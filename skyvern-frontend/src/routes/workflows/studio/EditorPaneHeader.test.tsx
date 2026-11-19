@@ -11,6 +11,7 @@ import {
   vi,
 } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -20,6 +21,8 @@ import {
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 import { type BlockSearchTarget } from "./blockSearch";
@@ -27,6 +30,14 @@ import {
   EditorPaneBlockSearch,
   EditorPaneModeToggle,
 } from "./EditorPaneHeader";
+
+const docFlag = vi.hoisted(() => ({ enabled: false }));
+vi.mock("@/hooks/useWorkflowDocEditorFlag", () => ({
+  useWorkflowDocEditorFlag: () => docFlag.enabled,
+}));
+vi.mock("@/routes/workflows/WorkflowPermanentIdContext", () => ({
+  useWorkflowPermanentId: () => "wpid_header",
+}));
 
 // cmdk and Radix Popover need ResizeObserver and scrollIntoView, which jsdom
 // lacks. Install them for this suite only and restore afterward.
@@ -87,6 +98,13 @@ function openSearch() {
 }
 
 beforeEach(() => {
+  docFlag.enabled = false;
+  localStorage.clear();
+  useWorkflowPresentationStore.setState({
+    presentation: "visual",
+    workflowPermanentId: null,
+    enabled: false,
+  });
   focusBlock.mockReset();
   useWorkflowBlockSearchStore.getState().registerHandle(null);
   useWorkflowYamlEditorStore.getState().close();
@@ -211,6 +229,82 @@ describe("EditorPaneModeToggle", () => {
     const yaml = screen.getByRole("button", { name: "YAML" });
     expect(visual.getAttribute("aria-pressed")).toBe("true");
     expect(yaml.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  test("with the Doc available the controls read Doc, YAML, Visual and the Doc is pressed", () => {
+    docFlag.enabled = true;
+    const store = useWorkflowYamlEditorStore.getState();
+    store.registerEnterYamlMode(() => store.open("blocks: []"));
+    renderToggle();
+
+    const group = screen.getByRole("group", { name: "Editor view" });
+    const order = Array.from(group.querySelectorAll("button")).map(
+      (button) => button.getAttribute("aria-label") ?? button.textContent,
+    );
+    expect(order).toEqual(["Doc", "YAML", "Visual"]);
+    expect(
+      screen.getByRole("button", { name: "Doc" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(
+      screen
+        .getByRole("button", { name: "Visual" })
+        .getAttribute("aria-pressed"),
+    ).toBe("false");
+  });
+
+  test("with the Doc unavailable the controls read Visual, YAML as before", () => {
+    const store = useWorkflowYamlEditorStore.getState();
+    store.registerEnterYamlMode(() => store.open("blocks: []"));
+    renderToggle();
+    const group = screen.getByRole("group", { name: "Editor view" });
+    expect(
+      Array.from(group.querySelectorAll("button")).map((b) =>
+        b.getAttribute("aria-label"),
+      ),
+    ).toEqual(["Visual", "YAML"]);
+  });
+
+  test("clicking Visual is remembered for the agent", async () => {
+    docFlag.enabled = true;
+    const store = useWorkflowYamlEditorStore.getState();
+    store.registerEnterYamlMode(() => store.open("blocks: []"));
+    renderToggle();
+
+    fireEvent.click(screen.getByRole("button", { name: "Visual" }));
+    await waitFor(() =>
+      expect(
+        localStorage.getItem("skyvern.workflowPresentation.wpid_header"),
+      ).toBe("visual"),
+    );
+  });
+
+  test("during a version comparison the pressed Visual stores nothing, and closing it shows the Doc again", async () => {
+    docFlag.enabled = true;
+    const store = useWorkflowYamlEditorStore.getState();
+    store.registerEnterYamlMode(() => store.open("blocks: []"));
+    const panel = useWorkflowPanelStore.getState().workflowPanelState;
+    act(() =>
+      useWorkflowPanelStore.setState({
+        workflowPanelState: {
+          ...panel,
+          data: { ...panel.data, showComparison: true },
+        },
+      }),
+    );
+    try {
+      renderToggle();
+      const visual = screen.getByRole("button", { name: "Visual" });
+      expect(visual.getAttribute("aria-pressed")).toBe("true");
+      fireEvent.click(visual);
+      await act(async () => {});
+      expect(localStorage.length).toBe(0);
+      expect(useWorkflowPresentationStore.getState().presentation).toBe("doc");
+    } finally {
+      act(() => useWorkflowPanelStore.setState({ workflowPanelState: panel }));
+    }
+    expect(
+      screen.getByRole("button", { name: "Doc" }).getAttribute("aria-pressed"),
+    ).toBe("true");
   });
 
   test("YAML enters yaml mode; Visual commits back out", async () => {

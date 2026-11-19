@@ -1597,6 +1597,15 @@ async def test_final_release_retries_keep_own_claim_and_completed_hook(
         ("failed", "failed", ["A"], set(), 0, (False, "no_match")),
         ("completed", "failed", None, set(), 0, (False, "no_match")),
         ("failed", "failed", None, {"browser_connection_lost"}, 0, (False, "browser_connection_lost")),
+        ("failed", "failed", None, {"gmail_organize_uncertain"}, 0, (False, "gmail_organize_uncertain")),
+        (
+            "failed",
+            "failed",
+            ["gmail_organize_uncertain"],
+            {"gmail_organize_uncertain"},
+            0,
+            (False, "gmail_organize_uncertain"),
+        ),
         ("failed", "failed", [], {"ANY", "browser_connection_lost"}, 0, (False, "browser_connection_lost")),
     ],
 )
@@ -3496,6 +3505,43 @@ async def test_concurrent_finalizers_send_a_no_policy_run_final_webhook_once(
     # A later finalizer, such as a cancel on the already-final run, finds the recorded outcome and skips too.
     await svc.execute_workflow_webhook(run, finalizer="api_cancel")
     deliver.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["delivered_after_listing", "claim_query_fails", "finished_at_missing"])
+async def test_replay_sends_only_under_the_run_claim(
+    case: str,
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A replay is late by definition: it must never duplicate an original that landed after the run was listed, and
+    # unlike the original senders it must not deliver unclaimed when it cannot take the run claim.
+    svc, _build_response, _update_run = webhook_service
+    sessions, runs = _use_real_run_repositories(monkeypatch, sqlite_engine)
+    await _seed_run(sessions, "wr_replay", **({"finished_at": None} if case == "finished_at_missing" else {}))
+    sent: list[str] = []
+
+    async def endpoint(**kwargs: Any) -> httpx.Response:
+        sent.append(kwargs["url"])
+        return _response(200, "ok")
+
+    monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", endpoint)
+    listed = await runs.get_workflow_run("wr_replay")
+    assert listed is not None
+    if case == "delivered_after_listing":
+        await svc.execute_workflow_webhook(listed, finalizer="webhook_activity")
+        assert len(sent) == 1
+    elif case == "claim_query_fails":
+        monkeypatch.setattr(runs, "claim_final_webhook_delivery", AsyncMock(side_effect=RuntimeError("db down")))
+
+    sent_before_replay = len(sent)
+    await svc.execute_workflow_webhook(listed, claim_kind=None, finalizer="replay")
+
+    assert len(sent) == sent_before_replay
+    if case != "delivered_after_listing":
+        await svc.execute_workflow_webhook(listed, claim_kind=None, finalizer="orphan_reaper")
+        assert len(sent) == 1
 
 
 @pytest.mark.asyncio

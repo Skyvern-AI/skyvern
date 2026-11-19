@@ -12,7 +12,9 @@ import structlog
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from pydantic import (
+    AfterValidator,
     BaseModel,
+    ConfigDict,
     Field,
     SerializerFunctionWrapHandler,
     StrictInt,
@@ -29,6 +31,7 @@ from pydantic_core import to_jsonable_python
 from skyvern.config import settings
 from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH, MAX_PDF_OCR_PAGES
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
+from skyvern.forge.sdk.db.id import is_uploaded_file_id
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -43,9 +46,21 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
-from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES, current_tool_names
+from skyvern.schemas.agent_step_tool_names import (
+    AGENT_STEP_TOOL_NAMES,
+    CATALOG_TOOL_NAMES,
+    current_tool_names,
+    is_known_tool_name,
+)
 from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
-from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
+from skyvern.schemas.emails import (
+    GMAIL_IMMUTABLE_LABELS,
+    GMAIL_ORGANIZE_FORBIDDEN_TARGETS,
+    ORGANIZE_ACTIONS_WITH_LABEL,
+    EmailBodyFormat,
+    EmailOrganizeAction,
+    EmailTransport,
+)
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
@@ -88,6 +103,23 @@ def sanitize_parameter_key(value: str) -> str:
 
 def _has_jinja_syntax(value: str) -> bool:
     return "{{" in value or "{%" in value
+
+
+# Marks a block field whose value is the id of a connected account. The condition names the sibling field values
+# under which the block reads it; with none, the field is always read.
+CONNECTED_ACCOUNT_SCHEMA_MARK = "x-skyvern-connected-account"
+CONNECTED_ACCOUNT_CONDITION_MARK = "x-skyvern-connected-account-when"
+# Marks a connected-account field the block uses to act on the outside world (send, upload), not only to read.
+CONNECTED_ACCOUNT_ACTS_MARK = "x-skyvern-connected-account-acts"
+
+
+def _connected_account_field(*, acts: bool = False, **condition: str) -> dict[str, Any]:
+    extra: dict[str, Any] = {CONNECTED_ACCOUNT_SCHEMA_MARK: True}
+    if condition:
+        extra[CONNECTED_ACCOUNT_CONDITION_MARK] = condition
+    if acts:
+        extra[CONNECTED_ACCOUNT_ACTS_MARK] = True
+    return extra
 
 
 @functools.lru_cache(maxsize=1)
@@ -554,6 +586,7 @@ class BlockType(StrEnum):
     DATA_EXPORT = "data_export"
     TERMINATE = "terminate"
     AGENT_STEP = "agent_step"
+    INTEGRATION_ACTION = "integration_action"
 
 
 class AIFallbackMode(StrEnum):
@@ -845,6 +878,26 @@ class OutputParameterYAML(ParameterYAML):
 
 
 BLOCK_NOTE_MAX_LENGTH = 2000
+BLOCK_IMAGE_CAPTION_MAX_LENGTH = 200
+BLOCK_DOC_IMAGES_MAX = 10
+BLOCK_PROMPT_IMAGES_MAX = 3
+
+
+def _uploaded_file_id(value: str) -> str:
+    if not is_uploaded_file_id(value):
+        raise ValueError(f"{value!r} is not an uploaded file id")
+    return value.strip()
+
+
+class BlockImage(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"x-internal": True})
+
+    file_id: Annotated[str, AfterValidator(_uploaded_file_id)]
+    caption: str | None = Field(default=None, max_length=BLOCK_IMAGE_CAPTION_MAX_LENGTH)
+    placement: Literal["above", "trailing", "block"] = "block"
+
+
+BLOCK_IMAGE_FIELDS = ("doc_images", "prompt_images")
 
 
 class BlockYAML(BaseModel, abc.ABC):
@@ -878,6 +931,23 @@ class BlockYAML(BaseModel, abc.ABC):
         "changing it never clears cached scripts. Omitting it on an update keeps the saved description; send null "
         "or an empty string to delete it.",
     )
+    doc_images: list[BlockImage] | None = Field(
+        default=None,
+        max_length=BLOCK_DOC_IMAGES_MAX,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Uploaded images shown with this block, for people reading the workflow. The agent never sees "
+        "them, and changing them never clears cached scripts. Omit to keep the saved images; send null or [] to "
+        "delete them.",
+    )
+    prompt_images: list[BlockImage] | None = Field(
+        default=None,
+        max_length=BLOCK_PROMPT_IMAGES_MAX,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Uploaded images reserved for this block's prompt; no block reads them yet. Omit to keep the "
+        "saved images; send null or [] to delete them.",
+    )
     next_block_label: str | None = Field(
         default=None,
         description="Optional pointer to the label of the next block. "
@@ -897,7 +967,7 @@ class BlockYAML(BaseModel, abc.ABC):
     def _preserve_explicit_note_clears(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
         data = handler(self)
         if isinstance(data, dict):
-            for field in ("notes", "trailing_notes", "description"):
+            for field in ("notes", "trailing_notes", "description", *BLOCK_IMAGE_FIELDS):
                 if field in self.model_fields_set and getattr(self, field) is None:
                     data[field] = None
         return data
@@ -1283,7 +1353,10 @@ class FileUploadBlockYAML(BlockYAML):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_folder_path: str | None = None
-    google_credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    google_credential_id: str | None = Field(
+        default=None,
+        json_schema_extra=_connected_account_field(acts=True, storage_type=FileStorageType.GOOGLE_DRIVE.value),
+    )
     google_drive_folder_id: str | None = None
     sftp_host: str | None = None
     sftp_port: int | None = None
@@ -1334,13 +1407,17 @@ class SendEmailBlockYAML(BlockYAML):
     credential_id: str | None = Field(
         default=None,
         description="ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
-        json_schema_extra={"x-skyvern-connected-account": True},
+        json_schema_extra=_connected_account_field(
+            acts=True, transport=EmailTransport.GMAIL.value, credential_source="native"
+        ),
     )
     credential_source: Literal["native", "nango"] = Field(
         default="native",
         description="'nango' sends from the connected account named by connection_id instead of credential_id.",
     )
-    connection_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    connection_id: str | None = Field(
+        default=None, json_schema_extra=_connected_account_field(acts=True, credential_source="nango")
+    )
     reply_to_message_id: str | None = Field(
         default=None,
         description="Gmail message ID to reply to in its original thread; requires send and read permissions.",
@@ -1595,8 +1672,10 @@ class AgentStepBlockYAML(BlockYAML):
     tools: list[str] | None = Field(
         default=None,
         description="The tools the step may call. A block it runs through run_block is named by its block type, such "
-        "as http_request. finish and read_run_data are always offered, and login only when parameter_keys lists a "
-        "credential parameter. Without a list the step has no other tools.",
+        "as http_request, and an integration action by <integration id>__<action id>, such as gmail__read_inbox. "
+        "finish and read_run_data are always offered, and login only when parameter_keys lists a credential "
+        "parameter. load_skill also offers read_skill_resource, and both are offered only when the run has skills. "
+        "Without a list the step has no other tools.",
     )
 
     @field_validator("tools")
@@ -1605,8 +1684,9 @@ class AgentStepBlockYAML(BlockYAML):
         if value is None:
             return None
         value = current_tool_names(value)
-        if unknown := sorted(set(value) - AGENT_STEP_TOOL_NAMES):
-            raise ValueError(f"Unknown tools {unknown}. Valid tools: {', '.join(sorted(AGENT_STEP_TOOL_NAMES))}.")
+        if unknown := sorted(name for name in set(value) if not is_known_tool_name(name)):
+            valid = sorted(AGENT_STEP_TOOL_NAMES | CATALOG_TOOL_NAMES)
+            raise ValueError(f"Unknown tools {unknown}. Valid tools: {', '.join(valid)}.")
         return value
 
     @field_validator("data_schema")
@@ -1634,7 +1714,10 @@ class FileDownloadBlockYAML(BlockYAML):
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
-    google_credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    google_credential_id: str | None = Field(
+        default=None,
+        json_schema_extra=_connected_account_field(acts=True, download_target=FileDownloadTarget.GOOGLE_DRIVE.value),
+    )
     google_drive_folder_id: str | None = None
     sftp_host: str | None = None
     sftp_port: int | None = None
@@ -1768,7 +1851,7 @@ class HttpRequestBlockYAML(BlockYAML):
     headers: dict[str, str] | None = None
     body: dict[str, Any] | None = None  # Changed to consistently be dict only
     files: dict[str, str] | None = None  # Dictionary mapping field names to file paths/URLs for multipart file uploads
-    timeout: int = 30
+    timeout: int = Field(default=30, ge=1)
     follow_redirects: bool = True
     download_filename: str | None = None
     save_response_as_file: bool = False
@@ -1847,7 +1930,7 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
     spreadsheet_url: str
     sheet_name: str | None = None
     range: str | None = None
-    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    credential_id: str | None = Field(default=None, json_schema_extra=_connected_account_field())
     has_header_row: bool = True
     parameter_keys: list[str] | None = None
 
@@ -1856,8 +1939,12 @@ class EmailInboxBlockYAML(BlockYAML):
     block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
     email_client: Literal["gmail", "outlook"]
     credential_source: Literal["native", "nango"] = "native"
-    connection_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
-    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    connection_id: str | None = Field(
+        default=None, json_schema_extra=_connected_account_field(credential_source="nango")
+    )
+    credential_id: str | None = Field(
+        default=None, json_schema_extra=_connected_account_field(credential_source="native")
+    )
     message_id: str | None = None
     folder: str | None = None
     prompt: str | None = None
@@ -1869,7 +1956,49 @@ class EmailInboxBlockYAML(BlockYAML):
     download_attachments: bool = Field(
         default=False, description="Download non-inline attachments from matched emails for downstream blocks."
     )
+    organize_action: EmailOrganizeAction | None = Field(
+        default=None,
+        description="Change every matched email: add a label, archive, move to a label, or mark read. Needs a "
+        "Connected Gmail account (credential_source nango).",
+    )
+    organize_label: str | None = Field(
+        default=None,
+        max_length=256,
+        description="Existing Gmail label name for organize_action label or move. Must be literal text.",
+    )
     parameter_keys: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _validate_organize(self) -> "EmailInboxBlockYAML":
+        if self.organize_action is None:
+            if self.organize_label is not None:
+                raise ValueError("organize_label is only used with organize_action")
+            return self
+        if self.email_client != "gmail":
+            raise ValueError("organize_action is only supported with gmail")
+        if self.credential_source != "nango":
+            raise ValueError("organize_action requires a Connected Gmail account")
+        if self.message_id:
+            raise ValueError("organize_action does not support message_id")
+        if (self.organize_action in ORGANIZE_ACTIONS_WITH_LABEL) != bool(
+            self.organize_label and self.organize_label.strip()
+        ):
+            raise ValueError("organize_label is required for label and move, and not allowed otherwise")
+        if any(
+            marker in value for value in (self.organize_label or "", self.folder or "") for marker in ("{{", "{%", "{#")
+        ):
+            raise ValueError("organize_label and folder must be literal for organize actions")
+        if (self.organize_label or "").strip().upper() in GMAIL_ORGANIZE_FORBIDDEN_TARGETS or (
+            self.organize_action == EmailOrganizeAction.MOVE
+            and (self.folder or "").strip().upper() in GMAIL_IMMUTABLE_LABELS
+        ):
+            raise ValueError("SENT, DRAFT, SPAM and TRASH cannot be organize targets; SENT and DRAFT cannot be sources")
+        if (
+            self.organize_action == EmailOrganizeAction.MOVE
+            and (self.organize_label or "").strip().casefold() == ((self.folder or "").strip() or "INBOX").casefold()
+        ):
+            raise ValueError("move source and target must differ")
+        return self
 
 
 class GoogleSheetsWriteBlockYAML(BlockYAML):
@@ -1877,7 +2006,7 @@ class GoogleSheetsWriteBlockYAML(BlockYAML):
     spreadsheet_url: str
     sheet_name: str | None = None
     range: str | None = None
-    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    credential_id: str | None = Field(default=None, json_schema_extra=_connected_account_field(acts=True))
     write_mode: Literal["append", "update"] = "append"
     values: str = ""
     column_mapping: dict[str, str] | None = None
@@ -1892,7 +2021,7 @@ class PowerBIQueryBlockYAML(BlockYAML):
     connection_id: str = Field(
         min_length=1,
         description="Power BI connection ID for this user.",
-        json_schema_extra={"x-skyvern-connected-account": True},
+        json_schema_extra=_connected_account_field(credential_source="nango"),
     )
     credential_source: Literal["nango"] = "nango"
     dataset_id: str = Field(min_length=1)
@@ -1906,6 +2035,21 @@ class PowerBIQueryBlockYAML(BlockYAML):
         if not value.strip() or _has_jinja_syntax(value):
             raise ValueError("Power BI connection_id must be a literal credential ID.")
         return value
+
+
+class IntegrationActionBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.INTEGRATION_ACTION] = BlockType.INTEGRATION_ACTION  # type: ignore
+    integration_id: str = Field(min_length=1, description="Integration catalog entry id, e.g. 'google_sheets'.")
+    action_id: str = Field(min_length=1, description="Action id within that entry, e.g. 'read_rows'.")
+    connection_id: str | None = Field(
+        default=None,
+        description="ID of the connected account the action runs as.",
+        json_schema_extra=_connected_account_field(),
+    )
+    inputs: dict[str, Any] = Field(
+        default_factory=dict, description="Values for the action's inputs, keyed by the catalog action's input names."
+    )
+    parameter_keys: list[str] | None = None
 
 
 PARAMETER_YAML_SUBCLASSES = (
@@ -1958,6 +2102,7 @@ BLOCK_YAML_SUBCLASSES = (
     | EmailInboxBlockYAML
     | GoogleSheetsWriteBlockYAML
     | PowerBIQueryBlockYAML
+    | IntegrationActionBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {

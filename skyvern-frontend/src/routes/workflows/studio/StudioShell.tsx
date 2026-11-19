@@ -27,18 +27,21 @@ import {
 } from "@/components/ui/tooltip";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import {
-  COPILOT_ATTENTION_LABEL,
-  useCopilotHeaderStore,
-} from "@/store/useCopilotHeaderStore";
+  EMBER_ATTENTION_LABEL,
+  useEmberHeaderStore,
+} from "@/store/useEmberHeaderStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { usePageSlots } from "@/store/PageSlots";
+import { useTriggerFocusStore } from "@/store/TriggerFocusStore";
 import { cn } from "@/util/utils";
 
 import { deriveDropIndicator } from "../editor/sortable/dropIndicator";
+import { useGlobalWorkflowStatus } from "../hooks/useIsGlobalWorkflow";
 import { WorkflowRunVerificationCodeForm } from "../workflowRun/WorkflowRunVerificationCodeForm";
 
 import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
-import { CopilotActiveDot, CopilotPaneControls } from "./CopilotPaneHeader";
+import { EmberActiveDot, EmberPaneControls } from "./EmberPaneHeader";
 import {
   EditorPaneBlockSearch,
   EditorPaneModeToggle,
@@ -71,7 +74,6 @@ import {
   panesListEqual,
   panesWithoutDeletedBlocked,
   STUDIO_DOC_MIN_WIDTH,
-  STUDIO_PANE_IDS,
   STUDIO_PANE_MIN_WIDTH,
   STUDIO_PANE_STRIP_WIDTH_PX,
   STUDIO_STAGE_GAP_PX,
@@ -82,6 +84,7 @@ import { useStudioNarrow } from "./useStudioNarrow";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import {
+  StudioGlobalWorkflowContext,
   StudioPaneCompactContext,
   StudioShellContext,
   StudioWorkflowDeletedContext,
@@ -90,7 +93,7 @@ import { StudioStageLauncher } from "./StudioStageLauncher";
 import { useStudioOnboardingTour } from "./useStudioOnboardingTour";
 import { StudioTopBar } from "./StudioTopBar";
 import { StudioWorkflowPanels } from "./StudioWorkflowPanels";
-import { useStudioPanes } from "./useStudioPanes";
+import { useStudioPaneIds, useStudioPanes } from "./useStudioPanes";
 import { useStudioRunId } from "./useStudioRunId";
 import { useRunVisuals } from "./useRunVisuals";
 
@@ -151,7 +154,7 @@ export function StudioPane({
   headerExtras?: ReactNode;
   // Rendered right-aligned, before the close button.
   headerActions?: ReactNode;
-  // Presence-badge overlay on the pane icon (e.g. the Copilot active dot).
+  // Presence-badge overlay on the pane icon (e.g. the Ember active dot).
   iconBadge?: ReactNode;
   chromeless?: boolean;
   children: ReactNode;
@@ -450,13 +453,13 @@ function CollapsedPaneStrip({
   const { icon: Icon } = STUDIO_PANE_META[id];
   const label = paneAccessibleName(id);
   const browserActivity = useStudioBrowserStore((s) => s.hasUnseenActivity);
-  const copilotAttention = useCopilotHeaderStore((s) => s.attention);
+  const emberAttention = useEmberHeaderStore((s) => s.attention);
   const activity = id === "browser" && browserActivity;
-  const awaiting = id === "copilot" ? copilotAttention : null;
+  const awaiting = id === "ember" ? emberAttention : null;
   const news = activity
     ? ", new activity"
     : awaiting
-      ? `, ${COPILOT_ATTENTION_LABEL[awaiting]}`
+      ? `, ${EMBER_ATTENTION_LABEL[awaiting]}`
       : "";
   return (
     <Tooltip>
@@ -484,7 +487,7 @@ function CollapsedPaneStrip({
             ) : awaiting ? (
               <StudioPaneAttentionDot
                 tone="waiting"
-                title={`Copilot, ${COPILOT_ATTENTION_LABEL[awaiting]}`}
+                title={`Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`}
               />
             ) : null}
           </span>
@@ -702,15 +705,16 @@ function StudioPaneDivider({
 }
 
 /**
- * Panes shell: the top bar's pane toggles (Copilot, Editor, Browser, Overview)
+ * Panes shell: the top bar's pane toggles (Ember, Editor, Browser, Overview)
  * each toggle a pane; open panes share the stage side by side in click order
- * (?panes=). The Copilot chat is portaled into its pane from Workspace.
+ * (?panes=). The Ember chat is portaled into its pane from Workspace.
  */
 export function StudioShell(props: StudioWorkspaceProps) {
   const [searchParams] = useSearchParams();
   const postHog = usePostHog();
   const openedWorkflowIds = useRef(new Set<string>());
   const workflowPermanentId = props.workflow.workflow_permanent_id;
+  const globalWorkflow = useGlobalWorkflowStatus();
 
   useEffect(() => {
     if (openedWorkflowIds.current.has(workflowPermanentId)) return;
@@ -731,18 +735,20 @@ export function StudioShell(props: StudioWorkspaceProps) {
     <StudioWorkflowDeletedContext.Provider
       value={props.workflow.deleted_at ?? null}
     >
-      <StudioPaneDefaultsProvider
-        hasBlocks={props.workflow.workflow_definition.blocks.length > 0}
-      >
-        <StudioStage {...props} />
-      </StudioPaneDefaultsProvider>
+      <StudioGlobalWorkflowContext.Provider value={globalWorkflow}>
+        <StudioPaneDefaultsProvider
+          hasBlocks={props.workflow.workflow_definition.blocks.length > 0}
+        >
+          <StudioStage {...props} />
+        </StudioPaneDefaultsProvider>
+      </StudioGlobalWorkflowContext.Provider>
     </StudioWorkflowDeletedContext.Provider>
   );
 }
 
 /**
  * Pane body while the source agent is deleted: the pane's normal content would
- * operate on the missing workflow (Copilot chats, editor saves, debug
+ * operate on the missing workflow (Ember chats, editor saves, debug
  * browsers), so it never mounts — runs stay viewable from the run panes.
  */
 function WorkflowDeletedPaneNotice() {
@@ -796,6 +802,9 @@ function StudioStage(props: StudioWorkspaceProps) {
   const { panes, closePane, openPane, setPanesOrder } = useStudioPanes();
   // Embedded run views keep their own layout at any iframe width.
   const narrow = useStudioNarrow() && !embedded;
+  const paneIds = useStudioPaneIds();
+  const { workflowTriggersPanel: WorkflowTriggersPanel } = usePageSlots();
+  const triggerFocus = useTriggerFocusStore();
   const editorShowsDoc = useEditorShowsDoc();
   const {
     registerStageElement,
@@ -842,10 +851,7 @@ function StudioStage(props: StudioWorkspaceProps) {
     fromBounds: PaneBounds;
   } | null>(null);
   const previousPanesRef = useRef(panes);
-  const [copilotPortalEl, setCopilotPortalEl] = useState<HTMLElement | null>(
-    null,
-  );
-  const [panelPortalEl, setPanelPortalEl] = useState<HTMLElement | null>(null);
+  const [emberPortalEl, setEmberPortalEl] = useState<HTMLElement | null>(null);
 
   // The live browser stream is mounted once into this detached host and
   // re-parented into the owning pane, so it never remounts on pane changes.
@@ -910,12 +916,14 @@ function StudioStage(props: StudioWorkspaceProps) {
     setSeenPanes(panes);
     if (added) setNarrowPick(added);
   }
+  // Closed panes stay mounted (CSS-hidden); Triggers waits for its first open
+  // so a visit that never opens it never loads the trigger list.
+  const [triggersOpened, setTriggersOpened] = useState(false);
+  if (!triggersOpened && panes.includes("triggers")) setTriggersOpened(true);
   const narrowShown =
     narrowPick !== null && panes.includes(narrowPick) ? narrowPick : panes[0];
   const narrowSwitchIds = (
-    workflowDeleted
-      ? panesWithoutDeletedBlocked(STUDIO_PANE_IDS)
-      : [...STUDIO_PANE_IDS]
+    workflowDeleted ? panesWithoutDeletedBlocked(paneIds) : [...paneIds]
   ).filter((id) => id !== "overview" || runId || panes.includes(id));
   const showNarrowPane = (id: StudioPaneId) => {
     setNarrowPick(id);
@@ -971,6 +979,15 @@ function StudioStage(props: StudioWorkspaceProps) {
   const isPaneFolded = useCallback(
     (id: StudioPaneId) => collapsedPanesRef.current.includes(id),
     [],
+  );
+  // Keyed on the lists' contents, so consumers re-render when what is on screen changes.
+  const visibleKey = visiblePanes.join(",");
+  // The row stays mounted under a pane that is still growing over the stage.
+  const isPaneOnScreen = useCallback(
+    (id: StudioPaneId) =>
+      visibleKey.split(",").includes(id) &&
+      (activeExpandedPaneId === null || activeExpandedPaneId === id),
+    [visibleKey, activeExpandedPaneId],
   );
   // Resolved after the render that applies the open, so a pane that was
   // closed and folds as it opens (the Doc leaves no room) is shown too.
@@ -1047,22 +1064,22 @@ function StudioStage(props: StudioWorkspaceProps) {
   const shellContextValue = useMemo(
     () => ({
       organizationId: props.workflow.organization_id,
-      copilotPortalEl,
-      panelPortalEl,
+      emberPortalEl,
       setEditorStreamSlot,
       setBrowserStreamSlot,
       setRunStreamSlot,
       restoreExpandedPane,
       showPane,
       isPaneFolded,
+      isPaneOnScreen,
     }),
     [
-      copilotPortalEl,
-      panelPortalEl,
+      emberPortalEl,
       props.workflow.organization_id,
       restoreExpandedPane,
       showPane,
       isPaneFolded,
+      isPaneOnScreen,
     ],
   );
 
@@ -1178,9 +1195,9 @@ function StudioStage(props: StudioWorkspaceProps) {
               )}
             >
               <StudioPane
-                {...paneProps("copilot")}
-                headerActions={<CopilotPaneControls />}
-                iconBadge={<CopilotActiveDot />}
+                {...paneProps("ember")}
+                headerActions={<EmberPaneControls />}
+                iconBadge={<EmberActiveDot />}
               >
                 {workflowDeleted ? (
                   <WorkflowDeletedPaneNotice />
@@ -1188,7 +1205,7 @@ function StudioStage(props: StudioWorkspaceProps) {
                   <div className="relative h-full w-full">
                     {/* The chat stays mounted throughout recording. Its transcript
                         owns the live recording chapter and its independent scroll. */}
-                    <div ref={setCopilotPortalEl} className="h-full w-full" />
+                    <div ref={setEmberPortalEl} className="h-full w-full" />
                   </div>
                 )}
               </StudioPane>
@@ -1246,6 +1263,25 @@ function StudioStage(props: StudioWorkspaceProps) {
                   <RunTab />
                 </PaneErrorBoundary>
               </StudioPane>
+              {WorkflowTriggersPanel &&
+              triggersOpened &&
+              paneIds.includes("triggers") ? (
+                <StudioPane {...paneProps("triggers")}>
+                  <PaneErrorBoundary
+                    key={`${props.workflow.workflow_permanent_id}:triggers`}
+                    pane="triggers"
+                    onError={(error, componentStack) =>
+                      reportPaneCrash("triggers", error, componentStack)
+                    }
+                  >
+                    <WorkflowTriggersPanel
+                      workflowPermanentId={props.workflow.workflow_permanent_id}
+                      focusTriggerId={triggerFocus.triggerId ?? undefined}
+                      focusRequest={triggerFocus.request}
+                    />
+                  </PaneErrorBoundary>
+                </StudioPane>
+              ) : null}
               {/* Dividers are the inter-pane gaps; stateless, so unlike the panes
                 they can re-render freely as the open list changes. */}
               {!narrow &&
@@ -1278,12 +1314,6 @@ function StudioStage(props: StudioWorkspaceProps) {
                 : null}
               {!embedded && panes.length === 0 ? <StudioStageLauncher /> : null}
               {embedded ? null : <StudioWorkflowPanels />}
-              {/* Overlay target for Workspace-wired panels (pointer-events off
-                  while empty so the stage stays clickable). */}
-              <div
-                ref={setPanelPortalEl}
-                className="pointer-events-none absolute inset-0 z-40"
-              />
               <span
                 role="status"
                 aria-live="polite"

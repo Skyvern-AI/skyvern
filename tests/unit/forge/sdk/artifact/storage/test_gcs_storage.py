@@ -7,9 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import google.api_core.exceptions as gcs_exceptions
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from google.cloud import storage
+from google.oauth2 import service_account
 
 import skyvern.forge.sdk.api.real_gcp as real_gcp_module
 import skyvern.forge.sdk.artifact.storage.base as base_module
@@ -257,6 +262,12 @@ class TestGcsStorageBrowserSessionFiles:
         uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/{settings.ENV}/o_other/file.pdf"
         with pytest.raises(PermissionError, match="No permission to access storage URI"):
             await gcs_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await gcs_storage.read_managed_file_head(uri, TEST_ORGANIZATION_ID, 64)
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await gcs_storage.presign_managed_file(
+                uri, TEST_ORGANIZATION_ID, expiry_seconds=60, inline_content_type="image/png"
+            )
 
     async def test_storage_type_property(self, gcs_storage: GcsStorageForTests) -> None:
         assert gcs_storage.storage_type == "gcs"
@@ -400,7 +411,7 @@ class TestGcsStorageClientSigning:
             mock_get_blob.return_value = mock_blob
 
             client = RealAsyncGcsStorageClient(project_id="test")
-            url = client._create_signed_url("gs://b/o.txt", expiry_hours=1)
+            url = client._create_signed_url("gs://b/o.txt", expiry_seconds=3600)
 
             assert url is not None and "X-Goog-Signature" in url
             kwargs = mock_blob.generate_signed_url.call_args.kwargs
@@ -476,6 +487,34 @@ class TestGcsStorageClientSigning:
 
 
 @pytest.mark.asyncio
+async def test_a_managed_file_url_expires_at_the_exact_lifetime_under_an_hour(
+    gcs_storage: GcsStorageForTests, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "GCS_SIGNER_SA_EMAIL", None)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    )
+    credentials = service_account.Credentials.from_service_account_info(
+        {
+            "client_email": "signer@proj.iam.gserviceaccount.com",
+            "private_key": key.decode(),
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    )
+    signer = RealAsyncGcsStorageClient(project_id="proj")
+    signer._client = storage.Client(project="proj", credentials=credentials)
+    gcs_storage.async_client = signer
+    uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/doc/shot.png"
+
+    url = await gcs_storage.presign_managed_file(
+        uri, TEST_ORGANIZATION_ID, expiry_seconds=1799, inline_content_type="image/png"
+    )
+
+    assert url is not None
+    assert parse_qs(urlparse(url).query)["X-Goog-Expires"] == ["1799"]
+
+
+@pytest.mark.asyncio
 class TestGcsShareLinkSensitiveCap:
     """Sensitive artifact types get hour-capped signed URLs (SKY-12527)."""
 
@@ -486,16 +525,16 @@ class TestGcsShareLinkSensitiveCap:
         )
 
         async def fake_sign(
-            uris: list[str], expiry_hours: int = 24, attachment_filenames: list[str | None] | None = None
+            uris: list[str], expiry_seconds: int = 86400, attachment_filenames: list[str | None] | None = None
         ) -> list[str]:
             suffix = "&attachment" if attachment_filenames is not None else ""
-            return [f"{uri}?h={expiry_hours}{suffix}" for uri in uris]
+            return [f"{uri}?s={expiry_seconds}{suffix}" for uri in uris]
 
         gcs_storage.async_client.create_signed_urls = AsyncMock(side_effect=fake_sign)
         urls = await gcs_storage.get_share_links([screenshot, download])
         assert urls == [
-            f"{screenshot.uri}?h={SENSITIVE_SHARE_URL_EXPIRY_HOURS}",
-            f"{download.uri}?h=24&attachment",
+            f"{screenshot.uri}?s={SENSITIVE_SHARE_URL_EXPIRY_HOURS * 3600}",
+            f"{download.uri}?s=86400&attachment",
         ]
 
 
@@ -710,3 +749,24 @@ async def test_cancelling_a_gcs_comparison_waits_for_its_storage_thread_to_finis
     with pytest.raises(asyncio.CancelledError):
         await read
     assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_managed_file_head_reads_only_the_requested_bytes() -> None:
+    data = b"\x89PNG" + b"\x00" * 100_000
+    served: list[int] = []
+
+    def download_as_bytes(start: int | None = None, end: int | None = None) -> bytes:
+        chunk = data[start or 0 : None if end is None else end + 1]
+        served.append(len(chunk))
+        return chunk
+
+    storage = GcsStorageForTests(bucket="b")
+    storage.async_client = client = RealAsyncGcsStorageClient(project_id="test")
+    client._get_blob = lambda _uri: SimpleNamespace(download_as_bytes=download_as_bytes)  # type: ignore[method-assign]
+    uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/shot.png"
+
+    head = await storage.read_managed_file_head(uri, TEST_ORGANIZATION_ID, 64)
+
+    assert head == data[:64]
+    assert served == [64]

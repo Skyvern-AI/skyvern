@@ -55,6 +55,7 @@ from structlog.testing import capture_logs
 
 from skyvern.exceptions import BrowserSessionExpired
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.api.llm.agents_model import SkyvernLitellmProvider, current_model_attempt_telemetry
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError, LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
@@ -134,8 +135,6 @@ from skyvern.forge.sdk.copilot.interruption import (
     INTERRUPTED_TERMINAL_RETRY,
     INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE,
 )
-from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider
-from skyvern.forge.sdk.copilot.model_telemetry import current_model_attempt_telemetry
 from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -164,8 +163,7 @@ from skyvern.forge.sdk.copilot.tools.completion import (
     _completion_verification_from_run_result,
 )
 from skyvern.forge.sdk.copilot.tools.credentials import (
-    _credential_ids_validation_error,
-    _credential_run_approval_blocker_signal,
+    _connection_approval_blocker_signal,
     _credential_run_approval_error,
     _extract_credential_ids_for_labels,
 )
@@ -195,6 +193,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotRunOutcomeUpdate,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.services import google_oauth_service as google_oauth_service_module
+from skyvern.forge.sdk.services import microsoft_oauth_service
 from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
@@ -210,6 +210,11 @@ from tests.unit.copilot_test_helpers import FakeCopilotStream
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
 from tests.unit.copilot_test_helpers import origin_run_input, passing_run, stub_copilot_agent_loop
+
+
+@pytest.fixture(autouse=True)
+def _no_microsoft_connections(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(microsoft_oauth_service, "get_credentials_for_org", AsyncMock(return_value=[]))
 
 
 def test_build_user_context_renders_scope_check_after_the_user_message() -> None:
@@ -486,7 +491,7 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
 
     restored_run_ids: list[str | None] = []
     seeded: list[tuple[str | None, str, str | None]] = []
-    hydrated: list[tuple[str, str, str | None]] = []
+    hydrated: list[tuple[str, str, str | None, bool]] = []
 
     async def restore_proposal(ctx: CopilotContext, *, required_workflow_run_id: str | None = None) -> None:
         restored_run_ids.append(required_workflow_run_id)
@@ -499,8 +504,10 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
         ctx.repair_origin_input_values = (origin_run_input("resume", "s3://bucket/resume.pdf"),)
         return SimpleNamespace(finished=True, run=None)
 
-    async def hydrate_run(ctx: CopilotContext, *, workflow_run_id: str) -> dict[str, dict[str, str]]:
-        hydrated.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
+    async def hydrate_run(
+        ctx: CopilotContext, *, workflow_run_id: str, queue_failure_frame: bool = False
+    ) -> dict[str, dict[str, str]]:
+        hydrated.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id, queue_failure_frame))
         return {"run": {"workflow_run_id": workflow_run_id, "status": "failed"}}
 
     monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", restore_proposal)
@@ -550,7 +557,7 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
     assert result.user_response == "ok"
     assert restored_run_ids == [expected_restore_run_id]
     assert seeded == [(expected_seed_run_id, expected_workflow_yaml, expected_proposal_run_id)]
-    assert hydrated == [(expected_run_id, expected_workflow_yaml, expected_proposal_run_id)]
+    assert hydrated == [(expected_run_id, expected_workflow_yaml, expected_proposal_run_id, True)]
     assert build_context.call_args.kwargs["workflow_yaml"] == expected_workflow_yaml
     run_packet_text = build_context.call_args.kwargs["debug_run_info_text"]
     assert (
@@ -2053,6 +2060,7 @@ class TestRequestPolicyInputGuardrail:
             prior_user_messages=policy_inputs.prior_user_messages,
             persisted_workflow_yaml=None,
             selected_connected_account_id="goac_selected",
+            selected_connected_account_from_pending_proposal=False,
         )
 
     @pytest.mark.asyncio
@@ -2395,7 +2403,7 @@ class _EnforcementAttempt:
     runs_tool: bool = True
     returns_tool_call: bool = False
     error: BaseException | None = None
-    stop_metadata: agent_module.CopilotModelStopMetadata | None = None
+    stop_metadata: agent_module.ModelStopMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -2565,7 +2573,7 @@ async def test_a_refusal_or_content_filter_stop_ends_the_turn_with_the_empty_com
     async def fake_acompletion(**_kwargs: object) -> AsyncIterator[ChatCompletionChunk]:
         return stream()
 
-    run_config = RunConfig(model_provider=CopilotLitellmProvider(), tracing_disabled=True)
+    run_config = RunConfig(model_provider=SkyvernLitellmProvider(), tracing_disabled=True)
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
@@ -2986,7 +2994,7 @@ workflow_definition:
         )
 
         expected = tools_module.sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
-        assert json.loads(result) == {**expected, "turn_seconds_remaining": None}
+        assert json.loads(result) == expected
         assert captured["update_calls"] == 1
         assert captured["run_calls"] == 1
         assert isinstance(captured["persisted_yaml"], str)
@@ -5704,7 +5712,7 @@ workflow_definition:
     def test_clicked_google_connection_is_run_approved_without_becoming_a_password_credential(self) -> None:
         policy = RequestPolicy(
             resolved_credentials=[],
-            run_approved_google_connection_ids=["goac_selected"],
+            run_approved_connection_ids=["goac_selected"],
         )
 
         assert _credential_run_approval_error(["goac_selected"], policy) is None
@@ -5713,10 +5721,12 @@ workflow_definition:
     def test_unclicked_google_connection_stays_unapproved(self) -> None:
         policy = RequestPolicy(resolved_credentials=[])
 
-        signal = _credential_run_approval_blocker_signal(["goac_staged"], policy)
+        signal = _connection_approval_blocker_signal(
+            ["goac_staged"], policy, admitted_ids=(), action="run the workflow", blocked_tool="update_and_run_blocks"
+        )
 
         assert signal is not None
-        assert signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert signal.internal_reason_code == "unapproved_connected_account_reference"
         assert signal.recovery_hint == "ask_user_clarifying"
         assert "goac_" not in signal.user_facing_reason
         assert "unapproved_credential_reference" not in signal.user_facing_reason
@@ -5924,7 +5934,7 @@ workflow_definition:
             modified_at=datetime(2026, 9, 1),
         )
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.get_visible_credentials_for_org",
+            "skyvern.forge.sdk.services.google_oauth_service.get_visible_credentials_for_org",
             AsyncMock(return_value=[connection]),
         )
         ctx = _ctx(
@@ -5959,7 +5969,7 @@ workflow_definition:
         )
 
         assert result["ok"] is True, result
-        assert result["data"]["google_connection_resolution"][0]["status"] == "resolved"
+        assert result["data"]["connection_resolution"][0]["status"] == "resolved"
         assert "goac_cited_persist" in process_workflow_yaml.await_args.kwargs["workflow_yaml"]
         assert "goac_cited_persist" in ctx.staged_workflow_yaml
 
@@ -5976,7 +5986,7 @@ workflow_definition:
             modified_at=datetime(2026, 9, 1),
         )
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.get_visible_credentials_for_org",
+            "skyvern.forge.sdk.services.google_oauth_service.get_visible_credentials_for_org",
             AsyncMock(return_value=[connection]),
         )
         ctx = _ctx(
@@ -6012,11 +6022,11 @@ workflow_definition:
 
         assert result["ok"] is True, result
         assert "block_id" not in result
-        fact = result["data"]["google_connection_resolution"][0]
+        fact = result["data"]["connection_resolution"][0]
         assert fact["status"] == "not_found"
         assert fact["canonicalized"] is False
         assert fact["detail"]
-        assert [row["connection_id"] for row in fact["eligible_connections"]] == ["goac_eligible_row"]
+        assert [row["connection_id"] for row in fact["active_connections"]] == ["goac_eligible_row"]
         assert "Quarterly Revenue Connection" in process_workflow_yaml.await_args.kwargs["workflow_yaml"]
         assert "Quarterly Revenue Connection" in ctx.staged_workflow_yaml
 
@@ -6377,7 +6387,7 @@ class TestRunBlocksCredentialApproval:
         execute_workflow.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_run_blocks_rejects_unapproved_direct_block_credential_id_before_dispatch(self, monkeypatch) -> None:
+    async def test_run_blocks_denies_a_credential_id_in_an_account_field_before_dispatch(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
         from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 
@@ -6409,7 +6419,7 @@ class TestRunBlocksCredentialApproval:
         )
 
         assert result["ok"] is False
-        assert "unapproved_credential_reference" in result["error"]
+        assert "connected accounts" in result["error"]
         database.credentials.get_credentials_by_ids.assert_not_called()
         database.organizations.get_organization.assert_not_called()
         prepare_workflow.assert_not_called()
@@ -6546,12 +6556,18 @@ class TestRunBlocksCredentialApproval:
             ),
         )
         monkeypatch.setattr(
-            credentials_module.google_oauth_service,
+            google_oauth_service_module,
             "get_visible_credentials_for_org",
             AsyncMock(
                 return_value=[
                     SimpleNamespace(
-                        id="goac_choice", credential_name="Google Sheets", state="active", email_address=None
+                        id="goac_choice",
+                        organization_id="org-1",
+                        credential_name="Google Sheets",
+                        state="active",
+                        email_address=None,
+                        scopes_granted=[GOOGLE_SHEETS_DATA_SCOPE],
+                        scopes_requested=[GOOGLE_SHEETS_DATA_SCOPE],
                     )
                 ]
             ),
@@ -6583,7 +6599,7 @@ class TestRunBlocksCredentialApproval:
             assert "cred_login" in result["error"]
         else:
             assert ctx.blocker_signal is not None
-            assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+            assert ctx.blocker_signal.internal_reason_code == "unapproved_connected_account_reference"
             assert [choice.connection_id for choice in ctx.connected_account_recovery_choices] == ["goac_choice"]
 
     @pytest.mark.asyncio
@@ -6632,8 +6648,6 @@ class TestRunBlocksCredentialApproval:
 
     @pytest.mark.asyncio
     async def test_unapproved_google_connection_halts_with_verified_account_rows(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
-
         workflow = self._workflow(
             parameters=[],
             blocks=[{"label": "login", "block_type": "google_sheets_read", "credential_id": "goac_staged"}],
@@ -6641,18 +6655,9 @@ class TestRunBlocksCredentialApproval:
         database = self._db(workflow=workflow)
         monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
         monkeypatch.setattr(
-            credentials_module.google_oauth_service,
+            google_oauth_service_module,
             "get_visible_credentials_for_org",
-            AsyncMock(
-                return_value=[
-                    SimpleNamespace(
-                        id="goac_choice",
-                        credential_name="Google Sheets",
-                        state="active",
-                        email_address=None,
-                    )
-                ]
-            ),
+            AsyncMock(return_value=[self._google_row("goac_choice")]),
         )
         ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
 
@@ -6665,11 +6670,11 @@ class TestRunBlocksCredentialApproval:
         assert "goac_" not in result["error"]
         assert "unapproved_credential_reference" not in result["error"]
         assert ctx.blocker_signal is not None
-        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_connected_account_reference"
         assert ctx.connected_account_recovery_choices == [
             ConnectedAccountChoice(
                 connection_id="goac_choice",
-                name="Google Sheets",
+                name="Connection goac_choice",
                 state="active",
                 email_address=None,
             )
@@ -6716,12 +6721,12 @@ class TestRunBlocksCredentialApproval:
         database = self._db(workflow=workflow, organization_lookup=None)
         monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
         monkeypatch.setattr(
-            credentials_module.google_oauth_service,
+            google_oauth_service_module,
             "get_visible_credentials_for_org",
             AsyncMock(return_value=visible),
         )
         monkeypatch.setattr(
-            credentials_module.google_oauth_service,
+            google_oauth_service_module,
             "get_credentials_for_org",
             AsyncMock(return_value=[SimpleNamespace(id=connection_id) for connection_id in active_ids]),
         )
@@ -6731,7 +6736,7 @@ class TestRunBlocksCredentialApproval:
     async def test_same_turn_google_admission_retires_the_earlier_denial(self, monkeypatch) -> None:
         workflow = self._workflow(
             parameters=[],
-            blocks=[{"label": "login", "block_type": "google_sheets_write", "credential_id": "goac_sheet"}],
+            blocks=[{"label": "login", "block_type": "google_sheets_read", "credential_id": "goac_sheet"}],
         )
         self._google_dispatch_stack(
             monkeypatch,
@@ -6746,7 +6751,7 @@ class TestRunBlocksCredentialApproval:
 
         assert denied["ok"] is False
         assert ctx.blocker_signal is not None
-        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_connected_account_reference"
         assert ctx.connected_account_recovery_choices
 
         ctx.tool_activity.append(self._listing_activity("goac_sheet"))
@@ -6757,7 +6762,7 @@ class TestRunBlocksCredentialApproval:
         assert ctx.latest_tool_blocker_signal is None
         assert ctx.tool_blocker_signals == []
         assert ctx.connected_account_recovery_choices == []
-        assert policy.run_approved_google_connection_ids == []
+        assert policy.run_approved_connection_ids == []
 
     @pytest.mark.asyncio
     async def test_replacing_the_denied_google_binding_with_an_admitted_one_retires_the_denial(
@@ -6765,7 +6770,7 @@ class TestRunBlocksCredentialApproval:
     ) -> None:
         workflow = self._workflow(
             parameters=[],
-            blocks=[{"label": "login", "block_type": "google_sheets_write", "credential_id": "goac_denied"}],
+            blocks=[{"label": "login", "block_type": "google_sheets_read", "credential_id": "goac_denied"}],
         )
         self._google_dispatch_stack(
             monkeypatch,
@@ -6795,8 +6800,8 @@ class TestRunBlocksCredentialApproval:
         workflow = self._workflow(
             parameters=[],
             blocks=[
-                {"label": "first_write", "block_type": "google_sheets_write", "credential_id": "goac_first"},
-                {"label": "second_write", "block_type": "google_sheets_write", "credential_id": "goac_second"},
+                {"label": "first_write", "block_type": "google_sheets_read", "credential_id": "goac_first"},
+                {"label": "second_write", "block_type": "google_sheets_read", "credential_id": "goac_second"},
             ],
             output_labels={"first_write", "second_write"},
         )
@@ -6814,21 +6819,21 @@ class TestRunBlocksCredentialApproval:
 
         assert denied["ok"] is False
         assert ctx.blocker_signal is not None
-        assert set(ctx.blocker_signal.extra["unapproved_google_connection_ids"]) == {"goac_first", "goac_second"}
+        assert ctx.blocker_signal.extra["unapproved_connection_reference_count"] == 2
 
         ctx.tool_activity.append(self._listing_activity("goac_first"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
 
         assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
-        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_connected_account_reference"
         assert ctx.connected_account_recovery_choices
 
     @pytest.mark.asyncio
     async def test_revoked_google_connection_row_leaves_the_denial_standing(self, monkeypatch) -> None:
         workflow = self._workflow(
             parameters=[],
-            blocks=[{"label": "login", "block_type": "google_sheets_write", "credential_id": "goac_revoked"}],
+            blocks=[{"label": "login", "block_type": "google_sheets_read", "credential_id": "goac_revoked"}],
         )
         self._google_dispatch_stack(
             monkeypatch,
@@ -6848,7 +6853,7 @@ class TestRunBlocksCredentialApproval:
 
         assert still_denied["ok"] is False
         assert ctx.blocker_signal is not None
-        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_connected_account_reference"
         assert ctx.connected_account_recovery_choices
 
     @pytest.mark.asyncio
@@ -6856,8 +6861,8 @@ class TestRunBlocksCredentialApproval:
         workflow = self._workflow(
             parameters=[],
             blocks=[
-                {"label": "first_write", "block_type": "google_sheets_write", "credential_id": "goac_first"},
-                {"label": "second_write", "block_type": "google_sheets_write", "credential_id": "goac_second"},
+                {"label": "first_write", "block_type": "google_sheets_read", "credential_id": "goac_first"},
+                {"label": "second_write", "block_type": "google_sheets_read", "credential_id": "goac_second"},
             ],
             output_labels={"first_write", "second_write"},
         )
@@ -6874,7 +6879,7 @@ class TestRunBlocksCredentialApproval:
 
         assert first["ok"] is False
         assert second["ok"] is False
-        assert ctx.blocker_signal.extra["unapproved_google_connection_ids"] == ["goac_first"]
+        assert ctx.blocker_signal.extra["unapproved_connection_reference_count"] == 1
         assert len(ctx.tool_blocker_signals) == 2
 
         ctx.tool_activity.append(self._listing_activity("goac_first"))
@@ -6882,7 +6887,7 @@ class TestRunBlocksCredentialApproval:
 
         assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
-        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_connected_account_reference"
         assert ctx.tool_blocker_signals
         assert ctx.connected_account_recovery_choices
 
@@ -6891,8 +6896,8 @@ class TestRunBlocksCredentialApproval:
         workflow = self._workflow(
             parameters=[],
             blocks=[
-                {"label": "first_write", "block_type": "google_sheets_write", "credential_id": "goac_first"},
-                {"label": "second_write", "block_type": "google_sheets_write", "credential_id": "Marketing Sheet"},
+                {"label": "first_write", "block_type": "google_sheets_read", "credential_id": "goac_first"},
+                {"label": "second_write", "block_type": "google_sheets_read", "credential_id": "Marketing Sheet"},
             ],
             output_labels={"first_write", "second_write"},
         )
@@ -6910,19 +6915,18 @@ class TestRunBlocksCredentialApproval:
 
         assert denied["ok"] is False
         assert ctx.blocker_signal is not None
-        assert ctx.blocker_signal.extra["unapproved_google_connection_ids"] == ["goac_first"]
-        assert ctx.blocker_signal.extra["unapproved_google_reference_count"] == 2
+        assert ctx.blocker_signal.extra["unapproved_connection_reference_count"] == 2
 
         ctx.tool_activity.append(self._listing_activity("goac_first"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
 
         assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
-        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_connected_account_reference"
         assert ctx.connected_account_recovery_choices
 
     @pytest.mark.asyncio
-    async def test_common_dispatch_gate_approves_only_selected_sheets_bindings(self, monkeypatch) -> None:
+    async def test_common_dispatch_gate_approves_only_executing_account_bindings(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
         from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 
@@ -6935,19 +6939,19 @@ class TestRunBlocksCredentialApproval:
                     "loop_blocks": [
                         {
                             "label": "nested_write",
-                            "block_type": "google_sheets_write",
+                            "block_type": "google_sheets_read",
                             "credential_id": "goac_nested",
                         }
                     ],
                 },
                 {
                     "label": "later_write",
-                    "block_type": "google_sheets_write",
+                    "block_type": "google_sheets_read",
                     "credential_id": "goac_later",
                 },
                 {
                     "label": "cleanup_write",
-                    "block_type": "google_sheets_write",
+                    "block_type": "google_sheets_read",
                     "credential_id": "goac_finally",
                 },
             ],
@@ -6956,10 +6960,9 @@ class TestRunBlocksCredentialApproval:
         )
         database = self._db(workflow=workflow, organization_lookup=None)
         policy = RequestPolicy(resolved_credentials=[])
-        approval = AsyncMock(side_effect=lambda bindings, **_kwargs: [connection_id for _, connection_id in bindings])
+        approval = AsyncMock(side_effect=lambda refs, **_kwargs: set(refs))
         monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
-        monkeypatch.setattr(run_execution_module, "_approve_server_verified_google_sheet_bindings", approval)
-        monkeypatch.setattr(run_execution_module, "_credential_ids_validation_error", AsyncMock(return_value=None))
+        monkeypatch.setattr(credentials_module, "admitted_connection_ids", approval)
 
         result = await _run_blocks_and_collect_debug(
             {"block_labels": ["loop"], "parameters": {}},
@@ -6968,16 +6971,13 @@ class TestRunBlocksCredentialApproval:
 
         assert result == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         approval.assert_awaited_once()
-        assert approval.await_args.args[0] == [
-            ("nested_write", "goac_nested"),
-            ("cleanup_write", "goac_finally"),
-        ]
+        assert approval.await_args.args[0] == ["goac_nested", "goac_finally"]
         assert approval.await_args.kwargs["tool_activity"] == []
-        assert policy.run_approved_google_connection_ids == []
-        assert "goac_later" not in policy.run_approved_google_connection_ids
+        assert policy.run_approved_connection_ids == []
+        assert "goac_later" not in policy.run_approved_connection_ids
 
     @pytest.mark.asyncio
-    async def test_dispatch_scoped_sheets_admission_cannot_authorize_a_non_sheets_use(self, monkeypatch) -> None:
+    async def test_one_admitted_connection_covers_its_sheets_and_mail_uses(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
         from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 
@@ -6990,7 +6990,7 @@ class TestRunBlocksCredentialApproval:
                     "loop_blocks": [
                         {
                             "label": "sheet_write",
-                            "block_type": "google_sheets_write",
+                            "block_type": "google_sheets_read",
                             "credential_id": "goac_shared",
                         },
                         {
@@ -7004,9 +7004,9 @@ class TestRunBlocksCredentialApproval:
             output_labels={"loop"},
         )
         database = self._db(workflow=workflow, organization_lookup=None)
-        approval = AsyncMock(return_value=["goac_shared"])
+        approval = AsyncMock(return_value={"goac_shared"})
         monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
-        monkeypatch.setattr(run_execution_module, "_approve_server_verified_google_sheet_bindings", approval)
+        monkeypatch.setattr(credentials_module, "admitted_connection_ids", approval)
         policy = RequestPolicy(resolved_credentials=[])
         ctx = _ctx(request_policy=policy)
 
@@ -7015,66 +7015,24 @@ class TestRunBlocksCredentialApproval:
             ctx,
         )
 
-        assert result["ok"] is False
-        assert ctx.blocker_signal is not None
-        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
-        assert ctx.blocker_signal.extra["unapproved_google_connection_ids"] == ["goac_shared"]
-        assert policy.run_approved_google_connection_ids == []
-        database.organizations.get_organization.assert_not_called()
+        assert result == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
+        assert ctx.blocker_signal is None
+        assert policy.run_approved_connection_ids == []
 
     @pytest.mark.asyncio
-    async def test_clicked_google_connection_uses_oauth_validation_without_password_lookup(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
-
+    async def test_an_approved_connection_never_reaches_the_saved_credential_lookup(self, monkeypatch) -> None:
         workflow = self._workflow(
             parameters=[],
             blocks=[{"label": "login", "block_type": "google_sheets_read", "credential_id": "goac_selected"}],
         )
         database = self._db(workflow=workflow, organization_lookup=None)
-        active_google_connections = AsyncMock(return_value=[SimpleNamespace(id="goac_selected")])
         monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
-        monkeypatch.setattr(
-            credentials_module.google_oauth_service,
-            "get_credentials_for_org",
-            active_google_connections,
-        )
 
-        ctx = _ctx(
-            request_policy=RequestPolicy(
-                resolved_credentials=[],
-                run_approved_google_connection_ids=["goac_selected"],
-            )
-        )
-        result = await _run_blocks_and_collect_debug(
-            {"block_labels": ["login"], "parameters": {}},
-            ctx,
-        )
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[], run_approved_connection_ids=["goac_selected"]))
+        result = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
 
         assert result["error"] == "Organization not found"
-        active_google_connections.assert_awaited_once_with("org-1")
         database.credentials.get_credentials_by_ids.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_inactive_google_connection_routes_to_reconnect_without_raw_id(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
-
-        monkeypatch.setattr(
-            credentials_module.google_oauth_service,
-            "get_credentials_for_org",
-            AsyncMock(return_value=[]),
-        )
-        database = SimpleNamespace(
-            credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(side_effect=AssertionError("called")))
-        )
-        monkeypatch.setattr(credentials_module.app, "DATABASE", database)
-
-        error = await _credential_ids_validation_error(["goac_inactive"], _ctx())
-
-        assert error is not None
-        assert "reconnect" in error.lower()
-        assert "Integrations" in error
-        assert "goac_inactive" not in error
-        assert "Credentials UI" not in error
 
 
 @pytest.mark.asyncio
@@ -7279,7 +7237,7 @@ class TestRunBlocksCredentialApprovalFrontierScope:
         assert self.CREDENTIAL_ID in result["error"]
 
     @pytest.mark.asyncio
-    async def test_direct_block_credential_id_in_frontier_is_unapproved(self, monkeypatch) -> None:
+    async def test_an_account_field_in_the_frontier_holding_a_credential_id_is_denied(self, monkeypatch) -> None:
         workflow = self._workflow(
             [
                 {"label": "login", "block_type": "google_sheets_read", "credential_id": self.CREDENTIAL_ID},
@@ -7290,8 +7248,7 @@ class TestRunBlocksCredentialApprovalFrontierScope:
         result, _ = await self._run(monkeypatch, workflow, ["login"])
 
         assert result["ok"] is False
-        assert "unapproved_credential_reference" in result["error"]
-        assert self.CREDENTIAL_ID in result["error"]
+        assert "connected accounts" in result["error"]
 
     @pytest.mark.asyncio
     async def test_credential_inside_executing_loop_child_is_unapproved(self, monkeypatch) -> None:
@@ -7531,14 +7488,14 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=0,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
         tool_bearing = agent_module._empty_completion_error(
             SimpleNamespace(final_output="", new_items=[_tool_call_item()]),
             ctx=ctx,
             tool_call_count_start=0,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is not None
@@ -7555,7 +7512,7 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=7,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is not None
@@ -7570,7 +7527,7 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=7,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is not None
@@ -7589,14 +7546,14 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=0,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is None
 
     @pytest.mark.parametrize("field", ["refusal", "content_filter"])
     def test_empty_completion_with_explicit_safety_stop_is_not_retriable(self, field: str) -> None:
-        stop_metadata = agent_module.CopilotModelStopMetadata(
+        stop_metadata = agent_module.ModelStopMetadata(
             model_call_index=1,
             **{field: True},
         )
@@ -7727,7 +7684,7 @@ class TestCopilotConfig:
     async def test_tool_bearing_empty_completion_after_safety_stop_skips_final_reply(
         self, monkeypatch: pytest.MonkeyPatch, field: str
     ) -> None:
-        stop_metadata = agent_module.CopilotModelStopMetadata(model_call_index=1, **{field: True})
+        stop_metadata = agent_module.ModelStopMetadata(model_call_index=1, **{field: True})
 
         run = await _run_tool_bearing_empty_completion_turn(
             monkeypatch,

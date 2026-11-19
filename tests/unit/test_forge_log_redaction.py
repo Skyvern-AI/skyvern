@@ -34,14 +34,8 @@ from skyvern.forge.log_redaction import (
 )
 from skyvern.forge.sdk import forge_log, log_artifacts
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.copilot import secret_scrub
 from skyvern.forge.sdk.copilot.runtime import AgentContext
-from skyvern.forge.sdk.copilot.secret_scrub import (
-    REDACTED_SECRET_PLACEHOLDER,
-    clear_session_scrub_values,
-    register_secret_scrub_value,
-    scrub_secrets_from_text,
-)
+from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value, scrub_secrets_from_text
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.forge_log import (
@@ -64,6 +58,8 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.skyvern_json_encoder import SkyvernJSONLogEncoder
 from skyvern.schemas.proxy_pinning import ProxyObservabilityField, RedactedProxyLogValue, redact_proxy_location
 from skyvern.schemas.runs import GeoTarget
+from skyvern.utils import secret_scrub
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER, clear_session_scrub_values
 
 _FAKE_CREDENTIAL = "fake-pa55w0rd-7x9"
 _REDACTED = "****"
@@ -834,10 +830,10 @@ def test_generated_string_subclasses_cannot_bypass_caller_text_scrubbing() -> No
         "from skyvern.forge.sdk import forge_log\nforge_log._generated_log_value('diagnostic', 'fake-credential')\n",
         "from skyvern.forge.sdk.forge_log import _GeneratedLogInt\n",
         "from skyvern.forge.sdk.forge_log import _GeneratedLogValue\n",
-        "from skyvern.forge.sdk.api.llm.copilot_model_usage import _emit_copilot_model_usage\n",
-        "from skyvern.forge.sdk.api.llm.copilot_model_usage import _emit_direct_copilot_model_usage\n",
+        "from skyvern.forge.sdk.api.llm.model_usage import _emit_model_usage\n",
+        "from skyvern.forge.sdk.api.llm.model_usage import _emit_direct_copilot_model_usage\n",
         "from skyvern.forge.sdk.routes.workflow_copilot import _bind_copilot_session_id\n",
-        "from skyvern.forge.sdk.copilot.model_telemetry import _model_call_telemetry_scope\n",
+        "from skyvern.forge.sdk.api.llm.agents_model import _model_call_telemetry_scope\n",
         "from skyvern.forge.sdk.api.llm.config_registry import _register_builtin_config\n",
         "from skyvern.forge.sdk.forge_log import _model_log_value\n",
     ],

@@ -33,7 +33,9 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.agents.skills import AvailableSkill
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -51,6 +53,7 @@ from skyvern.forge.sdk.copilot.config import (
     authoring_capability_for_request,
 )
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.http_request_authorization import GuardedHTTPHopResponse, GuardedHTTPHopStream
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
@@ -92,14 +95,16 @@ from skyvern.forge.sdk.services.request_principal import (
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar, CodeFailure
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
-from skyvern.schemas.emails import GmailSendErrorCode, GmailSendOutcome
+from skyvern.schemas.emails import EmailOrganizeAction, GmailSendErrorCode, GmailSendOutcome
 from skyvern.schemas.run_enums import RunEngine, RunType
+from skyvern.schemas.workflow_run_groups import DEFAULT_RUN_GROUP_LIMITS, RunGroupLimits
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
 from skyvern.services.email.gmail import GmailSendResult
 from skyvern.services.email.gmail_client import GmailAPIError
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.services.webhook_delivery import WebhookDeliveryAttempts, bound_webhook_request
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
+from skyvern.settings_manager import SettingsManager
 from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import pinned_ip_client
 from skyvern.webeye.actions.actions import Action
@@ -122,7 +127,8 @@ if TYPE_CHECKING:
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.db.models import FolderModel
-    from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry
+    from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry, IntegrationTrigger
+    from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.schemas.workflow_copilot import CopilotTurnControl
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
@@ -196,6 +202,14 @@ def running_in_packaged_deployment() -> bool:
     return any(os.path.exists(path) for path in _PACKAGED_DEPLOYMENT_MARKER_FILES)
 
 
+def developer_checkout_opted_into_inline_copilot_code() -> bool:
+    # ENV alone cannot carry this: self-hosted Docker and Kubernetes are documented with
+    # ENV=local, so a packaged deployment would look identical to a laptop.
+    if settings.is_cloud_environment() or running_in_packaged_deployment():
+        return False
+    return settings.EMBER_ALLOW_INLINE_CODE_EXECUTION
+
+
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
 CSS_SHAPE_CONVERTION_ATTEMPTS = 1
@@ -263,6 +277,9 @@ class ScriptExecutionPolicyDecision:
     # (ADR-0012 mint-time validation); a rollout verdict sets this False so the run reaches the
     # agent instead. Defaults closed so a new denial reason has to opt into degrading.
     fail_closed: bool = True
+    # A fail-open denial the policy issues on every run logs at debug; any other logs at warning so the
+    # fail-open denial monitor sees it at production LOG_LEVEL=INFO.
+    steady_state: bool = False
 
 
 class CopilotCandidateNetworkHop(TypedDict):
@@ -292,15 +309,40 @@ class CopilotOrganizationUsage:
 
 COPILOT_TRIGGERS_UNAVAILABLE = "Triggers are not available in this deployment."
 
+# Each workflow input key maps to a JSON Pointer into the event, or to {"value": <JSON>} for a fixed value.
+TriggerMapping = dict[str, str | dict[str, JsonValue]]
+
 
 @dataclass(frozen=True)
 class CopilotTriggerSummary:
     event_trigger_id: str
     workflow_permanent_id: str
     source_kind: str
-    mapping: dict[str, str]
+    mapping: TriggerMapping
+    settings: dict[str, JsonValue]
     enabled: bool
     created_at: str
+    note: str | None = None
+    # Whether anyone has seen its signing secret; None for sources that never hand one out.
+    secret_shown: bool | None = None
+    # Whether its source starts runs by itself once on (a poller), so switching it on is the only step left.
+    fires_on_its_own: bool = False
+    # The connected account the source reads through, when it has one, so the card can name it.
+    account_id: str | None = None
+    # The source's settings as {"label", "value"} rows in plain words, for the user-facing trigger card.
+    filters: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CopilotTriggerSource:
+    source_kind: str
+    description: str
+    # Adapter-managed sources are set up outside Copilot; `set_up_in` names where.
+    creatable_in_copilot: bool
+    settings_schema: dict[str, JsonValue]
+    example_event: dict[str, JsonValue]
+    fires_on_its_own: bool
+    set_up_in: str | None = None
 
 
 TriggerMappingReasonCode = Literal[
@@ -319,6 +361,7 @@ class CopilotTriggerResult:
     triggers: list[CopilotTriggerSummary] = field(default_factory=list)
     resolved_parameters: dict[str, JsonValue] | None = None
     reason_code: TriggerMappingReasonCode | None = None
+    after_create: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1018,6 +1061,12 @@ async def _convert_css_shape_to_string(
 
 
 @dataclass(frozen=True)
+class ProxyProviderRefusal:
+    status: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class RecordingVideoSizeResolution:
     """Outcome of resolving the recording resolution for a run.
 
@@ -1032,6 +1081,18 @@ class RecordingVideoSizeResolution:
     raw_output_bound: dict[str, int] | None
 
 
+TASK_V3_OBSERVE_SCREENSHOT_WIDTH_MIN = 256
+TASK_V3_OBSERVE_SCREENSHOT_WIDTH_MAX = 1024
+
+
+def observe_screenshot_width(value: int, *, source: str) -> int:
+    if TASK_V3_OBSERVE_SCREENSHOT_WIDTH_MIN <= value <= TASK_V3_OBSERVE_SCREENSHOT_WIDTH_MAX:
+        return value
+    if value != 0:
+        LOG.warning("taskv3 observe screenshot width invalid; off", width=value, source=source)
+    return 0
+
+
 OnePasswordTelemetryEvent = Literal[
     "onepassword.token_saved",
     "onepassword.token_cleared",
@@ -1044,7 +1105,14 @@ class AgentFunction:
     async def nango_gmail_catalog_available(self, organization_id: str) -> bool:
         return False
 
+    async def own_connected_gmail_connections(self, organization_id: str, user_id: str) -> list[OrgConnection]:
+        return []
+
     async def prepare_gmail_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
+        return None
+
+    async def request_gmail_hop_tokens(self, *, organization_id: str, workflow_run_id: str, workflow: Workflow) -> None:
+        """Ask whichever process may mint to issue this run's capabilities; a run can start where it cannot mint."""
         return None
 
     async def execute_gmail_inbox_for_run(
@@ -1082,6 +1150,23 @@ class AgentFunction:
         """Stream one attachment of a connected account into destination and return the bytes written."""
         raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
 
+    async def organize_gmail_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        action: EmailOrganizeAction,
+        label: str | None,
+        folder: str,
+        message_ids: list[str],
+        grants: list[str],
+    ) -> None:
+        """Apply the block's saved organize action to emails its own connected-account listing returned."""
+        raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
+
     async def send_gmail_for_run(
         self,
         *,
@@ -1097,6 +1182,10 @@ class AgentFunction:
 
     async def nango_powerbi_catalog_available(self, organization_id: str) -> bool:
         return False
+
+    async def hidden_integration_ids(self, organization_id: str) -> frozenset[str]:
+        """Catalog entries this organization must not see at all, not even as coming soon."""
+        return frozenset()
 
     async def powerbi_plan_allows(self, organization_id: str) -> bool | None:
         """None when the plan could not be read."""
@@ -1131,6 +1220,29 @@ class AgentFunction:
 
     def resolve_download_failure(self, failure_key: str) -> None:
         return None
+
+    def classify_failure(
+        self,
+        failure_reason: str | None,
+        exception: Exception | None = None,
+        fallback_to_unknown: bool = False,
+        exception_name: str | None = None,
+        unsolved_captcha_exception: str | None = None,
+        *,
+        status: str | None = None,
+        block_type: str | None = None,
+    ) -> list[dict] | None:
+        """Failure categories for one failure (a task's, a block's, or a tool error), most likely first.
+
+        ``status`` and ``block_type`` describe where the failure happened; the default implementation is the rule
+        classifier and does not use them."""
+        return classify_from_failure_reason(
+            failure_reason,
+            exception=exception,
+            fallback_to_unknown=fallback_to_unknown,
+            exception_name=exception_name,
+            unsolved_captcha_exception=unsolved_captcha_exception,
+        )
 
     def should_log_request_bodies(self, organization_id: str) -> bool:
         return True
@@ -1482,9 +1594,22 @@ class AgentFunction:
     async def task_v3_error_code_on_finish(self, *, organization_id: str) -> bool:
         return settings.TASK_V3_ERROR_CODE_ON_FINISH
 
+    # Width of the viewport picture a v3 observe attaches, 0 for none. Read once per task.
+    async def task_v3_observe_screenshot_width(self, *, organization_id: str | None) -> int:
+        return observe_screenshot_width(SettingsManager.get_settings().TASK_V3_OBSERVE_SCREENSHOT_WIDTH, source="env")
+
+    # Read once when a run group is submitted; the group stores its bound, so a later change never reaches it.
+    async def workflow_run_group_limits(self, *, organization_id: str) -> RunGroupLimits:
+        return DEFAULT_RUN_GROUP_LIMITS
+
     # Whether a v3 run holds its first terminated verdict once for what prevents the task. Read once per run.
     async def task_v3_justify_hold_enabled(self, *, task_id: str | None, organization_id: str | None) -> bool:
         return not settings.DISABLE_TASK_V3_JUSTIFY_HOLD
+
+    # Text appended to the task message of every page-aware v3 run except extraction and validation blocks, or None.
+    # OSS supplies none.
+    def task_v3_authorized_agent_default(self) -> str | None:
+        return None
 
     # (text appended to a page-aware v3 run's task message or None, reason logged on the loop-finished line), given
     # the run's payload. OSS supplies no default.
@@ -1582,6 +1707,13 @@ class AgentFunction:
         (``time.monotonic()``), when that status says the host did not accept the provider's connection."""
         return None
 
+    async def proxy_provider_refusal(
+        self, *, browser_session_id: str, host: str, since_wall: float
+    ) -> ProxyProviderRefusal | None:
+        """The refusal, with the reason it stated, the proxy provider gave this browser's connection to ``host`` at
+        or after ``since_wall`` (``time.time()``)."""
+        return None
+
     async def capture_workflow_run_created(
         self,
         *,
@@ -1615,6 +1747,14 @@ class AgentFunction:
 
     def get_cloud_integration_entries(self) -> list[IntegrationEntry]:
         return []
+
+    def get_cloud_integration_triggers(self) -> dict[str, list[IntegrationTrigger]]:
+        """Triggers cloud adds to entries it does not define, keyed by entry id."""
+        return {}
+
+    def integration_setup_path(self, entry: IntegrationEntry) -> str | None:
+        """App path Copilot links for setting up this catalog entry, or None to link no page."""
+        return None
 
     async def get_cloud_integration_accounts(self, organization_id: str, user_id: str | None = None) -> AccountsById:
         return {}
@@ -1940,6 +2080,11 @@ class AgentFunction:
     def copilot_browser_pattern_accepting_calls(self) -> tuple[str, ...]:
         return ()
 
+    async def agent_skills(
+        self, *, organization_id: str, workflow_permanent_id: str | None, agent: str
+    ) -> list[AvailableSkill]:
+        return []
+
     async def open_copilot_browser_code_session(
         self,
         *,
@@ -1963,8 +2108,23 @@ class AgentFunction:
         del organization_id
         return CopilotOrganizationUsage(credits_note="This deployment does not track billing.")
 
-    async def create_copilot_webhook_trigger(
-        self, *, organization_id: str, workflow_permanent_id: str, mapping: dict[str, str]
+    async def copilot_run_stop_rule(self, *, organization_id: str) -> str | None:
+        """The billing check that stops this organization's runs, in one sentence; None when it cannot be stated."""
+        del organization_id
+        return None
+
+    def copilot_trigger_sources(self) -> list[CopilotTriggerSource]:
+        return []
+
+    async def create_copilot_trigger(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        source_kind: str,
+        settings: dict[str, JsonValue],
+        mapping: TriggerMapping,
+        enabled: bool,
     ) -> CopilotTriggerResult:
         return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
 
@@ -1973,8 +2133,9 @@ class AgentFunction:
         *,
         organization_id: str,
         workflow_permanent_id: str,
-        mapping: dict[str, str],
-        payload: dict[str, JsonValue],
+        source_kind: str,
+        mapping: TriggerMapping,
+        payload: dict[str, JsonValue] | None,
     ) -> CopilotTriggerResult:
         return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
 
@@ -2005,12 +2166,8 @@ class AgentFunction:
 
     def allow_copilot_inline_code_execution(self) -> bool:
         """Whether a copilot block test run may execute in the API process when sandbox dispatch is
-        unavailable. Developer checkouts only."""
-        # ENV alone cannot carry this: self-hosted Docker and Kubernetes are documented with
-        # ENV=local, so a packaged deployment would look identical to a laptop.
-        if settings.is_cloud_environment() or running_in_packaged_deployment():
-            return False
-        return settings.COPILOT_ALLOW_INLINE_CODE_EXECUTION
+        unavailable. Open source has no sandbox and already runs every workflow in the API process."""
+        return True
 
     async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:
         """OSS always-on; cloud overrides to gate per-org for staged rollout."""
@@ -2258,6 +2415,11 @@ class AgentFunction:
     def on_browser_run_released(self, browser_context: BrowserContext | BrowserArtifacts | None) -> None:
         """A run released a browser that no other run shares. OSS no-op."""
 
+    def set_browser_run_http_cache(
+        self, browser_context: BrowserContext, generation: str | None, *, fresh_run: bool = False
+    ) -> None:
+        """Start a fresh run-scoped static response store on this context, or turn it off with None. OSS no-op."""
+
     def on_browser_context_retired(self, browser_context: BrowserContext) -> None:
         """A replacement took over from this context, which no run uses again; it may never emit close. OSS no-op."""
 
@@ -2467,6 +2629,23 @@ class AgentFunction:
     async def post_step_execution(self, task: Task, step: Step) -> None:
         if step.status == StepStatus.completed:
             await self._maybe_close_magic_link_page(task)
+
+    async def bind_page_reload_owner(self, *, task: Task, browser_state: BrowserState) -> None:
+        """Bind `task` to its browser, so a page-level handler finishing later raises the reload signal only for
+        the task and page document that sent its request."""
+        return None
+
+    async def settle_page_reload_signal(
+        self, *, task: Task, raise_signal: bool = True, accept: bool = False
+    ) -> bool | None:
+        """None means ordinary recovery; False withholds a private request; True prepares its checked executor."""
+        return None
+
+    async def page_submission_evidence(self, *, task: Task) -> str | None:
+        return None
+
+    async def release_page_reload_owner(self, *, task: Task) -> None:
+        return None
 
     async def gate_step_completion(
         self,
@@ -3378,6 +3557,39 @@ class AgentFunction:
                 timeout=httpx.Timeout(timeout_seconds),
             )
 
+    async def relay_http_request_hop(
+        self,
+        *,
+        organization_id: str | None = None,
+        method: str,
+        target_url: str,
+        headers: dict[str, str] | None = None,
+        data: Any | None = None,
+        json_data: dict[str, Any] | None = None,
+        files: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        timeout_seconds: float,
+        response_limit_bytes: int,
+        resolved_ips: Callable[[], tuple[str, ...]],
+    ) -> GuardedHTTPHopResponse | None:
+        """Relay one validated HTTP hop in Cloud; OSS keeps its guarded direct transport."""
+        return None
+
+    @asynccontextmanager
+    async def relay_http_download_hop(
+        self,
+        *,
+        organization_id: str | None = None,
+        target_url: str,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        timeout_seconds: float,
+        response_limit_bytes: int,
+        resolved_ips: Callable[[], tuple[str, ...]],
+    ) -> AsyncIterator[GuardedHTTPHopStream | None]:
+        """Stream one validated download hop in Cloud; OSS keeps its guarded direct transport."""
+        yield None
+
     async def post_totp_verification_request(
         self,
         url: str,
@@ -3526,7 +3738,7 @@ class AgentFunction:
         """The mode for a turn whose request states none: False is agent blocks only, None lets the model
         choose per step, True is code blocks only."""
         del organization_id
-        return None if settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE else False
+        return None if settings.EMBER_CODE_BLOCK_MODE else False
 
     async def agent_step_enabled(self, organization_id: str | None) -> bool:
         del organization_id

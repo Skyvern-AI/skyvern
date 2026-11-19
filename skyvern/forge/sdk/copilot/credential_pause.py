@@ -64,6 +64,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCredentialRequiredUpdate,
     WorkflowCopilotCredentialSiteQuestion,
     WorkflowCopilotStreamMessageType,
+    credential_recovery_token_is_valid,
 )
 from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.models.credential_release import login_site_url, saved_site_urls
@@ -113,8 +114,8 @@ def _credential_pause_record_ttl(timeout_seconds: int) -> timedelta:
 def longest_credential_pause_seconds() -> int:
     """A sign-in can start as the card's wait expires and then hold a Done claim, so all three add up."""
     return (
-        settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
-        + settings.WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS
+        settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
+        + settings.EMBER_MANUAL_SIGN_IN_TIMEOUT_SECONDS
         + MANUAL_SIGN_IN_CLAIM_SECONDS
     )
 
@@ -401,13 +402,7 @@ def _validate_pending_pause(record: _ActivePauseRecord | None, resume_token: str
 
 def credential_recovery_token_digest(token: str | None) -> str | None:
     """Hash a 32-byte browser capability without retaining the bearer value."""
-    if not isinstance(token, str) or len(token) != 64:
-        return None
-    try:
-        decoded = bytes.fromhex(token)
-    except ValueError:
-        return None
-    if len(decoded) != 32:
+    if not isinstance(token, str) or not credential_recovery_token_is_valid(token):
         return None
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -547,7 +542,7 @@ async def resolve_credential_pause(
         if declined_site:
             question = _bound_site_question(record, credential_id)
             site_answer = _site_answer("no", record, question)
-        ttl = _credential_pause_record_ttl(settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
+        ttl = _credential_pause_record_ttl(settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
         await cache.set(
             active_key,
             _encode_active_pause(
@@ -889,7 +884,7 @@ async def start_manual_sign_in(
             return record.expires_at
         record = _extend_pause(
             replace(record, manual_sign_in=replace(sign_in, started=True)),
-            settings.WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS,
+            settings.EMBER_MANUAL_SIGN_IN_TIMEOUT_SECONDS,
             signing_in=True,
         )
         await cache.set(active_key, _encode_record(record), ex=_longest_credential_pause_record_ttl())
@@ -1034,7 +1029,7 @@ async def finish_credential_generation(
             registration = claim.registration.model_copy(update={"outcome": outcome})
             reopened = _extend_pause(
                 replace(record, status="pending", claim_id=None, claim_deadline=None, registration=registration),
-                settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS,
+                settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS,
             )
             await cache.set(active_key, _encode_record(reopened), ex=ttl)
             return reopened.expires_at

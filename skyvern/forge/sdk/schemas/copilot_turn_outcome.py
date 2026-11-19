@@ -38,16 +38,6 @@ class ConnectedAccountChoice(BaseModel):
     email_address: str | None = None
 
 
-GoogleSetupScopeProfile = Literal["gmail", "google_sheets"]
-
-
-class GoogleSetupOffer(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    scope_profile: GoogleSetupScopeProfile
-    connection_id: str | None = None
-
-
 class DeliveredOutputFile(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
@@ -128,7 +118,11 @@ class TurnOutcome(BaseModel):
     interrupted_row_final: bool = False
     idempotency_digest: str | None = None
     connected_account_choices: list[ConnectedAccountChoice] | None = None
-    google_setup_offers: list[GoogleSetupOffer] | None = None
+    # The stored proposal a Test end-to-end turn left when it offered these choices. A pick refuses if this token
+    # changed and becomes a plain turn if a run was bound since.
+    test_proposal_owner_turn_id: str | None = None
+    test_proposal_revision: int | None = None
+    test_proposal_workflow_run_id: str | None = None
     output_files: list[DeliveredOutputFile] | None = None
 
     @field_validator("output_policy_reasons", mode="before")

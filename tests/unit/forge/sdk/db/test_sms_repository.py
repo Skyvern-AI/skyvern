@@ -52,7 +52,7 @@ def test_phone_number_unique_violation_uses_driver_constraint_metadata(driver: s
         )
     elif driver == "psycopg":
         original = Exception("duplicate key")
-        original.diag = SimpleNamespace(constraint_name=constraint)  # type: ignore[attr-defined]
+        original.diag = SimpleNamespace(constraint_name=constraint, sqlstate="23505")  # type: ignore[attr-defined]
     else:
         violation = UniqueViolationError("duplicate key")
         violation.constraint_name = constraint

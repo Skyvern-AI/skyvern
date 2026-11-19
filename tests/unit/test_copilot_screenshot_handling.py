@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,8 +14,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from PIL import Image
 
+import skyvern.forge.sdk.copilot.tools as tools_module
+import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import _consume_pending_screenshots
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     COPILOT_SCREENSHOT_MAX_HEIGHT,
     COPILOT_SCREENSHOT_MAX_WIDTH,
@@ -25,9 +30,9 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     enqueue_screenshot,
     enqueue_screenshot_from_result,
+    run_result_screenshot_provenance,
 )
 from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
-from skyvern.forge.sdk.copilot.tools import _run_result_screenshot_provenance
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     NO_PERSISTED_END_URL,
@@ -38,12 +43,20 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _resolve_run_screenshot_b64,
     _summarize_action_trace,
     _update_verification_evidence_from_run_result,
+    hydrate_prior_run_packet,
+    run_results_cursor,
 )
 from skyvern.forge.sdk.copilot.tools.scouting import _capture_post_interaction_screenshot
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.schemas.workflows import BlockType
+from skyvern.services import workflow_service as workflow_service_module
 from tests.unit.copilot_test_helpers import (
     captured_frame_entry,
+    image_parts,
+    install_fresh_run_browser,
     install_get_run_results_harness,
+    install_run_blocks_harness,
     make_copilot_ctx,
     make_model_input_data,
     run_result_block_row,
@@ -227,7 +240,7 @@ class TestEnqueueScreenshot:
 
 
 def test_run_result_screenshot_provenance_reads_nested_run_facts() -> None:
-    provenance = _run_result_screenshot_provenance(
+    provenance = run_result_screenshot_provenance(
         {
             "ok": False,
             "data": {
@@ -596,7 +609,7 @@ class TestSupersededRunResultFrame:
         enqueue_screenshot_from_result(
             ctx,
             result,
-            provenance=_run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
+            provenance=run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
         )
         frame_a = ctx.pending_screenshots[0]
         assert frame_a.provenance.workflow_run_id == run_data.get("workflow_run_id")
@@ -1564,6 +1577,262 @@ class TestAttachFailedBlockScreenshots:
 
         assert "screenshot_b64" not in result
         assert "final_url" not in result
+
+
+_LOOP_BLOCK_RGB = (220, 30, 30)
+_CODE_BLOCK_RGB = (30, 60, 220)
+
+
+def _delivered_frames(ctx: CopilotContext) -> list[tuple[tuple[int, int, int], str]]:
+    model_input = copilot_call_model_input_filter(
+        make_model_input_data([{"role": "user", "content": "Diagnose the run and repair the workflow."}], context=ctx)
+    )
+    frames = []
+    for item in model_input.input:
+        for part in image_parts(item):
+            image = Image.open(io.BytesIO(base64.b64decode(part["image_url"].partition(";base64,")[2])))
+            centre = image.convert("RGB").getpixel((image.width // 2, image.height // 2))
+            frames.append((centre, item["content"][0]["text"]))
+    return frames
+
+
+def _is_colour(pixel: tuple[int, int, int], rgb: tuple[int, int, int]) -> bool:
+    return all(abs(a - b) <= 16 for a, b in zip(pixel, rgb))
+
+
+_LOOP_THEN_CODE_WORKFLOW_YAML = """
+title: multi-step form
+workflow_definition:
+  version: 2
+  parameters:
+  - key: site_credential
+    parameter_type: workflow
+    workflow_parameter_type: credential_id
+    default_value: cred_saved
+  - key: items
+    parameter_type: workflow
+    workflow_parameter_type: json
+    default_value: [1]
+  blocks:
+  - block_type: for_loop
+    label: for_each_item
+    loop_over_parameter_key: items
+    loop_blocks:
+    - block_type: code
+      label: fill_step
+      parameter_keys: [site_credential]
+      code: |
+        await page.click("#next")
+"""
+
+
+def _terminal_row(label: str, block_type: BlockType, minute: int) -> WorkflowRunBlock:
+    return WorkflowRunBlock(
+        label=label,
+        block_type=block_type,
+        status="failed",
+        final_url="https://example.com/form/step-1",
+        failure_reason="Timeout 30000ms exceeded",
+        workflow_run_block_id=f"wrb_{label}",
+        workflow_run_id="wr_paused",
+        organization_id="org-1",
+        created_at=datetime(2026, 4, 21, 12, minute, tzinfo=UTC),
+        modified_at=datetime(2026, 4, 21, 12, minute, tzinfo=UTC),
+    )
+
+
+def _install_frame_per_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    frames = {
+        label: base64.b64decode(_png_b64(rgb))
+        for label, rgb in (("wrb_for_each_item", _LOOP_BLOCK_RGB), ("wrb_fill_step", _CODE_BLOCK_RGB))
+    }
+
+    async def artifact_for_row(**kwargs: Any) -> str:
+        return kwargs["workflow_run_block_id"]
+
+    async def frame_bytes(artifact: str) -> bytes:
+        return frames[artifact]
+
+    app = run_execution_module.app
+    monkeypatch.setattr(
+        app.DATABASE,
+        "artifacts",
+        SimpleNamespace(
+            get_artifact_by_entity_id=artifact_for_row, get_artifacts_for_task_v2=AsyncMock(return_value=[])
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", SimpleNamespace(retrieve_artifact=frame_bytes), raising=False)
+
+
+class TestFailedRunFrameReachesTheModel:
+    """A failed loop block and then a failed code block, each with its own at-failure frame, in a
+    workflow that takes a credential. The model must see the code block's frame, the one the run stopped on."""
+
+    @staticmethod
+    def _install_failed_run(monkeypatch: pytest.MonkeyPatch, *, run_status: str = "failed") -> CopilotContext:
+        loop_row = run_result_block_row("for_each_item", "failed", "https://example.com/items")
+        loop_row.block_type = SimpleNamespace(name="for_loop")
+        code_row = run_result_block_row(
+            "fill_step", "failed", "https://example.com/form/step-1", failure_reason="Timeout 30000ms"
+        )
+        for minute, row in enumerate((loop_row, code_row)):
+            row.created_at = datetime(2026, 9, 1, 12, minute, tzinfo=UTC)
+            row.parent_workflow_run_block_id = None
+            row.current_index = None
+            row.current_value = None
+        install_get_run_results_harness(
+            monkeypatch,
+            blocks=[code_row, loop_row],
+            run_status=run_status,
+            workflow_parameters=[{"parameter_type": "credential", "key": "site_credential"}],
+            attach_failed_block_screenshots=run_execution_module._attach_failed_block_screenshots,
+        )
+        _install_frame_per_row(monkeypatch)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args: None)
+        return make_copilot_ctx(workflow_permanent_id="wpid-1")
+
+    @staticmethod
+    async def _get_run_results(ctx: CopilotContext, **arguments: Any) -> dict[str, Any]:
+        raw = await tools_module.get_run_results_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="get_run_results"),
+            json.dumps({"workflow_run_id": "wr-1", **arguments}),
+        )
+        return json.loads(raw)
+
+    @pytest.mark.parametrize("path", ["hydrate_prior_run_packet", "get_run_results"])
+    @pytest.mark.asyncio
+    async def test_first_model_call_carries_the_failed_code_blocks_frame(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        ctx = self._install_failed_run(monkeypatch)
+
+        if path == "hydrate_prior_run_packet":
+            assert await hydrate_prior_run_packet(ctx, workflow_run_id="wr-1", queue_failure_frame=True) is not None
+        else:
+            assert (await self._get_run_results(ctx))["ok"] is True
+
+        frames = _delivered_frames(ctx)
+        assert len(frames) == 1
+        pixel, provenance = frames[0]
+        assert _is_colour(pixel, _CODE_BLOCK_RGB), pixel
+        assert "source_tool=get_run_results" in provenance
+        assert "workflow_run_id=wr-1" in provenance
+        assert "captured_url=unavailable" in provenance
+
+    @pytest.mark.asyncio
+    async def test_an_end_to_end_test_turn_on_a_failed_dispatched_run_carries_the_code_blocks_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = await install_run_blocks_harness(
+            monkeypatch,
+            workflow_yaml=_LOOP_THEN_CODE_WORKFLOW_YAML,
+            polled_status="failed",
+            dispatch_to_worker=True,
+            terminal_blocks=[
+                _terminal_row("fill_step", BlockType.CODE, minute=6),
+                _terminal_row("for_each_item", BlockType.FOR_LOOP, minute=5),
+            ],
+        )
+        _install_frame_per_row(monkeypatch)
+        forge_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=harness["workflow"])
+        forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock()
+        monkeypatch.setattr(run_execution_module, "_credential_ids_validation_error", AsyncMock(return_value=None))
+        install_fresh_run_browser(monkeypatch, "pbs_run")
+        workflow_service_module.prepare_workflow.return_value.browser_session_id = "pbs_run"
+        ctx = make_copilot_ctx(
+            browser_session_id="pbs_chat",
+            workflow_copilot_chat_id="chat-1",
+            request_policy=RequestPolicy(persisted_workflow_credential_ids=["cred_saved"]),
+        )
+        ctx.stream.is_disconnected = AsyncMock(return_value=True)
+
+        await agent_module._run_end_to_end_test_turn(ctx, workflow_yaml=_LOOP_THEN_CODE_WORKFLOW_YAML)
+
+        frames = _delivered_frames(ctx)
+        assert len(frames) == 1
+        pixel, provenance = frames[0]
+        assert _is_colour(pixel, _CODE_BLOCK_RGB), pixel
+        assert "source_tool=run_blocks_and_collect_debug" in provenance
+        assert "workflow_run_id=wr_paused" in provenance
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            pytest.param({"block_cursor": run_results_cursor("wr-1", 1)}, id="cursor_page"),
+            pytest.param({"row_keys": ["wrb_fill_step"]}, id="row_keys"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_later_page_leaves_the_queued_frame_alone(
+        self, monkeypatch: pytest.MonkeyPatch, arguments: dict[str, Any]
+    ) -> None:
+        ctx = self._install_failed_run(monkeypatch)
+        queued = captured_frame_entry()
+        ctx.pending_screenshots.append(queued)
+
+        assert (await self._get_run_results(ctx, **arguments))["ok"] is True
+
+        assert ctx.pending_screenshots == [queued]
+
+    @pytest.mark.asyncio
+    async def test_a_frame_queued_while_the_run_is_read_is_kept(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = self._install_failed_run(monkeypatch)
+        real_lookup = tools_module._get_run_results
+        queued: list[ScreenshotEntry] = []
+
+        async def lookup_with_concurrent_capture(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            queued.append(captured_frame_entry())
+            ctx.pending_screenshots[:] = queued
+            return await real_lookup(*args, **kwargs)
+
+        monkeypatch.setattr(tools_module, "_get_run_results", lookup_with_concurrent_capture)
+
+        assert (await self._get_run_results(ctx))["ok"] is True
+
+        assert ctx.pending_screenshots == queued
+
+    @pytest.mark.asyncio
+    async def test_a_model_without_vision_gets_no_image(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = self._install_failed_run(monkeypatch)
+        await hydrate_prior_run_packet(ctx, workflow_run_id="wr-1", queue_failure_frame=True)
+        assert len(ctx.pending_screenshots) == 1
+
+        ctx.supports_vision = False
+
+        assert _delivered_frames(ctx) == []
+
+    @pytest.mark.asyncio
+    async def test_hydrating_an_unseen_test_run_queues_no_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = self._install_failed_run(monkeypatch)
+
+        assert await hydrate_prior_run_packet(ctx, workflow_run_id="wr-1") is not None
+
+        assert ctx.pending_screenshots == []
+
+    @pytest.mark.asyncio
+    async def test_a_frame_that_cannot_be_queued_keeps_the_text_packet(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = self._install_failed_run(monkeypatch)
+        monkeypatch.setattr(
+            run_execution_module, "enqueue_screenshot_from_result", MagicMock(side_effect=RuntimeError("queue"))
+        )
+
+        assert await hydrate_prior_run_packet(ctx, workflow_run_id="wr-1", queue_failure_frame=True) is not None
+
+    @pytest.mark.parametrize("run_status", ["completed", "running"])
+    @pytest.mark.parametrize("path", ["hydrate_prior_run_packet", "get_run_results"])
+    @pytest.mark.asyncio
+    async def test_a_run_that_has_not_failed_promotes_no_failure_frame(
+        self, monkeypatch: pytest.MonkeyPatch, path: str, run_status: str
+    ) -> None:
+        ctx = self._install_failed_run(monkeypatch, run_status=run_status)
+
+        if path == "hydrate_prior_run_packet":
+            await hydrate_prior_run_packet(ctx, workflow_run_id="wr-1", queue_failure_frame=True)
+        else:
+            assert (await self._get_run_results(ctx))["ok"] is True
+
+        assert ctx.pending_screenshots == []
 
 
 class TestRunScreenshotResolution:

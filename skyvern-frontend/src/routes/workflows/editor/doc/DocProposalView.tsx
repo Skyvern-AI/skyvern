@@ -14,17 +14,17 @@ import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import type { WorkflowVersion } from "../../hooks/useWorkflowVersionsQuery";
 import { queryClient } from "@/api/QueryClient";
 import { Button } from "@/components/ui/button";
-import { humanizeBlockLabel } from "../../copilot/blockLabel";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { humanizeBlockLabel } from "../../ember/blockLabel";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
-import { ACCEPT_BUTTON_CLASS } from "../../copilot/cards/cardLayout";
+import { ACCEPT_BUTTON_CLASS } from "../../ember/cards/cardLayout";
 import {
   DuplicateWriteRows,
   ReviewCoverageBadge,
   humanizedList,
   reviewCoverageTag,
-} from "../../copilot/cards/ReviewEvidence";
+} from "../../ember/cards/ReviewEvidence";
 import type { WorkflowBlock } from "../../types/workflowTypes";
 import { apiWorkflowToSettings } from "../apiWorkflowToSettings";
 import { getInitialParameters } from "../utils";
@@ -48,12 +48,13 @@ import {
   type DocRemovedStep,
 } from "./docProposal";
 import { DocText } from "./DocText";
+import type { DocGoToDetails } from "./WorkflowDocActionsContext";
 
 const DocProposalContext = createContext<DocProposal | null>(null);
 
 export const DocProposalProvider = DocProposalContext.Provider;
 
-// A step Copilot added and the user has not accepted yet: its tag is drawn dashed.
+// A step Ember added and the user has not accepted yet: its tag is drawn dashed.
 // eslint-disable-next-line react-refresh/only-export-components
 export function useDocStepPending(node: AppNode | undefined): boolean {
   const proposal = useContext(DocProposalContext);
@@ -65,14 +66,36 @@ export function useDocStepPending(node: AppNode | undefined): boolean {
   );
 }
 
-// The pending Copilot proposal for this workflow, rendered from what Accept would save.
+/** The saved keys a proposal changes on this step; empty unless it is marked Changed. */
+// eslint-disable-next-line react-refresh/only-export-components
+export function useDocStepChangedKeys(node: AppNode): string[] {
+  const proposal = useContext(DocProposalContext);
+  if (!proposal || !isWorkflowBlockNode(node)) return [];
+  const label = node.data.label;
+  return proposal.marks.get(label) === "changed"
+    ? (proposal.changedKeys?.get(label) ?? [])
+    : [];
+}
+
+/** Whether the pending proposal adds this step. */
+// eslint-disable-next-line react-refresh/only-export-components
+export function useDocStepAdded(node: AppNode): boolean {
+  const proposal = useContext(DocProposalContext);
+  return (
+    Boolean(proposal) &&
+    isWorkflowBlockNode(node) &&
+    proposal!.marks.get(node.data.label) === "added"
+  );
+}
+
+// The pending Ember proposal for this workflow, rendered from what Accept would save.
 // eslint-disable-next-line react-refresh/only-export-components
 export function useDocProposal(
   workflowId: string | null,
   liveNodes: AppNode[],
   liveEdges: Edge[],
 ): DocProposal | null {
-  const pending = useCopilotProposalStore((s) => s.proposal);
+  const pending = useEmberProposalStore((s) => s.proposal);
   const credentialGetter = useCredentialGetter();
   const orgId = useActiveOrgId();
   const getSaveData = useWorkflowHasChangesStore((s) => s.getSaveData);
@@ -198,9 +221,9 @@ export function DocProposalCard({
   goTo,
 }: {
   proposal: DocProposal;
-  goTo: (nodeId: string) => void;
+  goTo: (nodeId: string, details?: DocGoToDetails) => void;
 }) {
-  const pending = useCopilotProposalStore((s) => s.proposal);
+  const pending = useEmberProposalStore((s) => s.proposal);
   const [open, setOpen] = useState(false);
   const [deciding, setDeciding] = useState(false);
   const idByLabel = new Map(
@@ -330,7 +353,7 @@ export function DocProposalCard({
             <button
               key={label}
               type="button"
-              onClick={() => goTo(idByLabel.get(label)!)}
+              onClick={() => goTo(idByLabel.get(label)!, "proposal")}
               className="flex min-w-0 items-center gap-2 rounded text-left outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
             >
               <MarkChip mark={mark} />

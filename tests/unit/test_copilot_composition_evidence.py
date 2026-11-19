@@ -3427,7 +3427,7 @@ def test_clickable_controls_with_shared_class_fall_back_to_text_only() -> None:
 
 
 def test_clickable_controls_key_absent_when_channel_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED", False)
+    monkeypatch.setattr(settings, "EMBER_CLICKABLE_CONTROLS_EVIDENCE_ENABLED", False)
     parsed = parse_composition_html(
         _STANDALONE_CONTROLS_HTML,
         inspected_url=_STANDALONE_CONTROLS_URL,
@@ -3438,7 +3438,7 @@ def test_clickable_controls_key_absent_when_channel_disabled(monkeypatch: pytest
 
 
 def test_structured_clickable_controls_key_absent_when_channel_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED", False)
+    monkeypatch.setattr(settings, "EMBER_CLICKABLE_CONTROLS_EVIDENCE_ENABLED", False)
     parsed = parse_composition_structured(
         {"page_title": "Account", "clickable_controls": [{"selector": "#biz-tile", "text": "Business"}]},
         inspected_url=_STANDALONE_CONTROLS_URL,

@@ -3,6 +3,7 @@
 export const ActionType = {
     Click: "click",
     InputText: "input_text",
+    PasteText: "paste_text",
     UploadFile: "upload_file",
     DownloadFile: "download_file",
     SelectOption: "select_option",

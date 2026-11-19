@@ -50,6 +50,10 @@ class RunsListSearchCanceled(Exception):
         self.statement_timeout_seconds = statement_timeout_seconds
 
 
+class CopilotTurnRunningError(Exception):
+    """Another live turn holds the chat, and the new turn asked not to stop it."""
+
+
 class DuplicateCopilotTurnError(Exception):
     def __init__(self, turn_id: str) -> None:
         super().__init__(f"Copilot turn {turn_id} already owns this idempotency key")
@@ -65,6 +69,7 @@ CopilotProposalConflictReason = Literal[
     "content_changed",
     "claim_changed",
     "disposition_changed",
+    "run_bound",
 ]
 
 

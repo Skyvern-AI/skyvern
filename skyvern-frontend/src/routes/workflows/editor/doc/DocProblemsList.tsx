@@ -5,11 +5,17 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { cn } from "@/util/utils";
-import { isWorkflowBlockNode, type AppNode } from "../nodes";
-import { workflowBlockTitle } from "../nodes/types";
+import { type AppNode } from "../nodes";
 import { docProblemsTitle, type DocProblemEntry } from "./docProblems";
-import { DOC_SHOW_PROBLEMS_EVENT, docStepLine } from "./docKeys";
-import { docBlockType, docStepCaption, docStepTitle } from "./docStepRegistry";
+import {
+  DOC_SHOW_PROBLEMS_EVENT,
+  type DocReturnPoint,
+  type DocShowProblemsDetail,
+  captureReturnPoint,
+  resolveReturnPoint,
+} from "./docKeys";
+import { docProblemStep } from "./docProblemStep";
+import { type DocGoToDetails } from "./WorkflowDocActionsContext";
 
 export function DocProblemsList({
   entries,
@@ -18,27 +24,26 @@ export function DocProblemsList({
 }: {
   entries: DocProblemEntry[];
   byId: ReadonlyMap<string, AppNode>;
-  goTo: (id: string) => void;
+  goTo: (id: string, details?: DocGoToDetails) => void;
 }) {
   const [open, setOpen] = useState(false);
   const jumped = useRef(false);
-  const returnFocus = useRef<HTMLElement | null>(null);
-  const returnStepId = useRef<string | null>(null);
+  const returnPoint = useRef<DocReturnPoint | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const titleId = useId();
   useEffect(() => {
     let frame = 0;
-    const show = () => {
+    const show = (event: Event) => {
+      // Where focus was when Run was pressed; the Run dialog has it by now.
+      const detail = (event as CustomEvent<DocShowProblemsDetail | undefined>)
+        .detail;
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
-        // A refused Run can come while the Doc is scrolled down; the popover is anchored to this button.
+        // Run can ask while the Doc is scrolled down; the popover is anchored to this button.
         trigger.current?.scrollIntoView?.({ block: "nearest" });
-        const active = document.activeElement;
-        returnFocus.current = active instanceof HTMLElement ? active : null;
-        returnStepId.current =
-          active
-            ?.closest<HTMLElement>("[data-doc-node-id]")
-            ?.getAttribute("data-doc-node-id") ?? null;
+        returnPoint.current = detail
+          ? detail.returnPoint
+          : captureReturnPoint(document.activeElement);
         setOpen(true);
       });
     };
@@ -58,8 +63,7 @@ export function DocProblemsList({
           data-doc-problems
           onClick={() => {
             // Closing from the button leaves focus on it.
-            returnFocus.current = null;
-            returnStepId.current = null;
+            returnPoint.current = null;
           }}
           className="rounded-md border border-border px-2 py-[2px] text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
         >
@@ -72,23 +76,20 @@ export function DocProblemsList({
         aria-labelledby={titleId}
         className="max-h-[min(420px,var(--radix-popover-content-available-height))] w-[min(380px,calc(100vw-32px))] overflow-y-auto p-2"
         onInteractOutside={() => {
-          returnFocus.current = null;
-          returnStepId.current = null;
+          returnPoint.current = null;
         }}
         onCloseAutoFocus={(event) => {
-          // Escape returns to where focus was when a refused Run opened the list; an entry's jump keeps the step's focus.
+          // Escape returns to where focus was when Run was pressed; an entry's jump keeps the step's focus.
           // A line being typed in blurs when the list takes focus and its edit span is replaced.
-          if (jumped.current || returnFocus.current) event.preventDefault();
-          if (!jumped.current && returnFocus.current) {
-            const target = returnFocus.current.isConnected
-              ? returnFocus.current
-              : (docStepLine(document, returnStepId.current) ??
-                trigger.current);
+          if (jumped.current || returnPoint.current) event.preventDefault();
+          if (!jumped.current && returnPoint.current) {
+            const target =
+              resolveReturnPoint(document, returnPoint.current) ??
+              trigger.current;
             target?.focus({ preventScroll: true });
           }
           jumped.current = false;
-          returnFocus.current = null;
-          returnStepId.current = null;
+          returnPoint.current = null;
         }}
       >
         <p id={titleId} className="px-2 pb-1 pt-0.5 text-[13px] font-medium">
@@ -97,15 +98,14 @@ export function DocProblemsList({
         <ul data-doc-problem-list className="flex flex-col">
           {entries.map((entry) => {
             const node = entry.nodeId ? byId.get(entry.nodeId) : undefined;
-            const blockType =
-              node && isWorkflowBlockNode(node) ? docBlockType(node) : null;
+            const step = node ? docProblemStep(node) : null;
             const body = (
               <>
-                {node && (
+                {step && (
                   <span className="block text-[12.5px] text-muted-foreground">
-                    {blockType ? `${workflowBlockTitle[blockType]} · ` : ""}
+                    {step.type ? `${step.type} · ` : ""}
                     <span className="font-medium text-foreground">
-                      {docStepCaption(node) ?? docStepTitle(node)}
+                      {step.name}
                     </span>
                   </span>
                 )}
@@ -133,7 +133,7 @@ export function DocProblemsList({
                     onClick={() => {
                       jumped.current = true;
                       setOpen(false);
-                      goTo(node.id);
+                      goTo(node.id, entry.inDetails ? "open" : undefined);
                     }}
                   >
                     {body}

@@ -98,3 +98,20 @@ def neutralize_untrusted_web_page_data_sentinels(text: str) -> str:
     for sentinel in _UNTRUSTED_WEB_PAGE_DATA_SENTINELS:
         text = text.replace(sentinel, _NEUTRALIZED_UNTRUSTED_WEB_PAGE_DATA_SENTINEL)
     return text
+
+
+def boundary_delimited_present(needle: str, haystack: str) -> bool:
+    if not needle or not haystack:
+        return False
+    length = len(needle)
+    start = 0
+    while True:
+        idx = haystack.find(needle, start)
+        if idx == -1:
+            return False
+        before_ok = idx == 0 or not haystack[idx - 1].isalnum()
+        after_index = idx + length
+        after_ok = after_index == len(haystack) or not haystack[after_index].isalnum()
+        if before_ok and after_ok:
+            return True
+        start = idx + 1

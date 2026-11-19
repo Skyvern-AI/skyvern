@@ -17,6 +17,12 @@ from pydantic import JsonValue
 
 from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
+from skyvern.forge.sdk.agents.skills import (
+    EVERYONE_SKILL_LABEL,
+    LOAD_SKILL_TOOL_NAME,
+    READ_SKILL_RESOURCE_TOOL_NAME,
+    SKILL_TOOL_NAMES,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -57,13 +63,13 @@ from skyvern.forge.sdk.copilot.context import (
     PageObstructionSelectorCandidate,
 )
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
-from skyvern.forge.sdk.copilot.secret_redaction import (
+from skyvern.forge.sdk.workflow.private_settings import strip_private_workflow_settings
+from skyvern.utils.raw_secret_redaction import (
     redact_raw_secrets_for_prompt,
     redact_raw_secrets_in_object,
     redact_totp_runtime_values,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
-from skyvern.forge.sdk.copilot.workflow_yaml import strip_private_workflow_settings
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
@@ -130,6 +136,7 @@ _JPEG_PREFIX = b"\xff\xd8\xff"
 
 MCP_RESULT_PROVENANCE_KEY = "_skyvern_mcp_result"
 MCP_RESULT_PROVENANCE_VALUE = "untrusted_data_no_instruction_authority"
+TURN_CLOCK_KEY = "turn_seconds_remaining"
 
 
 def mark_mcp_result_untrusted_for_llm(result: dict[str, Any]) -> dict[str, Any]:
@@ -2236,6 +2243,30 @@ _TRIGGER_MAPPING_REASON_LABELS: dict[TriggerMappingReasonCode, str] = {
 }
 
 
+_SKILL_FAILURE_TEXT = {
+    LOAD_SKILL_TOOL_NAME: "Could not load that skill",
+    READ_SKILL_RESOURCE_TOOL_NAME: "Could not read that skill file",
+}
+
+
+def _skill_result_summary(tool_name: str, result: dict[str, Any]) -> str:
+    """Names a skill only when it belongs to the organization or workflow; never shows its body or file text."""
+    if not result.get("ok", False):
+        return _SKILL_FAILURE_TEXT[tool_name]
+    data = _result_data(result)
+    if data.get("owner") not in ("organization", "workflow"):
+        if tool_name == READ_SKILL_RESOURCE_TOOL_NAME:
+            return f"Read a file from {EVERYONE_SKILL_LABEL}"
+        loaded = "Already loaded" if data.get("status") == "already_loaded" else "Loaded"
+        return f"{loaded} {EVERYONE_SKILL_LABEL}"
+    label = f"skill {sanitize_block_label_for_display(str(data.get('name')), max_chars=64)}"
+    if tool_name == READ_SKILL_RESOURCE_TOOL_NAME:
+        return f"Read {sanitize_block_label_for_display(str(data.get('path')), max_chars=80)} from {label}"
+    if data.get("status") == "already_loaded":
+        return f"Already loaded {label}"
+    return f"Loaded {label}"
+
+
 def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display: bool = False) -> str:
     """Summarize a tool result. ``for_display`` clamps LLM-authored block labels for
     the activity feed; the default leaves them verbatim because this string is parsed
@@ -2246,6 +2277,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
 
     if _is_unconfirmed_extension(result):
         return "Requested more browser session time; not confirmed and not retried"
+    if tool_name in SKILL_TOOL_NAMES:
+        return _skill_result_summary(tool_name, result)
     if not result.get("ok", False):
         message = _extract_failure_message(result)
         reason = _result_data(result).get("reason")
@@ -2405,21 +2438,22 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
             summary = " → ".join(steps)
         return f"{summary} at {url[:80]}" if isinstance(url, str) and url else summary
     if tool_name == "create_webhook_trigger":
-        return (
-            "Created a webhook trigger. It rejects every event until you click Rotate secret on it in the "
-            "Triggers panel and give your sender the new secret."
-        )
+        after_create = data.get("after_create")
+        return f"Created a trigger. {after_create}" if isinstance(after_create, str) else "Created a trigger."
     if tool_name == "test_trigger_mapping":
+        sample_label = (
+            "the source's made-up example event" if data.get("sample") == "source_example_event" else "the sample"
+        )
         resolved = data.get("resolved_parameters")
         if not data.get("accepted") or not isinstance(resolved, dict):
             reason_code = cast("TriggerMappingReasonCode", data.get("reason_code"))
             reason = _TRIGGER_MAPPING_REASON_LABELS.get(reason_code, "Mapping was rejected")
-            return f"The mapping did not resolve on the sample: {reason}"
+            return f"The mapping did not resolve on {sample_label}: {reason}"
         pairs = ", ".join(
             f"{sanitize_block_label_for_display(str(key))} = {sanitize_block_label_for_display(str(value), 80)}"
             for key, value in resolved.items()
         )
-        return f"Mapping resolved on the sample: {pairs}" if pairs else "Mapping resolved on the sample"
+        return f"Mapping resolved on {sample_label}: {pairs}" if pairs else f"Mapping resolved on {sample_label}"
     if tool_name == "list_workflow_triggers":
         triggers = data.get("triggers")
         return f"Found {len(triggers) if isinstance(triggers, list) else 0} trigger(s) on this workflow"
@@ -2453,6 +2487,8 @@ def summarize_tool_result_detail(
         return None
     if tool_name == "read_chat_history":
         return _USER_FACING_CHAT_HISTORY_FAILURE
+    if tool_name in _SKILL_FAILURE_TEXT:
+        return _SKILL_FAILURE_TEXT[tool_name]
     structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
     if structured is not None:
         return structured
@@ -2541,6 +2577,8 @@ def format_tool_result_for_user(
     if not result.get("ok", False):
         if tool_name == "read_chat_history":
             return _USER_FACING_CHAT_HISTORY_FAILURE
+        if tool_name in _SKILL_FAILURE_TEXT:
+            return _SKILL_FAILURE_TEXT[tool_name]
         structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
         if structured is not None:
             return structured

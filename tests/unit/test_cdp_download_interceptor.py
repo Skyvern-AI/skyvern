@@ -29,6 +29,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     extract_filename,
     finish_requested_download_for_context,
     is_download_response,
+    unsaved_downloads_since,
 )
 
 
@@ -6887,6 +6888,29 @@ class TestReplayCandidates:
         assert interceptor.replay_candidates() == {}
         tally = interceptor.download_tally()
         assert (tally.saved, tally.unsolicited_failures) == ((1, {}) if accepted else (0, {"capture_failed": 1}))
+
+    @pytest.mark.parametrize(
+        ("lost", "selected", "unsaved"),
+        [(False, False, {}), (True, False, {"capture_failed": 1}), (True, True, {"capture_failed": 1})],
+        ids=["declined", "lost-before-listing", "lost-before-its-selected-save"],
+    )
+    @pytest.mark.asyncio
+    async def test_only_a_candidate_the_model_left_unselected_is_not_an_unsaved_download(
+        self, tmp_path: Path, lost: bool, selected: bool, unsaved: dict[str, int]
+    ) -> None:
+        interceptor = self._interceptor(tmp_path)
+        before = interceptor.download_tally()
+        [handle] = await self._hold(interceptor, self._REPLY)
+        with patch.object(interceptor, "_artifact_scope_is_active", return_value=not lost):
+            if selected:
+                assert interceptor.resolve_replay_candidates(frozenset({handle})) == []
+            elif lost:
+                assert interceptor.replay_candidates() == {}
+            else:
+                interceptor.resolve_replay_candidates(frozenset())
+        tally = interceptor.download_tally()
+        assert tally.unsolicited_failures == {"capture_failed": 1}
+        assert unsaved_downloads_since(before, tally) == unsaved
 
     @pytest.mark.asyncio
     async def test_mixed_candidates_publish_only_the_selected_one(self, tmp_path: Path) -> None:

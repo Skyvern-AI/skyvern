@@ -1,6 +1,6 @@
 import { toast } from "@/components/ui/use-toast";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import type { WorkflowCopilotDemonstrationInsertion } from "@/routes/workflows/copilot/workflowCopilotTypes";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
+import type { EmberDemonstrationInsertion } from "@/routes/workflows/ember/emberTypes";
 
 type InsertionPoint = {
   previous: string | null;
@@ -53,7 +53,7 @@ function blockLabelFor(
 function demonstrationInsertionFromNodes(
   nodes: Array<WorkflowNodeLike>,
   insertionPoint: Pick<InsertionPoint, "previous" | "next" | "parent">,
-): WorkflowCopilotDemonstrationInsertion | null {
+): EmberDemonstrationInsertion | null {
   const insertion = {
     after_label: blockLabelFor(nodes, insertionPoint.previous),
     before_label: blockLabelFor(nodes, insertionPoint.next),
@@ -67,7 +67,7 @@ function demonstrationInsertionFromNodes(
 }
 
 function sopAttachmentDraft(
-  insertion: WorkflowCopilotDemonstrationInsertion | null = null,
+  insertion: EmberDemonstrationInsertion | null = null,
   containerLabel: string | null = null,
 ): string {
   if (insertion?.after_label)
@@ -97,9 +97,9 @@ function stageSopFile(file: File, draft: string) {
     toast(INVALID_SOP_FILE_TOAST);
     return;
   }
-  // Read at pick time: Copilot may have asked a question or started finishing a recording while
+  // Read at pick time: Ember may have asked a question or started finishing a recording while
   // the file picker was open.
-  const stage = useCopilotActionStore.getState().stageAttachment;
+  const stage = useEmberActionStore.getState().stageAttachment;
   if (!stage) {
     toast({
       title: "Copilot can't take a file right now",

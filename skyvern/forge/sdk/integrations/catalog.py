@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable, Collection, Sequence
 from functools import partial
 from typing import Any, Literal
@@ -17,11 +18,24 @@ from skyvern.forge.sdk.schemas.google_oauth import GOOGLE_GMAIL_SEND_SCOPE, Goog
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, microsoft_oauth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.schemas.emails import ORGANIZE_ACTIONS_WITH_LABEL, EmailOrganizeAction
+from skyvern.schemas.workflows import (
+    BlockType,
+    BlockYAML,
+    EmailInboxBlockYAML,
+    FileStorageType,
+    FileUploadBlockYAML,
+    GoogleSheetsReadBlockYAML,
+    GoogleSheetsWriteBlockYAML,
+    PowerBIQueryBlockYAML,
+    SendEmailBlockYAML,
+)
 
 LOG = structlog.get_logger()
 
 IntegrationStatus = Literal["live", "comingSoon"]
-IntegrationKind = Literal["oauth", "credential_form", "external", "internal"]
+# "trigger": the entry only offers triggers, so there is nothing to connect.
+IntegrationKind = Literal["oauth", "credential_form", "external", "internal", "trigger"]
 IntegrationCategory = Literal[
     "Workspace",
     "Communication",
@@ -48,8 +62,40 @@ class IntegrationAccount(BaseModel):
     source: Literal["organization", "instance_default"] | None = None
 
 
+_CATALOG_MODEL_CONFIG = ConfigDict(alias_generator=to_camel, populate_by_name=True, frozen=True)
+
+
+class IntegrationAction(BaseModel):
+    model_config = _CATALOG_MODEL_CONFIG
+
+    id: str
+    name: str
+    description: str
+    inputs: dict[str, Any]
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    # Provider scope strings, compared against IntegrationAccount.scopes_granted.
+    needs: list[str] = Field(default_factory=list)
+    acts: bool = False
+    # "block:<BlockType value>": the existing block that runs the action.
+    runs_via: str
+    agent_step: Literal["tool", "saved_block_only"] = "tool"
+
+
+class IntegrationTrigger(BaseModel):
+    model_config = _CATALOG_MODEL_CONFIG
+
+    id: str
+    name: str
+    description: str
+    source_kind: str
+    settings_schema: dict[str, Any] | None
+    example_event: dict[str, Any]
+    needs: list[str] = Field(default_factory=list)
+    fires_on_its_own: bool
+
+
 class IntegrationEntry(BaseModel):
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, frozen=True)
+    model_config = _CATALOG_MODEL_CONFIG
 
     id: str
     name: str
@@ -70,6 +116,8 @@ class IntegrationEntry(BaseModel):
     to: str | None = None
     # The page groups entries by kind and keeps this order inside each group.
     position: int = Field(exclude=True)
+    actions: list[IntegrationAction] = Field(default_factory=list)
+    triggers: list[IntegrationTrigger] = Field(default_factory=list)
     accounts: list[IntegrationAccount] | None = None
     accounts_unavailable: AccountsUnavailable | None = None
 
@@ -108,6 +156,99 @@ def copilot_payload(entry: IntegrationEntry) -> dict[str, Any]:
     return data
 
 
+def entry_action(
+    entries: Sequence[IntegrationEntry], integration_id: str, action_id: str
+) -> tuple[IntegrationEntry, IntegrationAction] | None:
+    for entry in entries:
+        if entry.id == integration_id:
+            for action in entry.actions:
+                if action.id == action_id:
+                    return entry, action
+    return None
+
+
+def block_inputs(yaml_class: type[BlockYAML], fields: Sequence[str], **fixed: str) -> dict[str, Any]:
+    """JSON schema of the block fields a user fills; each fixed field is pinned with const."""
+    schema = yaml_class.model_json_schema()
+    properties: dict[str, Any] = {name: schema["properties"][name] for name in fields}
+    properties |= {name: {"const": value, "default": value} for name, value in fixed.items()}
+    inputs: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "required": [name for name in fields if name in schema.get("required", [])],
+    }
+    # Only the definitions a kept field reaches; pydantic always serializes refs as "#/$defs/<name>".
+    defs = schema.get("$defs", {})
+    used: dict[str, Any] = {}
+    reached = json.dumps(properties)
+    while names := [name for name in defs if name not in used and f'"#/$defs/{name}"' in reached]:
+        used |= {name: defs[name] for name in names}
+        reached = json.dumps([defs[name] for name in names])
+    if used:
+        inputs["$defs"] = used
+    return inputs
+
+
+def _block(block_type: BlockType) -> str:
+    return f"block:{block_type.value}"
+
+
+_EMAIL_INBOX_FIELDS = (
+    "folder",
+    "prompt",
+    "sender",
+    "subject",
+    "newer_than_days",
+    "max_results",
+    "include_body",
+    "download_attachments",
+)
+
+
+def _read_inbox_action(email_client: str, needs: list[str]) -> IntegrationAction:
+    return IntegrationAction(
+        id="read_inbox",
+        name="Read inbox",
+        description="Find emails by sender, subject or age and read them, optionally with attachments.",
+        inputs=block_inputs(EmailInboxBlockYAML, _EMAIL_INBOX_FIELDS, email_client=email_client),
+        needs=needs,
+        runs_via=_block(BlockType.EMAIL_INBOX),
+    )
+
+
+_ORGANIZE_FIELDS = ("folder", "prompt", "sender", "subject", "newer_than_days", "max_results")
+
+
+def _organize_action(action_id: str, action: EmailOrganizeAction, name: str, description: str) -> IntegrationAction:
+    fields = (*_ORGANIZE_FIELDS, "organize_label") if action in ORGANIZE_ACTIONS_WITH_LABEL else _ORGANIZE_FIELDS
+    inputs = block_inputs(
+        EmailInboxBlockYAML,
+        fields,
+        email_client="gmail",
+        credential_source="nango",
+        organize_action=action.value,
+    )
+    if action in ORGANIZE_ACTIONS_WITH_LABEL:
+        label = inputs["properties"]["organize_label"]
+        inputs["properties"]["organize_label"] = {
+            **label["anyOf"][0],
+            "title": label["title"],
+            "description": label["description"],
+            "pattern": r"\S",
+        }
+        inputs["required"].append("organize_label")
+    return IntegrationAction(
+        id=action_id,
+        name=name,
+        description=f"{description} Works only with a Connected Gmail account.",
+        inputs=inputs,
+        acts=True,
+        runs_via=_block(BlockType.EMAIL_INBOX),
+        # Connected accounts report no scopes, so needs stays empty; a saved block is what the run capability binds.
+        agent_step="saved_block_only",
+    )
+
+
 def listed_oauth_accounts(integrations: Sequence[Any]) -> list[dict[str, Any]]:
     # Older captures listed the accounts themselves as rows; current results nest them per entry.
     rows: list[dict[str, Any]] = []
@@ -144,6 +285,38 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         required_scopes=list(google_oauth_service.GOOGLE_SHEETS_SCOPES),
         capability_scopes=[google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE],
         position=0,
+        actions=[
+            IntegrationAction(
+                id="read_rows",
+                name="Read rows",
+                description="Read rows from a sheet, keyed by the header row when there is one.",
+                inputs=block_inputs(
+                    GoogleSheetsReadBlockYAML, ("spreadsheet_url", "sheet_name", "range", "has_header_row")
+                ),
+                needs=[google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE],
+                runs_via=_block(BlockType.GOOGLE_SHEETS_READ),
+            ),
+            IntegrationAction(
+                id="write_rows",
+                name="Write rows",
+                description="Append rows to a sheet or update a range.",
+                inputs=block_inputs(
+                    GoogleSheetsWriteBlockYAML,
+                    (
+                        "spreadsheet_url",
+                        "sheet_name",
+                        "range",
+                        "write_mode",
+                        "values",
+                        "column_mapping",
+                        "create_sheet_if_missing",
+                    ),
+                ),
+                needs=[google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE],
+                acts=True,
+                runs_via=_block(BlockType.GOOGLE_SHEETS_WRITE),
+            ),
+        ],
     ),
     IntegrationEntry(
         id=_GOOGLE_GMAIL_ENTRY_ID,
@@ -170,6 +343,55 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         oauth_scope_profile="gmail",
         required_scopes=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
         position=1,
+        actions=[
+            _read_inbox_action("gmail", [google_oauth_service.GOOGLE_GMAIL_READONLY_SCOPE]),
+            IntegrationAction(
+                id="send_email",
+                name="Send email",
+                description="Send an email, or reply in a thread, from the connected Gmail account.",
+                inputs=block_inputs(
+                    SendEmailBlockYAML,
+                    (
+                        "recipients",
+                        "subject",
+                        "body",
+                        "body_format",
+                        "file_attachments",
+                        "cc",
+                        "bcc",
+                        "reply_to_message_id",
+                    ),
+                    transport="gmail",
+                ),
+                needs=[GOOGLE_GMAIL_SEND_SCOPE],
+                acts=True,
+                runs_via=_block(BlockType.SEND_EMAIL),
+            ),
+            _organize_action(
+                "label_email",
+                EmailOrganizeAction.LABEL,
+                "Label email",
+                "Find emails by sender, subject or age and add an existing label to each.",
+            ),
+            _organize_action(
+                "archive_email",
+                EmailOrganizeAction.ARCHIVE,
+                "Archive email",
+                "Find emails by sender, subject or age and archive each.",
+            ),
+            _organize_action(
+                "move_email",
+                EmailOrganizeAction.MOVE,
+                "Move email",
+                "Find emails by sender, subject or age and move each from its folder to an existing label.",
+            ),
+            _organize_action(
+                "mark_email_read",
+                EmailOrganizeAction.MARK_READ,
+                "Mark email read",
+                "Find emails by sender, subject or age and mark each read.",
+            ),
+        ],
     ),
     IntegrationEntry(
         id="outlook",
@@ -184,6 +406,7 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         oauth_scope_profile=microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_OUTLOOK_MAIL,
         required_scopes=["Mail.Read"],
         position=2,
+        actions=[_read_inbox_action("outlook", ["Mail.Read"])],
     ),
     IntegrationEntry(
         id="twilio",
@@ -213,6 +436,21 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         oauth_scope_profile="google_drive",
         required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
         position=6,
+        actions=[
+            IntegrationAction(
+                id="upload_files",
+                name="Upload files",
+                description="Upload this run's downloaded files to a Google Drive folder.",
+                inputs=block_inputs(
+                    FileUploadBlockYAML,
+                    ("google_drive_folder_id", "prompt", "path"),
+                    storage_type=FileStorageType.GOOGLE_DRIVE.value,
+                ),
+                needs=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+                acts=True,
+                runs_via=_block(BlockType.FILE_UPLOAD),
+            ),
+        ],
     ),
     IntegrationEntry(
         id="mcp",
@@ -287,6 +525,16 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         oauth_scope_profile=microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ,
         required_scopes=["Dataset.Read.All"],
         position=17,
+        actions=[
+            IntegrationAction(
+                id="query",
+                name="Run DAX query",
+                description="Run one read-only DAX query against a Power BI dataset.",
+                inputs=block_inputs(PowerBIQueryBlockYAML, ("dataset_id", "query", "max_rows")),
+                runs_via=_block(BlockType.POWERBI_QUERY),
+                agent_step="saved_block_only",
+            ),
+        ],
     ),
     IntegrationEntry(
         id="email_forwarding",
@@ -346,6 +594,14 @@ def google_entry_ids_for_credential(
 
 def _entries_for_provider(provider: OAuthProvider) -> list[IntegrationEntry]:
     return [entry for entry in SKYVERN_INTEGRATIONS if entry.status == "live" and entry.oauth_provider == provider]
+
+
+def has_native_gmail_credential(credentials: Sequence[GoogleOAuthCredentialBase]) -> bool:
+    """Whether any credential sits under the Gmail entry, by the same placement the page and Copilot use."""
+    entries = _entries_for_provider("google")
+    return any(
+        _GOOGLE_GMAIL_ENTRY_ID in google_entry_ids_for_credential(credential, entries) for credential in credentials
+    )
 
 
 async def _google_accounts(organization_id: str) -> AccountsById:
@@ -444,11 +700,21 @@ def with_accounts(
 
 
 def integration_entries(
-    email_forwarding_available: bool = True, powerbi_available: bool = False, gmail_available: bool = False
+    email_forwarding_available: bool = True,
+    powerbi_available: bool = False,
+    gmail_available: bool = False,
+    hidden_ids: frozenset[str] = frozenset(),
 ) -> list[IntegrationEntry]:
-    entries = [*SKYVERN_INTEGRATIONS, *app.AGENT_FUNCTION.get_cloud_integration_entries()]
+    added_triggers = app.AGENT_FUNCTION.get_cloud_integration_triggers()
+    entries = [
+        entry.model_copy(update={"triggers": [*entry.triggers, *added_triggers[entry.id]]})
+        if entry.id in added_triggers
+        else entry
+        for entry in [*SKYVERN_INTEGRATIONS, *app.AGENT_FUNCTION.get_cloud_integration_entries()]
+    ]
     if not email_forwarding_available:
-        entries = [entry for entry in entries if entry.id != "email_forwarding"]
+        hidden_ids = hidden_ids | {"email_forwarding"}
+    entries = [entry for entry in entries if entry.id not in hidden_ids]
     if gmail_available:
         entries = [
             entry.model_copy(update={"additional_credential_backends": ["nango"]})
@@ -473,6 +739,11 @@ def integration_entries(
             for entry in entries
         ]
     return sorted(entries, key=lambda entry: entry.position)
+
+
+def all_integration_entries() -> list[IntegrationEntry]:
+    """Every entry with every backend it can have, for lookups that must not depend on an org's availability gates."""
+    return integration_entries(powerbi_available=True, gmail_available=True)
 
 
 async def integration_entries_for_org(organization_id: str) -> list[IntegrationEntry]:
@@ -508,11 +779,15 @@ async def integration_entries_for_org(organization_id: str) -> list[IntegrationE
         gmail_available = await app.AGENT_FUNCTION.nango_gmail_catalog_available(organization_id)
     except Exception:  # noqa: BLE001 - availability failures leave Gmail dark.
         gmail_available = False
-    return integration_entries(
+    entries = integration_entries(
         email_forwarding_available=email_forwarding_available,
         powerbi_available=powerbi_available,
         gmail_available=gmail_available,
+        hidden_ids=await app.AGENT_FUNCTION.hidden_integration_ids(organization_id),
     )
+    # Neither the page nor Copilot's integration list has a use for an entry with nothing to connect yet;
+    # Copilot reads every trigger through its trigger tools.
+    return [entry for entry in entries if entry.kind != "trigger"]
 
 
 def integration_is_live(integration_id: str) -> bool:

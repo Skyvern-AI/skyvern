@@ -68,7 +68,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     screened_recorded_url,
 )
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
-from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 from skyvern.forge.sdk.copilot.runtime import (
     _BROWSER_BOOT_WAIT_SECONDS,
     AgentContext,
@@ -98,7 +97,6 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     screenshot_viewport_css_px,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    encoded_secret_variants,
     is_registered_scrub_value,
     matching_origin_run_redaction_parameters,
     registered_scrub_values,
@@ -107,8 +105,10 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import PAGE_CRASHES_KEY, PAGE_REQUEST_FAILURES_KEY
+from skyvern.forge.sdk.core.pending_operation import pending_operation
 from skyvern.forge.sdk.workflow.models.block import parameter_strings
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.utils.secret_scrub import encoded_secret_variants
 from skyvern.webeye.browser_retirement import BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState, PageCrashRecord
 

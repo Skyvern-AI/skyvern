@@ -1273,6 +1273,8 @@ async def skyvern_network_route(
 ) -> dict[str, Any]:
     """Intercept network requests matching a URL glob pattern. Use 'abort' to block or 'mock' to return fake data.
     Call skyvern_network_unroute to remove.
+    Mock/abort covers the top-level page and same-process frames only; requests originating in separate
+    out-of-process cross-site iframe targets are not intercepted and may reach the real server.
     """
     from skyvern.cli.core.session_manager import is_stateless_http_mode
 

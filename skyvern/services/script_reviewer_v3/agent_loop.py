@@ -32,12 +32,8 @@ from typing import Any, Awaitable, Callable
 
 import structlog
 
+from skyvern.forge.sdk.agents.loop_detection import detect_tool_loop
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller
-from skyvern.forge.sdk.copilot.loop_detection import (
-    detect_failed_tool_step_loop,
-    detect_tool_loop,
-    record_tool_step_result,
-)
 from skyvern.services.script_reviewer_v3.budget import Budget, InvocationHandle
 from skyvern.services.script_reviewer_v3.decision import Decision
 from skyvern.services.script_reviewer_v3.redaction import redact_sensitive_value
@@ -227,14 +223,8 @@ async def run_agent_loop(
     if not isinstance(sensitive_value, str):
         sensitive_value = None
 
-    # Anti-oscillation trackers, ported from Copilot's loop_detection module.
-    # ``consecutive_tool_tracker`` catches A-A-A streaks (same skill 3 times
-    # in a row). ``failed_step_tracker`` catches repeated failures of the
-    # same (skill, args) pair — even when other skills run in between.
-    # Terminal skills are exempted from loop detection because they're
-    # called once and end the loop anyway.
+    # Catches A-A-A streaks (same skill 3 times in a row). Terminal skills are exempt: they end the loop anyway.
     consecutive_tool_tracker: list[str] = []
-    failed_step_tracker: dict[str, int] = {}
 
     # We maintain ``messages`` ourselves rather than relying on
     # LLMCaller.add_tool_result + use_message_history. Reason:
@@ -379,8 +369,6 @@ async def run_agent_loop(
                 loop_warning: str | None = None
                 if not is_terminal_call:
                     loop_warning = detect_tool_loop(consecutive_tool_tracker, tool_name)
-                    if loop_warning is None:
-                        loop_warning = detect_failed_tool_step_loop(failed_step_tracker, tool_name, args)
                 if loop_warning is not None:
                     timeline.append(
                         {
@@ -428,22 +416,6 @@ async def run_agent_loop(
                             "status": result.status,
                             "latency_ms": round(skill_latency_ms, 2),
                         }
-                    )
-
-                # Update the failed-step tracker. record_tool_step_result
-                # expects a Mapping with "ok" and optional "error"/"data";
-                # we adapt SkillResult here. "not_available" is neutral —
-                # neither success nor failure — so we skip the update.
-                if not is_terminal_call and result.status in {"ok", "error"}:
-                    record_tool_step_result(
-                        failed_step_tracker,
-                        tool_name,
-                        args,
-                        {
-                            "ok": result.status == "ok",
-                            "error": result.error_message,
-                            "data": result.data if isinstance(result.data, dict) else None,
-                        },
                     )
 
                 # Feed result back to the LLM as a tool message so the next

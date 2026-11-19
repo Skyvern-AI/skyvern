@@ -3,7 +3,7 @@ import { persist, createJSONStorage } from "zustand/middleware";
 
 export const BLOCK_SIDEBAR_WIDTH_MIN = 320;
 export const BLOCK_SIDEBAR_WIDTH_MAX = 640;
-// Matches the Copilot column (STUDIO_COPILOT_WIDTH) so the two studio rails open
+// Matches the Ember column (STUDIO_EMBER_WIDTH) so the two studio rails open
 // to the same width; still drag-resizable within MIN/MAX.
 export const BLOCK_SIDEBAR_WIDTH_DEFAULT = 450;
 // The pre-v1 default; v0 sessions that never customized the width hold this, and
@@ -50,7 +50,7 @@ const useBlockSidebarWidthStore = create<BlockSidebarWidthStore>()(
       name: BLOCK_SIDEBAR_WIDTH_STORAGE_KEY,
       storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({ width: state.width }),
-      // Bumped when the default changed 360 -> 450 (match the Copilot column).
+      // Bumped when the default changed 360 -> 450 (match the Ember column).
       // Move the old default (and any out-of-range value) to the new default,
       // but keep a width the user deliberately dragged within range.
       version: 1,

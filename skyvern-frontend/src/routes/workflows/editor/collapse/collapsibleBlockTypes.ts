@@ -37,6 +37,7 @@ const COLLAPSIBLE_NODE_TYPE_TO_BLOCK_TYPE: Record<string, WorkflowBlockType> = {
   pdfFill: "pdf_fill",
   splitPdf: "split_pdf",
   dataExport: "data_export",
+  integrationAction: "integration_action",
   loop: "for_loop",
   conditional: "conditional",
 };

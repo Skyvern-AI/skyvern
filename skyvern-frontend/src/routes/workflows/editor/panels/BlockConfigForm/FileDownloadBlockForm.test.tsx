@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { RunEngine } from "@/api/types";
 import { placeholders } from "../../helpContent";
 import type { FileDownloadNode } from "../../nodes/FileDownloadNode/types";
+import { urlMayBeGoogleDrive } from "../../workflowEditorUtils";
 import type * as WorkflowEditorUtilsModule from "../../workflowEditorUtils";
 import type {
   FileDownloadBlock,
@@ -63,9 +64,9 @@ vi.mock("../../workflowEditorUtils", async () => {
 
 // Stub heavy components: WorkflowBlockInputTextarea, ParametersMultiSelect,
 // ErrorCodeMappingEditor, ModelSelector, RunEngineSelector,
-// BlockExecutionOptions, DisableCache. Each is replaced with a minimal stub
-// that exposes the props the form passes so we can drive the form's
-// contract without spinning up the full editor.
+// BlockExecutionOptions. Each is replaced with a minimal stub that exposes
+// the props the form passes so we can drive the form's contract without
+// spinning up the full editor.
 vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
   WorkflowBlockInputTextarea: (props: {
     value: string;
@@ -188,20 +189,6 @@ vi.mock("../../nodes/components/BlockExecutionOptions", () => ({
         }
       />
     </div>
-  ),
-}));
-
-vi.mock("../../nodes/DisableCache", () => ({
-  DisableCache: (props: {
-    disableCache: boolean;
-    editable: boolean;
-    onDisableCacheChange: (next: boolean) => void;
-  }) => (
-    <button
-      data-testid="disable-cache-toggle"
-      data-disabled={String(props.disableCache)}
-      onClick={() => props.onDisableCacheChange(!props.disableCache)}
-    />
   ),
 }));
 
@@ -648,6 +635,20 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     cleanup();
     setFileDownloadNode("drive", {
       downloadTarget: "sftp",
+      url: "https://docs.google.com/document/d/doc123/edit",
+      googleCredentialId: "goac-existing",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.getByText(
+        "Nothing runs before this block, so it needs a URL to start from.",
+      ),
+    ).toBeDefined();
+
+    cleanup();
+    setFileDownloadNode("drive", {
+      downloadTarget: "sftp",
       url: "https://example.com/invoices",
       googleCredentialId: "goac-existing",
     });
@@ -778,25 +779,6 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     expect(
       screen.getByText("Google Drive Source Account (Optional)"),
     ).toBeDefined();
-
-    cleanup();
-    setFileDownloadNode("d2", { downloadTarget: "sftp", url: "abc123_-XYZ" });
-    render(<FileDownloadBlockForm blockId="d2" />);
-
-    expect(
-      screen.getByText("Google Drive Source Account (Optional)"),
-    ).toBeDefined();
-
-    cleanup();
-    setFileDownloadNode("d3", {
-      downloadTarget: "sftp",
-      url: "https://DRIVE.GOOGLE.COM/file/d/abc123/view",
-    });
-    render(<FileDownloadBlockForm blockId="d3" />);
-
-    expect(
-      screen.getByText("Google Drive Source Account (Optional)"),
-    ).toBeDefined();
   });
 
   test("does not treat a URL containing the Drive hostname as a Drive link", () => {
@@ -809,6 +791,23 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     expect(
       screen.queryByText("Google Drive Source Account (Optional)"),
     ).toBeNull();
+  });
+
+  test.each([
+    ["https://drive.google.com/file/d/abc123/view", true],
+    ["abc123_-XYZ", true],
+    ["https://DRIVE.GOOGLE.COM/file/d/abc123/view", true],
+    ["https://drive.google.com/file/u/1/d/abc123/view", true],
+    ["https://docs.google.com/document/d/doc123/edit", true],
+    ["https://docs.google.com/document/u/1/d/doc123/edit?tab=t.0", true],
+    ["https://docs.google.com/document/d/example123/edit", true],
+    ["https://example.com/drive.google.com/file/d/abc123/view", false],
+    ["https://docs.google.com/document/d/e/2PACX-public/pub", false],
+    ["https://docs.google.com/spreadsheets/d/sheet123/edit", false],
+    ["https://docs.google.com/document/d/doc123.evil/edit", false],
+    ["https://drive.google.com/file/d/abc123.evil/view", false],
+  ])("classifies Drive source %s as %s", (url, expected) => {
+    expect(urlMayBeGoogleDrive(url)).toBe(expected);
   });
 
   test("selects a Google Drive source account for SFTP delivery", () => {
@@ -993,7 +992,6 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     fireEvent.change(screen.getByTestId("wbi-navigation_goal"), {
       target: { value: "blocked" },
     });
-    fireEvent.click(screen.getByTestId("disable-cache-toggle"));
     fireEvent.click(screen.getByTestId("error-code-mapping-switch"));
 
     expect(updateNodeData).not.toHaveBeenCalled();

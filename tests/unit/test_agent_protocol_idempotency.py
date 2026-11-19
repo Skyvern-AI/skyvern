@@ -1178,6 +1178,9 @@ async def test_each_surface_stamps_the_build_source_of_the_version_it_writes(
             staged_workflow=staged,
         )
         assert await build_source_of(api_version.workflow_id) == "copilot"
+        versions = await lab.client.get(f"/v1/workflows/{workflow_permanent_id}/versions")
+        assert versions.status_code == 200, versions.text
+        assert "copilot" in {version["build_source"] for version in versions.json()}
 
         # A rolled-back copilot turn must not leave its stamp on the version the API caller wrote.
         await _restore_workflow_definition(api_version, lab.organization.organization_id)

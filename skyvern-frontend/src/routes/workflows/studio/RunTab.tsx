@@ -7,7 +7,7 @@ import { RunView } from "./runview/RunView";
 import { useStudioInspectedRun } from "./useStudioInspectedRun";
 import { useStudioPanes } from "./useStudioPanes";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
-import { useDocRunOwnsTopBar } from "../editor/doc/useDocRunOwnsTopBar";
+import { useDocOnScreen } from "../editor/doc/useDocOnScreen";
 
 /**
  * Overview pane of the studio shell — the run timeline + run-data view (the
@@ -21,13 +21,13 @@ export function RunTab() {
   const { openPane, panes } = useStudioPanes();
   // The Run pane stays mounted while closed; behind the Doc, its selection must not reach the URL,
   // or a reload opens the run layout instead of the Doc.
-  const docOwnsEditor = useDocRunOwnsTopBar();
+  const docOwnsEditor = useDocOnScreen();
   const mirrorSelectionToUrl = !(docOwnsEditor && !panes.includes("overview"));
   const { runId, pending } = useStudioInspectedRun();
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
     workflowRunId: runId,
   });
-  // Fix (Copilot) and Retry both mutate/rerun the workflow — gone with the
+  // Fix (Ember) and Retry both mutate/rerun the workflow — gone with the
   // source agent, so the CTAs go too (the run stays viewable).
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
   // ?bl= marks a block-scoped run; "Retry" would rerun the whole workflow,
@@ -59,9 +59,9 @@ export function RunTab() {
           : (failingLabel) => {
               // One replace-navigation opens the pane and arms the action via
               // location.state, so the pane write can't race a state-only navigation.
-              openPane("copilot", {
+              openPane("ember", {
                 state: {
-                  copilotAction: {
+                  emberAction: {
                     kind: "diagnose_run",
                     workflowRunId: runId,
                     nonce: crypto.randomUUID(),

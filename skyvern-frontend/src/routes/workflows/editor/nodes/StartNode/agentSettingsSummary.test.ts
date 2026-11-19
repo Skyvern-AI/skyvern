@@ -40,7 +40,6 @@ const defaults: WorkflowStartNodeData = {
   workflowSystemPrompt: null,
   errorCodeMapping: null,
   label: "__start_block__",
-  showCode: false,
 };
 
 function boldCount(data: WorkflowStartNodeData) {
@@ -56,30 +55,32 @@ describe("agent settings summaries", () => {
     expect(summaries.runs.map((s) => s.text).join(" · ")).toBe(
       "No retry · 4 h limit",
     );
-    expect(summaries.runwith.map((s) => s.text).join(" · ")).toBe(
-      "Skyvern Agent",
-    );
   });
 
-  test("null proxy and null run_with are defaults, and the agent shows muted", () => {
+  test("a null proxy is a default", () => {
     const legacy = {
       ...defaults,
       proxyLocation: null,
-      runWith: null,
     } as unknown as WorkflowStartNodeData;
     expect(changedSettingCount(legacy)).toBe(0);
-    expect(buildGroupSummaries(legacy, {}).runwith).toEqual([
-      { text: "Skyvern Agent", changed: false },
-    ]);
   });
 
-  test("the seven settings from the brief each add one change and one bold segment", () => {
+  test("stored code-mode settings are not counted as changes", () => {
+    const code = {
+      ...defaults,
+      runWith: "code",
+      aiFallback: false,
+      scriptCacheKey: "k",
+    };
+    expect(changedSettingCount(code)).toBe(0);
+  });
+
+  test("the six settings from the brief each add one change and one bold segment", () => {
     const changes: Array<Partial<WorkflowStartNodeData>> = [
       { proxyLocation: ProxyLocation.ResidentialGB },
       { maxElapsedTimeMinutes: 60 },
       { maskSecrets: true },
       { webhookCallbackUrl: "https://hooks.example.com/a/b" },
-      { runWith: "code" },
       {
         retryPolicy: {
           max_retries: 2,
@@ -101,38 +102,6 @@ describe("agent settings summaries", () => {
       changed: true,
       title: "https://hooks.example.com/a/b",
     });
-  });
-
-  test("Code is a change, and AI fallback off and a code key each add one", () => {
-    const code = { ...defaults, runWith: "code" };
-    expect(changedSettingCount(code)).toBe(1);
-    expect(buildGroupSummaries(code, {}).runwith).toEqual([
-      { text: "Code", changed: true, title: undefined },
-      { text: "AI fallback on", changed: false },
-    ]);
-    expect(changedSettingCount({ ...code, aiFallback: false })).toBe(2);
-    expect(changedSettingCount({ ...code, scriptCacheKey: "k" })).toBe(2);
-    expect(
-      changedSettingCount({ ...code, aiFallback: false, scriptCacheKey: "k" }),
-    ).toBe(3);
-  });
-
-  test("hidden AI fallback and code key are not counted when running the agent", () => {
-    for (const runWith of ["agent", null]) {
-      const data = {
-        ...defaults,
-        runWith,
-        aiFallback: false,
-        scriptCacheKey: "k",
-      } as unknown as WorkflowStartNodeData;
-      expect(changedSettingCount(data)).toBe(0);
-    }
-  });
-
-  test("the backend's default code key is not a change", () => {
-    const code = { ...defaults, runWith: "code" };
-    expect(changedSettingCount({ ...code, scriptCacheKey: "default" })).toBe(1);
-    expect(changedSettingCount({ ...code, scriptCacheKey: "mine" })).toBe(2);
   });
 
   test("browser type shows the select's label and is not counted without options", () => {

@@ -9,6 +9,7 @@ from skyvern.exceptions import (
     ActionDeadlineExceeded,
     MissingBrowserStatePage,
     MissingElement,
+    MissingElementDict,
     ScrapingFailed,
     ScreenshotPageHasNoDrawnArea,
     ScreenshotTargetClosed,
@@ -24,8 +25,12 @@ from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.sdk_actions import (
+    ClickAction,
+    InputTextAction,
     RunSdkActionRequest,
     RunSdkActionResponse,
+    SelectOptionAction,
+    UploadFileAction,
 )
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
@@ -420,7 +425,7 @@ async def _run_sdk_action(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="The browser had no page left to act on before the action could complete.",
             )
-        except MissingElement as e:
+        except (MissingElement, MissingElementDict) as e:
             await app.DATABASE.tasks.update_task(
                 task_id=task.task_id,
                 organization_id=organization_id,
@@ -432,10 +437,20 @@ async def _run_sdk_action(
                 action_type=action.type,
                 browser_session_id=browser_session_id,
                 error=str(e),
+                error_type=type(e).__name__,
+                selector_supplied=(
+                    isinstance(action, (ClickAction, InputTextAction, SelectOptionAction, UploadFileAction))
+                    and bool(action.selector)
+                ),
             )
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="The element the action targeted was not found on the page. An earlier action may have removed it.",
+                detail=(
+                    "The chosen element is not in the page's current snapshot. "
+                    "Retry the action or describe the target more specifically."
+                    if isinstance(e, MissingElementDict)
+                    else "The element the action targeted was not found on the page. An earlier action may have removed it."
+                ),
             )
         except ActionDeadlineExceeded as e:
             await app.DATABASE.tasks.update_task(

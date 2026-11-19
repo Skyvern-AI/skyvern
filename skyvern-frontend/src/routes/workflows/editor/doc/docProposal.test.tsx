@@ -24,15 +24,15 @@ import { MemoryRouter } from "react-router-dom";
 import { parse as parseYaml } from "yaml";
 import { ProxyLocation } from "@/api/types";
 import * as axiosClientModule from "@/api/AxiosClient";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import {
   EMPTY_NARRATIVE,
   type ReviewProjection,
-} from "../../copilot/narrativeState";
-import { ReviewGateCard } from "../../copilot/cards/ReviewGateCard";
+} from "../../ember/narrativeState";
+import { ReviewGateCard } from "../../ember/cards/ReviewGateCard";
 import type {
   WorkflowApiResponse,
   WorkflowBlock,
@@ -44,23 +44,14 @@ import { buildDocProposal } from "./docProposal";
 import { DocProposalProvider } from "./DocProposalView";
 import { DocScope } from "./DocScope";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
+import { block } from "./docTestBlocks";
 
 // The run widgets need studio run contexts; this file tests the proposal, so they are stubbed.
-vi.mock("./DocStepResult", () => ({ DocStepResult: () => null }));
 vi.mock("./DocRunStepButton", () => ({ DocRunStepButton: () => null }));
 
-vi.mock("./useDocRun", () => {
-  const blocksByLabel = new Map();
-  return {
-    useDocRun: () => ({
-      rowsLoaded: true,
-      runId: null,
-      blocksByLabel,
-      live: false,
-      unknownLabels: new Set(),
-    }),
-  };
-});
+vi.mock("./useDocLatestRunCompleted", () => ({
+  useDocLatestRunCompleted: () => false,
+}));
 
 async function renderInStudio(ui: ReactElement) {
   let view!: ReturnType<typeof render>;
@@ -168,7 +159,7 @@ async function renderDoc(
   tested = false,
 ) {
   const decide = vi.fn(async () => true);
-  useCopilotProposalStore.getState().setProposal({
+  useEmberProposalStore.getState().setProposal({
     proposed: workflow(proposed),
     baseline: workflow(saved),
     review,
@@ -206,12 +197,44 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
-  useCopilotProposalStore.getState().setProposal(null);
+  useEmberProposalStore.getState().setProposal(null);
   vi.restoreAllMocks();
 });
 
-describe("Copilot proposal in the Doc view", () => {
-  test("the banner says Tested when Copilot ran the proposal and Untested when it did not", async () => {
+// `lead` runs before the step: give it a step that opens a page and `the_step` no longer opens the first one.
+async function renderProposal(
+  before: WorkflowBlock,
+  after: WorkflowBlock,
+  lead: WorkflowBlock[] = [],
+) {
+  useEmberProposalStore.getState().setProposal({
+    proposed: workflow([...lead, after]),
+    baseline: workflow([...lead, before]),
+    review: {
+      blocks: [
+        {
+          label: "the_step",
+          blockType: before.block_type,
+          change: "changed",
+        },
+      ],
+      duplicateWrites: [],
+      keptNotes: [],
+      keptDescriptions: [],
+    },
+    tested: false,
+    actionable: true,
+    acceptable: true,
+    decide: vi.fn(async () => true),
+  });
+  const live = getElements([...lead, before], settings, true);
+  await renderInStudio(
+    <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
+  );
+}
+
+describe("Ember proposal in the Doc view", () => {
+  test("the banner says Tested when Ember ran the proposal and Untested when it did not", async () => {
     await renderDoc(true, true, true);
     const banner = screen.getByRole("region", { name: "Copilot proposal" });
     expect(banner.textContent).toContain("Tested");
@@ -251,7 +274,7 @@ describe("Copilot proposal in the Doc view", () => {
       description: "The workflow gathers and verifies the requested data.",
       webhook_callback_url: "old-webhook-token",
     });
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: proposedWorkflow,
       baseline: baselineWorkflow,
       review,
@@ -318,7 +341,7 @@ describe("Copilot proposal in the Doc view", () => {
         },
       ],
     };
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow(proposed),
       baseline: workflow(saved),
       review: evidenceReview,
@@ -401,7 +424,7 @@ describe("Copilot proposal in the Doc view", () => {
       },
     ] as WorkflowApiResponse["workflow_definition"]["parameters"];
     const comparison = diffWorkflowVersions(baseline, proposedWorkflow);
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: proposedWorkflow,
       baseline,
       review,
@@ -448,7 +471,7 @@ describe("Copilot proposal in the Doc view", () => {
       task("open_page", null, { navigation_goal: "Open the proposed page." }),
     ];
     useWorkflowHasChangesStore.setState({ getSaveData: () => null });
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow(proposedBlocks),
       baseline: null,
       review,
@@ -506,7 +529,7 @@ describe("Copilot proposal in the Doc view", () => {
       task("right", "after"),
       task("after", null),
     ];
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow(proposedBlocks),
       baseline: workflow(baselineBlocks),
       review: {
@@ -544,7 +567,7 @@ describe("Copilot proposal in the Doc view", () => {
       }) as unknown as WorkflowBlock;
     const baselineBlocks = [loop([task("only", null)])];
     const proposedBlocks = [loop([])];
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow(proposedBlocks),
       baseline: workflow(baselineBlocks),
       review: {
@@ -577,7 +600,7 @@ describe("Copilot proposal in the Doc view", () => {
         next_block_label: null,
       }) as unknown as WorkflowBlock;
     const baselineBlocks = [loop(null)];
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow([loop("For each of the search results")]),
       baseline: workflow(baselineBlocks),
       review: {
@@ -661,6 +684,353 @@ describe("Copilot proposal in the Doc view", () => {
     ).not.toBeNull();
     // No whole-turn verdict anywhere on the proposal.
     expect(card.textContent).not.toMatch(/Done|✓|Tested/);
+  });
+
+  test("a step changed only in what Details holds shows its Details open, and Jump opens it again", async () => {
+    const before = [
+      task("open_page", "read_total"),
+      task("read_total", null, { notes: "Totals sit at the bottom." }),
+    ];
+    useEmberProposalStore.getState().setProposal({
+      proposed: workflow([
+        task("open_page", "read_total", {
+          complete_criterion: "The results show",
+        }),
+        task("read_total", null, { notes: "Totals sit lower." }),
+      ]),
+      baseline: workflow(before),
+      review: {
+        blocks: [
+          { label: "open_page", blockType: "navigation", change: "changed" },
+          { label: "read_total", blockType: "navigation", change: "changed" },
+        ],
+        duplicateWrites: [],
+        keptNotes: [],
+        keptDescriptions: [],
+      },
+      tested: false,
+      actionable: true,
+      acceptable: true,
+      decide: vi.fn(async () => true),
+    });
+    const live = getElements(before, settings, true);
+    await renderInStudio(
+      <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
+    );
+    const details = (title: string) =>
+      screen.getByRole("button", { name: `Details for ${title}` });
+    expect(details("Open page").getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("The results show")).not.toBeNull();
+    // A changed note shows in its own place, so it does not open Details.
+    expect(details("Read total").getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(details("Open page"));
+    expect(screen.queryByText("The results show")).toBeNull();
+    const card = screen.getByRole("region", { name: "Copilot proposal" });
+    fireEvent.click(within(card).getByRole("button", { expanded: false }));
+    fireEvent.click(within(card).getByText("Open Page"));
+    expect(details("Open page").getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("The results show")).not.toBeNull();
+  });
+
+  const one = (blockType: string, fields: Record<string, unknown>) =>
+    block(blockType, "the_step", null, fields);
+  const whileLoop = (expression: string) =>
+    one("while_loop", {
+      loop_blocks: [],
+      condition: { criteria_type: "jinja2_template", expression },
+    });
+  // Details opens for a change it shows, and stays closed for one shown on the step's line or not shown at all.
+  test.each([
+    [
+      "only a Code step's code",
+      one("code", { code: "print(1)", parameters: [] }),
+      one("code", { code: "print(2)", parameters: [] }),
+      false,
+    ],
+    [
+      "only a Wait step's seconds",
+      one("wait", { wait_sec: 5 }),
+      one("wait", { wait_sec: 9 }),
+      false,
+    ],
+    [
+      "only a while loop's condition",
+      whileLoop("{{ more }}"),
+      whileLoop("{{ still_more }}"),
+      false,
+    ],
+    [
+      "the Goal and a line Details holds",
+      task("the_step", null, { complete_criterion: "The page loads" }),
+      task("the_step", null, {
+        navigation_goal: "A new goal",
+        complete_criterion: "The results show",
+      }),
+      true,
+    ],
+    [
+      "only the step's text",
+      task("the_step", null),
+      task("the_step", null, { navigation_goal: "A new goal" }),
+      false,
+    ],
+    [
+      "only a setting reset to its default",
+      task("the_step", null, { max_retries: 3 }),
+      task("the_step", null, { max_retries: 0 }),
+      true,
+    ],
+    [
+      "only a step's inputs",
+      task("the_step", null, { parameters: [] }),
+      task("the_step", null, {
+        parameters: [
+          {
+            parameter_type: "workflow",
+            key: "order_id",
+            workflow_parameter_type: "string",
+          },
+        ],
+      }),
+      true,
+    ],
+    [
+      "only a step's output schema",
+      one("extraction", {
+        data_extraction_goal: "Read the total",
+        data_schema: { type: "object", properties: { total: {} } },
+      }),
+      one("extraction", {
+        data_extraction_goal: "Read the total",
+        data_schema: { type: "object", properties: { amount: {} } },
+      }),
+      true,
+    ],
+    [
+      // The line shows the agent's id, and Details lists it too.
+      "only the agent of a trigger whose title is not known",
+      one("workflow_trigger", { workflow_permanent_id: "wpid_first" }),
+      one("workflow_trigger", { workflow_permanent_id: "wpid_second" }),
+      true,
+    ],
+  ])(
+    "a proposal that changes %s shows Details open: %s",
+    async (_case, before, after, open) => {
+      await renderProposal(before, after);
+      expect(
+        screen
+          .getByRole("button", { name: /^Details for/ })
+          .getAttribute("aria-expanded"),
+      ).toBe(String(open));
+      if (before.block_type === "workflow_trigger")
+        expect(screen.getAllByText("wpid_second").length).toBeGreaterThan(0);
+    },
+  );
+
+  const recipients = (count: number) =>
+    one("send_email", {
+      subject: "Weekly summary",
+      body: "The summary is attached.",
+      file_attachments: [],
+      recipients: Array.from(
+        { length: count },
+        (_, i) => `person${i + 1}@example.com`,
+      ),
+    });
+  // The summary line shows a URL's host and cuts a long list, so a proposal that sets one lists it whole in Details.
+  test.each([
+    [
+      "a login's page host",
+      one("login", { url: "https://example.com/a", parameter_keys: [] }),
+      one("login", { url: "https://example.org/b", parameter_keys: [] }),
+      "https://example.org/b",
+    ],
+    [
+      "only a login's page path",
+      one("login", { url: "https://example.com/login", parameter_keys: [] }),
+      one("login", {
+        url: "https://example.com/admin/reset",
+        parameter_keys: [],
+      }),
+      "https://example.com/admin/reset",
+    ],
+    [
+      "only a Browser Task's page query",
+      task("the_step", null, { url: "https://example.com/list" }),
+      task("the_step", null, { url: "https://example.com/list?page=2" }),
+      "https://example.com/list?page=2",
+    ],
+    [
+      "a long recipients list",
+      recipients(1),
+      recipients(8),
+      "person8@example.com",
+    ],
+    [
+      "a login's page cleared",
+      one("login", { url: "https://example.com/a", parameter_keys: [] }),
+      one("login", { url: "", parameter_keys: [] }),
+      "Not set",
+    ],
+  ])(
+    "a read-only proposal that changes %s opens Details and shows the new value",
+    async (_case, before, after, shown) => {
+      await renderProposal(before, after);
+      const toggle = screen.getByRole("button", { name: /^Details for/ });
+      expect(toggle.getAttribute("aria-expanded")).toBe("true");
+      const details = document.getElementById(
+        toggle.getAttribute("aria-controls")!,
+      )!;
+      expect(details.textContent).toContain(shown);
+    },
+  );
+
+  // A step after one that opens a page needs no URL, so an unset one is hidden; a proposal that clears it still shows it.
+  test.each([
+    ["extraction", { data_extraction_goal: "Read the total" }],
+    ["action", { navigation_goal: "Click Next" }],
+    ["task", { navigation_goal: "Read the list" }],
+  ])(
+    "a proposal that adds a later %s step with no URL lists no URL row for it",
+    async (blockType, extra) => {
+      const open = (next: string | null) =>
+        task("open_page", next, { url: "https://example.com" });
+      useEmberProposalStore.getState().setProposal({
+        proposed: workflow([
+          open("the_step"),
+          block(blockType, "the_step", null, { ...extra, url: "" }),
+        ]),
+        baseline: workflow([open(null)]),
+        review: {
+          blocks: [{ label: "the_step", blockType, change: "added" }],
+          duplicateWrites: [],
+          keptNotes: [],
+          keptDescriptions: [],
+        },
+        tested: false,
+        actionable: true,
+        acceptable: true,
+        decide: vi.fn(async () => true),
+      });
+      const live = getElements([open(null)], settings, true);
+      await renderInStudio(
+        <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
+      );
+      const toggle = screen.getByRole("button", {
+        name: "Details for The step",
+      });
+      if (toggle.getAttribute("aria-expanded") !== "true")
+        fireEvent.click(toggle);
+      expect(
+        within(
+          document.getElementById(toggle.getAttribute("aria-controls")!)!,
+        ).queryByText("URL"),
+      ).toBeNull();
+    },
+  );
+
+  test.each([
+    ["navigation", { navigation_goal: "Read the list" }],
+    ["extraction", { data_extraction_goal: "Read the total" }],
+  ])(
+    "a read-only proposal that clears the URL of a later %s step lists it as not set",
+    async (blockType, extra) => {
+      const lead = [
+        task("open_page", "the_step", { url: "https://example.com" }),
+      ];
+      const step = (url: string) =>
+        block(blockType, "the_step", null, { ...extra, url });
+      await renderProposal(step("https://example.com/list"), step(""), lead);
+      const toggle = screen.getByRole("button", {
+        name: "Details for The step",
+      });
+      expect(toggle.getAttribute("aria-expanded")).toBe("true");
+      const details = within(
+        document.getElementById(toggle.getAttribute("aria-controls")!)!,
+      );
+      expect(details.getByText("URL").nextElementSibling?.textContent).toBe(
+        "Not set",
+      );
+      cleanup();
+      useEmberProposalStore.getState().setProposal(null);
+      const live = getElements([...lead, step("")], settings, true);
+      await renderInStudio(
+        <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
+      );
+      const plain = screen.getByRole("button", {
+        name: "Details for The step",
+      });
+      fireEvent.click(plain);
+      expect(
+        within(
+          document.getElementById(plain.getAttribute("aria-controls")!)!,
+        ).queryByText("URL"),
+      ).toBeNull();
+    },
+  );
+
+  test.each([
+    [
+      "with a Complete if, opens Details so the criterion is seen before Accept",
+      { complete_criterion: "The results show", max_retries: 3 },
+      true,
+    ],
+    ["with nothing beyond its goal, leaves Details closed", {}, false],
+    [
+      "as an Action at its defaults (No, 0), leaves Details closed",
+      { block_type: "action" },
+      false,
+    ],
+    [
+      "as an Action that continues on failure, opens Details",
+      { block_type: "action", continue_on_failure: true },
+      true,
+    ],
+    [
+      "with a page URL that has a path, opens Details listing it",
+      { url: "https://example.com/admin/reset" },
+      true,
+    ],
+  ])("a step the proposal adds %s", async (_case, extra, open) => {
+    const before = [task("open_page", null)];
+    useEmberProposalStore.getState().setProposal({
+      proposed: workflow([
+        task("open_page", "check_page"),
+        task("check_page", null, extra),
+      ]),
+      baseline: workflow(before),
+      review: {
+        blocks: [
+          { label: "check_page", blockType: "navigation", change: "added" },
+        ],
+        duplicateWrites: [],
+        keptNotes: [],
+        keptDescriptions: [],
+      },
+      tested: false,
+      actionable: true,
+      acceptable: true,
+      decide: vi.fn(async () => true),
+    });
+    const live = getElements(before, settings, true);
+    await renderInStudio(
+      <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
+    );
+    const toggle = screen.getByRole("button", {
+      name: "Details for Check page",
+    });
+    expect(toggle.getAttribute("aria-expanded")).toBe(String(open));
+    if ("url" in extra)
+      expect(
+        document.getElementById(toggle.getAttribute("aria-controls")!)!
+          .textContent,
+      ).toContain(extra.url);
+    expect(
+      screen
+        .getByRole("button", { name: "Details for Open page" })
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
   });
 
   test("Accept and Reject settle the whole proposal through the chat", async () => {
@@ -762,7 +1132,7 @@ describe("Copilot proposal in the Doc view", () => {
         (change) =>
           `${change.label}: ${change.before ?? "Not set"} → ${change.after ?? "Not set"}`,
       );
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: proposedWorkflow,
       baseline,
       review,
@@ -856,7 +1226,7 @@ describe("Copilot proposal in the Doc view", () => {
 
   test("shows the editable doc again once the proposal clears", async () => {
     await renderDoc();
-    act(() => useCopilotProposalStore.getState().setProposal(null));
+    act(() => useEmberProposalStore.getState().setProposal(null));
 
     expect(screen.queryByRole("region", { name: "Copilot proposal" })).toBe(
       null,
@@ -865,7 +1235,7 @@ describe("Copilot proposal in the Doc view", () => {
   });
 });
 
-describe("Copilot proposal marks", () => {
+describe("Ember proposal marks", () => {
   const reviewProjection = (label: string) => ({
     blocks: [{ label, blockType: "navigation", change: "changed" as const }],
     duplicateWrites: [],
@@ -1098,7 +1468,7 @@ describe("Copilot proposal marks", () => {
     ]);
   });
 
-  test("steps of a branch Copilot dropped sit after the conditional", () => {
+  test("steps of a branch Ember dropped sit after the conditional", () => {
     const check = (branches: unknown[]) => ({
       label: "check",
       block_type: "conditional",
@@ -1218,7 +1588,7 @@ test("a proposal's input chips do not open the live Inputs panel", async () => {
       default_value: null,
     },
   ] as unknown as WorkflowApiResponse["workflow_definition"]["parameters"];
-  useCopilotProposalStore.getState().setProposal({
+  useEmberProposalStore.getState().setProposal({
     proposed: withInput,
     baseline: workflow(saved),
     review,
@@ -1237,4 +1607,111 @@ test("a proposal's input chips do not open the live Inputs panel", async () => {
   expect(useWorkflowPanelStore.getState().workflowPanelState.active).toBe(
     false,
   );
+});
+
+describe("a long text in an Ember proposal", () => {
+  const FIVE = (last: string) =>
+    `Open the report.\nCheck every row.\nNote each difference.\nSum the totals.\n${last}`;
+  beforeEach(() => {
+    // jsdom has no layout: a text measures one 24.8px line per line of its text.
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return (this.textContent ?? "").split("\n").length * 24.8;
+      },
+    });
+  });
+  afterEach(() => {
+    // @ts-expect-error removing the jsdom layout stub restores the prototype's own getter
+    delete HTMLElement.prototype.scrollHeight;
+  });
+  const live = [
+    task("long_step", "other_step", { navigation_goal: FIVE("Stop.") }),
+    task("other_step", null, { navigation_goal: FIVE("Wait.") }),
+  ];
+  const propose = (blocks: WorkflowBlock[], base = live) =>
+    act(() =>
+      useEmberProposalStore.getState().setProposal({
+        proposed: workflow(blocks),
+        baseline: workflow(base),
+        review: null,
+        actionable: true,
+        acceptable: true,
+        decide: vi.fn(async () => true),
+      }),
+    );
+  const textWith = (snippet: string) =>
+    Array.from(document.querySelectorAll<HTMLElement>("span[id]")).find((el) =>
+      el.textContent?.includes(snippet),
+    )!;
+  const folded = (snippet: string) =>
+    textWith(snippet).style.overflow === "hidden";
+  const control = (step: string) =>
+    screen.queryByRole("button", {
+      name: new RegExp(`^Show (more|less): ${step}$`),
+    });
+  const renderLive = async (base = live) => {
+    const { nodes, edges } = getElements(base, settings, true);
+    await renderInStudio(<WorkflowDocEditor nodes={nodes} edges={edges} />);
+  };
+
+  test("a change on the fifth line shows the whole text, and the fold returns when the proposal ends", async () => {
+    await propose([
+      task("long_step", "other_step", {
+        navigation_goal: FIVE("CHANGED_LINE"),
+      }),
+      live[1]!,
+    ]);
+    await renderLive();
+    expect(control("Long step")).toBeNull();
+    expect(folded("CHANGED_LINE")).toBe(false);
+    expect(folded("Wait.")).toBe(true);
+
+    act(() => useEmberProposalStore.getState().setProposal(null));
+    expect(control("Long step")).not.toBeNull();
+    expect(folded("Stop.")).toBe(true);
+  });
+
+  test("an added step with a long text shows all of it", async () => {
+    await propose([
+      ...live.slice(0, 1),
+      task("other_step", "new_step", { navigation_goal: FIVE("Wait.") }),
+      task("new_step", null, { navigation_goal: FIVE("ADDED_LINE") }),
+    ]);
+    await renderLive();
+    expect(control("New step")).toBeNull();
+    expect(folded("ADDED_LINE")).toBe(false);
+    expect(folded("Stop.")).toBe(true);
+  });
+
+  test("a change to the text shown in place of an empty first field shows all of it", async () => {
+    const check = (last: string) =>
+      task("check_step", null, {
+        navigation_goal: "",
+        complete_criterion: FIVE(last),
+      });
+    const base = [
+      task("other_step", "check_step", { navigation_goal: FIVE("Wait.") }),
+      check("Done."),
+    ];
+    await propose([base[0]!, check("PROMOTED_CHANGE")], base);
+    await renderLive(base);
+    expect(control("Check step")).toBeNull();
+    expect(folded("PROMOTED_CHANGE")).toBe(false);
+    expect(folded("Wait.")).toBe(true);
+  });
+
+  test("a change to another setting of the step leaves its long text folded", async () => {
+    await propose([
+      task("long_step", "other_step", {
+        navigation_goal: FIVE("Stop."),
+        max_retries: 3,
+      }),
+      live[1]!,
+    ]);
+    await renderLive();
+    expect(screen.getAllByText("Changed").length).toBeGreaterThanOrEqual(1);
+    expect(control("Long step")).not.toBeNull();
+    expect(folded("Stop.")).toBe(true);
+  });
 });

@@ -21,11 +21,11 @@ import type { GoogleOAuthCredential } from "@/api/types";
 import { ReactFlowProvider, useNodes, useReactFlow } from "@xyflow/react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import {
-  beginCopilotAcceptance,
+  beginEmberAcceptance,
   beginSaveTransaction,
   beginYamlCommit,
   createYamlCommitOwner,
-  finishCopilotAcceptance,
+  finishEmberAcceptance,
   finishSaveTransaction,
   finishYamlCommit,
   registerEditorOwner,
@@ -280,7 +280,7 @@ describe("useResolveDefaultGoogleSheetsCredential (SKY-11219)", () => {
     });
   });
 
-  test("fills a grant that carries only the Sheets data scope, as the copilot reads it", () => {
+  test("fills a grant that carries only the Sheets data scope, as the Ember reads it", () => {
     mockCredentials = [
       credential("cred_spreadsheets_only", "active", [GOOGLE_SHEETS_SCOPE]),
     ];
@@ -424,9 +424,9 @@ describe("default Sheets credentials during editor locks", () => {
           expect(beginSaveTransaction(owner)).toBe(true);
           releaseLock = () => finishSaveTransaction(owner);
         } else {
-          const token = beginCopilotAcceptance();
+          const token = beginEmberAcceptance();
           expect(token).not.toBeNull();
-          releaseLock = () => finishCopilotAcceptance(token!);
+          releaseLock = () => finishEmberAcceptance(token!);
         }
       });
       const deferKey = JSON.stringify([
@@ -495,9 +495,9 @@ describe("default Sheets credentials during editor locks", () => {
           expect(beginYamlCommit(owner)).toBe(true);
           releaseLock = () => finishYamlCommit(owner);
         } else {
-          const token = beginCopilotAcceptance();
+          const token = beginEmberAcceptance();
           expect(token).not.toBeNull();
-          releaseLock = () => finishCopilotAcceptance(token!);
+          releaseLock = () => finishEmberAcceptance(token!);
         }
       });
 

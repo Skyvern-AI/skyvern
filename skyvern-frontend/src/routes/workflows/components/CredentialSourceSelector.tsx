@@ -5,6 +5,7 @@ import {
 import { GoogleOAuthCredentialSelector } from "./GoogleOAuthCredentialSelector";
 import {
   GOOGLE_GMAIL_REQUIRED_SCOPES,
+  GOOGLE_GMAIL_REPLY_REQUIRED_SCOPES,
   GOOGLE_GMAIL_SEND_REQUIRED_SCOPES,
 } from "@/util/googleScopes";
 
@@ -24,11 +25,14 @@ export function CredentialSourceSelector(props: BrokerCredentialSelectorProps) {
           value={props.credentialSource === "native" ? props.credentialId : ""}
           onChange={(id) => props.onChange("native", id)}
           requiredScopes={
-            props.purpose === "send" || props.purpose === "reply"
-              ? GOOGLE_GMAIL_SEND_REQUIRED_SCOPES
-              : GOOGLE_GMAIL_REQUIRED_SCOPES
+            props.purpose === "reply"
+              ? GOOGLE_GMAIL_REPLY_REQUIRED_SCOPES
+              : props.purpose === "send"
+                ? GOOGLE_GMAIL_SEND_REQUIRED_SCOPES
+                : GOOGLE_GMAIL_REQUIRED_SCOPES
           }
           gmailSendOnly={props.purpose === "send" || props.purpose === "reply"}
+          allowTemplates={props.allowTemplates}
           disabled={props.disabled}
           ariaLabel="Gmail account"
           showEmail

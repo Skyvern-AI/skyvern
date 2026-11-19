@@ -259,7 +259,6 @@ function WorkflowSettingsEditorBody({
     ),
     browserTypeOptions,
   });
-  const runsWithCode = data.runWith === "code";
 
   const [localWebhookUrl, setLocalWebhookUrl] = useState(
     data.webhookCallbackUrl,
@@ -718,63 +717,6 @@ function WorkflowSettingsEditorBody({
               }}
             />
           </div>
-        </SettingsGroup>
-        <SettingsGroup
-          id="runwith"
-          title="Run with"
-          summary={summaries.runwith}
-          locked={mutationLocked}
-        >
-          <div className="flex justify-between">
-            <div className="flex items-center gap-2">
-              <Label>Run With</Label>
-              <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the agent. To avoid using code, set this to 'Skyvern Agent'." />
-            </div>
-            <Select
-              value={data.runWith || "agent"}
-              onValueChange={(value) => update({ runWith: value })}
-            >
-              <SelectTrigger className="w-48">
-                <SelectValue placeholder="Run Method" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="agent">Skyvern Agent</SelectItem>
-                <SelectItem value="code">Code</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          {runsWithCode && (
-            <>
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <Label>AI Fallback (cached scripts)</Label>
-                  <HelpTooltip content="If a cached-script run fails, fall back to AI and regenerate the script." />
-                  <Switch
-                    className="ml-auto"
-                    checked={data.aiFallback}
-                    onCheckedChange={(value) => update({ aiFallback: value })}
-                  />
-                </div>
-              </div>
-              <div className="space-y-2">
-                <div className="flex gap-2">
-                  <Label>Code Key (optional)</Label>
-                  <HelpTooltip content="A static or dynamic key for directing code generation." />
-                </div>
-                <WorkflowBlockInputTextarea
-                  name="scriptCacheKey"
-                  nodeId={blockId}
-                  onChange={(value) => {
-                    const v = value.length ? value : null;
-                    update({ scriptCacheKey: v });
-                  }}
-                  value={data.scriptCacheKey ?? ""}
-                  placeholder={placeholders["scripts"]["scriptKey"]}
-                  className="nopan text-xs"
-                />
-              </div>
-            </>
-          )}
         </SettingsGroup>
         <SettingsGroup
           id="webhook"

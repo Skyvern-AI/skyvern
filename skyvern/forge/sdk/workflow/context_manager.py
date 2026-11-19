@@ -3233,6 +3233,13 @@ class WorkflowContextManager:
                 and block.credential_source == "nango"
             ]
             if powerbi_block_labels:
+                # A run nothing issued capabilities for at its start — scheduled, event, or a Trigger block's child —
+                # has to ask for them before this read, because only the API process may mint one.
+                await app.AGENT_FUNCTION.request_gmail_hop_tokens(
+                    organization_id=organization.organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow=workflow,
+                )
                 powerbi_hop_tokens = await app.AGENT_FUNCTION.get_powerbi_query_hop_tokens(
                     organization_id=organization.organization_id,
                     workflow_run_id=workflow_run_id,

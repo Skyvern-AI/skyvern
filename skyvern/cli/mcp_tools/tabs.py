@@ -696,7 +696,26 @@ async def skyvern_tab_close(
 
     try:
         async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
-            await target.close()
+            if ctx.mode == "extension":
+                runtime = BrowserExtensionRuntime.instance()
+                if runtime is None:
+                    raise RuntimeError("The browser-extension runtime is not available")
+                result = await runtime.close_page_tab(target)
+                if result.get("kept") is True:
+                    forget_target(release_hooks=True)
+                    return make_result(
+                        "skyvern_tab_close",
+                        ok=False,
+                        browser_context=ctx,
+                        error=make_error(
+                            ErrorCode.ACTION_FAILED,
+                            f"Tab {closed_tab_id} was not closed: the page asked to keep unsaved changes. "
+                            "It stays open and is back with the user.",
+                            "",
+                        ),
+                    )
+            else:
+                await target.close()
     except ActionDeadlineExceeded as e:
         # The close may land after the deadline, so the selection is dropped either way: the next
         # action re-selects a live tab instead of a page that closed after this reply.

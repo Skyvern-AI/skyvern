@@ -35,8 +35,9 @@ from skyvern.forge.sdk.copilot.request_policy import ClarificationReason, Reques
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools.credentials import (
-    _credential_run_approval_blocker_signal,
-    _retire_stale_google_connection_denial,
+    UNAPPROVED_CONNECTION_REASON_CODE,
+    _connection_approval_blocker_signal,
+    _retire_stale_connection_denial,
 )
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
@@ -139,7 +140,7 @@ def test_google_run_gate_blocker_attaches_fresh_server_verified_choices() -> Non
         agent_steering_text="Ask the user to choose a connected Google account.",
         user_facing_reason="Choose one of the connected Google accounts below so I can run the workflow.",
         recovery_hint="ask_user_clarifying",
-        internal_reason_code="unapproved_google_connection_reference",
+        internal_reason_code=UNAPPROVED_CONNECTION_REASON_CODE,
         blocked_tool="update_and_run_blocks",
         preserves_workflow_draft=True,
     )
@@ -591,7 +592,7 @@ def test_output_policy_block_does_not_answer_with_the_google_account_picker() ->
         response_kind=ResponseKind.CLARIFY,
         connected_account_choices=choices,
     )
-    ctx.request_policy = RequestPolicy(existing_workflow_credential_ids=["goac_active"])
+    ctx.request_policy = RequestPolicy(existing_workflow_connection_ids=["goac_active"])
 
     result = _blocked_result(ctx, OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
 
@@ -601,15 +602,17 @@ def test_output_policy_block_does_not_answer_with_the_google_account_picker() ->
 
 def test_retired_google_denial_lets_the_completed_run_reply_stand() -> None:
     completed_reply = "I ran both blocks and wrote the value into the sheet."
-    definition = {
-        "parameters": [],
-        "blocks": [{"label": "write", "block_type": "google_sheets_write", "credential_id": "goac_admitted"}],
-    }
 
     def denied_ctx() -> CopilotContext:
         ctx = _ctx()
         ctx.request_policy = RequestPolicy()
-        signal = _credential_run_approval_blocker_signal(["goac_admitted"], ctx.request_policy)
+        signal = _connection_approval_blocker_signal(
+            ["goac_admitted"],
+            ctx.request_policy,
+            admitted_ids=(),
+            action="run the workflow",
+            blocked_tool="update_and_run_blocks",
+        )
         assert signal is not None
         ctx.blocker_signal = signal
         ctx.latest_tool_blocker_signal = signal
@@ -627,11 +630,7 @@ def test_retired_google_denial_lets_the_completed_run_reply_stand() -> None:
     assert blocked.turn_outcome.connected_account_choices == standing.connected_account_recovery_choices
 
     retired = denied_ctx()
-    _retire_stale_google_connection_denial(
-        retired,
-        workflow_definition=definition,
-        additional_approved_ids={"goac_admitted"},
-    )
+    _retire_stale_connection_denial(retired, workflow_refs=["goac_admitted"], admitted_ids={"goac_admitted"})
     preserved = _finalize_result_with_blocker_override(retired, _agent_result(completed_reply))
 
     assert retired.blocker_signal is None
@@ -650,8 +649,8 @@ def test_password_blocker_does_not_reuse_prior_google_choices() -> None:
         connected_account_choices=choices,
     )
     ctx.request_policy = RequestPolicy(
-        existing_workflow_credential_ids=["goac_active", "cred_password"],
-        run_approved_google_connection_ids=["goac_active"],
+        existing_workflow_connection_ids=["goac_active"],
+        run_approved_connection_ids=["goac_active"],
     )
 
     result = _blocked_result(ctx, OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)

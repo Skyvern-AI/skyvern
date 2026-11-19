@@ -93,7 +93,7 @@ class TestImageBlockMediaType:
     async def test_multi_frame_tiff_over_total_pixel_bound_is_refused(
         self, builder: MessagesBuilder, message_pattern: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("skyvern.forge.sdk.api.llm.utils._MAX_TOTAL_DECODED_IMAGE_PIXELS", 20)
+        monkeypatch.setattr("skyvern.forge.sdk.api.llm.utils.MAX_TOTAL_DECODED_IMAGE_PIXELS", 20)
         with pytest.raises(ValueError, match="more than 20 pixels across frames"):
             await builder(prompt="read", screenshots=[_multi_page_group4_tiff()], message_pattern=message_pattern)
 
@@ -117,7 +117,7 @@ class TestImageBlockMediaType:
     async def test_image_past_the_pixel_bound_is_refused(
         self, builder: MessagesBuilder, message_pattern: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("skyvern.forge.sdk.api.llm.utils._MAX_DECODED_IMAGE_PIXELS", 4)
+        monkeypatch.setattr("skyvern.forge.sdk.api.llm.utils.MAX_DECODED_IMAGE_PIXELS", 4)
         bmp = _encoded(Image.new("RGB", (4, 4), "white"), "BMP")
         with pytest.raises(ValueError, match="more than 4 pixels"):
             await self._send(builder, message_pattern, bmp)
@@ -126,7 +126,7 @@ class TestImageBlockMediaType:
 @pytest.mark.asyncio
 async def test_fourteen_page_tiff_fits_fax_pixel_budget() -> None:
     assert llm_utils._MAX_DECODED_IMAGE_FRAMES == 20
-    assert llm_utils._MAX_TOTAL_DECODED_IMAGE_PIXELS >= 14 * 1728 * 2200
+    assert llm_utils.MAX_TOTAL_DECODED_IMAGE_PIXELS >= 14 * 1728 * 2200
     normalized = await normalize_llm_image(_multi_page_group4_tiff(page_count=14))
     assert isinstance(normalized, list)
     assert len(normalized) == 14

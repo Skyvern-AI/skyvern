@@ -245,3 +245,33 @@ class TestBuildWorkflowGraphWithFinallyBlock:
         svc = WorkflowService()
         with pytest.raises(InvalidWorkflowDefinition, match="unknown next_block_label"):
             svc._build_workflow_graph(dag_blocks)
+
+    def test_dag_validation_with_conditional_merging_into_own_branch_target_and_terminal_pointing_to_finally(self):
+        cond_block = ConditionalBlock(
+            label="check",
+            output_parameter=_make_output_parameter("check"),
+            next_block_label="draft",
+            branch_conditions=[
+                BranchCondition(
+                    next_block_label="draft",
+                    criteria={"criteria_type": "jinja2_template", "expression": "{{ true }}"},
+                ),
+                BranchCondition(next_block_label="report", is_default=True),
+            ],
+        )
+        dag_blocks = WorkflowService._strip_finally_block_references(
+            [
+                cond_block,
+                _make_task_block("draft", next_block_label="review"),
+                _make_task_block("review", next_block_label="report"),
+                _make_task_block("report", next_block_label="finally_block"),
+                _make_http_block("finally_block"),
+            ],
+            "finally_block",
+        )
+
+        start_label, label_to_block, default_next_map = WorkflowService()._build_workflow_graph(dag_blocks)
+
+        assert start_label == "check"
+        assert set(label_to_block.keys()) == {"check", "draft", "review", "report"}
+        assert default_next_map["report"] is None

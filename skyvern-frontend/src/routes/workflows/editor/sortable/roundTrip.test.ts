@@ -23,6 +23,7 @@ import {
   type CodeBlock,
   type EmailInboxBlock,
   type ForLoopBlock,
+  type IntegrationActionBlock,
   type OutputParameter,
   type PowerBIQueryBlock,
   type SendEmailBlock,
@@ -451,6 +452,58 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     });
   });
 
+  test("integration action keeps its ids, account and typed inputs through load and save", () => {
+    const block: IntegrationActionBlock = {
+      label: "add_invoice_row",
+      block_type: "integration_action",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("add_invoice_row"),
+      integration_id: "google_sheets",
+      action_id: "add_row",
+      connection_id: "goc_1",
+      inputs: {
+        sheet_name: "Invoices",
+        values: "{{ agent_step.amount }}",
+        row_count: 2,
+        create_if_missing: true,
+        column_mapping: { amount: "B" },
+      },
+      parameters: [makeWorkflowParameter("sheet_id")],
+    };
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    expect(
+      nodes.find((node) => node.type === "integrationAction")?.data,
+    ).toMatchObject({
+      integrationId: "google_sheets",
+      actionId: "add_row",
+      connectionId: "goc_1",
+      inputs: block.inputs,
+    });
+    const expected = {
+      block_type: "integration_action",
+      integration_id: "google_sheets",
+      action_id: "add_row",
+      connection_id: "goc_1",
+      inputs: block.inputs,
+      parameter_keys: ["sheet_id"],
+    };
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject(expected);
+    expect(
+      convert({
+        workflow_definition: { version: 2, parameters: [], blocks: [block] },
+      } as unknown as WorkflowApiResponse).workflow_definition.blocks[0],
+    ).toMatchObject(expected);
+
+    const fresh = createNode({ id: "new" }, "integrationAction", "block_1");
+    expect(getWorkflowBlocks([fresh], [])[0]).toMatchObject({
+      block_type: "integration_action",
+      connection_id: null,
+      inputs: {},
+    });
+  });
+
   test("Power BI preserves connection, DAX, dataset, row cap, and bindings", () => {
     const block = makePowerBIQueryBlock();
     const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
@@ -661,6 +714,81 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
       download_attachments: false,
     });
   });
+
+  test.each([
+    {
+      organize: {
+        organize_action: "label" as const,
+        organize_label: "Processed",
+      },
+    },
+    { organize: { organize_action: null, organize_label: null } },
+    { organize: {} },
+  ])(
+    "email inbox preserves organize settings through conversion: $organize",
+    ({ organize }) => {
+      const block: EmailInboxBlock = {
+        ...makeEmailInboxBlock("Read Inbox", []),
+        email_client: "gmail",
+        credential_id: null,
+        credential_source: "nango",
+        connection_id: "nc_synthetic_gmail",
+        ...organize,
+      };
+      const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+      const saved = getWorkflowBlocks(nodes, edges)[0];
+      const fromDefinition = convert({
+        workflow_definition: { version: 2, parameters: [], blocks: [block] },
+      } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+
+      for (const converted of [saved, fromDefinition]) {
+        const yamlBlock = parse(stringify(converted));
+        expect(yamlBlock.organize_action).toBe(organize.organize_action);
+        expect(yamlBlock.organize_label).toBe(organize.organize_label);
+        expect("organize_action" in yamlBlock).toBe(
+          "organize_action" in organize,
+        );
+        expect("organize_label" in yamlBlock).toBe(
+          "organize_label" in organize,
+        );
+      }
+
+      const reloaded = getElements(
+        [{ ...block, ...parse(stringify(saved)) } as EmailInboxBlock],
+        DEFAULT_SETTINGS,
+        true,
+      );
+      expect(getWorkflowBlocks(reloaded.nodes, reloaded.edges)[0]).toEqual(
+        saved,
+      );
+    },
+  );
+
+  test.each([
+    { emailClient: "outlook" as const, credentialSource: "nango" as const },
+    { emailClient: "gmail" as const, credentialSource: "native" as const },
+  ])(
+    "email inbox omits organize settings for an unsupported mailbox: $emailClient",
+    (mailbox) => {
+      const block: EmailInboxBlock = {
+        ...makeEmailInboxBlock("Read Inbox", []),
+        email_client: "gmail",
+        credential_id: null,
+        credential_source: "nango",
+        connection_id: "nc_synthetic_gmail",
+        organize_action: "label",
+        organize_label: "Processed",
+      };
+      const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+      const node = nodes.find((candidate) => candidate.type === "emailInbox");
+      if (!node || node.type !== "emailInbox")
+        throw new Error("Expected email inbox node");
+      Object.assign(node.data, mailbox);
+      const saved = parse(stringify(getWorkflowBlocks(nodes, edges)[0]));
+      expect(saved).not.toHaveProperty("organize_action");
+      expect(saved).not.toHaveProperty("organize_label");
+    },
+  );
 
   test("Nango Gmail source and connection survive API, editor, YAML, and reload", () => {
     const block: EmailInboxBlock = {

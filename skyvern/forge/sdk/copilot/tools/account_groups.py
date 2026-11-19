@@ -3,40 +3,58 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import re
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Awaitable, Iterable
+from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Literal
+from typing import Literal, TypeVar
 from uuid import uuid4
 
 import structlog
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, Field, JsonValue, ValidationError
 
 from skyvern.config import settings
-from skyvern.exceptions import MissingBrowserAddressError, SkyvernHTTPException
+from skyvern.exceptions import InvalidWorkflowParameter, MissingBrowserAddressError, SkyvernHTTPException
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AuditEvent
 from skyvern.forge.sdk.copilot.ask_user import (
+    INPUT_GROUP_TOOL_NAME,
     REPEAT_RISK_OUTCOMES,
+    ROW_GROUP_PAGE_SIZE,
+    SINGLE_RUN_TOOL_NAME,
     AccountGroupCancelReview,
     AccountGroupReview,
     AccountGroupRow,
     AccountGroupRunRow,
     QuestionInteraction,
+    RunCostFacts,
     wait_for_interaction,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.cost_telemetry import exclude_workflow_block_cost
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
+from skyvern.forge.sdk.copilot.proposal_accept import accept_copilot_proposal
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure, scrub_secrets_from_text
+from skyvern.forge.sdk.copilot.tools._shared import _executable_workflow_block_labels
 from skyvern.forge.sdk.copilot.tools.credentials import (
     _credential_run_approval_error,
     _extract_credential_ids_from_tool_value,
+    _extract_credential_ids_from_workflow_parameters,
+    run_credential_gate,
 )
-from skyvern.forge.sdk.copilot.tools.mcp_hooks import _chat_has_pending_proposal
-from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
-from skyvern.forge.sdk.copilot.workflow_yaml import workflow_to_copilot_yaml
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import PENDING_PROPOSAL_FACT, _chat_has_pending_proposal
+from skyvern.forge.sdk.copilot.tools.run_execution import _declared_execution_snapshot, _run_credits_used
+from skyvern.forge.sdk.copilot.tools.workflow_update import adopt_stored_workflow_candidate
+from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    block_credential_ids,
+    credential_param_ids,
+    declared_parameters,
+    parse_workflow_yaml,
+    workflow_blocks,
+    workflow_connection_refs,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.run_submission_gate import run_submission_slot
@@ -45,30 +63,54 @@ from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.db.id import generate_workflow_run_id
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    CopilotProposalMetadata,
+    WorkflowCopilotChat,
+    copilot_proposal_metadata,
+)
 from skyvern.forge.sdk.services.request_principal import (
     RequestPrincipal,
     enforce_principal_role,
     get_request_principal,
     trigger_owner_id,
 )
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.block_notes import strip_inert_block_fields
-from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    CredentialParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+    is_sensitive_workflow_parameter,
+)
 from skyvern.forge.sdk.workflow.models.tags import CallerType
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowDefinition,
+    WorkflowRequestBody,
+    WorkflowRun,
+    WorkflowRunParameter,
+    WorkflowRunStatus,
+)
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.workflow_run_groups import (
-    MAX_WORKFLOW_RUN_GROUP_ITEMS,
     WorkflowRunGroupCreateRequest,
     WorkflowRunGroupItemOutcome,
     WorkflowRunGroupItemRequest,
+    WorkflowRunGroupItemResponse,
     WorkflowRunGroupResponse,
     WorkflowRunGroupStatus,
 )
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import workflow_run_group_service, workflow_service
 from skyvern.services.organization_log_scope import organization_log_scope
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 
 LOG = structlog.get_logger()
+
+_T = TypeVar("_T")
+
+ACCOUNT_GROUP_MAX_ITEMS = 25
 
 SUBMIT_TOOL_DESCRIPTION = (
     "Run the saved workflow once per selected saved account, one run after another, each in a fresh "
@@ -85,13 +127,28 @@ SUBMIT_TOOL_DESCRIPTION = (
     "get_account_group_status for outcomes."
 )
 
+INPUT_GROUP_TOOL_DESCRIPTION = (
+    "Run the saved workflow once per input row. Each row is one real run of the saved version with that row's "
+    "values as its inputs, in its own fresh browser and with its own run record; inputs a row leaves out use their "
+    "saved defaults. Pass rows as objects mapping the saved workflow's input keys to values; every row must differ, "
+    "and a row cannot set a login or secret input. at_once is how many runs go at the same time, capped by the "
+    "organization's limit; the card shows the number that will be used. The organization's item limit caps how "
+    "many rows one card holds. The user reviews the rows on one card, can remove any, and approves or declines; "
+    "nothing runs without approval. The card starts unchecked any row whose last group run completed, may have "
+    "acted, or is still running. Runs keep going after your reply. The result only acknowledges dispatch; "
+    "get_account_group_status reads each run's id and outcome, and get_run_results with a run id reads that run."
+)
+
 SINGLE_RUN_TOOL_DESCRIPTION = (
     "Start one real run of the saved workflow, the same as the user pressing Run. It is not a test: it runs the "
     "saved version with the workflow's own browser profile and run settings, and it keeps running after your "
     "reply. Nothing runs until the user approves it on a card that lists the inputs you pass and the saved account "
     "each credential_id input uses; credentials set inside the workflow run as saved. Inputs you leave out use "
-    "their saved defaults; a credential_id input with neither runs without a credential, as Run does. The result "
-    "gives the workflow_run_id; get_run_results with that id reads the run's progress and outcome."
+    "their saved defaults; a credential_id input with neither runs without a credential, as Run does. When this chat "
+    "has an unsaved workflow change, the card says so, and the user's approval saves that change as a new version "
+    "and starts the run on it; a change to a saved login, connected account or browser profile is saved only by the "
+    "user accepting it. The result gives the workflow_run_id; get_run_results with that id reads the run's progress "
+    "and outcome."
 )
 
 _UNFINISHED_OUTCOMES = frozenset({WorkflowRunGroupItemOutcome.pending, WorkflowRunGroupItemOutcome.in_progress})
@@ -127,22 +184,36 @@ _VERIFIED_WORKFLOW_FIELDS = frozenset(
     }
 )
 
+_NON_LOGIN_PARAMETER_TYPES = frozenset({"workflow", "output", "context"})
+_PARAMETER_ROW_FIELDS = frozenset({"workflow_id", "created_at", "modified_at", "deleted_at"})
+
 _DEFINITION_HASH_DOMAIN = b"skyvern.copilot_account_group_definition.v1\0"
 _IDENTITY_HASH_DOMAIN = b"skyvern.copilot_account_group_identity.v1\0"
+_ROW_KEY_HASH_DOMAIN = b"skyvern.copilot_input_group_row.v1\0"
+_ROW_KEY_PATTERN = re.compile(r"[0-9a-f]{64}")
+_ROW_LABEL_LIMIT = 80
 _ACCOUNT_GROUP_KEY_ROOT = "copilot:"
 
-_PENDING_PROPOSAL_REFUSAL = (
-    "Nothing was submitted: this chat has a workflow change that is not saved yet, and a group runs the "
-    "saved version. End this turn so the change can be saved (the user accepts it, or auto-accept applies "
-    "it when the turn ends) or rejected, then propose the group again."
-)
+_PENDING_PROPOSAL_REFUSAL = f"Nothing was submitted: {PENDING_PROPOSAL_FACT}"
 
-_SINGLE_RUN_PENDING_PROPOSAL_REFUSAL = (
-    "Nothing was started: this chat has a workflow change waiting to be accepted or rejected, and this tool runs "
-    "the saved version."
+_SINGLE_RUN_PENDING_PROPOSAL_REFUSAL = f"Nothing was started: {PENDING_PROPOSAL_FACT}"
+
+_SINGLE_RUN_BINDING_REFUSAL = (
+    "Nothing was started: this tool runs the saved version, and this chat has an unsaved change to which saved "
+    "login the agent uses. The user saves it by accepting it, or keeps the saved version by rejecting it."
 )
 
 _SINGLE_RUN_STALE_VERSION_REFUSAL = "The saved workflow was updated after the review, so nothing was started."
+
+_SINGLE_RUN_DRAFT_REJECTED_REFUSAL = (
+    "Nothing was saved or started: the workflow change was rejected after the review, and the saved version is "
+    "unchanged."
+)
+
+_SINGLE_RUN_STALE_DRAFT_REFUSAL = (
+    "Nothing was saved or started: the workflow change or the saved workflow changed after the review. "
+    "Propose the run again so the user can review the current version."
+)
 
 _SINGLE_RUN_NOTE = "The run is not tied to this turn and keeps going after it ends."
 
@@ -150,10 +221,24 @@ _SINGLE_RUN_UNCONFIRMED = (
     "Starting the run raised an error after its run id was created, so the run may or may not exist."
 )
 
+_QUOTA_UNREADABLE_NOTE = "The account's credits could not be read just now, so no credit numbers are shown."
+
 _STATUS_NOTE = (
     "Runs execute one after another. Pending and in-progress rows have no result yet; "
     "use get_account_group_status for outcomes."
 )
+
+_INPUT_GROUP_OFF_REFUSAL = (
+    "Running the saved workflow once per input row is turned off, so nothing was started. run_saved_workflow, "
+    "when offered, starts one run per card."
+)
+
+
+def _row_group_status_note(max_concurrency: int) -> str:
+    return (
+        f"Up to {max_concurrency} runs execute at a time. Pending and in-progress rows have no result yet; "
+        "use get_account_group_status for outcomes."
+    )
 
 
 class AccountGroupRefused(Exception):
@@ -175,7 +260,11 @@ class AccountGroupSubmission(BaseModel):
     clean_group_run_id: str | None = None
     credential_parameter_used_by: list[str] = Field(default_factory=list)
     rows: list[AccountGroupRunRow] = Field(default_factory=list)
+    counts: dict[WorkflowRunGroupItemOutcome, int] | None = None
+    next_offset: int | None = None
     repeated_after_prior_effect: list[AccountGroupRow] = Field(default_factory=list)
+    repeated_count: int | None = None
+    cost: RunCostFacts | None = Field(default=None, exclude_if=lambda cost: cost is None)
     note: str
 
 
@@ -184,8 +273,10 @@ class SingleRunSubmission(BaseModel):
     approved: bool
     dispatched: bool | None
     workflow_run_id: str | None = None
+    saved_version: int | None = None
     error: str | None = None
     note: str | None = None
+    cost: RunCostFacts | None = Field(default=None, exclude_if=lambda cost: cost is None)
 
 
 class AccountGroupState(BaseModel):
@@ -193,6 +284,8 @@ class AccountGroupState(BaseModel):
     workflow_run_group_id: str
     status: WorkflowRunGroupStatus
     rows: list[AccountGroupRunRow]
+    counts: dict[WorkflowRunGroupItemOutcome, int] | None = None
+    next_offset: int | None = None
     cancel_approved: bool | None = None
 
 
@@ -207,12 +300,29 @@ async def _require_run_role() -> None:
         ) from e
 
 
+async def _require_save_permission(chat_id: str) -> None:
+    principal = get_request_principal()
+    try:
+        await enforce_principal_role(principal, "workflow.update")
+        await app.AGENT_FUNCTION.enforce_folder_access(
+            principal, "workflow.update", {"workflow_copilot_chat_id": chat_id}
+        )
+    except HTTPException as e:
+        if e.status_code != 403:
+            raise AccountGroupRefused(
+                "Nothing was saved or started: the save permission could not be checked just now."
+            ) from e
+        raise AccountGroupRefused(
+            "Nothing was saved or started: the person in this chat does not have permission to save this workflow."
+        ) from e
+
+
 def single_run_submit_enabled() -> bool:
-    return settings.COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED
+    return settings.EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED
 
 
 def account_group_submit_enabled() -> bool:
-    return settings.COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED and settings.WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED
+    return settings.EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED and settings.WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED
 
 
 def workflow_definition_hash(workflow: Workflow) -> str:
@@ -241,6 +351,15 @@ def account_group_submission_key(chat_id: str, interaction_id: str, definition_h
 def _approved_request(
     chat_id: str, interaction_id: str, review: AccountGroupReview, approved_ids: list[str]
 ) -> WorkflowRunGroupCreateRequest:
+    if review.row_group:
+        inputs = {row.credential_id: row.inputs or {} for row in review.rows}
+        return WorkflowRunGroupCreateRequest(
+            workflow_id=review.workflow_permanent_id,
+            version=review.version,
+            submission_key=account_group_submission_key(chat_id, interaction_id, review.definition_hash),
+            items=[WorkflowRunGroupItemRequest(key=key, parameters=inputs[key]) for key in approved_ids],
+            max_concurrency=review.max_concurrency or 1,
+        )
     return WorkflowRunGroupCreateRequest(
         workflow_id=review.workflow_permanent_id,
         version=review.version,
@@ -252,6 +371,7 @@ def _approved_request(
             )
             for credential_id in approved_ids
         ],
+        max_concurrency=1,
     )
 
 
@@ -271,7 +391,7 @@ async def recover_account_group_links(
         ):
             continue
         try:
-            request = _approved_request(chat_id, interaction.interaction_id, review, decision.credential_ids)
+            request = _approved_request(chat_id, interaction.interaction_id, review, decision.selected_ids)
         except Exception:
             LOG.warning(
                 "Skipping an approved review whose request cannot be rebuilt",
@@ -345,7 +465,7 @@ async def _clean_group_run_id(
 
 
 def _blocks_using_parameter(workflow: Workflow, key: str) -> list[str]:
-    parsed = parse_workflow_yaml(workflow_to_copilot_yaml(workflow))
+    parsed = parse_workflow_yaml(workflow_to_authoring_yaml(workflow))
     return [
         str(block.get("label"))
         for block in workflow_blocks(parsed if isinstance(parsed, dict) else {})
@@ -405,6 +525,141 @@ def _check_common_inputs(ctx: CopilotContext, common_inputs: dict[str, JsonValue
         raise AccountGroupRefused(approval_error)
 
 
+async def _check_connected_accounts(
+    ctx: CopilotContext,
+    workflow: Workflow,
+    common_inputs: dict[str, JsonValue],
+    *,
+    action: str = "run the workflow for these accounts",
+    blocked_tool: str = "run_workflow_for_accounts",
+) -> None:
+    gate = await run_credential_gate(
+        ctx,
+        workflow.workflow_definition,
+        labels=None,
+        run_parameters=dict(common_inputs),
+        action=action,
+        blocked_tool=blocked_tool,
+    )
+    if gate.error is not None:
+        raise AccountGroupRefused(gate.error)
+
+
+async def _check_draft_connected_accounts(
+    ctx: CopilotContext, draft: Workflow, common_inputs: dict[str, JsonValue]
+) -> None:
+    await _check_connected_accounts(
+        ctx, draft, common_inputs, action="save and run the workflow change", blocked_tool=SINGLE_RUN_TOOL_NAME
+    )
+
+
+async def _fact(name: str, read: Awaitable[_T]) -> _T | None:
+    try:
+        return await read
+    except Exception:
+        LOG.warning("A run card cost fact could not be read", fact=name, exc_info=True)
+        return None
+
+
+async def _accepted_tested_run(ctx: CopilotContext, saved: Workflow) -> WorkflowRun | None:
+    if ctx.workflow_copilot_chat_id is None:
+        return None
+    chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=ctx.organization_id, workflow_copilot_chat_id=ctx.workflow_copilot_chat_id
+    )
+    receipt = chat.accepted_tested_run if chat is not None else None
+    if (
+        receipt is None
+        or receipt.workflow_run_id is None
+        or (receipt.workflow_id, receipt.modified_at) != (saved.workflow_id, saved.modified_at)
+    ):
+        return None
+    return await app.DATABASE.workflow_runs.get_workflow_run(
+        receipt.workflow_run_id, organization_id=ctx.organization_id
+    )
+
+
+async def _based_on_run(ctx: CopilotContext, run_id: str | None, saved: Workflow | None) -> WorkflowRun | None:
+    if run_id is not None:
+        return await _fact(
+            "based_on_run", app.DATABASE.workflow_runs.get_workflow_run(run_id, organization_id=ctx.organization_id)
+        )
+    if saved is None:
+        return None
+    tested, completed = await asyncio.gather(
+        _fact("accepted_tested_run", _accepted_tested_run(ctx, saved)),
+        _fact(
+            "based_on_run",
+            app.DATABASE.workflow_runs.get_latest_finished_run_for_workflow_version(
+                ctx.organization_id, saved.workflow_permanent_id, saved.workflow_id, saved.modified_at
+            ),
+        ),
+    )
+    return max((run for run in (tested, completed) if run is not None), key=lambda run: run.created_at, default=None)
+
+
+def _shown_run_inputs(
+    ctx: CopilotContext, run_parameters: list[tuple[WorkflowParameter, WorkflowRunParameter]]
+) -> dict[str, JsonValue]:
+    inputs: dict[str, JsonValue] = {
+        parameter.key: REDACTED_SECRET_PLACEHOLDER if is_sensitive_workflow_parameter(parameter) else value.value
+        for parameter, value in run_parameters
+    }
+    return scrub_secrets_from_structure(ctx, inputs)
+
+
+async def _run_cost_facts(
+    ctx: CopilotContext,
+    *,
+    definition: WorkflowDefinition,
+    based_on_run_id: str | None,
+    saved: Workflow | None,
+    runs_to_start: int,
+) -> tuple[RunCostFacts, dict[str, JsonValue] | None]:
+    usage, stop_rule, run = await asyncio.gather(
+        _fact("usage", app.AGENT_FUNCTION.get_organization_usage_quota(organization_id=ctx.organization_id)),
+        _fact("stop_rule", app.AGENT_FUNCTION.copilot_run_stop_rule(organization_id=ctx.organization_id)),
+        _based_on_run(ctx, based_on_run_id, saved),
+    )
+    labels = _executable_workflow_block_labels(definition)
+    based_on_inputs: dict[str, JsonValue] | None = None
+    blocks_completed: int | None = None
+    if run is not None:
+        completed, run_parameters = await asyncio.gather(
+            _fact(
+                "run_blocks",
+                app.DATABASE.observer.get_completed_workflow_run_block_labels(run.workflow_run_id, ctx.organization_id),
+            ),
+            _fact("run_inputs", app.DATABASE.workflow_runs.get_workflow_run_parameters(run.workflow_run_id)),
+        )
+        if run_parameters is not None:
+            based_on_inputs = _shown_run_inputs(ctx, run_parameters)
+        if completed is not None:
+            blocks_completed = len(completed.intersection(labels))
+    based_on_run_id = run.workflow_run_id if run is not None else None
+    note = _QUOTA_UNREADABLE_NOTE if usage is None else usage.credits_note
+    if usage is None or note is not None:
+        return RunCostFacts(based_on_run_id=based_on_run_id, credits_note=note, stop_rule=stop_rule), based_on_inputs
+    credits = _run_credits_used(run)
+    whole_run = (
+        run is not None
+        and run.status == WorkflowRunStatus.completed
+        and len(labels) > 0
+        and blocks_completed == len(labels)
+    )
+    cost = RunCostFacts(
+        runs_to_start=runs_to_start,
+        based_on_run_id=based_on_run_id,
+        based_on_credits=credits,
+        blocks_completed=blocks_completed,
+        blocks_total=len(labels) if run is not None else None,
+        estimate_from_one_run=runs_to_start * credits if whole_run and credits is not None else None,
+        balance_credits=usage.remaining_credits,
+        stop_rule=stop_rule,
+    )
+    return cost, based_on_inputs
+
+
 async def build_review(
     ctx: CopilotContext,
     *,
@@ -414,10 +669,10 @@ async def build_review(
     action_summary: str,
 ) -> AccountGroupReview:
     await _require_run_role()
-    if len(credential_ids) > MAX_WORKFLOW_RUN_GROUP_ITEMS:
+    if len(credential_ids) > ACCOUNT_GROUP_MAX_ITEMS:
         raise AccountGroupRefused(
             f"{len(credential_ids)} accounts were selected and one group runs at most "
-            f"{MAX_WORKFLOW_RUN_GROUP_ITEMS}. Nothing was submitted. Offer the user separate reviewed groups. "
+            f"{ACCOUNT_GROUP_MAX_ITEMS}. Nothing was submitted. Offer the user separate reviewed groups. "
             f"All selected ids: {credential_ids}."
         )
     if not credential_ids:
@@ -431,6 +686,7 @@ async def build_review(
     if await _chat_has_pending_proposal(ctx):
         raise AccountGroupRefused(_PENDING_PROPOSAL_REFUSAL)
     workflow = await _saved_workflow(ctx)
+    await _check_connected_accounts(ctx, workflow, common_inputs)
     if reason := workflow_run_group_service.non_fresh_browser_reason(workflow):
         raise AccountGroupRefused(f"The saved workflow cannot run as a group because it has {reason}.")
     credential_parameter = await _require_credential_parameter(workflow, credential_parameter_key)
@@ -444,6 +700,24 @@ async def build_review(
     except SkyvernHTTPException as e:
         raise AccountGroupRefused(str(e)) from e
     last_groups, prior_outcomes = await _latest_outcomes(ctx, workflow, credential_ids)
+    rows = [
+        AccountGroupRow(
+            credential_id=credential_id,
+            label=_label(credentials[credential_id]),
+            identity=_identity_digest(credentials[credential_id]),
+            prior_outcome=prior_outcomes.get(credential_id),
+            last_group_id=last_groups.get(credential_id),
+            preselected=prior_outcomes.get(credential_id) not in REPEAT_RISK_OUTCOMES,
+        )
+        for credential_id in credential_ids
+    ]
+    cost, based_on_inputs = await _run_cost_facts(
+        ctx,
+        definition=workflow.workflow_definition,
+        based_on_run_id=None,
+        saved=workflow,
+        runs_to_start=sum(row.preselected for row in rows),
+    )
     return AccountGroupReview(
         workflow_permanent_id=workflow.workflow_permanent_id,
         workflow_id=workflow.workflow_id,
@@ -456,17 +730,161 @@ async def build_review(
         common_inputs=common_inputs,
         clean_group_run_id=await _clean_group_run_id(ctx, workflow, credential_parameter, credential_ids),
         credential_parameter_used_by=_blocks_using_parameter(workflow, credential_parameter_key),
-        rows=[
-            AccountGroupRow(
-                credential_id=credential_id,
-                label=_label(credentials[credential_id]),
-                identity=_identity_digest(credentials[credential_id]),
-                prior_outcome=prior_outcomes.get(credential_id),
-                last_group_id=last_groups.get(credential_id),
-                preselected=prior_outcomes.get(credential_id) not in REPEAT_RISK_OUTCOMES,
-            )
-            for credential_id in credential_ids
-        ],
+        rows=rows,
+        cost=cost,
+        based_on_inputs=based_on_inputs,
+    )
+
+
+def _typed_value(value: JsonValue, parameter: WorkflowParameter | None) -> JsonValue:
+    if parameter is None:
+        return value
+    # Matches WorkflowService._serialize_workflow_run_parameter_value: a run stores objects and arrays as JSON text.
+    value = json.dumps(value) if isinstance(value, (dict, list)) else value
+    try:
+        return parameter.workflow_parameter_type.convert_value(value)
+    except InvalidWorkflowParameter:
+        return value
+
+
+def _row_key(row: dict[str, JsonValue], parameters: dict[str, WorkflowParameter]) -> str:
+    # Keyed and canonical over the typed values that differ from the saved defaults, so rows that run the same under
+    # the same defaults share a key that reveals no value. A request null runs as the default; JSON text decoding to
+    # null runs as null.
+    typed = {key: _typed_value(value, parameters.get(key)) for key, value in row.items() if value is not None}
+    effective = {
+        key: value for key, value in typed.items() if key not in parameters or value != parameters[key].default_value
+    }
+    message = _ROW_KEY_HASH_DOMAIN + json.dumps(effective, sort_keys=True).encode()
+    return hmac.new(settings.SECRET_KEY.encode(), message, sha256).hexdigest()
+
+
+def _row_label(row: dict[str, JsonValue], position: int) -> str:
+    label = ", ".join(f"{key}: {value if isinstance(value, str) else json.dumps(value)}" for key, value in row.items())
+    if not label:
+        return f"Row {position + 1}"
+    return label if len(label) <= _ROW_LABEL_LIMIT else f"{label[: _ROW_LABEL_LIMIT - 1]}…"
+
+
+async def _check_row(
+    ctx: CopilotContext,
+    workflow: Workflow,
+    parameters: dict[str, WorkflowParameter],
+    organization: Organization,
+    position: int,
+    row: dict[str, JsonValue],
+) -> None:
+    if unknown := sorted(set(row) - set(parameters)):
+        raise AccountGroupRefused(
+            f"Row {position + 1} sets {unknown}, which are not inputs of the saved workflow (its inputs: "
+            f"{sorted(parameters)}). Nothing was started. Pass only the saved workflow's input keys."
+        )
+    if logins := sorted(key for key in row if is_sensitive_workflow_parameter(parameters[key])):
+        raise AccountGroupRefused(
+            f"Row {position + 1} sets {logins}, which take a login or secret, and a row cannot set a login or secret "
+            "input; the saved value of such an input still applies to every run. Nothing was started. "
+            "run_workflow_for_accounts runs the saved workflow once per saved login, and "
+            "run_saved_workflow runs it once with the login it is given."
+        )
+    _check_run_inputs(ctx, row)
+    await _check_connected_accounts(
+        ctx, workflow, row, action="run the workflow for these rows", blocked_tool=INPUT_GROUP_TOOL_NAME
+    )
+    try:
+        await app.WORKFLOW_SERVICE.validate_schedule_parameters(
+            workflow, organization, row, workflow_parameters=list(parameters.values())
+        )
+    except SkyvernHTTPException as e:
+        raise AccountGroupRefused(f"Row {position + 1}: {e}") from e
+
+
+async def _parameters_by_key(workflow: Workflow) -> dict[str, WorkflowParameter]:
+    return {
+        parameter.key: parameter
+        for parameter in await app.WORKFLOW_SERVICE.get_workflow_parameters(workflow_id=workflow.workflow_id)
+    }
+
+
+async def _check_rows(
+    ctx: CopilotContext,
+    workflow: Workflow,
+    parameters: dict[str, WorkflowParameter],
+    rows: Iterable[tuple[int, dict[str, JsonValue]]],
+) -> None:
+    organization = await _organization(ctx)
+    for position, row in rows:
+        await _check_row(ctx, workflow, parameters, organization, position, row)
+
+
+async def build_row_review(
+    ctx: CopilotContext, *, rows: list[dict[str, JsonValue]], at_once: int, action_summary: str
+) -> AccountGroupReview:
+    if not account_group_submit_enabled():
+        raise AccountGroupRefused(_INPUT_GROUP_OFF_REFUSAL)
+    await _require_run_role()
+    if not rows:
+        raise AccountGroupRefused("Pass at least one row. Nothing was started.")
+    if at_once < 1:
+        raise AccountGroupRefused("at_once must be at least 1. Nothing was started.")
+    limits = await app.AGENT_FUNCTION.workflow_run_group_limits(organization_id=ctx.organization_id)
+    if len(rows) > limits.max_items:
+        raise AccountGroupRefused(
+            f"{len(rows)} rows were passed and one group runs at most {limits.max_items} for this organization. "
+            "Nothing was started. Split the rows across several calls; each one gets its own card."
+        )
+    if await _chat_has_pending_proposal(ctx):
+        raise AccountGroupRefused(_PENDING_PROPOSAL_REFUSAL)
+    workflow = await _saved_workflow(ctx)
+    if reason := workflow_run_group_service.non_fresh_browser_reason(workflow):
+        raise AccountGroupRefused(
+            f"The saved workflow cannot run once per row because it has {reason}. Nothing was started. Removing "
+            "that setting is a workflow change the user accepts; run_saved_workflow runs the workflow once as it is."
+        )
+    parameters = await _parameters_by_key(workflow)
+    keys = [_row_key(row, parameters) for row in rows]
+    first_position: dict[str, int] = {}
+    repeats = [
+        position + 1 for position, key in enumerate(keys) if first_position.setdefault(key, position) != position
+    ]
+    if repeats:
+        raise AccountGroupRefused(
+            f"Rows {repeats} run the same as an earlier row, counting a left-out input and its saved value as the "
+            "same. Nothing was started. Pass each row once."
+        )
+    await _check_rows(ctx, workflow, parameters, enumerate(rows))
+    last_groups, prior_outcomes = await _latest_outcomes(ctx, workflow, keys)
+    review_rows = [
+        AccountGroupRow(
+            credential_id=key,
+            label=_row_label(row, position),
+            inputs=row,
+            prior_outcome=prior_outcomes.get(key),
+            last_group_id=last_groups.get(key),
+            preselected=prior_outcomes.get(key) not in REPEAT_RISK_OUTCOMES,
+        )
+        for position, (key, row) in enumerate(zip(keys, rows, strict=True))
+    ]
+    cost, based_on_inputs = await _run_cost_facts(
+        ctx,
+        definition=workflow.workflow_definition,
+        based_on_run_id=None,
+        saved=workflow,
+        runs_to_start=sum(row.preselected for row in review_rows),
+    )
+    return AccountGroupReview(
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        workflow_id=workflow.workflow_id,
+        version=workflow.version,
+        workflow_title=workflow.title,
+        modified_at=workflow.modified_at,
+        definition_hash=workflow_definition_hash(workflow),
+        credential_parameter_key="",
+        action_summary=redact_raw_secrets_for_prompt(scrub_secrets_from_text(ctx, action_summary)),
+        row_group=True,
+        max_concurrency=min(at_once, limits.max_concurrency),
+        rows=review_rows,
+        cost=cost,
+        based_on_inputs=based_on_inputs,
     )
 
 
@@ -488,15 +906,28 @@ async def _recheck_approval(ctx: CopilotContext, review: AccountGroupReview, app
             "The saved workflow was updated after the review, so nothing was dispatched. "
             "Propose the group again so the user can review the current version."
         )
-    _check_common_inputs(ctx, review.common_inputs)
-    await _require_credential_parameter(workflow, review.credential_parameter_key)
-    credentials = await _resolve_credentials(ctx, approved_ids)
-    shown = {row.credential_id: row.identity for row in review.rows}
-    if renamed := sorted(i for i in approved_ids if _identity_digest(credentials[i]) != shown.get(i)):
-        raise AccountGroupRefused(
-            f"Nothing was dispatched: the saved account behind {renamed} changed after the review. "
-            "Propose the group again so the user can review the current accounts."
+    if review.row_group:
+        await _check_rows(
+            ctx,
+            workflow,
+            await _parameters_by_key(workflow),
+            [
+                (position, row.inputs or {})
+                for position, row in enumerate(review.rows)
+                if row.credential_id in approved_ids
+            ],
         )
+    else:
+        _check_common_inputs(ctx, review.common_inputs)
+        await _check_connected_accounts(ctx, workflow, review.common_inputs)
+        await _require_credential_parameter(workflow, review.credential_parameter_key)
+        credentials = await _resolve_credentials(ctx, approved_ids)
+        shown = {row.credential_id: row.identity for row in review.rows}
+        if renamed := sorted(i for i in approved_ids if _identity_digest(credentials[i]) != shown.get(i)):
+            raise AccountGroupRefused(
+                f"Nothing was dispatched: the saved account behind {renamed} changed after the review. "
+                "Propose the group again so the user can review the current accounts."
+            )
     reviewed = {row.credential_id: row.last_group_id for row in review.rows if row.credential_id in approved_ids}
     latest_groups = await app.DATABASE.workflow_run_groups.get_latest_group_ids_by_item_key(
         ctx.organization_id, workflow.workflow_permanent_id, _ACCOUNT_GROUP_KEY_ROOT, approved_ids
@@ -512,18 +943,29 @@ async def _recheck_approval(ctx: CopilotContext, review: AccountGroupReview, app
     return {credential_id: group_id for credential_id, group_id in reviewed.items() if group_id is not None}
 
 
-def _rows(group: WorkflowRunGroupResponse, labels: dict[str, str]) -> list[AccountGroupRunRow]:
+def _rows(items: Iterable[WorkflowRunGroupItemResponse], labels: dict[str, str]) -> list[AccountGroupRunRow]:
     return [
         AccountGroupRunRow(
             credential_id=item.key,
-            label=labels.get(item.key, item.key),
+            label=labels[item.key],
             workflow_run_id=item.workflow_run_id,
             run_status=item.run_status,
             outcome=item.outcome,
         )
-        for item in group.items
+        for item in items
         if item.key in labels
     ]
+
+
+def _page(
+    group: WorkflowRunGroupResponse, labels: dict[str, str], offset: int
+) -> tuple[list[AccountGroupRunRow], int | None]:
+    end = offset + ROW_GROUP_PAGE_SIZE
+    return _rows(group.items[offset:end], labels), end if len(group.items) > end else None
+
+
+def _outcome_counts(group: WorkflowRunGroupResponse) -> dict[WorkflowRunGroupItemOutcome, int]:
+    return dict(Counter(item.outcome for item in group.items))
 
 
 async def submit_approved(
@@ -533,8 +975,13 @@ async def submit_approved(
     decision = interaction.account_group_decision
     chat_id = ctx.workflow_copilot_chat_id
     if review is None or decision is None or not decision.approved or chat_id is None:
-        return AccountGroupSubmission(approved=False, dispatched=False, note="Nothing was dispatched.")
-    approved_ids = decision.credential_ids
+        return AccountGroupSubmission(
+            approved=False,
+            dispatched=False,
+            cost=review.cost.not_started() if review is not None and review.cost is not None else None,
+            note="Nothing was dispatched.",
+        )
+    approved_ids = decision.selected_ids
     # Held until the group exists, so a sibling tool call cannot publish a proposal after the recheck.
     async with ctx.proposal_mutation_lock:
         latest_groups = await _recheck_approval(ctx, review, approved_ids)
@@ -572,16 +1019,21 @@ async def submit_approved(
         await ctx.stream.send(
             {"type": "question_resolved", "interaction": submitted.model_dump(mode="json"), "continued": True}
         )
-    labels = {row.credential_id: row.label for row in review.rows}
+    rows, next_offset = _page(group, {row.credential_id: row.label for row in review.rows}, 0)
+    repeated = review.repeated_after_prior_effect(approved_ids)
     return AccountGroupSubmission(
         approved=True,
         dispatched=True,
         workflow_run_group_id=group.workflow_run_group_id,
         clean_group_run_id=review.clean_group_run_id,
         credential_parameter_used_by=review.credential_parameter_used_by,
-        rows=_rows(group, labels),
-        repeated_after_prior_effect=review.repeated_after_prior_effect(approved_ids),
-        note=_STATUS_NOTE,
+        rows=rows,
+        counts=_outcome_counts(group) if review.row_group else None,
+        next_offset=next_offset,
+        repeated_after_prior_effect=repeated[:ROW_GROUP_PAGE_SIZE],
+        repeated_count=len(repeated) if review.row_group else None,
+        cost=review.cost.for_runs(len(approved_ids)) if review.cost is not None else None,
+        note=_row_group_status_note(review.max_concurrency or 1) if review.row_group else _STATUS_NOTE,
     )
 
 
@@ -594,14 +1046,37 @@ async def run_for_accounts(
     common_inputs: dict[str, JsonValue],
     action_summary: str,
 ) -> AccountGroupSubmission | AccountGroupRefusal:
-    try:
-        review = await build_review(
+    return await _review_and_submit(
+        ctx,
+        tool_call_id,
+        build_review(
             ctx,
             credential_ids=credential_ids,
             credential_parameter_key=credential_parameter_key,
             common_inputs=common_inputs,
             action_summary=action_summary,
-        )
+        ),
+    )
+
+
+async def run_for_inputs(
+    ctx: CopilotContext,
+    *,
+    tool_call_id: str,
+    rows: list[dict[str, JsonValue]],
+    at_once: int,
+    action_summary: str,
+) -> AccountGroupSubmission | AccountGroupRefusal:
+    return await _review_and_submit(
+        ctx, tool_call_id, build_row_review(ctx, rows=rows, at_once=at_once, action_summary=action_summary)
+    )
+
+
+async def _review_and_submit(
+    ctx: CopilotContext, tool_call_id: str, build: Awaitable[AccountGroupReview]
+) -> AccountGroupSubmission | AccountGroupRefusal:
+    try:
+        review = await build
         recorded = await wait_for_interaction(
             ctx,
             QuestionInteraction(
@@ -645,14 +1120,123 @@ def _single_run_credentials(parameters: list[WorkflowParameter], inputs: dict[st
     }
 
 
+async def _savable_draft(ctx: CopilotContext) -> tuple[Workflow, CopilotProposalMetadata] | None:
+    """The chat's unsaved draft the card can save, or None when nothing is pending."""
+    if not await _chat_has_pending_proposal(ctx):
+        return None
+    chat = (
+        await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+            organization_id=ctx.organization_id, workflow_copilot_chat_id=ctx.workflow_copilot_chat_id
+        )
+        if ctx.workflow_copilot_chat_id
+        else None
+    )
+    proposal = chat.proposed_workflow if chat is not None else None
+    metadata = copilot_proposal_metadata(proposal)
+    # An untokened proposal has nothing to bind the review to, and a settings-diverged one cannot vouch that its
+    # stored bytes are what the user reviewed.
+    if (
+        not isinstance(proposal, dict)
+        or metadata is None
+        or "workflow_definition" not in proposal
+        or metadata.claim_is_live(datetime.now(UTC))
+        or ctx.settings_diverged_proposal_token == (metadata.owner_turn_id, metadata.revision)
+    ):
+        raise AccountGroupRefused(_SINGLE_RUN_PENDING_PROPOSAL_REFUSAL)
+    try:
+        return Workflow.model_validate(proposal), metadata
+    except ValidationError as e:
+        raise AccountGroupRefused(_SINGLE_RUN_PENDING_PROPOSAL_REFUSAL) from e
+
+
+def _mentioned_input_defaults(value: object, defaults: dict[str, object]) -> dict[str, object]:
+    """A login field can name an input bare or in a template, so the defaults of every input it mentions count."""
+    # ponytail: a substring match can only over-count (an extra Accept), and covers any identifier the runtime accepts.
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    return {key: defaults[key] for key in sorted(defaults) if key in text}
+
+
+def _credential_bindings(workflow: Workflow) -> dict[str, list[str]]:
+    """The logins and connected accounts this version runs with when no run input overrides them, resolved the
+    way the runtime resolves them, since saving a draft keeps its definition and defaults for later runs."""
+    definition = workflow.workflow_definition.model_dump(mode="json")
+    parsed = {"workflow_definition": definition}
+    defaults = {
+        parameter["key"]: parameter.get("default_value")
+        for parameter in declared_parameters(parsed)
+        if isinstance(parameter, dict) and isinstance(parameter.get("key"), str)
+    }
+    # Mirrors resolve_credential_parameter_binding: a credential_id naming a parameter is that parameter's value.
+    for parameter in declared_parameters(parsed):
+        if (
+            isinstance(parameter, dict)
+            and str(parameter.get("parameter_type") or "").lower() == "credential"
+            and isinstance(named := defaults.get(str(parameter.get("credential_id"))), str)
+        ):
+            parameter["credential_id"] = named
+    parameter_ids = credential_param_ids(definition.get("parameters"))
+    # Order is kept: the runtime tries the primary login first, then the fallbacks in order.
+    bindings: dict[str, list[str]] = {}
+    for parameter in definition.get("parameters") or []:
+        if ids := _extract_credential_ids_from_workflow_parameters([parameter]):
+            bindings[f"parameter:{parameter.get('key')}"] = ids
+            bindings[f"fallbacks:{parameter.get('key')}"] = _extract_credential_ids_from_tool_value(
+                parameter.get("fallback_credential_ids")
+            )
+    # Every parameter that is not a plain input, block output or context value can resolve a login or secret,
+    # so it is compared whole; a new parameter type is covered without being listed here.
+    for parameter in declared_parameters(parsed):
+        if isinstance(parameter, dict) and parameter.get("parameter_type") not in _NON_LOGIN_PARAMETER_TYPES:
+            content = {
+                field: value
+                for field, value in parameter.items()
+                if field not in _PARAMETER_ROW_FIELDS and not field.endswith("_parameter_id")
+            }
+            content["input_defaults"] = _mentioned_input_defaults(content, defaults)
+            bindings[f"login_parameter:{parameter.get('key')}"] = [json.dumps(content, sort_keys=True, default=str)]
+    for block in workflow_blocks(parsed):
+        if block_ids := {
+            *_extract_credential_ids_from_workflow_parameters(block.get("parameters")),
+            *_extract_credential_ids_from_tool_value(block.get("credential_id")),
+            *block_credential_ids(block, parameter_ids),
+        }:
+            bindings[f"block:{block.get('label')}"] = sorted(block_ids)
+        if refs := workflow_connection_refs(parsed, selected_labels={str(block.get("label"))}, run_parameters=defaults):
+            bindings[f"connection:{block.get('label')}"] = sorted(refs)
+    # The memory switches pick the managed profile over the credential's profile or a fresh browser.
+    profile = [
+        workflow.browser_profile_id or "",
+        workflow.browser_profile_key or "",
+        str(workflow.persist_browser_session),
+        str(workflow.reuse_browser_session),
+    ]
+    bindings["browser_profile"] = [*profile, json.dumps(_mentioned_input_defaults(profile, defaults), default=str)]
+    return bindings
+
+
 async def build_single_run_review(
     ctx: CopilotContext, *, inputs: dict[str, JsonValue], action_summary: str
 ) -> AccountGroupReview:
     await _require_run_role()
-    if await _chat_has_pending_proposal(ctx):
-        raise AccountGroupRefused(_SINGLE_RUN_PENDING_PROPOSAL_REFUSAL)
-    workflow = await _saved_workflow(ctx)
-    parameters = await app.WORKFLOW_SERVICE.get_workflow_parameters(workflow_id=workflow.workflow_id)
+    draft = await _savable_draft(ctx)
+    metadata: CopilotProposalMetadata | None = None
+    if draft is None:
+        saved = await _saved_workflow(ctx)
+        workflow = saved
+        parameters = await app.WORKFLOW_SERVICE.get_workflow_parameters(workflow_id=workflow.workflow_id)
+    else:
+        workflow, metadata = draft
+        stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id, organization_id=ctx.organization_id
+        )
+        if stored is None:
+            raise AccountGroupRefused(_SINGLE_RUN_PENDING_PROPOSAL_REFUSAL)
+        saved = stored
+        if not workflow.workflow_definition.blocks:
+            raise AccountGroupRefused("The unsaved workflow change has no blocks to run, so nothing was started.")
+        if _credential_bindings(workflow) != _credential_bindings(saved):
+            raise AccountGroupRefused(_SINGLE_RUN_BINDING_REFUSAL)
+        parameters = list(_declared_execution_snapshot(workflow).workflow_parameters)
     definition_credential_keys = {
         parameter.key
         for parameter in workflow.workflow_definition.parameters
@@ -666,25 +1250,55 @@ async def build_single_run_review(
     credential_inputs = _single_run_credentials(parameters, inputs)
     common_inputs = {key: value for key, value in inputs.items() if key not in credential_inputs}
     _check_run_inputs(ctx, common_inputs)
+    if metadata is not None:
+        await _check_draft_connected_accounts(ctx, workflow, common_inputs)
     credentials = await _resolve_credentials(ctx, list(dict.fromkeys(credential_inputs.values())))
+    organization = await _organization(ctx)
     try:
-        await app.WORKFLOW_SERVICE.validate_schedule_parameters(
-            workflow, await _organization(ctx), {**common_inputs, **credential_inputs}
-        )
+        if metadata is None:
+            await app.WORKFLOW_SERVICE.validate_schedule_parameters(
+                workflow, organization, {**common_inputs, **credential_inputs}
+            )
+        else:
+            # The saved rows describe the version the draft replaces, so the draft's inputs get the check the run
+            # itself makes before it is created.
+            await app.WORKFLOW_SERVICE._refuse_unusable_request_parameters(
+                workflow=workflow,
+                workflow_parameters=parameters,
+                request_data={**common_inputs, **credential_inputs},
+                organization=organization,
+            )
     except SkyvernHTTPException as e:
         raise AccountGroupRefused(str(e)) from e
+    # Same source as the pending proposal's Tested badge: the stored disposition, which may carry no run id.
+    draft_tested = metadata is not None and metadata.disposition in ("review_tested", "auto_applicable")
+    tested_workflow_run_id = metadata.workflow_run_id if metadata is not None and draft_tested else None
+    cost, based_on_inputs = await _run_cost_facts(
+        ctx,
+        definition=workflow.workflow_definition,
+        based_on_run_id=tested_workflow_run_id,
+        saved=saved if metadata is None else None,
+        runs_to_start=1,
+    )
     return AccountGroupReview(
-        workflow_permanent_id=workflow.workflow_permanent_id,
-        workflow_id=workflow.workflow_id,
-        version=workflow.version,
+        workflow_permanent_id=saved.workflow_permanent_id,
+        workflow_id=saved.workflow_id,
+        version=saved.version,
         workflow_title=workflow.title,
-        modified_at=workflow.modified_at,
-        definition_hash=workflow_definition_hash(workflow),
+        modified_at=saved.modified_at,
+        definition_hash=workflow_definition_hash(saved),
         credential_parameter_key="",
         action_summary=redact_raw_secrets_for_prompt(scrub_secrets_from_text(ctx, action_summary)),
         common_inputs=common_inputs,
         single_run=True,
         credential_inputs=credential_inputs,
+        saves_draft=metadata is not None,
+        proposal_owner_turn_id=metadata.owner_turn_id if metadata is not None else None,
+        proposal_revision=metadata.revision if metadata is not None else None,
+        draft_tested=draft_tested,
+        tested_workflow_run_id=tested_workflow_run_id,
+        cost=cost,
+        based_on_inputs=based_on_inputs,
         rows=[
             AccountGroupRow(
                 credential_id=credential_id,
@@ -712,6 +1326,10 @@ async def _recheck_single_run(ctx: CopilotContext, review: AccountGroupReview) -
         list((await _credential_parameters(workflow)).values()), {**review.common_inputs, **review.credential_inputs}
     ) != review.credential_inputs:
         raise AccountGroupRefused(_SINGLE_RUN_STALE_VERSION_REFUSAL)
+    await _recheck_single_run_inputs(ctx, review)
+
+
+async def _recheck_single_run_inputs(ctx: CopilotContext, review: AccountGroupReview) -> None:
     _check_run_inputs(ctx, review.common_inputs)
     credentials = await _resolve_credentials(ctx, list(dict.fromkeys(row.credential_id for row in review.rows)))
     if changed := sorted(
@@ -721,6 +1339,87 @@ async def _recheck_single_run(ctx: CopilotContext, review: AccountGroupReview) -
             f"Nothing was started: the saved account behind {changed} changed after the review. "
             "Propose the run again so the user can review the current accounts."
         )
+
+
+def _stored_review(chat: WorkflowCopilotChat, interaction_id: str) -> AccountGroupReview | None:
+    for entry in chat.pending_turns.values():
+        for item in entry.question_interactions:
+            if item.interaction_id == interaction_id:
+                return item.account_group_review
+    return None
+
+
+async def _accepted_while_waiting(
+    ctx: CopilotContext, chat: WorkflowCopilotChat, interaction_id: str, review: AccountGroupReview
+) -> Workflow:
+    """The version an Accept saved from exactly the reviewed proposal, if nothing has written over it since."""
+    stored = _stored_review(chat, interaction_id)
+    saved = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=review.workflow_permanent_id, organization_id=ctx.organization_id
+    )
+    if (
+        (stored is None or stored.accepted_workflow_id is None)
+        and saved is not None
+        and (saved.workflow_id, saved.version, saved.modified_at)
+        == (review.workflow_id, review.version, review.modified_at)
+    ):
+        raise AccountGroupRefused(_SINGLE_RUN_DRAFT_REJECTED_REFUSAL)
+    if (
+        stored is None
+        or stored.accepted_workflow_id is None
+        or saved is None
+        or (saved.workflow_id, saved.version, saved.modified_at)
+        != (stored.accepted_workflow_id, stored.accepted_version, stored.accepted_modified_at)
+    ):
+        raise AccountGroupRefused(_SINGLE_RUN_STALE_VERSION_REFUSAL)
+    await _check_connected_accounts(
+        ctx, saved, review.common_inputs, action="run the workflow", blocked_tool=SINGLE_RUN_TOOL_NAME
+    )
+    return saved
+
+
+async def _recheck_draft_save(
+    ctx: CopilotContext, chat_id: str, interaction_id: str, review: AccountGroupReview
+) -> WorkflowCopilotChat | Workflow:
+    """The chat to save the reviewed draft from, or the version an Accept already saved from it."""
+    if not single_run_submit_enabled():
+        raise AccountGroupRefused("Starting runs from Copilot was turned off after the review, so nothing was started.")
+    await _require_run_role()
+    await _require_save_permission(chat_id)
+    await _recheck_single_run_inputs(ctx, review)
+    chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=ctx.organization_id, workflow_copilot_chat_id=chat_id
+    )
+    if chat is not None and chat.proposed_workflow is None:
+        return await _accepted_while_waiting(ctx, chat, interaction_id, review)
+    saved = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=review.workflow_permanent_id, organization_id=ctx.organization_id
+    )
+    if saved is None or (saved.workflow_id, saved.version, saved.modified_at) != (
+        review.workflow_id,
+        review.version,
+        review.modified_at,
+    ):
+        raise AccountGroupRefused(_SINGLE_RUN_STALE_VERSION_REFUSAL)
+    metadata = copilot_proposal_metadata(chat.proposed_workflow if chat is not None else None)
+    if (
+        chat is None
+        or metadata is None
+        or (metadata.owner_turn_id, metadata.revision)
+        != (
+            review.proposal_owner_turn_id,
+            review.proposal_revision,
+        )
+    ):
+        raise AccountGroupRefused(_SINGLE_RUN_STALE_DRAFT_REFUSAL)
+    if ctx.settings_diverged_proposal_token == (metadata.owner_turn_id, metadata.revision):
+        raise AccountGroupRefused(_SINGLE_RUN_PENDING_PROPOSAL_REFUSAL)
+    try:
+        draft = Workflow.model_validate(chat.proposed_workflow)
+    except ValidationError as e:
+        raise AccountGroupRefused(_SINGLE_RUN_STALE_DRAFT_REFUSAL) from e
+    await _check_draft_connected_accounts(ctx, draft, review.common_inputs)
+    return chat
 
 
 async def _start_run(
@@ -823,10 +1522,202 @@ async def _recheck_and_start_run(
             return AccountGroupRefusal(status_code=e.status_code, error=str(e.detail), dispatched=False)
 
 
-_PENDING_DISPATCHES: set[asyncio.Task[bool | None | AccountGroupRefusal]] = set()
+def _point_ctx_at_saved(ctx: CopilotContext, saved: Workflow) -> None:
+    """Drop the consumed proposal token and draft so a later edit this turn publishes against the saved version."""
+    ctx.proposal_owner_turn_id = None
+    ctx.proposal_revision = None
+    ctx.proposal_canonical_fingerprint = None
+    ctx.proposal_workflow_run_id = None
+    ctx.has_staged_proposal = False
+    ctx.staged_workflow = None
+    ctx.staged_workflow_yaml = None
+    ctx.last_workflow = None
+    ctx.last_workflow_yaml = None
+    ctx.last_good_workflow = None
+    ctx.last_good_workflow_yaml = None
+    ctx.workflow_id = saved.workflow_id
+    ctx.workflow_yaml = workflow_to_authoring_yaml(saved)
+    ctx.authored_private_workflow_settings = {}
+    ctx.private_workflow_settings = {}
 
 
-def _release_dispatch(task: asyncio.Task[bool | None | AccountGroupRefusal]) -> None:
+async def _start_saved_draft_run(
+    ctx: CopilotContext,
+    organization: Organization,
+    chat_id: str,
+    interaction_id: str,
+    review: AccountGroupReview,
+    saved: Workflow,
+    changed_fields: tuple[str, ...],
+    workflow_run_id: str,
+    *,
+    accepted_while_waiting: bool = False,
+) -> tuple[bool | None, str | None]:
+    """Whether the run started (None: may or may not exist), and why not; never raises, since the version exists."""
+    ctx.run_card_saved_workflow = saved
+    if await adopt_stored_workflow_candidate(ctx) != "cleared":
+        _point_ctx_at_saved(ctx, saved)
+    try:
+        if changed_fields:
+            await app.AGENT_FUNCTION.record_audit_event(
+                get_request_principal(),
+                AuditEvent(
+                    organization_id=organization.organization_id,
+                    action="workflow.update",
+                    resource_type="workflow",
+                    resource_id=saved.workflow_permanent_id,
+                    changed_fields=changed_fields,
+                ),
+            )
+        await app.DATABASE.workflow_params.record_copilot_single_run_save(
+            organization.organization_id,
+            chat_id,
+            interaction_id,
+            saved_workflow_id=saved.workflow_id,
+            saved_version=saved.version,
+            rollback_workflow=saved.model_dump(mode="json"),
+        )
+        current = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=saved.workflow_permanent_id, organization_id=organization.organization_id
+        )
+    except Exception:
+        LOG.warning("Copilot saved a draft from the run card but could not record it", exc_info=True)
+        return False, "the save could not be recorded in this chat. Propose the run again to run the saved version."
+    # Another chat can rewrite this version in place under the same id, so the content must still be the saved draft.
+    if (
+        current is None
+        or current.workflow_id != saved.workflow_id
+        or workflow_definition_hash(current) != workflow_definition_hash(saved)
+    ):
+        return False, _SINGLE_RUN_STALE_VERSION_REFUSAL
+    if accepted_while_waiting:
+        current = saved
+    run_review = review.model_copy(
+        update={"workflow_id": current.workflow_id, "version": current.version, "modified_at": current.modified_at}
+    )
+    try:
+        await PermissionCheckerFactory.get_instance().check(organization)
+        await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
+        started = await _start_run(
+            organization, chat_id, interaction_id, run_review, workflow_run_id, get_request_principal()
+        )
+    except AccountGroupRefused as e:
+        return False, str(e)
+    except (MissingBrowserAddressError, SkyvernHTTPException) as e:
+        return False, str(e)
+    except HTTPException as e:
+        return False, str(e.detail)
+    except Exception:
+        # _start_run returns None when the run may exist and raises only once it confirmed the run does not.
+        LOG.warning("Starting the run of a saved Copilot draft raised", workflow_run_id=workflow_run_id, exc_info=True)
+        return False, "the run could not be started, so no run exists. Propose the run again to run the saved version."
+    if started:
+        try:
+            await app.DATABASE.workflow_params.record_copilot_single_run_save(
+                organization.organization_id,
+                chat_id,
+                interaction_id,
+                saved_workflow_id=saved.workflow_id,
+                saved_version=saved.version,
+                run_started=True,
+            )
+        except Exception:
+            LOG.warning("Failed to record that a saved Copilot draft's run started", exc_info=True)
+    return started, None
+
+
+async def _save_and_start_run(
+    ctx: CopilotContext,
+    chat_id: str,
+    interaction: QuestionInteraction,
+    review: AccountGroupReview,
+    workflow_run_id: str,
+) -> SingleRunSubmission | AccountGroupRefusal:
+    # Held through dispatch, so a sibling tool call cannot publish or adopt a proposal between the recheck and the run.
+    async with ctx.proposal_mutation_lock:
+        checked = await _recheck_draft_save(ctx, chat_id, interaction.interaction_id, review)
+        organization = await _organization(ctx)
+        accepted_while_waiting = isinstance(checked, Workflow)
+        changed_fields: tuple[str, ...] = ()
+        if isinstance(checked, Workflow):
+            saved = checked
+        else:
+            try:
+                saved, changed_fields = await accept_copilot_proposal(
+                    organization,
+                    checked,
+                    owner_turn_id=review.proposal_owner_turn_id,
+                    revision=review.proposal_revision,
+                    auto_accept=None,
+                )
+            except HTTPException as e:
+                # A 409 can mean the user's own Accept of this draft won the claim, so it must not deny a save.
+                prefix = "Nothing was started" if e.status_code == 409 else "Nothing was saved or started"
+                return AccountGroupRefusal(status_code=e.status_code, error=f"{prefix}: {e.detail}", dispatched=False)
+        started, failure = await _start_saved_draft_run(
+            ctx,
+            organization,
+            chat_id,
+            interaction.interaction_id,
+            review,
+            saved,
+            changed_fields,
+            workflow_run_id,
+            accepted_while_waiting=accepted_while_waiting,
+        )
+    resolved = review.model_copy(
+        update={
+            "saved_workflow_id": saved.workflow_id,
+            "saved_version": saved.version,
+            "workflow_run_id": None if started is False else workflow_run_id,
+            "run_started": True if started else None,
+        }
+    )
+    if ctx.stream is not None:
+        try:
+            await ctx.stream.send(
+                {
+                    "type": "question_resolved",
+                    "interaction": interaction.model_copy(update={"account_group_review": resolved}).model_dump(
+                        mode="json"
+                    ),
+                    "continued": True,
+                }
+            )
+        except Exception:
+            LOG.warning("Failed to send the saved draft's run card update", exc_info=True)
+    saved_note = (
+        f"The user accepted the draft as version {saved.version} while the card waited, so the run uses that version."
+        if accepted_while_waiting
+        else f"The draft was saved as version {saved.version}."
+    )
+    if started is False:
+        return SingleRunSubmission(
+            ok=False,
+            approved=True,
+            dispatched=False,
+            saved_version=saved.version,
+            error=f"{saved_note} The run was not started: {failure}",
+            cost=review.cost.not_started() if review.cost is not None else None,
+        )
+    return SingleRunSubmission(
+        ok=started is True,
+        approved=True,
+        dispatched=started,
+        workflow_run_id=workflow_run_id,
+        saved_version=saved.version,
+        error=None if started else f"{saved_note} {_SINGLE_RUN_UNCONFIRMED}",
+        note=f"{saved_note} {_SINGLE_RUN_NOTE}" if started else None,
+        cost=review.cost,
+    )
+
+
+_DispatchResult = bool | None | AccountGroupRefusal | SingleRunSubmission
+
+_PENDING_DISPATCHES: set[asyncio.Task[_DispatchResult]] = set()
+
+
+def _release_dispatch(task: asyncio.Task[_DispatchResult]) -> None:
     _PENDING_DISPATCHES.discard(task)
     if not task.cancelled():
         task.exception()
@@ -839,17 +1730,24 @@ async def submit_single_run(
     decision = interaction.account_group_decision
     chat_id = ctx.workflow_copilot_chat_id
     if review is None or decision is None or not decision.approved or chat_id is None:
-        return SingleRunSubmission(approved=False, dispatched=False, note="Nothing was started.")
+        return SingleRunSubmission(
+            approved=False,
+            dispatched=False,
+            note="Nothing was started.",
+            cost=review.cost.not_started() if review is not None and review.cost is not None else None,
+        )
     workflow_run_id = generate_workflow_run_id()
     # Shielded so cancelling the tool call cannot cut dispatch, or the lock it holds, short; the set keeps the
     # task alive after a cancel, since the event loop holds only a weak reference.
-    dispatch = asyncio.create_task(
-        _recheck_and_start_run(ctx, chat_id, interaction.interaction_id, review, workflow_run_id)
+    dispatch: asyncio.Task[_DispatchResult] = asyncio.create_task(
+        _save_and_start_run(ctx, chat_id, interaction, review, workflow_run_id)
+        if review.saves_draft
+        else _recheck_and_start_run(ctx, chat_id, interaction.interaction_id, review, workflow_run_id)
     )
     _PENDING_DISPATCHES.add(dispatch)
     dispatch.add_done_callback(_release_dispatch)
     dispatched = await asyncio.shield(dispatch)
-    if isinstance(dispatched, AccountGroupRefusal):
+    if isinstance(dispatched, (AccountGroupRefusal, SingleRunSubmission)):
         return dispatched
     submitted = interaction.model_copy(
         update={"account_group_review": review.model_copy(update={"workflow_run_id": workflow_run_id})}
@@ -865,6 +1763,7 @@ async def submit_single_run(
         workflow_run_id=workflow_run_id,
         error=None if dispatched else _SINGLE_RUN_UNCONFIRMED,
         note=_SINGLE_RUN_NOTE if dispatched else None,
+        cost=review.cost,
     )
 
 
@@ -898,32 +1797,75 @@ async def _group_for_this_workflow(ctx: CopilotContext, workflow_run_group_id: s
     return group
 
 
+async def _row_group_review(ctx: CopilotContext, group: WorkflowRunGroupResponse) -> AccountGroupReview | None:
+    parts = group.submission_key.split(":")
+    if len(parts) != 4 or f"{parts[0]}:" != _ACCOUNT_GROUP_KEY_ROOT:
+        return None
+    _, chat_id, interaction_id, _ = parts
+    try:
+        chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+            organization_id=ctx.organization_id, workflow_copilot_chat_id=chat_id
+        )
+        # Anyone in the organization can create a group with any submission key, so the key alone does not tie a
+        # chat's reviews to this group's workflow.
+        if chat is None or chat.workflow_permanent_id != group.workflow_permanent_id:
+            return None
+        review = _stored_review(chat, interaction_id)
+        if review is None:
+            stored = await app.DATABASE.workflow_params.get_copilot_history_question(
+                ctx.organization_id, chat_id, interaction_id
+            )
+            review = stored.account_group_review if stored is not None else None
+    except Exception:
+        LOG.warning("Could not read the review of a group", interaction_id=interaction_id, exc_info=True)
+        return None
+    return review if review is not None and review.row_group else None
+
+
 async def _labels(ctx: CopilotContext, group: WorkflowRunGroupResponse) -> dict[str, str]:
     credentials = await load_credentials(
         ctx.organization_id, credential_ids=[item.key for item in group.items], include_deleted=True
     )
-    return {credential.credential_id: _label(credential) for credential in credentials}
+    if credentials:
+        return {credential.credential_id: _label(credential) for credential in credentials}
+    review = await _row_group_review(ctx, group)
+    if review is not None:
+        return {row.credential_id: row.label for row in review.rows}
+    # A row key is 64 hex characters and a credential id never is, so a credential hidden from this user stays out
+    # while a row whose review cannot be read keeps its run under a positional label.
+    return {
+        item.key: f"Row {position + 1}"
+        for position, item in enumerate(group.items)
+        if _ROW_KEY_PATTERN.fullmatch(item.key)
+    }
 
 
 async def _group_state(
-    ctx: CopilotContext, group: WorkflowRunGroupResponse, *, cancel_approved: bool | None = None
+    ctx: CopilotContext,
+    group: WorkflowRunGroupResponse,
+    *,
+    offset: int = 0,
+    cancel_approved: bool | None = None,
 ) -> AccountGroupState:
+    rows, next_offset = _page(group, await _labels(ctx, group), max(offset, 0))
     return AccountGroupState(
         workflow_run_group_id=group.workflow_run_group_id,
         status=group.status,
-        rows=_rows(group, await _labels(ctx, group)),
+        rows=rows,
+        counts=_outcome_counts(group),
+        next_offset=next_offset,
         cancel_approved=cancel_approved,
     )
 
 
 async def account_group_status(
-    ctx: CopilotContext, workflow_run_group_id: str
+    ctx: CopilotContext, workflow_run_group_id: str, offset: int = 0
 ) -> AccountGroupState | AccountGroupRefusal:
     try:
         group = await _group_for_this_workflow(ctx, workflow_run_group_id)
     except AccountGroupRefused as e:
         return AccountGroupRefusal(error=str(e))
-    return await _group_state(ctx, group)
+    return await _group_state(ctx, group, offset=offset)
 
 
 async def cancel_account_group(
@@ -936,8 +1878,7 @@ async def cancel_account_group(
             raise AccountGroupRefused(
                 f"Group {workflow_run_group_id} was not started from this chat, so it cannot be canceled here."
             )
-        state = await _group_state(ctx, group)
-        unfinished = [row for row in state.rows if row.outcome in _UNFINISHED_OUTCOMES]
+        unfinished = [item for item in group.items if item.outcome in _UNFINISHED_OUTCOMES]
         if group.status != WorkflowRunGroupStatus.active or not unfinished:
             raise AccountGroupRefused(f"Group {workflow_run_group_id} has no runs left to cancel.")
         recorded = await wait_for_interaction(
@@ -948,7 +1889,9 @@ async def cancel_account_group(
                 tool_call_id=tool_call_id,
                 parts=[],
                 account_group_cancel=AccountGroupCancelReview(
-                    workflow_run_group_id=workflow_run_group_id, unfinished_rows=unfinished
+                    workflow_run_group_id=workflow_run_group_id,
+                    unfinished_rows=_rows(unfinished[:ROW_GROUP_PAGE_SIZE], await _labels(ctx, group)),
+                    unfinished_count=len(unfinished),
                 ),
             ),
         )

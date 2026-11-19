@@ -4,7 +4,7 @@ import {
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { type FieldErrors, useForm } from "react-hook-form";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -37,15 +37,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
 import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { Input } from "@/components/ui/input";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
-import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "./studioNavigation";
@@ -117,37 +114,6 @@ function validateWorkflowForRun(
   }
 
   return getLoginBlocksWithoutCredentials(workflow.workflow_definition.blocks);
-}
-
-/**
- * Compares the raw form values, not the parsed ones: parsing a json parameter
- * mints a fresh object every call, so comparing after the parse would report
- * "changed" on every keystroke for any workflow that has one.
- */
-function isSameRunParameters(
-  previous: Record<string, unknown> | null,
-  next: Record<string, unknown>,
-): boolean {
-  if (previous === null) {
-    return false;
-  }
-  const previousKeys = Object.keys(previous);
-  return (
-    previousKeys.length === Object.keys(next).length &&
-    previousKeys.every(
-      (key) => key in next && Object.is(previous[key], next[key]),
-    )
-  );
-}
-
-// Utility function to omit specified keys from an object
-function omit<T extends Record<string, unknown>, K extends keyof T>(
-  obj: T,
-  keys: K[],
-): Omit<T, K> {
-  const result = { ...obj };
-  keys.forEach((key) => delete result[key]);
-  return result;
 }
 
 type Props = {
@@ -717,53 +683,7 @@ function RunWorkflowForm({
     },
   });
 
-  const [runParameters, setRunParameters] = useState<Record<
-    string,
-    unknown
-  > | null>(null);
-  const rawRunParametersRef = useRef<Record<string, unknown> | null>(null);
-  const [cacheKeyValue, setCacheKeyValue] = useState<string>("");
   const [isFormReset, setIsFormReset] = useState(false);
-  const cacheKey = workflow?.cache_key ?? "default";
-
-  useEffect(() => {
-    if (!runParameters) {
-      setCacheKeyValue("");
-      return;
-    }
-
-    const ckv = constructCacheKeyValueFromParameters({
-      codeKey: cacheKey,
-      parameters: runParameters,
-    });
-
-    setCacheKeyValue(ckv);
-  }, [cacheKey, runParameters]);
-
-  const { data: blockScripts } = useBlockScriptsQuery({
-    cacheKey,
-    cacheKeyValue,
-    workflowPermanentId,
-    status: "published",
-  });
-
-  const [hasCode, setHasCode] = useState(false);
-
-  useEffect(() => {
-    setHasCode(
-      Object.keys(blockScripts?.blocks ?? {}).length > 0 ||
-        Boolean(blockScripts?.main_script),
-    );
-  }, [blockScripts]);
-
-  // Watch form changes and update run parameters without triggering validation
-  useEffect(() => {
-    const subscription = form.watch((values) => {
-      onChange(values as RunWorkflowFormType);
-    });
-    return () => subscription.unsubscribe();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   // Reset form with initial values after all fields are registered
   useEffect(() => {
@@ -798,15 +718,6 @@ function RunWorkflowForm({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isFormReset]);
-
-  // if we're coming from debugger, block scripts may already be cached; let's ensure we bust it
-  // on mount
-  useEffect(() => {
-    queryClient.invalidateQueries({
-      queryKey: ["block-scripts"],
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   function onSubmit(values: RunWorkflowFormType) {
     const {
@@ -849,34 +760,6 @@ function RunWorkflowForm({
       [RESERVED_BROWSER_TYPE_FIELD]: browserType,
       aiFallback,
     });
-  }
-
-  function onChange(values: RunWorkflowFormType) {
-    const parameters = omit(values, [
-      "webhookCallbackUrl",
-      "proxyLocation",
-      "browserSessionId",
-      "reuseBrowserSession",
-      "browserProfileId",
-      "startFreshBrowser",
-      "maxScreenshotScrolls",
-      "extraHttpHeaders",
-      "cdpConnectHeaders",
-      "cdpAddress",
-      "runWith",
-      "aiFallback",
-      RESERVED_BROWSER_TYPE_FIELD,
-    ]);
-
-    // A settings-only edit still fires this subscription, and a fresh object
-    // would re-render the whole form (every CodeMirror editor in it included)
-    // for a parameter set that did not move.
-    if (isSameRunParameters(rawRunParametersRef.current, parameters)) {
-      return;
-    }
-    rawRunParametersRef.current = parameters;
-
-    setRunParameters(parseValuesForWorkflowRun(parameters, workflowParameters));
   }
 
   const handleInvalid = (errors: FieldErrors<RunWorkflowFormType>) => {
@@ -1413,98 +1296,6 @@ function RunWorkflowForm({
                           value={field.value}
                           onChange={field.onChange}
                           className="w-48"
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </div>
-                  </div>
-                </FormItem>
-              );
-            }}
-          />
-          <FormField
-            key="runWith"
-            control={form.control}
-            name="runWith"
-            render={({ field }) => {
-              const descriptions: Record<string, ReactNode> = {
-                agent: hasCode ? (
-                  <span>
-                    Run this agent with AI. (Even though it has generated code.)
-                  </span>
-                ) : (
-                  <span>Run this agent with AI.</span>
-                ),
-                code: hasCode ? (
-                  <span>Run this agent with generated code.</span>
-                ) : (
-                  <span>
-                    Run this agent with generated code (after it is first
-                    generated).
-                  </span>
-                ),
-              };
-              return (
-                <FormItem>
-                  <div className="flex gap-16">
-                    <FormLabel>
-                      <div className="w-72">
-                        <div className="flex items-center gap-2 text-lg">
-                          Run With
-                        </div>
-                        <h2 className="text-sm text-muted-foreground">
-                          {descriptions[field.value] ?? descriptions.agent}
-                        </h2>
-                      </div>
-                    </FormLabel>
-                    <div className="w-full space-y-2">
-                      <FormControl>
-                        <Select
-                          value={field.value}
-                          onValueChange={(v) => field.onChange(v)}
-                        >
-                          <SelectTrigger className="w-48">
-                            <SelectValue placeholder="Run Method" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="agent">Skyvern Agent</SelectItem>
-                            <SelectItem value="code">Code</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </FormControl>
-                      <FormMessage />
-                    </div>
-                  </div>
-                </FormItem>
-              );
-            }}
-          />
-
-          <FormField
-            key="aiFallback"
-            control={form.control}
-            name="aiFallback"
-            render={({ field }) => {
-              return (
-                <FormItem>
-                  <div className="flex gap-16">
-                    <FormLabel>
-                      <div className="w-72">
-                        <div className="flex items-center gap-2 text-lg">
-                          AI Fallback (cached scripts)
-                        </div>
-                        <h2 className="text-sm text-muted-foreground">
-                          If the run fails when running with code, keep this on
-                          to have AI attempt to fix the issue and regenerate the
-                          code.
-                        </h2>
-                      </div>
-                    </FormLabel>
-                    <div className="w-full space-y-2">
-                      <FormControl>
-                        <Switch
-                          checked={field.value ?? true}
-                          onCheckedChange={field.onChange}
                         />
                       </FormControl>
                       <FormMessage />

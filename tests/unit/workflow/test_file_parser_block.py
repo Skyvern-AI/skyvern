@@ -245,6 +245,62 @@ class TestValidateFileType:
 
 @pytest.mark.asyncio
 class TestFileParserBlockAutoDetectExecution:
+    async def test_configured_service_bypasses_local_parsers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"synthetic")
+        block = _make_file_parser_block("https://example.com/download", FileType.AUTO_DETECT)
+        remote_parse = AsyncMock(
+            return_value=block_module.IsolatedParserResult(
+                file_type="csv",
+                detection_source="magic",
+                kind="json",
+                metadata={},
+                content=[{"name": "alpha"}],
+            )
+        )
+        monkeypatch.setattr(settings, "FILE_PARSER_SERVICE_TARGET", "file-parser.test.svc:7820")
+        monkeypatch.setattr(block_module, "parse_file_remotely", remote_parse)
+        monkeypatch.setattr(
+            FileParserBlock, "_detect_file_type_from_url", MagicMock(side_effect=AssertionError("local detect"))
+        )
+        monkeypatch.setattr(
+            FileParserBlock, "validate_file_type", MagicMock(side_effect=AssertionError("local validate"))
+        )
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == [{"name": "alpha"}]
+        assert block.file_type == FileType.CSV
+
+        image_block = _make_file_parser_block("https://example.com/pages.tiff", FileType.AUTO_DETECT)
+        remote_parse.return_value = block_module.IsolatedParserResult(
+            file_type="image",
+            detection_source="magic",
+            kind="images",
+            metadata={"total_pages": 2},
+            images=[b"synthetic-page-1", b"synthetic-page-2"],
+        )
+        received_images: list[bytes | list[bytes]] = []
+
+        async def ocr_images(
+            _self: FileParserBlock,
+            image_bytes: bytes | list[bytes],
+            workflow_run_block_id: str | None = None,
+            organization_id: str | None = None,
+        ) -> str:
+            received_images.append(image_bytes)
+            return "synthetic pages"
+
+        monkeypatch.setattr(FileParserBlock, "_ocr_image_bytes", ocr_images)
+        image_result = await _execute_with_downloaded_file(image_block, path, monkeypatch)
+
+        assert image_result.success is True
+        assert image_result.output_parameter_value == {"value": "synthetic pages"}
+        assert received_images == [[b"synthetic-page-1", b"synthetic-page-2"]]
+
     async def test_docx_downloaded_from_extensionless_url_is_parsed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

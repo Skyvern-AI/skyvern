@@ -7,7 +7,7 @@ import json
 import socket
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import WebSocketDisconnect
@@ -20,7 +20,15 @@ from playwright.async_api import CDPSession
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from skyvern.forge import app
+from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.routes.streaming import cdp_input
+from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannel
+from skyvern.forge.sdk.streaming.user_control import (
+    mark_user_control,
+    release_user_control,
+    user_controls_browser_session,
+)
 
 
 class _RecordingPlaywrightTransport(Transport):
@@ -265,6 +273,67 @@ class _FakeWebSocket:
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
         self.closed = (code, reason)
+
+
+class _ControlProbingWebSocket(_FakeWebSocket):
+    """Reads whether another process would see the browser as controlled before handing over each message, and closes
+    the stream's sibling message socket once the first message is handled."""
+
+    def __init__(self, messages: list[str], sibling: MessageChannel) -> None:
+        super().__init__(messages)
+        self.sibling = sibling
+        self.controlled_before: list[bool] = []
+
+    async def receive_text(self) -> str:
+        if len(self.controlled_before) == 1:
+            await self.sibling.close()
+        self.controlled_before.append(await user_controls_browser_session("org_1", "pbs_test"))
+        return await super().receive_text()
+
+
+@pytest.mark.asyncio
+async def test_take_control_is_visible_to_other_processes_until_this_socket_cedes_or_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = LocalCache()
+    cache.is_shared = True
+    monkeypatch.setattr(app, "CACHE", cache)
+    channel = SimpleNamespace(interactor="agent", client_id="c1", organization_id="org_1")
+    sibling = MessageChannel(
+        client_id="c1",
+        organization_id="org_1",
+        websocket=AsyncMock(),
+        browser_session=SimpleNamespace(persistent_browser_session_id="pbs_test"),  # type: ignore[arg-type]
+    )
+    take, cede = json.dumps({"kind": "take-control"}), json.dumps({"kind": "cede-control"})
+    websocket = _ControlProbingWebSocket([take, cede, take], sibling)
+
+    await cdp_input._run_input_loop(
+        websocket,
+        channel,
+        _FakeInputSession(_FakeSession("s")),
+        "browser_session_id",
+        "pbs_test",
+        controlled_browser_session_id="pbs_test",
+    )
+
+    assert websocket.controlled_before == [False, True, False, True]
+    assert await user_controls_browser_session("org_1", "pbs_test") is False
+
+
+@pytest.mark.asyncio
+async def test_one_tab_ceding_keeps_another_tabs_take_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = LocalCache()
+    cache.is_shared = True
+    monkeypatch.setattr(app, "CACHE", cache)
+
+    await mark_user_control("org_1", "pbs_test", "tab_a")
+    await mark_user_control("org_1", "pbs_test", "tab_b")
+    await release_user_control("org_1", "pbs_test", "tab_b")
+    assert await user_controls_browser_session("org_1", "pbs_test") is True
+
+    await release_user_control("org_1", "pbs_test", "tab_a")
+    assert await user_controls_browser_session("org_1", "pbs_test") is False
 
 
 class _BlockingWebSocket(_FakeWebSocket):

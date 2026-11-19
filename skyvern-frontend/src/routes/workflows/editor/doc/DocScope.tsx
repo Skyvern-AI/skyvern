@@ -41,9 +41,15 @@ import {
   DocProposalStepMark,
 } from "./DocProposalView";
 import { DocEditableLine, DocInsertPopover } from "./DocEditing";
-import { NOTE_MAX_LENGTH, type DocScopeRef } from "./docGraphEdits";
+import {
+  docImagesOf,
+  NOTE_MAX_LENGTH,
+  type DocScopeRef,
+} from "./docGraphEdits";
+import { DocImagePicker, DocImages } from "./DocImages";
+import { docImageDropProps, useDocImageFiles } from "./useDocImageFiles";
+import type { WorkflowBlockImage } from "../../types/workflowTypes";
 import { TOP_SCOPE, type DocPlace } from "./docEditApi";
-import { DocStepResult } from "./DocStepResult";
 import { DocDemonstrationLine } from "./DocDemonstrationLine";
 import { demonstrationLineIndex } from "./docDemonstration";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
@@ -245,6 +251,7 @@ function DocNode({
   place,
   number,
   onEnter,
+  onAddNote,
   noteProblems,
 }: {
   item: Exclude<PlacedItem, { kind: "unplaced" }>;
@@ -253,6 +260,7 @@ function DocNode({
   place?: DocStepPlace;
   number: string;
   onEnter?: (split: LineSplit | null, key?: string) => void;
+  onAddNote?: () => void;
   noteProblems: ReadonlyMap<string, DocNoteProblem>;
 }) {
   const [inserting, setInserting] = useState(false);
@@ -260,6 +268,20 @@ function DocNode({
   const actions = useContext(WorkflowDocActionsContext);
   const open = actions.loopOpen(item.nodeId);
   const node = byId.get(item.nodeId);
+  const canEdit = Boolean(
+    node &&
+    actions.editable &&
+    !readOnly &&
+    !item.readOnlyReason &&
+    node.data.editable,
+  );
+  useLayoutEffect(() => {
+    if (!canEdit && inserting) {
+      finishSlash.current?.(false);
+      finishSlash.current = null;
+      setInserting(false);
+    }
+  }, [canEdit, inserting]);
   if (!node || !isWorkflowBlockNode(node)) return null;
   const editable =
     actions.editable && !readOnly && !item.readOnlyReason && node.data.editable;
@@ -387,6 +409,7 @@ function DocNode({
               hasFix={noteProblems.has(`${node.id}:fix`)}
               renamable={editable && Boolean(place)}
               onEnter={onEnter}
+              onAddNote={item.kind === "step" ? onAddNote : undefined}
               onMove={
                 place && actions.edit && !place.isFinally
                   ? (delta) => {
@@ -450,7 +473,6 @@ function DocNode({
           byId={byId}
           editable={editable}
         />
-        <DocStepResult label={node.data.label} />
       </div>
       {item.kind === "loop" && open && (
         <div className="mb-1 ml-[11px] mt-0.5 border-l border-border pl-4">
@@ -641,7 +663,7 @@ export function DocAddStep({
   );
 }
 
-function DocNote({
+function DocNoteLine({
   ownerNodeId,
   placement,
   text,
@@ -650,6 +672,7 @@ function DocNote({
   place,
   nestsInto,
   into,
+  onFiles,
 }: {
   ownerNodeId: string;
   placement: "above" | "trailing";
@@ -661,6 +684,8 @@ function DocNote({
   nestsInto?: "loop" | "branch";
   // Set when Tab put this line in an empty loop or branch: the picked step goes in there, holding the line's text.
   into?: DocScopeRef;
+  // Files pasted into the line, for its screenshots.
+  onFiles?: (files: File[]) => void;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const [inserting, setInserting] = useState(false);
@@ -728,6 +753,7 @@ function DocNote({
         className="text-base leading-[1.55] text-muted-foreground"
       >
         <DocEditableLine
+          onFiles={onFiles}
           value={text}
           editable={editable && Boolean(actions.edit)}
           multiline
@@ -841,6 +867,41 @@ function DocNote({
   );
 }
 
+/** A note line with its screenshots: paste, drop or the picker add one under the line. */
+function DocNote({
+  images = [],
+  ...line
+}: Omit<Parameters<typeof DocNoteLine>[0], "onFiles"> & {
+  images?: WorkflowBlockImage[];
+}) {
+  const actions = useContext(WorkflowDocActionsContext);
+  const { ownerNodeId, placement } = line;
+  const imageFiles = useDocImageFiles({ ownerNodeId, placement });
+  const addFiles = line.editable && actions.edit ? imageFiles.addFiles : null;
+  return (
+    <div className="group/note" {...docImageDropProps(addFiles)}>
+      <div className="flex items-start gap-1">
+        <div className="min-w-0 flex-1">
+          <DocNoteLine {...line} onFiles={addFiles ?? undefined} />
+        </div>
+        {addFiles && (
+          <DocImagePicker
+            slot={{ ownerNodeId, placement }}
+            onFiles={addFiles}
+            className="mt-0.5 opacity-0 focus-visible:opacity-100 group-focus-within/note:opacity-100 group-hover/note:opacity-100 [@media(hover:none)]:opacity-100"
+          />
+        )}
+      </div>
+      <DocImages
+        slot={{ ownerNodeId, placement }}
+        images={images}
+        editable={line.editable && Boolean(actions.edit)}
+        onRetry={imageFiles.retry}
+      />
+    </div>
+  );
+}
+
 export function DocScope({
   items,
   byId,
@@ -884,7 +945,13 @@ export function DocScope({
         i.ownerNodeId === owner &&
         i.placement === placement,
     );
+  // A step's own note stays on screen right below it after a step is added under it, so a new note goes to that note.
   const noteBelow = (nodeId: string) => {
+    if (notePresent(nodeId, "trailing"))
+      return actions.setPendingNote({
+        ownerNodeId: nodeId,
+        placement: "trailing",
+      });
     const at = steps.findIndex((s) => s.nodeId === nodeId);
     const next = steps[at + 1];
     const note = next
@@ -949,6 +1016,10 @@ export function DocScope({
     Boolean(pending.into);
   const pendingInto =
     pending?.into && sameScope(pending.into, scope) ? pending : null;
+  const noteImages = (owner: string, placement: "above" | "trailing") =>
+    docImagesOf(byId.get(owner)).filter(
+      (image) => image.placement === placement,
+    );
   // The loop or If that Tab would put a line in: the one it trails, or the step just above it.
   const nestsInto = (owner: string, placement: "above" | "trailing") => {
     const container =
@@ -1024,8 +1095,7 @@ export function DocScope({
   // The insert line above a step goes above its note too, as the drop line does. The doc's first step has none:
   // the top of the doc is not between steps.
   const insertBefore = (index: number) => {
-    if (dropping || actions.runGoing || !structural || !editable || !scope)
-      return null;
+    if (dropping || !structural || !editable || !scope) return null;
     const item = items[index]!;
     const owner =
       item.kind === "note"
@@ -1121,6 +1191,7 @@ export function DocScope({
           ownerNodeId={pendingInto.ownerNodeId}
           placement={pendingInto.placement}
           text={noteTextOfNode(byId, pendingInto)}
+          images={noteImages(pendingInto.ownerNodeId, pendingInto.placement)}
           editable={editable}
           into={scope}
         />
@@ -1154,6 +1225,7 @@ export function DocScope({
               ownerNodeId={item.ownerNodeId}
               placement={item.placement}
               text={item.text}
+              images={noteImages(item.ownerNodeId, item.placement)}
               title={noteReaders(item, byId, actions.previousNoteReader)}
               nestsInto={nestsInto(item.ownerNodeId, item.placement)}
               editable={editable && !previousReason(items, index + 1)}
@@ -1197,7 +1269,6 @@ export function DocScope({
                       byId={byId}
                       editable={false}
                     />
-                    <DocStepResult label={node.data.label} />
                     {node.type === "loop" && (
                       <DocProposalLoopRemovals loopLabel={node.data.label} />
                     )}
@@ -1244,6 +1315,11 @@ export function DocScope({
               onEnter={
                 editable
                   ? (split, key) => enterAfter(item.nodeId, split, key)
+                  : undefined
+              }
+              onAddNote={
+                editable && actions.edit
+                  ? () => noteBelow(item.nodeId)
                   : undefined
               }
               noteProblems={noteProblems}

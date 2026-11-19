@@ -70,7 +70,7 @@ describe("BlockSidebarWidthStore", () => {
   test("constants form a sane range", () => {
     expect(BLOCK_SIDEBAR_WIDTH_MIN).toBe(320);
     expect(BLOCK_SIDEBAR_WIDTH_MAX).toBe(640);
-    // Matches the studio Copilot column width (STUDIO_COPILOT_WIDTH = 450).
+    // Matches the studio Ember column width (STUDIO_EMBER_WIDTH = 450).
     expect(BLOCK_SIDEBAR_WIDTH_DEFAULT).toBe(450);
     expect(BLOCK_SIDEBAR_WIDTH_DEFAULT).toBeGreaterThanOrEqual(
       BLOCK_SIDEBAR_WIDTH_MIN,

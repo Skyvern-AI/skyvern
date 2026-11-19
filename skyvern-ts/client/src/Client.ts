@@ -32,8 +32,8 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "1.0.55",
-                    "User-Agent": "@skyvern/client/1.0.55",
+                    "X-Fern-SDK-Version": "1.0.58",
+                    "User-Agent": "@skyvern/client/1.0.58",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
@@ -6043,7 +6043,15 @@ export class SkyvernClient {
         request: Skyvern.GetWorkflowRunsRequest = {},
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.WorkflowRun[]>> {
-        const { page, page_size: pageSize, status, search_key: searchKey, error_code: errorCode } = request;
+        const {
+            page,
+            page_size: pageSize,
+            status,
+            search_key: searchKey,
+            error_code: errorCode,
+            created_at_start: createdAtStart,
+            created_at_end: createdAtEnd,
+        } = request;
         const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
         if (page != null) {
             _queryParams.page = page.toString();
@@ -6067,6 +6075,14 @@ export class SkyvernClient {
 
         if (errorCode != null) {
             _queryParams.error_code = errorCode;
+        }
+
+        if (createdAtStart != null) {
+            _queryParams.created_at_start = createdAtStart;
+        }
+
+        if (createdAtEnd != null) {
+            _queryParams.created_at_end = createdAtEnd;
         }
 
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(

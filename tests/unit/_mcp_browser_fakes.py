@@ -63,6 +63,19 @@ def make_session_state(**overrides: Any) -> SessionState:
     return state
 
 
+def make_cdp_page() -> MagicMock:
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.context._skyvern_http_interception = None
+    session = MagicMock()
+    session.send = AsyncMock(return_value={})
+    session.detach = AsyncMock()
+    page.context.new_cdp_session = AsyncMock(return_value=session)
+    page.route = AsyncMock()
+    page.unroute = AsyncMock()
+    return page
+
+
 def make_request_failure(
     page: object,
     path: str = "/report",

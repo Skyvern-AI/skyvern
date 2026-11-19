@@ -6,11 +6,15 @@ import {
   type NavigateOptions,
 } from "react-router-dom";
 
+import { EMBER_EVENTS } from "@/routes/workflows/ember/emberEvents";
+import { usePageSlots } from "@/store/PageSlots";
+
 import { liveLocationState, liveSearch } from "./liveSearch";
 import {
   panesWithoutDeletedBlocked,
   resolveOpenPanes,
   searchWithRunReference,
+  STUDIO_PANE_IDS,
   toReadableSearch,
   togglePane as togglePaneIn,
   withPaneClosed,
@@ -21,6 +25,7 @@ import { SELECTED_BLOCK_SEARCH_PARAM } from "../editor/hooks/useSelectedBlockUrl
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import { useStudioRunId } from "./useStudioRunId";
 import {
+  useStudioGlobalWorkflow,
   useStudioShellContext,
   useStudioWorkflowDeletedAt,
 } from "./StudioShellContext";
@@ -29,6 +34,22 @@ import { useWorkflowPermanentId } from "../WorkflowPermanentIdContext";
 type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
   selectedBlockLabel?: string | null;
 };
+
+const PANE_IDS_WITHOUT_TRIGGERS = STUDIO_PANE_IDS.filter(
+  (id) => id !== "triggers",
+);
+
+// The Triggers pane only exists where the build provides it (Cloud), and only
+// for an agent known to be changeable: never a deleted or global (read-only)
+// one, nor one whose global status is still loading.
+export function useStudioPaneIds(): readonly StudioPaneId[] {
+  const hasTriggers = Boolean(usePageSlots().workflowTriggersPanel);
+  const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
+  const globalWorkflow = useStudioGlobalWorkflow();
+  return hasTriggers && !workflowDeleted && globalWorkflow === false
+    ? STUDIO_PANE_IDS
+    : PANE_IDS_WITHOUT_TRIGGERS;
+}
 
 export function useStudioPanes() {
   const location = useLocation();
@@ -43,14 +64,23 @@ export function useStudioPanes() {
     preserveNextEntry,
   } = useStudioPaneDefaults();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
+  const paneIds = useStudioPaneIds();
   const { organizationId, restoreExpandedPane, showPane } =
     useStudioShellContext();
   const panes = useMemo(() => {
     const resolved = isStudio
       ? [...currentPanes]
       : resolveOpenPanes(searchWithRunReference(location.search, studioRunId));
-    return workflowDeleted ? panesWithoutDeletedBlocked(resolved) : resolved;
-  }, [isStudio, currentPanes, location.search, studioRunId, workflowDeleted]);
+    const available = resolved.filter((id) => paneIds.includes(id));
+    return workflowDeleted ? panesWithoutDeletedBlocked(available) : available;
+  }, [
+    isStudio,
+    currentPanes,
+    location.search,
+    studioRunId,
+    workflowDeleted,
+    paneIds,
+  ]);
   const resolveLivePanes = useCallback((): StudioPaneId[] => {
     const resolved = isStudio
       ? [...getPanes()]
@@ -73,10 +103,10 @@ export function useStudioPanes() {
         const next = compute(current, slots);
         if (
           !workflowDeleted &&
-          !current.includes("copilot") &&
-          next.includes("copilot")
+          !current.includes("ember") &&
+          next.includes("ember")
         ) {
-          posthog.capture("copilot.pane.opened", {
+          posthog.capture(EMBER_EVENTS.paneOpened, {
             org_id: organizationId,
             workflow_permanent_id: workflowPermanentId,
           });

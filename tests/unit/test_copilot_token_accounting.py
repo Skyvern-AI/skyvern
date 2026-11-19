@@ -239,7 +239,7 @@ def test_resolve_model_config_sets_include_usage_true(monkeypatch: pytest.Monkey
     # settings.LLM_KEY defaults to an OpenAI registry alias that isn't registered when
     # ENABLE_OPENAI is off (bare unit env); point it at a resolvable litellm model so the
     # None-llm_key fallback path resolves without tripping the SKY-12322 alias guard.
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.settings.LLM_KEY", "gpt-4o")
+    monkeypatch.setattr("skyvern.forge.sdk.api.llm.agents_model_resolver.settings.LLM_KEY", "gpt-4o")
     handler = MagicMock()
     handler.llm_key = None
 

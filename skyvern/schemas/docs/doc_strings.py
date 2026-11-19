@@ -55,7 +55,7 @@ Custom mapping of error codes to error messages if Skyvern encounters an error.
 """
 
 MAX_STEPS_DOC_STRING = """
-Maximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.
+Maximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: a run that takes more steps can cost more, so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.
 """
 
 WEBHOOK_URL_DOC_STRING = """

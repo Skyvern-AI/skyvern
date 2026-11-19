@@ -15,4 +15,17 @@ describe("noteReadings runtime parity", () => {
       ),
     ).toEqual(expected);
   });
+
+  it("reads notes on a 10,000-block chain without overflowing the stack", () => {
+    const blocks = Array.from({ length: 10_000 }, (_, index) => ({
+      label: `step_${index}`,
+      block_type: "navigation",
+      next_block_label: index < 9_999 ? `step_${index + 1}` : null,
+      notes: `Note ${index}.`,
+    }));
+    expect(noteReadings(blocks).textsByLabel.get("step_0")).toEqual([
+      "Note 0.",
+      "Note 1.",
+    ]);
+  });
 });

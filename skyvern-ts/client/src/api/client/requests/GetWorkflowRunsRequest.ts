@@ -22,4 +22,8 @@ export interface GetWorkflowRunsRequest {
     search_key?: string;
     /** Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution. */
     error_code?: string;
+    /** Only include runs created at or after this timestamp (ISO 8601; a value without an offset is read as UTC). Supplying it replaces the 30-day default window of a free-text search_key. */
+    created_at_start?: string;
+    /** Only include runs created strictly before this timestamp (ISO 8601; a value without an offset is read as UTC). Without created_at_start, a free-text search_key covers the 30 days before this timestamp. */
+    created_at_end?: string;
 }

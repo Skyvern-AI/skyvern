@@ -32,7 +32,6 @@ from skyvern.webeye.skycdp.facade.elements import ElementHandle, JSHandle, wait_
 from skyvern.webeye.skycdp.facade.evaluation import RemoteHandle, evaluate
 from skyvern.webeye.skycdp.facade.input import Keyboard, Mouse
 from skyvern.webeye.skycdp.facade.locator import _QUERY_ALL_JS, FrameLocator, Locator
-from skyvern.webeye.skycdp.facade.network import dispatch
 from skyvern.webeye.skycdp.facade.network_events import NetworkObserver
 from skyvern.webeye.skycdp.facade.routing import RouteHandler, RouteTable, URLMatcher
 from skyvern.webeye.skycdp.facade.timeouts import DEFAULT_NAVIGATION_TIMEOUT_MS, seconds_from_ms
@@ -128,14 +127,26 @@ class Frame:
     async def query_selector(self, selector: str) -> ElementHandle | None:
         return await self.query_selector_indexed(selector, 0)
 
-    async def query_selector_indexed(self, selector: str, index: int) -> ElementHandle | None:
-        handle = await evaluate(
-            self.session,
-            f"(spec) => {{ {_QUERY_ALL_JS} return __queryAll(document, spec.selector)[spec.index] || null; }}",
-            {"selector": selector, "index": index},
-            context_id=await self._context_id(),
-            by_value=False,
-        )
+    async def query_selector_indexed(
+        self, selector: str, index: int, root: ElementHandle | None = None
+    ) -> ElementHandle | None:
+        spec = {"selector": selector, "index": index}
+        if root is None:
+            handle = await evaluate(
+                self.session,
+                f"(spec) => {{ {_QUERY_ALL_JS} return __queryAll(document, spec.selector)[spec.index] || null; }}",
+                spec,
+                context_id=await self._context_id(),
+                by_value=False,
+            )
+        else:
+            handle = await evaluate(
+                root._session,
+                f"function(spec) {{ {_QUERY_ALL_JS} return __queryAll(this, spec.selector)[spec.index] || null; }}",
+                spec,
+                object_id=root._object_id,
+                by_value=False,
+            )
         if not isinstance(handle, RemoteHandle) or handle.subtype != "node":
             if isinstance(handle, RemoteHandle):
                 await handle.dispose()
@@ -159,13 +170,18 @@ class Frame:
             return None
         return ElementHandle(self, handle)
 
-    async def query_selector_all(self, selector: str) -> list[ElementHandle]:
-        total = int(
-            await self.evaluate(f"(s) => {{ {_QUERY_ALL_JS} return __queryAll(document, s).length; }}", selector)
-        )
+    async def query_selector_all(self, selector: str, root: ElementHandle | None = None) -> list[ElementHandle]:
+        if root is None:
+            total = int(
+                await self.evaluate(f"(s) => {{ {_QUERY_ALL_JS} return __queryAll(document, s).length; }}", selector)
+            )
+        else:
+            total = int(
+                await root._bound(f"function(s) {{ {_QUERY_ALL_JS} return __queryAll(this, s).length; }}", selector)
+            )
         found = []
         for index in range(total):
-            handle = await self.query_selector_indexed(selector, index)
+            handle = await self.query_selector_indexed(selector, index, root)
             if handle is not None:
                 found.append(handle)
         return found
@@ -300,6 +316,7 @@ class Page:
         self._context = context
         self._session = session
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
         self._frames: dict[str, Frame] = {}
         # Frames whose execution contexts live on a different target's session (out-of-process
         # iframes). Absent means "the page's own session", which covers the common case.
@@ -311,7 +328,6 @@ class Page:
         self.keyboard = Keyboard(session)
         self._viewport_size: dict[str, int] | None = None
         self._routes = RouteTable()
-        self._interception_enabled = False
         self._network = NetworkObserver(self)
 
     def __repr__(self) -> str:
@@ -965,32 +981,10 @@ class Page:
         await self._disable_interception_if_idle()
 
     async def _enable_interception(self) -> None:
-        """Pause every request and decide locally.
-
-        Chrome is given a catch-all pattern rather than the caller's globs: its matcher cannot
-        express Playwright's semantics, so filtering at the browser would silently change which
-        requests a handler sees.
-        """
-        if self._interception_enabled:
-            return
-        self._session.on("Fetch.requestPaused", self._on_request_paused)
-        with suppress(CdpError):
-            await self._session.send("Fetch.enable", {"patterns": [{"urlPattern": "*"}], "handleAuthRequests": False})
-        self._interception_enabled = True
+        await self._context._fetch.enable(self._session, self._routes, self.close)
 
     async def _disable_interception_if_idle(self) -> None:
-        if not self._interception_enabled:
-            return
-        if len(self._routes) or len(self._context.routes):
-            return
-        self._session.off("Fetch.requestPaused", self._on_request_paused)
-        with suppress(CdpError):
-            await self._session.send("Fetch.disable")
-        self._interception_enabled = False
-
-    def _on_request_paused(self, params: dict) -> None:
-        # Page routes are consulted before context routes, and an unhandled page route falls through.
-        asyncio.ensure_future(dispatch(self._session, [self._routes, self._context.routes], params))
+        await self._context._fetch.disable_if_idle(self._session)
 
     async def add_init_script(self, script: str) -> None:
         await self._session.send("Page.addScriptToEvaluateOnNewDocument", {"source": script})
@@ -1050,15 +1044,43 @@ class Page:
     # -- teardown -----------------------------------------------------------
 
     async def close(self, **_: Any) -> None:
-        if self._closed:
-            return
+        if self._context._fetch.is_draining_current_dispatch(self._session):
+            raise asyncio.CancelledError
+        await self._close_owned()
+
+    async def _close_owned(self) -> None:
+        if self._close_task is None:
+            if self._closed:
+                return
+            self._close_task = asyncio.create_task(self._close(), name="skycdp-page-close")
+        closing = self._close_task
+        try:
+            await asyncio.shield(closing)
+        except asyncio.CancelledError:
+            # Teardown cannot drain a dispatcher that is waiting for this same close task.
+            if self._context._fetch.is_draining_current_dispatch(self._session):
+                raise
+            try:
+                await asyncio.shield(closing)
+            except CdpError:
+                pass
+            raise
+        finally:
+            if closing.done() and self._close_task is closing:
+                self._close_task = None
+
+    async def _close(self) -> None:
         self._closed = True
+        try:
+            await self._context._fetch.prepare_close(self._session)
+            await self._context.browser.connection.close_target(self._session.target.target_id)
+        except BaseException:
+            self._context._fetch.resume(self._session)
+            self._closed = False
+            raise
+        await self._context._fetch.close(self._session)
         self._network.clear()
         await self._context._detach_page(self)
-        try:
-            await self._context.browser.connection.close_target(self._session.target.target_id)
-        except CdpError:
-            pass
         self._emit("close", self)
 
 

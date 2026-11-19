@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import struct
 import zipfile
 from datetime import datetime, timedelta, timezone
 
@@ -21,7 +22,7 @@ from fastapi import HTTPException, UploadFile
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.id import generate_uploaded_file_id
-from skyvern.forge.sdk.schemas.files import UploadedFile
+from skyvern.forge.sdk.schemas.files import UploadedFile, UploadedFileSignedUrl
 
 LOG = structlog.get_logger()
 
@@ -120,7 +121,121 @@ async def validate_file_size(file: UploadFile, *, max_size_bytes: int | None = N
 
 _SNIFF_BYTES = 8192
 
-# Anything the OS or a browser would execute; unknown and bespoke extensions are allowed on purpose.
+# The expected upload types: each extension lists the MIME types a client may declare for it. Extensions
+# outside a route's allowlist are refused before any content is read; signatures are checked below.
+DOCUMENT_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "pdf": ("application/pdf", "application/x-pdf"),
+    "doc": ("application/msword", "application/vnd.ms-word"),
+    "docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",),
+    "odt": ("application/vnd.oasis.opendocument.text",),
+    "rtf": ("application/rtf", "application/x-rtf", "text/rtf"),
+    "txt": ("text/plain",),
+    "log": ("text/plain", "text/x-log"),
+    "ics": ("text/calendar", "text/plain"),
+    "vcf": ("text/vcard", "text/x-vcard", "text/directory", "text/plain"),
+    "md": ("text/markdown", "text/x-markdown", "text/plain"),
+    "eml": ("message/rfc822", "text/plain"),
+    "msg": ("application/vnd.ms-outlook",),
+}
+SPREADSHEET_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "xls": ("application/vnd.ms-excel", "application/excel", "application/x-excel"),
+    "xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",),
+    "ods": ("application/vnd.oasis.opendocument.spreadsheet",),
+    "csv": (
+        "text/csv",
+        "text/x-csv",
+        "application/csv",
+        "application/x-csv",
+        "text/comma-separated-values",
+        "application/vnd.ms-excel",
+        "application/x-msexcel",
+        "text/plain",
+    ),
+    "tsv": ("text/tab-separated-values", "text/tsv", "text/plain"),
+}
+PRESENTATION_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "ppt": ("application/vnd.ms-powerpoint",),
+    "pptx": ("application/vnd.openxmlformats-officedocument.presentationml.presentation",),
+    "odp": ("application/vnd.oasis.opendocument.presentation",),
+}
+IMAGE_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "png": ("image/png", "image/x-png"),
+    "jpg": ("image/jpeg", "image/jpg", "image/pjpeg"),
+    "jpeg": ("image/jpeg", "image/jpg", "image/pjpeg"),
+    "gif": ("image/gif",),
+    "webp": ("image/webp",),
+    "bmp": ("image/bmp", "image/x-ms-bmp", "image/x-bmp"),
+    "tif": ("image/tiff", "image/x-tiff", "image/tif"),
+    "tiff": ("image/tiff", "image/x-tiff", "image/tif"),
+    "heic": ("image/heic", "image/heif", "image/heic-sequence"),
+    "avif": ("image/avif",),
+    "jfif": ("image/jpeg", "image/jpg", "image/pjpeg"),
+}
+DATA_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "json": ("application/json", "application/x-json", "text/json", "text/plain"),
+    "xml": ("application/xml", "text/xml", "text/plain"),
+    "yaml": ("application/yaml", "application/x-yaml", "text/yaml", "text/x-yaml", "text/plain"),
+    "yml": ("application/yaml", "application/x-yaml", "text/yaml", "text/x-yaml", "text/plain"),
+}
+ARCHIVE_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "zip": ("application/zip", "application/x-zip-compressed", "application/x-zip", "multipart/x-zip"),
+}
+# Copilot chat attachments include screen recordings the model watches.
+VIDEO_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "mp4": ("video/mp4",),
+    "webm": ("video/webm",),
+    "mov": ("video/quicktime", "video/x-quicktime"),
+}
+# Dictation is recorded in the browser and always named .webm, whatever container the browser produced.
+AUDIO_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "webm": ("audio/webm", "video/webm"),
+    "mp4": ("audio/mp4", "video/mp4"),
+    "m4a": ("audio/mp4", "audio/x-m4a", "audio/m4a", "audio/mp4a-latm"),
+    "mp3": ("audio/mpeg", "audio/mp3", "audio/x-mpeg"),
+    "ogg": ("audio/ogg", "application/ogg", "video/ogg"),
+    "oga": ("audio/ogg", "application/ogg", "video/ogg"),
+    "wav": ("audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave"),
+    "flac": ("audio/flac", "audio/x-flac"),
+}
+
+
+def _merge_declared_types(*tables: dict[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
+    merged: dict[str, tuple[str, ...]] = {}
+    for table in tables:
+        for extension, mime_types in table.items():
+            merged[extension] = tuple(dict.fromkeys(merged.get(extension, ()) + mime_types))
+    return merged
+
+
+DECLARED_UPLOAD_TYPES = _merge_declared_types(
+    DOCUMENT_UPLOAD_TYPES,
+    SPREADSHEET_UPLOAD_TYPES,
+    PRESENTATION_UPLOAD_TYPES,
+    IMAGE_UPLOAD_TYPES,
+    DATA_UPLOAD_TYPES,
+    ARCHIVE_UPLOAD_TYPES,
+    VIDEO_UPLOAD_TYPES,
+    AUDIO_UPLOAD_TYPES,
+)
+# Per-route allowlists. The generic route takes everything a run may hand to a third-party form.
+ALLOWED_UPLOAD_EXTENSIONS = frozenset(
+    DOCUMENT_UPLOAD_TYPES
+    | SPREADSHEET_UPLOAD_TYPES
+    | PRESENTATION_UPLOAD_TYPES
+    | IMAGE_UPLOAD_TYPES
+    | DATA_UPLOAD_TYPES
+    | ARCHIVE_UPLOAD_TYPES
+    | VIDEO_UPLOAD_TYPES
+    | AUDIO_UPLOAD_TYPES
+)
+PDF_UPLOAD_EXTENSIONS = frozenset({"pdf"})
+# What the resume parser reads: PDF, DOCX and its image branch.
+RESUME_UPLOAD_EXTENSIONS = frozenset({"pdf", "docx", "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"})
+VOICE_NOTE_UPLOAD_EXTENSIONS = frozenset(AUDIO_UPLOAD_TYPES)
+# Clients that do not know a type send a generic one; anything more specific must agree with the extension.
+_GENERIC_DECLARED_TYPES = frozenset({"", "application/octet-stream", "binary/octet-stream"})
+
+# Second gate: anything the OS or a browser would execute, whatever the allowlist says.
 DENIED_UPLOAD_EXTENSIONS = frozenset(
     {
         "app", "apk", "bat", "cmd", "com", "cpl", "deb", "dll", "dmg", "docm", "exe", "hta", "htm", "html", "jar",
@@ -168,7 +283,17 @@ _OLE_ENCRYPTED_PACKAGE_ENTRY = "EncryptedPackage\0".encode("utf-16-le")
 _OLE_SCAN_CHUNK = 1 << 20
 _WINDOWS_SHORTCUT_MAGIC = b"L\x00\x00\x00\x01\x14\x02\x00\x00\x00\x00\x00\xc0\x00\x00\x00\x00\x00\x00F"
 _OOXML_EXTENSIONS = frozenset({"docx", "xlsx", "pptx"})
-_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "gif", "webp"})
+_ODF_EXTENSIONS = frozenset({"odt", "ods", "odp"})
+# filetype recognizes these reliably; HEIF brands and BigTIFF it does not.
+_SNIFFED_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "jfif", "gif", "webp"})
+_TIFF_MAGICS = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
+_MEDIA_CONTAINER_EXTENSIONS = frozenset({"mp4", "mov", "webm", "m4a"})
+_EBML_MAGIC = b"\x1a\x45\xdf\xa3"
+# ISO-BMFF files from older encoders may open with an atom other than ftyp.
+_ISO_BMFF_LEAD_ATOMS = frozenset({b"ftyp", b"moov", b"mdat", b"wide", b"free", b"skip", b"pnot"})
+_RTF_MAGIC = b"{\\rtf"
+# An OpenDocument package keeps Basic macros under Basic/<library>/ and other script languages under Scripts/.
+_ODF_MACRO_INDEX_FILES = frozenset({"script-lc.xml", "script-lb.xml", "dialog-lc.xml", "dialog-lb.xml"})
 
 
 def upload_extension(filename: str | None) -> str:
@@ -224,17 +349,33 @@ def _dangerous_content_reason(head: bytes, extension: str) -> str | None:
     return None
 
 
+def _is_odf_macro_member(name: str) -> bool:
+    if name.endswith("/"):
+        return False
+    if name.startswith("Scripts/"):
+        return True
+    # LibreOffice writes empty library indexes into documents that have no macros.
+    return name.startswith("Basic/") and os.path.basename(name) not in _ODF_MACRO_INDEX_FILES
+
+
 def _zip_member_reason(file: UploadFile, extension: str) -> str | None:
     # ZipFile reads only the central directory here, never member data.
     try:
         with zipfile.ZipFile(file.file) as archive:
             names = archive.namelist()
     except (zipfile.BadZipFile, OSError, ValueError):
-        return f"content does not match .{extension}" if extension in _OOXML_EXTENSIONS else None
+        return f"content does not match .{extension}" if extension in _OOXML_EXTENSIONS | _ODF_EXTENSIONS else None
     finally:
         file.file.seek(0)
+    # Every real OOXML package has a content-types part and every ODF package a manifest or mimetype entry.
+    if extension in _OOXML_EXTENSIONS and "[Content_Types].xml" not in names:
+        return f"content does not match .{extension}"
+    if extension in _ODF_EXTENSIONS and not {"mimetype", "META-INF/manifest.xml"} & set(names):
+        return f"content does not match .{extension}"
     if "[Content_Types].xml" in names and any(name.lower().endswith("vbaproject.bin") for name in names):
         return "Office document with macros"
+    if {"mimetype", "META-INF/manifest.xml"} & set(names) and any(_is_odf_macro_member(n) for n in names):
+        return "OpenDocument file with macros"
     if "AndroidManifest.xml" in names and "classes.dex" in names:
         return "Android package"
     if "META-INF/MANIFEST.MF" in names and any(name.endswith(".class") for name in names):
@@ -271,34 +412,99 @@ def _ole_reason(file: UploadFile, extension: str) -> str | None:
     return None
 
 
-def _declared_type_mismatch(head: bytes, extension: str) -> bool:
+def _is_media_container(head: bytes) -> bool:
+    return head.startswith(_EBML_MAGIC) or head[4:8] in _ISO_BMFF_LEAD_ATOMS
+
+
+def has_audio_container_signature(head: bytes) -> bool:
+    return (
+        _is_media_container(head)
+        or head.startswith((b"OggS", b"ID3", b"fLaC"))
+        or (head[:4] == b"RIFF" and head[8:12] == b"WAVE")
+        or (len(head) > 1 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0)
+    )
+
+
+def _declared_type_mismatch(head: bytes, extension: str, any_audio_container: bool) -> bool:
+    """True when the content contradicts a format whose signature is reliable.
+
+    Formats with common unsigned variants (legacy .doc/.xls/.ppt saved as text, XML or a renamed zip) have no
+    positive check; the denylist, markup sniff and macro scans still apply to them.
+    """
     if extension == "pdf":
         # Readers accept a PDF header anywhere in the first KiB.
         return b"%PDF-" not in head[:1024]
-    if extension == "zip":
+    if extension == "zip" or extension in _ODF_EXTENSIONS:
         return not head.startswith(_ZIP_MAGICS)
     if extension in _OOXML_EXTENSIONS:
         return not head.startswith(_ZIP_MAGICS + (_OLE_MAGIC,))
-    if extension in _IMAGE_EXTENSIONS:
+    if extension == "rtf":
+        return not head.removeprefix(b"\xef\xbb\xbf").lstrip().startswith(_RTF_MAGIC)
+    if extension in _SNIFFED_IMAGE_EXTENSIONS:
         return not filetype.is_image(head)
+    if extension == "bmp":
+        return not head.startswith(b"BM")
+    if extension in {"tif", "tiff"}:
+        return not head.startswith(_TIFF_MAGICS)
+    if extension in {"heic", "avif"}:
+        return head[4:8] != b"ftyp"
+    if any_audio_container:
+        # Dictation is named .webm whatever container the browser recorded into.
+        return not has_audio_container_signature(head)
+    if extension in _MEDIA_CONTAINER_EXTENSIONS:
+        return not _is_media_container(head)
     return False
 
 
-def _upload_type_rejection_reason(file: UploadFile) -> str | None:
-    extension = upload_extension(file.filename)
-    if extension in DENIED_UPLOAD_EXTENSIONS:
-        return f".{extension} files are not allowed"
+def _declared_mime_type(file: UploadFile) -> str:
+    return (file.content_type or "").split(";", 1)[0].strip().lower()
+
+
+def _sniff_head(file: UploadFile) -> bytes:
     try:
         head = file.file.read(_SNIFF_BYTES)
         if len(head) == _SNIFF_BYTES and _markup_preamble_unfinished(head):
             head += file.file.read(_MARKUP_PREAMBLE_LIMIT - _SNIFF_BYTES)
-            if len(head) == _MARKUP_PREAMBLE_LIMIT and _markup_preamble_unfinished(head):
-                return "markup preamble too long to inspect"
     finally:
         file.file.seek(0)
+    return head
+
+
+def _operator_extra_extensions() -> frozenset[str]:
+    extra = (extension.strip().lstrip(".").lower() for extension in settings.UPLOAD_EXTRA_ALLOWED_EXTENSIONS)
+    return frozenset(extension for extension in extra if extension)
+
+
+def _upload_type_rejection_reason(
+    file: UploadFile,
+    allowed: frozenset[str],
+    *,
+    any_declared_type: frozenset[str] = frozenset(),
+    any_audio_container: bool = False,
+) -> str | None:
+    # Gate 1: the allowlist, by extension and declared MIME type. No bytes are read for a refused extension.
+    extension = upload_extension(file.filename)
+    if extension and extension not in allowed:
+        return f".{extension} files are not allowed"
+    head = _sniff_head(file)
+    if not extension:
+        sniffed = filetype.guess(head)
+        extension = sniffed.extension if sniffed is not None else ""
+        if extension not in allowed:
+            return "no file extension and the content is not a recognized type"
+    declared = _declared_mime_type(file)
+    # An operator-listed extension takes any declared type, so the setting can also reopen an alias refusal.
+    expected_types = None if extension in any_declared_type else DECLARED_UPLOAD_TYPES.get(extension)
+    if declared not in _GENERIC_DECLARED_TYPES and expected_types is not None and declared not in expected_types:
+        return f"declared type {declared} does not match .{extension}"
+    # Gate 2: the denylist and content sniffing, for renamed executables, markup and macro documents.
+    if extension in DENIED_UPLOAD_EXTENSIONS:
+        return f".{extension} files are not allowed"
+    if len(head) == _MARKUP_PREAMBLE_LIMIT and _markup_preamble_unfinished(head):
+        return "markup preamble too long to inspect"
     if reason := _dangerous_content_reason(head, extension):
         return reason
-    if _declared_type_mismatch(head, extension):
+    if _declared_type_mismatch(head, extension, any_audio_container):
         return f"content does not match .{extension}"
     if head.startswith(_ZIP_MAGICS):
         return _zip_member_reason(file, extension)
@@ -307,39 +513,53 @@ def _upload_type_rejection_reason(file: UploadFile) -> str | None:
     return None
 
 
-def validate_upload_type(file: UploadFile) -> UploadFile:
-    """Reject executables, installers, scripts, browser-renderable markup and mislabeled documents.
+def validate_upload_type(
+    file: UploadFile,
+    *,
+    purpose: str,
+    organization_id: str | None = None,
+    allowed: frozenset[str] | None = None,
+    any_audio_container: bool = False,
+) -> UploadFile:
+    """Allow only the route's expected types, then refuse executable, scripted, renderable or mislabeled content.
 
-    A denylist rather than an allowlist: customers upload niche formats that must keep working.
+    The allowlist is by extension and declared MIME type (a file without an extension must sniff as an allowed
+    type); the denylist and content sniffing stay as the second gate for renamed executables and macro documents.
+    ``allowed`` defaults to the generic route's set, the only one ``UPLOAD_EXTRA_ALLOWED_EXTENSIONS`` widens.
     """
-    reason = _upload_type_rejection_reason(file)
+    operator_extra = _operator_extra_extensions() if allowed is None else frozenset()
+    reason = _upload_type_rejection_reason(
+        file,
+        ALLOWED_UPLOAD_EXTENSIONS | operator_extra if allowed is None else allowed,
+        any_declared_type=operator_extra,
+        any_audio_container=any_audio_container,
+    )
     if reason is not None:
-        LOG.info("Rejected upload by file type", extension=upload_extension(file.filename), reason=reason)
+        LOG.info(
+            "Rejected upload by file type",
+            purpose=purpose,
+            organization_id=organization_id,
+            extension=upload_extension(file.filename),
+            declared_type=_declared_mime_type(file),
+            reason=reason,
+        )
         raise HTTPException(status_code=415, detail=f"File type not allowed: {reason}")
     return file
 
 
-async def validate_upload(file: UploadFile, *, max_size_bytes: int | None = None) -> UploadFile:
+async def validate_upload(
+    file: UploadFile,
+    *,
+    purpose: str,
+    organization_id: str | None = None,
+    max_size_bytes: int | None = None,
+    allowed: frozenset[str] | None = None,
+) -> UploadFile:
     await validate_file_size(file, max_size_bytes=max_size_bytes)
     # The OLE macro scan reads the whole file, so it runs off the event loop.
-    return await asyncio.to_thread(validate_upload_type, file)
-
-
-async def validate_passthrough_upload(file: UploadFile, *, max_size_bytes: int | None, purpose: str) -> UploadFile:
-    """Size-check a file the agent hands to a third-party site, which may legitimately ask for any type.
-
-    The type rules are logged rather than enforced; the stored copy is only ever served as an attachment.
-    """
-    await validate_file_size(file, max_size_bytes=max_size_bytes)
-    reason = await asyncio.to_thread(_upload_type_rejection_reason, file)
-    if reason is not None:
-        LOG.info(
-            "Accepted a restricted file type for pass-through",
-            extension=upload_extension(file.filename),
-            reason=reason,
-            purpose=purpose,
-        )
-    return file
+    return await asyncio.to_thread(
+        validate_upload_type, file, purpose=purpose, organization_id=organization_id, allowed=allowed
+    )
 
 
 async def save_uploaded_file(
@@ -416,6 +636,17 @@ async def assert_files_attachable(*, file_ids: list[str], organization_id: str) 
     unattachable = [file_id for file_id in requested if file_id not in attachable]
     if unattachable:
         raise FileNotAttachable(unattachable)
+
+
+async def live_uploaded_files(*, file_ids: list[str], organization_id: str) -> dict[str, UploadedFile]:
+    """The live files this organization uploaded among ``file_ids``, by id."""
+    requested = list(dict.fromkeys(file_ids))
+    if not requested:
+        return {}
+    live = await app.DATABASE.uploaded_files.get_uploaded_files_by_ids(
+        file_ids=requested, organization_id=organization_id
+    )
+    return {uploaded_file.file_id: uploaded_file for uploaded_file in live if not is_past_retention(uploaded_file)}
 
 
 async def attach_files_to_run(*, file_ids: list[str], organization_id: str, run_id: str) -> list[UploadedFile]:
@@ -549,16 +780,184 @@ async def resolve_file_reference(*, file_id: str, organization_id: str) -> str |
     uploaded_file = await app.DATABASE.uploaded_files.get_uploaded_file(
         file_id=file_id, organization_id=organization_id
     )
-    if uploaded_file is None:
+    if uploaded_file is None or is_past_retention(uploaded_file):
         return None
+    return uploaded_file.storage_uri
+
+
+# The only upload types a block image may name: raster images render inline and run no script.
+BLOCK_IMAGE_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+# The uploads bucket moves objects over 4 MiB to Deep Archive after 92 days, where they cannot be read.
+BLOCK_IMAGE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def is_block_image_upload(uploaded_file: UploadedFile) -> bool:
+    # The row records no content type, so the extension decides: any bytes can sit under an image name, which is
+    # why the signed-URL route sniffs the stored bytes before it serves them.
+    media_types = IMAGE_UPLOAD_TYPES.get(upload_extension(uploaded_file.filename), ())
+    return bool(media_types) and media_types[0] in BLOCK_IMAGE_MEDIA_TYPES
+
+
+def is_past_retention(uploaded_file: UploadedFile) -> bool:
     # The purge runs hourly, so an expired row can still name live bytes. The retention the caller
     # was promised governs the dereference, not when the sweep happens to run.
-    expires_at = uploaded_file.expires_at
-    if expires_at is not None:
-        expiry = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
-        if expiry <= datetime.now(timezone.utc):
+    if uploaded_file.expires_at is None:
+        return False
+    return _as_utc(uploaded_file.expires_at) <= datetime.now(timezone.utc)
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+FILE_URL_EXPIRY_SECONDS = 60 * 60
+# A 56-byte WebP can declare 268 megapixels, which costs a viewer's tab gigabytes to decode.
+BLOCK_IMAGE_MAX_PIXELS = 80_000_000
+# A JPEG's SOF or a GIF's first frame can sit behind metadata past this; the route then reads the whole file.
+_IMAGE_HEAD_BYTES = 64 * 1024
+_JPEG_SOF_MARKERS = frozenset({0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
+# As in libjpeg: no length follows these markers.
+_JPEG_BARE_MARKERS = frozenset({0x00, 0x01, *range(0xD0, 0xD8)})
+_JPEG_FILL = re.compile(rb"\xff+")
+# A real header takes tens of steps; a crafted 4 MiB one takes millions, each on the event loop.
+_IMAGE_HEADER_MAX_STEPS = 4096
+
+
+class _HeaderRunsPastHead(Exception):
+    """The bytes read end before the header answers; only more of the file can."""
+
+
+def _jpeg_pixels(head: bytes) -> int | None:
+    offset, pixels = 2, None
+    for _ in range(_IMAGE_HEADER_MAX_STEPS):
+        fill = _JPEG_FILL.match(head, offset)
+        if offset >= len(head) or (fill is not None and fill.end() + 2 >= len(head)):
+            raise _HeaderRunsPastHead
+        if fill is None:
             return None
-    return uploaded_file.storage_uri
+        marker, offset = head[fill.end()], fill.end() + 1
+        if marker == 0xDA:
+            return pixels
+        # libjpeg refuses a second SOI and an EOI before SOS; ImageIO restarts at the SOI and sizes the SOF inside it.
+        if marker in (0xD8, 0xD9):
+            return None
+        if marker in _JPEG_BARE_MARKERS:
+            continue
+        if marker in _JPEG_SOF_MARKERS:
+            if pixels is not None:
+                return None
+            if offset + 7 > len(head):
+                raise _HeaderRunsPastHead
+            height, width = struct.unpack(">HH", head[offset + 3 : offset + 7])
+            pixels = width * height
+        offset += int.from_bytes(head[offset : offset + 2], "big")
+    return None
+
+
+def _gif_pixels(head: bytes) -> int | None:
+    # Chromium and Pillow size a GIF to its first frame's extent, which can lie far outside the logical screen.
+    width, height, flags = struct.unpack("<HHB", head[6:11])
+    offset, in_extension = 13 + (3 << ((flags & 7) + 1) if flags & 0x80 else 0), False
+    for _ in range(_IMAGE_HEADER_MAX_STEPS):
+        if offset >= len(head):
+            raise _HeaderRunsPastHead
+        if not (in_extension or head[offset] == 0x21):
+            break
+        if in_extension:
+            in_extension, offset = head[offset] > 0, offset + 1 + head[offset]
+        else:
+            in_extension, offset = True, offset + 2
+    else:
+        return None
+    if head[offset] != 0x2C:
+        return None
+    if offset + 9 > len(head):
+        raise _HeaderRunsPastHead
+    left, top, frame_width, frame_height = struct.unpack("<HHHH", head[offset + 1 : offset + 9])
+    return max(width, left + frame_width) * max(height, top + frame_height)
+
+
+def declared_pixels(head: bytes) -> int | None:
+    """Width times height as the image header declares it, read without decoding; None when it is refused.
+    Raises _HeaderRunsPastHead when ``head`` ends before a JPEG or GIF header answers."""
+    chunk = head[12:16]
+    if head.startswith(b"\x89PNG\r\n\x1a\n") and chunk == b"IHDR" and len(head) >= 24:
+        width, height = struct.unpack(">II", head[16:24])
+    elif head[:6] in (b"GIF87a", b"GIF89a") and len(head) >= 13:
+        return _gif_pixels(head) or None
+    elif head[:4] == b"RIFF" and head[8:12] == b"WEBP" and len(head) >= 30:
+        if chunk == b"VP8X":
+            width, height = 1 + int.from_bytes(head[24:27], "little"), 1 + int.from_bytes(head[27:30], "little")
+        elif chunk == b"VP8L" and head[20] == 0x2F:
+            bits = int.from_bytes(head[21:25], "little")
+            width, height = (bits & 0x3FFF) + 1, (bits >> 14 & 0x3FFF) + 1
+        elif chunk == b"VP8 " and head[23:26] == b"\x9d\x01\x2a":
+            width, height = (value & 0x3FFF for value in struct.unpack("<HH", head[26:30]))
+        else:
+            return None
+    elif head[:2] == b"\xff\xd8":
+        return _jpeg_pixels(head) or None
+    else:
+        return None
+    return width * height or None
+
+
+async def mint_file_url(*, file_id: str, organization_id: str) -> UploadedFileSignedUrl | None:
+    """A short-lived inline URL for a live raster-image upload of ``organization_id``; None for anything else.
+    A run-bound upload is deleted with its run and is never a workflow's own file."""
+    uploaded_file = await app.DATABASE.uploaded_files.get_uploaded_file(
+        file_id=file_id, organization_id=organization_id
+    )
+    if (
+        uploaded_file is None
+        or uploaded_file.organization_id != organization_id
+        or uploaded_file.run_id is not None
+        or (uploaded_file.size_bytes is not None and uploaded_file.size_bytes > BLOCK_IMAGE_MAX_BYTES)
+        or is_past_retention(uploaded_file)
+    ):
+        return None
+    head = await app.STORAGE.read_managed_file_head(uploaded_file.storage_uri, organization_id, _IMAGE_HEAD_BYTES)
+    if not head:
+        return None
+    if uploaded_file.size_bytes is None:
+        stored_size = await app.STORAGE.managed_file_size(uploaded_file.storage_uri, organization_id)
+        if stored_size is None or stored_size > BLOCK_IMAGE_MAX_BYTES:
+            return None
+    sniffed = filetype.guess(head)
+    if sniffed is None or sniffed.mime not in BLOCK_IMAGE_MEDIA_TYPES:
+        return None
+    try:
+        pixels = declared_pixels(head)
+    except _HeaderRunsPastHead:
+        pixels = None
+        if len(head) == _IMAGE_HEAD_BYTES:
+            whole = await app.STORAGE.read_managed_file_head(
+                uploaded_file.storage_uri, organization_id, BLOCK_IMAGE_MAX_BYTES
+            )
+            try:
+                pixels = declared_pixels(whole or b"")
+            except _HeaderRunsPastHead:
+                pass
+    if pixels is None or pixels > BLOCK_IMAGE_MAX_PIXELS:
+        return None
+    now = datetime.now(timezone.utc)
+    lifetime = FILE_URL_EXPIRY_SECONDS
+    if uploaded_file.expires_at is not None:
+        lifetime = max(1, min(lifetime, int((_as_utc(uploaded_file.expires_at) - now).total_seconds())))
+    signed_url = await app.STORAGE.presign_managed_file(
+        uploaded_file.storage_uri,
+        organization_id,
+        expiry_seconds=lifetime,
+        inline_content_type=sniffed.mime,
+    )
+    if signed_url is None:
+        return None
+    return UploadedFileSignedUrl(
+        file_id=file_id,
+        signed_url=signed_url,
+        expires_at=int(now.timestamp()) + lifetime if app.STORAGE.presigned_urls_expire else None,
+        content_type=sniffed.mime,
+    )
 
 
 async def purge_expired_files(*, limit: int = 500) -> dict[str, int]:

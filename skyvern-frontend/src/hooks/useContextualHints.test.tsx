@@ -120,6 +120,26 @@ describe("useContextualHints", () => {
     });
   });
 
+  it("an anchor under the Doc (inert) shows no hint and spends nothing; it shows once the canvas is back", () => {
+    const cover = document.createElement("div");
+    cover.setAttribute("inert", "");
+    document.body.appendChild(cover);
+    const adder = document.createElement("div");
+    adder.setAttribute("data-tour", "node-adder");
+    cover.appendChild(adder);
+    const ctx = makeCtx();
+    renderAt("/workflows/wpid_1/build", ctx);
+
+    vi.advanceTimersByTime(DRIVE_AND_SHOW_MS);
+    expect(vi.mocked(driver)).not.toHaveBeenCalled();
+    expect(ctx.updateState).not.toHaveBeenCalled();
+
+    cover.removeAttribute("inert");
+    vi.advanceTimersByTime(DRIVE_AND_SHOW_MS);
+    expect(vi.mocked(driver)).toHaveBeenCalledOnce();
+    expect(ctx.updateState).toHaveBeenCalledWith({ seen_hint_block: true });
+  });
+
   it("does not show when the Layer-1 tour is not completed", () => {
     addAnchor("data-tour", "node-adder");
     const ctx = makeCtx({

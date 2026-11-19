@@ -16,11 +16,6 @@ from skyvern.constants import DEFAULT_LOGIN_PROMPT, DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
-from skyvern.forge.sdk.copilot.code_block_steps import (
-    bind_referenced_parameters_in_yaml,
-    derive_code_block_steps_in_yaml,
-    is_code_block_type,
-)
 from skyvern.forge.sdk.copilot.output_contracts import declared_workflow_parameter_keys
 from skyvern.forge.sdk.copilot.workflow_block_traversal import (
     WorkflowBlockLocation,
@@ -29,9 +24,16 @@ from skyvern.forge.sdk.copilot.workflow_block_traversal import (
     workflow_block_node_locations,
     workflow_link_node_mappings,
 )
+from skyvern.forge.sdk.workflow.authoring_yaml import authoring_yaml_workflow_definition, runs_in_list_order
+from skyvern.forge.sdk.workflow.code_block_steps import (
+    bind_referenced_parameters_in_yaml,
+    derive_code_block_steps_in_yaml,
+    is_code_block_type,
+)
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.private_settings import (
+    PRIVATE_WORKFLOW_SETTINGS_FIELDS,
     resolve_cdp_connect_headers,
 )
 from skyvern.forge.sdk.workflow.private_settings import resolve_extra_http_headers as _resolve_extra_http_headers
@@ -43,11 +45,9 @@ from skyvern.forge.sdk.workflow.private_settings import (
 )
 from skyvern.forge.sdk.workflow.secret_encryption import (
     definition_has_inline_secret_fields,
-    mask_workflow_definition_secrets,
     preserve_workflow_definition_secrets,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
-from skyvern.schemas.proxy_location import GeoTarget
 from skyvern.schemas.runs import ProxyLocation, RunEngine
 from skyvern.schemas.workflows import (
     BlockType,
@@ -64,16 +64,8 @@ from skyvern.utils.yaml_loader import _YAML_NO_FOLD_WIDTH, NoDatesSafeLoader, du
 
 LOG = structlog.get_logger()
 
-_PRIVATE_WORKFLOW_SETTINGS_FIELDS = (
-    "extra_http_headers",
-    "cdp_connect_headers",
-    "proxy_location",
-    "totp_identifier",
-    "totp_verification_url",
-    "webhook_callback_url",
-)
 _WORKFLOW_SETTINGS_WITH_RESOLVERS = (
-    *_PRIVATE_WORKFLOW_SETTINGS_FIELDS,
+    *PRIVATE_WORKFLOW_SETTINGS_FIELDS,
     "enable_self_healing",
     "mask_secrets",
     "pin_saved_session_ip",
@@ -101,7 +93,7 @@ def merge_private_workflow_settings(
     merged: dict[str, Any] = {}
     for source in sources:
         for key, value in source.items():
-            if key not in _PRIVATE_WORKFLOW_SETTINGS_FIELDS:
+            if key not in PRIVATE_WORKFLOW_SETTINGS_FIELDS:
                 continue
             if key in ("extra_http_headers", "cdp_connect_headers") and value is not None:
                 if not isinstance(value, Mapping) or not all(
@@ -119,58 +111,8 @@ def merge_private_workflow_settings(
 
 def submitted_private_workflow_settings(*sources: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(
-        {key: value for source in sources for key, value in source.items() if key in _PRIVATE_WORKFLOW_SETTINGS_FIELDS}
+        {key: value for source in sources for key, value in source.items() if key in PRIVATE_WORKFLOW_SETTINGS_FIELDS}
     )
-
-
-def _is_private_proxy_mapping(proxy_location: object) -> bool:
-    if not isinstance(proxy_location, Mapping):
-        return False
-    unknown_keys = set(proxy_location) - set(GeoTarget.model_fields)
-    if unknown_keys:
-        return True
-    try:
-        GeoTarget.model_validate(proxy_location)
-    except ValidationError as exc:
-        errors = exc.errors(include_input=False, include_context=False, include_url=False)
-        LOG.warning(
-            "Withholding invalid geo proxy mapping from Copilot",
-            field_names=sorted({str(error["loc"][0]) for error in errors if error["loc"]}),
-            error_types=sorted({error["type"] for error in errors}),
-        )
-        return True
-    return False
-
-
-def strip_private_workflow_settings(data: dict[str, Any]) -> bool:
-    changed = False
-    for key in ("extra_http_headers", "cdp_connect_headers"):
-        if key not in data:
-            continue
-        headers = data[key]
-        if (
-            headers
-            and isinstance(headers, dict)
-            and all(isinstance(name, str) and isinstance(value, str) for name, value in headers.items())
-        ):
-            masked = dict.fromkeys(headers, SECRET_HEADER_MASK)
-            changed |= headers != masked
-            data[key] = masked
-        else:
-            del data[key]
-            changed = True
-    for key in (
-        "totp_identifier",
-        "totp_verification_url",
-        "webhook_callback_url",
-    ):
-        if key in data:
-            del data[key]
-            changed = True
-    if _is_private_proxy_mapping(data.get("proxy_location")):
-        del data["proxy_location"]
-        changed = True
-    return changed
 
 
 def private_workflow_settings_from_yaml(workflow_yaml: str | None) -> dict[str, Any]:
@@ -182,7 +124,7 @@ def private_workflow_settings_from_yaml(workflow_yaml: str | None) -> dict[str, 
         return {}
     if not isinstance(data, dict):
         return {}
-    settings = {key: data[key] for key in _PRIVATE_WORKFLOW_SETTINGS_FIELDS if key in data}
+    settings = {key: data[key] for key in PRIVATE_WORKFLOW_SETTINGS_FIELDS if key in data}
     _canonicalize_copilot_proxy_location(settings)
     return settings
 
@@ -259,123 +201,6 @@ def runner_code_block_associations(
                 prior_associations[label] if preserve_existing and label in prior_associations else f"cba_{uuid4().hex}"
             )
     return associations
-
-
-def strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
-    cleaned = deepcopy(block)
-    cleaned.pop("output_parameter", None)
-    cleaned.pop("workflow_system_prompt", None)
-
-    parameters = cleaned.pop("parameters", None)
-    if isinstance(parameters, list) and "parameter_keys" not in cleaned:
-        parameter_keys = [
-            parameter.get("key")
-            for parameter in parameters
-            if isinstance(parameter, dict)
-            and parameter.get("key")
-            and parameter.get("parameter_type") != ParameterType.OUTPUT.value
-        ]
-        if parameter_keys:
-            cleaned["parameter_keys"] = parameter_keys
-
-    loop_over = cleaned.pop("loop_over", None)
-    if isinstance(loop_over, dict) and "loop_over_parameter_key" not in cleaned:
-        loop_over_parameter_key = loop_over.get("key")
-        if loop_over_parameter_key:
-            cleaned["loop_over_parameter_key"] = loop_over_parameter_key
-
-    loop_blocks = cleaned.get("loop_blocks")
-    if isinstance(loop_blocks, list):
-        cleaned["loop_blocks"] = [
-            strip_runtime_block_fields(loop_block) if isinstance(loop_block, dict) else loop_block
-            for loop_block in loop_blocks
-        ]
-    return cleaned
-
-
-def _runs_in_list_order(definition: dict[str, Any]) -> bool:
-    """Whether the top level runs in list order (version 1), deriving a missing version as the schema validator does."""
-    version = definition.get("version")
-    if version is not None:
-        return isinstance(version, int) and version < 2
-    blocks = definition.get("blocks")
-    return not (
-        isinstance(blocks, list)
-        and any(
-            isinstance(block, dict)
-            and (block.get("block_type") == BlockType.CONDITIONAL or block.get("next_block_label") is not None)
-            for block in blocks
-        )
-    )
-
-
-def _drop_list_order_chain(definition: dict[str, Any]) -> None:
-    # Legacy version 1 rows carry stitched next_block_label pointers that validation rejects at version 1.
-    blocks = definition.get("blocks")
-    if not (
-        isinstance(definition.get("version"), int)
-        and _runs_in_list_order(definition)
-        and isinstance(blocks, list)
-        and all(isinstance(block, dict) and block.get("block_type") != BlockType.CONDITIONAL for block in blocks)
-    ):
-        return
-    following = [block.get("label") for block in blocks[1:]] + [None]
-    if all(block.get("next_block_label") == label for block, label in zip(blocks, following)):
-        for block in blocks:
-            block.pop("next_block_label", None)
-
-
-def _copilot_yaml_workflow_definition(persisted_definition: dict[str, Any]) -> dict[str, Any]:
-    workflow_definition = deepcopy(persisted_definition)
-    parameters = workflow_definition.get("parameters")
-    if isinstance(parameters, list):
-        workflow_definition["parameters"] = [
-            parameter
-            for parameter in parameters
-            if not (isinstance(parameter, dict) and parameter.get("parameter_type") == ParameterType.OUTPUT.value)
-        ]
-        for parameter in workflow_definition["parameters"]:
-            if isinstance(parameter, dict) and parameter.get("parameter_type") == ParameterType.CONTEXT.value:
-                source = parameter.get("source")
-                if isinstance(source, dict) and isinstance(source.get("key"), str):
-                    parameter["source_parameter_key"] = source["key"]
-                    parameter.pop("source")
-                    parameter.pop("value", None)
-
-    blocks = workflow_definition.get("blocks")
-    if isinstance(blocks, list):
-        workflow_definition["blocks"] = [
-            strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
-        ]
-    _drop_list_order_chain(workflow_definition)
-    return workflow_definition
-
-
-def workflow_to_copilot_yaml(workflow: Workflow) -> str:
-    workflow_data = workflow.model_dump(mode="json", exclude_none=True)
-    strip_private_workflow_settings(workflow_data)
-    mask_workflow_definition_secrets(workflow_data.get("workflow_definition"))
-    workflow_definition = _copilot_yaml_workflow_definition(workflow_data.get("workflow_definition") or {})
-
-    request_data = {
-        key: workflow_data[key]
-        for key in WorkflowCreateYAMLRequest.model_fields
-        if key != "workflow_definition" and key in workflow_data
-    }
-    request_data["workflow_definition"] = workflow_definition
-
-    try:
-        workflow_request = WorkflowCreateYAMLRequest.model_validate(request_data)
-        yaml_data = workflow_request.model_dump(mode="json", exclude_none=True)
-    except ValidationError:
-        LOG.warning(
-            "Persisted workflow did not round-trip through copilot YAML schema; using best-effort workflow dump",
-            workflow_id=workflow.workflow_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            exc_info=True,
-        )
-        yaml_data = request_data
-    return yaml.safe_dump(yaml_data, sort_keys=False)
 
 
 def reconcile_workflow_completion_contract(
@@ -720,7 +545,7 @@ def _normalize_copilot_yaml_with_dropped_links(
                 block["title"] = block.get("title", "")
 
     workflow_yaml_request = WorkflowCreateYAMLRequest.model_validate(parsed_yaml)
-    list_ordered = _runs_in_list_order(parsed_yaml["workflow_definition"])
+    list_ordered = runs_in_list_order(parsed_yaml["workflow_definition"])
 
     # Post-processing
     for block in workflow_yaml_request.workflow_definition.blocks:
@@ -861,7 +686,7 @@ def redact_credentials_in_workflow_yaml(
     ``credential_values`` must be scoped to the authoring session. Replacing values registered by
     other sessions would let one org's short secret rewrite another org's stored workflow.
     """
-    from skyvern.forge.sdk.copilot.secret_scrub import MIN_PERSISTED_REDACTION_LENGTH, REDACTED_SECRET_PLACEHOLDER
+    from skyvern.utils.secret_scrub import MIN_PERSISTED_REDACTION_LENGTH, REDACTED_SECRET_PLACEHOLDER
 
     redactable = {
         form
@@ -916,7 +741,7 @@ def _copilot_definition_from_yaml(
 
 def copilot_round_trip_definition(definition: WorkflowDefinition, *, workflow_id: str) -> WorkflowDefinition:
     """The definition as Copilot's own save path would persist it, whoever authored it."""
-    workflow_definition = _copilot_yaml_workflow_definition(definition.model_dump(mode="json", exclude_none=True))
+    workflow_definition = authoring_yaml_workflow_definition(definition.model_dump(mode="json", exclude_none=True))
     # Legacy rows can carry version 1 beside stitched next_block_label routing, which validation rejects;
     # letting validation derive the version again round-trips them.
     workflow_definition.pop("version", None)
@@ -936,11 +761,11 @@ _FILE_UPLOAD_BLANK_MEANS_UNSET = frozenset(
 def canonical_copilot_workflow(
     workflow_yaml: str, inherited: Mapping[str, Any] | None = None, *, bind_parameters: bool = True
 ) -> dict[str, Any]:
-    """The workflow as ``workflow_to_copilot_yaml`` would write it once saved, so two spellings of one workflow
+    """The workflow as ``workflow_to_authoring_yaml`` would write it once saved, so two spellings of one workflow
     compare equal. A top-level setting the YAML omits takes its ``inherited`` value, as the save path does."""
     request, definition = _copilot_definition_from_yaml(workflow_yaml, workflow_id="", bind_parameters=bind_parameters)
     data = request.model_dump(mode="json", exclude_none=True)
-    data["workflow_definition"] = _copilot_yaml_workflow_definition(
+    data["workflow_definition"] = authoring_yaml_workflow_definition(
         definition.model_dump(mode="json", exclude_none=True)
     )
     canonical = WorkflowCreateYAMLRequest.model_validate(data).model_dump(mode="json", exclude_none=True)
@@ -1657,7 +1482,7 @@ def add_block_to_workflow(
             "Use edit_block to change it, or give the new block a different label."
         )
 
-    if not _runs_in_list_order(parsed["workflow_definition"]):
+    if not runs_in_list_order(parsed["workflow_definition"]):
         new_block["next_block_label"] = predecessor.get("next_block_label")
         predecessor["next_block_label"] = new_label
     else:

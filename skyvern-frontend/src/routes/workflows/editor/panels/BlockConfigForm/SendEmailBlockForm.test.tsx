@@ -89,6 +89,24 @@ vi.mock("@/components/HelpTooltip", () => ({
   ),
 }));
 
+vi.mock("@/routes/workflows/components/GoogleOAuthCredentialSelector", () => ({
+  GoogleOAuthCredentialSelector: ({
+    onChange,
+  }: {
+    onChange: (id: string) => void;
+  }) => (
+    <select
+      aria-label="Gmail account"
+      defaultValue="native_old"
+      onChange={(event) => onChange(event.target.value)}
+    >
+      <option value="">No Google account</option>
+      <option value="native_old">Original account</option>
+      <option value="native_new">Another account</option>
+    </select>
+  ),
+}));
+
 const isFirstBlockMock = vi.fn<() => boolean>(() => false);
 vi.mock("../../hooks/useIsFirstNodeInWorkflow", () => ({
   useIsFirstBlockInWorkflow: () => isFirstBlockMock(),
@@ -132,6 +150,89 @@ afterEach(() => {
 });
 
 describe("SendEmailBlockForm (SKY-9379)", () => {
+  test("preserves reply when choosing an account after the incompatible account was cleared", () => {
+    const data = {
+      ...baseSendEmailData,
+      transport: "gmail",
+      credentialId: "",
+      replyToMessageId: "{{ email.id }}",
+    };
+    mockNodeFixtures.set("b1", { id: "b1", type: "sendEmail", data });
+    render(<SendEmailBlockForm blockId="b1" />);
+    fireEvent.change(screen.getByRole("combobox", { name: "Gmail account" }), {
+      target: { value: "native_new" },
+    });
+    Object.assign(data, updateNodeDataMock.mock.lastCall?.[1]);
+    expect(data.credentialId).toBe("native_new");
+    expect(data.replyToMessageId).toBe("{{ email.id }}");
+  });
+
+  test("keeps reply enabled when its incompatible account is cleared", () => {
+    mockNodeFixtures.set("b1", {
+      id: "b1",
+      type: "sendEmail",
+      data: {
+        ...baseSendEmailData,
+        transport: "gmail",
+        credentialId: "native_old",
+        replyToMessageId: "{{ email.id }}",
+      },
+    });
+    render(<SendEmailBlockForm blockId="b1" />);
+    fireEvent.change(screen.getByRole("combobox", { name: "Gmail account" }), {
+      target: { value: "" },
+    });
+    expect(updateNodeDataMock).toHaveBeenCalledWith("b1", {
+      credentialId: "",
+      credentialSource: "native",
+      connectionId: "",
+    });
+  });
+
+  test("preserves the reply target when reselecting the same Gmail account", () => {
+    const data = {
+      ...baseSendEmailData,
+      transport: "gmail",
+      credentialId: "native_old",
+      replyToMessageId: "synthetic_message",
+    };
+    mockNodeFixtures.set("b1", { id: "b1", type: "sendEmail", data });
+    render(<SendEmailBlockForm blockId="b1" />);
+    fireEvent.change(screen.getByRole("combobox", { name: "Gmail account" }), {
+      target: { value: "native_old" },
+    });
+    Object.assign(data, updateNodeDataMock.mock.lastCall?.[1]);
+    expect(data.replyToMessageId).toBe("synthetic_message");
+  });
+
+  test.each(["{{ email.id }}", "synthetic_message"])(
+    "clears reply target %s when changing Gmail accounts",
+    (replyToMessageId) => {
+      mockNodeFixtures.set("b1", {
+        id: "b1",
+        type: "sendEmail",
+        data: {
+          ...baseSendEmailData,
+          transport: "gmail",
+          credentialId: "native_old",
+          replyToMessageId,
+        },
+      });
+      render(<SendEmailBlockForm blockId="b1" />);
+      fireEvent.change(
+        screen.getByRole("combobox", { name: "Gmail account" }),
+        { target: { value: "native_new" } },
+      );
+      expect(updateNodeDataMock).toHaveBeenCalledWith(
+        "b1",
+        expect.objectContaining({
+          credentialId: "native_new",
+          replyToMessageId: "",
+        }),
+      );
+    },
+  );
+
   test("returns null when the node lookup misses", () => {
     mockNodeFixtures.set("missing", undefined);
     const { container } = render(<SendEmailBlockForm blockId="missing" />);

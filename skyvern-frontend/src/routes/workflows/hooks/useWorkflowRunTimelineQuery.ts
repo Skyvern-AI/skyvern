@@ -21,7 +21,7 @@ import {
   useActiveOrgId,
 } from "@/store/ActiveOrgContext";
 
-// Mirrors RECORDED_ACTIONS_POLL_INTERVAL_MS in WorkflowCopilotChat, the other reader of
+// Mirrors RECORDED_ACTIONS_POLL_INTERVAL_MS in EmberChat, the other reader of
 // this endpoint; the two must not drift apart or their counts disagree on screen.
 const RUNNING_TIMELINE_REFETCH_INTERVAL_MS = 2500;
 // A final run's blocks, whatever its final status, can close after the run itself turns final.
@@ -98,7 +98,7 @@ function useWorkflowRunTimelineQuery(options?: {
       return data;
     },
     // The header counted off this data used to refetch only when the 5s run query landed,
-    // so it trailed the copilot chat's own 2.5s timeline poll and could report no actions
+    // so it trailed the Ember chat's own 2.5s timeline poll and could report no actions
     // while rows were visibly executing. Polling directly replaces that chained refetch.
     // The gate reads the run query's cached data, which is retained after failed
     // refetches, so this query's own error state has to stop the poll.

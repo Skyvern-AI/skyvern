@@ -430,6 +430,8 @@ export interface GoogleOAuthCredential {
   // Decided by the server: active, send permission granted, and a verified account identity on record.
   gmail_send_ready?: boolean;
   account_recorded?: boolean;
+  // The server's fit for each catalog action, keyed "<integration id>.<action id>". Labels only.
+  action_fit?: Record<string, "yes" | "no" | "unknown">;
   created_at: string;
   modified_at: string;
 }
@@ -441,11 +443,12 @@ export interface GoogleOAuthCredentialResponse {
 
 export interface GoogleOAuthCredentialListResponse {
   credentials: GoogleOAuthCredential[];
+  action_fit?: Record<string, Record<string, "yes" | "no" | "unknown">>;
 }
 
 export interface GoogleOAuthClientConfigSafe {
   client_id: string | null;
-  redirect_hosts: string[];
+  redirect_uris: string[];
   app_origins: string[];
   client_secret_configured: boolean;
   configured: boolean;
@@ -460,7 +463,7 @@ export interface GoogleOAuthClientConfigResponse {
 export interface UpdateGoogleOAuthClientConfigRequest {
   client_id: string;
   client_secret?: string | null;
-  redirect_hosts: string[];
+  redirect_uris: string[];
   app_origins: string[];
 }
 
@@ -990,6 +993,8 @@ export type WorkflowRunApiResponse = {
   workflow_run_id: string;
   workflow_title: string | null;
   retried_from_workflow_run_id?: string | null;
+  // Set when the run was started from the editor's per-block Run.
+  debug_session_id?: string | null;
 } & Pick<
   WorkflowRunRetryFields,
   "attempt" | "retry_pending" | "next_attempt_at"
@@ -1068,6 +1073,7 @@ export type WorkflowRunStatusApiResponse = {
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
   copilot_session_id?: string | null;
+  ember_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
@@ -1114,6 +1120,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
   copilot_session_id?: string | null;
+  ember_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export type TaskGenerationApiResponse = {

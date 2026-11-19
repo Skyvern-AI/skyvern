@@ -19,7 +19,7 @@ from openai import PermissionDeniedError as OpenAIPermissionDeniedError
 from openai import UnprocessableEntityError as OpenAIUnprocessableEntityError
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.model_telemetry import CopilotModelStopMetadata
+    from skyvern.forge.sdk.api.llm.agents_model import ModelStopMetadata
 
 
 class CopilotEmptyCompletionError(RuntimeError):
@@ -29,7 +29,7 @@ class CopilotEmptyCompletionError(RuntimeError):
         self,
         *,
         llm_key: str,
-        stop_metadata: CopilotModelStopMetadata,
+        stop_metadata: ModelStopMetadata,
         retry_allowed: bool = True,
     ) -> None:
         super().__init__(f"{self.reason}: {llm_key}")

@@ -53,6 +53,7 @@ from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     BROWSER_CONNECTION_LOST_ERROR_CODE,
+    ActionDeadlineExceeded,
     ActionExecutionTimeout,
     BlockedHost,
     CaptchaSolveError,
@@ -138,7 +139,6 @@ from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_a
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import starts_like_pdf
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
-from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import RedirectHopAuthorizer, deny_unenrolled_redirect_hop
@@ -169,6 +169,7 @@ from skyvern.forge.sdk.services.credentials import (
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
+from skyvern.forge.sdk.workflow.block_goal_wrapping import unwrap_goal_fields
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.run_cancellation import RunCancellation, read_run_cancellation
@@ -183,6 +184,7 @@ from skyvern.utils.prompt_engine import (
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_previous_extracted_information
 from skyvern.utils.url_validators import redacted_url_origin, signed_url_ttl_remaining_seconds, validate_fetch_url
+from skyvern.webeye.action_deadline import under_action_deadline
 from skyvern.webeye.actions import action_phase, actions, handler_utils
 from skyvern.webeye.actions.action_phase import ActionPhase
 from skyvern.webeye.actions.action_types import ActionType
@@ -362,6 +364,10 @@ DOWNLOAD_OBSERVED_BUT_EMPTY_FOLLOWUP_MESSAGE = (
     "A file download was observed but no file could be saved from it. "
     "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
 )
+DOWNLOAD_TIMEOUT_FAILURE_MESSAGE = (
+    "This download started but did not finish within the download timeout, so no file was saved. "
+    "The file may be too large or the site may have stalled; try a smaller export or a different download link."
+)
 # Arming/tearing down blob URL retention is best-effort and must never stall a download action.
 _BLOB_RETENTION_ARMING_TIMEOUT_SECONDS = 5.0
 SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE = (
@@ -375,7 +381,6 @@ _MULTI_FIELD_TOTP_OPERATION_TIMEOUT_SECONDS = _MULTI_FIELD_TOTP_OPERATION_TIMEOU
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
-COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
 COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG = "COLLAPSE_AUTOCOMPLETE_FANOUT"
 COLLAPSE_XP_ASSIGNMENT_FLAG = "COLLAPSE_XP_ASSIGNMENT"
 # Nested dispatch replaces contexts, so run-stickiness is process-local and keyed by run ID.
@@ -431,6 +436,12 @@ class CustomSelectFamilyOutcome(StrEnum):
 # calendar stepped one month per click) while stopping a walk that cannot finish inside the action
 # execution deadline — the deadline cancels the action, which skips every recovery below.
 DATEPICKER_WALK_BUDGET_SECONDS = 300.0
+# A click that reveals a whole document (a modal holding a long filing, say) can add thousands of
+# elements; rescraping and resolving them one by one once ran into the 20-minute action cap.
+# under_action_deadline adds its headroom, so the scan ends about 35 s in.
+DROPDOWN_SCAN_BUDGET_MS = 30_000
+# Checked after the rescrape; it skips the menu search over a reveal no menu could be.
+DROPDOWN_SCAN_MAX_NEW_ELEMENTS = 5000
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
 DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
@@ -3160,7 +3171,7 @@ async def _resolve_collapse_xp_assignment(
 
 async def _resolve_collapse_gate(
     task: Task,
-    family_flag: str,
+    family_flag: str | None,
     log_label: str,
     *,
     consult_assignment: bool = True,
@@ -3182,7 +3193,7 @@ async def _resolve_collapse_gate(
             "workflow_permanent_id": workflow_permanent_id or "",
             "script_mode": "true" if script_mode_run else "false",
         }
-        family_enabled = bool(
+        family_enabled = family_flag is None or bool(
             await experimentation_provider.is_feature_enabled_cached(
                 family_flag,
                 organization_id,
@@ -3224,14 +3235,6 @@ async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
         consult_assignment=False,
     )
     return gate.family_enabled
-
-
-async def _is_collapse_custom_select_fanout_enabled(task: Task) -> bool:
-    return await _is_collapse_fanout_enabled(
-        task,
-        COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
-        "collapse-custom-select-fanout",
-    )
 
 
 async def _is_collapse_autocomplete_fanout_enabled(task: Task) -> bool:
@@ -6190,37 +6193,54 @@ class ActionHandler:
             results[-1].download_triggered = True
             action.download_triggered = True
 
-            async with asyncio.timeout(_download_completion_timeout):
-                async with settle_browser_downloads_for_context(page.context):
-                    if action_download_observation is not None:
-                        # Mirror the mid-wait rule at finalize: poll the provider only when no local
-                        # artifact already accounts for this action. A file the CDP/local/session path
-                        # already saved must not be duplicated by a second, collision-suffixed provider
-                        # copy here. The listing is done only when a provider is attached, so the
-                        # legacy no-provider path issues no extra directory read.
-                        local_signal_accounts_for_action = bool(
-                            {_download_signal_identity(file) for file in await _list_download_signal_files()}
-                            - signal_file_identities_before
-                        )
-                        if not local_signal_accounts_for_action:
-                            await _provider_poll_and_measure(
-                                action_download_observation,
-                                provider_poll_phase,
-                                destination_dir=download_dir,
-                                deadline=download_wait_deadline,
-                                list_signal_files=_list_download_signal_files,
-                                signal_identity=_download_signal_identity,
-                                identities_before=signal_file_identities_before,
-                                poll_failure_log="Final provider download poll failed",
-                                measure=False,
+            try:
+                async with asyncio.timeout(_download_completion_timeout):
+                    async with settle_browser_downloads_for_context(page.context):
+                        if action_download_observation is not None:
+                            # Mirror the mid-wait rule at finalize: poll the provider only when no local
+                            # artifact already accounts for this action. A file the CDP/local/session path
+                            # already saved must not be duplicated by a second, collision-suffixed provider
+                            # copy here. The listing is done only when a provider is attached, so the
+                            # legacy no-provider path issues no extra directory read.
+                            local_signal_accounts_for_action = bool(
+                                {_download_signal_identity(file) for file in await _list_download_signal_files()}
+                                - signal_file_identities_before
                             )
-                    downloaded_file_names, new_file_paths = await _finalize_download_artifacts(
-                        download_dir=download_dir,
-                        task=task,
-                        list_files_before=list_files_before,
-                        list_observed_download_files=_list_final_download_files,
-                        attempt_started_at=attempt_started_at,
-                    )
+                            if not local_signal_accounts_for_action:
+                                await _provider_poll_and_measure(
+                                    action_download_observation,
+                                    provider_poll_phase,
+                                    destination_dir=download_dir,
+                                    deadline=download_wait_deadline,
+                                    list_signal_files=_list_download_signal_files,
+                                    signal_identity=_download_signal_identity,
+                                    identities_before=signal_file_identities_before,
+                                    poll_failure_log="Final provider download poll failed",
+                                    measure=False,
+                                )
+                        downloaded_file_names, new_file_paths = await _finalize_download_artifacts(
+                            download_dir=download_dir,
+                            task=task,
+                            list_files_before=list_files_before,
+                            list_observed_download_files=_list_final_download_files,
+                            attempt_started_at=attempt_started_at,
+                        )
+            except asyncio.TimeoutError:
+                # The settle budget and the budget inside the finalize wait are both the task's download
+                # timeout, and this one starts first, so the inner wait's own graceful timeout can never
+                # fire here. Without this the budget's TimeoutError leaves the download path entirely and
+                # the step runner's catch-all reports it as an unexpected exception.
+                LOG.warning(
+                    "Download did not finish within the download timeout; no file was saved",
+                    workflow_run_id=task.workflow_run_id,
+                    download_dir=download_dir,
+                    timeout_seconds=_download_completion_timeout,
+                )
+                results[-1] = ActionFailure(
+                    Exception(DOWNLOAD_TIMEOUT_FAILURE_MESSAGE),
+                    download_triggered=True,
+                )
+                return results
             if downloaded_file_names:
                 results[-1].downloaded_files = action.downloaded_files = downloaded_file_names
                 successful_download_bytes = 0
@@ -8126,7 +8146,7 @@ async def _build_after_click_verify_prompt(
     # SKY-9718 Layer 1: sequential-click after-dropdown verifier path. Keep
     # Skyvern IDs (default html_need_skyvern_attrs=True) because
     # `new_elements_ids` is threaded and the LLM compares those IDs to what's
-    # rendered. Gate lean on the PostHog flag.
+    # rendered.
     _ctx = skyvern_context.current()
     lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
     slim_output = await get_slim_output_template_value("check-user-goal")
@@ -8201,6 +8221,25 @@ async def handle_sequential_click_with_submit_bypass(
     )
 
 
+async def _scan_elements_revealed_by_click(scraped_page: ScrapedPage) -> tuple[ScrapedPage, set[str], list[str]] | None:
+    scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
+    new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
+    candidate_ids = [
+        element_id
+        for element_id in new_element_ids
+        if scraped_page_after_open.id_to_element_dict.get(element_id, {}).get("interactable", False)
+    ]
+    if len(candidate_ids) > DROPDOWN_SCAN_MAX_NEW_ELEMENTS:
+        LOG.warning(
+            "Click revealed more interactable elements than any menu holds; exiting the sequential click logic",
+            new_interactable_elements=len(candidate_ids),
+            limit=DROPDOWN_SCAN_MAX_NEW_ELEMENTS,
+        )
+        return None
+
+    return scraped_page_after_open, new_element_ids, candidate_ids
+
+
 @traced(name="skyvern.agent.action.click_dropdown_sequential")
 async def handle_sequential_click_for_dropdown(
     action: actions.ClickAction,
@@ -8235,15 +8274,30 @@ async def handle_sequential_click_for_dropdown(
         return None
 
     LOG.info("Detected new element after clicking", action=action, sampling=True)
-    scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
-    new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
-
-    dom_after_open = DomUtil(scraped_page=scraped_page_after_open, page=page)
-    new_interactable_element_ids = [
-        element_id
-        for element_id in new_element_ids
-        if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
-    ]
+    scan_started = time.monotonic()
+    try:
+        # Used as an overall cap on the rescrape, which issues many driver calls.
+        async with under_action_deadline(budget_ms=DROPDOWN_SCAN_BUDGET_MS):
+            scanned = await _scan_elements_revealed_by_click(scraped_page)
+    except ActionDeadlineExceeded as exc:
+        # Also reached by a timeout inside the rescrape itself; the error says which.
+        LOG.warning(
+            "Post-click dropdown scan timed out; treating the click as not opening a menu",
+            budget_ms=DROPDOWN_SCAN_BUDGET_MS,
+            error=str(exc),
+            element_id=anchor_element.get_id(),
+        )
+        return None
+    if scanned is None:
+        return None
+    scraped_page_after_open, new_element_ids, new_interactable_element_ids = scanned
+    LOG.info(
+        "Post-click dropdown scan finished",
+        duration_seconds=round(time.monotonic() - scan_started, 2),
+        new_elements=len(new_element_ids),
+        new_interactable_elements=len(new_interactable_element_ids),
+        sampling=True,
+    )
 
     if len(new_interactable_element_ids) == 0:
         LOG.info("No new interactable elements found, exiting the sequential click logic")
@@ -15053,8 +15107,8 @@ async def _select_deterministic_custom_option(
     script_mode_run = bool(context and context.script_mode)
     gate = await _resolve_collapse_gate(
         task,
-        COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
-        "collapse-custom-select-fanout",
+        family_flag=None,
+        log_label="collapse-custom-select-fanout",
     )
     if gate.gate_error and not post_failed_click_commit_recovery:
         emit(CustomSelectFamilyOutcome.llm_fallback_gate_error)

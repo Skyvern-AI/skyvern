@@ -161,7 +161,7 @@ describe("useLoginGoalAutoFill", () => {
       });
       act(() => {
         useWorkflowYamlEditorStore.setState({
-          copilotAcceptance: Symbol("turn"),
+          emberAcceptance: Symbol("turn"),
         });
       });
       rerender(
@@ -175,7 +175,7 @@ describe("useLoginGoalAutoFill", () => {
       expect(screen.getByTestId("saved-goal").textContent).toBe(DEFAULT_GOAL);
 
       act(() => {
-        useWorkflowYamlEditorStore.setState({ copilotAcceptance: null });
+        useWorkflowYamlEditorStore.setState({ emberAcceptance: null });
       });
       act(() => vi.advanceTimersByTime(300));
 
@@ -196,7 +196,7 @@ describe("useLoginGoalAutoFill", () => {
     );
     act(() => {
       useWorkflowYamlEditorStore.setState({
-        copilotAcceptance: Symbol("turn"),
+        emberAcceptance: Symbol("turn"),
       });
     });
     rerender(
@@ -208,7 +208,7 @@ describe("useLoginGoalAutoFill", () => {
     expect(screen.getByTestId("saved-goal").textContent).toBe(DEFAULT_GOAL);
 
     act(() => {
-      useWorkflowYamlEditorStore.setState({ copilotAcceptance: null });
+      useWorkflowYamlEditorStore.setState({ emberAcceptance: null });
     });
 
     expect(screen.getByTestId("saved-goal").textContent).toContain(

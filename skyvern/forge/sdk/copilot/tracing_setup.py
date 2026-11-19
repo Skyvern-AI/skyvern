@@ -23,7 +23,7 @@ from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.sdk.core import skyvern_context
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.model_telemetry import CopilotModelCallTelemetry
+    from skyvern.forge.sdk.api.llm.agents_model import ModelCallTelemetry
 
 LOG = structlog.get_logger()
 
@@ -58,8 +58,8 @@ class _LogfireAgentSpan(Protocol):
 
 
 def is_tracing_enabled() -> bool:
-    """Check COPILOT_TRACING_ENABLED env var (1/true/yes)."""
-    value = os.getenv("COPILOT_TRACING_ENABLED", "")
+    """Check EMBER_TRACING_ENABLED env var (1/true/yes)."""
+    value = os.getenv("EMBER_TRACING_ENABLED") or os.getenv("COPILOT_TRACING_ENABLED") or ""
     return value.strip().lower() in _TRACING_ENABLED_VALUES
 
 
@@ -76,7 +76,7 @@ def _clear_sdk_trace_processors() -> None:
 def ensure_tracing_initialized() -> None:
     """Initialize Agents SDK tracing processors once.
 
-    When ``COPILOT_TRACING_ENABLED`` is set, logfire is configured as the
+    When ``EMBER_TRACING_ENABLED`` is set, logfire is configured as the
     trace exporter.  Otherwise the SDK's built-in tracing to OpenAI servers
     is disabled to avoid 403/401 errors.
     """
@@ -119,7 +119,7 @@ def ensure_tracing_initialized() -> None:
             logfire.instrument_openai_agents()
         except ImportError as exc:
             # `instrument_openai_agents` imports the optional `agents` SDK at call time;
-            # self-hosted installs without it still need to boot under COPILOT_TRACING_ENABLED.
+            # self-hosted installs without it still need to boot under EMBER_TRACING_ENABLED.
             LOG.warning("Copilot tracing requested but openai-agents SDK not installed", error=repr(exc))
         _patch_agent_span_attributes()
         # Logfire instruments via OpenTelemetry independently of the SDK's
@@ -155,17 +155,17 @@ def _calculate_price(calc_price: Any, usage: Any, model: str) -> Any:
         return calc_price(usage, model_ref=model_ref, provider_id=provider)
 
 
-def _model_call_cost(telemetry: CopilotModelCallTelemetry, model: str) -> float | None:
+def _model_call_cost(telemetry: ModelCallTelemetry, model: str) -> float | None:
     # ``tracing_setup`` is imported by lightweight CLI/browser modules that do
     # not install the server-only OpenAI Agents SDK. Keep the model adapter
-    # behind the runtime Copilot seam instead of importing it at module load.
-    from skyvern.forge.sdk.copilot.model_telemetry import _model_call_cost as calculate_model_call_cost
+    # behind this lazy import instead of importing it at module load.
+    from skyvern.forge.sdk.api.llm.agents_model import _model_call_cost as calculate_model_call_cost
 
     return calculate_model_call_cost(telemetry, model)
 
 
-def current_model_call_telemetry() -> CopilotModelCallTelemetry | None:
-    from skyvern.forge.sdk.copilot.model_telemetry import current_model_call_telemetry as get_model_call_telemetry
+def current_model_call_telemetry() -> ModelCallTelemetry | None:
+    from skyvern.forge.sdk.api.llm.agents_model import current_model_call_telemetry as get_model_call_telemetry
 
     return get_model_call_telemetry()
 
@@ -208,7 +208,7 @@ def _attach_legacy_cost_attr(attrs: dict[str, Any], usage: Any, model: str | Non
 
 def _attach_cost_attr(
     attrs: dict[str, Any],
-    telemetry: CopilotModelCallTelemetry,
+    telemetry: ModelCallTelemetry,
     model: str | None,
 ) -> None:
     if model is None or telemetry.input_tokens is None or telemetry.output_tokens is None:
@@ -233,14 +233,14 @@ def _attach_cost_attr(
 
 def _attach_copilot_model_call_attrs(
     attrs: dict[str, Any],
-    telemetry: CopilotModelCallTelemetry,
+    telemetry: ModelCallTelemetry,
     model: str | None,
 ) -> None:
-    attrs["copilot.model_call_index"] = telemetry.model_call_index
-    attrs["copilot.cache.mode"] = telemetry.cache_mode
-    attrs["copilot.cache.breakpoint_count"] = telemetry.cache_breakpoint_count
+    attrs["llm.model_call_index"] = telemetry.model_call_index
+    attrs["llm.cache.mode"] = telemetry.cache_mode
+    attrs["llm.cache.breakpoint_count"] = telemetry.cache_breakpoint_count
     if telemetry.cache_stable_prefix_chars is not None:
-        attrs["copilot.cache.stable_prefix_chars"] = telemetry.cache_stable_prefix_chars
+        attrs["llm.cache.stable_prefix_chars"] = telemetry.cache_stable_prefix_chars
 
     if telemetry.input_tokens is not None:
         attrs["gen_ai.usage.input_tokens"] = telemetry.input_tokens

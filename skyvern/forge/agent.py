@@ -103,9 +103,9 @@ from skyvern.forge import app
 from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.failure_classifier import (
+    CLASSIFIER_LABEL_REASON_CODES,
     FailureCategory,
     bounded_failure_categories,
-    classify_from_failure_reason,
     is_captcha_solve_failure,
 )
 from skyvern.forge.final_failure_diagnostic import annotate_failed_task
@@ -152,7 +152,6 @@ from skyvern.forge.sdk.browser_action_preflight import (
     stamp_parsed_actions,
 )
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
-from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
@@ -212,6 +211,7 @@ from skyvern.forge.sdk.services.credentials import parse_totp_config
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, task_requester_id
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced, traced_span
+from skyvern.forge.sdk.workflow.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.workflow.context_manager import NON_SECRET_CREDENTIAL_FIELDS, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -241,6 +241,7 @@ from skyvern.forge.taskv3.loop import (
     LoopOutcome,
     RoundAction,
     TurnRecord,
+    UnsavedDownloads,
     submissions_across_contexts,
 )
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
@@ -252,7 +253,6 @@ from skyvern.forge.taskv3.provider_downloads import (
 from skyvern.forge.taskv3.run_arms import (
     ANSWER_AUDIT_LOG_ONLY_FLAG,
     APPLICATION_CONTEXT_FLAG,
-    CARRY_REASONING_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     LLM_ROUTE_FLAG,
     LOGIN_PACE_FLAG,
@@ -406,6 +406,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     record_download_artifact_outcome_for_context,
     replay_candidate_holds,
     settle_browser_downloads_for_context,
+    unsaved_downloads_since,
 )
 from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.native_downloads import NativeDownloadAttempt, NativeDownloads
@@ -634,6 +635,7 @@ def _taskv3_row_intention(
             round_action.target_kind,
             _taskv3_label_secret_values(task, secret_values),
             succeeded=round_action.succeeded,
+            shown=round_action.target_shown,
         )
     except Exception:
         LOG.warning("task_v3 failed to compose action label", task_id=task.task_id)
@@ -752,8 +754,9 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     # action, so a page that never moved would still hash differently the first time a tool touches it: the stall
     # detector reads that as progress and the action-effect check as an effect. Page-authored data-tv3 values stay
     # significant, as in loop.py's canonicalization. OTP bookkeeping attributes are ignored for the same reason.
-    " const scrub = (s) => s.replace(/ data-(?:tv3-(?:act|catcher|cellgrid|close|codebox|collateral|cover|dateseg"
-    '|filter-base|focus|look|menu|menu-scroller|pick|popup-filter|pre|sugg|sugglist)|skyvern-otp-[^\\s=]+)="[^"]*"'
+    " const scrub = (s) => s.replace(/ data-(?:tv3-(?:act|catcher|cellgrid|codebox|collateral|cover|ctl|dateseg"
+    "|filter-base|focus|liveparent|look|menu|menu-scroller|pick|popup-filter|pre|prerow|sugg|sugglist)"
+    '|skyvern-otp-[^\\s=]+)="[^"]*"'
     "| data-tv3=\"t\\d+(?:-\\d+)?\"/gi, '');"
     # Each sample scores every element's own text, capped at 2: +1 when rewritten, -1 when unchanged, 0 when it grew.
     # From 2 until back at 0 it is a ticker, and the settle check (maskTicks) ignores a ticker's change only to a
@@ -1881,6 +1884,22 @@ def _redacted_user_defined_errors(task: Task, errors: list[UserDefinedError]) ->
     ]
 
 
+def _action_block_action_succeeded(step: Step) -> bool:
+    """Whether the step executed actions and each actually succeeded.
+
+    A tolerated ``ActionFailure`` (``stop_execution_on_failure=False``, e.g. an element id the model
+    picked that is not on the page) still persists the step as completed, so the step's status alone
+    cannot tell a performed action from a skipped one.
+    """
+    actions_and_results = step.output.actions_and_results if step.output else None
+    if not actions_and_results:
+        return False
+    return all(
+        results and results[-1].success and action.status != ActionStatus.skipped
+        for action, results in actions_and_results
+    )
+
+
 def _is_transient_page_read_refusal(exc: BaseException) -> bool:
     """Whether a browser refused a read because the page closed, is mid-navigation, or lost the
     document's context. Matched on the message across every driver family the image can hold,
@@ -2300,8 +2319,13 @@ def _v3_failure_category(
     if task_status == TaskStatus.failed:
         # Same code-level failure classification fail_task records, so v3 failures carry a
         # failure_category like step-engine failures.
-        failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=not cap_is_the_cause)
-        if failure_category is None and cap_is_the_cause:
+        failure_category = app.AGENT_FUNCTION.classify_failure(
+            failure_reason, fallback_to_unknown=not cap_is_the_cause, status=TaskStatus.failed
+        )
+        rule_categories = [
+            c for c in failure_category or [] if c.get("reason_code") not in CLASSIFIER_LABEL_REASON_CODES
+        ]
+        if not rule_categories and cap_is_the_cause:
             return [
                 {
                     "category": FailureCategory.BUDGET_EXHAUSTED.value,
@@ -2339,6 +2363,42 @@ def _holding_replay_candidates(
             return await execute(agent, *args, **kwargs)
 
     return holding
+
+
+async def _recover_page(browser_state: BrowserState, task: Task, page: Any) -> bool | None:
+    context = skyvern_context.current()
+    if context is not None and (request := context.page_reload_request) is not None and request.pin() is not page:
+        context.page_reload_request = None
+    if context is None or context.page_reload_request is None:
+        prepared = await app.AGENT_FUNCTION.settle_page_reload_signal(task=task)
+        if prepared is not True:
+            return prepared
+    request = context.page_reload_request if context is not None else None
+    if context is None or request is None or request.pin() is not page:
+        return False
+    context.page_reload_request = None
+    try:
+        preflight_action(ReloadPageAction(task_id=task.task_id), page, site="internal_refresh")
+        return await browser_state.reload_page(page=page, still_wanted=request.still_wanted)
+    except Exception:
+        context.page_reload_request = request
+        raise
+
+
+async def _recover_page_action(
+    browser_state: BrowserState, task: Task, page: Any, action: ReloadPageAction
+) -> bool | None:
+    recovered: bool | None = False
+    action.started_at = naive_utc_now()
+    try:
+        recovered = await _recover_page(browser_state, task, page)
+        return recovered
+    finally:
+        if recovered is not None:
+            with contained_effect("persist page recovery action"):
+                action.finished_at = naive_utc_now()
+                action.status = ActionStatus.completed if recovered else ActionStatus.failed
+                action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
 
 
 class ForgeAgent:
@@ -3108,6 +3168,7 @@ class ForgeAgent:
             _observable_child_frames,
             _realm_document_id,
             _recorded_work_frames,
+            downloaded_line,
             pending_marker,
         )
 
@@ -3187,13 +3248,6 @@ class ForgeAgent:
             await resolve_run_arm(
                 context,
                 ANSWER_AUDIT_LOG_ONLY_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=False,
-            )
-            await resolve_run_arm(
-                context,
-                CARRY_REASONING_FLAG,
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=False,
@@ -3393,10 +3447,11 @@ class ForgeAgent:
         download_wait_exhausted: set[str] = set()
 
         download_finalized = False
+        capture_tally_before = download_tally_for_context(browser_state.browser_context)
         # Files settle already recorded, as the finalizer left them, so a later settle records only files new since.
         recorded_files: list[str] = []
-        recorded_count = 0
         download_completion_reason: str | None = None
+        landed_lines: list[str] = []
 
         # Owned here (not by the engine) so the final clean_up_task below can also exclude names
         # tools staged into the downloads dir this run, whether or not a download settle ever finalized.
@@ -3462,8 +3517,26 @@ class ForgeAgent:
             quiet = await native_download_attempt.failed_and_quiescent()
             return quiet and _native_attempt_eligible()
 
+        async def _unfinalized_file_landed() -> bool:
+            # No download settle finalized this block's file; clean_up_task below does.
+            # Same local-plus-session listing as the baseline, and a partial is not a delivered file.
+            if workflow_download_directory is None or download_baseline_files is None:
+                return False
+            landed = set(list_files_in_directory(workflow_download_directory, attempt_started_at=attempt_started_at))
+            if task.browser_session_id:
+                landed |= set(
+                    await app.STORAGE.list_downloaded_files_in_browser_session(
+                        organization_id=organization.organization_id,
+                        browser_session_id=task.browser_session_id,
+                    )
+                )
+            landed -= set(download_baseline_files)
+            landed -= {str(workflow_download_directory / name) for name in staged_downloads}
+            return any(Path(name).suffix != BROWSER_DOWNLOADING_SUFFIX for name in landed)
+
         download_wait: DownloadWait | None = None
         download_settle: DownloadSettle | None = None
+        unsaved_downloads: UnsavedDownloads | None = None
         if task_block is not None and task_block.complete_on_download and task.workflow_run_id:
             complete_on_download_block = task_block
 
@@ -3506,8 +3579,16 @@ class ForgeAgent:
                 replay_drain_until = None
                 return True
 
+            def _local_sizes() -> dict[str, int]:
+                assert workflow_download_directory is not None
+                sizes: dict[str, int] = {}
+                for f in list_files_in_directory(workflow_download_directory):
+                    with contextlib.suppress(OSError):  # a file can vanish between the listing and the stat
+                        sizes[f] = os.path.getsize(f)
+                return sizes
+
             async def _settle_downloads(staged: frozenset[str]) -> str | None:
-                nonlocal download_finalized, download_completion_reason, recorded_files, recorded_count
+                nonlocal download_finalized, download_completion_reason, recorded_files, landed_lines
                 assert workflow_download_directory is not None  # set alongside complete_on_download above
                 if not await _drain_held_replays():
                     return None
@@ -3518,6 +3599,7 @@ class ForgeAgent:
                     # browser-session download re-fetched, twice; with none new this returns the recorded result.
                     recorded_now: list[str] = []
                     before = [*(download_baseline_files or []), *staged_paths, *recorded_files]
+                    sizes = _local_sizes()
                     later = await self._finalize_downloaded_files_for_task(
                         task,
                         organization_id=organization.organization_id,
@@ -3530,8 +3612,10 @@ class ForgeAgent:
                     )
                     if later:
                         recorded_files = [*recorded_files, *_kept_after_recording(later, recorded_now)]
-                        recorded_count += len(later)
-                        download_completion_reason = f"download completed ({recorded_count} new file(s))"
+                        landed_lines += [
+                            downloaded_line(Path(f).name, sizes.get(f), f.startswith(("s3://", "gs://"))) for f in later
+                        ]
+                        download_completion_reason = "\n".join(landed_lines)
                         LOG.info("Task V3 download finalized", task_id=task.task_id, num_new_files=len(later))
                     return download_completion_reason
                 cancelled = await self._wait_for_in_flight_downloads(
@@ -3560,6 +3644,7 @@ class ForgeAgent:
                     return None
                 recorded_now = []
                 before = [*(download_baseline_files or []), *staged_paths]
+                sizes = _local_sizes()
                 new_files = await self._finalize_downloaded_files_for_task(
                     task,
                     organization_id=organization.organization_id,
@@ -3576,8 +3661,10 @@ class ForgeAgent:
                     context.download_completed_task_ids.add(task.task_id)
                 download_finalized = True
                 recorded_files = _kept_after_recording(new_files, recorded_now)
-                recorded_count = len(new_files)
-                download_completion_reason = f"download completed ({len(new_files)} new file(s))"
+                landed_lines = [
+                    downloaded_line(Path(f).name, sizes.get(f), f.startswith(("s3://", "gs://"))) for f in new_files
+                ]
+                download_completion_reason = "\n".join(landed_lines)
                 LOG.info(
                     "Task V3 download finalized",
                     task_id=task.task_id,
@@ -3586,6 +3673,13 @@ class ForgeAgent:
                 return download_completion_reason
 
             download_settle = _settle_downloads
+
+            async def _unsaved_downloads() -> dict[str, int]:
+                tally_now = download_tally_for_context(browser_state.browser_context)
+                unsaved = unsaved_downloads_since(capture_tally_before, tally_now)
+                return {} if download_finalized or not unsaved or await _unfinalized_file_landed() else unsaved
+
+            unsaved_downloads = _unsaved_downloads
         if (
             task_block is not None
             and (task_block.complete_on_download or task_block.download_timeout is not None)
@@ -4159,10 +4253,11 @@ class ForgeAgent:
                 if task.task_type != TaskType.validation
                 else None
             )
-            # A block that completes on a download is not done by its one action.
+            # A block that completes on a download is not done by its one action, so it gets no completion offer;
+            # every action block still gets the reserve for its own action.
             single_action_block = isinstance(task_block, ActionBlock) and not task_block.complete_on_download
             target_action_reserve = 0
-            if single_action_block:
+            if isinstance(task_block, ActionBlock):
                 # The pinned ceiling above refuses the extension; the reserve answers to the org's run-wide pool.
                 target_action_reserve = ACTION_BLOCK_TARGET_ACTION_RESERVE
                 if workflow_pool_ceiling is not None:
@@ -4290,8 +4385,14 @@ class ForgeAgent:
                 ),
                 download_wait=download_wait,
                 download_settle=download_settle,
+                unsaved_downloads=unsaved_downloads,
                 native_download_attempt=native_download_attempt,
                 completion_gate=_completion_gate,
+                settle_reload_signal=lambda accept: app.AGENT_FUNCTION.settle_page_reload_signal(
+                    task=task, raise_signal=False, accept=accept
+                ),
+                submission_evidence=lambda: app.AGENT_FUNCTION.page_submission_evidence(task=task),
+                recover_page=lambda page: _recover_page(browser_state, task, page),
                 staged_downloads=staged_downloads,
                 deadline_seconds=loop_deadline_seconds,
                 verification_blocker=verification_state.block_finish,
@@ -4410,27 +4511,8 @@ class ForgeAgent:
                             return False
 
                     blank_page = await _v3_page_left_blank(first_sample, _fingerprint_page, _settle_should_stop)
-                    # No download settle finalized this block's file; clean_up_task below does.
-                    # Same local-plus-session listing as the baseline, and a partial is not a delivered file.
-                    if (
-                        blank_page is not None
-                        and workflow_download_directory is not None
-                        and download_baseline_files is not None
-                    ):
-                        landed = set(
-                            list_files_in_directory(workflow_download_directory, attempt_started_at=attempt_started_at)
-                        )
-                        if task.browser_session_id:
-                            landed |= set(
-                                await app.STORAGE.list_downloaded_files_in_browser_session(
-                                    organization_id=organization.organization_id,
-                                    browser_session_id=task.browser_session_id,
-                                )
-                            )
-                        landed -= set(download_baseline_files)
-                        landed -= {str(workflow_download_directory / name) for name in staged_downloads}
-                        if any(Path(name).suffix != BROWSER_DOWNLOADING_SUFFIX for name in landed):
-                            blank_page = None
+                    if blank_page is not None and await _unfinalized_file_landed():
+                        blank_page = None
                 except Exception:
                     blank_page = None
                     LOG.warning(
@@ -4594,6 +4676,7 @@ class ForgeAgent:
         if verification_state.last_status is not None:
             LOG.info(
                 "task_v3 ended on a verification code status",
+                last_status=redact_secrets_from_text(verification_state.last_status, run_secrets),
                 task_id=task.task_id,
                 organization_id=task.organization_id,
                 workflow_run_id=task.workflow_run_id,
@@ -4892,6 +4975,7 @@ class ForgeAgent:
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
                 # The parent run tears the browser down without this task's cleanup, so stop its pooled operations here.
+                await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
                 await self.async_operation_pool.cancel_task(task.task_id)
                 step = await self.update_step(
                     step,
@@ -4911,6 +4995,7 @@ class ForgeAgent:
                     "Workflow run is timed out, stopping execution inside task",
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+                await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
                 await self.async_operation_pool.cancel_task(task.task_id)
                 step = await self.update_step(
                     step,
@@ -5011,6 +5096,10 @@ class ForgeAgent:
                 browser_session_id,
                 pre_resolved_browser_state=pre_resolved_browser_state,
             )
+            # Before the engine split, so both engines' reload signals belong to this task's page. Unbound, no
+            # page-level request can ask for a reload, so a failure here costs only that.
+            with contained_effect("page reload owner bind", task_id=task.task_id):
+                await app.AGENT_FUNCTION.bind_page_reload_owner(task=task, browser_state=browser_state)
 
             # mark step as completed and mark task as completed
             if (
@@ -5226,6 +5315,7 @@ class ForgeAgent:
                 # The poll already settled this stop; a failed read or write (or a row already final) must not
                 # reach the catch-all, which would fail the task and run cleanup the parent run owns.
                 if canceled_by_workflow_run:
+                    await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
                     await self.async_operation_pool.cancel_task(task.task_id)
                     try:
                         task = await self.update_task(task, status=terminal_status)
@@ -5488,6 +5578,7 @@ class ForgeAgent:
         # TODO (kerem): Let's add other exceptions that we know about here as custom exceptions as well
         except CancelledError:
             context.clear_multi_field_totp_state(task.task_id)
+            await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
             # A cancelled step never reaches clean_up_task, where its pooled operations are otherwise stopped.
             with contained_effect("pooled async operation cancellation", task_id=task.task_id):
                 await self.async_operation_pool.cancel_task(task.task_id)
@@ -5523,7 +5614,7 @@ class ForgeAgent:
                     task,
                     status=TaskStatus.terminated,
                     failure_reason=reason,
-                    failure_category=classify_from_failure_reason(reason),
+                    failure_category=app.AGENT_FUNCTION.classify_failure(reason, status=TaskStatus.terminated),
                 )
             except (TaskAlreadyCanceled, TaskAlreadyTimeout, InvalidTaskStatusTransition, ValueError):
                 LOG.warning("Task isn't marked as terminated, after completion gate termination. NOT clean up the task")
@@ -5803,6 +5894,8 @@ class ForgeAgent:
             # It recovers the download half only, so its kwargs are pinned to that scope rather than
             # inherited from the handler that skipped this cleanup.
             try:
+                if cleanup_skipped_by_handler:
+                    await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
                 if cleanup_skipped_by_handler and not context.cleanup_downloads_recorded(task.task_id):
                     with contained_effect("skipped task cleanup recovery", task_id=task.task_id):
                         LOG.warning(
@@ -6017,15 +6110,18 @@ class ForgeAgent:
             if reason and run_secrets:
                 reason = redact_secrets_from_text(reason, run_secrets)
 
-            failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
+            failure_category = app.AGENT_FUNCTION.classify_failure(
+                reason, exception=exception, fallback_to_unknown=True, status=TaskStatus.failed
+            )
             if any(category.get("category") == FailureCategory.BROWSER_ERROR for category in failure_category or []):
                 unsolved_captcha_exception = await self._unsolved_captcha_exception(task)
                 if unsolved_captcha_exception:
-                    failure_category = classify_from_failure_reason(
+                    failure_category = app.AGENT_FUNCTION.classify_failure(
                         reason,
                         exception=exception,
                         fallback_to_unknown=True,
                         unsolved_captcha_exception=unsolved_captcha_exception,
+                        status=TaskStatus.failed,
                     )
             LOG.info(
                 "Task failure classified",
@@ -6691,6 +6787,16 @@ class ForgeAgent:
             try:
                 if otp_refusal is not None:
                     results = [otp_refusal]
+                elif (
+                    isinstance(action, ReloadPageAction)
+                    and (recovered := await _recover_page_action(browser_state, task, current_page, action)) is not None
+                ):
+                    results = [
+                        ActionSuccess()
+                        if recovered
+                        else ActionFailure(RuntimeError("page recovery withheld: submission or page identity changed"))
+                    ]
+                    results[0].skip_remaining_actions = True
                 else:
                     results = await ActionHandler.handle_action(
                         scraped_page=dispatch_page,
@@ -7964,13 +8070,15 @@ class ForgeAgent:
 
         slim_output = await get_slim_output_template_value(template_name)
 
-        # SKY-9718 Layer 1: gate the lean recipe on the PostHog flag at the
-        # call site. complete_verify only needs the visual page state to
+        # complete_verify only needs the visual page state to
         # decide is_complete / is_terminate / continue — no element-id refs,
         # no new_elements_ids threading — so we also drop Skyvern IDs.
         _ctx = skyvern_context.current()
         lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
         llm_screenshots_enabled = bool(_ctx and _ctx.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index))
+        submission_evidence = await app.AGENT_FUNCTION.page_submission_evidence(task=task)
+        if submission_evidence:
+            actions_and_results_str += "\n" + submission_evidence
         verification_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
@@ -8821,32 +8929,7 @@ class ForgeAgent:
         # If we don't have pre-scraped data, scrape normally
         if scraped_page is None:
             if context:
-                # SKY-9718 Layer 1: local-override env var for bench / debugging.
-                # `FORCE_ENABLE_LEAN_ELEMENT_TREE=true` bypasses the PostHog gate
-                # and forces lean ON for every run in this process. Never set in
-                # production — the PostHog flag is the only prod control.
-                if os.getenv("FORCE_ENABLE_LEAN_ELEMENT_TREE", "").lower() in ("true", "1", "yes"):
-                    context.enable_lean_element_tree = True
-                    LOG.info(
-                        "ENABLE_LEAN_ELEMENT_TREE forced ON via env var (bypasses PostHog gate)",
-                        task_id=task.task_id,
-                    )
-                else:
-                    try:
-                        distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                        context.enable_lean_element_tree = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_LEAN_ELEMENT_TREE",
-                            distinct_id,
-                            properties={"organization_id": task.organization_id},
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to check ENABLE_LEAN_ELEMENT_TREE feature flag",
-                            exc_info=True,
-                            task_id=task.task_id,
-                        )
-                        context.enable_lean_element_tree = False
-
+                context.enable_lean_element_tree = True
                 await resolve_transient_ui_capture_arm(context)
 
             # start the async tasks while running scrape_website
@@ -9470,6 +9553,8 @@ class ForgeAgent:
             properties={"task_url": task.url, "organization_id": task.organization_id},
         )
         extra_action_guidance = await app.AGENT_FUNCTION.get_extra_extract_action_guidance(task)
+        if submission_evidence := await app.AGENT_FUNCTION.page_submission_evidence(task=task):
+            extra_action_guidance = f"{extra_action_guidance or ''}\n{submission_evidence}"
 
         # SKY-9983: render per-step-changing sections (action history, dialogs, tabs) after the
         # element tree so provider prefix caches can hit the tree across steps on the same page.
@@ -10136,6 +10221,9 @@ class ForgeAgent:
         download_completion_files: list[str] | None = None,
     ) -> Task:
         cleanup_context = skyvern_context.current()
+        # The task is over: a page-level handler finishing later must not raise a reload for the next task.
+        with contained_effect("page reload owner release", task_id=task.task_id):
+            await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
         try:
             return await self._clean_up_task(
                 task,
@@ -10529,8 +10617,8 @@ class ForgeAgent:
                     completion_updates["extracted_information"] = extracted_information
                 if failure_reason:
                     completion_updates["failure_reason"] = failure_reason
-                    completion_updates["failure_category"] = classify_from_failure_reason(
-                        failure_reason, fallback_to_unknown=True
+                    completion_updates["failure_category"] = app.AGENT_FUNCTION.classify_failure(
+                        failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
                     )
                 try:
                     task = await self.update_task(
@@ -11783,7 +11871,7 @@ class ForgeAgent:
                 if persisted_action.errors:
                     failure_reason = "; ".join(error.reasoning for error in persisted_action.errors)
                 failure_category = bounded_failure_categories(persisted_action.failure_categories) or (
-                    classify_from_failure_reason(failure_reason)
+                    app.AGENT_FUNCTION.classify_failure(failure_reason, status=TaskStatus.terminated)
                 )
                 LOG.info(
                     "Task failure classified",
@@ -11828,6 +11916,7 @@ class ForgeAgent:
                 is_last=True,
             )
             extracted_information = await self.get_extracted_information_for_task(task)
+            await app.AGENT_FUNCTION.settle_page_reload_signal(task=task, raise_signal=False, accept=True)
             await self.update_task(
                 task,
                 status=TaskStatus.completed,
@@ -11947,8 +12036,8 @@ class ForgeAgent:
             errors = [ReachMaxStepsError().model_dump()] + [
                 error.model_dump() for error in generated_failure_reason.errors
             ]
-            failure_category = generated_failure_reason.failure_categories or classify_from_failure_reason(
-                failure_reason, fallback_to_unknown=True
+            failure_category = generated_failure_reason.failure_categories or app.AGENT_FUNCTION.classify_failure(
+                failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
             )
             LOG.info(
                 "Task failure classified",
@@ -11999,7 +12088,9 @@ class ForgeAgent:
         )
         if step_errors:
             failure_reason = "; ".join(error.reasoning for error in step_errors)
-            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+            failure_category = app.AGENT_FUNCTION.classify_failure(
+                failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
+            )
             existing_errors = {
                 (error.get("error_code"), error.get("reasoning"))
                 for error in (task.errors or [])
@@ -12087,8 +12178,8 @@ class ForgeAgent:
                 failure_reason = (
                     f"Max retries per step ({max_retries_per_step}) exceeded. {ReachMaxRetriesError().reasoning}"
                 )
-            failure_category = failure_response.failure_categories or classify_from_failure_reason(
-                failure_reason, fallback_to_unknown=True
+            failure_category = failure_response.failure_categories or app.AGENT_FUNCTION.classify_failure(
+                failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
             )
             LOG.info(
                 "Task failure classified",
@@ -12525,7 +12616,9 @@ class ForgeAgent:
             f"Workflow run reached the maximum total steps ({max_steps_per_workflow_run}) set on the organization."
         )
         errors = [ReachMaxStepsError().model_dump()]
-        failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+        failure_category = app.AGENT_FUNCTION.classify_failure(
+            failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
+        )
         LOG.info(
             "Task failure classified",
             task_id=task.task_id,
@@ -12634,6 +12727,7 @@ class ForgeAgent:
             )
             last_step = await self.update_step(step, is_last=True)
             extracted_information = await self.get_extracted_information_for_task(task)
+            await app.AGENT_FUNCTION.settle_page_reload_signal(task=task, raise_signal=False, accept=True)
             if task_completes_on_download:
                 # Cleanup is the last chance to validate a native download before completion.
                 task.extracted_information = extracted_information
@@ -12688,7 +12782,7 @@ class ForgeAgent:
                     **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
                 )
                 last_step = await self.update_step(step, is_last=True)
-                failure_category = classify_from_failure_reason(failure_reason)
+                failure_category = app.AGENT_FUNCTION.classify_failure(failure_reason, status=TaskStatus.terminated)
                 # handle_terminate_action already resolved the block's error_code_mapping against the
                 # page and left the codes on the action. Persist them, as the sibling terminal paths
                 # (terminate_check_goal, max_retries, max_steps) do: without this a mapped
@@ -12742,20 +12836,30 @@ class ForgeAgent:
             or settings.MAX_STEPS_PER_RUN
         )
 
-        # HACK: action block only have one step to execute without complete action, so we consider the task is completed as long as the step is completed
+        # HACK: action block only have one step to execute without complete action, so we consider the task is
+        # completed as long as the step is completed AND all recorded actions actually succeeded. Without the second
+        # half, a tolerated action failure (which leaves the step completed) reports the block as successful and the
+        # workflow continues as if the click or input happened.
         if isinstance(task_block, ActionBlock) and step.is_success() and not recovery_only:
-            LOG.info(
-                "Step completed for the action block, marking task as completed",
+            if _action_block_action_succeeded(step):
+                LOG.info(
+                    "Step completed for the action block, marking task as completed",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
+                )
+                last_step = await self.update_step(step, is_last=True)
+                await self.update_task(
+                    task,
+                    status=TaskStatus.completed,
+                )
+                return True, last_step, None
+            LOG.warning(
+                "Step completed for the action block but its actions did not all succeed, not completing the block",
                 step_order=step.order,
                 step_retry=step.retry_index,
                 **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
             )
-            last_step = await self.update_step(step, is_last=True)
-            await self.update_task(
-                task,
-                status=TaskStatus.completed,
-            )
-            return True, last_step, None
 
         workflow_run_budget = await self._check_workflow_run_step_budget(organization, task)
         if workflow_run_budget is not None and workflow_run_budget[0] >= workflow_run_budget[1]:
@@ -12788,8 +12892,8 @@ class ForgeAgent:
             errors = [ReachMaxStepsError().model_dump()] + [
                 error.model_dump() for error in generated_failure_reason.errors
             ]
-            failure_category = generated_failure_reason.failure_categories or classify_from_failure_reason(
-                failure_reason, fallback_to_unknown=True
+            failure_category = generated_failure_reason.failure_categories or app.AGENT_FUNCTION.classify_failure(
+                failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
             )
             LOG.info(
                 "Task failure classified",

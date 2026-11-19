@@ -10,6 +10,7 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.integrations.connected_accounts import resolve_account_token
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models._jinja import (
@@ -78,7 +79,7 @@ def _maybe_dump_sheets_write(record: dict[str, Any]) -> None:
     The range actually sent is otherwise not observable from a run, so writing it takes both an
     explicit path and a local environment: the record carries the rendered cell values.
     """
-    dump_dir = os.getenv("COPILOT_DUMP_SHEETS_WRITE")
+    dump_dir = os.getenv("SKYVERN_DUMP_SHEETS_WRITE") or os.getenv("COPILOT_DUMP_SHEETS_WRITE")
     if not dump_dir or settings.ENV != "local":
         return
     try:
@@ -138,10 +139,7 @@ async def _google_sheets_access(organization_id: str, credential_id: str) -> Goo
     problems: reporting both as "reconnect" sends someone round the reconnect loop instead of at
     the wrong identifier.
     """
-    access_token = await app.AGENT_FUNCTION.get_google_sheets_credentials(
-        organization_id=organization_id,
-        credential_id=credential_id,
-    )
+    access_token = await resolve_account_token(organization_id, credential_id, api="google")
     if access_token:
         return GoogleSheetsAccess(access_token=access_token, failure_reason=None)
     return GoogleSheetsAccess(

@@ -90,6 +90,7 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   google_sheets_read: "googleSheetsRead",
   google_sheets_write: "googleSheetsWrite",
   powerbi_query: "powerBIQuery",
+  integration_action: "integrationAction",
 };
 
 function blockIdentity(block: WorkflowBlock): string {
@@ -249,22 +250,65 @@ function redactSecrets(key: string, value: unknown): unknown {
   return value;
 }
 
+// The app never names the service behind connected accounts, so a stored source reads as its account picker's term and
+// a connection id is hidden.
+const GMAIL_SOURCE_TEXT: Record<string, string> = {
+  nango: "Connected Gmail",
+  native: "Google account",
+};
+const POWER_BI_SOURCE_TEXT: Record<string, string> = {
+  nango: "Power BI connection",
+  native: "Native Power BI connection",
+};
+
+// An integration action's connection id is typed by the user, so it stays visible.
+const ACCOUNT_SOURCE_BLOCKS = new Set([
+  "email_inbox",
+  "send_email",
+  "powerbi_query",
+]);
+
+type SourceContext = { block_type?: unknown; email_client?: unknown };
+
+function accountSourceText(key: string, value: unknown, block?: SourceContext) {
+  if (
+    key === "connection_id" &&
+    !isEmptyValue(value) &&
+    ACCOUNT_SOURCE_BLOCKS.has(String(block?.block_type))
+  )
+    return HIDDEN_VALUE;
+  if (key !== "credential_source" || typeof value !== "string") return value;
+  if (block?.email_client === "outlook" && value === "native")
+    return "Microsoft Account";
+  const terms =
+    block?.block_type === "powerbi_query"
+      ? POWER_BI_SOURCE_TEXT
+      : GMAIL_SOURCE_TEXT;
+  return terms[value] ?? value;
+}
+
+/** A field value as the review card shows it: plain text, secrets hidden. */
+export const reviewFieldValue = (
+  key: string,
+  value: unknown,
+  block?: SourceContext,
+) => formatValue(redactSecrets(key, accountSourceText(key, value, block)));
+
 function toReviewChange(
   change: RawFieldChange,
   label = humanizeKey(change.key),
   hidden = false,
+  blocks: { before?: SourceContext; after?: SourceContext } = {},
 ): ReviewFieldChange {
-  const shown = (value: unknown) =>
-    formatValue(
-      hidden && !isEmptyValue(value)
-        ? HIDDEN_VALUE
-        : redactSecrets(change.key, value),
-    );
+  const shown = (value: unknown, block?: SourceContext) =>
+    hidden && !isEmptyValue(value)
+      ? formatValue(HIDDEN_VALUE)
+      : reviewFieldValue(change.key, value, block);
   return {
     key: change.key,
     label,
-    before: shown(change.before),
-    after: shown(change.after),
+    before: shown(change.before, blocks.before),
+    after: shown(change.after, blocks.after),
   };
 }
 
@@ -408,7 +452,7 @@ function recordSubtree(
   }
 }
 
-// A removed block can share its label with a block Copilot added (a type
+// A removed block can share its label with a block Ember added (a type
 // change), and the canvas needs unique labels, so a clashing one is renamed.
 function removedCopy(block: WorkflowBlock, state: DiffState): WorkflowBlock {
   const copy = clone(block);
@@ -657,7 +701,10 @@ function mergeLevel(
       return block;
     }
     const changes = diffBlockFields(prior, block).map((change) =>
-      toReviewChange(change),
+      toReviewChange(change, undefined, false, {
+        before: prior,
+        after: block,
+      }),
     );
     if (moved) {
       changes.push({
@@ -929,7 +976,7 @@ const SETTING_LABELS: Record<keyof WorkflowSettings, string> = {
   proxyLocation: "Proxy location",
   browserType: "Browser type",
   runWith: "Run with",
-  aiFallback: "AI fallback (cached scripts)",
+  aiFallback: "AI fallback",
   scriptCacheKey: "Code key",
   codeVersion: "Code version",
   maskSecrets: "Mask secrets",

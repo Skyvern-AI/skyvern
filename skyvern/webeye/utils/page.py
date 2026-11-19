@@ -2347,14 +2347,21 @@ class SkyvernFrame:
         *,
         force_cdp: bool = False,
         deadline: float | None = None,
+        check_active: Callable[[], None] | None = None,
     ) -> Any:
         async def evaluate_expression() -> Any:
+            if check_active is not None:
+                check_active()
             return await _dispatch_evaluate(frame, expression, arg, force_cdp=force_cdp)
 
         async def bootstrap_expression() -> Any:
+            if check_active is not None:
+                check_active()
             return await _dispatch_dom_utils_bootstrap(frame, arg, force_cdp=force_cdp)
 
         deadline_kwargs: dict[str, Any] = {"deadline": deadline} if deadline is not None else {}
+        if check_active is not None:
+            deadline_kwargs["check_active"] = check_active
         return await SkyvernFrame._evaluate_expression(
             frame=frame,
             expression=expression,
@@ -2395,6 +2402,7 @@ class SkyvernFrame:
         deadline: float | None = None,
         bootstrap_expression: Callable[[], Awaitable[Any]] | None = None,
         recover_navigation: bool = True,
+        check_active: Callable[[], None] | None = None,
     ) -> Any:
         if isinstance(expression, _DomUtilsExpression):
             if bootstrap_expression is None:
@@ -2436,6 +2444,7 @@ class SkyvernFrame:
                 initial_error=error_msg,
                 engine_selection=engine_selection,
                 deadline=deadline,
+                **({"check_active": check_active} if check_active is not None else {}),
             )
         except Exception as e:
             # A driver-native error from THIS run's engine (stock Playwright when no engine is
@@ -2454,6 +2463,7 @@ class SkyvernFrame:
                 initial_error=error_msg,
                 engine_selection=engine_selection,
                 deadline=deadline,
+                **({"check_active": check_active} if check_active is not None else {}),
             )
         skyvern_context.record_browser_success()
         return result
@@ -2467,6 +2477,7 @@ class SkyvernFrame:
         initial_error: str,
         engine_selection: BrowserEngineSelection | None = None,
         deadline: float | None = None,
+        check_active: Callable[[], None] | None = None,
     ) -> Any:
         # Multi-hop SSO/OIDC flows (especially response_mode=form_post) can destroy
         # the JS execution context several times in a row as the page auto-submits
@@ -2482,7 +2493,9 @@ class SkyvernFrame:
             return max(0.0, deadline - loop.time())
 
         last_error_msg = initial_error
+        check_active = check_active or (lambda: None)
         for attempt in range(1, _NAVIGATION_RECOVERY_MAX_ATTEMPTS + 1):
+            check_active()
             if _remaining_seconds() <= 0:
                 LOG.warning(
                     "Skyvern timed out trying to analyze the page after navigation recovery",
@@ -2499,6 +2512,7 @@ class SkyvernFrame:
             )
             settle_ms = min(_NAVIGATION_SETTLE_TIMEOUT_MS, _remaining_seconds() * 1000)
             await _wait_for_navigation_settle(frame, timeout_ms=settle_ms, engine_selection=engine_selection)
+            check_active()
 
             # The bootstrap call already IS the domUtils.js injection, so the retry below
             # re-injects it anyway; a separate injection pass would spend a second attempt
@@ -2526,6 +2540,7 @@ class SkyvernFrame:
                     skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE, frame_kind=frame_kind_of(frame))
                     raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
                 except Exception as inject_err:
+                    check_active()
                     # RuntimeError (main-world Runtime.evaluate payloads) is engine-agnostic; the
                     # driver-native failure routes through the per-run engine identity. A foreign
                     # error is re-raised; cancellation never reaches here.
@@ -2549,6 +2564,7 @@ class SkyvernFrame:
                 skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE, frame_kind=frame_kind_of(frame))
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
             try:
+                check_active()
                 async with asyncio.timeout(retry_budget):
                     result = await cancellable_driver_call(evaluate_expression)
                 # The final evaluate answered, so this run-wide health tally is no longer stale.
@@ -2604,6 +2620,7 @@ class SkyvernFrame:
         max_size_bytes: int | None = None,
         probe: bool = False,
         raise_too_large: bool = False,
+        check_active: Callable[[], None] | None = None,
     ) -> tuple[bytes, str] | None:
         """Read Blob bytes and the media type exposed by its fetch response."""
         # probe=True is for best-effort multi-page fallback where the caller tries every open
@@ -2612,6 +2629,8 @@ class SkyvernFrame:
         give_up_log = LOG.debug if probe else LOG.error
         retry_log = LOG.debug if probe else LOG.warning
 
+        check_active = check_active or (lambda: None)
+        check_active()
         blob_origin = _blob_url_origin(blob_url)
         if blob_origin is not None:
             frames = _frames_for_blob_origin(page, blob_origin)
@@ -2631,6 +2650,7 @@ class SkyvernFrame:
         blob_arg: dict[str, Any] = {"url": blob_url, "maxSizeBytes": max_size_bytes}
         main_frame = page.main_frame
         for frame in frames:
+            check_active()
             try:
                 # Main-frame routes through evaluate_in_main_world so any
                 # context-level main-world prefix stays attached; sub-frames use
@@ -2640,12 +2660,14 @@ class SkyvernFrame:
                 else:
                     result = await frame.evaluate(_SAME_ORIGIN_FETCH_JS, blob_arg)
             except Exception:
+                check_active()
                 retry_log(
                     "blob URL in-frame fetch raised; trying next frame if any",
                     workflow_run_id=workflow_run_id,
                     exc_info=True,
                 )
                 continue
+            check_active()
             if isinstance(result, dict) and result.get("error") == "too_large":
                 LOG.warning(
                     "blob URL exceeds max size; not reading",
@@ -2698,6 +2720,7 @@ class SkyvernFrame:
         timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         headers: dict[str, str] | None = None,
         redirect: Literal["follow", "error"] = "follow",
+        check_active: Callable[[], None] | None = None,
     ) -> bytes | None:
         """Fetch an http(s) URL's bytes via an in-page fetch() inside a same-origin frame.
 
@@ -2710,6 +2733,9 @@ class SkyvernFrame:
         a caller with a larger whole-operation budget can widen it so a slow-but-alive server
         isn't rejected by the generic action timeout.
         """
+        lifetime_kwargs: dict[str, Any] = {"check_active": check_active} if check_active is not None else {}
+        check_active = check_active or (lambda: None)
+        check_active()
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             return None
@@ -2724,6 +2750,7 @@ class SkyvernFrame:
             fetch_arg["headers"] = headers
         main_frame = page.main_frame
         for frame in frames:
+            check_active()
             # Route the main frame through the Page so SkyvernFrame.evaluate can attach any
             # context-level main-world prefix; sub-frames evaluate in-frame (prefixes are
             # page-scoped). SkyvernFrame.evaluate centralizes the main-world dispatch, timeout,
@@ -2731,15 +2758,21 @@ class SkyvernFrame:
             target: Page | Frame = page if frame is main_frame else frame
             try:
                 result = await SkyvernFrame.evaluate(
-                    frame=target, expression=_SAME_ORIGIN_FETCH_JS, arg=fetch_arg, timeout_ms=timeout_ms
+                    frame=target,
+                    expression=_SAME_ORIGIN_FETCH_JS,
+                    arg=fetch_arg,
+                    timeout_ms=timeout_ms,
+                    **lifetime_kwargs,
                 )
             except Exception:
+                check_active()
                 LOG.debug(
                     "same-origin URL in-frame fetch raised; trying next frame if any",
                     workflow_run_id=workflow_run_id,
                     exc_info=True,
                 )
                 continue
+            check_active()
             if isinstance(result, dict) and result.get("error") == "too_large":
                 LOG.warning(
                     "same-origin URL exceeds max size; not reading",

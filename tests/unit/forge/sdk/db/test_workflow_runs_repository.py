@@ -4703,10 +4703,28 @@ async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sql
                     created_by="user_prompter",
                 ),
                 TaskV2Model(observer_cruise_id="tsk_v2_1", organization_id="org_test", workflow_run_id="wr_task_v2"),
+                TaskV2Model(
+                    observer_cruise_id="tsk_v2_missing", organization_id="org_test", workflow_run_id="wr_missing"
+                ),
+                TaskV2Model(
+                    observer_cruise_id="tsk_v2_foreign", organization_id="org_other", workflow_run_id="wr_task_v2"
+                ),
                 _task_run_model(run_id="wr_member", created_at=now, workflow_permanent_id="wpid_member"),
                 _task_run_model(
                     run_id="tsk_v2_1",
                     created_at=now - timedelta(seconds=1),
+                    workflow_permanent_id=None,
+                    task_run_type=RunType.task_v2.value,
+                ),
+                _task_run_model(
+                    run_id="tsk_v2_missing",
+                    created_at=now - timedelta(seconds=2),
+                    workflow_permanent_id=None,
+                    task_run_type=RunType.task_v2.value,
+                ),
+                _task_run_model(
+                    run_id="tsk_v2_foreign",
+                    created_at=now - timedelta(seconds=3),
                     workflow_permanent_id=None,
                     task_run_type=RunType.task_v2.value,
                 ),
@@ -4719,6 +4737,8 @@ async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sql
     assert {row["run_id"]: row["created_by"] for row in rows} == {
         "wr_member": "user_member",
         "tsk_v2_1": "user_prompter",
+        "tsk_v2_missing": None,
+        "tsk_v2_foreign": None,
     }
 
 
@@ -5368,3 +5388,50 @@ async def test_get_workflow_runs_complete_id_search_still_applies_explicit_creat
         )
         assert [run.workflow_run_id for run in before_window] == [run_id], search_key
         assert in_window == [], search_key
+
+
+@pytest.mark.asyncio
+async def test_latest_finished_run_for_a_version_is_its_newest_final_top_level_run_since_the_start(
+    sqlite_db: AgentDB,
+) -> None:
+    since = datetime(2026, 11, 12, 12, 0)
+    rows = [
+        ("wr_before_write", "wf_test", WorkflowRunStatus.completed, None, -1),
+        ("wr_older", "wf_test", WorkflowRunStatus.completed, None, 1),
+        ("wr_newest", "wf_test", WorkflowRunStatus.completed, None, 2),
+        ("wr_child", "wf_test", WorkflowRunStatus.completed, "wr_newest", 3),
+        ("wr_failed", "wf_test", WorkflowRunStatus.failed, None, 4),
+        ("wr_test_copy", "wf_test_copy", WorkflowRunStatus.completed, None, 5),
+        ("wr_running", "wf_test", WorkflowRunStatus.running, None, 7),
+    ]
+    async with sqlite_db.Session() as session:
+        for run_id, workflow_id, status, parent, offset in rows:
+            run = _workflow_run_model(
+                workflow_run_id=run_id,
+                queued_at=since + timedelta(minutes=offset),
+                workflow_id=workflow_id,
+                status=status.value,
+            )
+            run.parent_workflow_run_id = parent
+            session.add(run)
+        draft_test = _workflow_run_model(
+            workflow_run_id="wr_draft_test",
+            queued_at=since + timedelta(minutes=6),
+            workflow_id="wf_draft",
+            status=WorkflowRunStatus.completed.value,
+        )
+        draft_test.copilot_session_id = "wcc_test"
+        session.add(draft_test)
+        await session.commit()
+
+    run = await sqlite_db.workflow_runs.get_latest_finished_run_for_workflow_version(
+        "org_test", "wpid_test", "wf_test", since
+    )
+
+    assert run is not None and run.workflow_run_id == "wr_failed"
+    assert (
+        await sqlite_db.workflow_runs.get_latest_finished_run_for_workflow_version(
+            "org_test", "wpid_test", "wf_test", since + timedelta(minutes=5)
+        )
+        is None
+    )

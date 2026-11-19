@@ -75,11 +75,6 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
       ? definitionBlock.download_suffix
       : null;
 
-  const disableCache =
-    definitionBlock && "disable_cache" in definitionBlock
-      ? definitionBlock.disable_cache
-      : undefined;
-
   const engine =
     block.engine ??
     (definitionBlock && "engine" in definitionBlock
@@ -94,7 +89,6 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
     Boolean(totpIdentifier) ||
     completeOnDownload === true ||
     Boolean(downloadSuffix) ||
-    disableCache === true ||
     engine !== null;
 
   return (
@@ -323,20 +317,6 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
                 <h1 className="text-lg">Download Suffix</h1>
               </div>
               <Input value={downloadSuffix} readOnly />
-            </div>
-          ) : null}
-
-          {disableCache === true ? (
-            <div className="flex gap-16">
-              <div className="w-80">
-                <h1 className="text-lg">Cache Disabled</h1>
-              </div>
-              <div className="flex w-full items-center gap-3">
-                <Switch checked={true} disabled />
-                <span className="text-sm text-muted-foreground">
-                  Cache is disabled for this block
-                </span>
-              </div>
             </div>
           ) : null}
         </>

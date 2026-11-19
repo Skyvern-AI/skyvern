@@ -5,14 +5,13 @@ import copy
 import hashlib
 import json
 import keyword
-import os
 import re
 import textwrap
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Annotated, Any, Literal, NamedTuple, cast
+from typing import Annotated, Any, Literal, NamedTuple, Protocol, cast, runtime_checkable
 
 import structlog
 import yaml
@@ -48,13 +47,6 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
     advisory_code_block_diagnostics,
     scanner_advisory_diagnostics,
 )
-from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
-from skyvern.forge.sdk.copilot.code_block_steps import (
-    bind_referenced_parameters_in_yaml,
-    carry_user_owned_goals_in_yaml,
-    fill_missing_code_block_goals_in_yaml,
-    user_owned_goal_carry_disclosure,
-)
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff, build_code_write_diffs
 from skyvern.forge.sdk.copilot.composition_evidence import (
@@ -69,12 +61,6 @@ from skyvern.forge.sdk.copilot.context import (
     record_kept_note_texts,
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import CredentialFillField
-from skyvern.forge.sdk.copilot.google_connection_notice import (
-    collect_google_connection_notices,
-    google_sheet_connection_bindings,
-    retain_notices_after_lookup_failure,
-    write_google_connection_notice_capture,
-)
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.output_contracts import (
     code_block_available_contracts_by_label,
@@ -84,11 +70,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     _BUILD_TEST_WORKFLOW_MAX_CHARS,
     INTERNAL_VALIDATION_FAILURE_PREFIX,
     sanitize_block_label_for_display,
-)
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
-    code_captures_download,
-    code_uses_download_claim,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     REQUESTED_OUTPUT_PATH_MINT_SOURCES,
@@ -107,7 +88,6 @@ from skyvern.forge.sdk.copilot.schema_incompatibility import (
     render_schema_incompatibility_agent_steer,
     render_schema_incompatibility_user_reason,
 )
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -116,7 +96,6 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_blocks,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import (
-    _PRIVATE_WORKFLOW_SETTINGS_FIELDS,
     _canonicalize_copilot_proxy_location,
     _normalize_copilot_yaml,
     _normalize_copilot_yaml_with_dropped_links,
@@ -134,23 +113,36 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     resolve_totp_verification_url,
     resolve_webhook_callback_url,
     runner_code_block_associations,
-    strip_private_workflow_settings,
-    strip_runtime_block_fields,
     submitted_private_workflow_settings,
     with_workflow_yaml_title,
-    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, CopilotProposalConflictReason
 from skyvern.forge.sdk.schemas.workflow_copilot import COPILOT_PRIVATE_SETTINGS_KEY, copilot_proposal_metadata
-from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.workflow.authoring_yaml import strip_runtime_block_fields, workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.block_notes import (
     carry_block_notes_from_versions,
     drop_submitted_note_fields,
     stored_notes_for_labels,
 )
+from skyvern.forge.sdk.workflow.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
+from skyvern.forge.sdk.workflow.code_block_steps import (
+    bind_referenced_parameters_in_yaml,
+    carry_user_owned_goals_in_yaml,
+    fill_missing_code_block_goals_in_yaml,
+    user_owned_goal_carry_disclosure,
+)
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from skyvern.forge.sdk.workflow.private_settings import (
+    PRIVATE_WORKFLOW_SETTINGS_FIELDS,
+    strip_private_workflow_settings,
+)
+from skyvern.forge.sdk.workflow.reached_download_target import (
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    code_captures_download,
+    code_uses_download_claim,
+)
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_code_artifact_metadata
 from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_definition_secrets
 from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_location
@@ -163,6 +155,7 @@ from skyvern.schemas.workflows import (
     WhileLoopBlockYAML,
     WorkflowCreateYAMLRequest,
 )
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK, merge_masked_headers
 from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -180,7 +173,7 @@ from .credentials import (
     _credential_id_misbinding_findings,
     _credential_reference_validation_error,
     bitwarden_binding_change_error,
-    canonicalize_named_google_sheet_bindings,
+    canonicalize_named_connection_bindings,
     import_bound_vault_logins,
     resolve_google_sheet_tabs_from_gid,
 )
@@ -3548,7 +3541,7 @@ def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, 
             "stored_notes_dropped",
             "stored_notes_dropped_text",
             "stored_notes_dropped_message",
-            "google_connection_resolution",
+            "connection_resolution",
             "persistence",
             "persistence_message",
             "google_sheet_tab_resolution",
@@ -3639,7 +3632,10 @@ def strip_copilot_yaml_headers(workflow_yaml: str | None) -> str | None:
 
 
 def copilot_workflow_yaml_matches(
-    submitted_yaml: str | None, *known_sources: str | None, inherited_proxy_location: ProxyLocationInput = None
+    submitted_yaml: str | None,
+    *known_sources: str | None,
+    inherited_proxy_location: ProxyLocationInput = None,
+    inherited_code_version: int | None = None,
 ) -> bool:
     submitted_yaml = strip_copilot_yaml_headers(submitted_yaml)
     if not submitted_yaml:
@@ -3650,7 +3646,9 @@ def copilot_workflow_yaml_matches(
             if not sanitized_source:
                 continue
             source_canvas = _normalized_canvas_for_proposal_restore(
-                sanitized_source, inherited_proxy_location=inherited_proxy_location
+                sanitized_source,
+                inherited_code_version=inherited_code_version,
+                inherited_proxy_location=inherited_proxy_location,
             )
             submitted_with_notes, _, _ = carry_block_notes_from_versions(submitted_yaml, sanitized_source, None)
             if (
@@ -3666,6 +3664,11 @@ def copilot_workflow_yaml_matches(
     except Exception:  # noqa: BLE001 - Normalization reparses YAML with the same constructor failures.
         return False
     return False
+
+
+@runtime_checkable
+class _ParameterKeyedBlock(Protocol):
+    parameter_keys: list[str] | None
 
 
 def _normalized_canvas_for_proposal_restore(
@@ -3698,9 +3701,11 @@ def _normalized_canvas_for_proposal_restore(
             block.notes = block.notes or None
             block.trailing_notes = block.trailing_notes or None
             block.description = block.description or None
+            # The editor sends parameter_keys: [] on every block and the converter reads [] and null alike.
+            if isinstance(block, _ParameterKeyedBlock):
+                block.parameter_keys = block.parameter_keys or None
             if isinstance(block, CodeBlockYAML):
                 block.steps = block.steps or None
-                block.parameter_keys = block.parameter_keys or None
             elif isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
                 normalize_blocks(block.loop_blocks)
 
@@ -3832,6 +3837,7 @@ async def _validated_pending_workflow_proposal(
         sanitized_yaml,
         saved_workflow_canvas(ctx, canonical),
         inherited_proxy_location=canonical.proxy_location if canonical is not None else None,
+        inherited_code_version=canonical.code_version if canonical is not None else None,
     ):
         LOG.info(
             "copilot_pending_proposal_restore_rejected",
@@ -3875,7 +3881,7 @@ def _effective_private_settings(*sources: Mapping[str, object]) -> dict[str, obj
     # The first source that names a setting wins; Accept fills settings the proposal omits from the saved workflow.
     return {
         name: _effective_private_setting(name, next((source[name] for source in sources if name in source), None))
-        for name in _PRIVATE_WORKFLOW_SETTINGS_FIELDS
+        for name in PRIVATE_WORKFLOW_SETTINGS_FIELDS
     }
 
 
@@ -3979,7 +3985,7 @@ def saved_workflow_canvas(ctx: CopilotContext, saved: Workflow | None = None) ->
     saved = saved or ctx.saved_workflow
     if ctx.persisted_workflow_yaml is not None or saved is None:
         return ctx.persisted_workflow_yaml
-    return workflow_to_copilot_yaml(saved)
+    return workflow_to_authoring_yaml(saved)
 
 
 async def restore_pending_workflow_proposal(
@@ -4145,7 +4151,7 @@ async def adopt_stored_workflow_candidate(ctx: CopilotContext) -> ProposalAdopti
     elif canonical is not None:
         # With no candidate left the saved row is the only source; omitted settings make edits inherit its own.
         ctx.workflow_id = canonical.workflow_id
-        ctx.workflow_yaml = workflow_to_copilot_yaml(canonical)
+        ctx.workflow_yaml = workflow_to_authoring_yaml(canonical)
         ctx.authored_private_workflow_settings = {}
         ctx.private_workflow_settings = {}
     else:
@@ -4193,11 +4199,15 @@ def proposal_conflict_result(
     adoption: ProposalAdoptionOutcome,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"ok": False, "conflict_reason": reason, "adoption": adoption}
-    if adoption == "adopted":
+    if reason == "run_bound":
+        result["error"] = (
+            f"{lost} Another test of this proposal had already started, and a proposal can be bound to only one "
+            "test run. This turn's draft is unchanged."
+        )
+    elif adoption == "adopted":
         result["error"] = f"{lost} Another change replaced the pending proposal, and this turn now works on it."
         adopted_yaml = redact_raw_secrets_for_prompt(ctx.staged_workflow_yaml or "")
-        if not copilot_sees_notes(ctx):
-            adopted_yaml = drop_submitted_note_fields(adopted_yaml)
+        adopted_yaml = drop_submitted_note_fields(adopted_yaml, keep_notes=copilot_sees_notes(ctx))
         if len(adopted_yaml) > _BUILD_TEST_WORKFLOW_MAX_CHARS:
             result["adopted_workflow_yaml"] = adopted_yaml[: _BUILD_TEST_WORKFLOW_MAX_CHARS - 3] + "..."
             result["next_step"] = (
@@ -4545,7 +4555,7 @@ async def _update_workflow(
     try:
         # Before redaction: a connection name equal to a registered scrub value would otherwise
         # reach the resolver already replaced by the placeholder.
-        workflow_yaml, google_connection_resolution = await canonicalize_named_google_sheet_bindings(workflow_yaml, ctx)
+        workflow_yaml, connection_resolution = await canonicalize_named_connection_bindings(workflow_yaml, ctx)
         workflow_yaml, google_sheet_tab_resolution = await resolve_google_sheet_tabs_from_gid(workflow_yaml, ctx)
         # Ahead of redaction: this copies stored Goal bytes into the candidate, so they have to
         # pass the scrub seam like any other submitted text.
@@ -4560,9 +4570,8 @@ async def _update_workflow(
             goal_rewritten_labels=goal_rewritten_labels,
         )
         workflow_yaml = goal_carry.workflow_yaml
-        if not copilot_sees_notes(ctx):
-            # Without the Doc editor the user cannot see notes, so Copilot keeps the saved ones untouched.
-            workflow_yaml = drop_submitted_note_fields(workflow_yaml)
+        # Copilot never writes images, and writes notes only with the Doc editor; saved values are carried.
+        workflow_yaml = drop_submitted_note_fields(workflow_yaml, keep_notes=copilot_sees_notes(ctx))
         workflow_yaml, kept_note_labels, dropped_note_labels = carry_block_notes_from_versions(
             workflow_yaml, prior_yaml, ctx.persisted_workflow_yaml if isinstance(ctx, CopilotContext) else None
         )
@@ -4699,59 +4708,6 @@ async def _update_workflow(
                 prior_associations=ctx.runner_code_block_associations_by_label,
                 preserve_existing=params.get("_preserve_code_block_associations") is True,
             )
-            current_google_connection_bindings = google_sheet_connection_bindings(workflow)
-            turn_start_workflow = prior_workflow
-            if ctx.google_connection_turn_start_bindings is None:
-                baseline_ready = True
-                turn_start_workflow_yaml = ctx.turn_start_workflow_yaml
-                if turn_start_workflow_yaml:
-                    try:
-                        turn_start_workflow = await _process_workflow_yaml(
-                            workflow_id=ctx.workflow_id,
-                            workflow_permanent_id=ctx.workflow_permanent_id,
-                            organization_id=ctx.organization_id,
-                            workflow_yaml=turn_start_workflow_yaml,
-                            private_workflow_settings=ctx.private_workflow_settings,
-                        )
-                    except Exception as baseline_err:
-                        baseline_ready = False
-                        LOG.warning("copilot_google_connection_notice_baseline_failed", error=str(baseline_err))
-                if baseline_ready:
-                    ctx.google_connection_turn_start_bindings = google_sheet_connection_bindings(turn_start_workflow)
-            current_google_connection_ids = tuple(
-                dict.fromkeys(connection_id for _, connection_id in current_google_connection_bindings)
-            )
-            if ctx.google_connection_turn_start_bindings is not None:
-                try:
-                    visible_google_credentials = await google_oauth_service.get_visible_credentials_for_org(
-                        ctx.organization_id
-                    )
-                    next_google_connection_notices = collect_google_connection_notices(
-                        turn_start_bindings=ctx.google_connection_turn_start_bindings,
-                        current_bindings=current_google_connection_bindings,
-                        visible_credentials=visible_google_credentials,
-                    )
-                    capture_root = os.environ.get("COPILOT_DUMP_GOOGLE_CONNECTION_NOTICE_INPUTS")
-                    if capture_root and current_google_connection_bindings:
-                        try:
-                            write_google_connection_notice_capture(
-                                output_root=capture_root,
-                                turn_id=ctx.turn_id,
-                                turn_start_workflow=turn_start_workflow,
-                                final_workflow=workflow,
-                                accepted_workflow_yaml=workflow_yaml,
-                                visible_credentials=visible_google_credentials,
-                                observed_notices=next_google_connection_notices,
-                            )
-                        except Exception as capture_err:
-                            LOG.warning("copilot_google_connection_notice_capture_failed", error=str(capture_err))
-                    ctx.google_connection_notices = next_google_connection_notices
-                except Exception as lookup_err:
-                    ctx.google_connection_notices = retain_notices_after_lookup_failure(
-                        current_connection_ids=current_google_connection_ids,
-                        notices=ctx.google_connection_notices,
-                    )
-                    LOG.warning("copilot_google_connection_notice_lookup_failed", error=str(lookup_err))
         _clear_code_authoring_repair_context(ctx)
         accepted_metadata = ctx.code_artifact_metadata
         if isinstance(accepted_metadata, dict) and accepted_metadata:
@@ -4883,12 +4839,10 @@ async def _update_workflow(
             data["findings"] = findings
         if authoring_validation.legacy_engine_blocks:
             data["legacy_engine_blocks"] = list(authoring_validation.legacy_engine_blocks)
-        if google_connection_resolution:
-            data["google_connection_resolution"] = google_connection_resolution
+        if connection_resolution:
+            data["connection_resolution"] = connection_resolution
         if google_sheet_tab_resolution:
             data["google_sheet_tab_resolution"] = google_sheet_tab_resolution
-        if isinstance(ctx, CopilotContext) and ctx.google_connection_notices:
-            data["google_connection_notices"] = [notice.to_payload() for notice in ctx.google_connection_notices]
         return {
             "ok": True,
             "data": data,

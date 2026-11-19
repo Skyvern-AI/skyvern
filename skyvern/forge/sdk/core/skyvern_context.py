@@ -16,7 +16,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import StrEnum
 from itertools import islice
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator, Literal, Protocol, TypedDict
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -728,6 +728,16 @@ def _receipt_digest(path: str, identity: tuple[int, int, int, int], stop: thread
     return digest.hexdigest()
 
 
+class PageReloadRequest(Protocol):
+    """One producer's request to reload one page document, which may stop standing before it is carried out."""
+
+    def pin(self) -> Page | None:
+        """The page to reload, or None once it is gone."""
+
+    async def still_wanted(self, page: Page) -> bool:
+        """Whether the reload still stands; awaited right before it is dispatched."""
+
+
 @dataclass
 class SkyvernContext:
     request_id: str | None = None
@@ -837,6 +847,8 @@ class SkyvernContext:
     # this like workflow_block_engine_lock or one task's refs stomp another's mid-flight.
     opaque_url_refs: dict[str, str] = field(default_factory=dict)
     refresh_working_page: bool = False
+    # A reload one producer asked for and owns, separate from the shared flag above; never serialized or shown.
+    page_reload_request: PageReloadRequest | None = field(default=None, repr=False, compare=False)
     # Empty-page recovery: the step whose plan was replaced by an internal-recovery
     # ClosePageAction, and a per-task consecutive-attempt counter that caps recovery at 3.
     empty_page_recovery_step_id: str | None = None
@@ -862,9 +874,8 @@ class SkyvernContext:
     vertex_cache_key: str | None = None  # Logical cache key (includes variant + llm key)
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
     prompt_caching_settings: dict[str, bool] | None = None
-    # SKY-9718 Layer 1 — gates apply_lean_recipe in prompt_engine + agent.
-    # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
-    # and read sync from prompt-build sites.
+    # Set by the agent step before it builds its prompt; prompt-build sites read it to apply the lean
+    # element-tree transforms. Paths that never run an agent step keep rendering the full tree.
     enable_lean_element_tree: bool = False
     # PRESERVE_TRANSIENT_UI_CAPTURE experiment arm, resolved per run. Tri-state: True=treatment
     # (suppress a scroll that would dismiss an open transient popup), False=control (shadow-detect

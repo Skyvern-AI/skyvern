@@ -395,6 +395,36 @@ def test_turn_context_change_summary_applies_doc_policy_to_both_sides(
     assert (ctx.turn_context_packet.workflow_change_context is not None) is changed
 
 
+@pytest.mark.parametrize("doc_editor_enabled", [False, True])
+def test_the_workflow_copilot_reads_never_shows_block_images(doc_editor_enabled: bool) -> None:
+    request_yaml = (
+        _WORKFLOW_WITH_NOTE + "      doc_images: [{file_id: file_901}]\n      prompt_images: [{file_id: file_902}]\n"
+    )
+    ctx = CopilotContext(
+        organization_id="org-1",
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        workflow_yaml=request_yaml,
+        browser_session_id=None,
+        stream=MagicMock(),
+        doc_editor_enabled=doc_editor_enabled,
+    )
+
+    _store_turn_context_packet_on_context(
+        ctx,
+        request_policy=RequestPolicy(),
+        chat_request=SimpleNamespace(message="Continue", workflow_yaml=request_yaml),
+        chat_history=[],
+        prior_copilot_workflow_yaml=request_yaml,
+    )
+
+    assert ctx.turn_context_packet is not None
+    assert ctx.turn_context_packet.workflow_context is not None
+    shown = ctx.turn_context_packet.workflow_context.yaml
+    assert "file_90" not in shown and not any(field in shown for field in ("doc_images", "prompt_images"))
+    assert ("hidden note" in shown) is doc_editor_enabled
+
+
 def test_a_prior_runs_typed_packet_reaches_the_turn_context() -> None:
     # A chat opened about a run this turn did not perform. Without the packet the only record of
     # that run is a rendered sentence, which cannot say user_code_error at line 6.

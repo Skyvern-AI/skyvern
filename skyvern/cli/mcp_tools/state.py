@@ -24,6 +24,41 @@ LOG = structlog.get_logger(__name__)
 _MCP_STATE_NAMESPACE_DIR = ".mcp-state"
 
 
+def _state_organization_id() -> str | None:
+    organization_id = app.AGENT_FUNCTION.get_mcp_request_organization_id()
+    if organization_id is not None:
+        return organization_id
+    try:
+        # fastmcp is a server extra, and `skyvern browser` commands import this module without it.
+        from fastmcp.server.dependencies import get_http_request  # noqa: PLC0415
+
+        request = get_http_request()
+    except (ImportError, RuntimeError):
+        return None
+    # A standalone HTTP server's API-key middleware records the caller's organization on the request.
+    organization_id = getattr(request.state, "organization_id", None)
+    if isinstance(organization_id, str) and organization_id:
+        return organization_id
+    raise ValueError(
+        "State files are not available on this HTTP MCP server: it has no organization to keep each caller's files "
+        "apart. Use a local stdio server for state files."
+    )
+
+
+_LEGACY_STATE_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _is_saved_state(path: Path) -> bool:
+    try:
+        # A caller names this file, so a large one is never read whole just to word an error.
+        if not path.is_file() or path.stat().st_size > _LEGACY_STATE_MAX_BYTES:
+            return False
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(payload, dict) and "cookies" in payload
+
+
 def _validate_state_path(
     file_path: str,
     *,
@@ -64,6 +99,15 @@ def _validate_state_path(
     if resolved.suffix not in (".json", ""):
         raise ValueError(f"State file must have .json extension or no extension: {resolved}")
     if must_exist and not resolved.exists():
+        legacy = raw.resolve()
+        # A file saved before per-organization folders has no owner on record, so only the operator may claim it.
+        # Only a real state file is named, so the message reveals no other file under the working directory.
+        if legacy != resolved and _is_saved_state(legacy):
+            raise FileNotFoundError(
+                f"State file not found: {resolved}. {legacy} was saved before this server kept each organization's "
+                f"state files apart; to use it with this API key's organization, the server's operator moves it to "
+                f"{resolved}."
+            )
         raise FileNotFoundError(f"State file not found: {resolved}")
     return resolved
 
@@ -84,8 +128,7 @@ async def skyvern_state_save(
 
     with Timer() as timer:
         try:
-            organization_id = app.AGENT_FUNCTION.get_mcp_request_organization_id()
-            resolved = _validate_state_path(file_path, organization_id=organization_id)
+            resolved = _validate_state_path(file_path, organization_id=_state_organization_id())
             resolved.parent.mkdir(parents=True, exist_ok=True)
 
             session = get_current_session()
@@ -150,8 +193,7 @@ async def skyvern_state_load(
 
     with Timer() as timer:
         try:
-            organization_id = app.AGENT_FUNCTION.get_mcp_request_organization_id()
-            resolved = _validate_state_path(file_path, must_exist=True, organization_id=organization_id)
+            resolved = _validate_state_path(file_path, must_exist=True, organization_id=_state_organization_id())
 
             session = get_current_session()
             browser = session.browser

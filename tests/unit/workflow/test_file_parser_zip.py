@@ -65,14 +65,16 @@ class TestZipDetection:
         block = _make_file_parser_block(url)
         return block._detect_file_type_from_url(url, file_path=file_path)
 
-    def test_zip_extension(self) -> None:
-        assert self._detect("https://example.com/archive.zip") == FileType.ZIP
-
-    def test_zip_extension_case_insensitive(self) -> None:
-        assert self._detect("https://example.com/archive.ZIP") == FileType.ZIP
-
-    def test_zip_extension_with_query_params(self) -> None:
-        assert self._detect("https://example.com/archive.zip?token=abc") == FileType.ZIP
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/archive.zip",
+            "https://example.com/archive.ZIP",
+            "https://example.com/archive.zip?token=synthetic",
+        ],
+    )
+    def test_zip_extension(self, url: str) -> None:
+        assert self._detect(url) == FileType.ZIP
 
     def test_no_extension_with_zip_magic_bytes(self, tmp_path: Path) -> None:
         zip_path = _create_zip(tmp_path / "no_ext_file", {"a.txt": b"hello"})

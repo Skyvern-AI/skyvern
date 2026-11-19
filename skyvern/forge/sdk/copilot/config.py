@@ -78,7 +78,7 @@ def block_authoring_policy_from_capability(capability: AuthoringCapability) -> B
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
 DEFAULT_MAX_TURNS = 200
 DEFAULT_TOKEN_BUDGET = 90_000
-TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
+TOTAL_TIMEOUT_SECONDS = settings.EMBER_TOTAL_TIMEOUT_SECONDS or 900
 
 SCREENSHOT_DROPPED_NUDGE = (
     "Your previous screenshot was dropped from context to recover from a token-budget overflow. "
@@ -100,15 +100,15 @@ def _default_fallback_llm_key() -> str | None:
 
 
 def _default_credential_pause_enabled() -> bool:
-    return settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED
+    return settings.EMBER_CREDENTIAL_PAUSE_ENABLED
 
 
 def _default_credential_pause_timeout_seconds() -> int:
-    return settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
+    return settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
 
 
 def _default_token_budget() -> int | None:
-    qa_token_budget = settings.WORKFLOW_COPILOT_QA_TOKEN_BUDGET
+    qa_token_budget = settings.EMBER_QA_TOKEN_BUDGET
     if not settings.is_cloud_environment() and qa_token_budget is not None:
         return qa_token_budget
     return None

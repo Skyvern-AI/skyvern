@@ -9,8 +9,8 @@ from typing import Any, Literal
 
 from skyvern.forge.sdk.copilot.challenge_evidence import is_carrier_backed_category_entry
 from skyvern.forge.sdk.copilot.failure_tracking import ANTI_BOT_CHALLENGE_FAILURE_CATEGORIES
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE, url_origin
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 
 RunOutcomeVerdict = Literal["evaluating", "demonstrated", "not_demonstrated", "not_evaluated"]
 RecordedRunOutcomeVerdict = Literal["demonstrated", "not_demonstrated", "not_evaluated"]

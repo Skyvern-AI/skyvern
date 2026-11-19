@@ -3655,6 +3655,8 @@ class Skyvern:
         status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
         search_key: typing.Optional[str] = None,
         error_code: typing.Optional[str] = None,
+        created_at_start: typing.Optional[dt.datetime] = None,
+        created_at_end: typing.Optional[dt.datetime] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[WorkflowRun]:
         """
@@ -3704,6 +3706,12 @@ class Skyvern:
         error_code : typing.Optional[str]
             Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
+        created_at_start : typing.Optional[dt.datetime]
+            Only include runs created at or after this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Supplying it replaces the 30-day default window of a free-text search_key.
+
+        created_at_end : typing.Optional[dt.datetime]
+            Only include runs created strictly before this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Without created_at_start, a free-text search_key covers the 30 days before this time.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -3732,6 +3740,8 @@ class Skyvern:
             status=status,
             search_key=search_key,
             error_code=error_code,
+            created_at_start=created_at_start,
+            created_at_end=created_at_end,
             request_options=request_options,
         )
         return _response.data
@@ -8084,6 +8094,8 @@ class AsyncSkyvern:
         status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
         search_key: typing.Optional[str] = None,
         error_code: typing.Optional[str] = None,
+        created_at_start: typing.Optional[dt.datetime] = None,
+        created_at_end: typing.Optional[dt.datetime] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[WorkflowRun]:
         """
@@ -8133,6 +8145,12 @@ class AsyncSkyvern:
         error_code : typing.Optional[str]
             Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
+        created_at_start : typing.Optional[dt.datetime]
+            Only include runs created at or after this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Supplying it replaces the 30-day default window of a free-text search_key.
+
+        created_at_end : typing.Optional[dt.datetime]
+            Only include runs created strictly before this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Without created_at_start, a free-text search_key covers the 30 days before this time.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -8169,6 +8187,8 @@ class AsyncSkyvern:
             status=status,
             search_key=search_key,
             error_code=error_code,
+            created_at_start=created_at_start,
+            created_at_end=created_at_end,
             request_options=request_options,
         )
         return _response.data

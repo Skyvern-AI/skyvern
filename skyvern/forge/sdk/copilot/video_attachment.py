@@ -22,13 +22,13 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     COPILOT_SHARP_MAX_WIDTH,
     sharp_jpeg_b64,
 )
-from skyvern.forge.sdk.copilot.secret_redaction import redact_secretlike_filename
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotAttachedFile,
     CopilotVideoEvidenceArtifact,
     CopilotVideoObservation,
 )
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.utils.raw_secret_redaction import redact_secretlike_filename
 from skyvern.webeye.video_utils import (
     extract_video_frames_jpeg,
     probe_media_duration_seconds,
@@ -552,7 +552,7 @@ async def screen_video_frames_for_copilot(
         for start in range(0, len(file_frames), VIDEO_PERCEPTION_CHUNK_SIZE)
     )
     try:
-        async with asyncio.timeout(settings.COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS):
+        async with asyncio.timeout(settings.EMBER_RAW_SECRET_SAFETY_TIMEOUT_SECONDS):
             chunk_results = await asyncio.gather(*(screen_chunk(chunk) for chunk in chunks))
     except TimeoutError:
         LOG.warning("Copilot video secret safety unavailable", reason="timeout")

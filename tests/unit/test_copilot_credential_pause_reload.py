@@ -8,6 +8,7 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import credential_pause as pauses
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
@@ -17,8 +18,8 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.routes import workflow_copilot as routes
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.credentials import PasswordCredential
-from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration
-from tests.unit.copilot_test_helpers import wire_credential_vault
+from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration, WorkflowCopilotChatRequest
+from tests.unit.copilot_test_helpers import stub_copilot_agent_loop, wire_credential_vault
 from tests.unit.test_copilot_ask_user import setup_question_chat
 from tests.unit.test_copilot_credential_pause import (
     _REGISTRATION,
@@ -26,6 +27,10 @@ from tests.unit.test_copilot_credential_pause import (
     _make_credential,
     _make_stream,
     _RegistrationVault,
+)
+
+both_recovery_headers = pytest.mark.parametrize(
+    "recovery_header", ["X-Ember-Credential-Recovery-Token", "X-Copilot-Credential-Recovery-Token"]
 )
 
 
@@ -47,9 +52,165 @@ async def test_recovery_capability_does_not_keep_a_direct_credential_ask_alive(s
     ctx.stream.send.assert_not_awaited()
 
 
+async def _turn_ctx(monkeypatch, chat_id: str, recovery_token: str, *, client_detached: bool):
+    monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_module, "seed_repair_origin_run", AsyncMock(return_value=SimpleNamespace(finished=True)))
+    monkeypatch.setattr(agent_module, "hydrate_prior_run_packet", AsyncMock(return_value=None))
+    stub_copilot_agent_loop(
+        monkeypatch,
+        AsyncMock(return_value=SimpleNamespace(final_output='{"type":"REPLY","user_response":"ok"}', new_items=[])),
+    )
+    sink = []
+    await agent_module.run_copilot_agent(
+        stream=_make_stream(),
+        organization_id="org",
+        chat_request=WorkflowCopilotChatRequest(
+            message="Sign in to the portal",
+            workflow_yaml="title: Portal\n",
+            workflow_id="workflow",
+            workflow_permanent_id="workflow",
+            workflow_copilot_chat_id=chat_id,
+            supports_credential_pause=True,
+            supports_credential_pause_recovery=True,
+            supports_credential_generation=True,
+            credential_recovery_token=recovery_token,
+            client_detached=client_detached,
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5),
+        turn_id="turn",
+        ctx_sink=sink,
+    )
+    ctx = sink[0]
+    ctx.request_policy = RequestPolicy()
+    _ground_user_provided_sites(ctx.request_policy, "https://portal.example.com/login", [])
+    ctx.stream = _make_stream(disconnected=True)
+    return ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_detached", [True, False])
+async def test_detached_turn_keeps_a_card_raised_after_the_stream_closed(sqlite_engine, monkeypatch, client_detached):
+    _, client, question_ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch)
+    monkeypatch.setattr(app, "CACHE", _FakeCache())
+    monkeypatch.setattr(
+        app.DATABASE,
+        "credentials",
+        SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[_make_credential()])),
+    )
+    monkeypatch.setattr(pauses, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(routes, "RECONCILE_ABANDON_AFTER_SECONDS", -1)
+    recovery_token = "a" * 64
+    ctx = await _turn_ctx(
+        monkeypatch, question_ctx.workflow_copilot_chat_id, recovery_token, client_detached=client_detached
+    )
+    client._transport.app.add_api_route(
+        "/credential-response", routes.workflow_copilot_credential_response, methods=["POST"]
+    )
+    async with client:
+        invocation = asyncio.create_task(_request_credential("https://portal.example.com/login", "Login", ctx))
+        try:
+            if not client_detached:
+                result = await asyncio.wait_for(invocation, 1)
+                assert result["outcome"] == "declined"
+                ctx.stream.send.assert_not_awaited()
+                return
+            await asyncio.sleep(0.05)
+            assert not invocation.done()
+            history = await client.get(
+                "/history",
+                params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id},
+                headers={"X-Ember-Credential-Recovery-Token": recovery_token},
+            )
+            [card] = history.json()["pending_credential_requests"]
+            accepted = await client.post(
+                "/credential-response",
+                json={
+                    "workflow_copilot_chat_id": card["workflow_copilot_chat_id"],
+                    "turn_id": card["turn_id"],
+                    "resume_token": card["resume_token"],
+                    "action": "connected",
+                    "credential_id": "cred_1",
+                },
+            )
+            assert accepted.status_code == 200
+            result = await asyncio.wait_for(invocation, 1)
+            assert (result["status"], result["credential_id"]) == ("connected", "cred_1")
+        finally:
+            if not invocation.done():
+                invocation.cancel()
+                await asyncio.gather(invocation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_detached_turn_registration_card_raised_after_the_stream_closed_resolves_by_generate(
+    sqlite_engine, monkeypatch
+):
+    _, client, question_ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch)
+    monkeypatch.setattr(app, "CACHE", _FakeCache())
+    monkeypatch.setattr(pauses, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(routes, "RECONCILE_ABANDON_AFTER_SECONDS", -1)
+    credential = _make_credential("cred_new", "Portal test account")
+    monkeypatch.setattr(
+        app.DATABASE,
+        "credentials",
+        SimpleNamespace(
+            get_credentials_by_ids=AsyncMock(return_value=[credential]), get_credentials=AsyncMock(return_value=[])
+        ),
+    )
+    _RegistrationVault(credential).install(monkeypatch)
+    recovery_token = "a" * 64
+    ctx = await _turn_ctx(monkeypatch, question_ctx.workflow_copilot_chat_id, recovery_token, client_detached=True)
+    api = client._transport.app
+    api.dependency_overrides[routes.org_auth_service.get_current_user_id_or_none] = lambda: "user-1"
+    api.add_api_route("/credential-generate", routes.workflow_copilot_credential_generate, methods=["POST"])
+    async with client:
+        invocation = asyncio.create_task(
+            _request_credential(
+                "https://portal.example.com/signup",
+                "Create the test account",
+                ctx,
+                registration=CredentialRegistration(**_REGISTRATION),
+            )
+        )
+        try:
+            await asyncio.sleep(0.05)
+            assert not invocation.done()
+            history = await client.get(
+                "/history",
+                params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id},
+                headers={"X-Copilot-Credential-Recovery-Token": recovery_token},
+            )
+            [card] = history.json()["pending_credential_requests"]
+            assert card["reason"] == "credential_registration"
+            with skyvern_context.scoped(SkyvernContext()):
+                generated = await client.post(
+                    "/credential-generate",
+                    json={
+                        "workflow_copilot_chat_id": card["workflow_copilot_chat_id"],
+                        "turn_id": card["turn_id"],
+                        "resume_token": card["resume_token"],
+                    },
+                )
+            assert generated.json()["result"] == "connected"
+            result = await asyncio.wait_for(invocation, 1)
+            assert (result["status"], result["credential_id"]) == ("connected", "cred_new")
+        finally:
+            if not invocation.done():
+                invocation.cancel()
+                await asyncio.gather(invocation, return_exceptions=True)
+
+
+@both_recovery_headers
 @pytest.mark.asyncio
 async def test_disconnected_card_recovers_through_authenticated_history_and_resumes_same_call(
-    sqlite_engine, monkeypatch
+    recovery_header: str, sqlite_engine, monkeypatch
 ):
     repo, client, ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch)
     cache = _FakeCache()
@@ -88,13 +249,13 @@ async def test_disconnected_card_recovers_through_authenticated_history_and_resu
             wrong_proof = await client.get(
                 "/history",
                 params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id},
-                headers={"X-Copilot-Credential-Recovery-Token": "b" * 64},
+                headers={recovery_header: "b" * 64},
             )
             assert wrong_proof.json()["pending_credential_requests"] == []
             history = await client.get(
                 "/history",
                 params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id},
-                headers={"X-Copilot-Credential-Recovery-Token": recovery_token},
+                headers={recovery_header: recovery_token},
             )
             card = history.json()["pending_credential_requests"][0]
             assert not invocation.done()
@@ -105,7 +266,7 @@ async def test_disconnected_card_recovers_through_authenticated_history_and_resu
                 params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id},
                 headers={
                     "test-org": "other",
-                    "X-Copilot-Credential-Recovery-Token": recovery_token,
+                    recovery_header: recovery_token,
                 },
             )
             assert foreign.json()["pending_credential_requests"] == []
@@ -113,7 +274,7 @@ async def test_disconnected_card_recovers_through_authenticated_history_and_resu
             other = await client.get(
                 "/history",
                 params={"workflow_copilot_chat_id": other_chat.workflow_copilot_chat_id},
-                headers={"X-Copilot-Credential-Recovery-Token": recovery_token},
+                headers={recovery_header: recovery_token},
             )
             assert other.json()["pending_credential_requests"] == []
             body = {
@@ -133,7 +294,7 @@ async def test_disconnected_card_recovers_through_authenticated_history_and_resu
             reloaded = await client.get(
                 "/history",
                 params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id},
-                headers={"X-Copilot-Credential-Recovery-Token": recovery_token},
+                headers={recovery_header: recovery_token},
             )
             assert reloaded.json()["pending_credential_requests"] == []
             duplicate = await client.post("/credential-response", json=body)
@@ -144,9 +305,12 @@ async def test_disconnected_card_recovers_through_authenticated_history_and_resu
                 await asyncio.gather(invocation, return_exceptions=True)
 
 
+@both_recovery_headers
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ending", ["expired", "cancelled"])
-async def test_history_hides_expired_or_cancelled_recoverable_card(sqlite_engine, monkeypatch, ending):
+async def test_history_hides_expired_or_cancelled_recoverable_card(
+    recovery_header: str, sqlite_engine, monkeypatch, ending
+):
     _, client, ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch)
     cache = _FakeCache()
     monkeypatch.setattr(app, "CACHE", cache)
@@ -185,7 +349,7 @@ async def test_history_hides_expired_or_cancelled_recoverable_card(sqlite_engine
             history = await client.get(
                 "/history",
                 params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id},
-                headers={"X-Copilot-Credential-Recovery-Token": recovery_token},
+                headers={recovery_header: recovery_token},
             )
             assert history.json()["pending_credential_requests"] == []
             with pytest.raises(pauses.CredentialPauseRejection) as rejection:
@@ -242,9 +406,10 @@ def _sign_in_card_context(ctx, *, recovery: bool):
     return emitted
 
 
+@both_recovery_headers
 @pytest.mark.asyncio
 async def test_signing_in_survives_a_reload_and_done_resumes_the_same_call_with_the_saved_profile(
-    sqlite_engine, monkeypatch
+    recovery_header: str, sqlite_engine, monkeypatch
 ):
     _, client, ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch)
     monkeypatch.setattr(app, "CACHE", _FakeCache())
@@ -267,7 +432,7 @@ async def test_signing_in_survives_a_reload_and_done_resumes_the_same_call_with_
     client._transport.app.add_api_route(
         "/credential-response", routes.workflow_copilot_credential_response, methods=["POST"]
     )
-    headers = {"X-Copilot-Credential-Recovery-Token": "a" * 64}
+    headers = {recovery_header: "a" * 64}
     params = {"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id}
     async with client:
         invocation = asyncio.create_task(_request_credential("https://portal.example.com/login", "Login", ctx))
@@ -284,7 +449,7 @@ async def test_signing_in_survives_a_reload_and_done_resumes_the_same_call_with_
             started = await client.post("/credential-response", json={**body, "action": "signing_in"})
             assert started.status_code == 200
             extended = datetime.fromisoformat(started.json()["expires_at"])
-            manual_window = timedelta(seconds=settings.WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS)
+            manual_window = timedelta(seconds=settings.EMBER_MANUAL_SIGN_IN_TIMEOUT_SECONDS)
             assert extended - card.expires_at > manual_window - timedelta(seconds=30)
             again = await client.post("/credential-response", json={**body, "action": "signing_in"})
             assert datetime.fromisoformat(again.json()["expires_at"]) == extended
@@ -336,8 +501,11 @@ async def test_signing_in_survives_a_reload_and_done_resumes_the_same_call_with_
     assert any(entry["event"] == "copilot_credential_pause_signed_in" for entry in logs)
 
 
+@both_recovery_headers
 @pytest.mark.asyncio
-async def test_an_update_card_restores_its_sign_in_after_a_reload_and_done_answers_it(sqlite_engine, monkeypatch):
+async def test_an_update_card_restores_its_sign_in_after_a_reload_and_done_answers_it(
+    recovery_header: str, sqlite_engine, monkeypatch
+):
     _, client, ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch)
     monkeypatch.setattr(app, "CACHE", _FakeCache())
     monkeypatch.setattr(pauses, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
@@ -351,7 +519,7 @@ async def test_an_update_card_restores_its_sign_in_after_a_reload_and_done_answe
     client._transport.app.add_api_route(
         "/credential-response", routes.workflow_copilot_credential_response, methods=["POST"]
     )
-    headers = {"X-Copilot-Credential-Recovery-Token": "a" * 64}
+    headers = {recovery_header: "a" * 64}
     params = {"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id}
     async with client:
         invocation = asyncio.create_task(
@@ -426,9 +594,10 @@ async def test_done_without_card_recovery_still_resumes_and_a_skip_after_no_sign
     assert ctx.request_policy.credential_pause_signed_in_profile_id is None
 
 
+@both_recovery_headers
 @pytest.mark.asyncio
 async def test_a_card_after_a_settled_sign_in_restores_alone_and_only_its_own_token_answers_it(
-    sqlite_engine, monkeypatch
+    recovery_header: str, sqlite_engine, monkeypatch
 ):
     _, client, ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch)
     monkeypatch.setattr(app, "CACHE", _FakeCache())
@@ -440,7 +609,7 @@ async def test_a_card_after_a_settled_sign_in_restores_alone_and_only_its_own_to
     client._transport.app.add_api_route(
         "/credential-response", routes.workflow_copilot_credential_response, methods=["POST"]
     )
-    headers = {"X-Copilot-Credential-Recovery-Token": "a" * 64}
+    headers = {recovery_header: "a" * 64}
     params = {"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id}
     cards = []
     results = []
@@ -526,8 +695,11 @@ async def test_a_done_whose_pause_ended_while_saving_discards_the_profile(sqlite
     assert response_key not in cache.store
 
 
+@both_recovery_headers
 @pytest.mark.asyncio
-async def test_registration_card_survives_a_reload_with_its_one_generate_attempt_recorded(sqlite_engine, monkeypatch):
+async def test_registration_card_survives_a_reload_with_its_one_generate_attempt_recorded(
+    recovery_header: str, sqlite_engine, monkeypatch
+):
     _, client, ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch)
     monkeypatch.setattr(app, "CACHE", _FakeCache())
     monkeypatch.setattr(pauses, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
@@ -559,7 +731,7 @@ async def test_registration_card_survives_a_reload_with_its_one_generate_attempt
         response = await client.get(
             "/history",
             params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id},
-            headers={"X-Copilot-Credential-Recovery-Token": recovery_token},
+            headers={recovery_header: recovery_token},
         )
         return response.json()["pending_credential_requests"]
 

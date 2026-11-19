@@ -166,7 +166,7 @@ describe("BranchesEditor", () => {
     expect(typeInto("{{ p < limit }}")).toBe("jinja2_template");
   });
 
-  describe.each(["yaml", "save", "copilot"] as const)("%s lock", (kind) => {
+  describe.each(["yaml", "save", "ember"] as const)("%s lock", (kind) => {
     function renderLockedGraph() {
       const data = makeData();
       nodes = [
@@ -207,8 +207,8 @@ describe("BranchesEditor", () => {
       render(<BranchesEditor nodeId="cond_1" data={data} />);
       act(() => {
         useWorkflowYamlEditorStore.setState({
-          commitInProgress: kind !== "copilot",
-          copilotAcceptance: kind === "copilot" ? Symbol("turn") : null,
+          commitInProgress: kind !== "ember",
+          emberAcceptance: kind === "ember" ? Symbol("turn") : null,
           lockKind: kind,
         });
       });
@@ -306,7 +306,7 @@ test.each(["yaml", "copilot"] as const)(
   (kind) => {
     useWorkflowYamlEditorStore.setState({
       commitInProgress: kind === "yaml",
-      copilotAcceptance: kind === "copilot" ? Symbol("turn") : null,
+      emberAcceptance: kind === "copilot" ? Symbol("turn") : null,
     });
     const data = makeData({ activeBranchId: null });
     data.branches = data.branches.filter((branch) => !branch.is_default);
@@ -315,7 +315,7 @@ test.each(["yaml", "copilot"] as const)(
     act(() =>
       useWorkflowYamlEditorStore.setState({
         commitInProgress: false,
-        copilotAcceptance: null,
+        emberAcceptance: null,
       }),
     );
     expect(updateNodeData).toHaveBeenCalledWith("cond_1", {

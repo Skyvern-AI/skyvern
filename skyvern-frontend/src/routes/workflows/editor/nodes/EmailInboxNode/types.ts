@@ -1,6 +1,9 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
-import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
+import {
+  debuggableWorkflowBlockTypes,
+  type EmailOrganizeAction,
+} from "@/routes/workflows/types/workflowTypes";
 
 export type EmailClient = "gmail" | "outlook";
 
@@ -18,6 +21,8 @@ export type EmailInboxNodeData = NodeBaseData & {
   includeBody: boolean;
   downloadAttachments: boolean;
   messageId: string;
+  organizeAction: EmailOrganizeAction | null | undefined;
+  organizeLabel: string | null | undefined;
   parameterKeys: Array<string>;
 };
 
@@ -42,6 +47,8 @@ export const emailInboxNodeDefaultData: EmailInboxNodeData = {
   includeBody: true,
   downloadAttachments: false,
   messageId: "",
+  organizeAction: undefined,
+  organizeLabel: undefined,
   parameterKeys: [],
 };
 

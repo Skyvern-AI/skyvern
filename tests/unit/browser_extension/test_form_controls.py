@@ -16,24 +16,37 @@ def test_fixed_form_fill_authorization_and_document_handoff() -> None:
     script = """
 const { authorizeDomFill, fillDomInput, revokeDomFills } = await import(DOM_URI);
 const { ProtocolError, ERROR_CODES } = await import(PROTOCOL_URI);
+const { TabScope } = await import(SCOPE_URI);
 const calls = [];
 let current = true;
 let url = 'https://example.test/form';
+let pendingUrl;
+let scopeError;
+let fenceError;
+let authorizationResult;
+let checkDenials = async () => {};
 let afterProbe = () => {};
 let beforeAuthorize = () => {};
 let beforeCommit = () => {};
 let beforeOperation = async () => {};
 let fillResponse = { ok: true, textLength: 3 };
-const lease = {
-  assertCurrent() {
-    if (!current) throw new ProtocolError(ERROR_CODES.TAB_NOT_SCOPED, 'scope revoked');
-  },
-  remainingMs() { return 4000; },
-  cancel() { current = false; },
-};
+let lease;
 const tabScope = {
+  operationGeneration: 0,
+  scopedTabIds: new Set([7]),
+  scopedGroupIds: new Map([[7, 1]]),
+  tabOperationLeases: new Map(),
+  cancelTabOperations: TabScope.prototype.cancelTabOperations,
+  debuggerRouter: { async assertCanSend() { if (fenceError) throw fenceError; } },
   async runTabOperation(tabId, operation, generation, cancelOnEvent, onLeaseCreated) {
     if (tabId !== 7) throw new Error('wrong tab');
+    lease = TabScope.prototype.createOperationLease.call(this, Date.now() + 4000);
+    const assertCurrent = lease.assertCurrent;
+    lease.assertCurrent = () => {
+      assertCurrent();
+      if (!current) throw new ProtocolError(ERROR_CODES.TAB_NOT_SCOPED, 'scope revoked');
+    };
+    this.tabOperationLeases.set(tabId, new Set([lease]));
     onLeaseCreated?.(lease);
     await beforeOperation();
     return operation(lease);
@@ -41,7 +54,8 @@ const tabScope = {
   async assertControllableLocked(tabId, token) {
     if (tabId !== 7 || token !== lease) throw new Error('scope lease missing');
     lease.assertCurrent();
-    return { id: 7, url };
+    if (scopeError) throw scopeError;
+    return { id: 7, url, pendingUrl };
   },
 };
 globalThis.chrome = {
@@ -58,18 +72,24 @@ globalThis.chrome = {
       const sender = { id: chrome.runtime.id, tab: { id: tabId }, frameId: 0, documentId: 'chrome-document', url };
       const wrongTab = await authorizeDomFill(tabScope, authorization, { ...sender, tab: { id: 99 } });
       assert(wrongTab.authorized === false, 'authorization granted to another tab');
+      assert(wrongTab.reason === 'authorization_lost', 'wrong sender denial changed');
       const earlyCommit = await authorizeDomFill(tabScope, { ...authorization, phase: 'commit' }, sender);
       assert(earlyCommit.authorized === false, 'commit skipped inspection authorization');
+      assert(earlyCommit.reason === 'authorization_lost', 'early commit denial changed');
+      await checkDenials(authorization, sender, message);
       const grant = await authorizeDomFill(tabScope, authorization, sender);
-      if (!grant.authorized) return { ok: false, error: 'authorization_lost' };
+      authorizationResult = grant;
+      if (!grant.authorized) return { ok: false, error: grant.reason };
       const replay = await authorizeDomFill(tabScope, authorization, sender);
       assert(replay.authorized === false, 'authorization can be replayed');
+      assert(replay.reason === 'authorization_lost', 'inspect replay denial changed');
       beforeCommit();
       const commit = { ...authorization, phase: 'commit' };
       const committed = await authorizeDomFill(tabScope, commit, sender);
-      if (!committed.authorized) return { ok: false, error: 'authorization_lost' };
+      if (!committed.authorized) return { ok: false, error: committed.reason };
       const commitReplay = await authorizeDomFill(tabScope, commit, sender);
       assert(commitReplay.authorized === false, 'commit authorization can be replayed');
+      assert(commitReplay.reason === 'authorization_lost', 'commit replay denial changed');
       return fillResponse;
     },
   },
@@ -93,6 +113,62 @@ assert(command.documentToken === 'document-a' && command.url === url, 'document 
 assert(command.selector === '#email' && command.text === 'abc', 'plain input data lost');
 assert(command.expiresAt > Date.now() && command.expiresAt <= Date.now() + 1000, 'late delivery not bounded');
 assert(!('expression' in command), 'no evaluation expression');
+
+checkDenials = async (authorization, sender, message) => {
+  for (const [request, source, reason] of [
+    [{ ...authorization, extra: true }, sender, 'authorization_lost'],
+    [authorization, { ...sender, frameId: 1 }, 'document_changed'],
+    [authorization, { ...sender, documentId: undefined }, 'document_changed'],
+    [authorization, { ...sender, url: 'https://example.test/other' }, 'document_changed'],
+    [{ ...authorization, documentToken: 'old-document' }, sender, 'document_changed'],
+  ]) {
+    const denied = await authorizeDomFill(tabScope, request, source);
+    assert(!denied.authorized && denied.reason === reason, 'wrong request or document denial');
+  }
+  const now = Date.now;
+  try {
+    Date.now = () => message.expiresAt;
+    const expired = await authorizeDomFill(tabScope, authorization, sender);
+    assert(!expired.authorized && expired.reason === 'document_changed', 'wrong expiry denial');
+  } finally { Date.now = now; }
+  for (const pendingNavigation of [false, true]) {
+    const originalUrl = url;
+    if (pendingNavigation) pendingUrl = 'https://example.test/next';
+    else url = 'https://example.test/next';
+    try {
+      const changed = await authorizeDomFill(tabScope, authorization, sender);
+      assert(!changed.authorized && changed.reason === 'document_changed', 'wrong tab URL denial');
+    } finally { url = originalUrl; pendingUrl = undefined; }
+  }
+};
+await fillDomInput(tabScope, args);
+checkDenials = async () => {};
+
+for (const [change, reason] of [
+  [{ url: 'https://example.test/next' }, 'document_changed'],
+  [{ url: 'chrome://settings' }, 'document_changed'],
+  [{ groupId: 2 }, 'authorization_lost'],
+]) {
+  beforeAuthorize = () => TabScope.prototype.cancelForTabUpdate.call(tabScope, 7, change, null);
+  authorizationResult = undefined;
+  await failure();
+  assert(authorizationResult?.reason === reason, 'wrong event cancellation denial reason');
+}
+for (const revoke of [
+  () => { current = false; },
+  () => { scopeError = new ProtocolError(ERROR_CODES.TAB_NOT_SCOPED, 'scope revoked'); },
+  () => { fenceError = new ProtocolError(ERROR_CODES.DEBUGGER_DETACHED, 'command fenced'); },
+  () => lease.cancel(new ProtocolError(ERROR_CODES.COMMAND_TIMEOUT, 'unknown cancellation')),
+]) {
+  beforeAuthorize = revoke;
+  authorizationResult = undefined;
+  await failure();
+  assert(authorizationResult?.reason === 'authorization_lost', 'wrong control-loss denial reason');
+  current = true;
+  scopeError = undefined;
+  fenceError = undefined;
+}
+beforeAuthorize = () => {};
 
 for (const invalid of [
   { ...args, expression: 'evil()' },
@@ -163,7 +239,10 @@ console.log('PASS fixed form-fill scope, schema, document and no-fallback contra
 """.replace("DOM_URI", json.dumps((extension / "dom_router.js").as_uri())).replace(
         "PROTOCOL_URI", json.dumps((extension / "protocol.js").as_uri())
     )
-    result = subprocess.run([node, "--input-type=module", "--eval", script], capture_output=True, text=True, timeout=10)
+    script = script.replace("SCOPE_URI", json.dumps((extension / "tab_scope.js").as_uri()))
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script], capture_output=True, text=True, timeout=10, check=False
+    )
     assert result.returncode == 0, result.stderr
 
 
@@ -222,13 +301,44 @@ for (const invalid of [
   { ...fill, text: {} },
 ]) assert((await send(invalid)).error === 'invalid_request', 'unstructured input accepted');
 assert((await send(fill)).error === 'authorization_lost', 'unauthorized fill accepted');
+for (const reason of ['document_changed', 'authorization_lost', 'unknown_reason']) {
+  context.chrome.runtime.sendMessage = async () => ({ ok: true, result: { authorized: false, reason } });
+  const expected = reason === 'document_changed' ? reason : 'authorization_lost';
+  assert((await send(fill)).error === expected, 'inspect denial reason lost');
+}
 context.chrome.runtime.sendMessage = async () => {
   context.Date = { now: () => Date.now() + 2000 };
   return { ok: true, result: { authorized: true } };
 };
 assert((await send(fill)).error === 'document_changed', 'fill applied after authorization deadline');
 assert(domReads === 0, 'rejected request accessed DOM');
+context.Date = Date;
+context.HTMLInputElement = class {};
+context.HTMLTextAreaElement = class {
+  isConnected = true;
+  getAttribute() { return null; }
+  matches() { return false; }
+  closest() { return null; }
+  getClientRects() { return [{ width: 100, height: 20 }]; }
+  checkVisibility() { return true; }
+  set value(value) { throw new Error('denied commit wrote the field'); }
+};
+const target = new context.HTMLTextAreaElement();
+context.document.querySelectorAll = () => [target];
+for (const reason of ['document_changed', 'authorization_lost', 'unknown_reason', undefined]) {
+  let commitRequested = false;
+  context.chrome.runtime.sendMessage = async ({ phase }) => {
+    if (phase === 'inspect') return { ok: true, result: { authorized: true } };
+    commitRequested = true;
+    return { ok: true, result: { authorized: false, reason } };
+  };
+  const expected = reason === 'document_changed' ? reason : 'authorization_lost';
+  assert((await send({ ...fill, expiresAt: Date.now() + 500 })).error === expected, 'commit denial reason lost');
+  assert(commitRequested, 'commit denial not exercised');
+}
 console.log('PASS fixed form sender, document, expiry and schema boundaries');
 """.replace("SOURCE_PATH", json.dumps(str(source)))
-    result = subprocess.run([node, "--input-type=module", "--eval", script], capture_output=True, text=True, timeout=10)
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script], capture_output=True, text=True, timeout=10, check=False
+    )
     assert result.returncode == 0, result.stderr

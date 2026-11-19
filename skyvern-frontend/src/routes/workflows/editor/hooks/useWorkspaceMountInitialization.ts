@@ -7,8 +7,7 @@ import {
   selectEditorMutationLocked,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
-import { canonicalRecoveriesByWorkflow } from "../../copilot/WorkflowCopilotChat";
-import type { QueryClient } from "@tanstack/react-query";
+import { canonicalRecoveriesByWorkflow } from "../../ember/EmberChat";
 
 import { useMountEffect } from "@/hooks/useMountEffect";
 
@@ -17,9 +16,7 @@ type WorkflowChangesStore = {
 };
 
 type WorkspaceMountInitializationOptions = {
-  cacheKey: string;
   closeWorkflowPanel: () => void;
-  queryClient: Pick<QueryClient, "invalidateQueries">;
   workflowChangesStore: WorkflowChangesStore;
   workflowPermanentId?: string;
 };
@@ -27,7 +24,7 @@ type WorkspaceMountInitializationOptions = {
 export function useWorkspaceDeferredEditCleanup(workflowId: string) {
   useEffect(() => {
     return () => {
-      // Copilot parks recovery in layout cleanup, before this passive cleanup.
+      // Ember parks recovery in layout cleanup, before this passive cleanup.
       // A remounted recovery may hold a lock or still be waiting for one.
       const state = useWorkflowYamlEditorStore.getState();
       const scalarLockBlocksCleanup =
@@ -46,9 +43,7 @@ export function useWorkspaceDeferredEditCleanup(workflowId: string) {
 }
 
 function useWorkspaceMountInitialization({
-  cacheKey,
   closeWorkflowPanel,
-  queryClient,
   workflowChangesStore,
   workflowPermanentId,
 }: WorkspaceMountInitializationOptions) {
@@ -62,11 +57,6 @@ function useWorkspaceMountInitialization({
       getDeferredEditReplayRevision(workflowPermanentId) !==
         replayRevisionAtMount.current,
     );
-    if (workflowPermanentId) {
-      queryClient.invalidateQueries({
-        queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
-      });
-    }
     closeWorkflowPanel();
   });
 }

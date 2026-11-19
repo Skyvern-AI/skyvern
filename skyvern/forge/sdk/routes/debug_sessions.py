@@ -1,6 +1,5 @@
 import asyncio
 import hashlib
-import time
 import typing as t
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -10,7 +9,7 @@ from fastapi import Depends, HTTPException, Query, Response, status
 from sqlalchemy.exc import IntegrityError
 
 from skyvern.config import settings
-from skyvern.exceptions import BrowserSessionNotRenewable
+from skyvern.exceptions import BrowserSessionNotRenewable, ProxyPolicyError
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.active_run_session import get_active_run_session
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -33,6 +32,11 @@ from skyvern.forge.sdk.services.browser_session_artifacts import (
     browser_session_artifact_read,
     redact_workflow_run_artifact_rows,
 )
+from skyvern.forge.sdk.services.debug_session_browser import (
+    create_debug_browser_session,
+    debug_browser_supports_vnc,
+    record_debug_session,
+)
 from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.models.block import LoginBlock
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -42,7 +46,7 @@ from skyvern.forge.sdk.workflow.service import (
 )
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import runtime_proxy_location
-from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 
 LOG = structlog.get_logger()
 BROWSER_SESSION_PREWARM_FLAG = "BROWSER_SESSION_PREWARM"
@@ -106,7 +110,30 @@ async def _claim_compatible_prewarm(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
     )
-    if browser_session.proxy_location != runtime_proxy_location(workflow.proxy_location):
+    approved_location: ProxyLocationInput = runtime_proxy_location(workflow.proxy_location)
+    if approved_location == ProxyLocation.RESIDENTIAL and (
+        isinstance(browser_session.proxy_location, GeoTarget)
+        or browser_session.proxy_location == ProxyLocation.RESIDENTIAL
+    ):
+        resolved_location = await app.PERSISTENT_SESSIONS_MANAGER.resolve_session_proxy_location(
+            browser_session, approved_location, workflow_permanent_id=workflow_permanent_id
+        )
+        if isinstance(browser_session.proxy_location, GeoTarget) or resolved_location != approved_location:
+            if browser_session.proxy_session_id or browser_session.browser_profile_id != workflow.browser_profile_id:
+                await _retire_prewarm(browser_session, organization_id, bound_key)
+                return None
+            profile = (
+                await app.DATABASE.browser_sessions.get_browser_profile(
+                    browser_session.browser_profile_id, organization_id
+                )
+                if browser_session.browser_profile_id
+                else None
+            )
+            if browser_session.browser_profile_id and (profile is None or profile.proxy_session_id):
+                await _retire_prewarm(browser_session, organization_id, bound_key)
+                return None
+        approved_location = resolved_location
+    if browser_session.proxy_location != approved_location:
         await _retire_prewarm(browser_session, organization_id, bound_key)
         return None
 
@@ -395,7 +422,7 @@ async def get_debug_session_viewer_state(
 async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
     workflow_permanent_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+    current_user_id: str = Depends(org_auth_service.get_debug_session_owner_id),
 ) -> DebugSession:
     """
     `current_user_id` is a unique identifier for a user, but does not map to an
@@ -404,7 +431,7 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
     If the debug session does not exist, a new one will be created.
 
     In addition, the timeout for the debug session's browser session will be
-    extended to 4 hours from the time of the request. If the browser session
+    extended to DEBUG_SESSION_TIMEOUT_MINUTES (20 minutes) from the time of the request. If the browser session
     cannot be renewed, a new one will be created and assigned to the debug
     session. The browser_session that could not be renewed will be closed.
     """
@@ -424,6 +451,8 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
                 user_id=current_user_id,
             )
             claimed_prewarm = debug_session is not None
+        except ProxyPolicyError:
+            raise
         except Exception:
             LOG.warning(
                 "Failed to claim debug-session prewarm; falling back to cold start",
@@ -633,75 +662,18 @@ async def new_debug_session(
             workflow_permanent_id=workflow_permanent_id,
         )
 
-    # Look up the workflow's proxy_location so the debug session browser
-    # uses the same proxy region the user configured on the workflow.
-    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
-        workflow_permanent_id=workflow_permanent_id,
-        organization_id=current_org.organization_id,
-    )
-    proxy_location = runtime_proxy_location(workflow.proxy_location)
-
-    browser_start_started_at = time.monotonic()
-    try:
-        new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-            organization_id=current_org.organization_id,
-            timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
-            proxy_location=proxy_location,
-            wait_for_startup=settings.ENV != "local",
-            needs_live_view=True,
-            created_by=current_user_id,
-            session_kind=BrowserSessionKind.editor,
-        )
-    except BrowserSessionCreditAdmissionRefusal:
-        # Expected: the caller gets the 402 and the org's credits decide the outcome, so there is no defect to page on.
-        LOG.warning(
-            "Debug session browser startup refused: credits exhausted",
-            organization_id=current_org.organization_id,
-            workflow_permanent_id=workflow_permanent_id,
-        )
-        raise
-    except Exception:
-        LOG.exception(
-            "Debug session browser startup failed",
-            organization_id=current_org.organization_id,
-            workflow_permanent_id=workflow_permanent_id,
-        )
-        raise
-    LOG.info(
-        "Debug session browser ready",
-        organization_id=current_org.organization_id,
-        workflow_permanent_id=workflow_permanent_id,
-        browser_session_id=new_browser_session.persistent_browser_session_id,
-        duration_seconds=time.monotonic() - browser_start_started_at,
-    )
-
-    debug_session = await app.DATABASE.debug.create_debug_session(
-        browser_session_id=new_browser_session.persistent_browser_session_id,
+    new_browser_session = await create_debug_browser_session(
         organization_id=current_org.organization_id,
         user_id=current_user_id,
         workflow_permanent_id=workflow_permanent_id,
-        vnc_streaming_supported=(
-            settings.ENV == "local" or bool(new_browser_session.ip_address or new_browser_session.browser_address)
-        )
-        and await app.AGENT_FUNCTION.supports_live_view(
-            new_browser_session.persistent_browser_session_id,
-            ip_address=new_browser_session.ip_address,
-        ),
     )
-
-    LOG.info(
-        "Created new debug session",
-        debug_session_id=debug_session.debug_session_id,
-        browser_session_id=new_browser_session.persistent_browser_session_id,
+    return await record_debug_session(
+        new_browser_session,
         organization_id=current_org.organization_id,
         user_id=current_user_id,
         workflow_permanent_id=workflow_permanent_id,
-        proxy_location=str(proxy_location),
+        vnc_streaming_supported=await debug_browser_supports_vnc(new_browser_session),
     )
-
-    # The freshly created session row carries the browser_profile_id already.
-    debug_session.pbs_browser_profile_id = new_browser_session.browser_profile_id
-    return debug_session
 
 
 @base_router.get(

@@ -343,7 +343,7 @@ class PowerBIQueryBlock(Block):
                 failure_reason="Power BI queries are not supported in this runtime.",
             )
         except PowerBIQueryError as exc:
-            if exc.code in {"principal_unavailable", "event_trigger_run"}:
+            if exc.code == "principal_unavailable":
                 return await self._failure(
                     workflow_run_context=workflow_run_context,
                     workflow_run_id=workflow_run_id,
@@ -351,9 +351,6 @@ class PowerBIQueryBlock(Block):
                     organization_id=effective_org_id,
                     error_code="human_run_required",
                     failure_reason=HUMAN_RUN_REQUIRED_REASON,
-                    # principal_unavailable also stands for a failed principal lookup, so only the event-trigger
-                    # fact is labeled.
-                    category=FailureCategory.CREDENTIAL_ERROR if exc.code == "event_trigger_run" else None,
                 )
             if exc.code == "copilot_test_run_unsupported":
                 return await self._failure(

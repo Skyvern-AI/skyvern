@@ -13,7 +13,6 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
-import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import { WorkflowScopeContext } from "../WorkflowScopeContext";
 import { getElements } from "../workflowEditorUtils";
 import { block, conditional, settings } from "./docTestBlocks";
@@ -26,18 +25,10 @@ const control = vi.hoisted(() => ({
   submits: vi.fn(),
   mounts: vi.fn(),
   unmounts: vi.fn(),
-  blocksByLabel: new Map<string, WorkflowRunBlock>(),
 }));
-vi.mock("./useDocRun", () => ({
-  useDocRun: () => ({
-    rowsLoaded: true,
-    runId: null,
-    blocksByLabel: control.blocksByLabel,
-    live: false,
-    unknownLabels: new Set(),
-  }),
+vi.mock("./useDocLatestRunCompleted", () => ({
+  useDocLatestRunCompleted: () => false,
 }));
-vi.mock("./DocStepResult", () => ({ DocStepResult: () => null }));
 vi.mock("../nodes/components/NodeHeader", () => ({
   NodeHeader: ({ nodeId }: { nodeId: string }) => {
     const [pending, setPending] = useState(false);

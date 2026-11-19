@@ -30,7 +30,7 @@ const useWorkflowParametersStore = create<WorkflowParametersStore>(
       },
       setParametersFromUser: (parameters) => {
         if (refuseMutationDuringYamlCommit()) return;
-        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        useWorkflowTitleStore.getState().recordEmberGraphEdit();
         get().setParameters(parameters);
       },
       setParameters: (parameters: ParametersState, options) => {

@@ -43,7 +43,7 @@ vi.mock("../../workflowEditorUtils", () => ({
 }));
 
 // Stub heavy components: WorkflowBlockInputTextarea, ParametersMultiSelect,
-// ErrorCodeMappingEditor, ModelSelector, BlockExecutionOptions, DisableCache.
+// ErrorCodeMappingEditor, ModelSelector, BlockExecutionOptions.
 // Each is replaced with a minimal stub that exposes the props the form passes
 // so we can drive the form's contract without spinning up the full editor.
 vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
@@ -129,20 +129,6 @@ vi.mock("../../nodes/components/BlockExecutionOptions", () => ({
         }
       />
     </div>
-  ),
-}));
-
-vi.mock("../../nodes/DisableCache", () => ({
-  DisableCache: (props: {
-    disableCache: boolean;
-    editable: boolean;
-    onDisableCacheChange: (next: boolean) => void;
-  }) => (
-    <button
-      data-testid="disable-cache-toggle"
-      data-disabled={String(props.disableCache)}
-      onClick={() => props.onDisableCacheChange(!props.disableCache)}
-    />
   ),
 }));
 
@@ -373,15 +359,6 @@ describe("ValidationBlockForm (SKY-9361)", () => {
     });
   });
 
-  test("toggling disableCache propagates", () => {
-    setValidationNode("v1", { disableCache: false });
-    render(<ValidationBlockForm blockId="v1" />);
-
-    fireEvent.click(screen.getByTestId("disable-cache-toggle"));
-
-    expect(updateNodeData).toHaveBeenCalledWith("v1", { disableCache: true });
-  });
-
   test("non-editable: edits do not propagate", () => {
     setValidationNode("v1", { editable: false });
     render(<ValidationBlockForm blockId="v1" />);
@@ -389,7 +366,6 @@ describe("ValidationBlockForm (SKY-9361)", () => {
     fireEvent.change(screen.getByTestId("wbi-complete_criterion"), {
       target: { value: "blocked" },
     });
-    fireEvent.click(screen.getByTestId("disable-cache-toggle"));
     fireEvent.click(screen.getByTestId("error-code-mapping-switch"));
 
     expect(updateNodeData).not.toHaveBeenCalled();

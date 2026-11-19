@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -21,6 +23,9 @@ class HumanInputWait:
     started_at: float = 0.0
     deadline_when: float | None = None
     owner: Literal["question", "credential"] = "question"
+    # Waits still open by kind; owner names only the first wait of an overlapping union.
+    kinds: Counter[Literal["question", "credential"]] = field(default_factory=Counter)
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
     # When each wait a person answered or worked on was open, in the current overlapping union.
     attended_spans: list[tuple[float, float]] = field(default_factory=list)
     # Set once the backstop needed its grace: the turn is past its budget, so later waits no longer pause it.
@@ -57,9 +62,15 @@ def pause_human_input(ctx: CopilotContext, kind: Literal["question", "credential
         if deadline is not None and wait.deadline_when is not None:
             deadline.reschedule(None)
     wait.count += 1
+    wait.kinds[kind] += 1
+    wait.changed.set()
     try:
         yield waiter
     finally:
+        wait.kinds[kind] -= 1
+        if not wait.kinds[kind]:
+            del wait.kinds[kind]
+        wait.changed.set()
         now = time.monotonic()
         if not waiter.unattended:
             wait.attended_spans.append((waiter.started_at, now))

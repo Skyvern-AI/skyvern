@@ -12,22 +12,19 @@ import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { ControlTooltip } from "./ControlTooltip";
 import { PastRunsList } from "./PastRunsList";
 import { STUDIO_PANE_META, railLabel } from "./paneMeta";
-import {
-  STUDIO_PANE_IDS,
-  WORKFLOW_AUTHORING_PANES,
-  type StudioPaneId,
-} from "./panes";
-import { useStudioPanes } from "./useStudioPanes";
+import { WORKFLOW_AUTHORING_PANES, type StudioPaneId } from "./panes";
+import { useStudioPaneIds, useStudioPanes } from "./useStudioPanes";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 
 /**
  * Zero-panes stage: every pane stays one labeled click away instead of the
- * stage dead-ending. Copilot/Editor/Browser open their pane; the "Past Runs"
+ * stage dead-ending. Ember/Editor/Browser open their pane; the "Past Runs"
  * tile opens the run selector (picking a run opens the run pane), mirroring the
  * rail tab.
  */
 export function StudioStageLauncher() {
   const { openPane } = useStudioPanes();
+  const paneIds = useStudioPaneIds();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
   const clearBrowserActivity = useStudioBrowserStore((s) => s.clearActivity);
   const [runsSelectorOpen, setRunsSelectorOpen] = useState(false);
@@ -51,7 +48,7 @@ export function StudioStageLauncher() {
           All panes are closed. Open one to keep working:
         </p>
         <div className="flex flex-wrap items-center justify-center gap-2">
-          {STUDIO_PANE_IDS.map((id) => {
+          {paneIds.map((id) => {
             const { icon: Icon } = STUDIO_PANE_META[id];
             const label = railLabel(id);
             const blockedByDeletion =

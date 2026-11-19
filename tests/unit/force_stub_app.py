@@ -103,7 +103,13 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.copilot_browser_code_mode = AsyncMock(return_value=CopilotBrowserCodeMode.OFF)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
+    fake_app_module.AGENT_FUNCTION.relay_http_request_hop = base_agent_function.relay_http_request_hop
+    fake_app_module.AGENT_FUNCTION.relay_http_download_hop = base_agent_function.relay_http_download_hop
+    fake_app_module.AGENT_FUNCTION.classify_failure = base_agent_function.classify_failure
     fake_app_module.AGENT_FUNCTION.note_page_action = base_agent_function.note_page_action
+    fake_app_module.AGENT_FUNCTION.page_submission_evidence = base_agent_function.page_submission_evidence
+    fake_app_module.AGENT_FUNCTION.settle_page_reload_signal = base_agent_function.settle_page_reload_signal
+    fake_app_module.AGENT_FUNCTION.agent_skills = base_agent_function.agent_skills
     fake_app_module.AGENT_FUNCTION.enforce_platform_aws_secret_ownership = (
         base_agent_function.enforce_platform_aws_secret_ownership
     )
@@ -127,9 +133,13 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.copilot_browser_pattern_accepting_calls = (
         base_agent_function.copilot_browser_pattern_accepting_calls
     )
+    fake_app_module.AGENT_FUNCTION.copilot_trigger_sources = base_agent_function.copilot_trigger_sources
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
+    fake_app_module.AGENT_FUNCTION.task_v3_authorized_agent_default = (
+        base_agent_function.task_v3_authorized_agent_default
+    )
     fake_app_module.AGENT_FUNCTION.task_v3_age_default = base_agent_function.task_v3_age_default
     fake_app_module.AGENT_FUNCTION.task_v3_application_defaults = base_agent_function.task_v3_application_defaults
     fake_app_module.AGENT_FUNCTION.task_v3_application_context_texts = (
@@ -246,6 +256,7 @@ def make_workflow_run_attempts_fake() -> SimpleNamespace:
         get_attempts=AsyncMock(return_value=[]),
         get_interim_payload_snapshot=AsyncMock(return_value={}),
         get_latest_attempts_for_runs=AsyncMock(return_value={}),
+        get_latest_attempt_summaries_for_runs=AsyncMock(return_value={}),
         list_stale_pending_retries=AsyncMock(return_value=[]),
         list_attempts_needing_recovery=AsyncMock(return_value=[]),
         list_stale_dispatch_claims=AsyncMock(return_value=[]),

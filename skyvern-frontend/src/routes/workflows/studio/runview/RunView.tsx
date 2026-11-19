@@ -39,6 +39,8 @@ import {
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
+import { useDocOnScreen } from "../../editor/doc/useDocOnScreen";
+import { useLocateBlockStore } from "../../editor/runValidation/useLocateBlockStore";
 import {
   type WorkflowRunMilestoneCardProps,
   usePageSlots,
@@ -58,17 +60,12 @@ import {
   type RecoveryGuidanceTelemetryContext,
 } from "@/util/onboarding/recoveryGuidanceTelemetry";
 
-import { constructCacheKeyValue } from "../../editor/utils";
-import { useBlockScriptsQuery } from "../../hooks/useBlockScriptsQuery";
-import { useFallbackEpisodesQuery } from "../../hooks/useFallbackEpisodesQuery";
 import { useRefreshOnboardingOnRunCompletion } from "../../hooks/useRefreshOnboardingOnRunCompletion";
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
 import { ResizableTimelineSplit } from "../../workflowRun/ResizableTimelineSplit";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
-import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
 import { WorkflowRunHumanInteraction } from "../../workflowRun/WorkflowRunHumanInteraction";
-import { ScriptUpdateCard } from "../../workflowRun/ScriptUpdateCard";
 import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
 import { findRunCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
@@ -125,12 +122,7 @@ const RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG =
   "RECOVERY_GUIDANCE_TREATMENT_SURFACE";
 
 function isRunPaneView(value: string | null): value is RunPaneView {
-  return (
-    value === "timeline" ||
-    value === "inputs" ||
-    value === "outputs" ||
-    value === "code"
-  );
+  return value === "timeline" || value === "inputs" || value === "outputs";
 }
 
 type RunViewProps = {
@@ -312,6 +304,7 @@ export function RunView({
     preserveNextEntry,
   } = useStudioPanes();
   const runPaneOpen = studioPanes.includes("overview");
+  const docOnScreen = useDocOnScreen();
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams] = useSearchParams();
@@ -333,23 +326,6 @@ export function RunView({
       : false;
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
-  const isWorkflowDeleted = Boolean(workflow?.deleted_at);
-  const cacheKey = workflow?.cache_key ?? "";
-  const cacheKeyValue =
-    constructCacheKeyValue({ codeKey: cacheKey, workflow, workflowRun }) ?? "";
-  const { data: blockScriptsPublished } = useBlockScriptsQuery({
-    cacheKey,
-    cacheKeyValue,
-    enabled: finalized && !isWorkflowDeleted,
-    workflowPermanentId,
-    status: "published",
-    workflowRunId: workflowRun?.workflow_run_id,
-  });
-  const { data: fallbackEpisodes } = useFallbackEpisodesQuery({
-    workflowPermanentId,
-    workflowRunId: workflowRun?.workflow_run_id,
-    enabled: finalized && !isWorkflowDeleted,
-  });
   const onboarding = useOnboardingStateOptional();
   const recoveryGuidanceTreatmentSurfaceEnabled =
     useFeatureFlag(RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG) === true;
@@ -864,7 +840,6 @@ export function RunView({
       workflowRun?.browser_profile_id,
       (id) => `/browser-profiles/${id}`,
     );
-    pushMeta("Run with", workflowRun?.run_with);
     pushMeta("Max screenshot scrolls", workflowRun?.max_screenshot_scrolls);
     return { parameters, blockPrompts, meta };
   }, [workflowRun]);
@@ -920,9 +895,10 @@ export function RunView({
       targets: handle.getTargets(),
       label: block.label,
     });
-    if (nodeId) {
-      handle.focusBlock(nodeId);
-    }
+    if (!nodeId) return;
+    // The canvas stays mounted behind the Doc; the Doc scrolls to and flashes a located block instead.
+    if (docOnScreen) useLocateBlockStore.getState().requestLocate(nodeId);
+    else handle.focusBlock(nodeId);
   };
   const selectTimelineBlock = (block: WorkflowRunBlock) => {
     pinFrame(block.workflow_run_block_id);
@@ -937,7 +913,7 @@ export function RunView({
   const failureDetail = failureReason.detail;
   const failureTips = matchFailureTips(workflowRun.failure_reason ?? null);
   // Editing code cannot reach a sandbox that was never available, so a fault the
-  // block did not cause offers a retry alone rather than a copilot session that
+  // block did not cause offers a retry alone rather than an Ember session that
   // would rewrite working code.
   const showFix = codeFailure === null || codeFailure.recovery !== "retry";
   const hasFixAction = Boolean(onFix && showFix);
@@ -1009,12 +985,6 @@ export function RunView({
         <WorkflowRunMilestoneCard
           workflowRunId={workflowRun.workflow_run_id}
           rerun={embedded ? undefined : milestoneRerun}
-        />
-      ) : null}
-      {fallbackEpisodes && fallbackEpisodes.episodes.length > 0 ? (
-        <ScriptUpdateCard
-          episodes={fallbackEpisodes.episodes}
-          scriptId={blockScriptsPublished?.script_id}
         />
       ) : null}
 
@@ -1138,7 +1108,7 @@ export function RunView({
             </div>
           )}
         </div>
-      ) : view === "outputs" ? (
+      ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           {hasOutputs ? (
             <RunOutputsSection
@@ -1163,13 +1133,6 @@ export function RunView({
                 : "Outputs appear when the run finishes"}
             </div>
           )}
-        </div>
-      ) : (
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <WorkflowRunCode
-            workflowRunId={workflowRun.workflow_run_id}
-            showCacheKeyValueSelector
-          />
         </div>
       )}
     </div>

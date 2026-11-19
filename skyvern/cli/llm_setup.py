@@ -73,7 +73,6 @@ def update_or_add_env_var(
             "MAX_STEPS_PER_RUN": "50",
             "LOG_LEVEL": "INFO",
             "LITELLM_LOG": "CRITICAL",
-            "DATABASE_STRING": DEFAULT_POSTGRES_DATABASE_STRING,
             "PORT": "8000",
             "ANALYTICS_ID": "anonymous",
             "ENABLE_LOG_ARTIFACTS": "false",

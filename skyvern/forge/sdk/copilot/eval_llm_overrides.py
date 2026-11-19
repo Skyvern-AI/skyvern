@@ -18,6 +18,7 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 
 EVAL_LLM_OVERRIDES_HEADER = "x-copilot-eval-llm-overrides"
+EMBER_EVAL_LLM_OVERRIDES_HEADER = "x-ember-eval-llm-overrides"
 EVAL_LLM_PROMPT_TYPES = frozenset({"workflow-copilot", "workflow-copilot-fast", "workflow-copilot-raw-secret-safety"})
 MAX_EVAL_LLM_OVERRIDES_BYTES = 2048
 _CONFIG_KEY = re.compile(r"[A-Za-z0-9_.:/-]{1,160}")
@@ -65,7 +66,7 @@ def admit_eval_llm_overrides(raw: str | None, organization_id: str) -> EvalLLMOv
         raise HTTPException(status_code=400, detail="Invalid Copilot eval model overrides") from exc
     if not parsed:
         return None
-    if organization_id not in settings.WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS:
+    if organization_id not in settings.EMBER_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS:
         raise HTTPException(
             status_code=403,
             detail="Copilot eval model overrides require an allowlisted Evaluation organization",

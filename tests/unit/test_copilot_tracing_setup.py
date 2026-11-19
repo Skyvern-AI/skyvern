@@ -36,6 +36,7 @@ def _nested_mapping(value: object, depth: int = 22) -> object:
 def _reset_module_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tracing_setup, "_TRACING_INITIALIZED", False)
     monkeypatch.setattr(tracing_setup, "_SPAN_RENAME_WARNED", threading.Event())
+    monkeypatch.delenv("EMBER_TRACING_ENABLED", raising=False)
     monkeypatch.delenv("COPILOT_TRACING_ENABLED", raising=False)
 
 
@@ -95,7 +96,7 @@ def _install_genai_prices_stub(monkeypatch: pytest.MonkeyPatch, calc_price: Any)
 
 
 def test_attach_cost_attr_uses_emitted_model_ref_first(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.copilot.model_telemetry import CopilotModelCallTelemetry
+    from skyvern.forge.sdk.api.llm.agents_model import ModelCallTelemetry
 
     calls: list[dict[str, Any]] = []
 
@@ -106,7 +107,7 @@ def test_attach_cost_attr_uses_emitted_model_ref_first(monkeypatch: pytest.Monke
     _install_genai_prices_stub(monkeypatch, fake_calc_price)
 
     attrs: dict[str, Any] = {}
-    usage = CopilotModelCallTelemetry(model_call_index=1, input_tokens=10, output_tokens=20)
+    usage = ModelCallTelemetry(model_call_index=1, input_tokens=10, output_tokens=20)
     tracing_setup._attach_cost_attr(attrs, usage, "gpt-5.5")
 
     assert attrs["operation.cost"] == 0.123
@@ -118,7 +119,7 @@ def test_attach_cost_attr_uses_emitted_model_ref_first(monkeypatch: pytest.Monke
 def test_attach_cost_attr_uses_litellm_prefix_as_provider_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from skyvern.forge.sdk.copilot.model_telemetry import CopilotModelCallTelemetry
+    from skyvern.forge.sdk.api.llm.agents_model import ModelCallTelemetry
 
     calls: list[dict[str, Any]] = []
 
@@ -131,7 +132,7 @@ def test_attach_cost_attr_uses_litellm_prefix_as_provider_fallback(
     usages = _install_genai_prices_stub(monkeypatch, fake_calc_price)
 
     attrs: dict[str, Any] = {}
-    usage = CopilotModelCallTelemetry(
+    usage = ModelCallTelemetry(
         model_call_index=1,
         input_tokens=384702,
         output_tokens=4666,
@@ -150,7 +151,7 @@ def test_attach_cost_attr_uses_litellm_prefix_as_provider_fallback(
 
 
 def test_attach_cost_attr_silently_skips_unknown_models(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.copilot.model_telemetry import CopilotModelCallTelemetry
+    from skyvern.forge.sdk.api.llm.agents_model import ModelCallTelemetry
 
     calls: list[dict[str, Any]] = []
 
@@ -161,7 +162,7 @@ def test_attach_cost_attr_silently_skips_unknown_models(monkeypatch: pytest.Monk
     _install_genai_prices_stub(monkeypatch, fake_calc_price)
 
     attrs: dict[str, Any] = {}
-    usage = CopilotModelCallTelemetry(model_call_index=1, input_tokens=10, output_tokens=20)
+    usage = ModelCallTelemetry(model_call_index=1, input_tokens=10, output_tokens=20)
     tracing_setup._attach_cost_attr(attrs, usage, "unknown/model")
 
     assert "operation.cost" not in attrs
@@ -175,7 +176,7 @@ def test_attach_cost_attr_silently_skips_unknown_models(monkeypatch: pytest.Monk
 def test_attach_cost_attr_uses_runtime_pricing_without_genai_prices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from skyvern.forge.sdk.copilot.model_telemetry import CopilotModelCallTelemetry
+    from skyvern.forge.sdk.api.llm.agents_model import ModelCallTelemetry
 
     monkeypatch.setitem(sys.modules, "genai_prices", None)
     monkeypatch.setattr(tracing_setup, "_model_call_cost", lambda telemetry, model: 0.789)
@@ -183,7 +184,7 @@ def test_attach_cost_attr_uses_runtime_pricing_without_genai_prices(
 
     tracing_setup._attach_cost_attr(
         attrs,
-        CopilotModelCallTelemetry(model_call_index=1, input_tokens=10, output_tokens=20),
+        ModelCallTelemetry(model_call_index=1, input_tokens=10, output_tokens=20),
         "gpt-5.6-sol",
     )
 
@@ -191,7 +192,7 @@ def test_attach_cost_attr_uses_runtime_pricing_without_genai_prices(
 
 
 def test_attach_cost_attr_omits_cost_without_raw_usage(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.copilot.model_telemetry import CopilotModelCallTelemetry
+    from skyvern.forge.sdk.api.llm.agents_model import ModelCallTelemetry
 
     def fail_calc_price(usage: Any, *, model_ref: str, provider_id: str | None = None) -> Any:
         pytest.fail("pricing should not run without raw token usage")
@@ -199,7 +200,7 @@ def test_attach_cost_attr_omits_cost_without_raw_usage(monkeypatch: pytest.Monke
     _install_genai_prices_stub(monkeypatch, fail_calc_price)
     attrs: dict[str, Any] = {}
 
-    tracing_setup._attach_cost_attr(attrs, CopilotModelCallTelemetry(model_call_index=1), "gpt-5.6")
+    tracing_setup._attach_cost_attr(attrs, ModelCallTelemetry(model_call_index=1), "gpt-5.6")
 
     assert "operation.cost" not in attrs
 
@@ -222,7 +223,7 @@ def test_enabled_with_logfire(
     monkeypatch: pytest.MonkeyPatch,
     agents_stub: tuple[list[bool], list[Any]],
 ) -> None:
-    monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+    monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
     _, processors_calls = agents_stub
 
     configure_calls: list[dict[str, Any]] = []
@@ -259,7 +260,7 @@ def test_enabled_without_logfire(
     agents_stub: tuple[list[bool], list[Any]],
     stub_logger: list[tuple[str, dict[str, Any]]],
 ) -> None:
-    monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+    monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
     _, processors_calls = agents_stub
 
     # Setting sys.modules[name] = None makes subsequent `import name` raise ImportError.
@@ -289,13 +290,14 @@ class TestTracingSetup:
         monkeypatch: pytest.MonkeyPatch,
         value: str,
     ) -> None:
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", value)
+        monkeypatch.setenv("EMBER_TRACING_ENABLED", value)
 
         from skyvern.forge.sdk.copilot.tracing_setup import is_tracing_enabled
 
         assert is_tracing_enabled() is True
 
     def test_is_tracing_enabled_defaults_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("EMBER_TRACING_ENABLED", raising=False)
         monkeypatch.delenv("COPILOT_TRACING_ENABLED", raising=False)
 
         from skyvern.forge.sdk.copilot.tracing_setup import is_tracing_enabled
@@ -307,6 +309,8 @@ class TestTracingSetup:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         import skyvern.forge.sdk.copilot.tracing_setup as tracing_setup
+
+        monkeypatch.delenv("EMBER_TRACING_ENABLED", raising=False)
 
         monkeypatch.delenv("COPILOT_TRACING_ENABLED", raising=False)
         monkeypatch.setattr(
@@ -326,7 +330,7 @@ class TestTracingSetup:
     ) -> None:
         import skyvern.forge.sdk.copilot.tracing_setup as tracing_setup
 
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
         monkeypatch.setattr(tracing_setup, "ensure_tracing_initialized", lambda: None)
 
         captured: dict[str, Any] = {}
@@ -356,7 +360,7 @@ class TestTracingSetup:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
         monkeypatch.setattr(tracing_setup, "ensure_tracing_initialized", lambda: None)
         captured: dict[str, Any] = {}
         fake_span = object()
@@ -391,7 +395,7 @@ class TestTracingSetup:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
         monkeypatch.setattr(tracing_setup, "ensure_tracing_initialized", lambda: None)
         captured: dict[str, Any] = {}
 
@@ -416,7 +420,7 @@ class TestTracingSetup:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
         monkeypatch.setattr(tracing_setup, "ensure_tracing_initialized", lambda: None)
         captured: dict[str, Any] = {}
         fake_span = object()
@@ -525,7 +529,7 @@ class TestPatchAgentSpanAttributes:
         from agents import GenerationSpanData
         from litellm.types.utils import Usage
 
-        from skyvern.forge.sdk.copilot.model_telemetry import _model_call_telemetry_scope
+        from skyvern.forge.sdk.api.llm.agents_model import _model_call_telemetry_scope
         from skyvern.forge.sdk.copilot.tracing_setup import _patch_agent_span_attributes
 
         monkeypatch.setattr(tracing_setup, "_attach_cost_attr", lambda attrs, telemetry, model: None)
@@ -562,9 +566,9 @@ class TestPatchAgentSpanAttributes:
         assert attrs["gen_ai.usage.cache_write_tokens"] == 47
         assert attrs["gen_ai.usage.cache_read.input_tokens"] == 31
         assert attrs["gen_ai.usage.cache_creation.input_tokens"] == 47
-        assert attrs["copilot.model_call_index"] == 6
-        assert attrs["copilot.cache.mode"] == "implicit"
-        assert attrs["copilot.cache.breakpoint_count"] == 0
+        assert attrs["llm.model_call_index"] == 6
+        assert attrs["llm.cache.mode"] == "implicit"
+        assert attrs["llm.cache.breakpoint_count"] == 0
         assert attrs["gen_ai.response.model"] == "gpt-5.6-sol-2026-07-09"
         assert attrs["usage"]["total_tokens"] == 107
         assert attrs["usage"]["input_tokens_details"] == {"cached_tokens": 31}
@@ -576,7 +580,7 @@ class TestPatchAgentSpanAttributes:
         import logfire._internal.integrations.openai_agents as _oai_mod
         from agents import GenerationSpanData
 
-        from skyvern.forge.sdk.copilot.model_telemetry import _model_call_telemetry_scope
+        from skyvern.forge.sdk.api.llm.agents_model import _model_call_telemetry_scope
         from skyvern.forge.sdk.copilot.tracing_setup import _patch_agent_span_attributes
 
         monkeypatch.setattr(tracing_setup, "_attach_cost_attr", lambda attrs, telemetry, model: None)
@@ -591,9 +595,9 @@ class TestPatchAgentSpanAttributes:
                 "Chat completion with {model!r}",
             )
 
-        assert attrs["copilot.cache.mode"] == "explicit"
-        assert attrs["copilot.cache.breakpoint_count"] == 1
-        assert attrs["copilot.cache.stable_prefix_chars"] == 12000
+        assert attrs["llm.cache.mode"] == "explicit"
+        assert attrs["llm.cache.breakpoint_count"] == 1
+        assert attrs["llm.cache.stable_prefix_chars"] == 12000
 
     def test_patch_redacts_function_span_input_and_sets_tool_semconv(self) -> None:
         import json

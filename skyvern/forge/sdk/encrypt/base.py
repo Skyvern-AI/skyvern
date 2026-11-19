@@ -3,7 +3,7 @@ from enum import Enum
 
 
 class EncryptMethod(Enum):
-    # AES-CBC with a fixed per-deployment IV; kept for decrypting rows written before AES_GCM.
+    # Retired AES-CBC writer; registered only to decrypt rows written before AES_GCM.
     AES = "aes"
     AES_GCM = "aes_gcm"
 

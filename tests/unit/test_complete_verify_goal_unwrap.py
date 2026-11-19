@@ -14,10 +14,10 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from skyvern.config import settings
 from skyvern.forge.agent import ForgeAgent
-from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.workflow.block_goal_wrapping import compose_mini_goal
 from skyvern.webeye.actions.handler import _build_after_click_verify_prompt
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
 

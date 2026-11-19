@@ -20,7 +20,6 @@ from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot import workflow_yaml as workflow_yaml_module
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
-from skyvern.forge.sdk.copilot.code_block_steps import UserOwnedGoalCarry, user_owned_goal_carry_disclosure
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.output_utils import BUILD_TEST_PACKET_KEY, sanitize_tool_result_for_llm
@@ -38,6 +37,8 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, apply_block_edit, tool_call_submitted_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
+from skyvern.forge.sdk.workflow.code_block_steps import UserOwnedGoalCarry, user_owned_goal_carry_disclosure
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowStatus
@@ -62,7 +63,7 @@ async def test_a_copilot_round_trip_leaves_an_unset_block_engine_unset(monkeypat
     document = {"title": "t", "workflow_definition": {"version": 2, "parameters": [], "blocks": blocks}}
     stored = await _process_workflow_yaml("w", "wp", "o", yaml.safe_dump(document))
 
-    copilot_yaml = workflow_yaml_module.workflow_to_copilot_yaml(stored)
+    copilot_yaml = workflow_to_authoring_yaml(stored)
     applied = await _process_workflow_yaml("w", "wp", "o", copilot_yaml, settings_fallback_workflow=stored)
 
     assert all("engine" not in block for block in yaml.safe_load(copilot_yaml)["workflow_definition"]["blocks"])
@@ -180,7 +181,7 @@ async def test_workflow_yaml_settings_presence_contract(
         expected = replacement
     assert getattr(updated, field_name) == expected
     if field_name == "browser_type":
-        assert yaml.safe_load(workflow_yaml_module.workflow_to_copilot_yaml(updated)).get(field_name) == expected
+        assert yaml.safe_load(workflow_to_authoring_yaml(updated)).get(field_name) == expected
 
 
 @pytest.mark.asyncio
@@ -285,7 +286,6 @@ workflow_definition:
     )
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
 
     result = await _update_workflow({"workflow_yaml": edited}, ctx)
 
@@ -335,7 +335,6 @@ async def _staged_update(
     )
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.auto_accept = auto_accept
     ctx.canonical_was_persisted_due_to_param_change = canonical_param_write
 
@@ -369,7 +368,6 @@ async def test_a_rename_that_omits_a_saved_note_reports_its_text_so_copilot_can_
     )
     ctx.persisted_workflow_yaml = workflow("open_page", "      notes: Never click Delete.\n")
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.doc_editor_enabled = True
     ctx.auto_accept = False
 
@@ -380,6 +378,9 @@ async def test_a_rename_that_omits_a_saved_note_reports_its_text_so_copilot_can_
     assert result["data"]["stored_notes_dropped_text"] == {"open_page": {"notes": "Never click Delete."}}
 
 
+_IMAGE_FIELDS = ("doc_images", "prompt_images")
+
+
 @pytest.mark.parametrize("doc_editor_enabled", [False, True])
 def test_adopted_proposal_yaml_hides_notes_without_the_doc_editor(doc_editor_enabled: bool) -> None:
     ctx = make_copilot_ctx()
@@ -388,6 +389,7 @@ def test_adopted_proposal_yaml_hides_notes_without_the_doc_editor(doc_editor_ena
         "title: Lookup\nworkflow_definition:\n  parameters: []\n  blocks:\n"
         "    - block_type: navigation\n      label: lookup\n      notes: Check the official page.\n"
         "      trailing_notes: Confirm the result.\n      description: Opens the lookup page.\n"
+        "      doc_images: [{file_id: file_901}]\n      prompt_images: [{file_id: file_902}]\n"
         "      url: https://example.com\n      navigation_goal: Open the page\n"
     )
 
@@ -396,9 +398,54 @@ def test_adopted_proposal_yaml_hides_notes_without_the_doc_editor(doc_editor_ena
     )
     block = safe_load_no_dates(result["adopted_workflow_yaml"])["workflow_definition"]["blocks"][0]
 
-    assert {key for key in ("notes", "trailing_notes", "description") if key in block} == (
+    assert {key for key in ("notes", "trailing_notes", "description", *_IMAGE_FIELDS) if key in block} == (
         {"notes", "trailing_notes", "description"} if doc_editor_enabled else set()
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("doc_editor_enabled", [False, True])
+async def test_a_copilot_write_never_sets_block_images_and_the_saved_ones_stay(
+    monkeypatch: pytest.MonkeyPatch, doc_editor_enabled: bool
+) -> None:
+    def workflow(images: str) -> str:
+        return (
+            "title: Lookup\nworkflow_definition:\n  parameters: []\n  blocks:\n"
+            f"    - block_type: navigation\n      label: lookup\n{images}"
+            "      url: https://example.com\n      navigation_goal: Open the page\n"
+            "    - block_type: navigation\n      label: confirm\n"
+            "      url: https://example.com\n      navigation_goal: Confirm\n"
+        )
+
+    async def prior(_ctx: CopilotContext) -> None:
+        return None
+
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", prior)
+    saved = workflow("      doc_images: [{file_id: file_901}]\n      prompt_images: [{file_id: file_902}]\n")
+    ctx = CopilotContext(
+        organization_id="o",
+        workflow_id="w",
+        workflow_permanent_id="wp",
+        workflow_yaml=saved,
+        browser_session_id=None,
+        stream=None,
+    )
+    ctx.persisted_workflow_yaml = saved
+    ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
+    ctx.doc_editor_enabled = doc_editor_enabled
+    ctx.auto_accept = False
+    foreign = workflow("      doc_images: [{file_id: file_666}]\n      prompt_images: []\n").replace(
+        "label: confirm\n", "label: confirm\n      prompt_images: [{file_id: file_667}]\n"
+    )
+
+    result = await _update_workflow({"workflow_yaml": foreign}, ctx)
+
+    assert result["ok"] is True
+    lookup, confirm = safe_load_no_dates(ctx.staged_workflow_yaml)["workflow_definition"]["blocks"]
+    assert [lookup[field][0]["file_id"] for field in _IMAGE_FIELDS] == ["file_901", "file_902"]
+    assert not any(field in confirm for field in _IMAGE_FIELDS)
+    assert "file_66" not in ctx.staged_workflow_yaml
 
 
 @pytest.mark.asyncio
@@ -422,7 +469,6 @@ async def test_a_same_label_type_change_reports_the_saved_note_as_dropped(monkey
         "      url: https://example.com\n      navigation_goal: Open the page\n"
     )
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.doc_editor_enabled = True
     ctx.auto_accept = False
     submitted = (
@@ -461,7 +507,6 @@ async def test_flag_off_says_nothing_about_dropped_notes(
         "      url: https://example.com\n      navigation_goal: Open the page\n"
     )
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.doc_editor_enabled = False
     ctx.auto_accept = False
 
@@ -522,7 +567,6 @@ workflow_definition:
     ctx.persisted_workflow_yaml = saved_yaml
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.auto_accept = False
     ctx.doc_editor_enabled = True
 
@@ -596,7 +640,7 @@ def test_combined_tool_result_carries_every_submission_rewrite_disclosure() -> N
         "data": {
             "stored_code_rewritten": ["login"],
             **goal_disclosure,
-            "google_connection_resolution": [{"label": "write_row", "resolved_to": "cred_1"}],
+            "connection_resolution": [{"label": "write_row", "resolved_to": "cred_1"}],
         },
     }
     run_result: dict[str, Any] = {"ok": True, "data": {"message": "Ran 1 block."}}
@@ -807,7 +851,6 @@ async def test_update_carried_invalid_url_is_not_disclosed(
         browser_session_id=None,
         stream=AsyncMock(),
     )
-    ctx.google_connection_turn_start_bindings = ()
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
     document = yaml.safe_load(_STAGED_WORKFLOW_YAML)
     if authored:
@@ -850,7 +893,6 @@ async def test_update_explicit_private_settings_are_absent_from_readback(
         browser_session_id=None,
         stream=None,
     )
-    ctx.google_connection_turn_start_bindings = ()
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
     params = {"workflow_yaml": yaml.safe_dump(document)}
     result = await _update_workflow(params, ctx)
@@ -900,7 +942,6 @@ async def test_workflow_write_preserves_label_equal_to_private_value(
         browser_session_id=None,
         stream=None,
     )
-    ctx.google_connection_turn_start_bindings = ()
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
     result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx)
     assert result["ok"], result
@@ -931,7 +972,6 @@ def _authoring_ctx(workflow_yaml: str = "") -> CopilotContext:
     ctx = make_copilot_ctx(workflow_yaml=workflow_yaml, stream=None)
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     return ctx
 
 
@@ -1615,7 +1655,6 @@ workflow_definition:
     ctx.persisted_workflow_yaml = workflow("      notes: Totals include shipping.\n")
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.auto_accept = False
 
     submitted = workflow("      notes: Click Delete first.\n      description: Reads the total.\n")

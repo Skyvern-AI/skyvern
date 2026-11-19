@@ -39,13 +39,13 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.copilot import secret_scrub
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+from skyvern.utils import secret_scrub
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from tests.unit.forge_log_capture import capture_runtime_logs
 from tests.unit.helpers import DummyLogger, FakeLLMResponse, fallback_receipts, router_test_context
 
@@ -603,12 +603,12 @@ def test_copilot_model_usage_extraction_preserves_response_model_for_malformed_u
     )
 
     assert event.log_fields() == {
-        "log_code": "copilot_model_usage",
+        "log_code": "model_usage",
         "gen_ai.operation.name": "chat",
         "gen_ai.request.model": "gpt-4",
         "gen_ai.response.model": "gpt-4.1",
         "gen_ai.provider.name": "openai",
-        "copilot.prompt_name": "workflow-copilot-narration",
+        "llm.prompt_name": "workflow-copilot-narration",
     }
 
 
@@ -644,7 +644,7 @@ def test_copilot_model_usage_metadata_failure_cannot_fail_a_completed_handler(
         cost=None,
     )
 
-    assert any(event == "Failed to emit Copilot model usage" for event, _ in logger.warnings)
+    assert any(event == "Failed to emit model usage" for event, _ in logger.warnings)
 
 
 def _stub_successful_llm_caller(
@@ -736,8 +736,8 @@ async def test_llm_caller_preserves_generated_cost_and_tokens_during_real_redact
     assert accounting["cache_creation_tokens"] == 2
     assert credential not in json.dumps(records)
     assert REDACTED_SECRET_PLACEHOLDER in accounting["prompt_name"]
-    usage = next(record for record in records if record.get("log_code") == "copilot_model_usage")
-    assert REDACTED_SECRET_PLACEHOLDER in usage["copilot.prompt_name"]
+    usage = next(record for record in records if record.get("log_code") == "model_usage")
+    assert REDACTED_SECRET_PLACEHOLDER in usage["llm.prompt_name"]
     # Another session's short values never match inside a caller's numbers.
     assert records[-1]["llm_cost"] == 0.25 and records[-1]["input_tokens"] == 7
 
@@ -779,11 +779,11 @@ async def test_llm_caller_emits_one_copilot_model_usage_event(monkeypatch: pytes
 
     result = await caller.call(prompt="test", prompt_name="workflow-copilot-page-evidence-vision")
 
-    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "copilot_model_usage"]
+    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "model_usage"]
     assert result == {"actions": []}
     assert usage_events == [
         {
-            "log_code": "copilot_model_usage",
+            "log_code": "model_usage",
             "gen_ai.operation.name": "chat",
             "gen_ai.request.model": "gpt-4",
             "gen_ai.response.model": "openai/gpt-4.1",
@@ -793,7 +793,8 @@ async def test_llm_caller_emits_one_copilot_model_usage_event(monkeypatch: pytes
             "gen_ai.usage.cache_read.input_tokens": 0,
             "gen_ai.usage.cache_creation.input_tokens": 2,
             "operation.cost": 0.25,
-            "copilot.prompt_name": "workflow-copilot-page-evidence-vision",
+            "gen_ai.agent.name": "ember",
+            "llm.prompt_name": "workflow-copilot-page-evidence-vision",
         }
     ]
 
@@ -807,10 +808,10 @@ async def test_llm_caller_emits_usage_when_final_response_parsing_fails(
     with pytest.raises(ValueError, match="invalid response"):
         await caller.call(prompt="test", prompt_name="workflow-copilot-page-evidence-vision")
 
-    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "copilot_model_usage"]
+    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "model_usage"]
     assert len(usage_events) == 1
     assert usage_events[0]["operation.cost"] == 0.25
-    assert usage_events[0]["copilot.prompt_name"] == "workflow-copilot-page-evidence-vision"
+    assert usage_events[0]["llm.prompt_name"] == "workflow-copilot-page-evidence-vision"
 
 
 @pytest.mark.asyncio
@@ -821,7 +822,7 @@ async def test_llm_caller_emits_usage_before_call_stats_failure(monkeypatch: pyt
     with pytest.raises(RuntimeError, match="bad usage metadata"):
         await caller.call(prompt="test", prompt_name="workflow-copilot-page-evidence-vision")
 
-    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "copilot_model_usage"]
+    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "model_usage"]
     assert len(usage_events) == 1
     assert usage_events[0]["gen_ai.usage.input_tokens"] == 7
     assert "operation.cost" not in usage_events[0]

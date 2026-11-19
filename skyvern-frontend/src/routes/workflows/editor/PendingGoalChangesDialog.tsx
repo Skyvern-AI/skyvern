@@ -10,7 +10,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 
 type Props = {
   open: boolean;
@@ -24,11 +24,11 @@ export function PendingGoalChangesDialog({
   onOpenChange,
   onSave,
 }: Props) {
-  const changes = useCopilotActionStore((state) => state.pendingGoalChanges);
-  const applyPendingGoalChanges = useCopilotActionStore(
+  const changes = useEmberActionStore((state) => state.pendingGoalChanges);
+  const applyPendingGoalChanges = useEmberActionStore(
     (state) => state.applyPendingGoalChanges,
   );
-  const undoGoalChange = useCopilotActionStore((state) => state.undoGoalChange);
+  const undoGoalChange = useEmberActionStore((state) => state.undoGoalChange);
 
   const single = changes.length === 1;
   const names = changes.map((change) => `“${change.label}”`).join(", ");

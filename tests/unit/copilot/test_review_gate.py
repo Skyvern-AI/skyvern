@@ -8,8 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps_in_yaml
 from skyvern.forge.sdk.copilot.data_write_defaults import DATA_WRITE_BLOCK_TYPES
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import (
@@ -20,7 +21,9 @@ from skyvern.forge.sdk.copilot.review_gate import (
     serialize_execution_receipts,
     workflow_block_fingerprints,
 )
-from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, workflow_to_copilot_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
+from skyvern.forge.sdk.workflow.code_block_steps import derive_code_block_steps_in_yaml
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -361,7 +364,7 @@ async def test_inputs_saved_through_the_converter_match_the_yaml_they_came_from(
         "{key: ratio, parameter_type: workflow, workflow_parameter_type: float, default_value: 2}, "
         """{key: seed_rows, parameter_type: workflow, workflow_parameter_type: json, default_value: '[{"id": 1}]'}]""",
     )
-    saved = workflow_to_copilot_yaml(await _process_workflow_yaml("w", "wp", "o", staged))
+    saved = workflow_to_authoring_yaml(await _process_workflow_yaml("w", "wp", "o", staged))
 
     projection = build_review_projection(saved, staged, set())
 
@@ -579,7 +582,9 @@ def test_sheets_identity_resolves_account_and_ignores_representational_url_query
         assert destination_value not in wire
 
 
-def test_sheets_identity_resolves_fixed_credential_parameters() -> None:
+def test_sheets_identity_resolves_fixed_credential_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    # The second write is an app action, which counts as the Sheets write it runs.
     staged = _workflow(
         """    - block_type: google_sheets_write
       label: first
@@ -587,12 +592,15 @@ def test_sheets_identity_resolves_fixed_credential_parameters() -> None:
       sheet_name: Summary
       credential_id: '{{ account }}'
       values: one
-    - block_type: google_sheets_write
+    - block_type: integration_action
       label: second
-      spreadsheet_url: spreadsheet-reference-123456
-      sheet_name: Summary
-      credential_id: '{{ account }}'
-      values: two
+      integration_id: google_sheets
+      action_id: write_rows
+      connection_id: '{{ account }}'
+      inputs:
+        spreadsheet_url: spreadsheet-reference-123456
+        sheet_name: Summary
+        values: two
 """,
         parameters="""
     - key: account
@@ -1133,7 +1141,7 @@ async def test_a_surfaced_draft_reads_omitted_settings_from_the_draft_it_inherit
         "wf-1", "wfp-1", "org-1", proposal, settings_fallback_yaml=proposal + f"mask_secrets: {draft_mask_secrets}\n"
     )
     ctx = make_copilot_ctx(
-        persisted_workflow_yaml=workflow_to_copilot_yaml(saved),
+        persisted_workflow_yaml=workflow_to_authoring_yaml(saved),
         last_workflow=candidate,
         last_workflow_yaml=proposal,
         request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
@@ -1528,7 +1536,7 @@ async def test_thirteen_saved_blocks_with_three_edits_and_an_unread_input_mark_e
         "w_after", "wpid_fixture", "o_fixture", _thirteen_block_yaml(edits, f"[{account}, {unread}]")
     )
 
-    projection = build_review_projection(workflow_to_copilot_yaml(before), workflow_to_copilot_yaml(after), {})
+    projection = build_review_projection(workflow_to_authoring_yaml(before), workflow_to_authoring_yaml(after), {})
 
     changes = _changes(projection)
     assert projection is not None and projection["inputs"] == [{"key": "unread_flag", "change": "added"}]

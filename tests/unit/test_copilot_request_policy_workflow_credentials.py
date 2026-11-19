@@ -10,7 +10,6 @@ from structlog.testing import capture_logs
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
-from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot.context import (
     _MAX_PROPOSAL_CARRIES,
     ApprovedCredential,
@@ -45,6 +44,7 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
 from skyvern.forge.sdk.copilot.turn_outcome import connected_account_choice_context
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
+from skyvern.forge.sdk.services import google_oauth_service, microsoft_oauth_service
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -1455,26 +1455,21 @@ def _google_row(organization_id: str, state: str, scopes: list[str]) -> GoogleOA
     ("rows", "selected_scopes"),
     [
         ([_google_row("org-1", "active", [_GMAIL_READ_SCOPE])], [_GMAIL_READ_SCOPE]),
-        (
-            [_google_row("org-1", "active", [_GMAIL_READ_SCOPE, _GMAIL_SEND_SCOPE])],
-            [_GMAIL_READ_SCOPE, _GMAIL_SEND_SCOPE],
-        ),
         ([_google_row("org-1", "active", [_SHEETS_SCOPE])], [_SHEETS_SCOPE]),
+        ([_google_row("org-1", "active", [_GMAIL_SEND_SCOPE])], [_GMAIL_SEND_SCOPE]),
         ([_google_row("org-other", "active", [_GMAIL_READ_SCOPE])], None),
         ([_google_row("org-1", "error", [_GMAIL_READ_SCOPE])], None),
-        ([_google_row("org-1", "active", [_GMAIL_SEND_SCOPE])], None),
         ([], None),
     ],
-    ids=["gmail-read", "gmail-read-send", "sheets", "other-org", "inactive", "send-only", "deleted"],
+    ids=["gmail-read", "sheets", "send-only", "other-org", "inactive", "deleted"],
 )
-async def test_picked_google_account_is_reported_when_valid_and_only_a_sheets_pick_gains_run_authority(
+async def test_a_picked_account_gains_run_authority_when_active_in_the_org_whatever_its_scopes(
     monkeypatch: pytest.MonkeyPatch,
     rows: list[GoogleOAuthCredentialBase],
     selected_scopes: list[str] | None,
 ) -> None:
-    monkeypatch.setattr(
-        request_policy_module.google_oauth_service, "get_credentials_for_org", AsyncMock(return_value=rows)
-    )
+    monkeypatch.setattr(google_oauth_service, "get_visible_credentials_for_org", AsyncMock(return_value=rows))
+    monkeypatch.setattr(microsoft_oauth_service, "get_credentials_for_org", AsyncMock(return_value=[]))
 
     policy = await _build_request_policy_bootstrap(
         user_message="goac_picked",
@@ -1486,25 +1481,18 @@ async def test_picked_google_account_is_reported_when_valid_and_only_a_sheets_pi
     )
     facts = connected_account_choice_context(
         None,
-        explicit_selected_connection_id=policy.picked_connected_account_id,
-        explicit_selected_connection_scopes=policy.picked_connected_account_scopes,
+        explicit_selected_connection_id=policy.selected_connected_account_id,
+        explicit_selected_connection_scopes=policy.selected_connected_account_scopes,
     )
 
     if selected_scopes is None:
-        assert policy.picked_connected_account_id is None
         assert policy.selected_connected_account_id is None
-        assert "goac_picked" not in policy.run_approved_google_connection_ids
+        assert policy.run_approved_connection_ids == []
         assert facts == ""
     else:
-        assert policy.picked_connected_account_id == "goac_picked"
-        assert json.loads(facts)["selected_connection"] == {
-            "connection_id": "goac_picked",
-            "state": "active",
-            "scopes_granted": selected_scopes,
-        }
-        sheets_pick = selected_scopes == [_SHEETS_SCOPE]
-        assert (policy.selected_connected_account_id == "goac_picked") is sheets_pick
-        assert ("goac_picked" in policy.run_approved_google_connection_ids) is sheets_pick
+        assert policy.selected_connected_account_id == "goac_picked"
+        assert policy.run_approved_connection_ids == ["goac_picked"]
+        assert json.loads(facts)["selected_connection"]["scopes_granted"] == selected_scopes
 
 
 def _login_credential_yaml(input_type: str, credential_param: str) -> str:

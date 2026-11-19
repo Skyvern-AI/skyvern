@@ -92,7 +92,7 @@ export async function fetchStreamingSse<T>(
         signal: controller.signal,
         // Keep the SSE connection alive when the browser tab is hidden.
         // Without this, the library closes and reconnects on tab focus,
-        // which restarts the copilot agent from scratch.
+        // which restarts the Ember agent from scratch.
         openWhenHidden: true,
         onmessage: (event) => {
           if (!event.data || !event.data.trim()) {

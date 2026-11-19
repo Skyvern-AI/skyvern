@@ -47,3 +47,6 @@ export const BROWSER_SESSION_PREWARM_FLAG = "BROWSER_SESSION_PREWARM";
 
 // Opt-in (0% base rollout) preview for the workflow Doc view.
 export const WORKFLOW_DOC_EDITOR_FLAG = "WORKFLOW_DOC_EDITOR";
+
+// Adding screenshots in the Doc. Beyond the pilot it waits for their storage lifecycle and cross-organization copy.
+export const WORKFLOW_DOC_IMAGES_FLAG = "WORKFLOW_DOC_IMAGES";

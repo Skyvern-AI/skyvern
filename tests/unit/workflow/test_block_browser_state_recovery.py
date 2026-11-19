@@ -2568,35 +2568,6 @@ async def _never_returns() -> None:
 
 
 @pytest.mark.asyncio
-async def test_browser_runtime_event_page_crash_preserves_recovery_and_identity() -> None:
-    order: list[str] = []
-    crashed = _crashable_page()
-    crashed.url = "https://example.invalid/form"
-    crashed.close = AsyncMock(side_effect=lambda: order.append("close"))
-    replacement = _crashable_page()
-    replacement.url = "about:blank"
-    context = _crashable_context(crashed)
-    crashed.context = context
-    context.new_page = _replacement_page_opener(context, replacement, order)
-    with skyvern_context.scoped(SkyvernContext(workflow_run_id="workflow-owner", browser_session_id="session-owner")):
-        state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
-    state.navigate_to_url = AsyncMock(side_effect=lambda page, url: order.append("navigate"))
-    handler = next(item.args[1] for item in crashed.on.call_args_list if item.args[0] == "crash")
-    with skyvern_context.scoped(SkyvernContext(workflow_run_id="other-workflow")), capture_logs() as logs:
-        handler(crashed)
-        handler(crashed)
-        await _reap_crashed_pages(state)
-    assert order == ["new_page", "close", "navigate"]
-    assert await state.must_get_working_page() is replacement
-    events = [entry for entry in logs if entry.get("browser_runtime_event") == "page_crash"]
-    assert len(events) == 1
-    assert events[0]["workflow_run_id"] == "workflow-owner"
-    assert events[0]["browser_session_id"] == "session-owner"
-    assert events[0]["expected"] is False
-    assert not [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["close", "recreate"])
 @pytest.mark.parametrize("failure", ["raise", "timeout"])
 @pytest.mark.parametrize("first_signal", ["context_close", "browser_disconnected"])

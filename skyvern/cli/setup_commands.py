@@ -206,8 +206,8 @@ def _prompt_mcp_scope_for_wizard(
 
     return MCPToolScope(
         Prompt.ask(
-            "Tool scope for this local MCP install: all=full 112-tool surface, "
-            "operate=run/monitor/inspect existing automations, build=author/modify automations, "
+            "Tool scope for this local MCP install: all=full tool surface, "
+            "operate=run/monitor/inspect existing automations and ask Ember to build, build=author/modify automations, "
             "browser=drive a browser directly, lean=focused direct browser actions",
             choices=[option.value for option in MCPToolScope],
             default=MCPToolScope.all.value,
@@ -948,8 +948,8 @@ _scope_opt = typer.Option(
     MCPToolScope.all,
     "--scope",
     help=(
-        "Tool scope for this MCP install: all (default), operate (run/monitor existing workflows), "
-        "build (author workflows), browser (direct browser control), or lean (focused browser surface: direct actions with selector-scoped page reading; 32 tools). Applies to --local stdio setup."
+        "Tool scope for this MCP install: all (default), operate (run/monitor existing workflows, ask Ember to build), "
+        "build (author workflows), browser (direct browser control), or lean (focused browser surface: direct actions with selector-scoped page reading). Applies to --local stdio setup."
     ),
 )
 _python_path_opt = typer.Option(

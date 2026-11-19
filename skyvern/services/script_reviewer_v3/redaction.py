@@ -2,7 +2,7 @@ import html
 import json
 from urllib.parse import quote, quote_plus
 
-from skyvern.forge.sdk.copilot.secret_scrub import MIN_PERSISTED_REDACTION_LENGTH, REDACTED_SECRET_PLACEHOLDER
+from skyvern.utils.secret_scrub import MIN_PERSISTED_REDACTION_LENGTH, REDACTED_SECRET_PLACEHOLDER
 
 
 def redact_sensitive_value(text: str, value: str | None) -> str:

@@ -333,7 +333,7 @@ async def build_file_tree(
                     artifact = await app.DATABASE.artifacts.get_artifact_by_id(script_file.artifact_id, organization_id)
                     if artifact:
                         # override the actual file in the storage
-                        asyncio.create_task(app.STORAGE.store_artifact(artifact, content_bytes))
+                        await app.STORAGE.store_artifact(artifact, content_bytes)
                     else:
                         artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
                             organization_id=organization_id,
@@ -3664,9 +3664,14 @@ async def ensure_in_process_script_execution_allowed(
     if decision.allowed:
         return
 
-    # A fail-open denial is the steady state on every tenant cached-script run (deny-all policy),
-    # so it stays at debug to keep out of indexed logs; fail-closed stays ERROR for the denial monitor.
-    log_denial = LOG.error if decision.fail_closed else LOG.debug
+    # The steady-state denial stays at debug to keep out of indexed logs; every other denial must reach the
+    # denial monitors, which only see INFO and above in production.
+    if decision.fail_closed:
+        log_denial = LOG.error
+    elif decision.steady_state:
+        log_denial = LOG.debug
+    else:
+        log_denial = LOG.warning
     log_denial(
         "script.in_process_execution_denied",
         seam=seam,

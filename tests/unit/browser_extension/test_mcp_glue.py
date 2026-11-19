@@ -47,6 +47,10 @@ _BROKER_PAIRING_FALLBACK_GUIDANCE = (
     "Skyvern browser extension is not connected. Keep Chrome and the Skyvern extension open, then retry. "
     "To open the one-click pairing page, run `skyvern browser extension-pair`."
 )
+_BROKER_APPROVED_CLIENT_GUIDANCE = (
+    "Skyvern browser extension is not connected. This agent is already approved, so no pairing is needed. "
+    "Keep Chrome open with the Skyvern Agent extension enabled, then retry."
+)
 
 
 @pytest.fixture(autouse=True)
@@ -127,8 +131,49 @@ async def test_extension_session_rejects_stateless_http_mode(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("use_shared_tab", [False, True])
+async def test_session_create_sets_shared_policy_only_for_new_session(
+    monkeypatch: pytest.MonkeyPatch,
+    use_shared_tab: bool,
+) -> None:
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    client.shared_tab_start = not use_shared_tab
+    runtime = BrowserExtensionRuntime(client, MagicMock())
+    monkeypatch.setattr(runtime, "wait_for_extension", AsyncMock(return_value=True))
+    monkeypatch.setattr(runtime, "broker_build_status", AsyncMock(return_value=None))
+    monkeypatch.setattr(mcp_session.BrowserExtensionRuntime, "get_or_start", AsyncMock(return_value=runtime))
+    monkeypatch.setenv("BROWSER_TYPE", "extension-connect")
+    monkeypatch.setattr(session_manager, "get_active_api_key", lambda: None)
+    current_token = session_manager._current_session.set(None)
+    monkeypatch.setattr(session_manager, "_global_session", None)
+    browser = SimpleNamespace(browser=SimpleNamespace(is_connected=Mock(return_value=True)))
+
+    async def connect(extension_runtime: BrowserExtensionRuntime) -> object:
+        assert extension_runtime is runtime
+        assert client.shared_tab_start is use_shared_tab
+        return browser
+
+    connect_to_extension = AsyncMock(side_effect=connect)
+    monkeypatch.setattr(
+        session_manager, "get_skyvern", lambda: SimpleNamespace(connect_to_browser_extension=connect_to_extension)
+    )
+    try:
+        created = await mcp_session.skyvern_browser_session_create(use_shared_tab=use_shared_tab)
+        assert created["ok"] is True
+        assert client.shared_tab_start is use_shared_tab
+        reused = await mcp_session.skyvern_browser_session_create(use_shared_tab=not use_shared_tab)
+        assert reused["ok"] is True
+        assert client.shared_tab_start is use_shared_tab
+        connect_to_extension.assert_awaited_once_with(runtime)
+    finally:
+        session_manager._current_session.reset(current_token)
+
+
+@pytest.mark.asyncio
 async def test_session_create_extension_takes_precedence_over_cdp(monkeypatch: pytest.MonkeyPatch) -> None:
-    runtime = SimpleNamespace(wait_for_extension=AsyncMock(return_value=True), begin_pairing=AsyncMock())
+    runtime = SimpleNamespace(
+        set_shared_tab_start=Mock(), wait_for_extension=AsyncMock(return_value=True), begin_pairing=AsyncMock()
+    )
     get_or_start = AsyncMock(return_value=runtime)
     resolve_browser = AsyncMock(return_value=(MagicMock(), BrowserContext(mode="extension")))
     monkeypatch.setattr(mcp_session, "_should_default_to_extension", lambda: True)
@@ -195,6 +240,7 @@ async def test_broker_session_opens_one_step_pairing_inline(
 ) -> None:
     runtime = SimpleNamespace(
         wait_for_extension=AsyncMock(return_value=False),
+        is_client_approved=AsyncMock(return_value=False),
         begin_pairing=AsyncMock(return_value=pairing_opened),
     )
     monkeypatch.setenv("BROWSER_TYPE", "extension-connect")
@@ -208,6 +254,44 @@ async def test_broker_session_opens_one_step_pairing_inline(
     assert "extension-token" not in result["error"]["message"]
     runtime.begin_pairing.assert_awaited_once_with()
     assert runtime.wait_for_extension.await_args_list == [call(8.0), call(remaining_wait)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extension_reconnects", [True, False])
+async def test_broker_session_approved_client_waits_for_reconnect_without_pairing(
+    monkeypatch: pytest.MonkeyPatch,
+    extension_reconnects: bool,
+) -> None:
+    """An approved client's extension is only in its reconnect backoff, so a pairing
+    page cannot help: it must wait the full broker window and never open a tab."""
+    runtime = SimpleNamespace(
+        set_shared_tab_start=Mock(),
+        wait_for_extension=AsyncMock(side_effect=[False, extension_reconnects]),
+        is_client_approved=AsyncMock(return_value=True),
+        begin_pairing=AsyncMock(return_value=True),
+    )
+    monkeypatch.setenv("BROWSER_TYPE", "extension-connect")
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER")
+    monkeypatch.setattr(mcp_session.BrowserExtensionRuntime, "get_or_start", AsyncMock(return_value=runtime))
+    monkeypatch.setattr(
+        mcp_session,
+        "resolve_browser",
+        AsyncMock(return_value=(MagicMock(), BrowserContext(mode="extension"))),
+    )
+
+    result = await mcp_session.skyvern_browser_session_create()
+
+    runtime.begin_pairing.assert_not_awaited()
+    assert runtime.wait_for_extension.await_args_list == [call(8.0), call(27.0)]
+    if extension_reconnects:
+        assert result["ok"] is True
+        assert result["data"]["browser"] == "extension"
+        return
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_session.ErrorCode.BROWSER_NOT_FOUND
+    assert result["error"]["message"] == _BROKER_APPROVED_CLIENT_GUIDANCE
+    assert "extension-pair" not in result["error"]["message"]
+    assert "Approve pairing" not in result["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -253,6 +337,7 @@ async def test_session_create_extension_connected_returns_safe_success_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = SimpleNamespace(
+        set_shared_tab_start=Mock(),
         cdp_ws_url="ws://127.0.0.1/private-capability",
         pairing_token="private-pairing-token",
         wait_for_extension=AsyncMock(return_value=True),
@@ -281,6 +366,7 @@ async def test_session_create_names_stale_extension_build_instead_of_failing_gen
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = SimpleNamespace(
+        set_shared_tab_start=Mock(),
         wait_for_extension=AsyncMock(return_value=True),
         broker_build_status=AsyncMock(
             return_value={
@@ -314,6 +400,7 @@ async def test_session_create_names_stale_extension_build_with_no_hash_reported(
     """A connected extension that predates build_hash.json reports no hash at all;
     the warning must still read as actionable, not print the literal word None."""
     runtime = SimpleNamespace(
+        set_shared_tab_start=Mock(),
         wait_for_extension=AsyncMock(return_value=True),
         broker_build_status=AsyncMock(
             return_value={
@@ -375,6 +462,7 @@ async def test_session_create_extension_connection_error_redacts_capability_url(
     skyvern = object.__new__(Skyvern)
     skyvern._get_playwright = AsyncMock(return_value=playwright)
     runtime = SimpleNamespace(
+        set_shared_tab_start=Mock(),
         cdp_ws_url=capability_url,
         extension_connected=True,
         wait_for_extension=AsyncMock(return_value=True),

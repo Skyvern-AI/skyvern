@@ -263,7 +263,6 @@ describe("duplicateBlockBelow", () => {
           withWorkflowSettings: false,
           editable: true,
           label: "__start_block__",
-          showCode: false,
           parentNodeType: "conditional",
         },
       } as AppNode,

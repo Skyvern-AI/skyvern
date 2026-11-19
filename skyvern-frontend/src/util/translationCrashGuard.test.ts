@@ -62,6 +62,24 @@ describe("installTranslationCrashGuard", () => {
     expect(parent.firstChild).toBe(node);
   });
 
+  it("removes and inserts before a form whose control shadows parentNode", () => {
+    const parent = document.createElement("div");
+    parent.innerHTML = '<form><input name="parentNode"></form><i></i>';
+    const form = parent.firstChild as HTMLFormElement;
+    // jsdom lacks HTMLFormElement named-property shadowing; model Chromium's.
+    Object.defineProperty(form, "parentNode", {
+      value: form.elements.namedItem("parentNode"),
+      configurable: true,
+    });
+
+    const node = document.createElement("b");
+    parent.insertBefore(node, form);
+    expect(parent.firstChild).toBe(node);
+
+    parent.removeChild(form);
+    expect(Array.from(parent.childNodes)).not.toContain(form);
+  });
+
   it("is idempotent and does not re-wrap the patched methods", () => {
     const patchedRemove = Node.prototype.removeChild;
     const patchedInsert = Node.prototype.insertBefore;

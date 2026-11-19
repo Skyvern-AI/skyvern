@@ -1,3 +1,4 @@
+import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import {
   SaveRefusedError,
   SaveStaleError,
@@ -48,7 +49,6 @@ import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChan
 import { useDuplicateNodeCallback } from "@/routes/workflows/hooks/useDuplicateNodeCallback";
 import { useRequestDeleteNodeCallback } from "@/routes/workflows/hooks/useRequestDeleteNodeCallback";
 import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
-import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useBrowserSessionRateLimit } from "@/routes/workflows/hooks/useBrowserSessionRateLimit";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
@@ -65,7 +65,6 @@ import {
 } from "@/routes/workflows/debugger/debugSessionProfileCompatibility";
 import {
   debuggableWorkflowBlockTypes,
-  scriptableWorkflowBlockTypes,
   type WorkflowBlockType,
   type WorkflowApiResponse,
   type WorkflowParameter,
@@ -146,15 +145,7 @@ import {
 } from "../../collapse/useNodeCollapseStore";
 import { useWorkflowEditorMode } from "../../hooks/useWorkflowEditorMode";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
-import { useDocRunOwnsTopBar } from "../../doc/useDocRunOwnsTopBar";
-
-class ValidationFailureError extends Error {
-  readonly isValidationFailure = true;
-  constructor() {
-    super("workflow validation failed");
-    this.name = "ValidationFailureError";
-  }
-}
+import { ValidationFailureError } from "./ValidationFailureError";
 
 function formatLabelList(labels: string[]): string {
   if (labels.length <= 1) return labels[0] ?? "";
@@ -315,16 +306,13 @@ function NodeHeader({
   const duplicateNodeCallback = useDuplicateNodeCallback();
   const requestDeleteNodeCallback = useRequestDeleteNodeCallback();
   const transmuteNodeCallback = useTransmuteNodeCallback();
-  const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const location = useLocation();
   const { resolveLivePanes, preserveNextEntry } = useStudioPanes();
-  const docShowing = useDocRunOwnsTopBar();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
-  const isScriptable = scriptableWorkflowBlockTypes.has(type);
   const {
     data: workflowRun,
     isError: statusUnavailable,
@@ -339,10 +327,7 @@ function NodeHeader({
     runStateIsLive &&
     workflowRun &&
     (statusIsRunningOrQueued(workflowRun) || runIsRetryWaiting(workflowRun));
-  // The Doc states a step run's outcome on the step's own line; this header stays mounted behind it.
-  useRunCompletionToast(
-    runStateIsLive && !headless && !docShowing ? workflowRun : undefined,
-  );
+  useRunCompletionToast(runStateIsLive && !headless ? workflowRun : undefined);
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
@@ -353,6 +338,7 @@ function NodeHeader({
   });
   const saveWorkflow = useWorkflowSave();
   const reactFlow = useReactFlow<AppNode>();
+  const activeOrgId = useActiveOrgId();
 
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued &&
@@ -476,7 +462,7 @@ function NodeHeader({
       // formats errors as `${label}: ${message}` - if that ever drifts,
       // errors for this block would silently slip past this gate.
       const blockErrors = runLabels.flatMap((runLabel) =>
-        blockRunErrors(reactFlow.getNodes(), runLabel),
+        blockRunErrors(reactFlow.getNodes(), runLabel, activeOrgId),
       );
       if (
         isMissingRequiredStartUrl(
@@ -718,7 +704,7 @@ function NodeHeader({
         runId: response.data.run_id,
       });
 
-      if (!docShowing && !demonstrating) {
+      if (!demonstrating) {
         toast({
           variant: "success",
           title: "Agent block run started",
@@ -730,10 +716,7 @@ function NodeHeader({
         // One navigation carries the pane state (open panes never move or
         // close; the run surfaces append); other query params intentionally
         // reset for the fresh run.
-        // The Doc shows the step's progress on its own line; adding panes would squeeze it.
-        const panes = docShowing
-          ? resolveLivePanes()
-          : withPanesOpen(resolveLivePanes(), RUN_APPEND_PANES);
+        const panes = withPanesOpen(resolveLivePanes(), RUN_APPEND_PANES);
         // A run of several blocks has no single block to mark, so it names none.
         const search = new URLSearchParams(
           demonstrating
@@ -1367,7 +1350,7 @@ function NodeHeader({
               editable={editable}
               onChange={(value) => {
                 // The label handler queues edits while the graph is locked.
-                useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+                useWorkflowTitleStore.getState().recordEmberGraphEdit();
                 setLabel(value);
               }}
               titleClassName={cn("text-base", {
@@ -1540,7 +1523,6 @@ function NodeHeader({
                   isDuplicable={
                     !isReadOnlyScope && Boolean(duplicateNodeCallback)
                   }
-                  isScriptable={isScriptable}
                   isCanvasLocked={isCanvasLocked}
                   onDuplicate={
                     isReadOnlyScope || !duplicateNodeCallback
@@ -1552,9 +1534,6 @@ function NodeHeader({
                   onDelete={() => {
                     requestDeleteNodeCallback(nodeId, blockLabel);
                   }}
-                  onShowScript={() =>
-                    toggleScriptForNodeCallback({ id: nodeId, show: true })
-                  }
                 />
               </div>
             </div>
