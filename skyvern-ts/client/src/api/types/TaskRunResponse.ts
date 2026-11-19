@@ -45,6 +45,8 @@ export interface TaskRunResponse {
     step_count?: number;
     /** The original request parameters used to start this task run */
     run_request?: Skyvern.TaskRunRequestOutput;
+    /** Whether another attempt is scheduled for this run */
+    retry_pending?: boolean;
 }
 
 export namespace TaskRunResponse {
