@@ -1025,7 +1025,7 @@ async def test_a_model_call_cut_mid_turn_leaves_the_fallback_on_the_turns_clock(
         attempts[-1]["allowance"] = ctx.model_stream_deadline.when() - asyncio.get_running_loop().time()
         if len(attempts) == 1:
             offset = seconds_at_cut
-            raise LiteLLMTimeout("Copilot model stream made no progress", model="m", llm_provider="anthropic")
+            raise LiteLLMTimeout("Model stream made no progress", model="m", llm_provider="anthropic")
 
     stub_copilot_agent_loop(monkeypatch, run_with_enforcement)
     monkeypatch.setattr(

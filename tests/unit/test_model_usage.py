@@ -6,10 +6,10 @@ from typing import Any
 
 import pytest
 
-from skyvern.forge.sdk.api.llm.copilot_model_usage import (
-    CopilotModelUsageEvent,
-    _emit_copilot_model_usage,
+from skyvern.forge.sdk.api.llm.model_usage import (
+    ModelUsageEvent,
     _emit_direct_copilot_model_usage,
+    _emit_model_usage,
     is_workflow_copilot_prompt_name,
     normalize_gen_ai_provider,
 )
@@ -52,7 +52,7 @@ def test_workflow_copilot_prompt_namespace_rejects_unrelated_names(prompt_name: 
 
 def test_direct_event_preserves_zeroes_and_omits_unavailable_optional_fields() -> None:
     logger = CapturingLogger()
-    event = CopilotModelUsageEvent(
+    event = ModelUsageEvent(
         request_model="openai/gpt-5.6-sol",
         response_model="gpt-5.6-sol-2026-07-09",
         provider_name="openai",
@@ -68,9 +68,9 @@ def test_direct_event_preserves_zeroes_and_omits_unavailable_optional_fields() -
 
     assert logger.events == [
         (
-            "Copilot model usage",
+            "Model usage",
             {
-                "log_code": "copilot_model_usage",
+                "log_code": "model_usage",
                 "gen_ai.operation.name": "chat",
                 "gen_ai.request.model": "openai/gpt-5.6-sol",
                 "gen_ai.response.model": "gpt-5.6-sol-2026-07-09",
@@ -79,7 +79,8 @@ def test_direct_event_preserves_zeroes_and_omits_unavailable_optional_fields() -
                 "gen_ai.usage.output_tokens": 0,
                 "gen_ai.usage.cache_read.input_tokens": 0,
                 "operation.cost": 0.0,
-                "copilot.prompt_name": "workflow-copilot-narration",
+                "gen_ai.agent.name": "ember",
+                "llm.prompt_name": "workflow-copilot-narration",
             },
         )
     ]
@@ -87,7 +88,7 @@ def test_direct_event_preserves_zeroes_and_omits_unavailable_optional_fields() -
 
 def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
     logger = CapturingLogger()
-    event = CopilotModelUsageEvent(
+    event = ModelUsageEvent(
         request_model="vertex_ai/gemini-3-flash-preview",
         response_model="gemini-3-flash-preview",
         provider_name="vertex_ai",
@@ -109,10 +110,11 @@ def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
         "gen_ai.usage.input_tokens",
         "gen_ai.usage.output_tokens",
         "gen_ai.usage.cache_creation.input_tokens",
-        "copilot.prompt_name",
+        "gen_ai.agent.name",
+        "llm.prompt_name",
     }
     assert all(isinstance(value, (str, int, float)) for value in fields.values())
-    assert {field.name for field in dataclass_fields(CopilotModelUsageEvent)} == {
+    assert {field.name for field in dataclass_fields(ModelUsageEvent)} == {
         "request_model",
         "response_model",
         "provider_name",
@@ -128,6 +130,7 @@ def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
         "cache_breakpoint_count",
         "cache_stable_prefix_chars",
         "ref_tool_outputs_escaped",
+        "agent_name",
     }
     assert normalize_gen_ai_provider(event.provider_name, event.response_model) == "gcp.vertex_ai"
 
@@ -135,11 +138,11 @@ def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
 def test_cost_ledger_records_actor_and_safety_cost_without_filling_unknowns() -> None:
     logger = CapturingLogger()
     with copilot_cost_scope():
-        _emit_copilot_model_usage(
-            CopilotModelUsageEvent(request_model="model", cost=0.03, cost_source="litellm_estimate"), logger=logger
+        _emit_model_usage(
+            ModelUsageEvent(request_model="model", cost=0.03, cost_source="litellm_estimate"), logger=logger
         )
         _emit_direct_copilot_model_usage(
-            CopilotModelUsageEvent(
+            ModelUsageEvent(
                 request_model="model",
                 prompt_name="workflow-copilot-raw-secret-safety",
                 cost=0.0,
@@ -147,7 +150,7 @@ def test_cost_ledger_records_actor_and_safety_cost_without_filling_unknowns() ->
             ),
             logger=logger,
         )
-        _emit_copilot_model_usage(CopilotModelUsageEvent(request_model="model"), logger=logger)
+        _emit_model_usage(ModelUsageEvent(request_model="model"), logger=logger)
         snapshot = current_copilot_cost()
         assert snapshot is not None
         assert snapshot["known_cost_usd"] == pytest.approx(0.03)
@@ -169,15 +172,15 @@ async def test_cost_ledger_isolates_concurrent_turns_and_closes_inherited_backgr
     async def record_later() -> None:
         background_ready.set()
         await background_release.wait()
-        _emit_copilot_model_usage(
-            CopilotModelUsageEvent(request_model="model", cost=10.0, cost_source="litellm_estimate"), logger=logger
+        _emit_model_usage(
+            ModelUsageEvent(request_model="model", cost=10.0, cost_source="litellm_estimate"), logger=logger
         )
         assert current_copilot_cost() is None
 
     async def turn(amount: float) -> dict[str, object] | None:
         with copilot_cost_scope():
-            _emit_copilot_model_usage(
-                CopilotModelUsageEvent(request_model="model", cost=amount, cost_source="litellm_estimate"),
+            _emit_model_usage(
+                ModelUsageEvent(request_model="model", cost=amount, cost_source="litellm_estimate"),
                 logger=logger,
             )
             await asyncio.sleep(0)
@@ -201,11 +204,11 @@ async def test_workflow_block_tasks_cannot_contribute_to_the_parent_copilot_cost
     async def execute_block() -> None:
         await asyncio.sleep(0)
         assert current_copilot_cost() is None
-        _emit_copilot_model_usage(
-            CopilotModelUsageEvent(request_model="model", cost=100.0, cost_source="litellm_estimate"), logger=logger
+        _emit_model_usage(
+            ModelUsageEvent(request_model="model", cost=100.0, cost_source="litellm_estimate"), logger=logger
         )
         _emit_direct_copilot_model_usage(
-            CopilotModelUsageEvent(
+            ModelUsageEvent(
                 request_model="model",
                 prompt_name="workflow-copilot-raw-secret-safety",
                 cost=20.0,
@@ -218,7 +221,7 @@ async def test_workflow_block_tasks_cannot_contribute_to_the_parent_copilot_cost
         with exclude_workflow_block_cost():
             task = asyncio.create_task(execute_block())
         _emit_direct_copilot_model_usage(
-            CopilotModelUsageEvent(
+            ModelUsageEvent(
                 request_model="model",
                 prompt_name="workflow-copilot-raw-secret-safety",
                 cost=0.01,
@@ -235,13 +238,13 @@ async def test_workflow_block_tasks_cannot_contribute_to_the_parent_copilot_cost
 @pytest.mark.parametrize("cost", [None, -1.0, float("nan"), float("inf"), True])
 def test_cost_ledger_preserves_invalid_cost_as_unknown(cost: float | None) -> None:
     with copilot_cost_scope() as ledger:
-        ledger.record(CopilotModelUsageEvent(request_model="model", cost=cost, cost_source="litellm_estimate"))
+        ledger.record(ModelUsageEvent(request_model="model", cost=cost, cost_source="litellm_estimate"))
         assert ledger.snapshot()["known_cost_usd"] is None
         assert ledger.snapshot()["unknown_call_count"] == 1
 
 
 def test_event_provider_falls_back_to_qualified_request_model() -> None:
-    event = CopilotModelUsageEvent(
+    event = ModelUsageEvent(
         request_model="anthropic/claude-sonnet-4-5",
         response_model="claude-sonnet-4-5",
     )
@@ -250,7 +253,7 @@ def test_event_provider_falls_back_to_qualified_request_model() -> None:
 
 
 def test_qualified_request_provider_precedes_bare_response_model_inference() -> None:
-    event = CopilotModelUsageEvent(
+    event = ModelUsageEvent(
         request_model="azure/gpt-4.1",
         response_model="gpt-4.1",
     )
@@ -259,7 +262,7 @@ def test_qualified_request_provider_precedes_bare_response_model_inference() -> 
 
 
 def test_qualified_response_provider_precedes_request_model_fallback() -> None:
-    event = CopilotModelUsageEvent(
+    event = ModelUsageEvent(
         request_model="azure/gpt-4.1",
         response_model="anthropic/claude-sonnet-4-6",
     )
@@ -269,7 +272,7 @@ def test_qualified_response_provider_precedes_request_model_fallback() -> None:
 
 def test_unrelated_direct_event_does_not_log() -> None:
     logger = CapturingLogger()
-    event = CopilotModelUsageEvent(
+    event = ModelUsageEvent(
         request_model="gpt-4.1-mini",
         prompt_name="extract-actions",
     )

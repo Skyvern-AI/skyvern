@@ -27,6 +27,7 @@ from openai.types.chat.chat_completion_chunk import (
 from PIL import Image
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.api.llm.agents_model import SkyvernLitellmProvider
 from skyvern.forge.sdk.copilot.ask_user import (
     QuestionAnswer,
     QuestionChoice,
@@ -48,7 +49,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     pending_screenshot_message,
     stable_prefix_anchors,
 )
-from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotEntry,
@@ -661,7 +661,7 @@ class TestModelInputCapture:
     def test_capture_records_instructions_and_input(self, tmp_path: Any, monkeypatch: Any) -> None:
         from agents import FunctionTool
 
-        from skyvern.forge.sdk.copilot.model_input_capture import attach_tool_surface_to_pending_capture
+        from skyvern.forge.sdk.api.llm.model_input_capture import attach_tool_surface_to_pending_capture
         from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
 
         monkeypatch.setenv("EMBER_DUMP_MODEL_INPUTS", str(tmp_path))
@@ -1209,7 +1209,7 @@ async def test_signature_only_claude_thinking_does_not_use_up_the_model_input_bu
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
     agent = Agent(name="workflow-copilot", model="anthropic/claude-sonnet-5-5", tools=[read_page])
     run_config = RunConfig(
-        model_provider=CopilotLitellmProvider(),
+        model_provider=SkyvernLitellmProvider(prefix_anchors=stable_prefix_anchors),
         tracing_disabled=True,
         call_model_input_filter=make_copilot_call_model_input_filter(estimate_tokens([page_text]) + 2_000),
     )

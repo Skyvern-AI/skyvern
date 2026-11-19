@@ -53,7 +53,7 @@ from skyvern.forge.sdk.agents.skills import (
     skill_result_chars,
 )
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.copilot_model_usage import CopilotModelUsageEvent, _observe_copilot_model_usage
+from skyvern.forge.sdk.api.llm.model_usage import ModelUsageEvent, _observe_model_usage
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
@@ -169,7 +169,7 @@ class _ScriptedModel(Model):
         self.tool_names.append([tool.name for tool in tools])
         self.tools.append(tools)
         self.tool_descriptions.append({tool.name: tool.description for tool in tools if isinstance(tool, FunctionTool)})
-        _observe_copilot_model_usage(CopilotModelUsageEvent(request_model="scripted", cost=MODEL_CALL_COST))
+        _observe_model_usage(ModelUsageEvent(request_model="scripted", cost=MODEL_CALL_COST))
         turn = self.script[len(self.inputs) - 1]
         output = turn(cast(list[Any], input)) if callable(turn) else turn
         return ModelResponse(output=output, usage=Usage(requests=1), response_id=None)
@@ -199,7 +199,7 @@ def child_prompts(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         if prompt_name == "generate-workflow-run-block-description":
             return {"summary": "description"}
         prompts.append(prompt)
-        _observe_copilot_model_usage(CopilotModelUsageEvent(request_model="child", cost=100.0))
+        _observe_model_usage(ModelUsageEvent(request_model="child", cost=100.0))
         return {"llm_response": f"the token is {SECRET}"}
 
     monkeypatch.setattr(app, "SECONDARY_LLM_API_HANDLER", fake_llm)
@@ -262,13 +262,15 @@ def _billed_decisions(hook: AsyncMock) -> int:
     return hook.await_args.kwargs["decisions"]
 
 
-def _litellm_replies(monkeypatch: pytest.MonkeyPatch, *replies: dict[str, Any]) -> list[dict[str, Any]]:
+def _litellm_replies(
+    monkeypatch: pytest.MonkeyPatch, *replies: dict[str, Any], usage: dict[str, int] | None = None
+) -> list[dict[str, Any]]:
     """Answer each litellm.acompletion call with the next choice and return the requests sent."""
     sent: list[dict[str, Any]] = []
 
     async def fake_acompletion(**kwargs: object) -> LitellmResponse:
         sent.append(kwargs)
-        return LitellmResponse(choices=[{"index": 0, **replies[len(sent) - 1]}])
+        return LitellmResponse(choices=[{"index": 0, **replies[len(sent) - 1]}], usage=usage)
 
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
     return sent
@@ -1070,14 +1072,21 @@ async def test_the_block_model_picks_a_pinned_key_only_after_the_flag_enables_th
 
 @pytest.mark.asyncio
 async def test_the_agent_block_sends_its_pinned_effort_on_a_bare_gpt_5_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    sent = _litellm_replies(monkeypatch, {"message": {"role": "assistant", "content": "ok"}})
+    sent = _litellm_replies(
+        monkeypatch,
+        {"message": {"role": "assistant", "content": "ok"}},
+        usage={"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+    )
     monkeypatch.setitem(LLMConfigRegistry._configs, "GPT5_PINNED_TEST", _pinned("high", "gpt-5.4"))
     model, run_config = agent_step_loop.resolve_agent_model("GPT5_PINNED_TEST")
 
-    await Runner.run(Agent(name="agent-step", model=model), "hello", run_config=run_config)
+    with capture_logs() as logs:
+        await Runner.run(Agent(name="agent-step", model=model), "hello", run_config=run_config)
 
     (request,) = sent
     assert request["reasoning_effort"] == "high"
+    (usage,) = (log for log in logs if log.get("log_code") == "model_usage")
+    assert usage["gen_ai.agent.name"] == "agent_step"
 
 
 def test_every_block_tool_schema_defines_exactly_the_definitions_it_references() -> None:

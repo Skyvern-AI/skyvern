@@ -40,6 +40,7 @@ from PIL import Image
 
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import parse_uri_to_path
+from skyvern.forge.sdk.api.llm.model_input_capture import serialize_tool_surface
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
@@ -58,7 +59,6 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
-from skyvern.forge.sdk.copilot.model_input_capture import serialize_tool_surface
 from skyvern.forge.sdk.copilot.narration import (
     MAX_DESIGN_ACTIVITY_ENTRIES,
     NarratorState,

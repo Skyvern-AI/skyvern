@@ -37,6 +37,7 @@ from skyvern.cli.mcp_tools._element_state import action_deadline_error, element_
 from skyvern.cli.mcp_tools.blocks import skyvern_block_schema, skyvern_block_validate, skyvern_workflow_knowledge
 from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
 from skyvern.cli.mcp_tools.workflow import skyvern_workflow_get
+from skyvern.forge.sdk.api.llm.model_input_capture import serialize_tool_surface
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import agent as copilot_agent
@@ -69,7 +70,6 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     _transform_args,
     resolve_browser_session_binding,
 )
-from skyvern.forge.sdk.copilot.model_input_capture import serialize_tool_surface
 from skyvern.forge.sdk.copilot.output_utils import (
     _BASE64_IMAGE_OMITTED_MESSAGE,
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
