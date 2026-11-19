@@ -11,13 +11,13 @@ import structlog
 
 from skyvern.forge.sdk.api.llm import config_registry
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, _build_litellm_router
-from skyvern.forge.sdk.api.llm.copilot_model_usage import CopilotModelUsageEvent, _emit_copilot_model_usage
+from skyvern.forge.sdk.api.llm.model_usage import ModelUsageEvent, _emit_model_usage
 from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.forge_log import _model_log_value, redact_registered_log_payload
 from skyvern.schemas import llm as llm_schemas
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from tests.unit.forge_log_capture import capture_runtime_logs
 
 
@@ -104,8 +104,8 @@ def test_copilot_router_provider_model_retains_only_its_source_provenance(
         model_name, run_config, _, _ = resolve_model_config(None, llm_key_override="TEST_ROUTER")
         model = run_config.model_provider.get_model(model_name)
         with capture_runtime_logs() as events:
-            _emit_copilot_model_usage(
-                CopilotModelUsageEvent(
+            _emit_model_usage(
+                ModelUsageEvent(
                     request_model=model.model,
                     response_model=provider_model,
                     input_tokens=15,
@@ -115,7 +115,7 @@ def test_copilot_router_provider_model_retains_only_its_source_provenance(
             )
             structlog.get_logger().info("Caller parameters", payload=parameters)
     records = json.loads(json.dumps(events))
-    usage = next(record for record in records if record.get("log_code") == "copilot_model_usage")
+    usage = next(record for record in records if record.get("log_code") == "model_usage")
     redacted = f"vertex_ai/gemini-{REDACTED_SECRET_PLACEHOLDER}-flash-preview"
     assert usage["gen_ai.request.model"] == (provider_model if builtin else redacted)
     assert usage["gen_ai.response.model"] == redacted

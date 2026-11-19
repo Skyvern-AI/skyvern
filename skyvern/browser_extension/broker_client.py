@@ -118,6 +118,7 @@ class BrokerClient:
         auto_spawn: bool = True,
         operator: bool = False,
     ) -> None:
+        self.shared_tab_start: bool = False
         self.port = port
         self.bound_port = port
         self.paths = broker_paths(port, base_dir=base_dir)
@@ -238,18 +239,13 @@ class BrokerClient:
         return result
 
     async def ensure_root_lease(self) -> dict[str, Any] | None:
-        """Ensure this client owns at least one tab and return its snapshot.
-
-        A multi-client broker grants a tab lease: it adopts a free user-shared tab or
-        creates a scoped about:blank tab. An M1 exclusive broker does not know the
-        operation; fall back to its behavior, where the filtered snapshot is already
-        exclusive to this client.
-        """
         if self.scoped_tabs:
             return dict(self.scoped_tabs[0])
+        if not self.shared_tab_start:
+            return None
         await self.start()
         try:
-            result = await self._control_request("lease.acquire_default", {}, 20.0)
+            result = await self._control_request("lease.acquire_default", {"adopt_shared": True}, 20.0)
         except BrowserExtensionBrokerError as exc:
             if exc.code == "OP_NOT_ALLOWED":
                 return None

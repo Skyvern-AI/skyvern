@@ -6,8 +6,8 @@ import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import {
   goalActionIsLocked,
-  useCopilotActionStore,
-} from "@/store/useCopilotActionStore";
+  useEmberActionStore,
+} from "@/store/useEmberActionStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { refuseMutationDuringYamlCommit } from "@/store/WorkflowYamlEditorStore";
 
@@ -31,22 +31,20 @@ export function PendingGoalChangesPublisher() {
   const { getNodes, updateNodeData } = useReactFlow<AppNode>();
   const credentialGetter = useCredentialGetter();
   const scopeReadOnly = useWorkflowScopeReadOnly();
-  const setPendingGoalChanges = useCopilotActionStore(
+  const setPendingGoalChanges = useEmberActionStore(
     (state) => state.setPendingGoalChanges,
   );
-  const setUndoGoalChange = useCopilotActionStore(
+  const setUndoGoalChange = useEmberActionStore(
     (state) => state.setUndoGoalChange,
   );
-  const goalSuggestions = useCopilotActionStore(
-    (state) => state.goalSuggestions,
-  );
-  const setCodeEditedBlocks = useCopilotActionStore(
+  const goalSuggestions = useEmberActionStore((state) => state.goalSuggestions);
+  const setCodeEditedBlocks = useEmberActionStore(
     (state) => state.setCodeEditedBlocks,
   );
-  const setReadOnlyGoalLabels = useCopilotActionStore(
+  const setReadOnlyGoalLabels = useEmberActionStore(
     (state) => state.setReadOnlyGoalLabels,
   );
-  const setCodeEditedGoalActions = useCopilotActionStore(
+  const setCodeEditedGoalActions = useEmberActionStore(
     (state) => state.setCodeEditedGoalActions,
   );
 
@@ -68,7 +66,7 @@ export function PendingGoalChangesPublisher() {
   const refuseGoalAction = useCallback(
     (node: CodeBlockNode, { offersGoal }: { offersGoal: boolean }) => {
       if (
-        goalActionIsLocked(useCopilotActionStore.getState(), node.data.label, {
+        goalActionIsLocked(useEmberActionStore.getState(), node.data.label, {
           readOnly: !node.data.editable || scopeReadOnly,
           mutationLocked: false,
         })
@@ -85,7 +83,7 @@ export function PendingGoalChangesPublisher() {
 
   const applyPatch = useCallback(
     (node: CodeBlockNode, patch: Partial<CodeBlockNode["data"]>) => {
-      useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+      useWorkflowTitleStore.getState().recordEmberGraphEdit();
       updateNodeData(node.id, patch);
     },
     [updateNodeData],
@@ -108,7 +106,7 @@ export function PendingGoalChangesPublisher() {
   const updateGoal = useCallback(
     async (label: string) => {
       const node = codeBlockLabelled(label);
-      const store = useCopilotActionStore.getState();
+      const store = useEmberActionStore.getState();
       if (
         !node ||
         !codeEditedNoticeIsShown(node.data) ||
@@ -123,7 +121,7 @@ export function PendingGoalChangesPublisher() {
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
         const response = await client.post<GoalSuggestionResponse>(
-          "/workflow/copilot/suggest-goal",
+          "/workflow/suggest-goal",
           {
             label,
             code: forCode,
@@ -144,7 +142,7 @@ export function PendingGoalChangesPublisher() {
       } catch {
         toast({ title: "Couldn't suggest a Goal", variant: "destructive" });
       } finally {
-        useCopilotActionStore.getState().setSuggestingGoal(label, false);
+        useEmberActionStore.getState().setSuggestingGoal(label, false);
       }
     },
     [codeBlockLabelled, refuseGoalAction, credentialGetter],
@@ -156,7 +154,7 @@ export function PendingGoalChangesPublisher() {
       if (!node || refuseGoalAction(node, { offersGoal: false })) {
         return;
       }
-      useCopilotActionStore.getState().setGoalSuggestion(label, null);
+      useEmberActionStore.getState().setGoalSuggestion(label, null);
       applyPatch(node, { codeEditedByHand: false });
     },
     [codeBlockLabelled, refuseGoalAction, applyPatch],
@@ -168,7 +166,7 @@ export function PendingGoalChangesPublisher() {
       if (!node || refuseGoalAction(node, { offersGoal: true })) {
         return;
       }
-      const store = useCopilotActionStore.getState();
+      const store = useEmberActionStore.getState();
       const patch = acceptGoalSuggestionPatch(
         node.data,
         store.goalSuggestions[label],
@@ -232,7 +230,7 @@ export function PendingGoalChangesPublisher() {
       setUndoGoalChange(() => {});
       setCodeEditedBlocks([]);
       setReadOnlyGoalLabels([]);
-      useCopilotActionStore.setState({
+      useEmberActionStore.setState({
         goalSuggestions: {},
         suggestingGoalLabels: [],
       });

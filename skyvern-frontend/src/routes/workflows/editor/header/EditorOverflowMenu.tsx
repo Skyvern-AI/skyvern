@@ -29,7 +29,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import { useProductTourStore } from "@/store/ProductTourStore";
 import {
   SaveRefusedError,
@@ -44,7 +44,6 @@ import { cn } from "@/util/utils";
 
 import { SaveFailedError, useSaveWorkflow } from "../hooks/useSaveWorkflow";
 import { useToggleHistoryPanel } from "../hooks/useToggleHistoryPanel";
-import { CodeSubmenu } from "./CodeSubmenu";
 
 export function EditorOverflowMenu({
   triggerClassName = "size-10 min-w-[2.5rem]",
@@ -71,8 +70,8 @@ export function EditorOverflowMenu({
     (s) => s.saveBlockedReason,
   );
   const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
-  const proposalPending = useCopilotProposalStore((s) => s.proposal !== null);
-  // Saving here would make a staged Copilot proposal durable without Accept.
+  const proposalPending = useEmberProposalStore((s) => s.proposal !== null);
+  // Saving here would make a staged Ember proposal durable without Accept.
   const templateSaveReason = proposalPending
     ? "Resolve the Copilot proposal before saving."
     : (saveBlockedReason ?? saveLockReason);
@@ -128,7 +127,7 @@ export function EditorOverflowMenu({
   const handleTemplateToggle = async () => {
     const newIsTemplate = !isTemplate;
     if (newIsTemplate) {
-      if (useCopilotProposalStore.getState().proposal) return;
+      if (useEmberProposalStore.getState().proposal) return;
       await onSave();
     }
     templateMutation.mutate(newIsTemplate);
@@ -167,8 +166,7 @@ export function EditorOverflowMenu({
             View schema
           </DropdownMenuItem>
         )}
-        <CodeSubmenu />
-        {/* Restoring a version would replace the canvas a Copilot proposal is staged on. */}
+        {/* Restoring a version would replace the canvas an Ember proposal is staged on. */}
         {!workflowRunIsRunningOrQueued && !proposalPending && (
           <DropdownMenuItem
             onSelect={() => (onVersionHistory ?? toggleHistoryPanel)()}

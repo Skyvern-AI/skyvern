@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypeAlias, TypeVar
 
@@ -21,6 +21,34 @@ class RedirectHopAuthorization:
     method: str
     download_scope: str | None = None
     initial_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GuardedHTTPHopResponse:
+    status_code: int
+    headers: dict[str, str]
+    body: bytes
+    set_cookies: tuple[str, ...] = ()
+
+    def header(self, name: str) -> str | None:
+        normalized = name.lower()
+        return next((value for key, value in self.headers.items() if key.lower() == normalized), None)
+
+
+@dataclass(frozen=True, slots=True)
+class GuardedHTTPHopStream:
+    status_code: int
+    headers: dict[str, str]
+    body: AsyncIterator[bytes]
+    set_cookies: tuple[str, ...] = ()
+
+    def header(self, name: str) -> str | None:
+        normalized = name.lower()
+        return next((value for key, value in self.headers.items() if key.lower() == normalized), None)
+
+
+class GuardedHTTPResponseLimitExceeded(Exception):
+    pass
 
 
 RedirectHopDispatcher: TypeAlias = Callable[[tuple[str, ...]], Awaitable[T]]

@@ -8,10 +8,10 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { useContext } from "react";
+import { useContext, useState } from "react";
 
 import { toast } from "@/components/ui/use-toast";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { AxiosError } from "axios";
 
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
@@ -57,7 +57,7 @@ afterEach(() => {
   cleanup();
   save.mockClear();
   catalogState.data = undefined;
-  useCopilotActionStore.setState({ pendingGoalChanges: [] });
+  useEmberActionStore.setState({ pendingGoalChanges: [] });
   useWorkflowHistoryAccessStore.getState().reset();
   useWorkflowSnapshotStore.getState().clearSnapshot();
   useWorkflowHasChangesStore.setState({ hasChanges: false });
@@ -77,7 +77,7 @@ describe("Doc edit bar row", () => {
 describe("Doc Save", () => {
   test("asks about a new Goal that isn't applied before saving", () => {
     useWorkflowHasChangesStore.setState({ hasChanges: true });
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       pendingGoalChanges: [
         { label: "read_total", goal: "Read the total", previousGoal: "Old" },
       ],
@@ -660,5 +660,123 @@ describe("@ in a loop's list", () => {
         "{{ extraction_1_output.extracted_information.titles }}",
     });
     expect(docStepProblems(current.nodes).has(loopId)).toBe(false);
+  });
+});
+
+describe("a step's long text while it is edited", () => {
+  // The view and the read-only span measure by their text; the editing span measures `editingLines` lines.
+  let viewLines = 5;
+  let editingLines = 5;
+  beforeEach(() => {
+    Object.defineProperty(HTMLSpanElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLSpanElement) {
+        return (
+          (this.getAttribute("contenteditable") ? editingLines : viewLines) *
+          24.8
+        );
+      },
+    });
+  });
+  afterEach(() => {
+    // @ts-expect-error removing the jsdom layout stub restores the prototype's own getter
+    delete HTMLSpanElement.prototype.scrollHeight;
+  });
+  function Line({
+    autoFocus = false,
+    editable = true,
+    stayFolded = false,
+  }: {
+    autoFocus?: boolean;
+    editable?: boolean;
+    stayFolded?: boolean;
+  }) {
+    const [open, setOpen] = useState(false);
+    const [value, setValue] = useState("");
+    return (
+      <DocEditableLine
+        value={value}
+        editable={editable}
+        autoFocus={autoFocus}
+        multiline
+        label="new_step navigationGoal"
+        collapse={{
+          open,
+          setOpen: stayFolded ? () => {} : setOpen,
+          name: "new_step",
+        }}
+        onChange={setValue}
+      />
+    );
+  }
+  const line = () =>
+    screen.getByRole("textbox", { name: "new_step navigationGoal" });
+
+  test("a line that starts in editing opens its text, so typing past three lines never folds it, editing or after", () => {
+    viewLines = editingLines = 5;
+    render(<Line autoFocus />);
+    expect(line().getAttribute("contenteditable")).toBe("plaintext-only");
+    expect(line().style.overflow).toBe("");
+    fireEvent.blur(line());
+    expect(line().getAttribute("contenteditable")).toBeNull();
+    expect(line().style.overflow).toBe("");
+    expect(
+      screen
+        .getByRole("button", { name: /^Show less/ })
+        .getAttribute("aria-expanded"),
+    ).toBe("true");
+  });
+
+  test("the editing line is never clamped, even while its text is folded", () => {
+    viewLines = editingLines = 5;
+    render(<Line stayFolded />);
+    expect(line().style.overflow).toBe("hidden");
+    fireEvent.focus(line());
+    expect(line().getAttribute("contenteditable")).toBe("plaintext-only");
+    expect(line().style.overflow).toBe("");
+    expect(screen.getByRole("button", { name: /^Show more/ })).toBeTruthy();
+  });
+
+  test("only the view decides the control: a view that fits shows none while editing, one that overflows keeps it", () => {
+    viewLines = 2;
+    editingLines = 4;
+    render(<Line />);
+    fireEvent.focus(line());
+    expect(line().getAttribute("contenteditable")).toBe("plaintext-only");
+    expect(screen.queryByRole("button", { name: /^Show/ })).toBeNull();
+    fireEvent.blur(line());
+    expect(screen.queryByRole("button", { name: /^Show/ })).toBeNull();
+    cleanup();
+
+    viewLines = 5;
+    editingLines = 2;
+    render(<Line />);
+    fireEvent.focus(line());
+    expect(screen.getByRole("button", { name: /^Show less/ })).toBeTruthy();
+  });
+
+  test("Show less keeps focus while the Doc locks and unlocks", () => {
+    viewLines = editingLines = 5;
+    function Lockable() {
+      const [editable, setEditable] = useState(true);
+      return (
+        <>
+          <button type="button" onClick={() => setEditable(!editable)}>
+            lock
+          </button>
+          <Line editable={editable} />
+        </>
+      );
+    }
+    render(<Lockable />);
+    fireEvent.focus(line());
+    fireEvent.blur(line());
+    const control = screen.getByRole("button", { name: /^Show less/ });
+    act(() => control.focus());
+    fireEvent.click(screen.getByRole("button", { name: "lock" }));
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(document.activeElement).toBe(control);
+    fireEvent.click(screen.getByRole("button", { name: "lock" }));
+    expect(document.activeElement).toBe(control);
   });
 });

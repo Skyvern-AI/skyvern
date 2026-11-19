@@ -1,0 +1,155 @@
+{
+ "pending_credential_requests": [
+  {
+   "type": "credential_required",
+   "turn_id": "c913bc19c3e24867beef6ff6af1f9340",
+   "workflow_copilot_chat_id": "wcc_596883454841800132",
+   "resume_token": "UlhcUJ5kZUZGEZC112hNnRuDX1Ia469W16j6WzfTFog",
+   "reason": "login_credentials_unresolved",
+   "message": "The workflow needs to sign in to this site, and no saved login covers it yet.",
+   "login_page_urls": [
+    "http://localhost:8961/login/"
+   ],
+   "credential_refs": [],
+   "named_credential_id": null,
+   "timeout_seconds": 300,
+   "expires_at": "2026-11-14T11:37:48.808193Z",
+   "anchor_tool_call_id": "toolu_01VtxLJRJqUqNWK4n65WhPvF",
+   "sign_in_browser_session_id": "pbs_596883480611603912",
+   "signing_in": false,
+   "credential_binding": null,
+   "registration": null,
+   "site_question": null,
+   "timestamp": "2026-11-14T11:32:48.808193Z",
+   "ember_chat_id": "wcc_596883454841800132"
+  }
+ ],
+ "question_interactions": [],
+ "pending_question_cancel_token": null,
+ "workflow_copilot_chat_id": "wcc_596883454841800132",
+ "request_turn_id": null,
+ "request_browser_allocations": null,
+ "in_flight_turn": {
+  "turn_id": "c913bc19c3e24867beef6ff6af1f9340",
+  "cancel_token": "0bf744ad-922b-4ce4-a63e-9d835ba5197c",
+  "latest_draft": null,
+  "latest_draft_at": null,
+  "steer_messages": [],
+  "narrative": {
+   "turnId": "c913bc19c3e24867beef6ff6af1f9340",
+   "turnIndex": 0,
+   "designStarted": true,
+   "designEnded": false,
+   "draft": null,
+   "blocks": [],
+   "terminal": "running",
+   "terminalMessage": null,
+   "narrativeSummary": null,
+   "priorBlockCount": 0,
+   "designActivity": [
+    {
+     "kind": "tool_call",
+     "text": "Checking saved credentials\u2026",
+     "iteration": 0,
+     "toolName": "list_credentials",
+     "displayLabel": "Checking saved credentials",
+     "reason": "Checking for saved logins for this site.",
+     "activityStartedAt": "2026-11-14T11:32:44.090337+00:00",
+     "activityBucket": {
+      "kind": "design"
+     },
+     "id": "tc-toolu_01TqsCWsLvfhqcGMMpJqrKDQ",
+     "timestamp": "2026-11-14T11:32:44.090337+00:00"
+    },
+    {
+     "kind": "tool_call",
+     "text": "Inspecting the page\u2026",
+     "iteration": 0,
+     "toolName": "inspect_page_for_composition",
+     "displayLabel": "Inspecting the page",
+     "reason": "Looking at the sign-in page's fields.",
+     "activityStartedAt": "2026-11-14T11:32:44.144762+00:00",
+     "activityBucket": {
+      "kind": "design"
+     },
+     "id": "tc-toolu_01R7rstSd2zce46H8GiHToXT",
+     "timestamp": "2026-11-14T11:32:44.144762+00:00"
+    },
+    {
+     "kind": "tool_result",
+     "text": "Checking saved credentials",
+     "iteration": 0,
+     "toolName": "list_credentials",
+     "displayLabel": "Checking saved credentials",
+     "success": true,
+     "reason": "Checking for saved logins for this site.",
+     "activityStartedAt": "2026-11-14T11:32:44.090337+00:00",
+     "activityBucket": {
+      "kind": "design"
+     },
+     "id": "tr-toolu_01TqsCWsLvfhqcGMMpJqrKDQ",
+     "timestamp": "2026-11-14T11:32:46.074016+00:00"
+    },
+    {
+     "kind": "tool_result",
+     "text": "Inspected the page (2 form field(s))",
+     "iteration": 1,
+     "toolName": "inspect_page_for_composition",
+     "displayLabel": "Inspecting the page",
+     "success": true,
+     "reason": "Looking at the sign-in page's fields.",
+     "activityStartedAt": "2026-11-14T11:32:44.144762+00:00",
+     "activityBucket": {
+      "kind": "design"
+     },
+     "id": "tr-toolu_01R7rstSd2zce46H8GiHToXT",
+     "timestamp": "2026-11-14T11:32:46.076051+00:00"
+    },
+    {
+     "kind": "tool_call",
+     "text": "Requesting a credential\u2026",
+     "iteration": 2,
+     "toolName": "request_credential",
+     "displayLabel": "Requesting a credential",
+     "reason": "Asking you to add or pick a login for this site.",
+     "activityStartedAt": "2026-11-14T11:32:48.565907+00:00",
+     "activityBucket": {
+      "kind": "design"
+     },
+     "id": "tc-toolu_01VtxLJRJqUqNWK4n65WhPvF",
+     "timestamp": "2026-11-14T11:32:48.565907+00:00"
+    }
+   ],
+   "startedAt": "2026-11-14T11:32:40.507689+00:00",
+   "endedAt": null,
+   "browserSessionId": null,
+   "pausedFor": "credential"
+  }
+ },
+ "chat_history": [
+  {
+   "workflow_copilot_chat_message_id": "wccm_596883454841800134",
+   "sender": "user",
+   "content": "Build a workflow that signs in to http://localhost:8961/login/ and extracts the page heading shown after sign-in. I have not saved a login for this site yet.",
+   "turn_id": "c913bc19c3e24867beef6ff6af1f9340",
+   "feedback": null,
+   "audio_artifact_id": null,
+   "attached_files": [],
+   "turn_outcome": null,
+   "narrative_payload": null,
+   "created_at": "2026-11-14T11:32:38.804021",
+   "modified_at": "2026-11-14T11:32:40.505594",
+   "ember_chat_message_id": "wccm_596883454841800134"
+  }
+ ],
+ "workflow_permanent_id": "wpid_596883454841800128",
+ "app_url": "http://localhost:8080",
+ "accepted_turn_ids": [],
+ "proposed_workflow": null,
+ "proposed_workflow_metadata": null,
+ "proposed_claim_expires_in_seconds": null,
+ "proposed_workflow_run": null,
+ "auto_accept": false,
+ "work_plan": [],
+ "ember_chat_id": "wcc_596883454841800132"
+}

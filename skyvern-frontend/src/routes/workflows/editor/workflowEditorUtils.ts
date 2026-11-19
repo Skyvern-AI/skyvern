@@ -3,6 +3,9 @@ import { buildWorkflowSaveRequest } from "./workflowYamlDocument";
 import { normalizeRetryPolicy } from "./nodes/StartNode/retryPolicyUtils";
 import Dagre from "@dagrejs/dagre";
 import type { QueryClient } from "@tanstack/react-query";
+import { queryClient as appQueryClient } from "@/api/QueryClient";
+import { integrationCatalogQueryOptions } from "@/hooks/useIntegrationCatalogQuery";
+import type { ActiveOrgId } from "@/store/ActiveOrgContext";
 import {
   applyNodeChanges,
   applyEdgeChanges,
@@ -86,6 +89,7 @@ import {
   EmailInboxBlockYAML,
   GoogleSheetsReadBlockYAML,
   GoogleSheetsWriteBlockYAML,
+  IntegrationActionBlockYAML,
   PowerBIQueryBlockYAML,
   PdfFillBlockYAML,
   SplitPdfBlockYAML,
@@ -105,7 +109,7 @@ import type {
   CodeEditedBlock,
   GoalSuggestion,
   PendingGoalChange,
-} from "@/store/useCopilotActionStore";
+} from "@/store/useEmberActionStore";
 import { dataExportNodeDefaultData } from "./nodes/DataExportNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import {
@@ -211,6 +215,12 @@ import {
 } from "./nodes/GoogleSheetsWriteNode/types";
 import { validateGoogleSheetsWriteNode } from "./nodes/GoogleSheetsWriteNode/validate";
 import {
+  integrationActionNodeDefaultData,
+  isIntegrationActionNode,
+  type IntegrationCatalogEntryWithActions,
+} from "./nodes/IntegrationActionNode/types";
+import { validateIntegrationActionNode } from "./nodes/IntegrationActionNode/validate";
+import {
   POWERBI_QUERY_DEFAULT_MAX_ROWS,
   isPowerBIQueryNode,
   powerBIQueryNodeDefaultData,
@@ -237,6 +247,7 @@ import {
   transformStringFieldsInObject,
   type AffectedBlock,
 } from "./jinjaReferences";
+import { resolveDocImages } from "./doc/docImageHandles";
 import {
   findFinallyBlockNodeId,
   isBlockFinallyGated,
@@ -254,29 +265,41 @@ export function inferBranchCriteriaTypeFromExpression(
   return BranchCriteriaTypes.Prompt;
 }
 
+type DocFieldsData = Pick<
+  NodeBaseData,
+  "notes" | "trailingNotes" | "description" | "docImages" | "promptImages"
+>;
+
 // Loaded only when set, so a block without them (or with the server's null default)
 // saves exactly as it would without these fields.
-function docFieldsFromBlock(
-  block: WorkflowBlockDocFields,
-): Pick<NodeBaseData, "notes" | "trailingNotes" | "description"> {
+function docFieldsFromBlock(block: WorkflowBlockDocFields): DocFieldsData {
   return {
     ...(block.notes != null && { notes: block.notes }),
     ...(block.trailing_notes != null && {
       trailingNotes: block.trailing_notes,
     }),
     ...(block.description != null && { description: block.description }),
+    ...(block.doc_images != null && { docImages: block.doc_images }),
+    ...(block.prompt_images != null && { promptImages: block.prompt_images }),
   };
 }
 
-function docFieldsFromNodeData(
-  data: Pick<NodeBaseData, "notes" | "trailingNotes" | "description">,
-): WorkflowBlockDocFields {
+function docFieldsFromNodeData(data: DocFieldsData): WorkflowBlockDocFields {
+  // Screenshots still uploading leave the save; a step holding only those saves as if it held none.
+  const docImages = data.docImages?.length
+    ? resolveDocImages(data.docImages)
+    : data.docImages;
   return {
     ...(data.notes != null && { notes: data.notes }),
     ...(data.trailingNotes != null && {
       trailing_notes: data.trailingNotes,
     }),
     ...(data.description != null && { description: data.description }),
+    ...(docImages != null &&
+      (docImages.length > 0 || !data.docImages?.length) && {
+        doc_images: docImages,
+      }),
+    ...(data.promptImages != null && { prompt_images: data.promptImages }),
   };
 }
 
@@ -1530,6 +1553,8 @@ function convertToNode(
           includeBody: block.include_body ?? true,
           downloadAttachments: block.download_attachments ?? false,
           messageId: block.message_id ?? "",
+          organizeAction: block.organize_action,
+          organizeLabel: block.organize_label,
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -1583,6 +1608,21 @@ function convertToNode(
             ? JSON.stringify(block.column_mapping, null, 2)
             : "",
           createSheetIfMissing: block.create_sheet_if_missing ?? false,
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
+        },
+      };
+    }
+    case "integration_action": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "integrationAction",
+        data: {
+          ...commonData,
+          integrationId: block.integration_id,
+          actionId: block.action_id,
+          connectionId: block.connection_id ?? "",
+          inputs: block.inputs ?? {},
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -2160,7 +2200,6 @@ function reconstructConditionalStructure(
           withWorkflowSettings: false,
           editable: true,
           label: "__start_block__",
-          showCode: false,
           parentNodeType: "conditional",
         },
         conditionalNode.id,
@@ -2565,7 +2604,6 @@ function getElements(
       aiFallback: settings.aiFallback ?? true,
       maskSecrets: settings.maskSecrets,
       label: "__start_block__",
-      showCode: false,
       runSequentially: settings.runSequentially,
       sequentialKey: settings.sequentialKey,
       finallyBlockLabel: settings.finallyBlockLabel ?? null,
@@ -2612,7 +2650,6 @@ function getElements(
           withWorkflowSettings: false,
           editable,
           label: "__start_block__",
-          showCode: false,
         },
         block.id,
       ),
@@ -3246,6 +3283,17 @@ function createNode(
         type: "googleSheetsWrite",
         data: {
           ...googleSheetsWriteNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "integrationAction": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "integrationAction",
+        data: {
+          ...integrationActionNodeDefaultData,
           label,
         },
       };
@@ -3906,7 +3954,10 @@ function getWorkflowBlock(
           file_attachments: splitEmailList(node.data.fileAttachments).filter(
             (attachment) => attachment !== SKYVERN_DOWNLOAD_DIRECTORY,
           ),
-          reply_to_message_id: node.data.replyToMessageId || null,
+          ...(node.data.replyToMessageId &&
+            node.data.credentialSource !== "nango" && {
+              reply_to_message_id: node.data.replyToMessageId,
+            }),
         };
       }
       return {
@@ -4150,6 +4201,10 @@ function getWorkflowBlock(
       };
     }
     case "emailInbox": {
+      const keepOrganize =
+        node.data.organizeAction == null ||
+        (node.data.emailClient === "gmail" &&
+          node.data.credentialSource === "nango");
       return {
         ...base,
         block_type: "email_inbox",
@@ -4165,7 +4220,19 @@ function getWorkflowBlock(
         max_results: node.data.maxResults,
         include_body: node.data.includeBody,
         download_attachments: node.data.downloadAttachments,
-        message_id: node.data.messageId || null,
+        ...(node.data.messageId &&
+          node.data.emailClient === "gmail" &&
+          node.data.credentialSource !== "nango" && {
+            message_id: node.data.messageId,
+          }),
+        ...(keepOrganize &&
+          node.data.organizeAction !== undefined && {
+            organize_action: node.data.organizeAction,
+          }),
+        ...(keepOrganize &&
+          node.data.organizeLabel !== undefined && {
+            organize_label: node.data.organizeLabel,
+          }),
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4213,6 +4280,17 @@ function getWorkflowBlock(
         values: node.data.values,
         column_mapping: parsedColumnMapping,
         create_sheet_if_missing: node.data.createSheetIfMissing,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "integrationAction": {
+      return {
+        ...base,
+        block_type: "integration_action",
+        integration_id: node.data.integrationId,
+        action_id: node.data.actionId,
+        connection_id: node.data.connectionId || null,
+        inputs: node.data.inputs,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4462,7 +4540,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     maxElapsedTimeMinutes: null,
     extraHttpHeaders: null,
     cdpConnectHeaders: null,
-    runWith: "code",
+    runWith: "agent",
     codeVersion: 2,
     scriptCacheKey: null,
     aiFallback: true,
@@ -4898,6 +4976,12 @@ function getAvailableOutputParameterKeys(
 // well as a Drive URL, and lowercases the host before comparing it. A templated URL can
 // still resolve to a Drive link at run time, so treat it as a maybe.
 const bareDriveFileId = /^[A-Za-z0-9_-]+$/;
+// Publish-to-web Doc links (/document/d/e/<public-id>) are not Drive file ids.
+const driveFilePathByHost: Record<string, RegExp> = {
+  "drive.google.com": /^\/file\/(?:u\/\d+\/)?d\/[A-Za-z0-9_-]+(?:\/|$)/,
+  "docs.google.com":
+    /^\/document\/(?:u\/\d+\/)?d\/(?!e(?:\/|$))[A-Za-z0-9_-]+(?:\/|$)/,
+};
 
 function urlMayBeGoogleDrive(url: string): boolean {
   const candidate = url.trim();
@@ -4909,8 +4993,7 @@ function urlMayBeGoogleDrive(url: string): boolean {
     const parsed = new URL(candidate);
     return (
       parsed.protocol === "https:" &&
-      parsed.hostname === "drive.google.com" &&
-      parsed.pathname.startsWith("/file/d/")
+      (driveFilePathByHost[parsed.hostname]?.test(parsed.pathname) ?? false)
     );
   } catch {
     return false;
@@ -5011,6 +5094,67 @@ function isMissingRequiredStartUrl(
     opensPageWithoutUrl(node, nodes) &&
     isFirstBrowserTaskBlock(nodes, edges, id)
   );
+}
+
+/** The ids `isMissingRequiredStartUrl` holds for, found in one pass over the graph. */
+function startUrlRequiredIds(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+): Set<string> {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  // `getPreviousNodeIds` follows the first edge into each node.
+  const sourceOf = new Map<string, string>();
+  for (const edge of edges)
+    if (!sourceOf.has(edge.target)) sourceOf.set(edge.target, edge.source);
+  const leaves = new Map<string, boolean>();
+  const leavesById = (id: string) => {
+    let value = leaves.get(id);
+    if (value === undefined) {
+      const node = byId.get(id);
+      value = node !== undefined && leavesBrowserState(node, nodes);
+      leaves.set(id, value);
+    }
+    return value;
+  };
+  // Whether a page is open before `id` runs: its predecessors, then its container's. Walked with an explicit stack, as
+  // a chain of thousands of steps would overflow a recursive walk.
+  const opened = new Map<string, boolean>();
+  const visiting = new Set<string>();
+  const openedBefore = (first: string): boolean => {
+    const stack = [first];
+    while (stack.length) {
+      const id = stack[stack.length - 1]!;
+      const source = sourceOf.get(id);
+      const parentId = byId.get(id)?.parentId;
+      if (visiting.has(id)) {
+        visiting.delete(id);
+        opened.set(
+          id,
+          (source !== undefined &&
+            (leavesById(source) || opened.get(source) === true)) ||
+            (parentId !== undefined && opened.get(parentId) === true),
+        );
+        stack.pop();
+      } else if (opened.has(id)) {
+        stack.pop();
+      } else {
+        // A cycle is an invalid graph (it would loop forever in `getPreviousNodeIds`). This provisional false is
+        // memoized for the nodes visited mid-cycle, so there the result can depend on iteration order.
+        opened.set(id, false);
+        visiting.add(id);
+        if (parentId !== undefined && !opened.has(parentId))
+          stack.push(parentId);
+        if (source !== undefined && !leavesById(source) && !opened.has(source))
+          stack.push(source);
+      }
+    }
+    return opened.get(first) === true;
+  };
+  const ids = new Set<string>();
+  for (const node of nodes)
+    if (opensPageWithoutUrl(node, nodes) && !openedBefore(node.id))
+      ids.add(node.id);
+  return ids;
 }
 
 function convertParametersToParameterYAML(
@@ -5758,6 +5902,12 @@ function convertBlocksToBlockYAML(
           include_body: block.include_body,
           download_attachments: block.download_attachments,
           message_id: block.message_id ?? null,
+          ...(block.organize_action !== undefined && {
+            organize_action: block.organize_action,
+          }),
+          ...(block.organize_label !== undefined && {
+            organize_label: block.organize_label,
+          }),
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
@@ -5800,6 +5950,18 @@ function convertBlocksToBlockYAML(
           values: block.values,
           column_mapping: block.column_mapping,
           create_sheet_if_missing: block.create_sheet_if_missing,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "integration_action": {
+        const blockYaml: IntegrationActionBlockYAML = {
+          ...base,
+          block_type: "integration_action",
+          integration_id: block.integration_id,
+          action_id: block.action_id,
+          connection_id: block.connection_id,
+          inputs: block.inputs,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
@@ -6065,14 +6227,19 @@ function pendingGoalErrors(nodes: Array<AppNode>): Array<string> {
 function blockRunErrors(
   nodes: Array<AppNode>,
   blockLabel: string,
+  activeOrgId?: ActiveOrgId,
 ): Array<string> {
   const pendingGoals = new Set(pendingGoalErrors(nodes));
-  return getWorkflowErrors(nodes).filter(
+  return getWorkflowErrors(nodes, activeOrgId).filter(
     (error) => error.startsWith(`${blockLabel}:`) || pendingGoals.has(error),
   );
 }
 
-function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
+// activeOrgId picks that org's cached app catalog for app action checks; without it they check ids only.
+function getWorkflowErrors(
+  nodes: Array<AppNode>,
+  activeOrgId?: ActiveOrgId,
+): Array<string> {
   const errors: Array<string> = [...pendingGoalErrors(nodes)];
 
   const workflowBlockNodes = nodes.filter(isWorkflowBlockNode);
@@ -6474,6 +6641,18 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     .filter(isGoogleSheetsWriteNode)
     .forEach((node) => errors.push(...validateGoogleSheetsWriteNode(node)));
 
+  const integrationCatalog =
+    activeOrgId === undefined
+      ? undefined
+      : appQueryClient.getQueryData<IntegrationCatalogEntryWithActions[]>(
+          integrationCatalogQueryOptions(null, activeOrgId).queryKey,
+        );
+  nodes
+    .filter(isIntegrationActionNode)
+    .forEach((node) =>
+      errors.push(...validateIntegrationActionNode(node, integrationCatalog)),
+    );
+
   nodes
     .filter(isPdfFillNode)
     .forEach((node) => errors.push(...validatePdfFillNode(node)));
@@ -6566,6 +6745,7 @@ export {
   isFirstBrowserTaskBlock,
   isMissingRequiredStartUrl,
   opensPageWithoutUrl,
+  startUrlRequiredIds,
   urlMayBeGoogleDrive,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
@@ -6626,18 +6806,18 @@ function workflowGraphContent(items: AppNode[], connections: Edge[]) {
   }
 }
 
-// Marker class for the copilot's gold-ring block-highlight flash. Kept off
+// Marker class for the Ember's gold-ring block-highlight flash. Kept off
 // React Flow's `.selected` so a normal editor node click (which sets
 // `selected` to open the sidebar) doesn't trigger the flash. Must match the
 // selector in reactFlowOverrideStyles.css.
-const COPILOT_BLOCK_HIGHLIGHT_CLASS = "sk-copilot-block-highlight";
-const COPILOT_BLOCK_HIGHLIGHT_MS = 1500;
+const EMBER_BLOCK_HIGHLIGHT_CLASS = "sk-ember-block-highlight";
+const EMBER_BLOCK_HIGHLIGHT_MS = 1500;
 
 function setBlockHighlightClass(node: AppNode, on: boolean): AppNode {
   const tokens = (node.className ?? "")
     .split(/\s+/)
-    .filter((token) => token && token !== COPILOT_BLOCK_HIGHLIGHT_CLASS);
-  if (on) tokens.push(COPILOT_BLOCK_HIGHLIGHT_CLASS);
+    .filter((token) => token && token !== EMBER_BLOCK_HIGHLIGHT_CLASS);
+  if (on) tokens.push(EMBER_BLOCK_HIGHLIGHT_CLASS);
   const next = tokens.join(" ") || undefined;
   if ((node.className ?? undefined) === next) return node;
   return { ...node, className: next };
@@ -6682,7 +6862,7 @@ export function useWorkflowGraphState(
       const workflowId =
         useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId;
       const trackedProposal = workflowId
-        ? useWorkflowTitleStore.getState().copilotMetadataEdits[workflowId]
+        ? useWorkflowTitleStore.getState().emberMetadataEdits[workflowId]
         : undefined;
       if (
         fromUser &&
@@ -6691,7 +6871,7 @@ export function useWorkflowGraphState(
         JSON.stringify(getWorkflowBlocks(previous, currentEdges.current)) !==
           JSON.stringify(getWorkflowBlocks(next, currentEdges.current))
       )
-        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        useWorkflowTitleStore.getState().recordEmberGraphEdit();
       updateNodes(next);
     },
     [updateNodes],
@@ -6711,7 +6891,7 @@ export function useWorkflowGraphState(
       const workflowId =
         useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId;
       const trackedProposal = workflowId
-        ? useWorkflowTitleStore.getState().copilotMetadataEdits[workflowId]
+        ? useWorkflowTitleStore.getState().emberMetadataEdits[workflowId]
         : undefined;
       if (
         fromUser &&
@@ -6720,7 +6900,7 @@ export function useWorkflowGraphState(
         JSON.stringify(getWorkflowBlocks(currentNodes.current, previous)) !==
           JSON.stringify(getWorkflowBlocks(currentNodes.current, next))
       )
-        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        useWorkflowTitleStore.getState().recordEmberGraphEdit();
       updateEdges(next);
     },
     [updateEdges],
@@ -6752,7 +6932,7 @@ export function useWorkflowGraphState(
     [setEdges, updateEdges],
   );
   // A highlight is presentation, not an edit, so it bypasses the edit lock a
-  // running Copilot turn holds.
+  // running Ember turn holds.
   const highlightBlock = useCallback(
     (blockLabel: string) => {
       const matches = (node: AppNode) =>
@@ -6768,7 +6948,7 @@ export function useWorkflowGraphState(
             matches(node) ? setBlockHighlightClass(node, false) : node,
           ),
         );
-      }, COPILOT_BLOCK_HIGHLIGHT_MS);
+      }, EMBER_BLOCK_HIGHLIGHT_MS);
     },
     [updateNodes],
   );

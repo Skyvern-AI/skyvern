@@ -193,7 +193,7 @@ def _stub_common(mp: pytest.MonkeyPatch, outcome: HandlerOutcome, context: Skyve
     mp.setattr(api_handler_factory.litellm, "completion_cost", lambda completion_response: LLM_COST)
 
     def capture_info(_event: str, **fields: Any) -> None:
-        if fields.get("log_code") == "copilot_model_usage":
+        if fields.get("log_code") == "model_usage":
             outcome.usage_events.append(fields)
         if _event == "LLM API handler duration metrics":
             outcome.metrics_events.append(fields)
@@ -590,7 +590,7 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
         )
 
     expected = {
-        "log_code": "copilot_model_usage",
+        "log_code": "model_usage",
         "gen_ai.operation.name": "chat",
         "gen_ai.request.model": "gpt-4",
         "gen_ai.response.model": "openai/gpt-4.1",
@@ -600,7 +600,8 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
         "gen_ai.usage.cache_read.input_tokens": 0,
         "gen_ai.usage.cache_creation.input_tokens": 0,
         "operation.cost": LLM_COST,
-        "copilot.prompt_name": "workflow-copilot-narration",
+        "gen_ai.agent.name": "ember",
+        "llm.prompt_name": "workflow-copilot-narration",
     }
     assert direct.error is None and router.error is None
     assert direct.usage_events == router.usage_events == [expected]

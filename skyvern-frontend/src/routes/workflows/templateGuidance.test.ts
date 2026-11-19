@@ -60,8 +60,8 @@ describe("buildTemplateGuidanceMessage", () => {
 
 describe("withoutTemplateViaParam", () => {
   it("drops only via=template", () => {
-    expect(withoutTemplateViaParam("?via=template&panes=copilot")).toBe(
-      "?panes=copilot",
+    expect(withoutTemplateViaParam("?via=template&panes=ember")).toBe(
+      "?panes=ember",
     );
     expect(withoutTemplateViaParam("?via=discover")).toBe("?via=discover");
   });

@@ -1,5 +1,27 @@
 import type { WorkflowBlockType } from "../../types/workflowTypes";
+import { agentStepToolTitles } from "../nodes/AgentStepNode/types";
+import { workflowBlockTitle } from "../nodes/types";
 import { docDetailsText } from "./docDetailsText";
+
+export type DocMetaIcon =
+  | "credential"
+  | "url"
+  | "file"
+  | "email"
+  | "text"
+  | "agent"
+  | "method"
+  | "range"
+  | "model"
+  | "errorCode";
+
+// A field shown on the step's summary line under its title instead of in Details.
+export type DocFieldMeta = {
+  icon: DocMetaIcon;
+  // When an unset field shows as a dashed chip in an editable Doc; otherwise it stays in Details as unset.
+  // A "firstPage" field is needed only on the step that opens the run's first page, and is left out unset elsewhere.
+  emptyChip: "always" | "firstPage" | "never";
+};
 
 // A block's key settings for Details, by saved (YAML) key. The first key with a value is shown; `empty` when none has one.
 export type DocFieldSpec = {
@@ -12,6 +34,10 @@ export type DocFieldSpec = {
   hiddenWhen?: (saved: Record<string, unknown>) => boolean;
   // A value the editor holds but does not save, shown ahead of the saved keys.
   editorValue?: (data: Record<string, unknown>) => unknown;
+  meta?: DocFieldMeta;
+  // What follows "Add" on the button an editable Doc offers for the field while it is unset (a dashed chip on the
+  // summary line, a button on its Details row); it opens the step's settings.
+  addLabel?: string;
 };
 
 const field = (
@@ -22,6 +48,11 @@ const field = (
   keys: typeof keys === "string" ? [keys] : keys,
   label,
   empty,
+});
+
+const onLine = (spec: DocFieldSpec, meta: DocFieldMeta): DocFieldSpec => ({
+  ...spec,
+  meta,
 });
 
 // Every field label Details uses for key settings.
@@ -36,7 +67,6 @@ const L = {
   errorCodes: "Error codes",
   url: "URL",
   terminateIf: "Terminate if",
-  cache: "Cache disabled",
   continueOnFailure: "Continue on failure",
   nextLoopOnFailure: "Next loop on failure",
   completeIfEmpty: "Complete if empty",
@@ -52,44 +82,90 @@ const L = {
   sender: "Sender",
   range: "Range",
   agent: "Agent",
+  tools: "Tools",
 } as const;
 
-// Up to four per type, ranked by how often users change the field between saved versions, then by how often it is set;
-// a login's credential and 2FA and a file download's file name lead, and fields the Doc already shows are left out.
+const errorCodes = () => ({
+  ...field("error_code_mapping", L.errorCodes),
+  addLabel: "error code",
+});
+
+const pageUrl = (
+  emptyChip: DocFieldMeta["emptyChip"] = "firstPage",
+  addLabel = "Page URL",
+): DocFieldSpec => ({
+  ...onLine(field("url", L.url), { icon: "url", emptyChip }),
+  addLabel,
+});
+
+// Up to four Details rows per type, ranked by how often users change the field between saved versions, then by how often it is set;
+// a login's 2FA leads, and fields the Doc already shows, on the step's lines or its summary line, are left out.
+// A `meta` field (the thing the step acts on or with) sits on the summary line, at most two per step in this order.
 export const DOC_FIELD_MAP: Partial<
   Record<WorkflowBlockType, readonly DocFieldSpec[]>
 > = {
+  agent_step: [
+    onLine(
+      {
+        ...field("tools", L.tools, "None"),
+        editorValue: (data) =>
+          Array.isArray(data.tools)
+            ? data.tools
+                .map((tool) => {
+                  const name = String(tool);
+                  return (
+                    agentStepToolTitles[name] ??
+                    (name === "browser_task"
+                      ? workflowBlockTitle.navigation
+                      : workflowBlockTitle[name as WorkflowBlockType]) ??
+                    name
+                  );
+                })
+                .join(", ")
+            : null,
+      },
+      { icon: "agent", emptyChip: "always" },
+    ),
+  ],
   navigation: [
     field("engine", L.engine, "Default"),
     field("max_steps_per_run", L.maxSteps, "Default"),
-    field("error_code_mapping", L.errorCodes),
-    field("url", L.url),
+    errorCodes(),
+    pageUrl(),
   ],
-  code: [
-    field("error_code_mapping", L.errorCodes),
-    field("continue_on_failure", L.continueOnFailure, "No"),
-  ],
+  code: [errorCodes(), field("continue_on_failure", L.continueOnFailure, "No")],
   extraction: [
+    pageUrl(),
     field("engine", L.engine, "Default"),
     field("max_steps_per_run", L.maxSteps, "Default"),
     field("max_retries", L.maxRetries, "0"),
-    field("disable_cache", L.cache, "No"),
   ],
   login: [
-    { ...field("parameter_keys", L.credential), credentialsOnly: true },
-    field(["totp_identifier", "totp_verification_url"], L.twoFactor),
-    field("error_code_mapping", L.errorCodes),
-    field("url", L.url),
+    onLine(
+      { ...field("parameter_keys", L.credential), credentialsOnly: true },
+      { icon: "credential", emptyChip: "always" },
+    ),
+    {
+      ...field(["totp_identifier", "totp_verification_url"], L.twoFactor),
+      addLabel: "2FA",
+    },
+    errorCodes(),
+    pageUrl("always", "Login page URL"),
   ],
   action: [
+    pageUrl(),
     field("engine", L.engine, "Default"),
     field("max_retries", L.maxRetries, "0"),
-    field("error_code_mapping", L.errorCodes),
+    errorCodes(),
     field("continue_on_failure", L.continueOnFailure, "No"),
   ],
   file_download: [
-    field("download_suffix", L.fileName),
-    field("error_code_mapping", L.errorCodes),
+    onLine(field("download_suffix", L.fileName), {
+      icon: "file",
+      emptyChip: "never",
+    }),
+    pageUrl(),
+    errorCodes(),
     field("engine", L.engine, "Default"),
     {
       ...field("download_timeout", L.downloadTimeout, "Default"),
@@ -111,29 +187,45 @@ export const DOC_FIELD_MAP: Partial<
     },
     field("headers", L.headers),
     field("continue_on_failure", L.continueOnFailure, "No"),
-    field("method", L.method),
+    onLine(field("method", L.method), { icon: "method", emptyChip: "never" }),
   ],
   task: [
     field("engine", L.engine, "Default"),
     field("terminate_criterion", L.terminateIf),
-    field("url", L.url),
+    pageUrl(),
     field("max_steps_per_run", L.maxSteps, "Default"),
   ],
-  text_prompt: [field("model", L.model, "Default")],
+  text_prompt: [
+    onLine(field("model", L.model, "Default"), {
+      icon: "model",
+      emptyChip: "never",
+    }),
+  ],
   file_url_parser: [
-    field("file_type", L.fileType),
+    onLine(field("file_type", L.fileType), {
+      icon: "file",
+      emptyChip: "never",
+    }),
     field("continue_on_failure", L.continueOnFailure, "No"),
   ],
   validation: [
-    field("error_code_mapping", L.errorCodes),
+    errorCodes(),
     field("engine", L.engine, "Default"),
     field("next_loop_on_failure", L.nextLoopOnFailure, "No"),
   ],
-  terminate: [field("error_code", L.errorCode)],
+  terminate: [
+    onLine(field("error_code", L.errorCode), {
+      icon: "errorCode",
+      emptyChip: "never",
+    }),
+  ],
   send_email: [
     field("file_attachments", L.attachments),
-    field("recipients", L.recipients),
-    field("subject", L.subject),
+    onLine(field("recipients", L.recipients), {
+      icon: "email",
+      emptyChip: "always",
+    }),
+    onLine(field("subject", L.subject), { icon: "text", emptyChip: "never" }),
     // Gmail sends from the connected account and saves an empty sender.
     {
       ...field("sender", L.sender),
@@ -142,11 +234,18 @@ export const DOC_FIELD_MAP: Partial<
   ],
   // The title is the editor's name for the target; one loaded without it shows the target's id.
   workflow_trigger: [
-    {
-      ...field("workflow_permanent_id", L.agent),
-      editorValue: (data) => data.workflowTitle,
-    },
+    onLine(
+      {
+        ...field("workflow_permanent_id", L.agent),
+        editorValue: (data) => data.workflowTitle,
+      },
+      { icon: "agent", emptyChip: "always" },
+    ),
   ],
-  google_sheets_read: [field("range", L.range)],
-  google_sheets_write: [field("range", L.range)],
+  google_sheets_read: [
+    onLine(field("range", L.range), { icon: "range", emptyChip: "never" }),
+  ],
+  google_sheets_write: [
+    onLine(field("range", L.range), { icon: "range", emptyChip: "never" }),
+  ],
 };

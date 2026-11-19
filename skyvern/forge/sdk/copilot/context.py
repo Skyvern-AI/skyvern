@@ -17,6 +17,7 @@ import structlog
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 from typing_extensions import NotRequired, TypedDict
 
+from skyvern.forge.sdk.agents.skills import SkillSession
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.agent_context import AgentContext
 from skyvern.forge.sdk.copilot.browser_ablation import (
@@ -24,7 +25,6 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     CopilotToolSurfaceIdentity,
 )
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
-from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.code_write_diff import TURN_PATCH_CHAR_BUDGET, CodeWriteDiff
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.connected_accounts import ConnectionCardPayload
@@ -33,11 +33,12 @@ from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint, safe_page_origin
 from skyvern.forge.sdk.copilot.review_gate import NarrativeReviewProjection
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.block_notes import block_field_texts
+from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.proxy_location import ProxyLocationInput
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.utils.strings import join_phrases
 
 LOG = structlog.get_logger()
@@ -160,6 +161,7 @@ class NarrativeBlock(TypedDict):
     label: str
     workflowRunBlockId: NotRequired[str]
     workflowRunId: NotRequired[str]
+    parentWorkflowRunBlockId: NotRequired[str]
     blockType: str
     state: str
     lastSeenIteration: int
@@ -180,6 +182,7 @@ MAX_NARRATIVE_BLOCK_ATTEMPTS = 200
 class NarrativeBlockAttempt(TypedDict):
     workflowRunBlockId: str
     workflowRunId: str | None
+    parentWorkflowRunBlockId: NotRequired[str]
     label: str
     blockType: str
     rawStatus: str
@@ -210,6 +213,7 @@ def upsert_narrative_block_attempt(
     iteration: int,
     started_at: str | None,
     ended_at: str | None,
+    parent_workflow_run_block_id: str | None = None,
 ) -> NarrativeBlockAttempt:
     attempt = archive.get(workflow_run_block_id)
     if attempt is None:
@@ -223,12 +227,16 @@ def upsert_narrative_block_attempt(
             "startedAt": started_at,
             "endedAt": ended_at,
         }
+        if parent_workflow_run_block_id:
+            attempt["parentWorkflowRunBlockId"] = parent_workflow_run_block_id
         archive[workflow_run_block_id] = attempt
         while len(archive) > MAX_NARRATIVE_BLOCK_ATTEMPTS:
             del archive[next(iter(archive))]
         return attempt
 
     attempt["workflowRunId"] = workflow_run_id or attempt["workflowRunId"]
+    if parent_workflow_run_block_id:
+        attempt["parentWorkflowRunBlockId"] = parent_workflow_run_block_id
     attempt["label"] = label or attempt["label"]
     attempt["blockType"] = block_type or attempt["blockType"]
     attempt["rawStatus"] = status
@@ -377,6 +385,11 @@ class TurnNarrativePayload(TypedDict):
     budgetExpiry: NotRequired[NarrativeBudgetExpiry]
     turnFacts: NotRequired[NarrativeTurnFacts]
     demonstrationItems: NotRequired[list[str]]
+
+
+class LiveTurnNarrative(TurnNarrativePayload):
+    browserSessionId: str | None
+    pausedFor: Literal["question", "credential"] | None
 
 
 if TYPE_CHECKING:
@@ -1259,6 +1272,8 @@ class AgentResult:
     # The turn took over another turn's stored candidate and authored nothing since, so it has no turn-end write.
     proposal_adopted: bool = False
     proposal_workflow_run_id: str | None = None
+    # The version a run card saved this turn: the turn's rollback target, and it rules out an auto-accept commit.
+    run_card_saved_workflow: Workflow | None = None
     code_artifact_metadata: dict[str, dict[str, Any]] | None = None
     executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
     # Legacy marker for turns that wrote canonical before snapshot isolation.
@@ -1358,6 +1373,7 @@ class CopilotContext(AgentContext):
     earlier_chat_history_rows: Callable[[], tuple[ChatHistoryRow, ...]] = tuple
     chat_history_oldest_shown_id: str | None = None
     earlier_chat_history_unavailable: bool = False
+    skill_session: SkillSession = field(default_factory=lambda: SkillSession([], agent="copilot"))
     prior_turn_outcome: TurnOutcome | None = None
     # Server-verified display data for recovering from a model-staged connected
     # account that has no run authority. This never grants authority itself.
@@ -1590,6 +1606,10 @@ class CopilotContext(AgentContext):
     proposal_adoptions_seen_by_model: int = 0
     proposal_canonical_fingerprint: str | None = None
     proposal_workflow_run_id: str | None = None
+    # When set, a run binds only while the stored run id still equals proposal_workflow_run_id, so two turns
+    # resuming one account pick cannot both bind a run.
+    proposal_bind_checks_run_id: bool = False
+    run_card_saved_workflow: Workflow | None = None
     # A restored candidate whose request private settings differ from its own; its stored bytes cannot vouch
     # for what a test under this token would run, so binding a run to it is refused.
     settings_diverged_proposal_token: tuple[str, int] | None = None
@@ -1607,6 +1627,9 @@ class CopilotContext(AgentContext):
     narrative_block_attempts: dict[str, NarrativeBlockAttempt] = field(default_factory=dict)
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
+    # Browser predicted for the latest browser tool call, as on its tool_call frame; kept when a call predicts none.
+    tool_browser_session_id: str | None = None
+    live_narrative_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         parent_post_init = getattr(super(), "__post_init__", None)

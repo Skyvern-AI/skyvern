@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import os
+import sqlite3
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
+from dotenv import dotenv_values
 
+import skyvern.config as skyvern_config
 from skyvern.cli import init_command
+from skyvern.forge.sdk.settings_manager import SettingsManager
 
 
 def test_server_extra_install_target_pins_installed_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -103,3 +109,38 @@ def test_init_env_wraps_local_org_setup_with_server_dependency_install(
     assert result.run_local is True
     assert wrapped_results == [None, "skyvern-api-key"]
     assert env_updates["SKYVERN_API_KEY"] == "skyvern-api-key"
+
+
+def test_init_env_on_sqlite_builds_schema_and_seeds_local_org(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database_path = tmp_path / "data.db"
+    database_string = f"sqlite+aiosqlite:///{database_path}"
+    env_path = tmp_path / ".env"
+    monkeypatch.setenv(init_command.BACKEND_ENV_FILE_ENV_VAR, "")
+    monkeypatch.setenv("DATABASE_STRING", database_string)
+    monkeypatch.setattr(init_command, "setup_postgresql", lambda *args, **kwargs: None)
+    # migrate_db swaps the process-wide settings for a fresh Settings(); restore them after the test.
+    monkeypatch.setattr(skyvern_config, "settings", skyvern_config.settings)
+    monkeypatch.setattr(SettingsManager, "_SettingsManager__instance", SettingsManager.get_settings())
+
+    # init_env mirrors every .env write into os.environ.
+    with patch.dict(os.environ):
+        result = init_command.init_env(
+            no_postgres=True,
+            skip_browser_install=True,
+            mode="local",
+            skip_llm_setup=True,
+            configure_mcp=False,
+            browser_type="cdp-connect",
+            analytics_id="anonymous",
+            env_path=env_path,
+            return_result=True,
+        )
+
+    assert result.run_local is True
+    with sqlite3.connect(database_path) as connection:
+        valid_tokens = connection.execute("SELECT count(*) FROM organization_auth_tokens WHERE valid").fetchone()
+    assert valid_tokens == (1,)
+    written_env = dotenv_values(env_path)
+    assert written_env["SKYVERN_API_KEY"]
+    # The server reads this .env next, so it must not point at a database other than the one just seeded.
+    assert written_env.get("DATABASE_STRING", database_string) == database_string

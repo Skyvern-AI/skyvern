@@ -37,10 +37,6 @@ from skyvern.forge import app
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_handler
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.copilot_model_usage import (
-    CopilotModelUsageEvent,
-    _emit_direct_copilot_model_usage,
-)
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CUSTOM_LLM_KEY_PREFIX,
     custom_llm_passthrough_parameters,
@@ -60,6 +56,10 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
 from skyvern.forge.sdk.api.llm.litellm_usage import use_anthropic_reported_thinking_tokens
+from skyvern.forge.sdk.api.llm.model_usage import (
+    ModelUsageEvent,
+    _emit_direct_copilot_model_usage,
+)
 from skyvern.forge.sdk.api.llm.nace_decision_llm_caller import (
     NACE_DECISION_LLM_KEY,
     call_nace_decision,
@@ -884,7 +884,7 @@ def _copilot_model_usage_event(
     provider_name: str | None,
     cost: float | None,
     prompt_name: str | None,
-) -> CopilotModelUsageEvent:
+) -> ModelUsageEvent:
     try:
         response_model = getattr(response, "model", None)
     except Exception:
@@ -906,7 +906,7 @@ def _copilot_model_usage_event(
         cache_read_tokens = None
         cache_creation_tokens = None
     hidden_params = getattr(response, "_hidden_params", None)
-    return CopilotModelUsageEvent(
+    return ModelUsageEvent(
         request_model=request_model,
         response_model=response_model if isinstance(response_model, str) else None,
         provider_name=provider_name,
@@ -949,7 +949,7 @@ def _emit_copilot_model_usage_for_response(
         )
     except Exception:
         try:
-            LOG.warning("Failed to emit Copilot model usage", exc_info=True)
+            LOG.warning("Failed to emit model usage", exc_info=True)
         except Exception:
             pass
 
@@ -3846,8 +3846,6 @@ class LLMCaller:
         self.llm_config = LLMConfigRegistry.get_config(llm_key)
         self.base_parameters = base_parameters
         self.message_history: list[dict[str, Any]] = []
-        # The router group that answered the last successful call; None for a direct config or an unknown deployment.
-        self.last_served_model_group: str | None = None
         self.current_tool_results: list[dict[str, Any]] = []
         self.screenshot_scaling_enabled = screenshot_scaling_enabled
         self.browser_window_dimension = Resolution(width=settings.BROWSER_WIDTH, height=settings.BROWSER_HEIGHT)
@@ -4300,7 +4298,6 @@ class LLMCaller:
             if self._router is not None:
                 served_model_group = LLMAPIHandlerFactory._served_model_group(self._router, response)
                 LLMAPIHandlerFactory._record_served_service_tier(self._router, response)
-            self.last_served_model_group = served_model_group
 
             call_stats = LLMCallStats()
             try:

@@ -742,7 +742,7 @@ class Locator:
     # -- actions ------------------------------------------------------------
 
     async def click(self, timeout: float | None = None, **kwargs: Any) -> None:
-        await (await self._act("click", timeout)).click(**kwargs)
+        await (await self._act("click", timeout)).click(timeout=timeout, **kwargs)
 
     async def dblclick(self, timeout: float | None = None, **kwargs: Any) -> None:
         await (await self._act("dblclick", timeout)).dblclick(**kwargs)
@@ -774,10 +774,10 @@ class Locator:
         await (await self._act("press", timeout)).press(key, delay=delay)
 
     async def check(self, timeout: float | None = None) -> None:
-        await (await self._act("check", timeout)).check()
+        await (await self._act("check", timeout)).check(timeout=timeout)
 
     async def uncheck(self, timeout: float | None = None) -> None:
-        await (await self._act("uncheck", timeout)).uncheck()
+        await (await self._act("uncheck", timeout)).uncheck(timeout=timeout)
 
     async def select_option(
         self,

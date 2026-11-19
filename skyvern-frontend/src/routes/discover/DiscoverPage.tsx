@@ -133,7 +133,7 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
         <h1 className="sr-only">Create an agent</h1>
         <PromptBox
           ref={promptBoxRef}
-          enableCopilotHandoff
+          enableEmberHandoff
           minimal
           onAgentCreated={onRevampComplete}
         />
@@ -168,7 +168,7 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
       <h1 className="sr-only">Create an agent</h1>
       <PromptBox
         ref={promptBoxRef}
-        enableCopilotHandoff
+        enableEmberHandoff
         siblingBusy={createWorkflowMutation.isPending}
         secondaryAction={({ busy }) => (
           <button

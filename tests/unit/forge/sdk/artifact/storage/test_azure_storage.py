@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 import azure.core.exceptions as azure_exceptions
 import pytest
+from structlog.testing import capture_logs
 
 import skyvern.forge.sdk.artifact.storage.azure as azure_module
 import skyvern.forge.sdk.artifact.storage.base as base_module
@@ -253,6 +254,12 @@ class TestAzureStorageBrowserSessionFiles:
 
         with pytest.raises(PermissionError, match="No permission to access storage URI"):
             await azure_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await azure_storage.read_managed_file_head(uri, TEST_ORGANIZATION_ID, 64)
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await azure_storage.presign_managed_file(
+                uri, TEST_ORGANIZATION_ID, expiry_seconds=60, inline_content_type="image/png"
+            )
 
     async def test_storage_type_property(self, azure_storage: AzureStorageForTests) -> None:
         """Test storage_type returns 'azure'."""
@@ -428,16 +435,16 @@ class TestAzureShareLinkSensitiveCap:
         download = make_artifact(f"azure://{TEST_CONTAINER}/file.pdf", artifact_type=ArtifactType.DOWNLOAD)
 
         async def fake_sas(
-            uris: list[str], expiry_hours: int = 24, attachment_filenames: list[str | None] | None = None
+            uris: list[str], expiry_seconds: int = 86400, attachment_filenames: list[str | None] | None = None
         ) -> list[str]:
             suffix = "&attachment" if attachment_filenames is not None else ""
-            return [f"{uri}?h={expiry_hours}{suffix}" for uri in uris]
+            return [f"{uri}?s={expiry_seconds}{suffix}" for uri in uris]
 
         azure_storage.async_client.create_sas_urls = AsyncMock(side_effect=fake_sas)
         urls = await azure_storage.get_share_links([recording, download])
         assert urls == [
-            f"{recording.uri}?h={SENSITIVE_SHARE_URL_EXPIRY_HOURS}",
-            f"{download.uri}?h=24&attachment",
+            f"{recording.uri}?s={SENSITIVE_SHARE_URL_EXPIRY_HOURS * 3600}",
+            f"{download.uri}?s=86400&attachment",
         ]
 
 
@@ -453,6 +460,26 @@ async def test_download_sas_urls_sign_an_octet_stream_attachment() -> None:
     assert query["rscd"] == ["attachment; filename=\"page.html\"; filename*=UTF-8''page.html"]
     assert query["rsct"] == ["application/octet-stream"]
     assert "rscd" not in parse_qs(urlparse(inline[0]).query)
+
+
+@pytest.mark.asyncio
+async def test_a_managed_file_sas_expires_at_the_exact_lifetime_under_an_hour(
+    azure_storage: AzureStorageForTests,
+) -> None:
+    azure_storage.async_client = RealAsyncAzureStorageClient(
+        account_name="acct", account_key=base64.b64encode(b"k" * 32).decode()
+    )
+    uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/doc/shot.png"
+
+    before = datetime.now(UTC).replace(microsecond=0)
+    url = await azure_storage.presign_managed_file(
+        uri, TEST_ORGANIZATION_ID, expiry_seconds=1799, inline_content_type="image/png"
+    )
+    after = datetime.now(UTC)
+
+    assert url is not None
+    expiry = datetime.strptime(parse_qs(urlparse(url).query)["se"][0], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    assert before + timedelta(seconds=1799) <= expiry <= after + timedelta(seconds=1799)
 
 
 @pytest.mark.asyncio
@@ -614,3 +641,46 @@ async def test_azure_downloads_list_each_pdf_content_once_only_from_etag_pinned_
     claimed = [pdf, pdf, make_pdf("Statement 2002")]
 
     assert await unique_stored_pdf_ids(monkeypatch, storage, "azure://c/o_1", claimed) == expected
+
+
+@pytest.mark.asyncio
+async def test_managed_file_head_reads_only_the_requested_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = b"\x89PNG" + b"\x00" * 100_000
+    served: list[int] = []
+
+    async def download_blob(offset: int = 0, length: int | None = None) -> SimpleNamespace:
+        chunk = data[offset : None if length is None else offset + length]
+        served.append(len(chunk))
+
+        async def readall() -> bytes:
+            return chunk
+
+        return SimpleNamespace(readall=readall)
+
+    blobs = SimpleNamespace(
+        get_container_client=lambda _c: SimpleNamespace(
+            get_blob_client=lambda _p: SimpleNamespace(download_blob=download_blob)
+        )
+    )
+    storage = AzureStorageForTests(container=TEST_CONTAINER)
+    storage.async_client = RealAsyncAzureStorageClient(
+        account_name="acct", account_key=base64.b64encode(b"k" * 32).decode()
+    )
+    monkeypatch.setattr(storage.async_client, "_get_blob_service_client", lambda: blobs)
+    uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/shot.png"
+
+    head = await storage.read_managed_file_head(uri, TEST_ORGANIZATION_ID, 64)
+
+    assert head == data[:64]
+    assert served == [64]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_managed_file_head_read_logs_one_warning(azure_storage: AzureStorageForTests) -> None:
+    azure_storage.async_client.download_file.return_value = None
+    uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/shot.png"
+
+    with capture_logs() as logs:
+        assert await azure_storage.read_managed_file_head(uri, TEST_ORGANIZATION_ID, 64) is None
+
+    assert [(log["log_level"], log["uri"]) for log in logs] == [("warning", uri)]

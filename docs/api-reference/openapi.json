@@ -9630,7 +9630,7 @@
               }
             ],
             "title": "Tools",
-            "description": "The tools the step may call. A block it runs through run_block is named by its block type, such as http_request. finish and read_run_data are always offered, and login only when parameter_keys lists a credential parameter. Without a list the step has no other tools."
+            "description": "The tools the step may call. A block it runs through run_block is named by its block type, such as http_request, and an integration action by <integration id>__<action id>, such as gmail__read_inbox. finish and read_run_data are always offered, and login only when parameter_keys lists a credential parameter. load_skill also offers read_skill_resource, and both are offered only when the run has skills. Without a list the step has no other tools."
           }
         },
         "type": "object",
@@ -10929,7 +10929,8 @@
           "email_inbox",
           "data_export",
           "terminate",
-          "agent_step"
+          "agent_step",
+          "integration_action"
         ],
         "title": "BlockType"
       },
@@ -14856,6 +14857,27 @@
             "title": "Download Attachments",
             "default": false
           },
+          "organize_action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailOrganizeAction"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "organize_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organize Label"
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -15104,6 +15126,30 @@
             "description": "Download non-inline attachments from matched emails for downstream blocks.",
             "default": false
           },
+          "organize_action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailOrganizeAction"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Change every matched email: add a label, archive, move to a label, or mark read. Needs a Connected Gmail account (credential_source nango)."
+          },
+          "organize_label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organize Label",
+            "description": "Existing Gmail label name for organize_action label or move. Must be literal text."
+          },
           "parameter_keys": {
             "anyOf": [
               {
@@ -15125,6 +15171,17 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "EmailOrganizeAction": {
+        "type": "string",
+        "enum": [
+          "label",
+          "archive",
+          "move",
+          "mark_read"
+        ],
+        "title": "EmailOrganizeAction",
+        "description": "One change an Email Inbox block applies to every email it matched."
       },
       "EmailTransport": {
         "type": "string",
@@ -18083,6 +18140,9 @@
                   "$ref": "#/components/schemas/PowerBIQueryBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/IntegrationActionBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PdfFillBlock"
                 },
                 {
@@ -18118,6 +18178,7 @@
                   "goto_url": "#/components/schemas/UrlBlock",
                   "http_request": "#/components/schemas/HttpRequestBlock",
                   "human_interaction": "#/components/schemas/HumanInteractionBlock",
+                  "integration_action": "#/components/schemas/IntegrationActionBlock",
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_fill": "#/components/schemas/PdfFillBlock",
@@ -18402,6 +18463,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PowerBIQueryBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/IntegrationActionBlockYAML"
                 }
               ],
               "discriminator": {
@@ -18424,6 +18488,7 @@
                   "goto_url": "#/components/schemas/UrlBlockYAML",
                   "http_request": "#/components/schemas/HttpRequestBlockYAML",
                   "human_interaction": "#/components/schemas/HumanInteractionBlockYAML",
+                  "integration_action": "#/components/schemas/IntegrationActionBlockYAML",
                   "login": "#/components/schemas/LoginBlockYAML",
                   "navigation": "#/components/schemas/NavigationBlockYAML",
                   "pdf_fill": "#/components/schemas/PdfFillBlockYAML",
@@ -19319,6 +19384,7 @@
           },
           "timeout": {
             "type": "integer",
+            "minimum": 1.0,
             "title": "Timeout",
             "default": 30
           },
@@ -19533,6 +19599,7 @@
           },
           "timeout": {
             "type": "integer",
+            "minimum": 1.0,
             "title": "Timeout",
             "default": 30
           },
@@ -20255,6 +20322,265 @@
         "type": "object",
         "title": "InputTextAction",
         "description": "Input text action parameters."
+      },
+      "IntegrationActionBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "integration_action",
+            "title": "Block Type",
+            "default": "integration_action"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "integration_id": {
+            "type": "string",
+            "title": "Integration Id"
+          },
+          "action_id": {
+            "type": "string",
+            "title": "Action Id"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
+          "inputs": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Inputs",
+            "default": {}
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "integration_id",
+          "action_id"
+        ],
+        "title": "IntegrationActionBlock"
+      },
+      "IntegrationActionBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "integration_action",
+            "title": "Block Type",
+            "default": "integration_action"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "integration_id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Integration Id",
+            "description": "Integration catalog entry id, e.g. 'google_sheets'."
+          },
+          "action_id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Action Id",
+            "description": "Action id within that entry, e.g. 'read_rows'."
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id",
+            "description": "ID of the connected account the action runs as.",
+            "x-skyvern-connected-account": true
+          },
+          "inputs": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Inputs",
+            "description": "Values for the action's inputs, keyed by the catalog action's input names."
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "integration_id",
+          "action_id"
+        ],
+        "title": "IntegrationActionBlockYAML"
       },
       "JinjaBranchCriteria": {
         "properties": {
@@ -25038,6 +25364,7 @@
             "x-skyvern-connected-account": true,
             "x-skyvern-connected-account-acts": true,
             "x-skyvern-connected-account-when": {
+              "credential_source": "native",
               "transport": "gmail"
             }
           },
@@ -31020,6 +31347,9 @@
                   "$ref": "#/components/schemas/PowerBIQueryBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/IntegrationActionBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PdfFillBlock"
                 },
                 {
@@ -31055,6 +31385,7 @@
                   "goto_url": "#/components/schemas/UrlBlock",
                   "http_request": "#/components/schemas/HttpRequestBlock",
                   "human_interaction": "#/components/schemas/HumanInteractionBlock",
+                  "integration_action": "#/components/schemas/IntegrationActionBlock",
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_fill": "#/components/schemas/PdfFillBlock",
@@ -31267,6 +31598,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PowerBIQueryBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/IntegrationActionBlockYAML"
                 }
               ],
               "discriminator": {
@@ -31289,6 +31623,7 @@
                   "goto_url": "#/components/schemas/UrlBlockYAML",
                   "http_request": "#/components/schemas/HttpRequestBlockYAML",
                   "human_interaction": "#/components/schemas/HumanInteractionBlockYAML",
+                  "integration_action": "#/components/schemas/IntegrationActionBlockYAML",
                   "login": "#/components/schemas/LoginBlockYAML",
                   "navigation": "#/components/schemas/NavigationBlockYAML",
                   "pdf_fill": "#/components/schemas/PdfFillBlockYAML",
@@ -31662,7 +31997,7 @@
                 "type": "null"
               }
             ],
-            "description": "Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began."
+            "description": "Which surface wrote this version: ui, copilot (Ember), mcp, cli, api, or internal. Null before tracking began."
           },
           "copilot_authored": {
             "type": "boolean",
@@ -31760,7 +32095,7 @@
           "internal"
         ],
         "title": "WorkflowBuildSource",
-        "description": "Which surface wrote a workflow version.\n\n- ui: the Skyvern app\n- copilot: the workflow copilot\n- mcp: a first-party MCP client\n- cli: the Skyvern CLI\n- api: any other API or SDK caller\n- internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)"
+        "description": "Which surface wrote a workflow version.\n\n- ui: the Skyvern app\n- copilot: Ember, Skyvern's agent builder (the value keeps the old name)\n- mcp: a first-party MCP client\n- cli: the Skyvern CLI\n- api: any other API or SDK caller\n- internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)"
       },
       "WorkflowCreateYAMLRequest": {
         "properties": {
@@ -32222,6 +32557,9 @@
                   "$ref": "#/components/schemas/PowerBIQueryBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/IntegrationActionBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PdfFillBlock"
                 },
                 {
@@ -32257,6 +32595,7 @@
                   "goto_url": "#/components/schemas/UrlBlock",
                   "http_request": "#/components/schemas/HttpRequestBlock",
                   "human_interaction": "#/components/schemas/HumanInteractionBlock",
+                  "integration_action": "#/components/schemas/IntegrationActionBlock",
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_fill": "#/components/schemas/PdfFillBlock",
@@ -32533,6 +32872,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PowerBIQueryBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/IntegrationActionBlockYAML"
                 }
               ],
               "discriminator": {
@@ -32555,6 +32897,7 @@
                   "goto_url": "#/components/schemas/UrlBlockYAML",
                   "http_request": "#/components/schemas/HttpRequestBlockYAML",
                   "human_interaction": "#/components/schemas/HumanInteractionBlockYAML",
+                  "integration_action": "#/components/schemas/IntegrationActionBlockYAML",
                   "login": "#/components/schemas/LoginBlockYAML",
                   "navigation": "#/components/schemas/NavigationBlockYAML",
                   "pdf_fill": "#/components/schemas/PdfFillBlockYAML",

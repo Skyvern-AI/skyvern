@@ -11,7 +11,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -422,11 +422,39 @@ def enqueue_screenshot_from_result(
     result: dict[str, Any],
     *,
     provenance: ScreenshotProvenance,
+    captured_at: float | None = None,
 ) -> None:
     """Extract, validate, and enqueue a screenshot from a copilot result dict."""
     from skyvern.forge.sdk.copilot.output_utils import extract_screenshot_b64, is_valid_image_base64
 
-    captured_at = time.monotonic()
+    if captured_at is None:
+        captured_at = time.monotonic()
     screenshot_b64 = extract_screenshot_b64(result)
     if screenshot_b64 and is_valid_image_base64(screenshot_b64):
         enqueue_screenshot(ctx, screenshot_b64, provenance=provenance, captured_at=captured_at)
+
+
+def run_result_screenshot_provenance(result: dict[str, Any], *, source_tool: str) -> ScreenshotProvenance:
+    """Identity fields come from ``data``, falling back to the top level that some error paths still use."""
+    data = result.get("data")
+    facts = data if isinstance(data, dict) else {}
+
+    def _string_fact(key: str) -> str | None:
+        value = facts.get(key)
+        if not isinstance(value, str) or not value:
+            value = result.get(key)
+        return value if isinstance(value, str) and value else None
+
+    return ScreenshotProvenance(
+        source_tool=source_tool,
+        captured_url=_string_fact("current_url"),
+        observation_step=None,
+        browser_session_id=_string_fact("browser_session_id"),
+        workflow_run_id=_string_fact("workflow_run_id"),
+        action_relation=ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
+    )
+
+
+def stored_run_frame_provenance(result: dict[str, Any]) -> ScreenshotProvenance:
+    """A frame read back from a finished run, whose page URL at capture time is unknown."""
+    return replace(run_result_screenshot_provenance(result, source_tool="get_run_results"), captured_url=None)

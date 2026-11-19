@@ -20,13 +20,12 @@ from __future__ import annotations
 
 from asyncio import CancelledError
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from skyvern.exceptions import MissingBrowserStatePage, TaskAlreadyCanceled
+from skyvern.exceptions import MissingBrowserStatePage
 from skyvern.forge.agent import ForgeAgent, StepPromptResult
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import MultiFieldTotpAttempt, SkyvernContext
@@ -34,7 +33,6 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.services.run_cancellation import RunCancellation
 from skyvern.webeye.actions.actions import ClickAction, CompleteAction, ExtractAction
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
@@ -425,127 +423,6 @@ async def test_canceled_run_stops_after_the_implicit_extraction(monkeypatch: pyt
     assert handle_action_mock.await_count == 2
     assert step.status == StepStatus.canceled
     assert detailed_output.run_cancellation is not None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("cancellation", "update_task_error"),
-    [
-        (RunCancellation(TaskStatus.canceled, from_workflow_run=True), None),
-        (RunCancellation(TaskStatus.timed_out, from_workflow_run=True), None),
-        (
-            RunCancellation(TaskStatus.canceled, from_workflow_run=True),
-            TaskAlreadyCanceled(new_status="canceled", task_id="task-123"),
-        ),
-        (RunCancellation(TaskStatus.canceled, from_workflow_run=True), ConnectionError("db blip")),
-        (RunCancellation(TaskStatus.canceled, from_workflow_run=False), None),
-    ],
-    ids=[
-        "parent-run-canceled",
-        "parent-run-timed-out",
-        "parent-run-canceled-task-row-final",
-        "parent-run-canceled-task-write-fails",
-        "task-canceled",
-    ],
-)
-async def test_execute_step_ends_the_task_when_agent_step_stops_mid_batch(
-    monkeypatch: pytest.MonkeyPatch, cancellation: RunCancellation, update_task_error: Exception | None
-) -> None:
-    """The task takes the status the action poll saw, even if neither row can be read again.
-
-    A stopped parent run keeps the teardown for itself; only a task-level cancel cleans up here.
-    """
-    parent_run_canceled = cancellation.from_workflow_run
-    agent = ForgeAgent()
-    now = datetime.now(UTC)
-    organization = make_organization(now)
-    task = make_task(now, organization, workflow_run_id="workflow-1")
-    step = make_step(now, task, step_id="step-0", status=StepStatus.running, order=0, output=None)
-    canceled_step = make_step(now, task, step_id="step-0", status=StepStatus.canceled, order=0, output=None)
-    detailed_output = SimpleNamespace(scraped_page=None, cua_response=None, run_cancellation=cancellation)
-    browser_state = MagicMock()
-    browser_state.get_working_page = AsyncMock(return_value=MagicMock())
-
-    canceled = {"yet": False}
-
-    async def _agent_step(*_args, **_kwargs):
-        canceled["yet"] = True
-        return canceled_step, detailed_output
-
-    async def _get_workflow_run(*_args, **_kwargs):
-        if canceled["yet"]:
-            raise ConnectionError("db blip")
-        return _workflow_run(WorkflowRunStatus.running)
-
-    async def _get_task(*_args, **_kwargs):
-        if canceled["yet"]:
-            raise ConnectionError("db blip")
-        return task.model_copy(update={"status": TaskStatus.running})
-
-    async def _update_task(task, status=None, **_kwargs):
-        if update_task_error is not None:
-            raise update_task_error
-        return task.model_copy(update={"status": status})
-
-    monkeypatch.setattr(
-        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run", AsyncMock(side_effect=_get_workflow_run)
-    )
-    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task", AsyncMock(side_effect=_get_task))
-    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.validate_step_execution", AsyncMock(return_value=None))
-    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_step_execution", AsyncMock(return_value=None))
-    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.flush_step_archive", AsyncMock(return_value=None))
-    monkeypatch.setattr("skyvern.forge.agent.record_fail_fast_shadow", AsyncMock(return_value=None))
-    agent.initialize_execution_state = AsyncMock(return_value=(step, browser_state, detailed_output))  # type: ignore[method-assign]
-    agent.register_async_operations = AsyncMock(return_value=None)  # type: ignore[method-assign]
-    agent.agent_step = AsyncMock(side_effect=_agent_step)  # type: ignore[method-assign]
-    agent.update_task_errors_from_detailed_output = AsyncMock(side_effect=lambda task, _output: task)  # type: ignore[method-assign]
-    update_task = AsyncMock(side_effect=_update_task)
-    agent.update_task = update_task  # type: ignore[method-assign]
-    clean_up_task = AsyncMock(return_value=None)
-    agent.clean_up_task = clean_up_task  # type: ignore[method-assign]
-    agent.handle_completed_step = AsyncMock()  # type: ignore[method-assign]
-    agent.handle_failed_step = AsyncMock()  # type: ignore[method-assign]
-
-    own = ParkedOperation(task.task_id)
-    other = ParkedOperation("task-other")
-    pool = agent.async_operation_pool
-    settled_at_return: list[bool] = []
-
-    async def run_step():
-        returned = await agent.execute_step(
-            organization=organization, task=task, step=step, api_key="api-key", download_baseline_files=[]
-        )
-        settled_at_return.append(own.settled.is_set())
-        return returned
-
-    skyvern_context.set(
-        SkyvernContext(organization_id=organization.organization_id, task_id=task.task_id, tz_info=ZoneInfo("UTC"))
-    )
-    try:
-        own_handle = await start_pooled_operation(pool, own)
-        other_handle = await start_pooled_operation(pool, other)
-        finished, _ = await settle_or_fail(run_step())
-        returned_step, _output, next_step = finished.result()
-
-        assert returned_step.status == StepStatus.canceled
-        assert next_step is None
-        agent.handle_completed_step.assert_not_awaited()
-        agent.handle_failed_step.assert_not_awaited()
-        assert not other_handle.done()
-        assert pool.get_aio_task(other.task_id, other.type) is other_handle
-        if parent_run_canceled:
-            assert update_task.await_args.kwargs["status"] == cancellation.task_status
-            clean_up_task.assert_not_awaited()
-            # The parent run tears the browser down without the task's cleanup, so the task stops its own job here.
-            assert settled_at_return == [True], "the task's pooled operation outlived the parent-run cancellation"
-            assert own_handle.done()
-            assert pool.get_aio_task(own.task_id, own.type) is None
-        else:
-            update_task.assert_not_awaited()
-            clean_up_task.assert_awaited_once()
-    finally:
-        skyvern_context.reset()
-        await stop_pooled_operations(pool, own.task_id, other.task_id)
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,7 @@ from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS, DEFA
 from skyvern.cli.mcp_tools.blocks import (
     CODE_BLOCK_RUNTIME_TOPIC,
     NOTES_KNOWLEDGE_TOPIC,
+    WORKFLOW_KNOWLEDGE_TOPIC_ALIASES,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
     _parse_knowledge_topics,
 )
@@ -64,7 +65,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
-from skyvern.forge.sdk.copilot.reached_download_target import download_claim_helper_contract
 from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_BINDING_FACTS,
     RequestPolicy,
@@ -81,7 +81,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     tab_switch_refusal,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import viewport_visible_effect
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import (
     registered_scrub_values,
     scrub_secrets_from_structure,
@@ -96,10 +95,17 @@ from skyvern.forge.sdk.workflow.models.block import (
     open_page_cap_reached,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.reached_download_target import download_claim_helper_contract
 from skyvern.forge.sdk.workflow.schedules import MIN_SCHEDULE_INTERVAL_SECONDS
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.forge.sdk.workflow.web_search_client import SearchProvider, SearchResponse, SearchResult
-from skyvern.schemas.workflows import AGENT_STEP_BLOCK_SUMMARY, AgentStepBlockYAML, TaskBlockYAML
+from skyvern.schemas.workflows import (
+    AGENT_STEP_BLOCK_SUMMARY,
+    BLOCK_IMAGE_FIELDS,
+    AgentStepBlockYAML,
+    TaskBlockYAML,
+)
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK
 from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
 
@@ -384,19 +390,29 @@ def _bound_failed_click_result(ctx: AgentContext, result: dict[str, Any]) -> Non
         bound_enrichment_text(container, key, max(minimum_chars, len(value) // 2))
 
 
-def _without_note_fields(value: Any) -> Any:
+def _without_note_fields(value: Any, fields: tuple[str, ...]) -> Any:
     if isinstance(value, dict):
         properties = value.get("properties")
         if isinstance(properties, dict):
-            for name in CARRIED_FIELDS:
+            for name in fields:
                 if isinstance(properties.get(name), dict) and properties[name].get("x-internal"):
                     del properties[name]
         for child in value.values():
-            _without_note_fields(child)
+            _without_note_fields(child, fields)
     elif isinstance(value, list):
         for child in value:
-            _without_note_fields(child)
+            _without_note_fields(child, fields)
     return value
+
+
+def _without_unreferenced_internal_defs(schema: dict[str, Any]) -> None:
+    definitions = schema.get("$defs")
+    if not isinstance(definitions, dict):
+        return
+    for name in [name for name, item in definitions.items() if isinstance(item, dict) and item.get("x-internal")]:
+        definition = definitions.pop(name)
+        if f'"#/$defs/{name}"' in json.dumps(schema):
+            definitions[name] = definition
 
 
 def _note_field_properties() -> dict[str, Any]:
@@ -418,15 +434,20 @@ def _block_property_maps(schema: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _note_fields_for_doc_editor(result: dict[str, Any] | None, ctx: AgentContext) -> dict[str, Any] | None:
-    """The MCP block schema leaves note fields out for every client; Copilot sees them only with the Doc editor."""
+    """The MCP block schema leaves note fields out for every client; Copilot sees them only with the Doc editor.
+
+    Image fields are not shown to the model, and a model-written image id is stripped before the carry.
+    """
     if result is None:
         return result
     data = result.get("data")
     schema = data.get("schema") if isinstance(data, dict) else None
     if not isinstance(schema, dict):
         return result
-    if not copilot_sees_notes(ctx):
-        _without_note_fields(schema)
+    notes_visible = copilot_sees_notes(ctx)
+    _without_note_fields(schema, BLOCK_IMAGE_FIELDS if notes_visible else (*CARRIED_FIELDS, *BLOCK_IMAGE_FIELDS))
+    _without_unreferenced_internal_defs(schema)
+    if not notes_visible:
         return result
     note_properties = _note_field_properties()
     for properties in _block_property_maps(schema):
@@ -646,6 +667,7 @@ _FOR_LOOP_GUIDANCE = "\n".join(
             "{{ current_value }} (also {{ current_item }}) is the current item and {{ current_index }} its position."
         ),
         "- complete_if_empty: true completes the loop successfully when the list is empty.",
+        "- A for_loop runs its items one after another in the run's one browser, within the run's time limit.",
         "",
         "Example - loop over a parser's rows (the parser's output is the list):",
         yaml.safe_dump(_FOR_LOOP_EXAMPLE, sort_keys=False).rstrip(),
@@ -857,7 +879,7 @@ def _task_v3_block_schema_guidance() -> list[str]:
 
 # The shared section bans `task` and points at navigation/extraction. Every authoring capability either
 # allows `task` or bans those two, so the section is false on every Copilot turn.
-_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC = "task_block_task_not_available_in_workflow_copilot"
+_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC = "task_block_task_not_available_in_ember"
 _REQUESTED_WORKFLOW_KNOWLEDGE_TOPICS: ContextVar[list[Any] | None] = ContextVar(
     "requested_workflow_knowledge_topics", default=None
 )
@@ -867,7 +889,7 @@ def _hidden_knowledge_topics(ctx: AgentContext) -> set[str]:
     hidden = {_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC}
     if not copilot_sees_notes(ctx):
         hidden.add(NOTES_KNOWLEDGE_TOPIC)
-    return hidden
+    return hidden | {alias for alias, topic in WORKFLOW_KNOWLEDGE_TOPIC_ALIASES.items() if topic in hidden}
 
 
 async def _get_workflow_knowledge_pre_hook(
@@ -944,8 +966,8 @@ async def _get_org_workflow_post_hook(
     data = result.get("data")
     definition = data.get("workflow_definition") if isinstance(data, dict) else None
     blocks = definition.get("blocks") if isinstance(definition, dict) else None
-    if isinstance(blocks, list) and not copilot_sees_notes(ctx):
-        remove_note_fields(blocks)
+    if isinstance(blocks, list):
+        remove_note_fields(blocks, keep_notes=copilot_sees_notes(ctx))
     return result
 
 
@@ -2371,11 +2393,12 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
     }
 
 
-_PENDING_PROPOSAL_SCHEDULE_ERROR = (
-    "No schedule was created: this chat has a workflow proposal that is not saved yet, and a schedule "
-    "runs the saved workflow. Ask the user to accept the proposal, which saves it, or to reject it to "
-    "schedule the saved version as it is; then create the schedule."
+PENDING_PROPOSAL_FACT = (
+    "this chat has a workflow change that is not saved yet, and only the saved version runs. The user saves the "
+    "change by accepting it, or rejects it to keep the saved version."
 )
+
+_PENDING_PROPOSAL_SCHEDULE_ERROR = f"No schedule was created: {PENDING_PROPOSAL_FACT}"
 
 
 async def _schedule_parameters_credential_pre_hook(

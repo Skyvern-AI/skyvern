@@ -25,8 +25,8 @@ type StudioBrowserState = {
   hasUnseenActivity: boolean;
   reloadNonce: number;
   view: BrowserPaneViewIntent;
-  // A docked Copilot turn is running; a browser pin in the URL counts only then.
-  copilotTurnActive: boolean;
+  // A docked Ember turn is running; a browser pin in the URL counts only then.
+  emberTurnActive: boolean;
   setStreamUrl: (url: string | null) => void;
   setDebugStreamState: (
     state: StreamState,
@@ -37,7 +37,7 @@ type StudioBrowserState = {
   clearActivity: () => void;
   reload: () => void;
   setView: (view: BrowserPaneViewIntent) => void;
-  setCopilotTurnActive: (active: boolean) => void;
+  setEmberTurnActive: (active: boolean) => void;
   reset: () => void;
 };
 
@@ -48,7 +48,7 @@ export const useStudioBrowserStore = create<StudioBrowserState>()((set) => ({
   hasUnseenActivity: false,
   reloadNonce: 0,
   view: "auto",
-  copilotTurnActive: false,
+  emberTurnActive: false,
   setStreamUrl: (streamUrl) => set({ streamUrl }),
   setDebugStreamState: (state, browserSessionId) =>
     set({ debugStream: { browserSessionId, state } }),
@@ -64,7 +64,7 @@ export const useStudioBrowserStore = create<StudioBrowserState>()((set) => ({
     ),
   reload: () => set((state) => ({ reloadNonce: state.reloadNonce + 1 })),
   setView: (view) => set({ view }),
-  setCopilotTurnActive: (copilotTurnActive) => set({ copilotTurnActive }),
+  setEmberTurnActive: (emberTurnActive) => set({ emberTurnActive }),
   // Also clears the view intent: workflow navigation resets this store without
   // a selection/run change, so a stale replay pill could otherwise survive.
   reset: () =>

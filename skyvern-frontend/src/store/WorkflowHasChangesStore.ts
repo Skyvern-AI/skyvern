@@ -12,6 +12,7 @@ import {
   markWorkflowSavePersisting,
   markWorkflowSaveSettled,
   refuseMutationDuringYamlCommit,
+  EMBER_CHANGE_PENDING_MESSAGE,
   useWorkflowYamlEditorStore,
   type YamlCommitContext,
   type YamlCommitOwner,
@@ -20,7 +21,7 @@ import { applyYamlCommitMetadata } from "./WorkflowTitleStore";
 import { AxiosError } from "axios";
 import { useEffect, useRef, useState } from "react";
 import { create } from "zustand";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { stringify as convertToYAML } from "yaml";
 import { usePostHog } from "posthog-js/react";
@@ -113,8 +114,8 @@ function assertWorkflowSaveAllowed(
     });
     throw new YamlCommitError("workflow", blockedReason);
   }
-  // Every save path lands here, so a staged Copilot proposal can only become durable through Accept.
-  if (useCopilotProposalStore.getState().proposal) {
+  // Every save path lands here, so a staged Ember proposal can only become durable through Accept.
+  if (useEmberProposalStore.getState().proposal) {
     throw new SaveRefusedError(PROPOSAL_SAVE_MESSAGE);
   }
   const state = useWorkflowYamlEditorStore.getState();
@@ -123,7 +124,7 @@ function assertWorkflowSaveAllowed(
   }
   const owner = state.lockKind === "save" ? saveOwner : yamlCommit?.owner;
   if (
-    state.copilotAcceptance ||
+    state.emberAcceptance ||
     (state.commitInProgress && (!owner || !isYamlCommitOwnerCurrent(owner)))
   ) {
     throw new SaveRefusedError(getWorkflowLockMessage());
@@ -309,8 +310,8 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         useWorkflowYamlEditorStore.getState().editorOwner;
       if (!override?.yamlCommit && (!owner || !beginSaveTransaction(owner))) {
         throw new SaveRefusedError(
-          store.copilotAcceptance
-            ? "Wait for the Copilot change to finish"
+          store.emberAcceptance
+            ? EMBER_CHANGE_PENDING_MESSAGE
             : !owner
               ? "The workflow editor is no longer available"
               : undefined,
@@ -686,7 +687,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   return saveWorkflowMutation;
 };
 
-function hydrateWorkflowEditor(workflow: WorkflowApiResponse): boolean {
+export function hydrateWorkflowEditor(workflow: WorkflowApiResponse): boolean {
   const owner = useWorkflowYamlEditorStore.getState().editorOwner;
   const hydrate = useWorkflowHasChangesStore.getState().hydrateSavedSettings;
   if (
@@ -825,7 +826,7 @@ export function reflectYamlDraftDirtiness(
   const hasChanges = entryHadChanges || draftDirty;
   // A dirty draft re-asserts the flag to invalidate an in-flight save; a clean
   // one that already matches has nothing to write, which also keeps opening
-  // YAML during a Copilot turn from tripping its edit lock.
+  // YAML during an Ember turn from tripping its edit lock.
   if (!draftDirty && changes.hasChanges === hasChanges) return;
   changes.setHasChanges(hasChanges);
 }

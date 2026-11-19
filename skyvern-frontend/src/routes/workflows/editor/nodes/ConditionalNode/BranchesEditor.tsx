@@ -264,7 +264,7 @@ function BranchesEditor({ nodeId, data }: Props) {
     (branchId: string) => {
       // Switching branches only toggles which branch's nodes are visible; it is
       // view state, not a workflow data change. It must therefore work even in
-      // read-only/comparison canvases (version history, copilot review), so we
+      // read-only/comparison canvases (version history, Ember review), so we
       // write activeBranchId directly rather than through the editability-gated
       // `update` helper.
       // Mark as internal update to prevent triggering "unsaved changes" dialog.

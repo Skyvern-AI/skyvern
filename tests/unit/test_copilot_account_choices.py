@@ -5,13 +5,16 @@ import json
 from collections.abc import Callable
 from datetime import datetime
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 import pytest_asyncio
 
+from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -20,6 +23,7 @@ from skyvern.forge.sdk.copilot.connected_accounts import (
     resolve_connection_reference,
 )
 from skyvern.forge.sdk.copilot.context import (
+    AgentResult,
     ApprovedCredential,
     CopilotContext,
     StructuredContext,
@@ -28,6 +32,7 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import mcp_hooks
 from skyvern.forge.sdk.copilot.tools.credentials import (
     UNAPPROVED_CONNECTION_REASON_CODE,
@@ -43,11 +48,18 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
 )
 from skyvern.forge.sdk.copilot.tools.integrations import _read_google_sheet
 from skyvern.forge.sdk.copilot.turn_outcome import (
+    AccountPickTestResume,
+    account_pick_test_resume,
     connected_account_choice_context,
     selected_connected_account_id,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_connection_refs
-from skyvern.forge.sdk.integrations.connected_accounts import ConnectionProvider, OrgConnection
+from skyvern.forge.sdk.integrations.connected_accounts import (
+    ConnectionProvider,
+    IncompleteConnectionRead,
+    OrgConnection,
+    org_connections,
+)
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     ConnectedAccountChoice,
@@ -57,11 +69,14 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    COPILOT_PROPOSAL_METADATA_KEY,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.services import google_oauth_service, microsoft_oauth_service
+from skyvern.forge.sdk.workflow.models.agent_step_tools import ACCOUNT_TOOL_NAMES
+from skyvern.forge.sdk.workflow.models.block import WorkflowTriggerBlock
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
@@ -264,43 +279,62 @@ async def test_a_microsoft_read_failure_still_verifies_google_choices(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_staged_unapproved_google_connection_offers_server_verified_recovery_choices(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "upload_block",
+    [
+        "    - block_type: file_upload\n      label: upload\n      storage_type: google_drive\n"
+        "      google_credential_id: goac_staged\n      google_drive_folder_id: folder\n",
+        "    - block_type: integration_action\n      label: upload\n      integration_id: google_drive\n"
+        "      action_id: upload_files\n      connection_id: goac_staged\n"
+        "      inputs:\n        google_drive_folder_id: folder\n",
+    ],
+    ids=["file_upload", "integration_action"],
+)
+async def test_recovery_choices_for_a_drive_upload_offer_the_staged_account_then_only_drive_accounts(
+    monkeypatch: pytest.MonkeyPatch, upload_block: str
 ) -> None:
+    drive = ["https://www.googleapis.com/auth/drive"]
+
     async def visible_for_org(organization_id: str) -> list[GoogleOAuthCredentialBase]:
         assert organization_id == "org-1"
         return [
-            _google("goac_first", "First account", email_address="first@example.test"),
-            _google("goac_second", "Second account", state="error", email_address="second@example.test"),
+            _google("goac_sheets", "Sheets account"),
+            _google("goac_drive", "Drive account", state="error", email_address="drive@example.test"),
+            _google("goac_staged", "Staged account"),
         ]
 
-    monkeypatch.setattr(
-        google_oauth_service,
-        "get_visible_credentials_for_org",
-        visible_for_org,
-    )
+    async def visible_drive_scopes(organization_id: str) -> list[GoogleOAuthCredentialBase]:
+        rows = await visible_for_org(organization_id)
+        return [row.model_copy(update={"scopes_granted": drive}) if row.id == "goac_drive" else row for row in rows]
+
+    monkeypatch.setattr(google_oauth_service, "get_visible_credentials_for_org", visible_drive_scopes)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_cloud_integration_entries", list)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_cloud_integration_triggers", dict)
     policy = request_policy_module.RequestPolicy(
-        existing_workflow_connection_ids=["goac_model_staged"],
-        run_approved_connection_ids=[],
+        existing_workflow_connection_ids=["goac_staged", "goac_sheets"],
+        run_approved_connection_ids=["goac_sheets"],
+    )
+    staged = (
+        "workflow_definition:\n  parameters: []\n  blocks:\n"
+        f"{upload_block}"
+        "    - block_type: agent_step\n      label: unrelated_agent\n      prompt: Summarize the page\n"
+        "    - block_type: google_sheets_read\n      label: read\n      credential_id: goac_sheets\n"
+        "      spreadsheet_url: https://docs.google.com/spreadsheets/d/sheet-reference-123/edit\n"
     )
 
     choices = await agent_module._server_verified_connected_account_recovery_choices(
         policy,
         organization_id="org-1",
+        workflow_yaml=staged,
     )
 
     assert choices == [
+        ConnectedAccountChoice(connection_id="goac_staged", name="Staged account", state="active"),
         ConnectedAccountChoice(
-            connection_id="goac_first",
-            name="First account",
-            state="active",
-            email_address="first@example.test",
-        ),
-        ConnectedAccountChoice(
-            connection_id="goac_second",
-            name="Second account",
+            connection_id="goac_drive",
+            name="Drive account",
             state="error",
-            email_address="second@example.test",
+            email_address="drive@example.test",
         ),
     ]
 
@@ -324,6 +358,7 @@ async def test_recovery_choices_are_omitted_without_an_unapproved_staged_google_
         await agent_module._server_verified_connected_account_recovery_choices(
             policy,
             organization_id="org-1",
+            workflow_yaml=None,
         )
         is None
     )
@@ -633,6 +668,106 @@ async def test_editor_bound_account_keeps_run_authority_from_resolution_through_
     assert _blocker(dispatched_ids, next_turn) is None
 
 
+CONNECTED_GMAIL_ID = "nc_connected_gmail"
+CONNECTED_GMAIL_YAML = (
+    "workflow_definition:\n"
+    "  blocks:\n"
+    "    - label: send\n"
+    "      block_type: send_email\n"
+    "      transport: gmail\n"
+    "      credential_source: nango\n"
+    f"      connection_id: {CONNECTED_GMAIL_ID}\n"
+    "      recipients: [ops@example.com]\n"
+    "      subject: Report\n"
+    "      body: Done\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "picked", "approved"),
+    [("user-1", False, True), ("user-2", False, False), ("user-1", True, True)],
+    ids=["own_saved_binding", "another_users_saved_binding", "own_card_pick"],
+)
+async def test_connected_gmail_gets_run_authority_only_for_its_owner_and_never_reaches_the_agent_step(
+    monkeypatch: pytest.MonkeyPatch, owner: str, picked: bool, approved: bool
+) -> None:
+    monkeypatch.setattr(google_oauth_service, "get_visible_credentials_for_org", AsyncMock(return_value=[]))
+    for module in (request_policy_module, credentials_module):
+        monkeypatch.setattr(module, "request_user_id", lambda organization_id: "user-1")
+
+    async def own_connected_gmail(organization_id: str, user_id: str) -> list[OrgConnection]:
+        return (
+            [OrgConnection(CONNECTED_GMAIL_ID, "nango", "Connected Gmail", None, "active", ())]
+            if user_id == owner
+            else []
+        )
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "own_connected_gmail_connections", own_connected_gmail)
+
+    policy = await request_policy_module._build_request_policy_bootstrap(
+        user_message="run it",
+        workflow_yaml=EMPTY_WORKFLOW_YAML if picked else CONNECTED_GMAIL_YAML,
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        persisted_workflow_yaml=None if picked else CONNECTED_GMAIL_YAML,
+        selected_connected_account_id=CONNECTED_GMAIL_ID if picked else None,
+    )
+    refs = _connection_refs(_parsed_workflow_definition(CONNECTED_GMAIL_YAML), ["send"])
+
+    assert refs == [CONNECTED_GMAIL_ID]
+    assert (policy.run_approved_connection_ids == [CONNECTED_GMAIL_ID]) is approved
+    if picked:
+        # The model is told what it picked, so it binds the account to the Gmail block's connection_id.
+        facts = json.loads(
+            connected_account_choice_context(
+                None,
+                explicit_selected_connection_id=policy.selected_connected_account_id,
+                explicit_selected_connection_scopes=policy.selected_connected_account_scopes,
+                explicit_selected_connection_provider=policy.selected_connected_account_provider,
+            )
+        )["selected_connection"]
+        assert facts["provider"] == "nango" and facts["scopes_granted"] is None
+        # The right binding for the pick dispatches; a wrong slot is left for the test run to report (rule 3).
+        ctx = make_copilot_ctx(request_policy=policy)
+        send = safe_load_no_dates(CONNECTED_GMAIL_YAML)["workflow_definition"]["blocks"][0]
+        right = await run_credential_gate(ctx, {"parameters": [], "blocks": [send]}, labels=None, run_parameters=None)
+        assert right.error is None and right.blocker is None
+        # A leftover native id on a Connected Gmail send is never read, so it cannot hold the run.
+        stale = {**send, "credential_id": "goac_stale"}
+        left = await run_credential_gate(ctx, {"parameters": [], "blocks": [stale]}, labels=None, run_parameters=None)
+        assert left.error is None and left.blocker is None
+    assert (_blocker(refs, policy) is None) is approved
+    agent_step_ids, _ = await credentials_module._agent_step_connection_ids(
+        "org-1", {}, set(ACCOUNT_TOOL_NAMES), selected_labels=None, run_parameters=None
+    )
+    assert CONNECTED_GMAIL_ID not in agent_step_ids
+
+
+@pytest.mark.asyncio
+async def test_a_failed_connected_gmail_read_leaves_native_accounts_usable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        google_oauth_service,
+        "get_visible_credentials_for_org",
+        AsyncMock(return_value=[_google(EDITOR_BOUND_ACCOUNT_ID, "Google Sheets")]),
+    )
+    monkeypatch.setattr(credentials_module, "request_user_id", lambda organization_id: "user-1")
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "own_connected_gmail_connections", AsyncMock(side_effect=RuntimeError("nango down"))
+    )
+
+    # The agent step cannot use a Nango account, so a failed Nango read must not refuse its native accounts.
+    agent_step_ids, _ = await credentials_module._agent_step_connection_ids(
+        "org-1", {}, set(ACCOUNT_TOOL_NAMES), selected_labels=None, run_parameters=None
+    )
+
+    assert agent_step_ids == [EDITOR_BOUND_ACCOUNT_ID]
+    # Name resolution still learns the read was incomplete, since a hidden Connected Gmail row could share a name.
+    with pytest.raises(IncompleteConnectionRead):
+        await org_connections("org-1", "user-1")
+
+
 @pytest.mark.asyncio
 async def test_named_account_with_no_server_owned_choice_selects_nothing_and_stays_blocked(
     monkeypatch: pytest.MonkeyPatch,
@@ -853,14 +988,14 @@ CITED_ACCOUNT_NAME = "Blog Metrics Connection"
 AMBIGUOUS_ACCOUNT_ID = "goac_ambiguous"
 
 
-def _named_sheets_yaml(reference: str) -> str:
-    return (
-        "workflow_definition:\n"
-        "  blocks:\n"
-        f"    - label: {SHEETS_BLOCK_LABEL}\n"
-        "      block_type: google_sheets_write\n"
-        f'      credential_id: "{reference}"\n'
+def _named_sheets_yaml(reference: str, *, catalog_action: bool = False) -> str:
+    block = (
+        "      block_type: integration_action\n      integration_id: google_sheets\n"
+        f'      action_id: write_rows\n      connection_id: "{reference}"\n'
+        if catalog_action
+        else f'      block_type: google_sheets_write\n      credential_id: "{reference}"\n'
     )
+    return f"workflow_definition:\n  blocks:\n    - label: {SHEETS_BLOCK_LABEL}\n{block}"
 
 
 def _canonicalization_ctx(workflow_yaml: str, user_message: str) -> CopilotContext:
@@ -887,9 +1022,11 @@ def _patch_visible_credentials(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("citation", [CITED_ACCOUNT_NAME, CITED_ACCOUNT_NAME.casefold()])
+@pytest.mark.parametrize("catalog_action", [False, True], ids=["native_block", "catalog_action"])
 async def test_cited_connection_name_canonicalizes_and_keeps_run_authority(
     monkeypatch: pytest.MonkeyPatch,
     citation: str,
+    catalog_action: bool,
 ) -> None:
     accounts = [_google(CITED_ACCOUNT_ID, CITED_ACCOUNT_NAME, email_address="metrics@example.test")]
     _patch_visible_credentials(monkeypatch, accounts)
@@ -897,7 +1034,9 @@ async def test_cited_connection_name_canonicalizes_and_keeps_run_authority(
         "skyvern.forge.sdk.services.google_oauth_service.get_visible_credentials_for_org",
         AsyncMock(return_value=accounts),
     )
-    draft = _named_sheets_yaml(citation)
+    # The catalog lookup behind an integration_action reads the real catalog.
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    draft = _named_sheets_yaml(citation, catalog_action=catalog_action)
     ctx = _canonicalization_ctx(draft, f'write the rows with the "{citation}" account')
 
     canonical_yaml, facts = await canonicalize_named_connection_bindings(draft, ctx)
@@ -1578,6 +1717,93 @@ def test_test_end_to_end_explicit_client_pick_is_still_labelled_as_a_user_picker
 
     assert chat_request.selected_connected_account_id == UNBOUND_ACCOUNT_ID
     assert '"selection_source":"user_picker"' in context
+
+
+def _test_picker_outcome(*, token: bool) -> TurnOutcome:
+    return TurnOutcome(
+        response_kind=ResponseKind.CLARIFY,
+        connected_account_choices=[
+            ConnectedAccountChoice(connection_id=PROPOSAL_BOUND_ACCOUNT_ID, name="Google Sheets", state="active")
+        ],
+        test_proposal_owner_turn_id="turn-test" if token else None,
+        test_proposal_revision=2 if token else None,
+        test_proposal_workflow_run_id="wr_offered" if token else None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("token", "message", "explicit", "resumes"),
+    [
+        pytest.param(True, PROPOSAL_BOUND_ACCOUNT_ID, PROPOSAL_BOUND_ACCOUNT_ID, True, id="test-picker-pick"),
+        pytest.param(True, PROPOSAL_BOUND_ACCOUNT_ID, None, True, id="test-picker-message-only"),
+        pytest.param(False, PROPOSAL_BOUND_ACCOUNT_ID, PROPOSAL_BOUND_ACCOUNT_ID, False, id="build-time-picker"),
+        pytest.param(True, "use my other sheet", PROPOSAL_BOUND_ACCOUNT_ID, False, id="typed-message"),
+        pytest.param(True, PROPOSAL_BOUND_ACCOUNT_ID, UNBOUND_ACCOUNT_ID, False, id="conflicting-selection"),
+    ],
+)
+def test_end_to_end_resumes_only_on_a_pick_from_a_test_picker(
+    token: bool, message: str, explicit: str | None, resumes: bool
+) -> None:
+    resume = account_pick_test_resume(_test_picker_outcome(token=token), message, explicit)
+
+    assert resume == (
+        AccountPickTestResume("turn-test", 2, "wr_offered", PROPOSAL_BOUND_ACCOUNT_ID) if resumes else None
+    )
+
+
+def _stored_test_proposal(owner_turn_id: str, revision: int, workflow_run_id: str | None) -> dict[str, Any]:
+    return {
+        "_copilot_yaml": _sheets_workflow_yaml(PROPOSAL_BOUND_ACCOUNT_ID),
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": owner_turn_id,
+            "revision": revision,
+            "canonical_fingerprint": "fingerprint",
+            "disposition": "review_untested",
+            "workflow_run_id": workflow_run_id,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("result_token", "disposition", "minted"),
+    [
+        pytest.param(("turn-test", 2), "review_untested", True, id="own-proposal"),
+        pytest.param(("turn-test", 1), "review_untested", False, id="superseded-revision"),
+        pytest.param(("turn-test", 2), "no_proposal", False, id="discarded-proposal"),
+    ],
+)
+def test_end_to_end_picker_token_names_only_the_turns_own_proposal(
+    result_token: tuple[str, int], disposition: str, minted: bool
+) -> None:
+    agent_result = AgentResult(
+        user_response="Choose one of the connected accounts below so I can run the workflow.",
+        updated_workflow=None,
+        global_llm_context=None,
+        proposal_disposition=disposition,
+        proposal_owner_turn_id=result_token[0],
+        proposal_revision=result_token[1],
+        turn_outcome=_test_picker_outcome(token=False).model_copy(
+            update={"reason_code": UNAPPROVED_CONNECTION_REASON_CODE}
+        ),
+    )
+    chat_request = WorkflowCopilotChatRequest(
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_test",
+        message="",
+        workflow_yaml=EMPTY_WORKFLOW_YAML,
+        product_action="test_end_to_end",
+    )
+
+    workflow_copilot_route._record_offered_test_proposal(
+        chat_request,
+        SimpleNamespace(proposed_workflow=_stored_test_proposal("turn-test", 2, "wr_offered")),
+        agent_result,
+    )
+
+    assert agent_result.turn_outcome is not None
+    assert account_pick_test_resume(agent_result.turn_outcome, PROPOSAL_BOUND_ACCOUNT_ID, None) == (
+        AccountPickTestResume("turn-test", 2, "wr_offered", PROPOSAL_BOUND_ACCOUNT_ID) if minted else None
+    )
 
 
 def _ctx_with_denial(policy: request_policy_module.RequestPolicy, refs: list[str]) -> tuple[CopilotContext, object]:
@@ -2286,7 +2512,226 @@ async def test_an_agent_step_offered_an_account_tool_acts_on_every_offered_accou
 
 
 @pytest.mark.asyncio
-async def test_a_nango_gmail_send_is_not_held_to_the_native_account_check(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_copilot_test_run_needs_only_the_account_the_chat_picked(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = {"label": "agent", "block_type": "agent_step", "prompt": "email the summary", "tools": ["send_email"]}
+    definition = {"parameters": [], "blocks": [agent]}
+    # Off, every account still needs approval, so a single pick does not let the run through.
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", False)
+    picked_off = _gate_ctx(monkeypatch)
+    picked_off.request_policy.run_approved_connection_ids = [DRIVE_ACCOUNT_ID]
+    off = await run_credential_gate(
+        picked_off, definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
+    )
+    assert off.blocker is not None
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
+    unapproved = _gate_ctx(monkeypatch)
+    cited = _gate_ctx(monkeypatch, message=f"send it from {DRIVE_ACCOUNT_ID}")
+
+    blocked = await run_credential_gate(
+        unapproved, definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
+    )
+    mentioned = await run_credential_gate(
+        cited, definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
+    )
+
+    assert blocked.blocker is not None and blocked.agent_step_connection_ids is None
+    # A mention is not a typed approval, so it does not narrow the offer; the card still asks.
+    assert mentioned.blocker is not None and mentioned.agent_step_connection_ids is None
+    earlier = _gate_ctx(monkeypatch)
+    earlier.request_policy.run_approved_connection_ids = [DRIVE_ACCOUNT_ID]
+    picked_before = await run_credential_gate(
+        earlier, definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
+    )
+    assert picked_before.blocker is None and picked_before.agent_step_connection_ids == (DRIVE_ACCOUNT_ID,)
+    renamed = _gate_ctx(monkeypatch, message=f"send it from {OUTLOOK_ACCOUNT_ID} instead")
+    renamed.request_policy.run_approved_connection_ids = [DRIVE_ACCOUNT_ID]
+    named_now = await run_credential_gate(
+        renamed, definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
+    )
+    # The account the current request names stays offered next to the earlier pick.
+    assert named_now.blocker is None
+    assert set(named_now.agent_step_connection_ids or ()) == {DRIVE_ACCOUNT_ID, OUTLOOK_ACCOUNT_ID}
+
+
+@pytest.mark.asyncio
+async def test_a_triggered_childs_account_need_reaches_the_card_and_the_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
+    child = {
+        "parameters": [],
+        "blocks": [{"label": "agent", "block_type": "agent_step", "prompt": "email it", "tools": ["send_email"]}],
+    }
+    trigger = {"label": "child", "block_type": "workflow_trigger", "workflow_permanent_id": "wpid_child"}
+    definition = {"parameters": [], "blocks": [trigger]}
+    unapproved = _gate_ctx(monkeypatch)
+    picked = _gate_ctx(monkeypatch)
+    picked.request_policy.run_approved_connection_ids = [DRIVE_ACCOUNT_ID]
+    monkeypatch.setattr(
+        app.DATABASE.workflows,
+        "get_workflow_by_permanent_id",
+        AsyncMock(return_value=SimpleNamespace(workflow_definition=SimpleNamespace(model_dump=lambda mode: child))),
+    )
+
+    blocked = await run_credential_gate(
+        unapproved, definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
+    )
+    narrowed = await run_credential_gate(
+        picked, definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
+    )
+
+    assert blocked.blocker is not None and blocked.agent_step_connection_ids is None
+    assert narrowed.blocker is None and narrowed.agent_step_connection_ids == (DRIVE_ACCOUNT_ID,)
+
+    # Off, the child is not read, so nothing new needs approval, but every account is recorded for a worker that is on.
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", False)
+    off = await run_credential_gate(
+        _gate_ctx(monkeypatch), definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
+    )
+    assert off.blocker is None
+    assert set(off.agent_step_connection_ids or ()) == {DRIVE_ACCOUNT_ID, OUTLOOK_ACCOUNT_ID}
+    revoked = await run_credential_gate(
+        _gate_ctx(monkeypatch, outlook=_outlook(state="revoked")),
+        definition,
+        labels=None,
+        run_parameters=None,
+        narrow_agent_step_accounts=True,
+    )
+    assert revoked.agent_step_connection_ids == (DRIVE_ACCOUNT_ID,)
+    # An unreadable provider is not recorded as a partial list; the dispatch is refused so it can be retried.
+    unreadable = _gate_ctx(monkeypatch)
+    monkeypatch.setattr(
+        microsoft_oauth_service, "get_credentials_for_org", AsyncMock(side_effect=RuntimeError("provider down"))
+    )
+    refused = await run_credential_gate(
+        unreadable, definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
+    )
+    assert refused.error is not None and refused.agent_step_connection_ids is None
+
+    # On, a triggered child with no account tool adds nothing to record.
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
+    monkeypatch.setattr(
+        app.DATABASE.workflows,
+        "get_workflow_by_permanent_id",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                workflow_definition=SimpleNamespace(model_dump=lambda mode: {"parameters": [], "blocks": []})
+            )
+        ),
+    )
+    accountless = await run_credential_gate(
+        _gate_ctx(monkeypatch), definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
+    )
+    assert accountless.blocker is None and accountless.agent_step_connection_ids is None
+
+
+def _trigger(target: str) -> dict[str, Any]:
+    return {"label": f"t_{target}", "block_type": "workflow_trigger", "workflow_permanent_id": target}
+
+
+def _chain(levels: int) -> dict[str, dict[str, Any]]:
+    return {
+        f"wpid_{level}": {"parameters": [], "blocks": [_trigger(f"wpid_{level + 1}")] if level < levels else []}
+        for level in range(1, levels + 1)
+    }
+
+
+_SENDER_CHILD = {
+    "wpid_1": {
+        "parameters": [],
+        "blocks": [{"label": "agent", "block_type": "agent_step", "prompt": "email it", "tools": ["send_email"]}],
+    }
+}
+_DEPTH = WorkflowTriggerBlock.MAX_TRIGGER_DEPTH
+
+
+@pytest.mark.parametrize(
+    ("workflows", "root_target", "narrowing_on", "narrow", "blocks", "reads"),
+    [
+        pytest.param(_chain(_DEPTH), "wpid_1", True, True, False, _DEPTH, id="at_the_depth_limit"),
+        pytest.param(_chain(_DEPTH + 1), "wpid_1", True, True, True, _DEPTH, id="past_the_depth_limit"),
+        pytest.param({}, "{{ target }}", True, True, True, 0, id="templated"),
+        pytest.param({}, "wpid_1", True, True, True, 1, id="unreadable"),
+        pytest.param({"wpid_1": None}, "wpid_1", True, True, True, 1, id="read_error"),
+        pytest.param(
+            {
+                "wpid_1": {"parameters": [], "blocks": [_trigger("wpid_2")]},
+                "wpid_2": {"parameters": [], "blocks": [_trigger("wpid_1")]},
+            },
+            "wpid_1",
+            True,
+            True,
+            False,
+            2,
+            id="cycle_reads_each_once",
+        ),
+        pytest.param(_SENDER_CHILD, "wpid_1", True, True, True, 1, id="child_sends"),
+        pytest.param(_SENDER_CHILD, "wpid_1", False, True, False, 0, id="setting_off"),
+        pytest.param(_SENDER_CHILD, "wpid_1", True, False, False, 0, id="schedule_gate"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_triggered_workflow_walk(
+    monkeypatch: pytest.MonkeyPatch,
+    workflows: dict[str, dict[str, Any] | None],
+    root_target: str,
+    narrowing_on: bool,
+    narrow: bool,
+    blocks: bool,
+    reads: int,
+) -> None:
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", narrowing_on)
+
+    async def read(*, workflow_permanent_id: str, organization_id: str) -> SimpleNamespace | None:
+        if workflow_permanent_id in workflows and workflows[workflow_permanent_id] is None:
+            raise RuntimeError("database down")
+        definition = workflows.get(workflow_permanent_id)
+        if definition is None:
+            return None
+        return SimpleNamespace(workflow_definition=SimpleNamespace(model_dump=lambda mode: definition))
+
+    reader = AsyncMock(side_effect=read)
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", reader)
+
+    result = await run_credential_gate(
+        _gate_ctx(monkeypatch),
+        {"parameters": [], "blocks": [_trigger(root_target)]},
+        labels=None,
+        run_parameters=None,
+        narrow_agent_step_accounts=narrow,
+    )
+
+    assert (result.blocker is not None) is blocks
+    assert reader.await_count == reads
+
+
+@pytest.mark.asyncio
+async def test_a_copilot_test_run_records_the_accounts_this_turn_admitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    reader = {"label": "agent", "block_type": "agent_step", "prompt": "summarize", "tools": ["google_sheets_read"]}
+    sender = {"label": "agent", "block_type": "agent_step", "prompt": "email it", "tools": ["send_email"]}
+    listed = _gate_ctx(monkeypatch, listed=[DRIVE_ACCOUNT_ID, OUTLOOK_ACCOUNT_ID])
+    read_by_listing = await run_credential_gate(
+        listed,
+        {"parameters": [], "blocks": [reader]},
+        labels=None,
+        run_parameters=None,
+        narrow_agent_step_accounts=True,
+    )
+    named = _gate_ctx(monkeypatch, message=f"send it from {DRIVE_ACCOUNT_ID}")
+    monkeypatch.setattr(microsoft_oauth_service, "get_credentials_for_org", AsyncMock(return_value=[]))
+    sent_by_name = await run_credential_gate(
+        named, {"parameters": [], "blocks": [sender]}, labels=None, run_parameters=None, narrow_agent_step_accounts=True
+    )
+
+    assert read_by_listing.blocker is None
+    assert set(read_by_listing.agent_step_connection_ids or ()) == {DRIVE_ACCOUNT_ID, OUTLOOK_ACCOUNT_ID}
+    assert sent_by_name.blocker is None and sent_by_name.agent_step_connection_ids == (DRIVE_ACCOUNT_ID,)
+
+
+@pytest.mark.asyncio
+async def test_an_unapproved_nango_gmail_send_is_held_but_a_saved_powerbi_query_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     send = {
         "label": "send",
         "block_type": "send_email",
@@ -2298,9 +2743,20 @@ async def test_a_nango_gmail_send_is_not_held_to_the_native_account_check(monkey
         "body": "Done",
     }
 
-    result = await _gate(monkeypatch, {"parameters": [], "blocks": [send]})
+    powerbi = {
+        "label": "query",
+        "block_type": "powerbi_query",
+        "connection_id": "nango-powerbi-1",
+        "dataset_id": "dataset-1",
+        "query": 'EVALUATE ROW("x", 1)',
+    }
 
-    assert result.blocker is None and result.error is None
+    held = await _gate(monkeypatch, {"parameters": [], "blocks": [send]})
+    # Power BI's Nango accounts are not listed among the user's connections yet, so its field stays outside the check.
+    passed = await _gate(monkeypatch, {"parameters": [], "blocks": [powerbi]})
+
+    assert held.blocker is not None
+    assert passed.blocker is None and passed.error is None
 
 
 @pytest.mark.asyncio

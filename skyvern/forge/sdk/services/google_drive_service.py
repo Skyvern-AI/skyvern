@@ -31,6 +31,7 @@ DRIVE_MULTIPART_FILE_MAX_BYTES = DRIVE_MULTIPART_UPLOAD_MAX_BYTES - 10 * 1024
 DRIVE_RESUMABLE_CHUNK_BYTES = 8 * 1024 * 1024
 DRIVE_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 GOOGLE_WORKSPACE_MIME_PREFIX = "application/vnd.google-apps."
+GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
 _DRIVE_FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _DEFAULT_BACKOFF_SECONDS = 1.0
@@ -592,12 +593,19 @@ def extract_file_reference(value: str) -> GoogleDriveFileReference:
         return GoogleDriveFileReference(file_id=candidate)
 
     parsed = urlparse(candidate)
-    if parsed.scheme.lower() != "https" or parsed.hostname != "drive.google.com":
-        raise ValueError("Google Drive file URL must use https://drive.google.com")
+    if parsed.scheme.lower() != "https" or parsed.hostname not in ("drive.google.com", "docs.google.com"):
+        raise ValueError("Google Drive file URL must use https://drive.google.com or https://docs.google.com")
 
+    expected_prefix = ["file", "d"] if parsed.hostname == "drive.google.com" else ["document", "d"]
     segments = [segment for segment in parsed.path.split("/") if segment]
-    if len(segments) < 3 or segments[:2] != ["file", "d"] or not _DRIVE_FILE_ID_PATTERN.fullmatch(segments[2]):
+    if len(segments) >= 3 and segments[1] == "u" and segments[2].isdigit():
+        # Signed into several accounts, Google inserts /u/<account-index>/ after the first segment.
+        del segments[1:3]
+    if len(segments) < 3 or segments[:2] != expected_prefix or not _DRIVE_FILE_ID_PATTERN.fullmatch(segments[2]):
         raise ValueError("Unsupported Google Drive file URL")
+    if parsed.hostname == "docs.google.com" and segments[2] == "e":
+        # Publish-to-web links (/document/d/e/<public-id>/pub) carry an ID Drive cannot resolve.
+        raise ValueError("Published Google Docs links are not Drive file URLs")
 
     query = parse_qs(parsed.query, keep_blank_values=True)
     resource_keys = query.get("resourcekey", []) + query.get("resourceKey", [])
@@ -695,7 +703,15 @@ async def download_file(
         _raise_for_error(metadata_response)
         metadata = _downloadable_file_from_payload(metadata_response.json() or {}, validated_file_id)
 
-        if metadata.mime_type and metadata.mime_type.startswith(GOOGLE_WORKSPACE_MIME_PREFIX):
+        media_url = file_url
+        media_params = {"alt": "media", "supportsAllDrives": "true"}
+        output_name = metadata.name
+        if metadata.mime_type == GOOGLE_DOC_MIME_TYPE:
+            # Drive caps exports at 10 MB and answers larger Docs with a non-retryable 403 exportSizeLimitExceeded.
+            media_url = f"{file_url}/export"
+            media_params = {"mimeType": "text/markdown"}
+            output_name = f"{metadata.name}.md"
+        elif metadata.mime_type and metadata.mime_type.startswith(GOOGLE_WORKSPACE_MIME_PREFIX):
             raise GoogleDriveNativeDocumentError()
         if metadata.size is not None and metadata.size > max_size_bytes:
             raise DownloadFileMaxSizeExceeded(max_size_mb)
@@ -718,12 +734,9 @@ async def download_file(
                 try:
                     async with client.stream(
                         "GET",
-                        file_url,
+                        media_url,
                         headers=headers,
-                        params={
-                            "alt": "media",
-                            "supportsAllDrives": "true",
-                        },
+                        params=media_params,
                     ) as response:
                         if response.status_code >= 400:
                             await response.aread()
@@ -767,7 +780,7 @@ async def download_file(
                 break
             else:
                 raise AssertionError("Drive download media retry loop exited without a response")
-            destination_path = publish_unique_download(temporary_path, destination_dir, metadata.name)
+            destination_path = publish_unique_download(temporary_path, destination_dir, output_name)
             return str(destination_path)
         except BaseException:
             temporary_path.unlink(missing_ok=True)

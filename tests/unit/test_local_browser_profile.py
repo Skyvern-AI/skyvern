@@ -612,6 +612,8 @@ def test_timed_out_deletion_stops_before_cleanup_returns(
     profile_path = tmp_path / "profile"
     profile_path.mkdir()
     late_mutation = tmp_path / "late-mutation"
+    ready_path = tmp_path / "child-ready"
+    release_path = tmp_path / "release-child"
     children: list[subprocess.Popen[bytes]] = []
     real_popen = subprocess.Popen
 
@@ -623,9 +625,13 @@ def test_timed_out_deletion_stops_before_cleanup_returns(
                 (
                     "import pathlib, signal, sys, time; "
                     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                    "time.sleep(0.5); pathlib.Path(sys.argv[1]).touch()"
+                    "pathlib.Path(sys.argv[2]).touch(); "
+                    "\nwhile not pathlib.Path(sys.argv[3]).exists(): time.sleep(0.01)"
+                    "\npathlib.Path(sys.argv[1]).touch()"
                 ),
                 str(late_mutation),
+                str(ready_path),
+                str(release_path),
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -634,16 +640,24 @@ def test_timed_out_deletion_stops_before_cleanup_returns(
         children.append(child)
         return child
 
-    monkeypatch.setattr(local_browser_profile, "PROFILE_DELETE_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(local_browser_profile, "terminate_local_browser_processes", lambda _path: True)
-    monkeypatch.setattr(local_browser_profile.subprocess, "Popen", start_blocking_deleter)
+    # Leave time to reap the deliberately SIGTERM-resistant child on a busy runner.
+    monkeypatch.setattr(local_browser_profile, "PROFILE_DELETE_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(local_browser_profile, "PROFILE_PROCESS_STOP_RESERVE_SECONDS", 2.5)
 
-    started_at = time.monotonic()
     try:
+        child = start_blocking_deleter()
+        ready_deadline = time.monotonic() + 5
+        while not ready_path.exists() and child.poll() is None and time.monotonic() < ready_deadline:
+            time.sleep(0.01)
+        assert ready_path.exists()
+        monkeypatch.setattr(local_browser_profile.subprocess, "Popen", lambda *_args, **_kwargs: child)
+
+        started_at = time.monotonic()
         assert local_browser_profile.cleanup_local_browser_profile(profile_path) is False
-        assert time.monotonic() - started_at <= 0.2
+        assert time.monotonic() - started_at <= local_browser_profile.PROFILE_DELETE_TIMEOUT_SECONDS + 0.5
         assert children[0].poll() is not None
-        time.sleep(0.55)
+        release_path.touch()
         assert not late_mutation.exists()
         assert profile_path.exists()
     finally:

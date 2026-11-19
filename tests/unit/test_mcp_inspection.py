@@ -46,40 +46,6 @@ def _network_entry(url: str = "https://a.com", method: str = "GET", status: int 
 # --- Hook registration ---
 
 
-class TestEnsureHooks:
-    def test_registers_six_listeners(self) -> None:
-        state = _make_state()
-        raw = MagicMock()
-        raw.on = MagicMock()
-        _register_hooks_on_page(state, raw)
-        assert raw.on.call_count == 6
-        events = {c.args[0] for c in raw.on.call_args_list}
-        assert events == {"console", "response", "requestfailed", "close", "dialog", "pageerror"}
-
-    def test_idempotent(self) -> None:
-        state = _make_state()
-        raw = MagicMock()
-        raw.on = MagicMock()
-        _register_hooks_on_page(state, raw)
-        _register_hooks_on_page(state, raw)
-        assert raw.on.call_count == 6
-
-    def test_keeps_hooks_on_both_pages(self) -> None:
-        """Multi-page: hooks are registered on ALL pages, not removed on switch."""
-        state = _make_state()
-        raw1 = MagicMock()
-        raw1.on = MagicMock()
-        raw1.remove_listener = MagicMock()
-        raw2 = MagicMock()
-        raw2.on = MagicMock()
-        _register_hooks_on_page(state, raw1)
-        _register_hooks_on_page(state, raw2)
-        # Both pages should have hooks registered — no removal
-        assert raw1.remove_listener.call_count == 0
-        assert raw1.on.call_count == 6
-        assert raw2.on.call_count == 6
-
-
 class TestRequestFailed:
     @skip_no_browser
     @pytest.mark.asyncio

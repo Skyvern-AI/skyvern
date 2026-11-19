@@ -26,6 +26,7 @@ from skyvern.forge import app
 # Reuse the HTTP-logging redactor so SSE tool inputs and request-body logs
 # share one exact-match sensitive-key policy.
 from skyvern.forge.log_redaction import redact_sensitive_fields
+from skyvern.forge.sdk.agents.skills import SKILL_TOOL_NAMES
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.copilot.browser_target import (
     BROWSER_TARGET_PARAM_NAME,
@@ -397,7 +398,7 @@ async def stream_to_sse(
     # carry the same iteration value; it advances after the matching result.
     iteration = 0
 
-    codegen_tracker = _CodegenProgressTracker() if settings.WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED else None
+    codegen_tracker = _CodegenProgressTracker() if settings.EMBER_CODEGEN_PROGRESS_ENABLED else None
 
     narrator_state = ctx.narrator_state or NarratorState()
     ctx.narrator_state = narrator_state
@@ -450,6 +451,11 @@ async def stream_to_sse(
                     tool_input = dict(raw_args)
 
                 reason = normalize_action_reason(tool_input.pop(USER_FACING_REASON_PARAM, None))
+                if tool_name in SKILL_TOOL_NAMES:
+                    # The model's reason can name the skill, so a call whose name is hidden gets no reason line.
+                    if not ctx.skill_session.shows_name(tool_input.get("name")):
+                        reason = None
+                    tool_input = ctx.skill_session.public_arguments(tool_input)
                 if reason is not None:
                     reason = _scrub_actor_text(ctx, reason)
                 display_label = tool_activity_display_label(tool_name, tool_input)
@@ -493,6 +499,9 @@ async def stream_to_sse(
                     )
                 )
 
+                call_browser_session_id = _call_browser_session_id(ctx, event.item, tool_name, tool_input)
+                if call_browser_session_id is not None:
+                    ctx.tool_browser_session_id = call_browser_session_id
                 if not client_gone:
                     await stream.send(
                         WorkflowCopilotToolCallUpdate(
@@ -505,7 +514,7 @@ async def stream_to_sse(
                             iteration=iteration,
                             tool_call_id=call_id,
                             timestamp=presentation.started_at or tool_call_ts,
-                            browser_session_id=_call_browser_session_id(ctx, event.item, tool_name, tool_input),
+                            browser_session_id=call_browser_session_id,
                         )
                     )
 
@@ -922,7 +931,7 @@ async def _capture_actor_dispatch(
     item: RunItem,
 ) -> None:
     """Best-effort local actor output evidence; never participates in dispatch."""
-    root = os.environ.get("COPILOT_DUMP_MODEL_INPUTS")
+    root = os.environ.get("EMBER_DUMP_MODEL_INPUTS") or os.environ.get("COPILOT_DUMP_MODEL_INPUTS")
     if settings.ENV != "local" or not root:
         return
     try:

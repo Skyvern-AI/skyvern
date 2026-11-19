@@ -1,4 +1,7 @@
-import { WORKFLOW_DOC_EDITOR_FLAG } from "@/util/featureFlags";
+import {
+  WORKFLOW_DOC_EDITOR_FLAG,
+  WORKFLOW_DOC_IMAGES_FLAG,
+} from "@/util/featureFlags";
 import { useFeatureFlag } from "./useFeatureFlag";
 
 const overrides = new Set(
@@ -26,4 +29,10 @@ export function useWorkflowDocEditorFlag(): boolean {
     isWorkflowDocEditorEnabled() &&
     (enabled === true || overrides.has(WORKFLOW_DOC_EDITOR_FLAG))
   );
+}
+
+// Screenshots by paste, drop or the picker; off when the flag is absent. Saved screenshots show either way.
+export function useWorkflowDocImagesFlag(): boolean {
+  const enabled = useFeatureFlag(WORKFLOW_DOC_IMAGES_FLAG);
+  return enabled === true || overrides.has(WORKFLOW_DOC_IMAGES_FLAG);
 }

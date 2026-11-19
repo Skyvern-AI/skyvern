@@ -9,7 +9,7 @@ import { GraphIcon } from "@/components/icons/GraphIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
 import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
-import { ATTACHMENT_SIZE_LIMIT_BYTES } from "@/routes/workflows/copilot/attachmentLimits";
+import { ATTACHMENT_SIZE_LIMIT_BYTES } from "@/routes/workflows/ember/attachmentLimits";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { useBrowserSessionPrewarm } from "./useBrowserSessionPrewarm";
@@ -74,7 +74,7 @@ import {
   type SettingsTab,
   type TaskRunSettings,
 } from "./taskRunSettings";
-import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
+import type { EmberAttachedFile } from "@/routes/workflows/ember/emberTypes";
 import { HomeTelemetry, type AgentCreationAttempt } from "@/util/homeTelemetry";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
@@ -84,7 +84,7 @@ import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
 import { openNewAgentInDoc } from "@/store/WorkflowPresentationStore";
-import { rememberDiscoverCopilotPrompt } from "@/routes/workflows/discoverCopilotHandoff";
+import { rememberDiscoverEmberPrompt } from "@/routes/workflows/discoverEmberHandoff";
 import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 
 // Most-clicked first; the grid order is the ranking users see.
@@ -166,7 +166,7 @@ type ExamplePromptKey = (typeof exampleCases)[number]["key"];
 type ExampleAttribution = { id: string; edited: boolean };
 
 const UPLOAD_RETENTION_DAYS = 30;
-// Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the copilot chat request.
+// Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the Ember chat request.
 const MAX_HOME_ATTACHMENTS = 20;
 
 const HOW_IT_WORKS = [
@@ -188,7 +188,7 @@ const HOW_IT_WORKS = [
 ];
 
 type PromptBoxProps = {
-  enableCopilotHandoff?: boolean;
+  enableEmberHandoff?: boolean;
   /** Home-screen variant: no prompt improver and no advanced settings. */
   minimal?: boolean;
   /** Fires once an agent has been created from this prompt box. */
@@ -279,7 +279,7 @@ function showCreateErrorToast(title: string, error: unknown) {
 
 function PromptBoxImpl(
   {
-    enableCopilotHandoff = false,
+    enableEmberHandoff = false,
     minimal = false,
     onAgentCreated,
     secondaryAction,
@@ -301,7 +301,7 @@ function PromptBoxImpl(
     DEFAULT_TASK_RUN_SETTINGS,
   );
   const prewarmBrowserSession = useBrowserSessionPrewarm(
-    enableCopilotHandoff ? null : taskRunSettings.proxyLocation,
+    enableEmberHandoff ? null : taskRunSettings.proxyLocation,
   );
   useEffect(() => {
     prewarmBrowserSession(prompt);
@@ -311,7 +311,7 @@ function PromptBoxImpl(
     useState<SettingsTab>("run");
   const [showHowItWorks, setShowHowItWorks] = useState(false);
   const [promptTouched, setPromptTouched] = useState(false);
-  const [attachedFiles, setAttachedFiles] = useState<CopilotAttachedFile[]>([]);
+  const [attachedFiles, setAttachedFiles] = useState<EmberAttachedFile[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // file_id of the sample resume an example uploaded, so a user's own upload is never mistaken for it.
   const exampleFileIdRef = useRef<string>();
@@ -391,7 +391,7 @@ function PromptBoxImpl(
         filename: file.name,
         size_bytes: file.size,
         available: true,
-      } satisfies CopilotAttachedFile;
+      } satisfies EmberAttachedFile;
     },
     onSuccess: (attached, source) => {
       if (typeof source === "string") {
@@ -411,7 +411,7 @@ function PromptBoxImpl(
     },
   });
 
-  // Returns the prompt to load. Attachments only reach the copilot handoff path,
+  // Returns the prompt to load. Attachments only reach the Ember handoff path,
   // so the plain task path gets the file's public URL in the prompt instead.
   const withExampleAttachment = (prompt: string, path?: string) => {
     if (!path) {
@@ -420,7 +420,7 @@ function PromptBoxImpl(
       );
       return prompt;
     }
-    if (!enableCopilotHandoff) {
+    if (!enableEmberHandoff) {
       return `${prompt} The attached resume is at ${SAMPLE_RESUME_PUBLIC_URL}; download it from there.`;
     }
     if (attachedFiles.length >= MAX_HOME_ATTACHMENTS) {
@@ -482,7 +482,7 @@ function PromptBoxImpl(
     },
   });
 
-  // The editor stages the SOP file in Copilot once it opens (`?sop=1`), the same path as the Copilot card.
+  // The editor stages the SOP file in Ember once it opens (`?sop=1`), the same path as the Ember card.
   const startFromSopMutation = useMutation({
     mutationFn: async (file: File) => ({
       file,
@@ -508,12 +508,8 @@ function PromptBoxImpl(
       attempt: AgentCreationAttempt;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      const {
-        proxyLocation,
-        publishWorkflow,
-        generateScript,
-        maxStepsOverride,
-      } = taskRunSettings;
+      const { proxyLocation, publishWorkflow, maxStepsOverride } =
+        taskRunSettings;
       // The popover shows whitespace-only values as unchanged, so send them as unset.
       const webhookCallbackUrl = blankToNull(
         taskRunSettings.webhookCallbackUrl,
@@ -531,7 +527,6 @@ function PromptBoxImpl(
         totp_identifier: totpIdentifier,
         max_screenshot_scrolls: maxScreenshotScrolls,
         publish_workflow: publishWorkflow,
-        generate_script: generateScript,
         run_with: "agent",
         ai_fallback: true,
         extracted_information_schema: dataSchema
@@ -627,7 +622,7 @@ function PromptBoxImpl(
     }) => {
       const client = await getClient(credentialGetter);
       const yaml = convertToYAML(
-        // A default title lets Copilot name the agent from this prompt on its first turn.
+        // A default title lets Ember name the agent from this prompt on its first turn.
         buildBlankWorkflowRequest("New Agent", runWith),
       );
       const result = await client.post<string, AxiosResponse<unknown>>(
@@ -657,7 +652,7 @@ function PromptBoxImpl(
       // Only the studio handoff writes the recovery key. The legacy /build path
       // can mount Workspace, but it never consumes this stored discover seed.
       if (studioEnabled) {
-        rememberDiscoverCopilotPrompt(workflow.workflow_permanent_id, prompt);
+        rememberDiscoverEmberPrompt(workflow.workflow_permanent_id, prompt);
       }
       // `?via=discover` is what makes WorkflowEditor fire
       // `copilot.discover.started` with entry_point=discover on mount.
@@ -669,8 +664,8 @@ function PromptBoxImpl(
         ),
         {
           state: {
-            copilotMessage: prompt,
-            copilotAttachedFiles:
+            emberMessage: prompt,
+            emberAttachedFiles:
               attachedFiles.length > 0 ? attachedFiles : undefined,
           },
         },
@@ -723,7 +718,7 @@ function PromptBoxImpl(
       source,
       example,
       exampleEdited,
-      handoff: enableCopilotHandoff,
+      handoff: enableEmberHandoff,
       variant: minimal ? "revamp" : "legacy",
     });
     HomeTelemetry.promptSubmitted({
@@ -732,9 +727,9 @@ function PromptBoxImpl(
       example,
       exampleEdited,
       promptLength: prompt.length,
-      handoff: enableCopilotHandoff,
+      handoff: enableEmberHandoff,
     });
-    if (enableCopilotHandoff) {
+    if (enableEmberHandoff) {
       handoffWorkflowMutation.mutate({
         prompt,
         runWith: "agent",
@@ -838,7 +833,7 @@ function PromptBoxImpl(
         </Tooltip>
       </TooltipProvider>
       <DropdownMenuContent align="start">
-        {enableCopilotHandoff ? (
+        {enableEmberHandoff ? (
           <DropdownMenuItem
             disabled={attachedFiles.length >= MAX_HOME_ATTACHMENTS}
             onSelect={() => {
@@ -895,7 +890,7 @@ function PromptBoxImpl(
               onFocus={() => setPromptTouched(true)}
               cycling={!promptTouched}
             />
-            {enableCopilotHandoff ? (
+            {enableEmberHandoff ? (
               <div className="px-5">{attachmentChips}</div>
             ) : null}
             <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-2">
@@ -912,7 +907,7 @@ function PromptBoxImpl(
                 className="size-11 rounded-full border-0 bg-transparent md:size-9"
                 iconClassName="h-[18px] w-[18px]"
               />
-              {!enableCopilotHandoff ? (
+              {!enableEmberHandoff ? (
                 <AdvancedSettingsPopover
                   settings={taskRunSettings}
                   onChange={setTaskRunSettings}
@@ -943,7 +938,7 @@ function PromptBoxImpl(
               </button>
             </div>
           </div>
-          {!enableCopilotHandoff ? (
+          {!enableEmberHandoff ? (
             <ChangedSettingsChips
               settings={taskRunSettings}
               onChange={setTaskRunSettings}

@@ -220,6 +220,27 @@ class CancelledLargeResponseRelay(EventRelay):
 
 
 @pytest.mark.asyncio
+async def test_root_lease_requires_explicit_shared_tab_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    start = AsyncMock()
+    request = AsyncMock(return_value={"tab": {"tabId": 11, "url": "about:blank", "title": ""}})
+    monkeypatch.setattr(client, "start", start)
+    monkeypatch.setattr(client, "_control_request", request)
+
+    assert await client.ensure_root_lease() is None
+    start.assert_not_awaited()
+    request.assert_not_awaited()
+
+    client.shared_tab_start = True
+    assert (await client.ensure_root_lease())["tabId"] == 11
+    request.assert_awaited_once_with("lease.acquire_default", {"adopt_shared": True}, 20.0)
+
+    client.shared_tab_start = False
+    assert (await client.ensure_root_lease())["tabId"] == 11
+    assert request.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_client_is_relay_compatible_and_fences_stale_disconnect() -> None:
     server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     events: list[tuple[str, dict]] = []
@@ -242,6 +263,7 @@ async def test_client_is_relay_compatible_and_fences_stale_disconnect() -> None:
         await _eventually(lambda: len(events) > hello_count)
         assert events[-1] == ("extension.hello", {"scopedTabs": []})
 
+        client.shared_tab_start = True
         leased_tab = await client.ensure_root_lease()
         assert leased_tab == relay.scoped_tabs[0]
         assert client.scoped_tabs == [leased_tab]
@@ -720,6 +742,7 @@ async def test_client_lists_fresh_tabs_owned_by_its_lease() -> None:
             {"tabId": 11, "url": "https://one.test", "active": True},
             {"tabId": 12, "url": "https://two.test", "active": False},
         ]
+        client.shared_tab_start = True
         assert (await client.ensure_root_lease())["tabId"] == relay.scoped_tabs[0]["tabId"]
         await client.request("tabs.activate", {"tabId": 12})
 
@@ -763,6 +786,7 @@ async def test_connected_is_published_only_after_synthetic_hello_snapshot() -> N
         assert observed_tabs == [[]]
         assert client.scoped_tabs == []
 
+        client.shared_tab_start = True
         leased_tab = await client.ensure_root_lease()
         assert leased_tab == relay.scoped_tabs[0]
         assert client.scoped_tabs == [leased_tab]

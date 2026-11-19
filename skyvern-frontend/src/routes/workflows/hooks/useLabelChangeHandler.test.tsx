@@ -16,8 +16,8 @@ import {
   useNodeCollapseStore,
 } from "../editor/collapse/useNodeCollapseStore";
 import {
-  beginCopilotAcceptance,
-  finishCopilotAcceptance,
+  beginEmberAcceptance,
+  finishEmberAcceptance,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
@@ -124,7 +124,7 @@ describe("useNodeLabelChangeHandler collapse migration", () => {
     );
     let token: symbol;
     act(() => {
-      token = beginCopilotAcceptance()!;
+      token = beginEmberAcceptance()!;
     });
     act(() => result.current[1]("New_Label"));
     expect(result.current[0]).toBe("Old_Label");
@@ -139,7 +139,7 @@ describe("useNodeLabelChangeHandler collapse migration", () => {
       ],
     ).toBeUndefined();
     expect(xyflow.setNodes).not.toHaveBeenCalled();
-    act(() => finishCopilotAcceptance(token));
+    act(() => finishEmberAcceptance(token));
     expect(xyflow.setNodes).toHaveBeenCalledTimes(1);
     expect(result.current[0]).toBe("New_Label");
   });
@@ -181,11 +181,11 @@ describe("deferred block label edits", () => {
     );
     let token: symbol;
     act(() => {
-      token = beginCopilotAcceptance()!;
+      token = beginEmberAcceptance()!;
     });
     act(() => first.result.current[1]("New_Label"));
     first.unmount();
-    act(() => finishCopilotAcceptance(token));
+    act(() => finishEmberAcceptance(token));
     const parkedEntries = [...deferredEdits.entries()];
     expect(parkedEntries).toHaveLength(1);
 
@@ -231,7 +231,7 @@ describe("deferred block label edits", () => {
     );
     let token: symbol;
     act(() => {
-      token = beginCopilotAcceptance()!;
+      token = beginEmberAcceptance()!;
     });
     act(() => first.result.current[1]("New_Label"));
     first.unmount();
@@ -243,7 +243,7 @@ describe("deferred block label edits", () => {
     clearDeferredEdits();
 
     expect(deferredEdits.size).toBe(0);
-    act(() => finishCopilotAcceptance(token));
+    act(() => finishEmberAcceptance(token));
     renderHook(
       () =>
         useNodeLabelChangeHandler({ id: "node-1", initialValue: "Old_Label" }),
@@ -260,7 +260,7 @@ describe("deferred block label edits", () => {
     );
     let token: symbol;
     act(() => {
-      token = beginCopilotAcceptance()!;
+      token = beginEmberAcceptance()!;
     });
     act(() => first.result.current[1]("New_Label"));
     expect(xyflow.setNodes).not.toHaveBeenCalled();
@@ -272,7 +272,7 @@ describe("deferred block label edits", () => {
       { wrapper },
     );
     expect(xyflow.setNodes).not.toHaveBeenCalled();
-    act(() => finishCopilotAcceptance(token));
+    act(() => finishEmberAcceptance(token));
     expect(second.result.current[0]).toBe("New_Label");
     expect((xyflow.nodes[0] as AppNode).data.label).toBe("New_Label");
     expect(xyflow.setNodes).toHaveBeenCalledTimes(1);
@@ -294,7 +294,7 @@ describe("deferred block label edits", () => {
       fireEvent.change(input, { target: { value: "New_Label" } });
       let token: symbol;
       act(() => {
-        if (kind === "copilot") token = beginCopilotAcceptance()!;
+        if (kind === "copilot") token = beginEmberAcceptance()!;
         else
           useWorkflowYamlEditorStore.setState({
             commitInProgress: true,
@@ -305,7 +305,7 @@ describe("deferred block label edits", () => {
       expect(xyflow.setNodes).not.toHaveBeenCalled();
       expect((xyflow.nodes[0] as AppNode).data.label).toBe("Old_Label");
       act(() => {
-        if (kind === "copilot") finishCopilotAcceptance(token);
+        if (kind === "copilot") finishEmberAcceptance(token);
         else
           useWorkflowYamlEditorStore.setState({
             commitInProgress: false,
@@ -325,18 +325,18 @@ describe("deferred block label edits", () => {
     });
     let token: symbol;
     act(() => {
-      token = beginCopilotAcceptance()!;
+      token = beginEmberAcceptance()!;
     });
     expect(screen.queryByRole("textbox")).toBeNull();
     expect(xyflow.setNodes).not.toHaveBeenCalled();
-    act(() => finishCopilotAcceptance(token));
+    act(() => finishEmberAcceptance(token));
     expect((xyflow.nodes[0] as AppNode).data.label).toBe("New_Label");
     expect(xyflow.setNodes).toHaveBeenCalledTimes(1);
   });
 
   test("cannot begin editing while locked", () => {
     act(() => {
-      beginCopilotAcceptance();
+      beginEmberAcceptance();
     });
     render(<EditableLabel />, { wrapper });
     fireEvent.click(screen.getByRole("heading", { name: "Old_Label" }));
@@ -356,12 +356,12 @@ describe("deferred block label edits", () => {
       );
       let token: symbol;
       act(() => {
-        token = beginCopilotAcceptance()!;
+        token = beginEmberAcceptance()!;
       });
       act(() => result.current[1]("New_Label"));
       xyflow.nodes =
         change === "renamed" ? [makeNode("node-1", "Copilot_Label")] : [];
-      act(() => finishCopilotAcceptance(token));
+      act(() => finishEmberAcceptance(token));
       expect(xyflow.setNodes).not.toHaveBeenCalled();
     },
   );

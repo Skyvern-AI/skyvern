@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
@@ -10,6 +11,7 @@ import structlog
 from pydantic import BaseModel
 
 from skyvern.forge import app
+from skyvern.forge.sdk.integrations.catalog import all_integration_entries, entry_action
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
@@ -24,11 +26,11 @@ from skyvern.schemas.workflows import (
 
 LOG = structlog.get_logger()
 
-ConnectionProvider = Literal["google", "microsoft"]
+ConnectionProvider = Literal["google", "microsoft", "nango"]
 
-# ponytail: Nango connections are not among the org connections resolved here, so their fields stay outside the
-# approval check; add a Nango reader to org_connections to bring them under it (SKY-19944).
-_UNRESOLVED_CONNECTION_SOURCES = frozenset({"nango"})
+# ponytail: org_connections lists only Connected Gmail among Nango accounts, so other blocks' Nango fields stay
+# outside the approval check; add a block type here once its owned Nango rows join org_connections.
+_LISTED_NANGO_BLOCK_TYPES = frozenset({BlockType.SEND_EMAIL, BlockType.EMAIL_INBOX})
 
 
 @dataclass(frozen=True)
@@ -46,7 +48,8 @@ def _marked_fields(model: type[BaseModel]) -> tuple[_MarkedField, ...]:
             continue
         condition = extra.get(CONNECTED_ACCOUNT_CONDITION_MARK)
         condition = dict(condition) if isinstance(condition, dict) else {}
-        if condition.get("credential_source") in _UNRESOLVED_CONNECTION_SOURCES:
+        block_type = model.model_fields["block_type"].default
+        if condition.get("credential_source") == "nango" and block_type not in _LISTED_NANGO_BLOCK_TYPES:
             continue
         defaults = {key: model.model_fields[key].default for key in condition if key in model.model_fields}
         marked.append(
@@ -81,15 +84,46 @@ def settable_connected_account_fields(
     )
 
 
+def _integration_action_acts(block: Mapping[str, Any]) -> bool:
+    # An unknown action counts as acting, so its account still gets the stricter approval.
+    found = entry_action(
+        all_integration_entries(),
+        str(block.get("integration_id")),
+        str(block.get("action_id")),
+    )
+    return found is None or found[1].acts
+
+
 def connected_account_fields(block: Mapping[str, Any], *, acting_only: bool = False) -> tuple[str, ...]:
     """The marked fields this block reads, given the sibling values each mark's condition names. With
-    `acting_only`, only those the schema marks as acting on the outside world."""
+    `acting_only`, only those acting on the outside world: the schema's mark, or an integration action's `acts`."""
+    acts = block.get("block_type") == BlockType.INTEGRATION_ACTION.value and _integration_action_acts(block)
     return tuple(
         field.name
         for field in _connected_account_fields().get(str(block.get("block_type")), ())
-        if (field.acts or not acting_only)
+        if (field.acts or acts or not acting_only)
         and all(block.get(key, default) == value for key, (value, default) in field.condition.items())
     )
+
+
+def as_run_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
+    """An integration_action block seen as the existing block it runs, with the same field precedence the block uses
+    at run time; any other block, or an action that runs no existing block, comes back unchanged."""
+    if block.get("block_type") != BlockType.INTEGRATION_ACTION.value:
+        return block
+    found = entry_action(all_integration_entries(), str(block.get("integration_id")), str(block.get("action_id")))
+    kind, _, block_type = found[1].runs_via.partition(":") if found else ("", "", "")
+    if found is None or kind != "block":
+        return block
+    pins = {
+        name: schema["const"] for name, schema in found[1].inputs.get("properties", {}).items() if "const" in schema
+    }
+    inputs = block.get("inputs")
+    view = {**block, **pins, **(inputs if isinstance(inputs, dict) else {}), "block_type": block_type}
+    account_fields = connected_account_fields(view)
+    if account_fields and block.get("connection_id"):
+        view[account_fields[0]] = block["connection_id"]
+    return view
 
 
 def block_connection_refs(block: Mapping[str, Any], *, acting_only: bool = False) -> list[str]:
@@ -113,6 +147,11 @@ class OrgConnection:
     @property
     def active(self) -> bool:
         return self.state == STATE_ACTIVE
+
+    @property
+    def agent_step_usable(self) -> bool:
+        # A Nango hop token is minted only for a saved block, so the agent step never offers a Nango account (ADR 0033).
+        return self.provider != "nango"
 
     def choice(self) -> ConnectedAccountChoice:
         return ConnectedAccountChoice(
@@ -143,29 +182,39 @@ def _connection(
     )
 
 
+async def _no_connections() -> list[OrgConnection]:
+    return []
+
+
 class IncompleteConnectionRead(Exception):
     """A provider's rows could not be read. `connections` holds the providers that did load; only an id lookup may
     use them, because a name that looks unique among them can still match a row in the provider that failed."""
 
-    def __init__(self, connections: list[OrgConnection]) -> None:
+    def __init__(self, connections: list[OrgConnection], failed: frozenset[str]) -> None:
         super().__init__("a connected-account provider could not be read")
         self.connections = connections
+        self.failed = failed
 
 
 async def org_connections(organization_id: str, user_id: str | None = None) -> list[OrgConnection]:
-    """Every OAuth connection `user_id` may see in the org, as one flat list."""
+    """Every connection `user_id` may see in the org, as one flat list. Nango connections are the user's own."""
     # Not integrations_for_org: it files accounts under catalog entries by scope, and this list must not.
-    results: list[Sequence[GoogleOAuthCredentialBase | MicrosoftOAuthCredentialBase] | BaseException] = list(
+    own_nango: Awaitable[list[OrgConnection]] = (
+        app.AGENT_FUNCTION.own_connected_gmail_connections(organization_id, user_id) if user_id else _no_connections()
+    )
+    reads: list[Sequence[Any] | BaseException] = list(
         await asyncio.gather(
             google_oauth_service.get_visible_credentials_for_org(organization_id),
             microsoft_oauth_service.get_credentials_for_org(organization_id, user_id=user_id),
+            own_nango,
             return_exceptions=True,
         )
     )
-    providers: tuple[ConnectionProvider, ...] = ("google", "microsoft")
+    providers: tuple[ConnectionProvider, ...] = ("google", "microsoft", "nango")
     connections: list[OrgConnection] = []
     failure: BaseException | None = None
-    for provider, rows in zip(providers, results):
+    failed: set[str] = set()
+    for provider, rows in zip(providers, reads):
         if isinstance(rows, BaseException):
             if not isinstance(rows, Exception):
                 raise rows
@@ -176,11 +225,60 @@ async def org_connections(organization_id: str, user_id: str | None = None) -> l
                 exc_info=rows,
             )
             failure = rows
+            failed.add(provider)
             continue
-        connections.extend(_connection(row, provider) for row in rows if row.organization_id == organization_id)
+        if provider == "nango":
+            connections.extend(rows)
+        else:
+            connections.extend(_connection(row, provider) for row in rows if row.organization_id == organization_id)
     if failure is not None:
-        raise IncompleteConnectionRead(connections) from failure
+        raise IncompleteConnectionRead(connections, frozenset(failed)) from failure
     return connections
+
+
+# A run Copilot starts offers its agent steps only the accounts the chat approved, recorded here at dispatch.
+_RUN_ACCOUNTS_TTL_SECONDS = 3 * 24 * 60 * 60
+COPILOT_RUN_CREATOR = "copilot"
+
+
+def _run_accounts_key(organization_id: str, workflow_run_id: str) -> str:
+    return f"agent_step_run_accounts:{organization_id}:{workflow_run_id}"
+
+
+async def record_run_connection_ids(organization_id: str, workflow_run_id: str, connection_ids: Sequence[str]) -> None:
+    await app.CACHE.set(
+        _run_accounts_key(organization_id, workflow_run_id),
+        json.dumps(list(connection_ids)),
+        ex=_RUN_ACCOUNTS_TTL_SECONDS,
+    )
+
+
+async def run_connection_ids(organization_id: str, workflow_run_id: str) -> set[str] | None:
+    """The accounts recorded for a Copilot run; None only when nothing was recorded. A record that cannot be read
+    offers no account, whatever the reader's own setting."""
+    try:
+        raw = await app.CACHE.get(_run_accounts_key(organization_id, workflow_run_id))
+    except Exception:
+        LOG.warning("agent_step_run_accounts_read_failed", workflow_run_id=workflow_run_id, exc_info=True)
+        return set()
+    if not raw:
+        return None
+    try:
+        ids = json.loads(raw)
+    except (TypeError, ValueError):
+        return set()
+    return {i for i in ids if isinstance(i, str)} if isinstance(ids, list) else set()
+
+
+async def agent_step_org_connections(organization_id: str, user_id: str | None) -> list[OrgConnection]:
+    """The connections an agent step may be offered. A Nango-only read failure hides nothing it could use."""
+    try:
+        connections = await org_connections(organization_id, user_id)
+    except IncompleteConnectionRead as incomplete:
+        if not incomplete.failed <= {"nango"}:
+            raise
+        connections = incomplete.connections
+    return [connection for connection in connections if connection.agent_step_usable]
 
 
 async def org_connections_by_id(organization_id: str, user_id: str | None = None) -> list[OrgConnection]:
@@ -233,8 +331,7 @@ async def _nango_access(organization_id: str, account_id: str, required_scopes: 
     return UseHop()
 
 
-# ponytail: Nango accounts are not among org_connections yet, so the lookup never reaches "nango" until a Nango
-# reader joins it. Its token never leaves the hop, so no block can call a provider API with it directly.
+# A Nango account's token never leaves the hop, so no block can call a provider API with it directly.
 ACCOUNT_BACKENDS: dict[str, AccountBackend] = {
     "google": AccountBackend(_google_access, frozenset({"google"})),
     "microsoft": AccountBackend(_microsoft_access, frozenset({"microsoft"})),

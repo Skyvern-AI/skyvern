@@ -24,6 +24,10 @@ import {
   workflowEffectiveDefaultEngine,
 } from "./workflowEditorUtils";
 import { removeJinjaReferenceFromNodes } from "./jinjaReferences";
+import {
+  newDocImageHandle,
+  resolveDocImageHandle,
+} from "./doc/docImageHandles";
 import { collectKnownErrorCodes } from "./nodes/StartNode/retryPolicyUtils";
 import { terminateNodeDefaultData } from "./nodes/TerminateNode/types";
 
@@ -246,6 +250,64 @@ test("Gmail message ids survive load, save and export", () => {
 
   expect(getWorkflowBlocks(nodes, edges)).toMatchObject(expected);
   expect(convert(source).workflow_definition.blocks).toMatchObject(expected);
+});
+
+test("Gmail message ids are written only when set on a native account", () => {
+  const send = {
+    block_type: "send_email",
+    label: "send",
+    transport: "gmail",
+    credential_id: "cred_1",
+    sender: "",
+    recipients: ["a@example.com"],
+    subject: "Hi",
+    body: "Hi",
+    file_attachments: [],
+    continue_on_failure: false,
+    next_loop_on_failure: false,
+    model: null,
+  };
+  const read = {
+    block_type: "email_inbox",
+    label: "read",
+    email_client: "gmail",
+    credential_id: "cred_1",
+    folder: "INBOX",
+    prompt: "",
+    max_results: 25,
+    include_body: true,
+    download_attachments: false,
+    parameters: [],
+    continue_on_failure: false,
+    next_loop_on_failure: false,
+    model: null,
+  };
+  const stored = [
+    { ...send, label: "unset" },
+    { ...read, label: "unset_read" },
+    {
+      ...send,
+      label: "broker",
+      credential_id: null,
+      credential_source: "nango",
+      connection_id: "conn_1",
+      reply_to_message_id: "{{ email.id }}",
+    },
+    {
+      ...read,
+      label: "broker_read",
+      credential_id: null,
+      credential_source: "nango",
+      connection_id: "conn_1",
+      message_id: "{{ email.id }}",
+    },
+  ] as unknown as Array<WorkflowBlock>;
+  const { nodes, edges } = getElements(stored, SETTINGS, true);
+
+  for (const block of getWorkflowBlocks(nodes, edges)) {
+    expect(block).not.toHaveProperty("reply_to_message_id");
+    expect(block).not.toHaveProperty("message_id");
+  }
 });
 
 describe("withGoalUndoRecordsFrom", () => {
@@ -818,12 +880,49 @@ describe("removeKeyFromNodesParameterKeys", () => {
 });
 
 describe("block note metadata round trip", () => {
+  test("no upload handle leaves a save: a finished one is sent as its file, the rest are left out", () => {
+    const done = newDocImageHandle();
+    const uploading = newDocImageHandle();
+    resolveDocImageHandle(done, "file_done");
+    const shots = (...ids: string[]) =>
+      ids.map((file_id) => ({ file_id, caption: null, placement: "above" }));
+    const { nodes, edges } = getElements(
+      [
+        {
+          ...minimalTaskBlock(),
+          label: "mixed",
+          doc_images: shots("file_saved", uploading, done),
+        },
+        {
+          ...minimalTaskBlock(),
+          label: "uploading",
+          doc_images: shots(uploading),
+        },
+        { ...minimalTaskBlock(), label: "empty", doc_images: [] },
+      ] as WorkflowBlock[],
+      SETTINGS,
+      false,
+    );
+    const saved = getWorkflowBlocks(nodes, edges);
+    const of = (label: string) => saved.find((b) => b.label === label)!;
+    expect(of("mixed").doc_images).toEqual(shots("file_saved", "file_done"));
+    expect(of("uploading")).not.toHaveProperty("doc_images");
+    expect(of("empty").doc_images).toEqual([]);
+    expect(JSON.stringify(saved)).not.toContain("pending_");
+  });
+
   test("preserves notes and omits unset fields through graph serialization", () => {
     const noted = {
       ...minimalTaskBlock(),
       notes: "Read the saved plan first.",
       trailing_notes: "Stop after confirming the result.",
       description: "Only for the workflow author.",
+      doc_images: [
+        { file_id: "file_shot", caption: "Login page", placement: "above" },
+      ],
+      prompt_images: [
+        { file_id: "file_ref", caption: null, placement: "block" },
+      ],
     } as WorkflowBlock;
     const oldVersion = {
       ...minimalTaskBlock(),
@@ -836,12 +935,24 @@ describe("block note metadata round trip", () => {
       notes: "Read the saved plan first.",
       trailing_notes: "Stop after confirming the result.",
       description: "Only for the workflow author.",
+      doc_images: [
+        { file_id: "file_shot", caption: "Login page", placement: "above" },
+      ],
+      prompt_images: [
+        { file_id: "file_ref", caption: null, placement: "block" },
+      ],
     });
     const savedOldVersion = saved.find(
       (block) => block.label === "old_version",
     );
     expect(savedOldVersion).toBeDefined();
-    for (const key of ["notes", "trailing_notes", "description"] as const) {
+    for (const key of [
+      "notes",
+      "trailing_notes",
+      "description",
+      "doc_images",
+      "prompt_images",
+    ] as const) {
       expect(savedOldVersion).not.toHaveProperty(key);
     }
   });

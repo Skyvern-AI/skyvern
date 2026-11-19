@@ -26,13 +26,13 @@
   }
 }
 
-/* Class set by useWorkflowGraphState's highlightBlock (COPILOT_BLOCK_HIGHLIGHT_CLASS).
+/* Class set by useWorkflowGraphState's highlightBlock (EMBER_BLOCK_HIGHLIGHT_CLASS).
    Deliberately not `.selected` — that flag also tracks the editor's sidebar
    selection, so keying off it flashed on every normal node click. */
-.react-flow__node.sk-copilot-block-highlight
+.react-flow__node.sk-ember-block-highlight
   > div
   > .rounded-lg.transition-shadow,
-.react-flow__node.sk-copilot-block-highlight
+.react-flow__node.sk-ember-block-highlight
   > div
   > div
   > .rounded-lg.transition-shadow {

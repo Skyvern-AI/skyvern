@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot.ask_user import (
+    DETACHED_QUESTION_CLIENT_GRACE,
+    QUESTION_CLIENT_GRACE,
     AskUserArguments,
     QuestionAnswer,
     QuestionResponse,
@@ -22,6 +24,7 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait, pause_human_input
 from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _RawSecretSafetyScreen
+from skyvern.forge.sdk.db import repositories
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotPendingTurn
@@ -189,7 +192,7 @@ def test_question_secret_screen_preserves_safe_content():
     assert interaction.parts[0].choices[0].text == "Send me the receipt"
 
 
-async def setup_question_chat(sqlite_engine, monkeypatch):
+async def setup_question_chat(sqlite_engine, monkeypatch, question_client_grace_seconds=None):
     from fastapi import FastAPI, Request
     from httpx import ASGITransport, AsyncClient
 
@@ -222,7 +225,12 @@ async def setup_question_chat(sqlite_engine, monkeypatch):
     await repo.start_copilot_turn(
         organization_id="org",
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-        pending_turn=CopilotPendingTurn(turn_id="turn", started_at=datetime.now(UTC), cancel_token="stop"),
+        pending_turn=CopilotPendingTurn(
+            turn_id="turn",
+            started_at=datetime.now(UTC),
+            cancel_token="stop",
+            question_client_grace_seconds=question_client_grace_seconds,
+        ),
         user_message="Ask about the invoice format",
     )
     api = FastAPI()
@@ -837,6 +845,88 @@ async def test_client_checkins_extend_wait_and_abandoned_handler_exits(sqlite_en
             if not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("silent_minutes, still_open", [(6, True), (30, False)])
+async def test_detached_question_stays_open_thirty_minutes_without_reads(
+    sqlite_engine, monkeypatch, silent_minutes, still_open
+):
+    repo, client, ctx, frames = await setup_question_chat(
+        sqlite_engine, monkeypatch, int(DETACHED_QUESTION_CLIENT_GRACE.total_seconds())
+    )
+    now = [datetime.now(UTC)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now[0]
+
+    monkeypatch.setattr(repositories.workflow_parameters, "datetime", Clock)
+    async with client:
+        task = asyncio.create_task(
+            ask_user(ctx, AskUserArguments.model_validate({"parts": [{"prompt": "Format?"}]}), "call")
+        )
+        try:
+            question = (await asyncio.wait_for(frames.get(), 5))["interactions"][0]
+            now[0] += timedelta(minutes=silent_minutes)
+            await asyncio.sleep(0.1)
+            if still_open:
+                assert not task.done()
+                history = (
+                    await client.get("/history", params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id})
+                ).json()
+                assert history["question_interactions"][0]["status"] == "pending"
+                assert datetime.fromisoformat(history["in_flight_turn"]["question_open_until"]) == (
+                    now[0] + DETACHED_QUESTION_CLIENT_GRACE
+                )
+            else:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 5)
+            reply = await client.post(
+                "/reply",
+                json={
+                    "workflow_copilot_chat_id": ctx.workflow_copilot_chat_id,
+                    "interaction_id": question["interaction_id"],
+                    "text": "CSV",
+                },
+            )
+            if still_open:
+                assert reply.status_code == 200
+                assert (await asyncio.wait_for(task, 5))["text"] == "CSV"
+            else:
+                assert reply.status_code == 409
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grace_seconds", [None, int(DETACHED_QUESTION_CLIENT_GRACE.total_seconds())])
+async def test_question_open_until_is_the_expiry_deadline_for_the_starter_only(
+    sqlite_engine, monkeypatch, grace_seconds
+):
+    repo, client, ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch, grace_seconds)
+    params = {"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id}
+    async with client:
+        before_question = (await client.get("/history", params=params)).json()
+        question = create_question_interaction(
+            AskUserArguments.model_validate({"parts": [{"prompt": "Format?"}]}), turn_id="turn", tool_call_id="call"
+        )
+        await repo.start_copilot_question("org", ctx.workflow_copilot_chat_id, question)
+        open_until = datetime.fromisoformat(
+            (await client.get("/history", params=params)).json()["in_flight_turn"]["question_open_until"]
+        )
+        stored = (await repo.get_workflow_copilot_chat_by_id("org", ctx.workflow_copilot_chat_id)).pending_turns["turn"]
+        monkeypatch.setattr(app.AGENT_FUNCTION, "copilot_turn_control_allowed", AsyncMock(return_value=False))
+        not_starter = (await client.get("/history", params=params)).json()
+
+    assert before_question["in_flight_turn"]["question_open_until"] is None
+    grace = QUESTION_CLIENT_GRACE if grace_seconds is None else DETACHED_QUESTION_CLIENT_GRACE
+    assert open_until == stored.question_client_seen_at + grace
+    assert open_until == stored.question_client_deadline(stored.question_interactions[0])
+    assert not_starter["in_flight_turn"]["question_open_until"] is None
 
 
 @pytest.mark.asyncio

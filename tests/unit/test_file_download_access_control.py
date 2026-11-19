@@ -14,6 +14,7 @@ from aiohttp.test_utils import TestServer
 from skyvern.config import settings
 from skyvern.constants import DOWNLOAD_FILE_PREFIX
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
@@ -63,7 +64,7 @@ def storage(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         assert_managed_file_access=MagicMock(side_effect=assert_managed_file_access),
         download_managed_file=AsyncMock(return_value=b"tenant-secret-bytes"),
     )
-    monkeypatch.setattr(files, "app", SimpleNamespace(STORAGE=storage))
+    monkeypatch.setattr(files, "app", SimpleNamespace(STORAGE=storage, AGENT_FUNCTION=AgentFunction()))
     return storage
 
 

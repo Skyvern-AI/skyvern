@@ -21,7 +21,7 @@ export const docLearnContent: DocLearnContent[] = [
     id: "notes",
     title: "Notes",
     description:
-      "Plain text between steps is a note. The agent reads it at run time, in the step above it and the step below it. Text after the last step of a loop or branch is read by that last step.",
+      "Plain text between steps is a note; + Note under a step adds one below it. The agent reads it at run time, in the step above it and the step below it. Text after the last step of a loop or branch is read by that last step.",
   },
   {
     id: "keys",

@@ -6,16 +6,11 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from skyvern.forge.sdk.copilot.code_block_steps import (
-    code_block_labels_awaiting_goal_rebuild,
-    code_block_labels_with_user_owned_goal,
-)
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     build_transcript_context,
     redact_raw_secrets_for_prompt,
 )
-from skyvern.forge.sdk.copilot.secret_redaction import redact_secretlike_filename
 from skyvern.forge.sdk.copilot.workflow_change_summary import WorkflowChangeKind, summarize_user_workflow_change
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -24,6 +19,11 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
+from skyvern.forge.sdk.workflow.code_block_steps import (
+    code_block_labels_awaiting_goal_rebuild,
+    code_block_labels_with_user_owned_goal,
+)
+from skyvern.utils.raw_secret_redaction import redact_secretlike_filename
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()

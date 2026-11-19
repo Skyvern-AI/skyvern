@@ -35,6 +35,7 @@ _api_key_clients: OrderedDict[str, Skyvern] = OrderedDict()
 # Evicted loopback clients whose driver a running call still leases; the idle sweep closes them once it is released.
 _closing_clients: set[_LoopbackSkyvern] = set()
 _clients_lock = RLock()
+_standalone_http_server = False
 LOG = structlog.get_logger(__name__)
 
 
@@ -62,16 +63,16 @@ def _resolve_base_url() -> str | None:
     return settings.SKYVERN_BASE_URL or os.environ.get("SKYVERN_BASE_URL")
 
 
+def set_standalone_http_server(enabled: bool) -> None:
+    global _standalone_http_server
+    _standalone_http_server = enabled
+
+
 def _resolve_self_base_url() -> str:
-    """Build the base URL for the current server process.
-
-    When the MCP server is hosted inside the FastAPI process (stateless HTTP
-    mode), tool handlers must call back to the *same* server rather than the
-    default ``SkyvernEnvironment.CLOUD`` URL.  This prevents staging API keys
-    from being sent to production (or vice-versa).
-
-    Always uses HTTP on localhost since TLS terminates at the load balancer.
-    """
+    """Hosted MCP runs inside the API process and calls itself on 127.0.0.1, so a staging key never reaches
+    production; a standalone `skyvern run mcp` server is not the API, so it calls SKYVERN_BASE_URL."""
+    if _standalone_http_server and settings.is_skyvern_base_url_explicitly_configured:
+        return settings.SKYVERN_BASE_URL
     return f"http://127.0.0.1:{settings.PORT}"
 
 

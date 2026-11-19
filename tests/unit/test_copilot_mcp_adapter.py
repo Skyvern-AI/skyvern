@@ -37,6 +37,7 @@ from skyvern.cli.mcp_tools._element_state import action_deadline_error, element_
 from skyvern.cli.mcp_tools.blocks import skyvern_block_schema, skyvern_block_validate, skyvern_workflow_knowledge
 from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
 from skyvern.cli.mcp_tools.workflow import skyvern_workflow_get
+from skyvern.forge.sdk.api.llm.model_input_capture import serialize_tool_surface
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import agent as copilot_agent
@@ -69,7 +70,6 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     _transform_args,
     resolve_browser_session_binding,
 )
-from skyvern.forge.sdk.copilot.model_input_capture import serialize_tool_surface
 from skyvern.forge.sdk.copilot.output_utils import (
     _BASE64_IMAGE_OMITTED_MESSAGE,
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
@@ -89,7 +89,6 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotProvenance, enqueue_screenshot
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    clear_session_scrub_values,
     register_secret_scrub_value,
     register_secret_scrub_values_from_structure,
 )
@@ -117,6 +116,7 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.utils.secret_scrub import clear_session_scrub_values
 from skyvern.webeye.browser_state import PageCrashRecord
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserOperation,
@@ -4204,9 +4204,26 @@ async def test_closed_value_parameters_carry_the_enforced_values_as_a_schema_enu
 _NOTE_FIELDS = {"notes", "trailing_notes", "description"}
 
 
+_IMAGE_FIELDS = ("doc_images", "prompt_images")
+
+
 def _saved_workflow_with_notes() -> dict[str, Any]:
-    child = {"label": "open", "block_type": "navigation", "notes": "use the left menu", "description": "people only"}
-    loop = {"label": "each", "block_type": "for_loop", "loop_blocks": [child], "trailing_notes": "stop at ten"}
+    image = [{"file_id": "file_901", "caption": None, "placement": "block"}]
+    child = {
+        "label": "open",
+        "block_type": "navigation",
+        "notes": "use the left menu",
+        "description": "people only",
+        "doc_images": image,
+        "prompt_images": image,
+    }
+    loop = {
+        "label": "each",
+        "block_type": "for_loop",
+        "loop_blocks": [child],
+        "trailing_notes": "stop at ten",
+        "doc_images": image,
+    }
     return {
         "ok": True,
         "data": {"description": "workflow summary", "workflow_definition": {"parameters": [], "blocks": [loop]}},
@@ -4225,6 +4242,7 @@ async def test_copilot_reads_notes_only_with_the_doc_editor(doc_editor_enabled: 
         asked = await call("get_workflow_knowledge", {"topics": ["notes_between_blocks", "for_loop_block"]})
         asked_only_notes = await call("get_workflow_knowledge", {"topics": ["notes_between_blocks"]})
         loop_schema = (await call("get_block_schema", {"block_type": "for_loop"}))["data"]["schema"]
+        task_schema = (await call("get_block_schema", {"block_type": "task"}))["data"]["schema"]
     saved = await _build_skyvern_mcp_overlays(ALL_BLOCK_FAMILIES, notes_visible=doc_editor_enabled)[
         "get_org_workflow"
     ].post_hook(_saved_workflow_with_notes(), {}, make_copilot_ctx(doc_editor_enabled=doc_editor_enabled))
@@ -4235,6 +4253,9 @@ async def test_copilot_reads_notes_only_with_the_doc_editor(doc_editor_enabled: 
         if {"label", "block_type"} <= set(definition.get("properties", {}))
     ]
     saved_loop = saved["data"]["workflow_definition"]["blocks"][0]
+    for schema in (loop_schema, task_schema):
+        assert not any(name in json.dumps(schema) for name in (*_IMAGE_FIELDS, "BlockImage", "file_id"))
+    assert "file_901" not in json.dumps(saved)
     if doc_editor_enabled:
         assert "notes_between_blocks" in catalog and "notes_between_blocks" in asked["data"]["sections"]
         assert set(asked_only_notes["data"]["sections"]) == {"notes_between_blocks"}
@@ -4262,8 +4283,12 @@ async def test_the_task_unavailable_topic_never_reaches_the_model(capability: Au
             "get_workflow_knowledge", {"topics": [_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC, "for_loop_block"]}
         )
         alone = await call("get_workflow_knowledge", {"topics": [_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC.upper()]})
+        retired_id = await call(
+            "get_workflow_knowledge", {"topics": ["task_block_task_not_available_in_workflow_copilot"]}
+        )
 
-    assert _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC not in json.dumps(tools["get_workflow_knowledge"].inputSchema)
+    assert retired_id == catalog
+    assert "task_block_task_not_available" not in json.dumps(tools["get_workflow_knowledge"].inputSchema)
     topics = catalog["data"]["topics"]
     assert _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC not in topics
     assert "for_loop_block" in topics

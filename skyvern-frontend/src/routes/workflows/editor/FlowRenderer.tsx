@@ -1,6 +1,8 @@
+import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
 import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import { WorkflowDocEditor } from "./doc/WorkflowDocEditor";
+import { useDocImageUploadScope } from "./doc/docImageUploads";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 import {
   useWorkflowHasChangesStore,
@@ -126,7 +128,7 @@ import {
 } from "./paneFit";
 import { useBlockerExit } from "./useBlockerExit";
 import { changesIncludeWorkflowEdit } from "./workflowEditChanges";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
 import { FlowJumpControls } from "./controls/FlowJumpControls";
@@ -206,7 +208,7 @@ import {
 import { PoliteDndLiveRegionPolicy } from "./sortable/dragLiveRegionPolicy";
 import { useIsCanvasLocked } from "./controls/useIsCanvasLocked";
 import { BlockConfigSidebar } from "./panels/BlockConfigSidebar";
-import { STUDIO_COPILOT_TRANSITION_MS } from "../studio/constants";
+import { STUDIO_EMBER_TRANSITION_MS } from "../studio/constants";
 import {
   beginFocusGeneration,
   blockJumpDuration,
@@ -257,17 +259,17 @@ const PRESENTATION_LAYOUT_SETTLE_MS = 50;
 // phantom (the broad autofill-on-mount case is tracked as a follow-up).
 const USER_EDIT_GESTURE_WINDOW_MS = 250;
 
-// The Copilot lock refuses edits, not presentation, so layout may still move nodes under it.
-const selectCopilotOnlyLock = (
+// The Ember lock refuses edits, not presentation, so layout may still move nodes under it.
+const selectEmberOnlyLock = (
   state: ReturnType<typeof useWorkflowYamlEditorStore.getState>,
-) => state.lockKind === "copilot";
+) => state.lockKind === "ember";
 
-function isCopilotOnlyLock(): boolean {
-  return selectCopilotOnlyLock(useWorkflowYamlEditorStore.getState());
+function isEmberOnlyLock(): boolean {
+  return selectEmberOnlyLock(useWorkflowYamlEditorStore.getState());
 }
 
 function canLayoutUnderLock(): boolean {
-  return !isLockedByOther() || isCopilotOnlyLock();
+  return !isLockedByOther() || isEmberOnlyLock();
 }
 
 function convertToParametersYAML(
@@ -441,7 +443,7 @@ type Props = {
   showZoomControls?: boolean;
   // Render the canvas as a read-only viewer (no controls, no
   // selection-driven sidebar). Used by WorkflowComparisonPanel for the
-  // history/copilot diff canvas.
+  // history/Ember diff canvas.
   readOnly?: boolean;
   nodes: Array<AppNode>;
   edges: Array<Edge>;
@@ -484,17 +486,17 @@ type Props = {
     props: import("./Workspace").AddNodeProps,
   ) => string | undefined | void;
   // Fires on every layout-phase transition. Workspace uses this to gate
-  // expensive sibling mounts (VNC stream, copilot transcripts) on the
+  // expensive sibling mounts (VNC stream, Ember transcripts) on the
   // canvas being settled, so the initial Dagre + fade-in pass owns the
   // main thread without competing work.
   onLayoutPhaseChange?: (
     phase: "pre-layout" | "initial-load" | "ready",
   ) => void;
-  // Width of a left-side panel (the studio Copilot column) the canvas sits right
+  // Width of a left-side panel (the studio Ember column) the canvas sits right
   // of; the chain shifts left by half of it to read as page-centered, not pane.
   centerOffsetX?: number;
   // Embedded in the studio shell: aligns the block-config sidebar's top/bottom
-  // edges with the Copilot column instead of the legacy header offsets.
+  // edges with the Ember column instead of the legacy header offsets.
   embedded?: boolean;
   // Studio pane-layout key (open set + committed divider widths); a change
   // recenters the canvas once the layout settles.
@@ -548,6 +550,10 @@ function FlowRenderer({
       (node) => node.type === "start" && !node.parentId && node.data.editable,
     ) &&
     !yamlActive;
+  useDocImageUploadScope(
+    workflow.workflow_permanent_id,
+    embedded && !readOnly && docEnabled,
+  );
   const editorFinallyBlockLabel = useWorkflowSettingsStore(
     (state) => state.finallyBlockLabel,
   );
@@ -572,13 +578,14 @@ function FlowRenderer({
   }, [embedded, readOnly, workflow.workflow_permanent_id, docEnabled]);
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
+  const activeOrgId = useActiveOrgId();
   const postHog = usePostHog();
   const debugStore = useDebugStore();
   const isCanvasLocked = useIsCanvasLocked();
   const hydrationLocked = useWorkflowYamlEditorStore(
     selectEditorMutationLocked,
   );
-  const copilotOnlyLock = useWorkflowYamlEditorStore(selectCopilotOnlyLock);
+  const emberOnlyLock = useWorkflowYamlEditorStore(selectEmberOnlyLock);
   const { title, description, initializeTitle, initializeDescription } =
     useWorkflowTitleStore();
   const parameters = useWorkflowParametersStore((state) => state.parameters);
@@ -595,7 +602,7 @@ function FlowRenderer({
   // on the FlowRenderer because that scopes the global keydown to the
   // editor view; the WorkflowEditor route is the only mount point for it.
   // Read-only canvases (WorkflowComparisonPanel) skip the listener
-  // entirely so an Escape press to dismiss compare/copilot UI cannot
+  // entirely so an Escape press to dismiss compare/Ember UI cannot
   // mutate the main editor's shared selection store.
   useEffect(() => {
     if (readOnly || showDoc) return;
@@ -629,7 +636,7 @@ function FlowRenderer({
         maxZoom: options?.maxZoom ?? 1,
         duration,
       });
-      // fitView centers on the editor pane (right of the Copilot panel); once it
+      // fitView centers on the editor pane (right of the Ember panel); once it
       // settles, nudge left by half the panel so it reads as page-centered.
       if (centerOffsetX > 0) {
         window.setTimeout(() => {
@@ -656,9 +663,9 @@ function FlowRenderer({
   const runFitViewRef = useRef(runFitView);
   runFitViewRef.current = runFitView;
 
-  // React Flow's viewport is in canvas coords, so a Copilot collapse/expand
+  // React Flow's viewport is in canvas coords, so an Ember collapse/expand
   // would slide the chain by the column-width delta. The column animates over
-  // STUDIO_COPILOT_TRANSITION_MS, so a one-shot counter-translate jumps the
+  // STUDIO_EMBER_TRANSITION_MS, so a one-shot counter-translate jumps the
   // canvas by the full delta and drifts back. Instead, track the editor pane's
   // real left edge every frame for the transition's duration and counter the
   // measured movement, keeping the chain screen-pinned while the column slides.
@@ -715,7 +722,7 @@ function FlowRenderer({
         y: vp.y,
         zoom: vp.zoom,
       });
-      if (performance.now() - startTime >= STUDIO_COPILOT_TRANSITION_MS) {
+      if (performance.now() - startTime >= STUDIO_EMBER_TRANSITION_MS) {
         // Snap to the exact final viewport so CSS/RAF cadence drift can't leave
         // a sub-pixel gap from the measured per-frame correction.
         applyFinalCorrection();
@@ -866,7 +873,7 @@ function FlowRenderer({
   const leaveSaveReason =
     workflowChangesStore.saveBlockedReason || saveLockReason;
   useShouldNotifyWhenClosingTab(!readOnly && workflowChangesStore.hasChanges);
-  const pendingGoalChanges = useCopilotActionStore(
+  const pendingGoalChanges = useEmberActionStore(
     (state) => state.pendingGoalChanges,
   );
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
@@ -904,7 +911,7 @@ function FlowRenderer({
       choice,
     });
   };
-  const applyPendingGoalChanges = useCopilotActionStore(
+  const applyPendingGoalChanges = useEmberActionStore(
     (state) => state.applyPendingGoalChanges,
   );
 
@@ -940,7 +947,7 @@ function FlowRenderer({
     // Released synchronously on unlock so the user's first edit is not absorbed as layout drift.
     const unsubscribe = useWorkflowYamlEditorStore.subscribe(
       (state, previous) => {
-        if (selectCopilotOnlyLock(previous) && !selectCopilotOnlyLock(state)) {
+        if (selectEmberOnlyLock(previous) && !selectEmberOnlyLock(state)) {
           releaseLayoutGuard();
         }
       },
@@ -953,7 +960,7 @@ function FlowRenderer({
   // `presentation` callers lay out the graph as it stands; the rest pass an edited graph and stay refused under a lock.
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>, presentation = false) => {
-      if (presentation && isLockedByOther() && isCopilotOnlyLock()) {
+      if (presentation && isLockedByOther() && isEmberOnlyLock()) {
         const layoutedElements = layout(nodes, edges, targettedBlockLabel);
         const positionChanges = layoutedElements.nodes.map(
           (node): NodeChange<AppNode> => ({
@@ -1003,7 +1010,7 @@ function FlowRenderer({
         return;
       }
       if (isLayoutingRef.current) {
-        if (isCopilotOnlyLock()) relayoutAfterLayoutingRef.current = true;
+        if (isEmberOnlyLock()) relayoutAfterLayoutingRef.current = true;
         return;
       }
       isLayoutingRef.current = true;
@@ -1079,7 +1086,7 @@ function FlowRenderer({
     return useWorkflowYamlEditorStore.subscribe((state, previous) => {
       if (
         (state.commitInProgress && !previous.commitInProgress) ||
-        (state.copilotAcceptance && !previous.copilotAcceptance)
+        (state.emberAcceptance && !previous.emberAcceptance)
       ) {
         if (debouncedLayoutForDimensions.isPending())
           pendingLayoutRef.current = true;
@@ -1089,7 +1096,7 @@ function FlowRenderer({
   }, [debouncedLayoutForDimensions]);
 
   useEffect(() => {
-    if (hydrationLocked && !copilotOnlyLock) return;
+    if (hydrationLocked && !emberOnlyLock) return;
     if (nodesInitialized && !hasCompletedInitialLoad.current) {
       if (!doLayout(nodes, edges, true)) return;
       // After Dagre computes positions, wait one frame for the DOM to update
@@ -1115,7 +1122,7 @@ function FlowRenderer({
     // re-running on every nodes/edges/doLayout change would re-trigger the
     // pre-layout fade after every edit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodesInitialized, hydrationLocked, copilotOnlyLock]);
+  }, [nodesInitialized, hydrationLocked, emberOnlyLock]);
 
   // Re-layout when the targeted block changes to account for the status row
   // that appears when a block is being debugged
@@ -1145,13 +1152,13 @@ function FlowRenderer({
   }, [targettedBlockLabel, nodesInitialized]);
 
   useEffect(() => {
-    if ((hydrationLocked && !copilotOnlyLock) || !pendingLayoutRef.current)
+    if ((hydrationLocked && !emberOnlyLock) || !pendingLayoutRef.current)
       return;
     // Cleared first: the presentation layout's position commit re-runs this effect.
     pendingLayoutRef.current = false;
     // The transaction may have replaced the graph since layout was requested.
     doLayout(nodes, edges, true);
-  }, [hydrationLocked, copilotOnlyLock, nodes, edges, doLayout]);
+  }, [hydrationLocked, emberOnlyLock, nodes, edges, doLayout]);
 
   // Re-layout when a loop node's header height changes (e.g., data schema toggled)
   useEffect(() => {
@@ -1422,7 +1429,7 @@ function FlowRenderer({
     useWorkflowYamlEditorStore.getState().flushDraft?.();
     flushBufferedEditorEdits();
     const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
-    const errors = getWorkflowErrors(currentNodes);
+    const errors = getWorkflowErrors(currentNodes, activeOrgId);
     if (errors.length > 0) {
       toast({
         title: "Can not save workflow because of errors:",
@@ -1627,37 +1634,6 @@ function FlowRenderer({
 
     workflowChangesStore.setHasChanges(true);
     doLayout(newNodes, edges);
-  }
-
-  function toggleScript({
-    id,
-    label,
-    show,
-  }: {
-    id?: string;
-    label?: string;
-    show: boolean;
-  }) {
-    if (id) {
-      const node = nodes.find((node) => node.id === id);
-      if (!node) {
-        return;
-      }
-
-      node.data.showCode = show;
-    } else if (label) {
-      const node = nodes.find(
-        (node) => "label" in node.data && node.data.label === label,
-      );
-
-      if (!node) {
-        return;
-      }
-
-      node.data.showCode = show;
-    }
-
-    doLayout(nodes, edges);
   }
 
   const editorElementRef = useRef<HTMLDivElement>(null);
@@ -2737,7 +2713,7 @@ function FlowRenderer({
                   captureUnsavedResolution("discard");
                   useWorkflowTitleStore
                     .getState()
-                    .clearCopilotMetadata(workflow.workflow_permanent_id);
+                    .clearEmberMetadata(workflow.workflow_permanent_id);
                   blockerExit.proceed();
                 }}
               >
@@ -2782,8 +2758,8 @@ function FlowRenderer({
         <BlockActionContext.Provider
           value={{
             // Read-only canvases (WorkflowComparisonPanel) must not expose
-            // mutation callbacks. NodeHeader's transmute / delete /
-            // script-toggle menus would otherwise still drive real edits
+            // mutation callbacks. NodeHeader's transmute / delete menus
+            // would otherwise still drive real edits
             // and flip `setHasChanges(true)` on the main editor's store
             // while the user is only inspecting versions.
             requestDeleteNodeCallback: readOnly ? () => {} : requestDeleteNode,
@@ -2796,7 +2772,6 @@ function FlowRenderer({
               ? () => {}
               : (id: string, nodeName: string) =>
                   setTimeout(() => transmuteNode(id, nodeName), 0),
-            toggleScriptForNodeCallback: readOnly ? () => {} : toggleScript,
           }}
         >
           <DndContext
@@ -2855,11 +2830,11 @@ function FlowRenderer({
                         change.type === "dimensions",
                     );
 
-                    // Canvases without the Copilot lock drop mid-layout changes to avoid the React #185 loop;
-                    // Copilot-locked ones queue one relayout.
+                    // Canvases without the Ember lock drop mid-layout changes to avoid the React #185 loop;
+                    // Ember-locked ones queue one relayout.
                     if (
                       dimensionChanges.length > 0 &&
-                      (!isLayoutingRef.current || isCopilotOnlyLock())
+                      (!isLayoutingRef.current || isEmberOnlyLock())
                     ) {
                       const { nodes: tempNodes, shouldLayout } =
                         processDimensionChanges(

@@ -123,6 +123,7 @@ if typing.TYPE_CHECKING:
     from .delete_schedule_response import DeleteScheduleResponse
     from .download_to_s3block import DownloadToS3Block
     from .download_to_s3block_yaml import DownloadToS3BlockYaml
+    from .email_organize_action import EmailOrganizeAction
     from .email_inbox_block import EmailInboxBlock
     from .email_inbox_block_email_client import EmailInboxBlockEmailClient
     from .email_inbox_block_parameters_item import (
@@ -940,6 +941,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "DeleteScheduleResponse": ".delete_schedule_response",
     "DownloadToS3Block": ".download_to_s3block",
     "DownloadToS3BlockYaml": ".download_to_s3block_yaml",
+    "EmailOrganizeAction": ".email_organize_action",
     "EmailInboxBlock": ".email_inbox_block",
     "EmailInboxBlockEmailClient": ".email_inbox_block_email_client",
     "EmailInboxBlockParametersItem": ".email_inbox_block_parameters_item",
@@ -1721,6 +1723,7 @@ __all__ = [
     "DeleteScheduleResponse",
     "DownloadToS3Block",
     "DownloadToS3BlockYaml",
+    "EmailOrganizeAction",
     "EmailInboxBlock",
     "EmailInboxBlockEmailClient",
     "EmailInboxBlockParametersItem",

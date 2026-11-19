@@ -55,6 +55,7 @@ from structlog.testing import capture_logs
 
 from skyvern.exceptions import BrowserSessionExpired
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.api.llm.agents_model import SkyvernLitellmProvider, current_model_attempt_telemetry
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError, LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
@@ -134,8 +135,6 @@ from skyvern.forge.sdk.copilot.interruption import (
     INTERRUPTED_TERMINAL_RETRY,
     INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE,
 )
-from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider
-from skyvern.forge.sdk.copilot.model_telemetry import current_model_attempt_telemetry
 from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -492,7 +491,7 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
 
     restored_run_ids: list[str | None] = []
     seeded: list[tuple[str | None, str, str | None]] = []
-    hydrated: list[tuple[str, str, str | None]] = []
+    hydrated: list[tuple[str, str, str | None, bool]] = []
 
     async def restore_proposal(ctx: CopilotContext, *, required_workflow_run_id: str | None = None) -> None:
         restored_run_ids.append(required_workflow_run_id)
@@ -505,8 +504,10 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
         ctx.repair_origin_input_values = (origin_run_input("resume", "s3://bucket/resume.pdf"),)
         return SimpleNamespace(finished=True, run=None)
 
-    async def hydrate_run(ctx: CopilotContext, *, workflow_run_id: str) -> dict[str, dict[str, str]]:
-        hydrated.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
+    async def hydrate_run(
+        ctx: CopilotContext, *, workflow_run_id: str, queue_failure_frame: bool = False
+    ) -> dict[str, dict[str, str]]:
+        hydrated.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id, queue_failure_frame))
         return {"run": {"workflow_run_id": workflow_run_id, "status": "failed"}}
 
     monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", restore_proposal)
@@ -556,7 +557,7 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
     assert result.user_response == "ok"
     assert restored_run_ids == [expected_restore_run_id]
     assert seeded == [(expected_seed_run_id, expected_workflow_yaml, expected_proposal_run_id)]
-    assert hydrated == [(expected_run_id, expected_workflow_yaml, expected_proposal_run_id)]
+    assert hydrated == [(expected_run_id, expected_workflow_yaml, expected_proposal_run_id, True)]
     assert build_context.call_args.kwargs["workflow_yaml"] == expected_workflow_yaml
     run_packet_text = build_context.call_args.kwargs["debug_run_info_text"]
     assert (
@@ -2402,7 +2403,7 @@ class _EnforcementAttempt:
     runs_tool: bool = True
     returns_tool_call: bool = False
     error: BaseException | None = None
-    stop_metadata: agent_module.CopilotModelStopMetadata | None = None
+    stop_metadata: agent_module.ModelStopMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -2572,7 +2573,7 @@ async def test_a_refusal_or_content_filter_stop_ends_the_turn_with_the_empty_com
     async def fake_acompletion(**_kwargs: object) -> AsyncIterator[ChatCompletionChunk]:
         return stream()
 
-    run_config = RunConfig(model_provider=CopilotLitellmProvider(), tracing_disabled=True)
+    run_config = RunConfig(model_provider=SkyvernLitellmProvider(), tracing_disabled=True)
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
@@ -2993,7 +2994,7 @@ workflow_definition:
         )
 
         expected = tools_module.sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
-        assert json.loads(result) == {**expected, "turn_seconds_remaining": None}
+        assert json.loads(result) == expected
         assert captured["update_calls"] == 1
         assert captured["run_calls"] == 1
         assert isinstance(captured["persisted_yaml"], str)
@@ -7487,14 +7488,14 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=0,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
         tool_bearing = agent_module._empty_completion_error(
             SimpleNamespace(final_output="", new_items=[_tool_call_item()]),
             ctx=ctx,
             tool_call_count_start=0,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is not None
@@ -7511,7 +7512,7 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=7,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is not None
@@ -7526,7 +7527,7 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=7,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is not None
@@ -7545,14 +7546,14 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=0,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is None
 
     @pytest.mark.parametrize("field", ["refusal", "content_filter"])
     def test_empty_completion_with_explicit_safety_stop_is_not_retriable(self, field: str) -> None:
-        stop_metadata = agent_module.CopilotModelStopMetadata(
+        stop_metadata = agent_module.ModelStopMetadata(
             model_call_index=1,
             **{field: True},
         )
@@ -7683,7 +7684,7 @@ class TestCopilotConfig:
     async def test_tool_bearing_empty_completion_after_safety_stop_skips_final_reply(
         self, monkeypatch: pytest.MonkeyPatch, field: str
     ) -> None:
-        stop_metadata = agent_module.CopilotModelStopMetadata(model_call_index=1, **{field: True})
+        stop_metadata = agent_module.ModelStopMetadata(model_call_index=1, **{field: True})
 
         run = await _run_tool_bearing_empty_completion_turn(
             monkeypatch,

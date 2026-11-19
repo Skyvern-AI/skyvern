@@ -167,7 +167,7 @@ describe("RunTab milestone rerun", () => {
 });
 
 describe("RunTab Fix navigation", () => {
-  test("writes the Copilot message and selected block in one navigation", () => {
+  test("writes the Ember message and selected block in one navigation", () => {
     mockWorkflowRun();
     const router = createMemoryRouter(
       [
@@ -192,8 +192,8 @@ describe("RunTab Fix navigation", () => {
 
       expect(writes).toHaveLength(1);
       expect(writes[0]?.search).toBe("?wr=run_1&selected-block=checkout");
-      const action = (writes[0]?.state as { copilotAction?: unknown })
-        ?.copilotAction as Record<string, unknown> | undefined;
+      const action = (writes[0]?.state as { emberAction?: unknown })
+        ?.emberAction as Record<string, unknown> | undefined;
       expect(action?.kind).toBe("diagnose_run");
       expect(action?.workflowRunId).toBe("run_1");
       expect(typeof action?.nonce).toBe("string");
@@ -314,7 +314,7 @@ describe("RunTab selection mirroring behind the Doc", () => {
       presentation: "doc",
       docMounted: true,
     });
-    renderAt("/workflows/wpid_abc/studio?panes=copilot,editor");
+    renderAt("/workflows/wpid_abc/studio?panes=ember,editor");
     expect(mirror()).toBe("no");
   });
 
@@ -331,7 +331,7 @@ describe("RunTab selection mirroring behind the Doc", () => {
       presentation: "visual",
       docMounted: false,
     });
-    renderAt("/workflows/wpid_abc/studio?panes=copilot,editor");
+    renderAt("/workflows/wpid_abc/studio?panes=ember,editor");
     expect(mirror()).toBe("yes");
   });
 });

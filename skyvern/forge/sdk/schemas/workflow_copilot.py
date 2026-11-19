@@ -5,6 +5,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -14,16 +15,23 @@ from pydantic import (
     PrivateAttr,
     SecretStr,
     StringConstraints,
+    computed_field,
     field_serializer,
     field_validator,
     model_validator,
 )
 
-from skyvern.forge.sdk.copilot.ask_user import AccountGroupDecision, QuestionInteraction, QuestionResponse
+from skyvern.forge.sdk.copilot.ask_user import (
+    QUESTION_CLIENT_GRACE,
+    AccountGroupDecision,
+    QuestionInteraction,
+    QuestionResponse,
+)
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import (
     ActivityBucket,
     CopilotTestInput,
+    LiveTurnNarrative,
     ProposalDisposition,
     ResponseType,
     SkippedPrefixBlock,
@@ -73,8 +81,21 @@ ClientVisibleProposedWorkflow = Annotated[
     dict[str, Any], PlainSerializer(client_visible_proposed_workflow, when_used="json")
 ]
 
+_CHAT_ID_ALIASES = AliasChoices("ember_chat_id", "workflow_copilot_chat_id")
+_CHAT_MESSAGE_ID_ALIASES = AliasChoices("ember_chat_message_id", "workflow_copilot_chat_message_id")
 COPILOT_PROPOSAL_METADATA_KEY = "_copilot_proposal"
 COPILOT_PRIVATE_SETTINGS_KEY = "_copilot_private_settings"
+
+
+def credential_recovery_token_is_valid(token: str) -> bool:
+    if len(token) != 64:
+        return False
+    try:
+        return len(bytes.fromhex(token)) == 32
+    except ValueError:
+        return False
+
+
 CopilotCandidateDisposition = Literal[
     "no_proposal",
     "auto_applicable",
@@ -186,6 +207,7 @@ class CopilotPendingTurn(BaseModel):
     question_interactions: list[QuestionInteraction] = Field(default_factory=list)
     question_heartbeat_at: datetime | None = None
     question_client_seen_at: datetime | None = None
+    question_client_grace_seconds: int | None = None
     cancel_token: str | None = None
     # The person who started the turn; None for a turn started by an organization API key or before this was recorded.
     starter_user_id: str | None = None
@@ -198,6 +220,14 @@ class CopilotPendingTurn(BaseModel):
     latest_draft: ClientVisibleProposedWorkflow | None = None
     latest_draft_at: datetime | None = None
 
+    def question_client_deadline(self, item: QuestionInteraction) -> datetime:
+        grace = (
+            timedelta(seconds=self.question_client_grace_seconds)
+            if self.question_client_grace_seconds is not None
+            else QUESTION_CLIENT_GRACE
+        )
+        return (self.question_client_seen_at or item.created_at) + grace
+
 
 CopilotTurnControl = Literal["steer", "answer", "cancel"]
 
@@ -207,6 +237,16 @@ class CopilotInFlightTurn(BaseModel):
     cancel_token: str | None = None
     latest_draft: ClientVisibleProposedWorkflow | None = None
     latest_draft_at: datetime | None = None
+    steer_messages: list[CopilotSteerMessage] = Field(default_factory=list)
+    # The running turn's narrative as last copied to the cache; set only when the caller asks for it.
+    narrative: LiveTurnNarrative | None = None
+    question_open_until: datetime | None = None
+
+
+class CopilotAcceptedTestedRun(BaseModel):
+    workflow_id: str
+    modified_at: datetime
+    workflow_run_id: str | None = None
 
 
 class WorkflowCopilotChat(BaseModel):
@@ -226,6 +266,9 @@ class WorkflowCopilotChat(BaseModel):
         default_factory=dict, description="In-flight turns keyed by turn id"
     )
     work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
+    accepted_tested_run: CopilotAcceptedTestedRun | None = Field(
+        None, description="The run that tested the draft this chat last accepted, keyed by the saved version"
+    )
 
     @field_validator("accepted_turn_ids", mode="before")
     @classmethod
@@ -378,8 +421,12 @@ class WorkflowCopilotMessageFeedback(BaseModel):
 
 
 class WorkflowCopilotMessageFeedbackRequest(BaseModel):
-    workflow_copilot_chat_id: str = Field(..., description="Chat that owns the rated message")
-    workflow_copilot_chat_message_id: str | None = Field(None, description="Assistant message being rated")
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="Chat that owns the rated message"
+    )
+    workflow_copilot_chat_message_id: str | None = Field(
+        None, validation_alias=_CHAT_MESSAGE_ID_ALIASES, description="Assistant message being rated"
+    )
     turn_id: str | None = Field(
         None, description="Turn whose assistant row is rated; a live turn knows this before the row id"
     )
@@ -397,6 +444,12 @@ class WorkflowCopilotMessageFeedbackRequest(BaseModel):
 
 class WorkflowCopilotMessageFeedbackResponse(BaseModel):
     workflow_copilot_chat_message_id: str
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_message_id(self) -> str:
+        return self.workflow_copilot_chat_message_id
+
     feedback: WorkflowCopilotMessageFeedback | None
 
 
@@ -433,7 +486,9 @@ class WorkflowCopilotDemonstrationInsertion(BaseModel):
 class WorkflowCopilotChatRequest(BaseModel):
     workflow_permanent_id: str = Field(..., description="Workflow permanent ID for the chat")
     workflow_id: str = Field(..., description="Workflow ID (mutable version ID)")
-    workflow_copilot_chat_id: str | None = Field(None, description="The chat ID to send the message to")
+    workflow_copilot_chat_id: str | None = Field(
+        None, validation_alias=_CHAT_ID_ALIASES, description="The chat ID to send the message to"
+    )
     workflow_run_id: str | None = Field(None, description="The workflow run ID to use for the context")
     browser_session_id: str | None = Field(
         None,
@@ -510,6 +565,9 @@ class WorkflowCopilotChatRequest(BaseModel):
     supports_single_run_card: bool = Field(
         False, description="The client can display the single saved-workflow run review and its receipt."
     )
+    supports_input_group_card: bool = Field(
+        False, description="The client can display the one-run-per-input-row group review, receipt and cancel cards."
+    )
     supports_credential_delete_card: bool = Field(
         False, description="The client can display the credential deletion card and post its confirmation."
     )
@@ -527,6 +585,18 @@ class WorkflowCopilotChatRequest(BaseModel):
     )
     supports_credential_pause_recovery: bool = Field(
         False, description="The client restores pending credential cards from chat history."
+    )
+    refuse_if_turn_running: bool = Field(
+        False,
+        description="Refuse this message, instead of stopping it, when another turn is still running on this workflow.",
+    )
+    client_detached: bool = Field(
+        False,
+        description=(
+            "The client closes the stream after turn_start and follows the turn through chat history. "
+            "Requires supports_credential_pause, supports_credential_pause_recovery and a valid "
+            "credential_recovery_token."
+        ),
     )
     supports_credential_generation: bool = Field(
         False, description="The client can render a registration card and post its Generate and save answer."
@@ -568,9 +638,23 @@ class WorkflowCopilotChatRequest(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def _detached_client_can_recover_cards(self) -> "WorkflowCopilotChatRequest":
+        if self.client_detached and not (
+            self.supports_credential_pause
+            and self.supports_credential_pause_recovery
+            and self.credential_recovery_token is not None
+            and credential_recovery_token_is_valid(self.credential_recovery_token.get_secret_value())
+        ):
+            raise ValueError(
+                "client_detached requires supports_credential_pause, supports_credential_pause_recovery "
+                "and a valid credential_recovery_token"
+            )
+        return self
+
 
 class WorkflowCopilotCancelRequest(BaseModel):
-    workflow_copilot_chat_id: str | None = None
+    workflow_copilot_chat_id: str | None = Field(None, validation_alias=_CHAT_ID_ALIASES)
     cancel_token: str = Field(..., description="The cancel_token sent on the original /chat-post request")
     source: CopilotCancelSource | None = Field(
         default=None,
@@ -583,20 +667,28 @@ class WorkflowCopilotCancelRequest(BaseModel):
 
 
 class WorkflowCopilotSteerRequest(BaseModel):
-    workflow_copilot_chat_id: str
+    workflow_copilot_chat_id: str = Field(validation_alias=_CHAT_ID_ALIASES)
     cancel_token: str = Field(..., description="The cancel_token sent on the running turn's /chat-post request")
     steer_id: str = Field(..., max_length=64, description="Client-generated id; a retry with the same id is a no-op")
     message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class WorkflowCopilotQuestionResponseRequest(QuestionResponse):
-    workflow_copilot_chat_id: str
+    workflow_copilot_chat_id: str = Field(validation_alias=_CHAT_ID_ALIASES)
     interaction_id: str
     account_group_decision: AccountGroupDecision | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_old_chat_id_key_when_both_sent(cls, data: Any) -> Any:
+        # QuestionResponse forbids extra keys, so the alias that loses would otherwise fail as extra_forbidden.
+        if isinstance(data, dict) and "ember_chat_id" in data and "workflow_copilot_chat_id" in data:
+            return {key: value for key, value in data.items() if key != "workflow_copilot_chat_id"}
+        return data
+
 
 class WorkflowCopilotCredentialDeletionRequest(BaseModel):
-    workflow_copilot_chat_id: str
+    workflow_copilot_chat_id: str = Field(validation_alias=_CHAT_ID_ALIASES)
     interaction_id: str
     credential_ids: list[str] = Field(min_length=1)
 
@@ -614,7 +706,9 @@ class WorkflowCopilotCredentialSiteQuestion(BaseModel):
 
 class WorkflowCopilotCredentialResponseRequest(BaseModel):
     turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
-    workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="chat ID from the matching credential_required frame"
+    )
     resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
     action: Literal["connected", "skip", "signing_in", "signed_in"] = Field(
         ...,
@@ -667,7 +761,9 @@ class WorkflowCopilotDemonstrationActiveResult(BaseModel):
 
 class WorkflowCopilotCredentialGenerateRequest(BaseModel):
     turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
-    workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="chat ID from the matching credential_required frame"
+    )
     resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
 
 
@@ -710,18 +806,22 @@ class WorkflowCopilotCredentialResponseResult(BaseModel):
 
 
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
-    workflow_copilot_chat_id: str = Field(..., description="The chat ID to update")
+    workflow_copilot_chat_id: str = Field(..., validation_alias=_CHAT_ID_ALIASES, description="The chat ID to update")
     auto_accept: bool = Field(..., description="Whether to auto-accept future workflow updates")
     owner_turn_id: str | None = Field(None, description="Owner token returned with a typed proposal")
     revision: int | None = Field(None, ge=1, description="Revision token returned with a typed proposal")
 
 
 class WorkflowCopilotDisableAutoAcceptRequest(BaseModel):
-    workflow_copilot_chat_id: str = Field(..., description="The chat whose auto-accept should be turned off")
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="The chat whose auto-accept should be turned off"
+    )
 
 
 class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
-    workflow_copilot_chat_id: str = Field(..., description="The chat whose proposed workflow should be applied")
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="The chat whose proposed workflow should be applied"
+    )
     auto_accept: bool = Field(
         False,
         description="If true, flip the chat to auto-accept mode so future turns persist directly without review",
@@ -736,6 +836,12 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
     workflow_copilot_chat_message_id: str | None = Field(
         None, description="Persisted row id; absent on rows synthesized in-process"
     )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_message_id(self) -> str | None:
+        return self.workflow_copilot_chat_message_id
+
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
     turn_id: str | None = Field(None, description="Turn that owns this row")
@@ -760,6 +866,12 @@ class WorkflowCopilotChatSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     workflow_copilot_chat_id: str = Field(..., description="ID for the workflow copilot chat")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str:
+        return self.workflow_copilot_chat_id
+
     workflow_permanent_id: str = Field(..., description="Workflow permanent ID the chat belongs to")
     workflow_title: str | None = Field(None, description="Title of the workflow the chat belongs to")
     title: str = Field(..., description="Single-line preview derived from the chat's first message")
@@ -769,10 +881,21 @@ class WorkflowCopilotChatSummary(BaseModel):
         False,
         description="Whether the chat has a pending question record still waiting on the user",
     )
+    in_flight: bool = Field(
+        False,
+        description="Whether the chat has a turn marker no reply has answered and recovery has not claimed;"
+        " a dead turn reads true until a chat-history read reconciles it",
+    )
 
 
 class WorkflowCopilotAudioUploadResponse(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="Chat ID the audio artifact is associated with")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str:
+        return self.workflow_copilot_chat_id
+
     audio_artifact_id: str = Field(..., description="Stored audio artifact ID")
 
 
@@ -811,6 +934,12 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.RESPONSE, description="Message type"
     )
     workflow_copilot_chat_id: str = Field(..., description="The chat ID")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str:
+        return self.workflow_copilot_chat_id
+
     message: str = Field(..., description="The message sent to the user")
     updated_workflow: ClientVisibleProposedWorkflow | None = Field(None, description="The updated workflow")
     response_time: datetime = Field(..., description="When the assistant message was created")
@@ -1029,6 +1158,9 @@ class WorkflowCopilotBlockProgressUpdate(BaseModel):
         description="Dispatched run id for this block; lets the FE fetch recorded actions live during execution. "
         "Optional for backward compatibility with clients that only read the run id from run_outcome.",
     )
+    parent_workflow_run_block_id: str | None = Field(
+        None, description="Run-block id of the block that ran this one (an agent step, loop or code-block fallback)"
+    )
     block_label: str = Field(..., description="Workflow block label (e.g. 'enter_name')")
     block_type: str = Field(..., description="Workflow block type (e.g. 'navigation', 'extraction')")
     status: str = Field(
@@ -1075,6 +1207,12 @@ class WorkflowCopilotRunOutcomeUpdate(BaseModel):
     workflow_permanent_id: str | None = Field(None, description="Workflow whose Copilot turn created this run")
     turn_id: str | None = Field(None, description="Parent Copilot turn for this child run")
     workflow_copilot_chat_id: str | None = Field(None, description="Parent Copilot chat for this child run")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str | None:
+        return self.workflow_copilot_chat_id
+
     continuity_source: Literal["workflow_run"] = Field(
         "workflow_run", description="Distinguishes authoritative run state from pane-stream presentation state"
     )
@@ -1099,6 +1237,11 @@ class WorkflowCopilotTurnStartUpdate(BaseModel):
     workflow_copilot_chat_id: str | None = Field(
         None, description="The chat this turn runs in, known to a client that opened the chat with this turn"
     )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str | None:
+        return self.workflow_copilot_chat_id
 
 
 class WorkflowCopilotDesignStartUpdate(BaseModel):
@@ -1181,6 +1324,12 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     )
     turn_id: str = Field(..., description="UUID for the paused turn; correlates with credential-response POSTs")
     workflow_copilot_chat_id: str = Field(..., description="The chat ID")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str:
+        return self.workflow_copilot_chat_id
+
     resume_token: str = Field(..., description="One-time token the credential-response POST must echo back to resume")
     reason: Literal[
         "workflow_credential_inputs_unbound",
@@ -1227,6 +1376,12 @@ class WorkflowCopilotCredentialPauseResolvedUpdate(BaseModel):
     )
     turn_id: str = Field(..., description="UUID for the paused turn")
     workflow_copilot_chat_id: str = Field(..., description="The chat ID")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str:
+        return self.workflow_copilot_chat_id
+
     resume_token: str = Field(..., description="Token of the credential_required card this answer resolves")
     outcome: CredentialPauseResolvedOutcome = Field(
         ..., description="The waiter's final verdict, after admission; never the raw POSTed action"
@@ -1248,12 +1403,20 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     question_interactions: list[QuestionInteraction] = Field(default_factory=list)
     pending_question_cancel_token: str | None = None
     workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str | None:
+        return self.workflow_copilot_chat_id
+
     request_turn_id: str | None = Field(
         None, description="Turn matched by request_cancel_token when recovery requests provide one"
     )
     request_browser_allocations: CopilotRequestBrowserAllocations | None = None
     in_flight_turn: CopilotInFlightTurn | None = None
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
+    workflow_permanent_id: str | None = Field(None, description="Workflow the chat belongs to")
+    app_url: str | None = Field(None, description="Base URL of the web app, without a trailing slash")
     accepted_turn_ids: list[str] = Field(
         default_factory=list, description="Turns whose manual Accept completed on the server"
     )

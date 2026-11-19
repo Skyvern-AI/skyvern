@@ -92,10 +92,6 @@ vi.mock("../../workflowEditorUtils", () => ({
   isNodeInsideForLoop: () => false,
 }));
 
-vi.mock("../DisableCache", () => ({
-  DisableCache: () => null,
-}));
-
 vi.mock("../IgnoreWorkflowSystemPrompt", () => ({
   IgnoreWorkflowSystemPrompt: () => null,
 }));

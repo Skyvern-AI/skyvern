@@ -1169,7 +1169,7 @@ def gmail_send_oauth(monkeypatch: pytest.MonkeyPatch, repo: GoogleOAuthRepositor
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
-    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", ["https://x/cb"], raising=False)
     monkeypatch.setattr(
         google_oauth_service.SettingsManager,
         "get_settings",

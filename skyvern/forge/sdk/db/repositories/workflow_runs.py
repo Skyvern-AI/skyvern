@@ -120,7 +120,13 @@ from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs, workflow_log
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.audit_events import record_run_cancel_audit
-from skyvern.forge.sdk.services.request_principal import RequestPrincipal, api_key_actor_id, get_request_principal
+from skyvern.forge.sdk.services.request_principal import (
+    AuthKind,
+    RequestPrincipal,
+    api_key_actor_id,
+    get_request_principal,
+    key_requester_id,
+)
 from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES
 from skyvern.forge.sdk.workflow.credential_selection import clear_credential_selections_for_retry
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
@@ -143,7 +149,7 @@ from skyvern.forge.sdk.workflow.status_mapping import (
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TERMINAL_STATUSES, ProxyLocationInput, RunType
-from skyvern.schemas.workflows import BlockStatus
+from skyvern.schemas.workflows import BlockStatus, BlockType
 
 LOG = structlog.get_logger()
 
@@ -560,6 +566,11 @@ def _final_webhook_claim_is_free(stale_before: datetime) -> ColumnElement[bool]:
             WorkflowRunModel.webhook_delivery_finalized_at < stale_before,
         ),
     )
+
+
+class FinalWebhookDeliveryState(NamedTuple):
+    status: str | None
+    finalized_at: datetime | None
 
 
 class WorkflowRunsRepository(BaseRepository):
@@ -1131,8 +1142,12 @@ class WorkflowRunsRepository(BaseRepository):
                 kwargs["browser_settings"] = browser_settings.model_dump(mode="json")
             principal = get_request_principal()
             api_key_actor = api_key_actor_id(organization_id)
-            if principal is not None and principal.api_key_access_mode == "scoped":
-                requested_by = api_key_actor
+            if principal is not None and (
+                principal.auth_kind == AuthKind.member_api_key or principal.api_key_access_mode == "scoped"
+            ):
+                requested_by = key_requester_id(principal, organization_id)
+                if principal.auth_kind == AuthKind.member_api_key:
+                    created_by = principal.user_id
             workflow_run = WorkflowRunModel(
                 workflow_permanent_id=workflow_permanent_id,
                 workflow_id=workflow_id,
@@ -1261,6 +1276,22 @@ class WorkflowRunsRepository(BaseRepository):
                 )
             )
         return free_run_id is not None
+
+    @db_operation("get_final_webhook_delivery_state")
+    async def get_final_webhook_delivery_state(self, workflow_run_id: str) -> FinalWebhookDeliveryState | None:
+        async with self.Session() as session:
+            row = (
+                await session.execute(
+                    select(
+                        WorkflowRunModel.webhook_delivery_status, WorkflowRunModel.webhook_delivery_finalized_at
+                    ).where(WorkflowRunModel.workflow_run_id == workflow_run_id)
+                )
+            ).first()
+        if row is None:
+            return None
+        return FinalWebhookDeliveryState(
+            status=row.webhook_delivery_status, finalized_at=row.webhook_delivery_finalized_at
+        )
 
     @db_operation("release_final_webhook_delivery_claim")
     async def release_final_webhook_delivery_claim(self, workflow_run_id: str, *, claimed_at: datetime) -> None:
@@ -2190,10 +2221,10 @@ class WorkflowRunsRepository(BaseRepository):
             )
             workflow_deleted_expr = self._workflow_deleted_expr(effective_wpid, TaskRunModel.organization_id)
             # A task v2 row's run_id is the task v2 id, so its creator lives on the task's own workflow run.
-            task_v2_workflow_run = aliased(WorkflowRunModel)
+            task_v2_workflow_run = WorkflowRunModel.__table__.alias()
             task_v2_created_by = (
-                select(task_v2_workflow_run.created_by)
-                .join(TaskV2Model, TaskV2Model.workflow_run_id == task_v2_workflow_run.workflow_run_id)
+                select(task_v2_workflow_run.c.created_by)
+                .join(TaskV2Model, TaskV2Model.workflow_run_id == task_v2_workflow_run.c.workflow_run_id)
                 .where(TaskV2Model.observer_cruise_id == TaskRunModel.run_id)
                 .where(TaskV2Model.organization_id == TaskRunModel.organization_id)
                 .scalar_subquery()
@@ -2238,8 +2269,8 @@ class WorkflowRunsRepository(BaseRepository):
             )
             # A task v2 row records no workflow, and the join above skips its run, so it follows its own workflow run.
             task_v2_wpid = (
-                select(task_v2_workflow_run.workflow_permanent_id)
-                .join(TaskV2Model, TaskV2Model.workflow_run_id == task_v2_workflow_run.workflow_run_id)
+                select(task_v2_workflow_run.c.workflow_permanent_id)
+                .join(TaskV2Model, TaskV2Model.workflow_run_id == task_v2_workflow_run.c.workflow_run_id)
                 .where(TaskV2Model.observer_cruise_id == TaskRunModel.run_id)
                 .where(TaskV2Model.organization_id == TaskRunModel.organization_id)
                 .scalar_subquery()
@@ -2545,6 +2576,24 @@ class WorkflowRunsRepository(BaseRepository):
                 .where(WorkflowRunModel.status.in_(["created", "queued", "running"]))
                 .limit(1)
             )
+
+    @db_operation("get_latest_finished_run_for_workflow_version")
+    async def get_latest_finished_run_for_workflow_version(
+        self, organization_id: str, workflow_permanent_id: str, workflow_id: str, created_at_start: datetime
+    ) -> WorkflowRun | None:
+        async with self.Session() as session:
+            run = await session.scalar(
+                select(WorkflowRunModel)
+                .where(WorkflowRunModel.organization_id == organization_id)
+                .where(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowRunModel.workflow_id == workflow_id)
+                .where(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                .where(WorkflowRunModel.status.in_([status.value for status in WorkflowRunStatus if status.is_final()]))
+                .where(WorkflowRunModel.created_at >= created_at_start)
+                .order_by(WorkflowRunModel.created_at.desc())
+                .limit(1)
+            )
+            return convert_to_workflow_run(run) if run is not None else None
 
     @db_operation("get_last_queued_workflow_run")
     async def get_last_queued_workflow_run(
@@ -4303,14 +4352,26 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str,
         organization_id: str | None = None,
         attempt_number: int | None = None,
+        *,
+        only_error_output: bool = False,
     ) -> list[WorkflowRunBlockErrorRow]:
         """Return block provenance and error details for errored blocks in stable creation order."""
+        output = (
+            case(
+                (
+                    WorkflowRunBlockModel.block_type.in_((BlockType.CODE.value, BlockType.WEB_SEARCH.value)),
+                    WorkflowRunBlockModel.output,
+                ),
+            ).label("output")
+            if only_error_output
+            else WorkflowRunBlockModel.output
+        )
         async with self.Session() as session:
             query = select(
                 WorkflowRunBlockModel.workflow_run_block_id,
                 WorkflowRunBlockModel.error_codes,
                 WorkflowRunBlockModel.failure_reason,
-                WorkflowRunBlockModel.output,
+                output,
                 WorkflowRunBlockModel.block_type,
                 WorkflowRunBlockModel.label,
                 WorkflowRunBlockModel.current_index,

@@ -408,6 +408,27 @@ def api_key_actor_id(organization_id: str) -> str | None:
     )
 
 
+def key_requester_id(principal: RequestPrincipal | None, organization_id: str) -> str | None:
+    """Record key provenance separately from the human who owns a resource."""
+    if principal is None or principal.organization_id != organization_id:
+        return None
+    if principal.auth_kind == AuthKind.member_api_key:
+        return (
+            f"{_MEMBER_API_KEY_ACTOR_PREFIX}{principal.api_key_token_id}"
+            if principal.api_key_token_id
+            else UNATTRIBUTED_TASK_ACTOR
+        )
+    if principal.api_key_access_mode == "scoped":
+        return (
+            scoped_api_key_actor_id(principal.api_key_token_id, human_user_id(principal, organization_id))
+            if principal.api_key_token_id
+            else UNATTRIBUTED_TASK_ACTOR
+        )
+    if principal.auth_kind in {AuthKind.api_key, AuthKind.api_key_and_bearer}:
+        return synthetic_user_id(organization_id)
+    return None
+
+
 def task_requester_id(organization_id: str) -> str:
     principal = get_request_principal()
     if principal is None or principal.organization_id != organization_id:

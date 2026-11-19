@@ -52,7 +52,7 @@ function collectBlocks(
  * meant to author a block drops the user into the last finished run instead.
  *
  * `systemFocusLabel` is the machine-origin marker (SYSTEM_BLOCK_FOCUS_PARAM):
- * the copilot's build-follow moves the canvas, which mirrors into
+ * the Ember's build-follow moves the canvas, which mirrors into
  * ?selected-block=, and pinning that would walk the Run and Browser panes
  * through an old finalized run while the build streams. Only a selection the
  * user made pins.

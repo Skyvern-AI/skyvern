@@ -5,15 +5,10 @@ import pytest
 import yaml
 from structlog.testing import capture_logs
 
-from skyvern.forge.sdk.copilot.code_block_steps import fill_code_block_error_code_mappings_in_yaml
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.tools.run_execution import _workflow_from_prior_draft
 from skyvern.forge.sdk.copilot.tools.workflow_update import strip_copilot_yaml_headers
-from skyvern.forge.sdk.copilot.workflow_yaml import (
-    _process_workflow_yaml,
-    strip_private_workflow_settings,
-    workflow_to_copilot_yaml,
-)
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _blockless_submission_fallback,
     _commit_staged_workflow,
@@ -24,10 +19,13 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
     client_visible_proposed_workflow,
 )
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
+from skyvern.forge.sdk.workflow.code_block_steps import fill_code_block_error_code_mappings_in_yaml
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, FileDownloadBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from skyvern.forge.sdk.workflow.private_settings import strip_private_workflow_settings
 from skyvern.schemas.proxy_location import GeoTarget
 from skyvern.schemas.runs import ProxyLocationInput
 from tests.copilot_policy_support import (
@@ -73,7 +71,7 @@ def test_invalid_geo_proxy_is_private_and_logs_only_fields_and_error_types() -> 
     assert "proxy_location" not in data
     assert logs == [
         {
-            "event": "Withholding invalid geo proxy mapping from Copilot",
+            "event": "Withholding invalid geo proxy mapping from authoring YAML",
             "field_names": ["country"],
             "error_types": ["value_error"],
             "log_level": "warning",
@@ -137,8 +135,8 @@ def _chat_request(workflow_yaml: str) -> WorkflowCopilotChatRequest:
     )
 
 
-def test_workflow_to_copilot_yaml_keeps_saved_blocks_without_runtime_fields() -> None:
-    persisted_yaml = workflow_to_copilot_yaml(_saved_workflow())
+def test_workflow_to_authoring_yaml_keeps_saved_blocks_without_runtime_fields() -> None:
+    persisted_yaml = workflow_to_authoring_yaml(_saved_workflow())
     parsed = yaml.safe_load(persisted_yaml)
 
     blocks = parsed["workflow_definition"]["blocks"]
@@ -152,7 +150,7 @@ def test_workflow_to_copilot_yaml_keeps_saved_blocks_without_runtime_fields() ->
 
 
 @pytest.mark.parametrize("tools", [["http_request"], None])
-def test_workflow_to_copilot_yaml_keeps_an_agent_steps_tools_list_or_its_absence(tools: list[str] | None) -> None:
+def test_workflow_to_authoring_yaml_keeps_an_agent_steps_tools_list_or_its_absence(tools: list[str] | None) -> None:
     workflow = _saved_workflow()
     workflow.workflow_definition.blocks = [
         AgentStepBlock(
@@ -164,7 +162,7 @@ def test_workflow_to_copilot_yaml_keeps_an_agent_steps_tools_list_or_its_absence
         )
     ]
 
-    block = yaml.safe_load(workflow_to_copilot_yaml(workflow))["workflow_definition"]["blocks"][0]
+    block = yaml.safe_load(workflow_to_authoring_yaml(workflow))["workflow_definition"]["blocks"][0]
 
     assert block.get("tools") == tools
 
@@ -191,11 +189,11 @@ def test_copilot_workflow_outputs_mask_inline_secrets_without_mutating_proposal(
     assert yaml.safe_load(proposal["_copilot_yaml"])["workflow_definition"]["blocks"][0]["sftp_private_key"] == secret
 
 
-def test_workflow_to_copilot_yaml_masks_inline_secrets() -> None:
+def test_workflow_to_authoring_yaml_masks_inline_secrets() -> None:
     workflow = _saved_workflow()
     workflow.workflow_definition.blocks[0].sftp_private_key = "synthetic-copilot-yaml-private-key"
 
-    block = yaml.safe_load(workflow_to_copilot_yaml(workflow))["workflow_definition"]["blocks"][0]
+    block = yaml.safe_load(workflow_to_authoring_yaml(workflow))["workflow_definition"]["blocks"][0]
 
     assert block["sftp_private_key"] == "[REDACTED]"
     assert workflow.workflow_definition.blocks[0].sftp_private_key == "synthetic-copilot-yaml-private-key"
@@ -207,7 +205,7 @@ async def test_copilot_staging_restores_masked_secrets_from_saved_workflow() -> 
     secret = "synthetic-copilot-staging-private-key"
     saved.workflow_definition.blocks[0].sftp_private_key = secret
     saved.workflow_definition.blocks[0].sftp_source_path = "/synthetic/invoice.pdf"
-    client_visible_yaml = workflow_to_copilot_yaml(saved)
+    client_visible_yaml = workflow_to_authoring_yaml(saved)
     assert yaml.safe_load(client_visible_yaml)["workflow_definition"]["blocks"][0]["sftp_private_key"] == "[REDACTED]"
 
     with patch(
@@ -366,7 +364,7 @@ def test_a_saved_user_owned_goal_reaches_the_copilot_yaml_the_next_turn_reads() 
         ),
     )
 
-    block = yaml.safe_load(workflow_to_copilot_yaml(workflow))["workflow_definition"]["blocks"][0]
+    block = yaml.safe_load(workflow_to_authoring_yaml(workflow))["workflow_definition"]["blocks"][0]
 
     assert block["prompt"] == "Download last month's invoice"
     assert block["user_owned_goal"] is True
@@ -435,7 +433,7 @@ def test_backend_copilot_yaml_masks_header_keys_and_omits_other_private_fields(
         _ensure_copilot_workflow_yaml(request, workflow)
         document = request.workflow_yaml
     else:
-        document = workflow_to_copilot_yaml(workflow)
+        document = workflow_to_authoring_yaml(workflow)
     parsed = yaml.safe_load(document)
     assert parsed["extra_http_headers"] == {"X-Test": "***"}
     assert parsed["cdp_connect_headers"] == {"X-CDP": "***"}

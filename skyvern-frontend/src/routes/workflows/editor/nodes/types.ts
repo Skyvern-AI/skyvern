@@ -1,8 +1,8 @@
 import {
   WorkflowBlockType,
+  type WorkflowBlockImage,
   type WorkflowModel,
 } from "../../types/workflowTypes";
-import type { CodeBlockTitleSource } from "../../types/scriptTypes";
 import type {
   BlockReviewAnnotation,
   FoldReviewAnnotation,
@@ -18,9 +18,10 @@ export type NodeBaseData = {
   notes?: string | null;
   trailingNotes?: string | null;
   description?: string | null;
+  docImages?: WorkflowBlockImage[] | null;
+  promptImages?: WorkflowBlockImage[] | null;
   // A person picked the block's engine; only task-like blocks read it.
   enginePinned?: boolean;
-  showCode?: boolean;
   review?: BlockReviewAnnotation | FoldReviewAnnotation;
   ignoreWorkflowSystemPrompt?: boolean;
   /**
@@ -71,6 +72,10 @@ function truncateTitle(value: string): string {
   return `${value.slice(0, CODE_BLOCK_TITLE_MAX_LENGTH - 1).trimEnd()}…`;
 }
 
+type CodeBlockTitleSource = {
+  prompt?: string | null;
+};
+
 export function getCodeBlockTitle(source: CodeBlockTitleSource): string {
   return truncateTitle(
     normalizeTitle(source.prompt) ?? CODE_BLOCK_FALLBACK_TITLE,
@@ -114,5 +119,6 @@ export const workflowBlockTitle: {
   powerbi_query: "Power BI Query",
   pdf_fill: "PDF Fill",
   split_pdf: "Split PDF",
+  integration_action: "App Action",
   data_export: "Data Export",
 };

@@ -74,12 +74,6 @@ export function getRunAbsoluteTime(
   return dt ? dt.toLocaleString() : null;
 }
 
-export function getRunModeLabel(run: DebugSessionRun): string {
-  if (run.run_with === "code") return "Code";
-  if (run.run_with === "agent") return "Agent";
-  return "Unknown";
-}
-
 export function getRunStatusLabel(status: string): string {
   return status
     .replace(/_/g, " ")

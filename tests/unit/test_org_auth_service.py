@@ -171,6 +171,31 @@ async def test_scoped_group_dispatch_preserves_key_actor(
     child = await run_group_env.database.workflow_runs.get_workflow_run(child_id)
     assert child is not None and child.requested_by == scoped_api_key_actor_id(token_id)
 
+    principal = RequestPrincipal(
+        ORG,
+        AuthKind.member_api_key,
+        "user_member",
+        "org:member",
+        api_key_token_id="oat_member",
+        api_key_access_mode="member",
+    )
+    monkeypatch.setattr(workflow_run_groups_repository, "get_request_principal", lambda: principal)
+    group = await run_group_env.database.workflow_run_groups.create_group(
+        organization_id=ORG,
+        workflow_permanent_id=WPID,
+        requested_version=1,
+        workflow_id="wf_1",
+        submission_key="member-key-group",
+        input_fingerprint="fingerprint",
+        items=[("item", {})],
+    )
+    await group_service.advance_workflow_run_group(group.workflow_run_group_id)
+    item = (await run_group_env.database.workflow_run_groups.get_items(group.workflow_run_group_id))[0]
+    child = await run_group_env.database.workflow_runs.get_workflow_run(item.workflow_run_id)
+    assert child is not None
+    assert child.created_by == "user_member"
+    assert child.requested_by == "member_api_key:oat_member"
+
 
 def test_debug_fields_show_when_normalized_token_still_fails() -> None:
     raw_api_key = '"Bearer definitely-not-a-jwt"'
@@ -1343,10 +1368,8 @@ def _principal_app() -> FastAPI:
         return principal()
 
     @fastapi_app.websocket("/stream")
-    async def stream(websocket: WebSocket, apikey: str | None = None, token: str | None = None) -> None:
-        await streaming_auth(
-            apikey, token, websocket, folder_action="workflow_run.read", folder_resource={"workflow_run_id": "wr_1"}
-        )
+    async def stream(websocket: WebSocket) -> None:
+        await streaming_auth(websocket, folder_action="workflow_run.read", folder_resource={"workflow_run_id": "wr_1"})
         await websocket.send_json(principal())
         await websocket.close()
 
@@ -1613,23 +1636,6 @@ async def test_two_users_behind_one_key_each_get_their_own_principal_across_a_ca
 
 
 @pytest.mark.asyncio
-async def test_two_auth_dependencies_on_one_route_resolve_the_bearer_once(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_request_log: MagicMock,
-) -> None:
-    headers, organization_id, identity_provider = await _principal_credentials(
-        monkeypatch, "api", "Bearer admin-bearer"
-    )
-    _use_bearer_authentication(monkeypatch, _make_org(organization_id))
-
-    with TestClient(_principal_app()) as client:
-        response = client.post("/org-and-user", headers=headers)
-
-    assert response.json() == _principal_payload(organization_id, {"auth_kind": "api_key_and_bearer", **_ADMIN})
-    assert identity_provider.resolved == [("admin-bearer", organization_id)]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("bearer_organization_id", "expected_conflict"),
     [("org-bearer-authority", True), ("org-ui-session", False)],
@@ -1786,21 +1792,6 @@ async def test_fallback_principal_is_recomputed_when_its_resolution_key_changes(
 
 
 @pytest.mark.asyncio
-async def test_caller_context_with_a_bearer_alone_resolves_the_identity_once(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_request_log: MagicMock,
-) -> None:
-    # The org and user helpers run in gathered tasks; the identity lookup must not be paid once per task.
-    headers, organization_id, identity_provider = await _principal_credentials(monkeypatch, None, "Bearer admin-bearer")
-
-    with TestClient(_principal_app()) as client:
-        response = client.post("/caller", headers=headers)
-
-    assert response.json() == _principal_payload(organization_id, {"auth_kind": "bearer", **_ADMIN})
-    assert identity_provider.resolved == [("admin-bearer", organization_id)]
-
-
-@pytest.mark.asyncio
 async def test_a_hanging_identity_lookup_cannot_hold_up_an_authenticated_request(
     monkeypatch: pytest.MonkeyPatch,
     raw_request_log: MagicMock,
@@ -1878,12 +1869,15 @@ async def test_unexpected_identity_lookup_failure_is_logged_without_rejecting_re
 
 
 @pytest.mark.asyncio
-async def test_websocket_in_body_auth_resolves_the_principal(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_websocket_handshake_auth_resolves_the_principal(monkeypatch: pytest.MonkeyPatch) -> None:
     headers, organization_id, _ = await _principal_credentials(monkeypatch, "api", None)
 
     with (
         TestClient(_principal_app()) as client,
-        client.websocket_connect(f"/stream?apikey={headers['x-api-key']}&token=Bearer%20member-bearer") as websocket,
+        client.websocket_connect(
+            "/stream",
+            subprotocols=["skyvern.v1", f"apikey.{headers['x-api-key']}", "bearer.member-bearer"],
+        ) as websocket,
     ):
         principal = websocket.receive_json()
 

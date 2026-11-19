@@ -9,7 +9,6 @@ import pytest
 from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import browser_profiles as mcp_browser_profiles
-from skyvern.cli.mcp_tools import skyvern_browser_profile_create
 from skyvern.cli.mcp_tools._session import SessionState, set_current_session
 
 
@@ -197,7 +196,3 @@ async def test_browser_profile_update_rejects_empty_update() -> None:
 
     assert result["ok"] is False
     assert result["error"]["code"] == "INVALID_INPUT"
-
-
-def test_browser_profile_tools_are_exported() -> None:
-    assert skyvern_browser_profile_create is mcp_browser_profiles.skyvern_browser_profile_create

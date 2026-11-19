@@ -23,8 +23,8 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     delete_block_from_workflow,
     stored_block_code,
     stored_workflow_yaml,
-    workflow_to_copilot_yaml,
 )
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 
 _WORKFLOW = """title: Lookup
 workflow_definition:
@@ -672,7 +672,7 @@ class TestLegacyListOrderedRows:
     async def test_a_version_1_row_chained_in_list_order_reads_as_list_order(self) -> None:
         saved = await self._saved_row(_ROUTED_WORKFLOW, version=1)
 
-        baseline = workflow_to_copilot_yaml(saved)
+        baseline = workflow_to_authoring_yaml(saved)
 
         definition = _normalize_copilot_yaml(baseline).workflow_definition
         assert definition.version == 1
@@ -683,7 +683,7 @@ class TestLegacyListOrderedRows:
         unchained = await self._saved_row(
             _ROUTED_WORKFLOW, version=1, pointers={"open_portal": None, "list_rows": None, "read_total": None}
         )
-        proposal = workflow_to_copilot_yaml(unchained)
+        proposal = workflow_to_authoring_yaml(unchained)
         projection = build_review_projection(baseline, proposal, workflow_block_fingerprints(baseline))
         assert projection is not None
         assert {(row["change"], row.get("coverage")) for row in projection["blocks"]} == {
@@ -705,7 +705,7 @@ class TestLegacyListOrderedRows:
         saved = await self._saved_row(_ROUTED_WORKFLOW, version=version, pointers=pointers)
         expected = [block.next_block_label for block in saved.workflow_definition.blocks]
 
-        blocks = yaml.safe_load(workflow_to_copilot_yaml(saved))["workflow_definition"]["blocks"]
+        blocks = yaml.safe_load(workflow_to_authoring_yaml(saved))["workflow_definition"]["blocks"]
 
         assert [block.get("next_block_label") for block in blocks] == expected
         assert any(expected)

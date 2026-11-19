@@ -11,6 +11,7 @@ import {
 import type { OnboardingState } from "@/store/onboarding/types";
 import { useProductTourStore } from "@/store/ProductTourStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 
 vi.mock("driver.js", () => ({
   driver: vi.fn(() => ({
@@ -878,6 +879,242 @@ describe("useEditorOnboardingTour", () => {
       });
 
       expect(driverMock()).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("while the Doc is on screen", () => {
+    beforeEach(() => {
+      localStorage.clear();
+      useWorkflowPresentationStore.setState({
+        workflowPermanentId: "wpid_a",
+        enabled: true,
+        presentation: "doc",
+        docMounted: true,
+      });
+    });
+    afterEach(() => {
+      useWorkflowPresentationStore.setState({
+        workflowPermanentId: null,
+        enabled: false,
+        presentation: "visual",
+        docMounted: false,
+      });
+    });
+
+    it("shows Visual without remembering it, and starts once the Doc has closed", () => {
+      renderHook(() => useEditorOnboardingTour(), {
+        wrapper: wrapWith(makeContext({ isNewUser: false })),
+      });
+      act(() => {
+        vi.runAllTimers();
+      });
+
+      expect(useWorkflowPresentationStore.getState().presentation).toBe(
+        "visual",
+      );
+      expect(localStorage.length).toBe(0);
+      expect(driverMock()).not.toHaveBeenCalled();
+
+      act(() => {
+        useWorkflowPresentationStore.getState().setDocMounted(false);
+      });
+      expect(driverMock()).toHaveBeenCalledOnce();
+      expect(lastInstance().drive).toHaveBeenCalledOnce();
+    });
+
+    it("a tour that cannot start once the Doc closes gives the view back", () => {
+      driverMock().mockImplementationOnce(() => {
+        throw new Error("driver failed");
+      });
+      renderHook(() => useEditorOnboardingTour(), {
+        wrapper: wrapWith(makeContext({ isNewUser: false })),
+      });
+      act(() => {
+        vi.runAllTimers();
+      });
+      act(() => {
+        useWorkflowPresentationStore.getState().setDocMounted(false);
+      });
+      expect(useWorkflowPresentationStore.getState().presentation).toBe("doc");
+      expect(localStorage.length).toBe(0);
+    });
+
+    it("a tour with nothing to point at once the Doc closes gives the view back", () => {
+      removeAnchors();
+      renderHook(() => useEditorOnboardingTour(), {
+        wrapper: wrapWith(makeContext({ isNewUser: false })),
+      });
+      act(() => {
+        vi.runAllTimers();
+      });
+      act(() => {
+        useWorkflowPresentationStore.getState().setDocMounted(false);
+      });
+      expect(driverMock()).not.toHaveBeenCalled();
+      expect(useWorkflowPresentationStore.getState().presentation).toBe("doc");
+    });
+
+    it("does not start after the editor has left while the Doc was closing, and gives the view back", () => {
+      const { unmount } = renderHook(() => useEditorOnboardingTour(), {
+        wrapper: wrapWith(makeContext({ isNewUser: false })),
+      });
+      act(() => {
+        vi.runAllTimers();
+      });
+      unmount();
+      act(() => {
+        useWorkflowPresentationStore.getState().setDocMounted(false);
+      });
+      expect(driverMock()).not.toHaveBeenCalled();
+      expect(useWorkflowPresentationStore.getState().presentation).toBe("doc");
+    });
+  });
+
+  describe("the Doc stays off the canvas during the tour", () => {
+    const presentation = () => useWorkflowPresentationStore.getState();
+    const startTour = () => {
+      const view = renderHook(() => useEditorOnboardingTour(), {
+        wrapper: wrapWith(makeContext({ isNewUser: false })),
+      });
+      act(() => {
+        vi.runAllTimers();
+      });
+      expect(driverMock()).toHaveBeenCalledOnce();
+      return view;
+    };
+    beforeEach(() => {
+      localStorage.clear();
+    });
+    afterEach(() => {
+      useWorkflowPresentationStore.setState({
+        workflowPermanentId: null,
+        enabled: false,
+        presentation: "visual",
+        docMounted: false,
+      });
+    });
+
+    it("a Doc flag that resolves after the tour began does not open the Doc", () => {
+      useWorkflowPresentationStore.setState({
+        workflowPermanentId: "wpid_a",
+        enabled: false,
+        presentation: "visual",
+        docMounted: false,
+      });
+      startTour();
+      act(() => presentation().syncScope("wpid_a", true));
+      expect(presentation().presentation).toBe("visual");
+      expect(localStorage.length).toBe(0);
+    });
+
+    it("a tour that begins before the Doc has mounted ends up on Visual", () => {
+      useWorkflowPresentationStore.setState({
+        workflowPermanentId: "wpid_a",
+        enabled: true,
+        presentation: "doc",
+        docMounted: false,
+      });
+      startTour();
+      expect(presentation().presentation).toBe("visual");
+      expect(localStorage.length).toBe(0);
+    });
+
+    const onAgent = (stored?: "visual") => {
+      if (stored)
+        localStorage.setItem("skyvern.workflowPresentation.wpid_a", stored);
+      useWorkflowPresentationStore.setState({
+        workflowPermanentId: "wpid_a",
+        enabled: true,
+        presentation: stored ?? "doc",
+        docMounted: false,
+      });
+    };
+
+    it("leaving an editor no tour switched keeps the person's Visual, even when storage cannot be written", () => {
+      const original = Storage.prototype.setItem;
+      Storage.prototype.setItem = () => {
+        throw new Error("blocked");
+      };
+      try {
+        onAgent();
+        const { unmount } = renderHook(() => useEditorOnboardingTour(), {
+          wrapper: wrapWith(
+            makeContext({
+              isNewUser: false,
+              state: {
+                ...DEFAULT_STATE,
+                tour_completed_at: "2024-01-01T00:00:00Z",
+              },
+            }),
+          ),
+        });
+        act(() => {
+          vi.runAllTimers();
+        });
+        expect(driverMock()).not.toHaveBeenCalled();
+        act(() => presentation().setPresentation("visual"));
+        unmount();
+        expect(presentation().presentation).toBe("visual");
+        presentation().syncScope("wpid_a", true);
+        expect(presentation().presentation).toBe("visual");
+      } finally {
+        Storage.prototype.setItem = original;
+      }
+    });
+
+    it("ending the tour shows the person's view again: the Doc with nothing stored", () => {
+      onAgent();
+      const { result } = startTour();
+      expect(presentation().presentation).toBe("visual");
+      act(() => {
+        result.current.onExitConfirm();
+      });
+      expect(presentation().presentation).toBe("doc");
+    });
+
+    it("closing the editor during the tour shows the person's view again", () => {
+      onAgent();
+      const { unmount } = startTour();
+      unmount();
+      expect(presentation().presentation).toBe("doc");
+    });
+
+    it("a Doc click during the tour is stored, and the Doc shows once the tour ends", () => {
+      onAgent("visual");
+      const { result } = startTour();
+      act(() => presentation().setPresentation("doc"));
+      expect(localStorage.getItem("skyvern.workflowPresentation.wpid_a")).toBe(
+        "doc",
+      );
+      expect(presentation().presentation).toBe("visual");
+      act(() => {
+        result.current.onExitConfirm();
+      });
+      expect(presentation().presentation).toBe("doc");
+    });
+
+    it("a tour started on a stored Visual ends on Visual", () => {
+      onAgent("visual");
+      const { result } = startTour();
+      act(() => {
+        result.current.onExitConfirm();
+      });
+      expect(presentation().presentation).toBe("visual");
+    });
+
+    it("after the tour is dismissed, choosing the Doc works", () => {
+      useWorkflowPresentationStore.setState({
+        workflowPermanentId: "wpid_a",
+        enabled: true,
+        presentation: "visual",
+        docMounted: false,
+      });
+      const { result } = startTour();
+      act(() => {
+        result.current.onExitConfirm();
+      });
+      act(() => presentation().setPresentation("doc"));
+      expect(presentation().presentation).toBe("doc");
     });
   });
 });

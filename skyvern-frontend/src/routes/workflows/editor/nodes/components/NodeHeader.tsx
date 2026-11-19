@@ -1,3 +1,4 @@
+import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import {
   SaveRefusedError,
   SaveStaleError,
@@ -48,7 +49,6 @@ import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChan
 import { useDuplicateNodeCallback } from "@/routes/workflows/hooks/useDuplicateNodeCallback";
 import { useRequestDeleteNodeCallback } from "@/routes/workflows/hooks/useRequestDeleteNodeCallback";
 import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
-import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useBrowserSessionRateLimit } from "@/routes/workflows/hooks/useBrowserSessionRateLimit";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
@@ -65,7 +65,6 @@ import {
 } from "@/routes/workflows/debugger/debugSessionProfileCompatibility";
 import {
   debuggableWorkflowBlockTypes,
-  scriptableWorkflowBlockTypes,
   type WorkflowBlockType,
   type WorkflowApiResponse,
   type WorkflowParameter,
@@ -146,14 +145,7 @@ import {
 } from "../../collapse/useNodeCollapseStore";
 import { useWorkflowEditorMode } from "../../hooks/useWorkflowEditorMode";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
-
-class ValidationFailureError extends Error {
-  readonly isValidationFailure = true;
-  constructor() {
-    super("workflow validation failed");
-    this.name = "ValidationFailureError";
-  }
-}
+import { ValidationFailureError } from "./ValidationFailureError";
 
 function formatLabelList(labels: string[]): string {
   if (labels.length <= 1) return labels[0] ?? "";
@@ -314,7 +306,6 @@ function NodeHeader({
   const duplicateNodeCallback = useDuplicateNodeCallback();
   const requestDeleteNodeCallback = useRequestDeleteNodeCallback();
   const transmuteNodeCallback = useTransmuteNodeCallback();
-  const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
@@ -322,7 +313,6 @@ function NodeHeader({
   const location = useLocation();
   const { resolveLivePanes, preserveNextEntry } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
-  const isScriptable = scriptableWorkflowBlockTypes.has(type);
   const {
     data: workflowRun,
     isError: statusUnavailable,
@@ -348,6 +338,7 @@ function NodeHeader({
   });
   const saveWorkflow = useWorkflowSave();
   const reactFlow = useReactFlow<AppNode>();
+  const activeOrgId = useActiveOrgId();
 
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued &&
@@ -471,7 +462,7 @@ function NodeHeader({
       // formats errors as `${label}: ${message}` - if that ever drifts,
       // errors for this block would silently slip past this gate.
       const blockErrors = runLabels.flatMap((runLabel) =>
-        blockRunErrors(reactFlow.getNodes(), runLabel),
+        blockRunErrors(reactFlow.getNodes(), runLabel, activeOrgId),
       );
       if (
         isMissingRequiredStartUrl(
@@ -1359,7 +1350,7 @@ function NodeHeader({
               editable={editable}
               onChange={(value) => {
                 // The label handler queues edits while the graph is locked.
-                useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+                useWorkflowTitleStore.getState().recordEmberGraphEdit();
                 setLabel(value);
               }}
               titleClassName={cn("text-base", {
@@ -1532,7 +1523,6 @@ function NodeHeader({
                   isDuplicable={
                     !isReadOnlyScope && Boolean(duplicateNodeCallback)
                   }
-                  isScriptable={isScriptable}
                   isCanvasLocked={isCanvasLocked}
                   onDuplicate={
                     isReadOnlyScope || !duplicateNodeCallback
@@ -1544,9 +1534,6 @@ function NodeHeader({
                   onDelete={() => {
                     requestDeleteNodeCallback(nodeId, blockLabel);
                   }}
-                  onShowScript={() =>
-                    toggleScriptForNodeCallback({ id: nodeId, show: true })
-                  }
                 />
               </div>
             </div>

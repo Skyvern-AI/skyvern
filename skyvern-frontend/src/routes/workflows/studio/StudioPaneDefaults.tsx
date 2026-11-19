@@ -41,9 +41,10 @@ import { isStudioNarrow } from "./useStudioNarrow";
 // Browser, first to last; Editor leads so a one-pane stage still shows it.
 const REOPEN_EDITOR_PANE_RANK: Record<StudioPaneId, number> = {
   editor: 0,
-  copilot: 1,
+  ember: 1,
   overview: 2,
   browser: 3,
+  triggers: 4,
 };
 
 // Create markers nothing reads after mount; discover, template and record are
@@ -79,7 +80,7 @@ export function StudioPaneDefaultsProvider({
   const location = useLocation();
   const navigate = useNavigate();
   const pathRunId = useFirstParam("workflowRunId", "runId");
-  // A Copilot manual sign-in happens in the Browser pane, which Edit does not
+  // An Ember manual sign-in happens in the Browser pane, which Edit does not
   // open; a re-resolve during the sign-in (it can drop ?wr=) keeps it too. The
   // store is global, so only a sign-in that starts after this studio mounts counts.
   const signingInRef = useRef(false);
@@ -259,7 +260,7 @@ export function StudioPaneDefaultsProvider({
       };
     });
   }, [updatePanes]);
-  // A layout effect subscribes before the Copilot chat's passive effects write
+  // A layout effect subscribes before the Ember chat's passive effects write
   // the store, and before a previous agent's chat clears it on unmount.
   useLayoutEffect(
     () =>

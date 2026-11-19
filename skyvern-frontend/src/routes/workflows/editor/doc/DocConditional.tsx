@@ -20,7 +20,6 @@ import type { DocBranch, DocItem } from "./buildDocTree";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import { docStepTitle } from "./docStepRegistry";
 import {
-  DocStepCaption,
   DocStepControls,
   DocStepNumber,
   DocTag,
@@ -28,6 +27,7 @@ import {
 } from "./DocStep";
 import { runStepByKey, type LineSplit } from "./docKeys";
 import type { DocScopeRef } from "./docGraphEdits";
+import { DocStepName } from "./DocStepName";
 import { DocText } from "./DocText";
 import { DocDeleteConfirm, DocEditableLine } from "./DocEditing";
 import { docBranchSelection, selectedStepIds } from "./docBranchSelection";
@@ -212,33 +212,35 @@ export function DocConditional({
   return (
     <div className="rounded py-[3px]">
       {/* The hover group is the header only: the steps inside a branch show their own controls. */}
-      <div className="group/line relative flex min-h-[26px] flex-wrap items-center gap-2">
-        <DocStepNumber number={number} />
-        <DocTag node={node} place={editable ? place : undefined} />
-        <DocStepCaption node={node} />
-        <button
-          type="button"
-          aria-label={`${open ? "Collapse" : "Expand"} ${docStepTitle(node)}`}
-          aria-expanded={open}
-          onClick={() => actions.toggleConditional(node.id)}
-          className="grid size-[22px] place-items-center rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          {open ? (
-            <ChevronDownIcon className="size-3.5" />
-          ) : (
-            <ChevronRightIcon className="size-3.5" />
-          )}
-        </button>
-        <span className="text-[12.5px] text-muted-foreground">
-          {conditions.length === 1
-            ? "If the condition holds, its steps run; otherwise the fallback branch runs"
-            : "Runs the first branch whose condition matches, checked left to right"}
-        </span>
-        <DocStepControls
-          node={node}
-          editable={editable}
-          showRunControl={showRunControl}
-        />
+      <div className="group/line">
+        <div className="relative flex min-h-[26px] flex-wrap items-center gap-2">
+          <DocStepNumber number={number} />
+          <DocTag node={node} place={editable ? place : undefined} />
+          <button
+            type="button"
+            aria-label={`${open ? "Collapse" : "Expand"} ${docStepTitle(node)}`}
+            aria-expanded={open}
+            onClick={() => actions.toggleConditional(node.id)}
+            className="grid size-[22px] place-items-center rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {open ? (
+              <ChevronDownIcon className="size-3.5" />
+            ) : (
+              <ChevronRightIcon className="size-3.5" />
+            )}
+          </button>
+          <span className="text-[12.5px] text-muted-foreground">
+            {conditions.length === 1
+              ? "If the condition holds, its steps run; otherwise the fallback branch runs"
+              : "Runs the first branch whose condition matches, checked left to right"}
+          </span>
+          <DocStepControls
+            node={node}
+            editable={editable}
+            showRunControl={showRunControl}
+          />
+        </div>
+        <DocStepName node={node} editable={editable} />
       </div>
       {open && (
         <>

@@ -4,12 +4,9 @@ import { type StudioPaneId } from "./panes";
 
 type StudioShellContextValue = {
   organizationId?: string | null;
-  // Left-column target Workspace portals the docked Copilot into; null when
+  // Left-column target Workspace portals the docked Ember into; null when
   // collapsed or when Workspace isn't embedded in the studio shell.
-  copilotPortalEl: HTMLElement | null;
-  // Stage-level overlay target for Workspace-wired panels that must outlive a
-  // hidden Editor pane (e.g. the code-cache key/value panel).
-  panelPortalEl: HTMLElement | null;
+  emberPortalEl: HTMLElement | null;
   // Tabs register their stream container so the shell can re-parent the single
   // persistent stream node into the active surface without remounting it.
   setEditorStreamSlot: (el: HTMLElement | null) => void;
@@ -31,8 +28,7 @@ type StudioShellContextValue = {
 
 export const StudioShellContext = createContext<StudioShellContextValue>({
   organizationId: null,
-  copilotPortalEl: null,
-  panelPortalEl: null,
+  emberPortalEl: null,
   setEditorStreamSlot: () => {},
   setBrowserStreamSlot: () => {},
   setRunStreamSlot: () => {},
@@ -53,10 +49,21 @@ export function useStudioPaneCompact(): boolean {
 
 // The source agent's deleted_at when the studio shows a run whose workflow was
 // deleted (the shell runs from the run's embedded snapshot). Workflow-mutating
-// chrome keys off this to degrade: Copilot/Editor panes blocked, top-bar
+// chrome keys off this to degrade: Ember/Editor panes blocked, top-bar
 // actions replaced by the legacy "Agent deleted on …" tag.
 export const StudioWorkflowDeletedContext = createContext<string | null>(null);
 
 export function useStudioWorkflowDeletedAt(): string | null {
   return useContext(StudioWorkflowDeletedContext);
+}
+
+// Whether the studio shows a global (read-only) agent, undefined until known.
+// The shell reads the global-workflows query once, so pane hooks used
+// everywhere stay query-free.
+export const StudioGlobalWorkflowContext = createContext<boolean | undefined>(
+  false,
+);
+
+export function useStudioGlobalWorkflow(): boolean | undefined {
+  return useContext(StudioGlobalWorkflowContext);
 }

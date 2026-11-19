@@ -17,6 +17,7 @@ CREDENTIALS_WITH_COLON_IN_PASSWORD = "alice:p:w@ss"
         # No colon means an empty password, which curl still sends as "user:".
         ("curl -u alice https://api.example.com/me", "Basic YWxpY2U6"),
     ],
+    ids=["short-flag", "long-flag", "colon-in-password", "no-password"],
 )
 def test_user_flag_becomes_basic_authorization_header(curl_command: str, expected_authorization: str) -> None:
     assert parse_curl_command(curl_command)["headers"]["Authorization"] == expected_authorization

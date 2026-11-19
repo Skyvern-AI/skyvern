@@ -21,13 +21,13 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _mark_copilot_total_timeout,
     run_with_enforcement,
 )
-from skyvern.forge.sdk.copilot.pending_operation import (
+from skyvern.forge.sdk.copilot.tools import run_execution
+from skyvern.forge.sdk.copilot.tools.run_execution import _run_blocks_and_collect_debug
+from skyvern.forge.sdk.core.pending_operation import (
     _turn_operations,
     pending_operation,
     pending_operation_fields,
 )
-from skyvern.forge.sdk.copilot.tools import run_execution
-from skyvern.forge.sdk.copilot.tools.run_execution import _run_blocks_and_collect_debug
 from tests.unit.copilot_test_helpers import (
     count_record_and_send,
     failed_second_factor_run,

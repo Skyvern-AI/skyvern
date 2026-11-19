@@ -35,6 +35,7 @@ const REACT_FLOW_TYPE_TO_BLOCK_TYPE: Record<string, string> = {
   powerBIQuery: "powerbi_query",
   pdfFill: "pdf_fill",
   splitPdf: "split_pdf",
+  integrationAction: "integration_action",
 };
 
 type Loopish = { type?: string; data?: Partial<LoopNodeData> };

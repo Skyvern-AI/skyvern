@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import (
-    FAILURE_CLASSIFIER_V2_REASON_CODE,
+    CLASSIFIER_LABEL_REASON_CODES,
     classify_from_failure_reason,
 )
 from skyvern.forge.sdk.core import skyvern_context
@@ -75,7 +75,7 @@ def _failure_category_names(workflow_run: WorkflowRun) -> set[str]:
     categories: list[dict[str, Any]] | None = [
         entry
         for entry in without_final_har_user_match(workflow_run.failure_category) or []
-        if not (isinstance(entry, dict) and entry.get("reason_code") == FAILURE_CLASSIFIER_V2_REASON_CODE)
+        if not (isinstance(entry, dict) and entry.get("reason_code") in CLASSIFIER_LABEL_REASON_CODES)
     ]
     if not categories:
         categories = classify_from_failure_reason(workflow_run.failure_reason)

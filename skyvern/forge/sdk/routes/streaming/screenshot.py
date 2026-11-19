@@ -64,10 +64,8 @@ async def _run_screencast_with_reauthorization(
 async def task_stream(
     websocket: WebSocket,
     task_id: str,
-    apikey: str | None = None,
-    token: str | None = None,
 ) -> None:
-    credentials = credentials_from_websocket(websocket, apikey, token)
+    credentials = credentials_from_websocket(websocket)
     try:
         await websocket.accept(subprotocol=credentials.subprotocol)
         if not credentials.authorization and not credentials.apikey:
@@ -213,10 +211,8 @@ async def task_stream(
 async def workflow_run_streaming(
     websocket: WebSocket,
     workflow_run_id: str,
-    apikey: str | None = None,
-    token: str | None = None,
 ) -> None:
-    credentials = credentials_from_websocket(websocket, apikey, token)
+    credentials = credentials_from_websocket(websocket)
     try:
         await websocket.accept(subprotocol=credentials.subprotocol)
         if not credentials.authorization and not credentials.apikey:
@@ -451,11 +447,9 @@ async def workflow_run_streaming(
 async def browser_session_streaming(
     websocket: WebSocket,
     browser_session_id: str,
-    apikey: str | None = None,
-    token: str | None = None,
     force_cdp: bool = False,
 ) -> None:
-    credentials = credentials_from_websocket(websocket, apikey, token)
+    credentials = credentials_from_websocket(websocket)
     try:
         await websocket.accept(subprotocol=credentials.subprotocol)
         if not credentials.authorization and not credentials.apikey:

@@ -232,7 +232,8 @@ export type WorkflowBlock =
   | GoogleSheetsWriteBlock
   | PowerBIQueryBlock
   | PdfFillBlock
-  | SplitPdfBlock;
+  | SplitPdfBlock
+  | IntegrationActionBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -270,6 +271,7 @@ export const WorkflowBlockTypes = {
   PowerBIQuery: "powerbi_query",
   PDFFill: "pdf_fill",
   SplitPDF: "split_pdf",
+  IntegrationAction: "integration_action",
 } as const;
 
 // all of them
@@ -277,7 +279,7 @@ export const debuggableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set(
   Object.values(WorkflowBlockTypes),
 );
 
-export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
+const taskVariantWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
   "action",
   "extraction",
   "file_download",
@@ -292,7 +294,7 @@ export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
 export function isTaskVariantBlock(item: {
   block_type: WorkflowBlockType;
 }): boolean {
-  return scriptableWorkflowBlockTypes.has(item.block_type);
+  return taskVariantWorkflowBlockTypes.has(item.block_type);
 }
 
 export function isNestedLoopWorkflowBlock(
@@ -316,12 +318,23 @@ export const WorkflowEditorParameterTypes = {
 export type WorkflowEditorParameterType =
   (typeof WorkflowEditorParameterTypes)[keyof typeof WorkflowEditorParameterTypes];
 
+// An uploaded image on a block. `placement` names the line it shows under: the above note, the trailing note or the
+// block's own text.
+export type WorkflowBlockImage = {
+  file_id: string;
+  caption: string | null;
+  placement: "above" | "trailing" | "block";
+};
+
 // Text shown in the Doc view. `notes` sits above a block and `trailing_notes` after the last block of a sequence;
-// both are read by the agent at run time. `description` is for people only.
+// both are read by the agent at run time. `description` and `doc_images` are for people only. The Doc carries
+// `prompt_images` through unchanged.
 export type WorkflowBlockDocFields = {
   notes?: string | null;
   trailing_notes?: string | null;
   description?: string | null;
+  doc_images?: WorkflowBlockImage[] | null;
+  prompt_images?: WorkflowBlockImage[] | null;
 };
 
 export type WorkflowBlockBase = WorkflowBlockDocFields & {
@@ -749,6 +762,8 @@ export type WorkflowTriggerBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type EmailOrganizeAction = "label" | "archive" | "move" | "mark_read";
+
 export type EmailInboxBlock = WorkflowBlockBase & {
   block_type: "email_inbox";
   email_client: "gmail" | "outlook";
@@ -764,6 +779,8 @@ export type EmailInboxBlock = WorkflowBlockBase & {
   include_body: boolean;
   download_attachments: boolean;
   message_id?: string | null;
+  organize_action?: EmailOrganizeAction | null;
+  organize_label?: string | null;
   parameters: Array<WorkflowParameter>;
 };
 
@@ -806,6 +823,15 @@ export type PdfFillBlock = WorkflowBlockBase & {
   prompt: string;
   payload: Record<string, unknown> | Array<unknown> | string | null;
   llm_key: string | null;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type IntegrationActionBlock = WorkflowBlockBase & {
+  block_type: "integration_action";
+  integration_id: string;
+  action_id: string;
+  connection_id: string | null;
+  inputs: Record<string, unknown>;
   parameters: Array<WorkflowParameter>;
 };
 

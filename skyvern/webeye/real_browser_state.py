@@ -439,6 +439,8 @@ class RealBrowserState(BrowserState):
         self.external_browser = external_browser
         self._runtime_event_context = runtime_event_context or BrowserRuntimeLogContext.current()
         self._run_released = False
+        self._run_http_cache_bound = False
+        self._run_http_cache_seed_closed = False
         if engine_selection is not None:
             self._runtime_event_context = replace(self._runtime_event_context, browser_engine=engine_selection.name)
         self._acquisition_reported_context: BrowserRuntimeLogContext | None = None
@@ -549,12 +551,25 @@ class RealBrowserState(BrowserState):
         self._on_close_callbacks.append(callback)
 
     def bind_runtime_event_context(self, context: BrowserRuntimeLogContext) -> None:
+        previous = self._runtime_event_context
+        # A workflow's tasks share its authority. Reacquiring that same owner must not rotate a live
+        # generation (Task V2 acquires before its planned navigation), nor restore a revoked seed.
+        same_owner = (
+            self._run_http_cache_bound
+            and not self._run_released
+            and (context.workflow_run_id is not None or context.task_id is not None)
+            and previous.workflow_run_id == context.workflow_run_id
+            and (context.workflow_run_id is not None or previous.task_id == context.task_id)
+            and previous.browser_session_id == (context.browser_session_id or previous.browser_session_id)
+        )
         self._run_released = False
+        self._run_http_cache_bound = True
         self._runtime_event_context = replace(
             context,
             browser_session_id=context.browser_session_id or self._runtime_event_context.browser_session_id,
         ).with_browser_dimensions_of(self._runtime_event_context)
-        self._set_run_http_cache()
+        if not same_owner:
+            self._set_run_http_cache()
 
     @property
     def runtime_event_context(self) -> BrowserRuntimeLogContext:
@@ -562,15 +577,19 @@ class RealBrowserState(BrowserState):
 
     def mark_run_released(self) -> None:
         self._run_released = True
+        self._run_http_cache_seed_closed = True
         self._set_run_http_cache()
         app.AGENT_FUNCTION.on_browser_run_released(self.browser_context or self.browser_artifacts)
 
-    # Every bind gets a new generation and every release turns it off, so no response is reused across runs, even
-    # when a persistent or shared context outlives the run that filled it.
+    # A new owner/context gets a new generation and release turns it off, even when the context outlives its run.
     def _set_run_http_cache(self) -> None:
         if self._browser_context is not None:
             generation = None if self._run_released else uuid.uuid4().hex
-            app.AGENT_FUNCTION.set_browser_run_http_cache(self._browser_context, generation)
+            fresh_run = self._run_http_cache_bound and not self._run_released and not self._run_http_cache_seed_closed
+            if fresh_run:
+                # The seed opportunity belongs to the run owner, not to each replacement context.
+                self._run_http_cache_seed_closed = True
+            app.AGENT_FUNCTION.set_browser_run_http_cache(self._browser_context, generation, fresh_run=fresh_run)
 
     @property
     def _run_phase(self) -> RunPhase:
@@ -2152,12 +2171,22 @@ class RealBrowserState(BrowserState):
             if session is not None:
                 _schedule_detach(session)
 
-    async def reload_page(self, degradation: bool = False, page: Page | None = None) -> None:
+    async def reload_page(
+        self,
+        degradation: bool = False,
+        page: Page | None = None,
+        still_wanted: Callable[[Page], Awaitable[bool]] | None = None,
+    ) -> bool:
+        """Reload the page; False, without reloading, when `still_wanted` says the reload no longer stands."""
         # A caller that pins its own page passes it, since the working-page accessor would reload
         # (and repoint to) the newest tab instead.
         if page is None:
             page = await self.__assert_page()
         await self._wait_for_browser_to_record_page(page)
+        # Awaited last, so nothing between its answer and the reload below can change it.
+        if still_wanted is not None and not await still_wanted(page):
+            LOG.info("Reload withheld: the request for it no longer stands", url=page.url)
+            return False
         url = page.url
 
         if not degradation:
@@ -2173,7 +2202,7 @@ class RealBrowserState(BrowserState):
                 self._record_reload_timeout(e)
                 LOG.exception("Error while reload url", error=repr(e))
                 raise FailedToReloadPage(url=url, error_message=repr(e))
-            return
+            return True
 
         strategies: list[str] = ["load", "domcontentloaded", "commit"]
         for i, strategy in enumerate(strategies):
@@ -2190,7 +2219,7 @@ class RealBrowserState(BrowserState):
                 skyvern_context.record_browser_success()
                 await self._wait_for_settle()
                 await self._wait_for_challenge_solver(page=page)
-                return
+                return True
             except Exception as e:
                 self._record_reload_timeout(e)
                 # A reload that failed after the owning run lost its browser is final; degrading would send another.
@@ -2205,6 +2234,8 @@ class RealBrowserState(BrowserState):
                     continue
                 LOG.warning("Error while reload url after degradation", error=repr(e), exc_info=True)
                 raise FailedToReloadPage(url=url, error_message=repr(e))
+        # Unreachable: every strategy above returns or raises.
+        raise FailedToReloadPage(url=url, error_message="no reload strategy left")
 
     async def scrape_website(
         self,

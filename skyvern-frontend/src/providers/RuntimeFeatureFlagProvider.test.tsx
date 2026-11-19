@@ -21,40 +21,31 @@ describe("RuntimeFeatureFlagProvider", () => {
   beforeEach(() => {
     useRuntimeConfigMock.mockReturnValue({
       data: {
-        workflow_copilot_code_block_mode: true,
         code_block_access: true,
       },
     } as ReturnType<typeof useRuntimeConfig>);
   });
 
-  it.each(["WORKFLOW_COPILOT_CODE_BLOCK_MODE", "CODE_BLOCK_ACCESS"])(
-    "exposes the OSS runtime value for %s",
-    (flagName) => {
-      const { result } = renderHook(() => useFeatureFlag(flagName), {
-        wrapper,
-      });
+  it("exposes the OSS runtime value for CODE_BLOCK_ACCESS", () => {
+    const { result } = renderHook(() => useFeatureFlag("CODE_BLOCK_ACCESS"), {
+      wrapper,
+    });
 
-      expect(result.current).toBe(true);
-    },
-  );
+    expect(result.current).toBe(true);
+  });
 
   it("keeps code authoring unavailable when runtime execution access is disabled", () => {
     useRuntimeConfigMock.mockReturnValue({
       data: {
-        workflow_copilot_code_block_mode: true,
         code_block_access: false,
       },
     } as ReturnType<typeof useRuntimeConfig>);
 
-    const { result } = renderHook(
-      () => ({
-        codeMode: useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE"),
-        codeAccess: useFeatureFlag("CODE_BLOCK_ACCESS"),
-      }),
-      { wrapper },
-    );
+    const { result } = renderHook(() => useFeatureFlag("CODE_BLOCK_ACCESS"), {
+      wrapper,
+    });
 
-    expect(result.current).toEqual({ codeMode: true, codeAccess: false });
+    expect(result.current).toBe(false);
   });
 
   it("keeps workflow tagging on, since the OSS backend never gates it", () => {
@@ -82,10 +73,9 @@ describe("RuntimeFeatureFlagProvider", () => {
       data: undefined,
     } as ReturnType<typeof useRuntimeConfig>);
 
-    const { result } = renderHook(
-      () => useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE"),
-      { wrapper },
-    );
+    const { result } = renderHook(() => useFeatureFlag("CODE_BLOCK_ACCESS"), {
+      wrapper,
+    });
 
     expect(result.current).toBeUndefined();
   });

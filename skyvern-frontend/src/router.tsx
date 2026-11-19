@@ -4,6 +4,7 @@ import {
   DebugRoute,
   EditRoute,
   StudioRoute,
+  TriggersRoute,
   WorkflowRunRoute,
 } from "@/routes/workflows/StudioRouteGates";
 import { LegacyWorkflowsRedirect } from "@/routes/workflows/LegacyWorkflowsRedirect";
@@ -24,8 +25,6 @@ import { TaskParameters } from "./routes/tasks/detail/TaskParameters";
 import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
 import { TasksPage } from "./routes/tasks/list/TasksPage";
 import { WorkflowPage } from "./routes/workflows/WorkflowPage";
-import { WorkflowScriptDetailPage } from "./routes/workflows/WorkflowScriptDetailPage";
-import { WorkflowScriptsPage } from "./routes/workflows/WorkflowScriptsPage";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
 import { Workflows } from "./routes/workflows/Workflows";
 import { WorkflowsPageLayout } from "./routes/workflows/WorkflowsPageLayout";
@@ -269,6 +268,10 @@ const router = createBrowserRouter([
                 element: <StudioRoute />,
               },
               {
+                path: "triggers",
+                element: <TriggersRoute />,
+              },
+              {
                 path: "run",
                 element: <WorkflowRunParameters />,
               },
@@ -277,18 +280,9 @@ const router = createBrowserRouter([
                 element: <WorkflowPage />,
               },
               {
-                path: "scripts",
-                element: <Outlet />,
-                children: [
-                  {
-                    index: true,
-                    element: <WorkflowScriptsPage />,
-                  },
-                  {
-                    path: ":scriptId",
-                    element: <WorkflowScriptDetailPage />,
-                  },
-                ],
+                // Script pages were removed; old links land on the agent's runs.
+                path: "scripts/*",
+                element: <Navigate to="../runs" replace />,
               },
               {
                 path: ":workflowRunId/*",

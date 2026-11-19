@@ -14,12 +14,14 @@ import {
   createYamlCommitOwner,
   finishYamlCommit,
   invalidateYamlCommitOwner,
-  beginCopilotAcceptance,
-  finishCopilotAcceptance,
-  withCopilotAcceptance,
+  beginEmberAcceptance,
+  finishEmberAcceptance,
+  withEmberAcceptance,
   filterWorkflowChanges,
   getWorkflowLockMessage,
   isWorkflowMutation,
+  readStoredAccept,
+  storePendingAccept,
 } from "./WorkflowYamlEditorStore";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { toast } from "@/components/ui/use-toast";
@@ -30,7 +32,7 @@ import { useWorkflowParametersStore } from "./WorkflowParametersStore";
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
-describe("Copilot turn reservations", () => {
+describe("Ember turn reservations", () => {
   beforeEach(() => {
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
@@ -50,21 +52,21 @@ describe("Copilot turn reservations", () => {
     );
   });
 
-  test("leaves an unedited YAML view during a Copilot turn but keeps an edited one open", async () => {
+  test("leaves an unedited YAML view during an Ember turn but keeps an edited one open", async () => {
     const store = useWorkflowYamlEditorStore.getState();
     const commit = vi.fn().mockResolvedValue(true);
     store.registerCommit(commit);
     store.open("blocks: []");
-    const token = beginCopilotAcceptance()!;
+    const token = beginEmberAcceptance()!;
     vi.mocked(toast).mockClear();
     expect(await commitYamlDraft(false)).toBe(true);
     expect(useWorkflowYamlEditorStore.getState().active).toBe(false);
     expect(toast).not.toHaveBeenCalled();
-    finishCopilotAcceptance(token);
+    finishEmberAcceptance(token);
 
     store.open("blocks: []");
     store.setDraft("title: Edited\nblocks: []");
-    const edited = beginCopilotAcceptance()!;
+    const edited = beginEmberAcceptance()!;
     expect(await commitYamlDraft(false)).toBe(false);
     expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
       active: true,
@@ -75,7 +77,7 @@ describe("Copilot turn reservations", () => {
       variant: "destructive",
     });
     expect(commit).not.toHaveBeenCalled();
-    finishCopilotAcceptance(edited);
+    finishEmberAcceptance(edited);
   });
 
   test("keeps the YAML view open when the editor holds text the draft refused", async () => {
@@ -89,10 +91,10 @@ describe("Copilot turn reservations", () => {
     expect(commit).not.toHaveBeenCalled();
   });
 
-  test("refuses ordinary editor writes while a Copilot turn is reserved", () => {
+  test("refuses ordinary editor writes while an Ember turn is reserved", () => {
     const store = useWorkflowYamlEditorStore.getState();
     store.open("blocks: []");
-    const token = beginCopilotAcceptance()!;
+    const token = beginEmberAcceptance()!;
     const parameter = {
       key: "input",
       parameterType: "context" as const,
@@ -111,31 +113,31 @@ describe("Copilot turn reservations", () => {
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
     expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
       draft: "blocks: []",
-      copilotAcceptance: token,
+      emberAcceptance: token,
       commitInProgress: false,
     });
     expect(useWorkflowYamlEditorStore.getState().revision).toBe(store.revision);
     expect(refuseMutationDuringYamlCommit()).toBe(true);
-    finishCopilotAcceptance(token);
+    finishEmberAcceptance(token);
   });
 
-  test("defers YAML commits and Copilot reservations until authoring finishes", async () => {
+  test("defers YAML commits and Ember reservations until authoring finishes", async () => {
     const commit = vi.fn().mockResolvedValue(true);
     const owner = createYamlCommitOwner("wpid_1");
     useWorkflowYamlEditorStore.setState({ authoringInProgress: true, commit });
 
     expect(await commitYamlDraft(true)).toBe(false);
     expect(beginYamlCommit(owner)).toBe(false);
-    expect(beginCopilotAcceptance()).toBeNull();
+    expect(beginEmberAcceptance()).toBeNull();
     expect(commit).not.toHaveBeenCalled();
     useWorkflowHasChangesStore.getState().setHasChanges(true);
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
 
     useWorkflowYamlEditorStore.setState({ authoringInProgress: false });
     expect(await commitYamlDraft(true)).toBe(true);
-    const token = beginCopilotAcceptance();
+    const token = beginEmberAcceptance();
     expect(token).not.toBeNull();
-    finishCopilotAcceptance(token!);
+    finishEmberAcceptance(token!);
   });
 
   test("silently passes passive graph events, refuses mutations, and permits owner graph writes", () => {
@@ -171,7 +173,7 @@ describe("Copilot turn reservations", () => {
       },
       { type: "add", item: { id: "edge", source: "a", target: "b" } },
     ];
-    const token = beginCopilotAcceptance()!;
+    const token = beginEmberAcceptance()!;
     vi.mocked(toast).mockClear();
     expect(filterWorkflowChanges(passive)).toEqual(passive);
     expect(toast).not.toHaveBeenCalled();
@@ -180,7 +182,7 @@ describe("Copilot turn reservations", () => {
       title: "Wait for the Copilot change to finish",
       variant: "destructive",
     });
-    withCopilotAcceptance(token, () => {
+    withEmberAcceptance(token, () => {
       expect(filterWorkflowChanges(mutations)).toEqual(mutations);
       const parameters = useWorkflowParametersStore.getState();
       parameters.setParameters([
@@ -202,76 +204,105 @@ describe("Copilot turn reservations", () => {
       "Owned description",
     );
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
-    finishCopilotAcceptance(token);
+    finishEmberAcceptance(token);
     expect(filterWorkflowChanges(mutations)).toEqual(mutations);
   });
 
   test.each([
     ["yaml", "A YAML commit is in progress"],
     ["save", "A save is in progress"],
-    ["copilot", "Wait for the Copilot change to finish"],
+    ["ember", "Wait for the Copilot change to finish"],
   ] as const)("reports the %s lock kind", (lockKind, message) => {
     useWorkflowYamlEditorStore.setState({
       lockKind,
-      commitInProgress: lockKind !== "copilot",
-      copilotAcceptance: lockKind === "copilot" ? Symbol("turn") : null,
+      commitInProgress: lockKind !== "ember",
+      emberAcceptance: lockKind === "ember" ? Symbol("turn") : null,
     });
     expect(getWorkflowLockMessage()).toBe(message);
   });
 
-  test("allows the owning apply's nested writes and refuses unrelated or stale applies", () => {
-    const token = beginCopilotAcceptance()!;
-    const otherWriter = vi.fn();
-    expect(withCopilotAcceptance(undefined, otherWriter)).toBe(false);
-    expect(withCopilotAcceptance(Symbol("stale"), otherWriter)).toBe(false);
-    expect(otherWriter).not.toHaveBeenCalled();
-    expect(beginCopilotAcceptance()).toBeNull();
+  test("pending-accept markers read the Ember key first, fall back to the old key, write the Ember key, and clear both", () => {
+    sessionStorage.clear();
+    const marker = (chatId: string) =>
+      JSON.stringify({ chatId, acceptAttempt: null, alwaysAccept: false });
+    sessionStorage.setItem("copilot-pending-accept:wpid_1", marker("wcc_old"));
+    expect(readStoredAccept("wpid_1")?.chatId).toBe("wcc_old");
+    sessionStorage.setItem("ember-pending-accept:wpid_1", marker("wcc_new"));
+    expect(readStoredAccept("wpid_1")?.chatId).toBe("wcc_new");
+
+    storePendingAccept("wpid_2", {
+      chatId: "wcc_2",
+      acceptAttempt: null,
+      alwaysAccept: false,
+    });
     expect(
-      withCopilotAcceptance(token, () => {
+      sessionStorage.getItem("ember-pending-accept:wpid_2"),
+    ).not.toBeNull();
+    expect(sessionStorage.getItem("copilot-pending-accept:wpid_2")).toBeNull();
+
+    const token = beginEmberAcceptance()!;
+    useWorkflowYamlEditorStore.setState({
+      pendingAccepts: { wpid_1: { reservation: token, snapshot: {} as never } },
+    });
+    finishEmberAcceptance(token);
+    expect(sessionStorage.getItem("copilot-pending-accept:wpid_1")).toBeNull();
+    expect(sessionStorage.getItem("ember-pending-accept:wpid_1")).toBeNull();
+    sessionStorage.clear();
+  });
+
+  test("allows the owning apply's nested writes and refuses unrelated or stale applies", () => {
+    const token = beginEmberAcceptance()!;
+    const otherWriter = vi.fn();
+    expect(withEmberAcceptance(undefined, otherWriter)).toBe(false);
+    expect(withEmberAcceptance(Symbol("stale"), otherWriter)).toBe(false);
+    expect(otherWriter).not.toHaveBeenCalled();
+    expect(beginEmberAcceptance()).toBeNull();
+    expect(
+      withEmberAcceptance(token, () => {
         expect(refuseMutationDuringYamlCommit()).toBe(false);
         useWorkflowTitleStore.getState().setTitle("Owned edit");
       }),
     ).toBe(true);
     expect(useWorkflowTitleStore.getState().title).toBe("Owned edit");
-    finishCopilotAcceptance(Symbol("stale"));
-    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(token);
-    finishCopilotAcceptance(token);
-    expect(withCopilotAcceptance(token, otherWriter)).toBe(false);
-    const nextToken = beginCopilotAcceptance()!;
-    expect(withCopilotAcceptance(token, otherWriter)).toBe(false);
+    finishEmberAcceptance(Symbol("stale"));
+    expect(useWorkflowYamlEditorStore.getState().emberAcceptance).toBe(token);
+    finishEmberAcceptance(token);
+    expect(withEmberAcceptance(token, otherWriter)).toBe(false);
+    const nextToken = beginEmberAcceptance()!;
+    expect(withEmberAcceptance(token, otherWriter)).toBe(false);
     expect(otherWriter).not.toHaveBeenCalled();
-    finishCopilotAcceptance(nextToken);
-    expect(withCopilotAcceptance(undefined, otherWriter)).toBe(true);
+    finishEmberAcceptance(nextToken);
+    expect(withEmberAcceptance(undefined, otherWriter)).toBe(true);
     expect(otherWriter).toHaveBeenCalledTimes(1);
   });
 
   test("an apply exception restores the guard and retains the reservation", () => {
-    const token = beginCopilotAcceptance()!;
+    const token = beginEmberAcceptance()!;
     expect(() =>
-      withCopilotAcceptance(token, () => {
+      withEmberAcceptance(token, () => {
         throw new Error("apply failed");
       }),
     ).toThrow("apply failed");
-    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(token);
+    expect(useWorkflowYamlEditorStore.getState().emberAcceptance).toBe(token);
     expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
     const otherWriter = vi.fn();
-    expect(withCopilotAcceptance(undefined, otherWriter)).toBe(false);
+    expect(withEmberAcceptance(undefined, otherWriter)).toBe(false);
     expect(otherWriter).not.toHaveBeenCalled();
     useWorkflowTitleStore.getState().setTitle("Edit after apply failure");
     expect(useWorkflowTitleStore.getState().title).toBe("");
-    finishCopilotAcceptance(token);
+    finishEmberAcceptance(token);
   });
 
-  test("resetting the store removes the active Copilot write scope", () => {
-    const token = beginCopilotAcceptance()!;
-    withCopilotAcceptance(token, () => {
+  test("resetting the store removes the active Ember write scope", () => {
+    const token = beginEmberAcceptance()!;
+    withEmberAcceptance(token, () => {
       expect(isLockedByOther()).toBe(false);
       useWorkflowYamlEditorStore.setState(
         useWorkflowYamlEditorStore.getInitialState(),
       );
       useWorkflowYamlEditorStore.setState({
-        copilotAcceptance: token,
-        lockKind: "copilot",
+        emberAcceptance: token,
+        lockKind: "ember",
       });
       expect(isLockedByOther()).toBe(true);
       expect(refuseMutationDuringYamlCommit()).toBe(true);
@@ -621,28 +652,28 @@ describe("save ownership", () => {
     ["save", beginSaveTransaction],
     ["yaml", beginYamlCommit],
   ] as const)(
-    "excludes %s transactions and Copilot reservations, while allowing the owning restore",
+    "excludes %s transactions and Ember reservations, while allowing the owning restore",
     async (_kind, begin) => {
       const owner = createYamlCommitOwner("wpid_1");
       registerEditorOwner(owner);
-      const token = beginCopilotAcceptance()!;
+      const token = beginEmberAcceptance()!;
       expect(begin(owner)).toBe(false);
       const commit = vi.fn(async () => true);
       useWorkflowYamlEditorStore.getState().registerCommit(commit);
       expect(await commitYamlDraft(true)).toBe(false);
       expect(commit).not.toHaveBeenCalled();
       expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
-        copilotAcceptance: token,
+        emberAcceptance: token,
         commitInProgress: false,
       });
       expect(isLockedByOther(token)).toBe(false);
       expect(isLockedByOther()).toBe(true);
-      finishCopilotAcceptance(token);
+      finishEmberAcceptance(token);
       expect(begin(owner)).toBe(true);
-      expect(beginCopilotAcceptance()).toBeNull();
+      expect(beginEmberAcceptance()).toBeNull();
       expect(begin(owner)).toBe(false);
       expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
-        copilotAcceptance: null,
+        emberAcceptance: null,
         commitInProgress: true,
       });
       expect(isLockedByOther(token)).toBe(true);

@@ -99,7 +99,11 @@
       authorization?.ok !== true ||
       authorization.result?.authorized !== true
     ) {
-      return failure("authorization_lost");
+      return failure(
+        authorization?.result?.reason === "document_changed"
+          ? "document_changed"
+          : "authorization_lost",
+      );
     }
     if (message.url !== location.href || Date.now() >= message.expiresAt) {
       return failure("document_changed");
@@ -144,7 +148,11 @@
       commitAuthorization?.ok !== true ||
       commitAuthorization.result?.authorized !== true
     ) {
-      return failure("authorization_lost");
+      return failure(
+        commitAuthorization?.result?.reason === "document_changed"
+          ? "document_changed"
+          : "authorization_lost",
+      );
     }
     // No asynchronous work follows the final grant. Revalidate any state that
     // could have changed while awaiting it; revocation cannot undo a committed write.

@@ -9,8 +9,9 @@ from unittest.mock import MagicMock
 
 import pytest
 from agents.stream_events import RunItemStreamEvent
+from pydantic import TypeAdapter
 
-from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
+from skyvern.forge.sdk.copilot.agent import _build_narrative_payload, _live_turn_narrative
 from skyvern.forge.sdk.copilot.blocker_signal import clear_active_run_evidence_on_workflow_edit
 from skyvern.forge.sdk.copilot.code_write_diff import (
     PER_PATCH_CHAR_CAP,
@@ -20,9 +21,12 @@ from skyvern.forge.sdk.copilot.code_write_diff import (
 from skyvern.forge.sdk.copilot.context import (
     MAX_NARRATIVE_BLOCK_ATTEMPTS,
     CopilotContext,
+    LiveTurnNarrative,
     NarrativeBlockAttempt,
+    TurnNarrativePayload,
     upsert_narrative_block_attempt,
 )
+from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
 from skyvern.forge.sdk.copilot.narration import (
     MAX_BLOCK_ACTIVITY_ENTRIES,
     MAX_DESIGN_ACTIVITY_ENTRIES,
@@ -42,7 +46,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _stash_recorded_run_outcome,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
-from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
 from skyvern.services import workflow_service as workflow_service_module
 from tests.unit.copilot_test_helpers import (
     FakeCopilotStream,
@@ -300,6 +304,105 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
     assert blocks_by_label["step_2"]["activity"] == []
 
 
+def _activity_ids(payload: TurnNarrativePayload) -> list[str]:
+    return [entry["id"] for entry in payload["designActivity"]] + [
+        entry["id"] for block in payload["blocks"] for entry in block["activity"]
+    ]
+
+
+def test_live_narrative_is_the_final_payload_unsealed_and_without_diffs_or_test_inputs() -> None:
+    ctx = _ctx()
+    ctx.turn_id = "turn-1"
+    ctx.tool_browser_session_id = "pbs_1"
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id="wrb_1",
+        workflow_run_id="wr_1",
+        label="step_1",
+        block_type="task",
+        status="running",
+        iteration=1,
+        started_at=_TS.isoformat(),
+        ended_at=None,
+    )
+    state = NarratorState()
+    state.design_activity = [
+        build_tool_result_activity(
+            "update_workflow",
+            "Drafted step_1",
+            True,
+            0,
+            "c0",
+            timestamp=_TS,
+            code_diffs=[{"label": "step_1", "added": 3, "removed": 0, "patch": "+print(1)"}],
+        )
+    ]
+    state.block_activity = {
+        "wrb_1": [
+            build_tool_result_activity(
+                "run_blocks_and_collect_debug",
+                "ran step_1",
+                True,
+                1,
+                "c1",
+                timestamp=_TS,
+                workflow_run_id="wr_1",
+                test_inputs=[{"key": "email", "source": "placeholder"}],
+            )
+        ]
+    }
+    state.work_plan = {"toolCallId": "p1", "items": ["Open the admin page"]}
+    ctx.narrator_state = state
+
+    with pause_human_input(ctx, "credential"):
+        assert _live_turn_narrative(ctx)["pausedFor"] == "credential"
+    with pause_human_input(ctx, "question"):
+        with pause_human_input(ctx, "credential"):
+            assert _live_turn_narrative(ctx)["pausedFor"] == "credential"
+        live = _live_turn_narrative(ctx)
+    assert _live_turn_narrative(ctx)["pausedFor"] is None
+
+    assert TypeAdapter(LiveTurnNarrative).validate_json(json.dumps(live)) == live
+    assert live["terminal"] == "running"
+    assert live["designEnded"] is False
+    assert live["endedAt"] is None
+    assert ctx.turn_ended_at is None
+    assert live["pausedFor"] == "question"
+    assert live["browserSessionId"] == "pbs_1"
+    assert live["workPlan"] == state.work_plan
+    assert live["blocks"][0]["state"] == "running"
+    assert live["blocks"][0]["workflowRunId"] == "wr_1"
+    live_entries = live["designActivity"] + live["blocks"][0]["activity"]
+    assert live_entries and all("codeDiffs" not in entry and "testInputs" not in entry for entry in live_entries)
+    assert "codeDiffs" in state.design_activity[0]
+    assert "testInputs" in state.block_activity["wrb_1"][0]
+
+    final = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    assert _activity_ids(live) == _activity_ids(final)
+    assert list(final) == [
+        "turnId",
+        "turnIndex",
+        "designStarted",
+        "designEnded",
+        "draft",
+        "blocks",
+        "terminal",
+        "terminalMessage",
+        "narrativeSummary",
+        "priorBlockCount",
+        "designActivity",
+        "startedAt",
+        "endedAt",
+        "workPlan",
+        "testedBlockFingerprints",
+    ]
+    assert "codeDiffs" in final["designActivity"][0]
+    assert "testInputs" in final["blocks"][0]["activity"][0]
+    assert final["terminal"] == "response"
+    assert final["endedAt"] is not None
+
+
 def test_build_narrative_payload_marks_only_the_left_runs_blocks_unfinished() -> None:
     ctx = _ctx()
     for workflow_run_block_id, workflow_run_id in (("wrb_left", "wr_left"), ("wrb_cancelled", "wr_cancelled")):
@@ -472,6 +575,52 @@ def test_attempt_archive_keeps_only_the_most_recent_attempts() -> None:
     assert len(archive) == MAX_NARRATIVE_BLOCK_ATTEMPTS
     assert "wrb_iter_0" not in archive
     assert next(iter(archive)) == "wrb_iter_1"
+
+
+def test_saved_turn_nests_a_child_by_parent_id_without_saving_the_steps_calls() -> None:
+    ctx = _ctx()
+    step = WorkflowRunBlock(
+        workflow_run_block_id="wrb_step",
+        workflow_run_id="wr_full",
+        organization_id="org",
+        block_type="agent_step",
+        label="research",
+        status="completed",
+        created_at=_TS,
+        modified_at=_TS,
+        tool_calls=[
+            AgentStepToolCall(
+                index=0,
+                tool="browser_task",
+                status="completed",
+                started_at=_TS,
+                finished_at=_TS,
+                arguments='{"navigation_goal": "open the private dashboard"}',
+                child_workflow_run_block_id="wrb_child",
+            )
+        ],
+    )
+    child = WorkflowRunBlock(
+        workflow_run_block_id="wrb_child",
+        parent_workflow_run_block_id="wrb_step",
+        workflow_run_id="wr_full",
+        organization_id="org",
+        block_type="task_v2",
+        label="research_task_1",
+        status="completed",
+        created_at=_TS,
+        modified_at=_TS,
+    )
+
+    _reconcile_narrative_block_attempts(ctx, [step, child])
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    blocks = {block["workflowRunBlockId"]: block for block in payload["blocks"]}
+    assert blocks["wrb_child"].get("parentWorkflowRunBlockId") == "wrb_step"
+    assert "parentWorkflowRunBlockId" not in blocks["wrb_step"]
+    saved = json.dumps(payload)
+    for leaked in ("tool_calls", "toolCalls", "arguments", "agentStepCalls", "private dashboard"):
+        assert leaked not in saved
 
 
 def test_run_row_reconciliation_puts_both_ends_of_elapsed_on_the_database_clock() -> None:

@@ -15,7 +15,7 @@ import { useStudioRunId } from "./useStudioRunId";
  * mode (no run → no timeline), so it is purely additive over the node.
  *
  * Reports state only. Remediation ("Fix with Copilot", Retry) belongs to the
- * Run pane, which has the failure reason and the copilot bridge; this chip has
+ * Run pane, which has the failure reason and the Ember bridge; this chip has
  * neither and must not promise them.
  */
 export function BlockStatusBar({ blockLabel }: { blockLabel: string }) {

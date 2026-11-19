@@ -1,6 +1,6 @@
 from typing import Literal, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from skyvern.config import CodeBlockMode, settings
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
@@ -14,7 +14,10 @@ class RuntimeConfig(BaseModel):
     browser_streaming_mode: BrowserStreamingMode
     browser_streaming_label: str
     environment: str
-    workflow_copilot_code_block_mode: bool | None = None
+    workflow_copilot_code_block_mode: bool | None = Field(
+        default=None,
+        description="Deprecated: the value of EMBER_CODE_BLOCK_MODE, kept for OSS UI v1.0.53 to v1.0.57.",
+    )
     code_block_access: bool | None = None
     warnings: list[str] = []
 
@@ -41,9 +44,7 @@ async def get_runtime_config() -> RuntimeConfig:
         browser_streaming_mode=mode,
         browser_streaming_label=_browser_streaming_label(mode),
         environment=settings.ENV,
-        workflow_copilot_code_block_mode=(
-            settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE if expose_oss_code_config else None
-        ),
+        workflow_copilot_code_block_mode=settings.EMBER_CODE_BLOCK_MODE if expose_oss_code_config else None,
         code_block_access=(settings.CODE_BLOCK_MODE is CodeBlockMode.enabled if expose_oss_code_config else None),
         warnings=warnings,
     )

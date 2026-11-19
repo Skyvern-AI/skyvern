@@ -1,5 +1,7 @@
 import {
   ERROR_CODES,
+  PAGE_CHANGED_BEFORE_START_MESSAGE,
+  PAGE_CHANGED_WHILE_RUNNING_MESSAGE,
   ProtocolError,
   requireArgs,
   requireTabId,
@@ -29,7 +31,7 @@ export async function evaluateDom(tabScope, args) {
 
 const FORM_FILL_ERRORS = Object.freeze({
   document_changed:
-    "The selected document changed or the fill expired. Inspect the page before retrying.",
+    "The page's address or document changed, or the fill expired. Inspect the page before retrying.",
   authorization_lost:
     "The fixed fill is no longer authorized for this tab. Inspect its sharing state.",
   password_field:
@@ -51,7 +53,8 @@ const FORM_FILL_ERRORS = Object.freeze({
 const pendingFormFills = new Map();
 
 export async function authorizeDomFill(tabScope, message, sender) {
-  const denied = { authorized: false };
+  const denied = { authorized: false, reason: "authorization_lost" };
+  const documentChanged = { authorized: false, reason: "document_changed" };
   if (
     message === null ||
     typeof message !== "object" ||
@@ -71,13 +74,16 @@ export async function authorizeDomFill(tabScope, message, sender) {
     pending.authorized ||
     (message.phase === "commit") !== (pending.inspected === true) ||
     sender?.id !== chrome.runtime.id ||
-    sender.tab?.id !== pending.tabId ||
+    sender.tab?.id !== pending.tabId
+  )
+    return denied;
+  if (
     sender.frameId !== 0 ||
     typeof sender.documentId !== "string" ||
     sender.url !== pending.url ||
     message.documentToken !== pending.documentToken
   )
-    return denied;
+    return documentChanged;
   try {
     pending.lease.assertCurrent();
     const tab = await tabScope.assertControllableLocked(
@@ -91,15 +97,29 @@ export async function authorizeDomFill(tabScope, message, sender) {
     if (
       pendingFormFills.get(message.requestId) !== pending ||
       pending.authorized ||
-      (message.phase === "commit") !== (pending.inspected === true) ||
+      (message.phase === "commit") !== (pending.inspected === true)
+    )
+      return denied;
+    if (
       Date.now() >= pending.expiresAt ||
       (tab.pendingUrl || tab.url) !== pending.url
     )
-      return denied;
+      return documentChanged;
     if (message.phase === "inspect") pending.inspected = true;
     else pending.authorized = true;
     return { authorized: true };
-  } catch {
+  } catch (error) {
+    if (
+      error instanceof ProtocolError &&
+      (error.code === ERROR_CODES.RESTRICTED_URL ||
+        (error.code === ERROR_CODES.COMMAND_TIMEOUT &&
+          [
+            PAGE_CHANGED_BEFORE_START_MESSAGE,
+            PAGE_CHANGED_WHILE_RUNNING_MESSAGE,
+            FORM_FILL_ERRORS.document_changed,
+          ].includes(error.message)))
+    )
+      return documentChanged;
     return denied;
   }
 }

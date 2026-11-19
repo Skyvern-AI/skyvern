@@ -19,7 +19,6 @@ from skyvern.forge.sdk.copilot.agent import (
     _store_request_policy_on_context,
 )
 from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
-from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import (
     ApprovedCredential,
@@ -50,6 +49,7 @@ from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error
 from skyvern.forge.sdk.integrations.connected_accounts import IncompleteConnectionRead, OrgConnection
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
 from tests.unit.copilot_test_helpers import make_copilot_ctx, redact_mid_turn, resolve_exact_credential_data
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.scoped_time import ScopedTime
@@ -586,7 +586,9 @@ async def test_org_visible_connection_id_citation_is_exonerated(
 ) -> None:
     rows = [OrgConnection(connection_id, "google", "Account", None, "active", ())]
     lookup = (
-        AsyncMock(side_effect=IncompleteConnectionRead(rows)) if other_provider_failed else AsyncMock(return_value=rows)
+        AsyncMock(side_effect=IncompleteConnectionRead(rows, frozenset({"microsoft"})))
+        if other_provider_failed
+        else AsyncMock(return_value=rows)
     )
     with patch("skyvern.forge.sdk.integrations.connected_accounts.org_connections", new=lookup):
         policy, _ = await _build(
@@ -759,7 +761,7 @@ async def test_safety_timeout_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
         await asyncio.sleep(1)
         return {}
 
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 0.001)
     policy = await build_request_policy_trust_floor(
         user_message="Hello",
         workflow_yaml="",
@@ -1198,7 +1200,7 @@ async def _trust_floor(message: str, handler: _SafetyLeg) -> RequestPolicy:
 async def test_hung_primary_is_answered_by_the_fallback_inside_the_screen_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
     primary = _SafetyLeg("PRIMARY", hang=True)
     fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT, delay=0.05)
     builds = _route_with_fallback(monkeypatch, fallback)
@@ -1209,7 +1211,7 @@ async def test_hung_primary_is_answered_by_the_fallback_inside_the_screen_timeou
     assert screen.canonical_user_message == _CLEAN_MESSAGE
     assert (screen.answered_by, screen.hedged) == ("fallback", True)
     assert builds == ["FALLBACK"]
-    assert fallback.started_at[0] - primary.started_at[0] >= settings.COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS
+    assert fallback.started_at[0] - primary.started_at[0] >= settings.EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS
     assert screen.latency_ms < 4000
     assert primary.cancelled is True
 
@@ -1243,7 +1245,7 @@ async def test_failed_primary_starts_the_fallback_without_waiting_for_the_hedge_
 
 @pytest.mark.asyncio
 async def test_fallback_citation_redacts_the_cited_secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
     primary = _SafetyLeg("PRIMARY", hang=True)
     fallback = _SafetyLeg("FALLBACK", {"version": "1", "state": "detected", "citations": ["Hunter2Portal!"]})
     _route_with_fallback(monkeypatch, fallback)
@@ -1256,7 +1258,7 @@ async def test_fallback_citation_redacts_the_cited_secret(monkeypatch: pytest.Mo
 
 @pytest.mark.asyncio
 async def test_invalid_fallback_verdict_is_final_and_withholds_the_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
     primary = _SafetyLeg("PRIMARY", _CLEAN_VERDICT, delay=0.5)
     fallback = _SafetyLeg("FALLBACK", {"version": "1", "state": "detected", "citations": ["not-in-turn-8391!"]})
     _route_with_fallback(monkeypatch, fallback)
@@ -1278,7 +1280,7 @@ async def test_invalid_fallback_verdict_is_final_and_withholds_the_turn(monkeypa
 async def test_primary_verdict_wins_a_same_tick_finish(
     monkeypatch: pytest.MonkeyPatch, fallback_response: object
 ) -> None:
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.0)
     primary = _SafetyLeg("PRIMARY", _CLEAN_VERDICT)
     fallback = (
         _SafetyLeg("FALLBACK", error=RuntimeError)
@@ -1295,8 +1297,8 @@ async def test_primary_verdict_wins_a_same_tick_finish(
 
 @pytest.mark.asyncio
 async def test_both_hung_legs_withhold_the_turn_at_the_screen_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 1.0)
     primary = _SafetyLeg("PRIMARY", hang=True)
     fallback = _SafetyLeg("FALLBACK", hang=True)
     _route_with_fallback(monkeypatch, fallback)
@@ -1337,9 +1339,9 @@ async def test_both_hung_legs_withhold_the_turn_at_the_screen_timeout(monkeypatc
 async def test_screen_without_a_usable_fallback_makes_one_call(
     monkeypatch: pytest.MonkeyPatch, route: str, primary_hangs: bool
 ) -> None:
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED", route != "hedge_disabled")
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.05)
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_HEDGE_ENABLED", route != "hedge_disabled")
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.05)
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 0.2)
     llm_key = {"no_fallback_key": "SOLO", "self_fallback": "SELF"}.get(route, "PRIMARY")
     primary = _SafetyLeg(llm_key, hang=primary_hangs, error=RuntimeError)
     fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT)
@@ -1370,7 +1372,7 @@ async def test_screen_without_a_usable_fallback_makes_one_call(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("variant", ["bound_method_handler", "acting_model_eval_override"])
 async def test_hung_primary_still_hedges(monkeypatch: pytest.MonkeyPatch, variant: str) -> None:
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
     primary = _SafetyLeg("PRIMARY", hang=True)
     fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT)
     _route_with_fallback(monkeypatch, fallback)
@@ -1390,7 +1392,7 @@ async def test_hung_primary_still_hedges(monkeypatch: pytest.MonkeyPatch, varian
 
 @pytest.mark.asyncio
 async def test_cancelling_the_screen_cancels_both_legs(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
     primary = _SafetyLeg("PRIMARY", hang=True)
     fallback = _SafetyLeg("FALLBACK", hang=True)
     _route_with_fallback(monkeypatch, fallback)

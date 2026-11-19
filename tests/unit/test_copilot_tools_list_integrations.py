@@ -850,6 +850,44 @@ async def test_request_connection_offers_no_card_for_an_entry_that_is_not_live(o
     assert ctx.connection_cards == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("integration_id", "kind", "url"),
+    [
+        ("twilio", "credential_form", None),
+        ("mcp", "internal", None),
+        ("example_external", "external", "https://external.example.test/skyvern"),
+    ],
+)
+async def test_request_connection_links_only_a_setup_page_this_deployment_renders(
+    org: _OrgState, monkeypatch: pytest.MonkeyPatch, integration_id: str, kind: str, url: str | None
+) -> None:
+    external = catalog.IntegrationEntry(
+        id="example_external",
+        name="Example External",
+        category="Automation",
+        description="An external integration.",
+        status="live",
+        kind="external",
+        logo="robot",
+        learn_more_url="https://external.example.test/skyvern",
+        position=99,
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_cloud_integration_entries", lambda: [external])
+    monkeypatch.setattr(copilot_integrations.settings, "SKYVERN_APP_URL", "https://app.example.test/")
+    monkeypatch.setattr(SettingsManager.get_settings(), "TWILIO_SMS_2FA_ENABLED", True)
+    ctx = make_copilot_ctx(organization_id=ORGANIZATION_ID)
+
+    result = await _request_connection(integration_id, None, ctx)
+
+    if url is None:
+        assert result["data"] == {"status": "not_offered", "integration_status": "live", "kind": kind}
+    else:
+        assert result["data"]["status"] == "setup_page"
+        assert result["data"]["url"] == url
+    assert ctx.connection_cards == []
+
+
 @pytest.mark.parametrize("supports_connection_card", [False, True])
 def test_request_connection_is_offered_only_to_a_client_that_renders_the_card(supports_connection_card: bool) -> None:
     names = {

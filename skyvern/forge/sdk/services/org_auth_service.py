@@ -520,6 +520,40 @@ async def get_current_user_id(
     )
 
 
+async def get_debug_session_owner_id(
+    current_org: Annotated[Organization, Depends(get_current_org)],
+    authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_api_key: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_fern_language: Annotated[str | None, Header(include_in_schema=False)] = None,
+) -> str:
+    """The user a debug session belongs to. Unlike get_current_user_id, organization and member API keys qualify
+    without the UI user agent; a scoped key without a verified bearer never does, whatever its user agent."""
+    principal = get_request_principal()
+    if principal is not None and principal.auth_kind == AuthKind.scoped_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Scoped API keys cannot open a debug session; use an organization or member API key.",
+        )
+    if authorization and app.authenticate_user_function:
+        return await authenticate_user_helper(authorization)
+    if principal is not None and principal.organization_id == current_org.organization_id:
+        if principal.auth_kind == AuthKind.member_api_key:
+            member_user_id = human_user_id(principal, current_org.organization_id)
+            if member_user_id:
+                return member_user_id
+        elif principal.auth_kind == AuthKind.api_key:
+            return synthetic_user_id(current_org.organization_id)
+    return await get_current_user_id(
+        authorization=authorization,
+        x_api_key=x_api_key,
+        x_user_agent=x_user_agent,
+        user_agent=user_agent,
+        x_fern_language=x_fern_language,
+    )
+
+
 async def get_current_user_id_or_none(
     authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
     x_api_key: Annotated[str | None, Header(include_in_schema=False)] = None,

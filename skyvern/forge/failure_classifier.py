@@ -609,6 +609,74 @@ def classify_from_failure_reason(
     return categories
 
 
+# (keywords, case-sensitive, category, confidence, evidence_source), in the order classify_from_failure_reason appends
+# entries when the failure reason is a fixed message naming the exception, so both give the same list.
+_EXCEPTION_NAME_RULES: tuple[tuple[tuple[str, ...], bool, FailureCategory, float, str], ...] = (
+    (("captcha", "cloudflare", "turnstile"), False, FailureCategory.ANTI_BOT_DETECTION, 0.7, "keyword_only"),
+    (("NoProxy", "ProxyError", "GetOutboundIP"), True, FailureCategory.PROXY_ERROR, 0.9, "exception_type"),
+    (("Browser", "CDP", "TargetClosed"), True, FailureCategory.BROWSER_ERROR, 0.9, "exception_type"),
+    (("FailedToNavigateToUrl",), True, FailureCategory.NAVIGATION_FAILURE, 0.9, "exception_type"),
+    (("404",), False, FailureCategory.NAVIGATION_FAILURE, 0.9, "keyword_match"),
+    (("Timeout",), True, FailureCategory.PAGE_LOAD_TIMEOUT, 0.8, "exception_type"),
+    (("timeout",), False, FailureCategory.PAGE_LOAD_TIMEOUT, 0.8, "keyword_match"),
+    (("password", "mfa"), False, FailureCategory.AUTH_FAILURE, 0.7, "keyword_match"),
+    (("Bitwarden",), True, FailureCategory.CREDENTIAL_ERROR, 0.8, "exception_type"),
+    (("LLM", "APIError", "RateLimit"), True, FailureCategory.LLM_ERROR, 0.9, "exception_type"),
+    (("Scraping",), True, FailureCategory.DATA_EXTRACTION_FAILURE, 0.7, "exception_type"),
+    (("scraping",), False, FailureCategory.DATA_EXTRACTION_FAILURE, 0.7, "keyword_match"),
+    (("ElementNotFound",), True, FailureCategory.ELEMENT_NOT_FOUND, 0.8, "exception_type"),
+    (("hallucin",), False, FailureCategory.LLM_REASONING_ERROR, 0.6, "keyword_match"),
+)
+
+
+_KEYWORD_REASONING = {
+    FailureCategory.ANTI_BOT_DETECTION: "Keywords matched in failure reason",
+    FailureCategory.PAGE_LOAD_TIMEOUT: "Timeout in failure reason",
+}
+
+
+def failure_category_for_exception_name(exception_name: str) -> list[dict]:
+    """Categories for a failure known only by its exception class name or typed cause code, read from the name alone.
+
+    For finalizers whose failure reason is a fixed message about that cause, such as an activity failure that
+    crossed the Temporal boundary or a run whose worker restarted."""
+    entries: list[dict] = []
+    seen: set[FailureCategory] = set()
+    for keywords, case_sensitive, category, confidence, evidence_source in _EXCEPTION_NAME_RULES:
+        name = exception_name if case_sensitive else exception_name.lower()
+        # One entry per category, and a proxy name is not also a browser failure.
+        if category in seen or (category is FailureCategory.BROWSER_ERROR and FailureCategory.PROXY_ERROR in seen):
+            continue
+        if any(kw in name for kw in keywords):
+            seen.add(category)
+            entries.append(
+                {
+                    "category": category.value,
+                    "confidence_float": confidence,
+                    "reasoning": f"Exception: {exception_name}"
+                    if evidence_source == "exception_type"
+                    else _KEYWORD_REASONING.get(category, "Keywords matched"),
+                    "evidence_source": evidence_source,
+                }
+            )
+    if exception_name == WORKER_CONTAINER_RESTARTED_REASON_CODE:
+        entries.append(
+            {
+                "category": FailureCategory.INFRASTRUCTURE_ERROR.value,
+                "confidence_float": 0.95,
+                "reason_code": WORKER_CONTAINER_RESTARTED_REASON_CODE,
+                "reasoning": "Worker container restarted mid-run",
+                "evidence_source": "reason_code",
+            }
+        )
+    if not entries:
+        return [
+            {"category": FailureCategory.UNKNOWN.value, "confidence_float": 0.5, "reasoning": "No keyword match found"}
+        ]
+    entries.sort(key=lambda entry: entry["confidence_float"], reverse=True)
+    return entries
+
+
 # ── Infra-failure attribution (SKY-16588) ─────────────────────────────────────
 # Derives one bounded internal attribution document from the typed failure_category
 # above; introduces no second classifier. Persisted to workflow_runs.failure_attribution
@@ -688,6 +756,9 @@ SIGN_IN_FORM_VISIBLE_REASON_CODE = "sign_in_form_visible"
 SAVED_PROFILE_SIGNED_OUT_REASON_CODE = "saved_profile_signed_out"
 # Marks a primary entry written by the model-based failure classifier, so a reader can tell it from a rule's.
 FAILURE_CLASSIFIER_V2_REASON_CODE = "failure_classifier_v2"
+# Marks a classifier's label for one failure text; the run-level label replaces it, and run-level readers skip it.
+FAILURE_CLASSIFIER_TEXT_REASON_CODE = "failure_classifier_text"
+CLASSIFIER_LABEL_REASON_CODES = frozenset({FAILURE_CLASSIFIER_V2_REASON_CODE, FAILURE_CLASSIFIER_TEXT_REASON_CODE})
 # The user-defined errors a task v2 root's own failure summary matched, carried for the run's errors[] output.
 TASK_V2_ROOT_USER_ERRORS_REASON_CODE = "task_v2_root_user_errors"
 _MAX_ROOT_USER_ERRORS = 10
@@ -711,6 +782,7 @@ OUTPUT_ONLY_LABEL_REASON_CODES = frozenset(
         # The model classifier's label is for the run page and API; runtime readers keep following the rule
         # classifier's entries (ADR 0028).
         FAILURE_CLASSIFIER_V2_REASON_CODE,
+        FAILURE_CLASSIFIER_TEXT_REASON_CODE,
     }
 )
 
@@ -760,12 +832,13 @@ def with_diagnostic_entry(categories: list | None, entry: dict[str, Any]) -> lis
 
 def with_root_user_errors(categories: list[dict] | None, user_errors: list[dict[str, Any]]) -> list[dict] | None:
     """``categories`` with the root's matched user errors appended after every entry. The entry repeats the primary's
-    category, so readers of the category set (credential fallback) see the same run."""
-    if not categories or not user_errors:
+    category, skipping a model label entry, so readers of the category set (credential fallback) see the same run."""
+    primary = next((c for c in categories or [] if c.get("reason_code") not in CLASSIFIER_LABEL_REASON_CODES), None)
+    if not categories or primary is None or not user_errors:
         return categories
     entry = {
-        "category": categories[0].get("category"),
-        "confidence_float": categories[0].get("confidence_float"),
+        "category": primary.get("category"),
+        "confidence_float": primary.get("confidence_float"),
         "reason_code": TASK_V2_ROOT_USER_ERRORS_REASON_CODE,
         "reasoning": "User-defined errors the run's failure summary matched",
         "user_errors": user_errors[:_MAX_ROOT_USER_ERRORS],
@@ -775,14 +848,13 @@ def with_root_user_errors(categories: list[dict] | None, user_errors: list[dict[
 
 def has_classifier_primary(categories: object) -> bool:
     """Whether ``categories[0]`` is a classifier entry; an output-only label there is not a primary to follow, except
-    the model classifier's, which is the run's primary label."""
+    a classifier label, which is the run's primary label."""
     return (
         isinstance(categories, list)
         and bool(categories)
         and isinstance(categories[0], dict)
         and (
-            not is_output_only_entry(categories[0])
-            or categories[0].get("reason_code") == FAILURE_CLASSIFIER_V2_REASON_CODE
+            not is_output_only_entry(categories[0]) or categories[0].get("reason_code") in CLASSIFIER_LABEL_REASON_CODES
         )
     )
 
@@ -1064,7 +1136,18 @@ def derive_failure_attribution(failure_category: list[dict] | None) -> dict[str,
         # A historical/producer value may be a non-list (object or scalar); indexing it would
         # raise inside the terminal status transaction. Only a non-empty list is subscripted;
         # anything else abstains safely.
-        primary = failure_category[0] if isinstance(failure_category, list) and failure_category else None
+        primary = (
+            next(
+                (
+                    c
+                    for c in failure_category
+                    if not (isinstance(c, dict) and c.get("reason_code") == FAILURE_CLASSIFIER_TEXT_REASON_CODE)
+                ),
+                None,
+            )
+            if isinstance(failure_category, list)
+            else None
+        )
         if not isinstance(primary, dict):
             primary = None
         document: dict[str, Any] = {

@@ -110,6 +110,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "google_sheets_write": "Write rows to a Google Sheet (append new rows or update existing cells)",
     "powerbi_query": "Run one read-only DAX query against a user's authorized Power BI dataset",
     "agent_step": AGENT_STEP_BLOCK_SUMMARY,
+    "integration_action": "Run one integration catalog action (e.g. Google Sheets read rows) as a connected account",
 }
 
 # ---------------------------------------------------------------------------
@@ -336,6 +337,11 @@ _KB_PATH = Path(__file__).resolve().parents[2] / "forge" / "prompts" / "skyvern"
 
 _HEADER_RE = re.compile(r"^\*\*\s+(.+?)\s+\((\w+)\)\s+\*\*$")
 
+# Retired topic ids that still resolve, so a client or prompt that names one keeps working.
+WORKFLOW_KNOWLEDGE_TOPIC_ALIASES = {
+    "task_block_task_not_available_in_workflow_copilot": "task_block_task_not_available_in_ember",
+}
+
 WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
     "workflow_structure_overview": "** WORKFLOW STRUCTURE OVERVIEW **",
     "workflow_parameters": "** WORKFLOW PARAMETERS **",
@@ -344,9 +350,7 @@ WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
     "navigation_block": "** NAVIGATION BLOCK (navigation) **",
     "url_block": "** URL BLOCK (goto_url) **",
     "action_block": "** ACTION BLOCK (action) **",
-    "task_block_task_not_available_in_workflow_copilot": (
-        "** TASK BLOCK (task) — NOT AVAILABLE IN WORKFLOW COPILOT **"
-    ),
+    "task_block_task_not_available_in_ember": "** TASK BLOCK (task) — NOT AVAILABLE IN WORKFLOW COPILOT **",
     "task_v2_block_task_v2_deprecated": "** TASK V2 BLOCK (task_v2) — DEPRECATED **",
     "for_loop_block": "** FOR LOOP BLOCK (for_loop) **",
     "while_loop_block": "** WHILE LOOP BLOCK (while_loop) **",
@@ -618,7 +622,7 @@ async def skyvern_workflow_knowledge(
         )
 
     requested = list(dict.fromkeys(topic.strip().lower() for topic in topics))
-    unknown = [topic for topic in requested if topic not in knowledge]
+    unknown = [topic for topic in requested if WORKFLOW_KNOWLEDGE_TOPIC_ALIASES.get(topic, topic) not in knowledge]
     if unknown:
         return make_result(
             action,
@@ -632,7 +636,9 @@ async def skyvern_workflow_knowledge(
 
     return make_result(
         action,
-        data={"sections": {topic: knowledge[topic] for topic in requested}},
+        data={
+            "sections": {topic: knowledge[WORKFLOW_KNOWLEDGE_TOPIC_ALIASES.get(topic, topic)] for topic in requested}
+        },
     )
 
 

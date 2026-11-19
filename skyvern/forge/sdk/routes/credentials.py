@@ -28,6 +28,12 @@ modifying existing ones, ensure that:
 Violating this invariant would allow any caller with a valid API key to
 exfiltrate stored passwords, card numbers, and secrets — which is the
 exact threat the vault architecture is designed to prevent.
+
+The invariant also covers the secrets an organization saves to connect its
+own vault. The Bitwarden and 1Password responses have no field for the secret.
+The Azure and custom credential service responses do, so each route that
+returns one must first pass it through ``_redact_azure_client_secret`` or
+``_redact_custom_credential_secret``; no type enforces that.
 """
 
 import asyncio
@@ -4032,7 +4038,7 @@ async def update_bitwarden_credential(
     "/credentials/azure_credential/get",
     response_model=AzureClientSecretCredentialResponse,
     summary="Get Azure Client Secret Credential",
-    description="Retrieves the current Azure Client Secret Credential for the organization.",
+    description="Retrieves the current Azure Client Secret Credential for the organization. The client_secret is always masked.",
     include_in_schema=False,
 )
 @base_router.get(
@@ -4058,9 +4064,7 @@ async def get_azure_client_secret_credential(
                 detail="No Azure Client Secret Credential found for this organization",
             )
 
-        if await _should_redact_org_credential_secrets(current_org.organization_id):
-            auth_token = _redact_azure_client_secret(auth_token)
-        return AzureClientSecretCredentialResponse(token=auth_token)
+        return AzureClientSecretCredentialResponse(token=_redact_azure_client_secret(auth_token))
 
     except HTTPException:
         raise
@@ -4102,8 +4106,6 @@ async def update_azure_client_secret_credential(
     """
     try:
         credential = request.credential
-        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
-        # A redacted form echoes the sentinel even if the caller's role changed since the read.
         if credential.client_secret == _REDACTED_ORG_CREDENTIAL_SECRET:
             existing = await app.DATABASE.organizations.get_valid_org_auth_token(
                 organization_id=current_org.organization_id,
@@ -4143,9 +4145,7 @@ async def update_azure_client_secret_credential(
             OrganizationAuthTokenType.azure_client_secret_credential.value,
         )
 
-        if redact_secrets:
-            auth_token = _redact_azure_client_secret(auth_token)
-        return AzureClientSecretCredentialResponse(token=auth_token)
+        return AzureClientSecretCredentialResponse(token=_redact_azure_client_secret(auth_token))
 
     except HTTPException:
         raise
@@ -4186,7 +4186,7 @@ async def get_custom_credential_service_status(
     "/credentials/custom_credential/get",
     response_model=CustomCredentialServiceConfigResponse,
     summary="Get Custom Credential Service Configuration",
-    description="Retrieves the current custom credential service configuration for the organization.",
+    description="Retrieves the current custom credential service configuration for the organization. The api_token is always masked.",
     include_in_schema=False,
 )
 @base_router.get(
@@ -4212,10 +4212,7 @@ async def get_custom_credential_service_config(
                 detail="No custom credential service configuration found for this organization",
             )
 
-        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
-        if redact_secrets:
-            auth_token = _redact_custom_credential_secret(auth_token)
-        return CustomCredentialServiceConfigResponse(token=auth_token)
+        return CustomCredentialServiceConfigResponse(token=_redact_custom_credential_secret(auth_token))
 
     except HTTPException:
         raise
@@ -4256,7 +4253,6 @@ async def update_custom_credential_service_config(
     If a valid configuration already exists, it will be invalidated before creating the new one.
     """
     try:
-        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
         config = await _restore_redacted_custom_credential_secret(current_org.organization_id, request.config)
 
         # Invalidate any existing valid custom credential service configuration for this organization
@@ -4287,9 +4283,7 @@ async def update_custom_credential_service_config(
             OrganizationAuthTokenType.custom_credential_service.value,
         )
 
-        if redact_secrets:
-            auth_token = _redact_custom_credential_secret(auth_token)
-        return CustomCredentialServiceConfigResponse(token=auth_token)
+        return CustomCredentialServiceConfigResponse(token=_redact_custom_credential_secret(auth_token))
 
     except HTTPException:
         raise

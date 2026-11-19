@@ -6,7 +6,7 @@ import {
 } from "../../types/workflowTypes";
 import { blockTypeFromNode } from "../nodes/blockTypeFromNode";
 import { workflowBlockTitle } from "../nodes/types";
-import { humanizeBlockLabel } from "../../copilot/blockLabel";
+import { humanizeBlockLabel } from "../../ember/blockLabel";
 import { stripJinjaReferences } from "./docTextUtils";
 import { nodeLibraryItems } from "../panels/nodeLibraryItems";
 
@@ -55,6 +55,7 @@ const tagColors: Record<WorkflowBlockType, DocTagColor> = {
   email_inbox: "orange",
   google_sheets_read: "orange",
   google_sheets_write: "orange",
+  integration_action: "orange",
   file_download: "brown",
   download_to_s3: "brown",
   upload_to_s3: "brown",
@@ -85,6 +86,7 @@ const OUTPUT_BLOCK_TYPES = new Set<WorkflowBlockType>([
   "file_download",
   "download_to_s3",
   "workflow_trigger",
+  "integration_action",
 ]);
 
 /** Whether the step hands data to later steps; the others don't name an output. */
@@ -254,19 +256,28 @@ const requiredSettings: Record<string, Array<[string, string]>> = {
   workflowTrigger: [["workflowPermanentId", "Agent"]],
   wait: [["waitInSeconds", "Seconds"]],
   sendEmail: [["recipients", "Recipients"]],
+  agentStep: [["tools", "Tools"]],
 };
 
-export function getDocMissingSettings(node: Node): string[] {
+export function getDocMissingSettings(
+  node: Node,
+  skip: (key: string) => boolean = () => false,
+): string[] {
   return (requiredSettings[node.type ?? ""] ?? []).flatMap(([key, label]) =>
-    settingIsSet(node, key) ? [] : [label],
+    settingIsSet(node, key) || skip(key) ? [] : [label],
   );
 }
+
+/** The data keys a step of this type cannot run without. */
+export const docRequiredSettingKeys = (node: Node): string[] =>
+  (requiredSettings[node.type ?? ""] ?? []).map(([key]) => key);
 
 // A Wait needs a whole number of seconds of at least 1; "" or "0" would save as a wait that does nothing or is refused.
 function settingIsSet(node: Node, key: string): boolean {
   if (node.type === "wait")
     return /^\d+$/.test(text(node, key)) && Number(text(node, key)) >= 1;
-  return Boolean(text(node, key));
+  const value = node.data[key];
+  return Array.isArray(value) ? value.length > 0 : Boolean(text(node, key));
 }
 
 const text = (node: Node, key: string) =>
@@ -305,6 +316,10 @@ function fixedStepSummary(node: Node): string | null {
       return text(node, "prompt") || "Run Python code";
     case "fileParser":
       return "Read data from a file";
+    case "integrationAction":
+      return text(node, "actionId")
+        ? `Run ${text(node, "integrationId").replace(/_/g, " ")}: ${text(node, "actionId").replace(/_/g, " ")}`
+        : "Run an app action";
     case "pdfParser":
       return "Read data from a PDF";
     case "upload":

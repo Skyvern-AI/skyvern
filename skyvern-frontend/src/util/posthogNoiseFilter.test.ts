@@ -8,26 +8,27 @@ const baseEvent = {
 };
 
 describe("dropNoiseExceptions", () => {
-  it("drops ResizeObserver loop $exception events", () => {
+  it.each([
+    "ResizeObserver loop completed with undelivered notifications.",
+    "Non-Error promise rejection captured with value: Object Not Found Matching Id:5, MethodName:update, ParamCount:4",
+  ])("drops known noise $exception events: %s", (value) => {
     const result = dropNoiseExceptions({
       ...baseEvent,
       properties: {
-        $exception_list: [
-          {
-            value:
-              "ResizeObserver loop completed with undelivered notifications.",
-          },
-        ],
+        $exception_list: [{ value }],
       },
     });
     expect(result).toBeNull();
   });
 
-  it("keeps other $exception events", () => {
+  it.each([
+    "TypeError: foo",
+    "Non-Error promise rejection captured with value: Object Not Found Matching Id:5, MethodName:update, ParamCount:4 extra",
+  ])("keeps other $exception events: %s", (value) => {
     const event = {
       ...baseEvent,
       properties: {
-        $exception_list: [{ value: "TypeError: foo" }],
+        $exception_list: [{ value }],
       },
     };
     expect(dropNoiseExceptions(event)).toBe(event);

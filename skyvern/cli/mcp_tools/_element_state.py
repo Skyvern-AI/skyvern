@@ -4,8 +4,8 @@ import asyncio
 import os
 from typing import TYPE_CHECKING, Any, Literal
 
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 
 from ._common import ErrorCode, make_error
 

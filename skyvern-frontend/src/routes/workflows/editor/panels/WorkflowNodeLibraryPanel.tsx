@@ -1,13 +1,16 @@
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useState, useRef, useEffect } from "react";
-import { PlusIcon, MagnifyingGlassIcon } from "@radix-ui/react-icons";
+import { MagnifyingGlassIcon, PlusIcon } from "@radix-ui/react-icons";
 import { AddNodeProps } from "../Workspace";
 import { Input } from "@/components/ui/input";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { AGENT_BLOCK_FLAG } from "@/util/featureFlags";
 import { availableNodeLibraryItems } from "./nodeLibraryItems";
 import { useIntegrationCatalogQuery } from "@/hooks/useIntegrationCatalogQuery";
+import type { IntegrationCatalogEntryWithActions } from "../nodes/IntegrationActionNode/types";
+import { appRows, matchingAppActions } from "./appLibrary";
+import { LibraryApps } from "./LibraryApps";
 
 type Props = {
   onNodeClick: (props: AddNodeProps) => void;
@@ -24,7 +27,8 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
     (state) => state.closeWorkflowPanel,
   );
   const enableAgentBlock = useFeatureFlag(AGENT_BLOCK_FLAG) === true;
-  const { data: integrationCatalog } = useIntegrationCatalogQuery();
+  const { data: integrationCatalog } =
+    useIntegrationCatalogQuery<IntegrationCatalogEntryWithActions>();
   const [search, setSearch] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -79,6 +83,31 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
     );
   });
 
+  const apps = appRows(integrationCatalog, () => false);
+  const hasApps = apps.length > 0;
+  const appSearch = search.trim();
+  const actionMatches = matchingAppActions(apps, appSearch);
+
+  const addNode = (
+    nodeType: AddNodeProps["nodeType"],
+    integrationAction?: AddNodeProps["integrationAction"],
+  ) => {
+    onNodeClick({
+      nodeType,
+      integrationAction,
+      label: integrationAction
+        ? `${integrationAction.integrationId}_${integrationAction.actionId}`
+        : undefined,
+      next: workflowPanelData?.next ?? null,
+      parent: workflowPanelData?.parent,
+      previous: workflowPanelData?.previous ?? null,
+      connectingEdgeType:
+        workflowPanelData?.connectingEdgeType ?? "edgeWithAddButton",
+      branch: workflowPanelData?.branchContext,
+    });
+    closeWorkflowPanel();
+  };
+
   return (
     <div className="flex h-full min-h-0 w-full min-w-0 flex-col gap-4">
       <div className="relative">
@@ -103,25 +132,22 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
         clipped editor shell. */}
         <ScrollAreaViewport className="h-full w-full [&>div]:!block [&>div]:!overflow-x-hidden">
           <div className="space-y-2">
-            {filteredItems.length > 0 ? (
+            {appSearch && hasApps ? (
+              <LibraryApps
+                catalog={integrationCatalog ?? []}
+                search={appSearch}
+                onAdd={(integrationAction) =>
+                  addNode("integrationAction", integrationAction)
+                }
+              />
+            ) : null}
+            {filteredItems.length > 0 || actionMatches.length > 0 ? (
               filteredItems.map((item) => (
                 <div
                   key={item.nodeType}
                   data-testid={`block-library-item-${item.nodeType}`}
                   className="flex min-w-0 cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
-                  onClick={() => {
-                    onNodeClick({
-                      nodeType: item.nodeType,
-                      next: workflowPanelData?.next ?? null,
-                      parent: workflowPanelData?.parent,
-                      previous: workflowPanelData?.previous ?? null,
-                      connectingEdgeType:
-                        workflowPanelData?.connectingEdgeType ??
-                        "edgeWithAddButton",
-                      branch: workflowPanelData?.branchContext,
-                    });
-                    closeWorkflowPanel();
-                  }}
+                  onClick={() => addNode(item.nodeType)}
                 >
                   <div className="flex min-w-0 gap-2">
                     <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-border dark:border-slate-600">
@@ -144,6 +170,15 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
                 No results found
               </div>
             )}
+            {!appSearch && hasApps ? (
+              <LibraryApps
+                catalog={integrationCatalog ?? []}
+                search=""
+                onAdd={(integrationAction) =>
+                  addNode("integrationAction", integrationAction)
+                }
+              />
+            ) : null}
           </div>
         </ScrollAreaViewport>
       </ScrollArea>

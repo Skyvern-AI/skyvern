@@ -37,8 +37,6 @@ from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MC
 from skyvern.forge.sdk.copilot.result_evidence import EVALUATE_TOOL_NAME
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    REDACTED_SECRET_PLACEHOLDER,
-    clear_session_scrub_values,
     register_secret_scrub_value,
     register_secret_scrub_values_from_structure,
 )
@@ -73,6 +71,7 @@ from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.forge.sdk.workflow.web_search_client import SearchProvider, SearchResponse, SearchResult
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER, clear_session_scrub_values
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from skyvern.webeye.utils import challenge_signature as challenge_signature_module
 from tests.unit._mcp_browser_fakes import crash_free_browser_state
@@ -2483,7 +2482,7 @@ class TestScoutedInteractionCapture:
         """Report as though the click returned longer ago than the settle window, so nothing waits."""
         monkeypatch.setattr(mcp_hooks, "_start_scout_challenge_settle", lambda _ctx: None)
         ctx.pending_scout_challenge_armed_at = (
-            time.monotonic() - settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 1.0
+            time.monotonic() - settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 1.0
         )
 
     @pytest.mark.asyncio
@@ -2501,7 +2500,7 @@ class TestScoutedInteractionCapture:
 
         result = await self._post(ctx)
 
-        assert sleeps == [pytest.approx(settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
         assert result["data"]["observed_effects"]["challenge_raised"] is True
         assert result["data"]["challenge_vendor"] == "turnstile"
 
@@ -2667,7 +2666,7 @@ class TestScoutedInteractionCapture:
 
         await self._post(ctx)
 
-        assert sleeps == [pytest.approx(settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
 
     @pytest.mark.asyncio
     async def test_a_widget_mounted_while_the_click_is_being_armed_is_credited_when_revealed(
@@ -2743,7 +2742,7 @@ class TestScoutedInteractionCapture:
 
         result = await self._post(ctx)
 
-        assert sleeps == [pytest.approx(settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
         assert result["data"]["challenge_vendor"] == "turnstile"
 
     async def _navigate(

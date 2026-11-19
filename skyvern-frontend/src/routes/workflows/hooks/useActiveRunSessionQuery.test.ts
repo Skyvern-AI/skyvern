@@ -19,7 +19,7 @@ function forbiddenError(status = 403): AxiosError {
 }
 
 describe("getActiveRunSessionRefetchInterval", () => {
-  test("polls while the local Copilot turn is active", () => {
+  test("polls while the local Ember turn is active", () => {
     expect(
       getActiveRunSessionRefetchInterval(
         { data: { active_run_session_id: null } },

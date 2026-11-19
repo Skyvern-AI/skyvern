@@ -18,6 +18,7 @@ from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, handler_llm_key
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.router_fallback import router_fallback_llm_key
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
 from skyvern.forge.sdk.copilot.config import CopilotConfig
@@ -40,7 +41,6 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
 from skyvern.forge.sdk.copilot.credential_resolution import url_parts as _url_parts
 from skyvern.forge.sdk.copilot.eval_llm_overrides import current_eval_llm_overrides
 from skyvern.forge.sdk.copilot.llm_config import WORKFLOW_COPILOT_RAW_SECRET_SAFETY_PROMPT_TYPE
-from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
     RequestSlotContractV1,
@@ -48,13 +48,6 @@ from skyvern.forge.sdk.copilot.request_slots import (
     request_slot_request_digest,
     request_slot_source_text,
     request_slot_sources,
-)
-from skyvern.forge.sdk.copilot.router_fallback import router_fallback_llm_key
-from skyvern.forge.sdk.copilot.secret_redaction import (
-    RAW_SECRET_PATTERNS,
-    contains_email_password_pair,
-    raw_secret_spans_for_prompt,
-    redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.vault_logins import vault_login_credential, vault_login_ref
@@ -79,7 +72,14 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
 from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
+from skyvern.forge.sdk.workflow.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
 from skyvern.schemas.google_sheets import extract_spreadsheet_id
+from skyvern.utils.raw_secret_redaction import (
+    RAW_SECRET_PATTERNS,
+    contains_email_password_pair,
+    raw_secret_spans_for_prompt,
+    redact_raw_secrets_for_prompt,
+)
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -434,7 +434,7 @@ def _raw_secret_safety_fallback_key(handler: LLMAPIHandler) -> str | None:
     llm_key = handler_llm_key(handler)
     overrides = current_eval_llm_overrides()
     if (
-        not settings.COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED
+        not settings.EMBER_RAW_SECRET_SAFETY_HEDGE_ENABLED
         or llm_key is None
         or (overrides is not None and handler is overrides.handlers.get(WORKFLOW_COPILOT_RAW_SECRET_SAFETY_PROMPT_TYPE))
     ):
@@ -453,8 +453,8 @@ class _RawSecretSafetyRace(NamedTuple):
 
 async def _race_raw_secret_safety(prompt: str, handler: LLMAPIHandler) -> _RawSecretSafetyRace:
     started_at = time.monotonic()
-    deadline = started_at + settings.COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS
-    hedge_at = started_at + settings.COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS
+    deadline = started_at + settings.EMBER_RAW_SECRET_SAFETY_TIMEOUT_SECONDS
+    hedge_at = started_at + settings.EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS
     fallback_key = _raw_secret_safety_fallback_key(handler)
 
     async def _ask(leg_handler: LLMAPIHandler) -> object:
@@ -1126,6 +1126,7 @@ class RequestPolicy:
     # substitute; the dispatch seam separately admits one this turn listed or the user named.
     selected_connected_account_id: str | None = None
     selected_connected_account_scopes: list[str] = field(default_factory=list)
+    selected_connected_account_provider: str | None = None
     # Test end to end derived the pick from the pending proposal, so it is recorded as reads-only whatever else
     # approves the account this turn: a saved binding stops approving once it is removed.
     selected_connected_account_from_pending_proposal: bool = False
@@ -5077,6 +5078,7 @@ async def _build_request_policy_bootstrap(
     connection_candidates = full_approvals | reads_only_approvals
     policy.selected_connected_account_id = None
     policy.selected_connected_account_scopes = []
+    policy.selected_connected_account_provider = None
     policy.selected_connected_account_from_pending_proposal = False
     if connection_candidates or selected_connected_account_id is not None:
         connections: list[OrgConnection] | None
@@ -5097,6 +5099,7 @@ async def _build_request_policy_bootstrap(
             if selected is not None:
                 policy.selected_connected_account_id = selected.id
                 policy.selected_connected_account_scopes = list(selected.scopes_granted)
+                policy.selected_connected_account_provider = selected.provider
                 policy.selected_connected_account_from_pending_proposal = (
                     selected_connected_account_from_pending_proposal
                 )

@@ -35,7 +35,6 @@ from skyvern.forge.antibot_evidence import run_prompt_evidence_str
 from skyvern.forge.failure_classifier import (
     HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
     bounded_failure_categories,
-    classify_from_failure_reason,
     with_root_user_errors,
 )
 from skyvern.forge.prompts import prompt_engine
@@ -403,7 +402,9 @@ async def _handle_task_v2_termination(
         output=output,
     )
 
-    resolved_failure_category = failure_category or classify_from_failure_reason(termination_reason)
+    resolved_failure_category = failure_category or app.AGENT_FUNCTION.classify_failure(
+        termination_reason, status=TaskV2Status.terminated
+    )
     LOG.info(
         "Task failure classified",
         task_v2_id=task_v2_id,
@@ -1701,8 +1702,8 @@ async def run_task_v2_helper(
                 f' "x-max-steps-override" header with your desired number'
                 f" of steps in the API request."
             )
-            failure_category = llm_failure_categories or classify_from_failure_reason(
-                full_failure_reason, fallback_to_unknown=True
+            failure_category = llm_failure_categories or app.AGENT_FUNCTION.classify_failure(
+                full_failure_reason, fallback_to_unknown=True, status=TaskV2Status.failed
             )
             LOG.info(
                 "Task failure classified",
@@ -1734,8 +1735,8 @@ async def run_task_v2_helper(
     else:
         # Loop completed without early exit - task exceeded max iterations
         max_iterations_failure_reason = f"Task exceeded maximum of {max_iterations} planning iterations. Consider simplifying the task or breaking it into smaller steps."
-        max_iterations_failure_category = classify_from_failure_reason(
-            max_iterations_failure_reason, fallback_to_unknown=True
+        max_iterations_failure_category = app.AGENT_FUNCTION.classify_failure(
+            max_iterations_failure_reason, fallback_to_unknown=True, status=TaskV2Status.failed
         )
         LOG.info(
             "Task v2 failed - exceeded maximum iterations",

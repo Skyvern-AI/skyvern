@@ -16,13 +16,13 @@ import {
   SKIP_KEYS_FOR_JINJA_CHECK,
   transformStringFieldsInObject,
 } from "../jinjaReferences";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { goalChangeIsPending } from "../workflowEditorUtils";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
 import {
-  ChevronDownIcon,
   ChevronRightIcon,
   GearIcon,
+  PlusIcon,
+  ViewVerticalIcon,
 } from "@radix-ui/react-icons";
 import {
   DropdownMenu,
@@ -39,7 +39,6 @@ import {
 import { cn } from "@/util/utils";
 import { DocKeyLabel, DocKeyTooltip } from "./DocKeyLabel";
 import type { WorkflowBlockNode } from "../nodes";
-import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 import { announceDoc, announceMoved, announceTurnedInto } from "./docAnnounce";
 import { workflowBlockTitle } from "../nodes/types";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
@@ -79,12 +78,20 @@ import {
   DocOutputName,
   DocStepPicker,
 } from "./DocEditing";
+import { DocImages } from "./DocImages";
+import { docImageDropProps, useDocImageFiles } from "./useDocImageFiles";
+import { docImagesOf } from "./docGraphEdits";
 import {
   useDocStepAdded,
   useDocStepChangedKeys,
   useDocStepPending,
 } from "./DocProposalView";
 import { DocOneActionHint } from "./DocOneActionHint";
+import { isDocUrlOfferVisible } from "./docOneAction";
+import { DocStepMeta } from "./DocStepMeta";
+import { DocStepName } from "./DocStepName";
+import { useDocGoalBuild } from "./useDocGoalBuild";
+import { useDocStepMetaRows } from "./useDocStepMetaRows";
 import {
   docShortcut,
   takeCaretAtStart,
@@ -100,24 +107,11 @@ const tagClass = (
   pending = false,
 ) =>
   cn(
-    "inline-flex h-[21px] shrink-0 items-center gap-1 whitespace-nowrap rounded px-[6px] text-[12.5px] font-semibold leading-none",
+    "inline-flex h-[21px] shrink-0 items-center whitespace-nowrap rounded px-[6px] text-[12.5px] font-semibold leading-none",
     docTagClasses[docTagColor(blockType)],
     pending &&
       "border border-dashed border-current bg-transparent px-[5px] opacity-80 dark:bg-transparent",
   );
-
-function DocTagIcon({
-  blockType,
-}: {
-  blockType: ReturnType<typeof docBlockType>;
-}) {
-  return blockType ? (
-    <WorkflowBlockIcon
-      workflowBlockType={blockType}
-      className="size-3 shrink-0"
-    />
-  ) : null;
-}
 
 // The six dots of the Visual editor's node grip.
 function GripDots() {
@@ -415,6 +409,7 @@ function DocStepMenu({
             type="button"
             ref={tagRef}
             data-doc-tag
+            data-testid="doc-step-tag"
             aria-haspopup="menu"
             aria-expanded={menuAt === "tag"}
             onClick={() => toggleFrom("tag")}
@@ -426,7 +421,6 @@ function DocStepMenu({
               "outline-none hover:brightness-95 focus-visible:ring-2 focus-visible:ring-ring",
             )}
           >
-            <DocTagIcon blockType={blockType} />
             {blockType ? workflowBlockTitle[blockType] : node.type}
           </button>
           {menu("tag")}
@@ -461,8 +455,7 @@ export function DocTag({
       <DocStepMenu node={node} place={place} besideChevron={besideChevron} />
     );
   return (
-    <span className={tagClass(blockType, pending)}>
-      <DocTagIcon blockType={blockType} />
+    <span data-testid="doc-step-tag" className={tagClass(blockType, pending)}>
       {blockType ? workflowBlockTitle[blockType] : node.type}
     </span>
   );
@@ -542,15 +535,6 @@ export function DocStepNumber({ number }: { number?: string }) {
   ) : null;
 }
 
-export function DocStepCaption({ node }: { node: WorkflowBlockNode }) {
-  const caption = docStepCaption(node);
-  return caption ? (
-    <span className="min-w-0 truncate text-[13px] font-medium text-foreground">
-      {caption}
-    </span>
-  ) : null;
-}
-
 export function DocStepHeader({
   node,
   editable,
@@ -569,43 +553,46 @@ export function DocStepHeader({
   number?: string;
 }) {
   return (
-    <div className="relative flex min-h-[26px] flex-wrap items-center gap-2">
-      {disclosure && (
-        <button
-          type="button"
-          aria-expanded={disclosure.open}
-          aria-label={`${disclosure.open ? "Collapse" : "Expand"} ${node.data.label}`}
-          onClick={disclosure.onToggle}
-          className={cn(
-            "absolute -left-[26px] top-0.5 grid h-[22px] w-[22px] place-items-center rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
-            // On touch the grip shows at rest, so from sm up the arrow moves out to its left: arrow, grip, label.
-            editable &&
-              place &&
-              "sm:max-[719px]:-left-[54px] [@media(hover:none)_and_(min-width:640px)]:-left-[54px]",
-          )}
-        >
-          <ChevronRightIcon
+    <div>
+      {/* The grip and the loop arrow are placed against this row, so they stay beside the number. */}
+      <div className="relative flex min-h-[26px] flex-wrap items-center gap-2">
+        {disclosure && (
+          <button
+            type="button"
+            aria-expanded={disclosure.open}
+            aria-label={`${disclosure.open ? "Collapse" : "Expand"} ${node.data.label}`}
+            onClick={disclosure.onToggle}
             className={cn(
-              "size-4 transition-transform",
-              disclosure.open && "rotate-90",
+              "absolute -left-[26px] top-0.5 grid h-[22px] w-[22px] place-items-center rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+              // On touch the grip shows at rest, so from sm up the arrow moves out to its left: arrow, grip, label.
+              editable &&
+                place &&
+                "sm:max-[719px]:-left-[54px] [@media(hover:none)_and_(min-width:640px)]:-left-[54px]",
             )}
-          />
-        </button>
-      )}
-      <DocStepNumber number={number} />
-      <DocTag
-        node={node}
-        place={editable ? place : undefined}
-        besideChevron={Boolean(disclosure)}
-      />
-      <DocStepCaption node={node} />
-      {extra}
-      <DocStepControls
-        node={node}
-        editable={editable}
-        showRunControl={showRunControl}
-        settings={false}
-      />
+          >
+            <ChevronRightIcon
+              className={cn(
+                "size-4 transition-transform",
+                disclosure.open && "rotate-90",
+              )}
+            />
+          </button>
+        )}
+        <DocStepNumber number={number} />
+        <DocTag
+          node={node}
+          place={editable ? place : undefined}
+          besideChevron={Boolean(disclosure)}
+        />
+        {extra}
+        <DocStepControls
+          node={node}
+          editable={editable}
+          showRunControl={showRunControl}
+          settings={false}
+        />
+      </div>
+      <DocStepName node={node} editable={editable} />
     </div>
   );
 }
@@ -619,11 +606,14 @@ export function DocStepBody({
   onBackspaceAtStart,
   onMove,
   onRunStep,
+  onAddNote,
   hasFix = false,
   renamable = false,
 }: {
   node: WorkflowBlockNode;
   editable?: boolean;
+  // Opens the note line below the step, as Enter at the end of a step that needs no text does.
+  onAddNote?: () => void;
   // The step's problem line (what it still needs before it can run) is on screen under it.
   hasFix?: boolean;
   // Whether the output name can be renamed here.
@@ -639,15 +629,7 @@ export function DocStepBody({
   const actions = useContext(WorkflowDocActionsContext);
   const data = node.data as Record<string, unknown>;
   // A build in flight carries the Goal it started with, so the Code line is read-only until it ends, as in Visual.
-  const goalBuild = useCopilotActionStore((state) =>
-    state.generatingBlockLabel === node.data.label
-      ? "building"
-      : state.queuedBuilds.some(
-            (queued) => queued.blockLabel === node.data.label,
-          )
-        ? "queued"
-        : null,
-  );
+  const goalBuild = useDocGoalBuild(node.data.label);
   const editable = editableProp && !(node.type === "codeBlock" && goalBuild);
   const goalNotApplied =
     node.type === "codeBlock" &&
@@ -675,8 +657,15 @@ export function DocStepBody({
     () => docKeySettings(node, actions.loginCredentialKeys),
     [node, actions.loginCredentialKeys],
   );
+  const settingRows = useDocStepMetaRows(node, keyFields);
+  const metaRows = settingRows.line;
   const unfinished = useDocUnfinishedStore((state) => state.ids.has(node.id));
-  const missing = unfinished ? [] : getDocMissingSettings(node);
+  // A dashed chip already asks for the setting, so it is not also listed as required.
+  const missing = unfinished
+    ? []
+    : getDocMissingSettings(node, (key) =>
+        metaRows.some((row) => row.unset && row.key === yamlKey(key)),
+      );
   // A description sits under a prompt-driven step's text; on other steps it is the main line, with the setting it would hide underneath.
   // A loop's line that already names its list says what "For each of …" would, so the summary is left out.
   const loopSource = stripJinjaReferences(loopList(data));
@@ -695,16 +684,62 @@ export function DocStepBody({
   const emptyText = getDocMainPlaceholder(node, editable);
   const forEachLoop = node.type === "loop" && data.loopKind !== "while";
   const mainKey = isProse ? fields[0]!.key : "description";
-  // Hidden while the main line is being typed in, so a half-typed URL ("https://exa") is not offered. Focus is kept per
-  // rendering of the line, because React fires no blur when the focused line unmounts; a run or a demonstration that
-  // takes editing away clears it, so the same rendering coming back is not read as still focused.
+  // Read-only, an empty first field gives the main line to the next filled one; that line is the one that folds.
+  const shownMainKey = isProse ? (main?.key ?? mainKey) : mainKey;
+  // A proposal that adds the step or changes its shown text keeps that text whole, so nothing is accepted unseen.
+  const proposalChanged = useDocStepChangedKeys(node);
+  const proposalAdded = useDocStepAdded(node);
+  const revealText =
+    proposalAdded || proposalChanged.includes(yamlKey(shownMainKey));
+  // The summary line shows a URL's host only and cuts long values, so a value the proposal sets is listed whole in
+  // Details, which opens for it; so is every value of a step whose settings cannot be opened.
+  const lineTouched = settingRows.proposed;
+  const detailsFields = keyFields.filter(
+    (f) =>
+      settingRows.details.includes(f) ||
+      (metaRows.includes(f) && (lineTouched(f.key) || !settingRows.editable)),
+  );
+  // Keep a pre-existing offer reachable on focus, but hide it after typing until the line is left.
   const lineMode = `${editable}-${isProse}`;
   const [focusedMode, setFocusedMode] = useState<string | null>(null);
+  const menuActive = useRef(false);
+  const lineContainer = useRef<HTMLDivElement>(null);
+  const [focusStart, setFocusStart] = useState<{
+    text: string;
+    requiredOffer: boolean;
+  } | null>(null);
+  // A lock can unmount the focused line without a blur, so discard its snapshot.
   if (!editable && focusedMode !== null) setFocusedMode(null);
+  const candidate =
+    editable && actions.edit ? actions.promptUrlOffer(node) : null;
+  const focused = focusedMode === lineMode;
   const urlOffer =
-    editable && actions.edit && focusedMode !== lineMode
-      ? actions.promptUrlOffer(node)
-      : null;
+    !focused || focusStart?.text === stringOf(shownMainKey) ? candidate : null;
+  const [, refreshHint] = useState(0);
+  const urlOfferVisible = isDocUrlOfferVisible(node, urlOffer);
+  const requiredUrlOfferVisible =
+    urlOfferVisible && Boolean(urlOffer?.required);
+  const hideUrlChip = focused
+    ? Boolean(focusStart?.requiredOffer)
+    : requiredUrlOfferVisible;
+  const hint = editableProp && (
+    <DocOneActionHint
+      node={node}
+      urlOffer={urlOffer}
+      onDismiss={() => refreshHint((n) => n + 1)}
+    />
+  );
+  const textCollapse = {
+    open: actions.textOpen(node.id),
+    setOpen: (open: boolean) => actions.setTextOpen(node.id, open),
+    name: docStepCaption(node) ?? node.data.label,
+  };
+  // A screenshot pasted into the step's text goes under the text, never inside it.
+  const imageFiles = useDocImageFiles({
+    ownerNodeId: node.id,
+    placement: "block",
+  });
+  const addFiles = editable && actions.edit ? imageFiles.addFiles : null;
   const line = (
     key: string,
     value: string,
@@ -712,6 +747,15 @@ export function DocStepBody({
     className: string,
   ) => (
     <DocEditableLine
+      onMenuActiveChange={(open) => {
+        menuActive.current = open;
+        if (!open && !lineContainer.current?.contains(document.activeElement)) {
+          setFocusedMode(null);
+          setFocusStart(null);
+          setHeldRestInView(null);
+        }
+      }}
+      onFiles={addFiles ?? undefined}
       value={value}
       editable={editable}
       placeholder={placeholder}
@@ -734,6 +778,7 @@ export function DocStepBody({
         key === mainKey ? () => takeCaretAtStart(node.id) : undefined
       }
       multiline
+      collapse={key === shownMainKey && !revealText ? textCollapse : undefined}
       onChange={(v) => {
         if (!v.trim() && !kept.includes(key)) setKept([...kept, key]);
         actions.edit?.setText(node.id, key, v);
@@ -789,12 +834,14 @@ export function DocStepBody({
           ...(restInView ? rest.map((f) => f.key) : []),
         ]
       : ["description"]
-  ).map(yamlKey);
+  )
+    .map(yamlKey)
+    .concat(metaRows.filter((f) => !lineTouched(f.key)).map((f) => f.key));
   const keySettings = (
     <>
-      {keyFields.length > 0 && (
+      {detailsFields.length > 0 && (
         <dl className="mb-1 grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 text-[13px]">
-          {keyFields.map((f) => (
+          {detailsFields.map((f) => (
             <Fragment key={f.key}>
               <dt className="text-muted-foreground">{f.label}</dt>
               <dd
@@ -804,6 +851,17 @@ export function DocStepBody({
                 )}
               >
                 <DocText value={f.value} />
+                {f.unset && f.addLabel && editableProp && actions.edit && (
+                  <button
+                    type="button"
+                    data-doc-add-row={f.key}
+                    onClick={() => actions.openSettings(node.id)}
+                    className="ml-2 inline-flex items-center gap-0.5 rounded px-1 text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <PlusIcon aria-hidden className="size-3" />
+                    Add {f.addLabel}
+                  </button>
+                )}
               </dd>
             </Fragment>
           ))}
@@ -826,14 +884,37 @@ export function DocStepBody({
   );
   return (
     <>
+      <DocStepMeta
+        node={node}
+        rows={metaRows.filter(
+          (row) => !(hideUrlChip && row.key === "url" && row.unset),
+        )}
+      />
       <div
+        ref={lineContainer}
         className="min-h-[1.55em] text-base font-normal leading-[1.55]"
-        onFocus={() => {
+        {...docImageDropProps(addFiles)}
+        onFocus={(event) => {
+          if (isCollapseControl(event.target) || menuActive.current) return;
+          setFocusStart({
+            text: stringOf(shownMainKey),
+            requiredOffer: Boolean(
+              candidate?.required && isDocUrlOfferVisible(node, candidate),
+            ),
+          });
           setFocusedMode(lineMode);
           setHeldRestInView((held) => held ?? liveRestInView);
         }}
-        onBlur={() => {
+        onBlur={(event) => {
+          if (isCollapseControl(event.target) || menuActive.current) return;
+          if (
+            focused &&
+            focusStart?.text !== stringOf(shownMainKey) &&
+            isDocUrlOfferVisible(node, candidate)
+          )
+            announceDoc("A URL suggestion is available.");
           setFocusedMode(null);
+          setFocusStart(null);
           setHeldRestInView(null);
         }}
       >
@@ -869,6 +950,14 @@ export function DocStepBody({
           <DocText value={description ?? getDocStepSummary(node)} />
         )}
       </div>
+      <DocImages
+        slot={{ ownerNodeId: node.id, placement: "block" }}
+        images={docImagesOf(node).filter(
+          (image) => image.placement === "block",
+        )}
+        editable={editable && Boolean(actions.edit)}
+        onRetry={imageFiles.retry}
+      />
       {restInView && restLines}
       {node.type === "codeBlock" && (goalBuild || goalNotApplied) && (
         <div
@@ -900,22 +989,28 @@ export function DocStepBody({
           <DocText value={settingSummary} />
         </div>
       )}
+      {requiredUrlOfferVisible && hint}
       <DocStepSummary
         node={node}
         lineKeys={lineKeys}
         hasDetailsLines={
           (!restInView && rest.length > 0) ||
           descriptionInDetails ||
-          keyFields.some((f) => f.changed)
+          detailsFields.some((f) => f.changed)
         }
         editable={editableProp}
         renamable={renamable}
         keySettings={keySettings}
+        onAddNote={editableProp ? onAddNote : undefined}
       />
-      {editableProp && <DocOneActionHint node={node} urlOffer={urlOffer} />}
+      {!requiredUrlOfferVisible && hint}
     </>
   );
 }
+
+// Show more is not the step's text: focusing it neither hides the URL offer nor holds the lines in place.
+const isCollapseControl = (target: EventTarget) =>
+  target instanceof HTMLElement && target.dataset.docCollapse !== undefined;
 
 // The Doc does not show a Code step's Python, so its reads are not listed.
 const CODE_SKIP_KEYS = new Set([...SKIP_KEYS_FOR_JINJA_CHECK, "code", "steps"]);
@@ -969,8 +1064,10 @@ function DocStepSummary({
   editable,
   renamable,
   keySettings,
+  onAddNote,
 }: {
   node: WorkflowBlockNode;
+  onAddNote?: () => void;
   lineKeys: string[];
   // Details holds a filled line or key setting of the step.
   hasDetailsLines: boolean;
@@ -996,9 +1093,28 @@ function DocStepSummary({
       : changed.some((key) => !docStepShowsKey(node, key, lineKeys)));
   const setOpen = (next: boolean) => actions.setDetailsOpen(node.id, next);
   const panelId = useId();
+  const noteButton = useRef<HTMLButtonElement>(null);
+  // Escape on the empty note this button opened leaves focus on the page, so it comes back here.
+  const [noteOpened, setNoteOpened] = useState(false);
+  const pendingNote = actions.pendingNote;
+  const escaped = useRef(false);
+  useEffect(() => {
+    if (!noteOpened) return;
+    if (pendingNote) {
+      escaped.current = false;
+      const onKey = (event: globalThis.KeyboardEvent) => {
+        if (event.key === "Escape") escaped.current = true;
+      };
+      document.addEventListener("keydown", onKey, true);
+      return () => document.removeEventListener("keydown", onKey, true);
+    }
+    setNoteOpened(false);
+    if (escaped.current)
+      requestAnimationFrame(() => noteButton.current?.focus());
+  }, [noteOpened, pendingNote]);
   return (
     <>
-      <div className="mt-1 text-[12.5px] text-muted-foreground">
+      <div className="mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
         <DocKeyTooltip
           content={
             custom?.length
@@ -1016,16 +1132,28 @@ function DocStepSummary({
             onClick={() => setOpen(!open)}
             className="-ml-1 inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
           >
-            {docDetailsText.toggle}
-            <ChevronDownIcon
+            <ChevronRightIcon
               aria-hidden
-              className={cn(
-                "size-3 transition-transform",
-                open && "rotate-180",
-              )}
+              className={cn("size-3 transition-transform", open && "rotate-90")}
             />
+            {docDetailsText.toggle}
           </button>
         </DocKeyTooltip>
+        {onAddNote && (
+          <button
+            type="button"
+            ref={noteButton}
+            aria-label={`Add note below ${docStepCaption(node) ?? node.data.label}`}
+            onClick={() => {
+              onAddNote?.();
+              setNoteOpened(true);
+            }}
+            className="inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <PlusIcon aria-hidden className="size-3" />
+            Note
+          </button>
+        )}
       </div>
       {open && (
         <DocStepDetails
@@ -1106,8 +1234,10 @@ function DocStepDetails({
           </div>
         </>
       )}
-      {custom && <p className={heading}>{docDetailsText.custom}</p>}
-      {custom === null ? null : custom.length > 0 ? (
+      {custom && custom.length > 0 && (
+        <p className={heading}>{docDetailsText.custom}</p>
+      )}
+      {custom && custom.length > 0 && (
         <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5">
           {custom.map((row) => (
             <Fragment key={row.key}>
@@ -1118,8 +1248,6 @@ function DocStepDetails({
             </Fragment>
           ))}
         </dl>
-      ) : (
-        <p className="text-muted-foreground">{docDetailsText.allDefault}</p>
       )}
       {/* A read-only Doc's side panel cannot show a step's settings, so the link is left out. */}
       {editable && (
@@ -1129,9 +1257,10 @@ function DocStepDetails({
             onClose();
             actions.openSettings(node.id);
           }}
-          className="mt-1.5 rounded text-[12.5px] text-muted-foreground underline underline-offset-4 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          className="ml-auto mt-1.5 flex w-fit items-center gap-1.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
         >
           {docDetailsText.morePanel}
+          <ViewVerticalIcon aria-hidden className="size-3.5" />
         </button>
       )}
     </div>

@@ -17,10 +17,10 @@ type ResolveBrowserPaneViewArgs = {
   // A block-scoped run (?bl=) shares the live debug session; the live browser
   // stays the surface even after it finalizes (the block-iterate loop).
   blockRunInDebugSession: boolean;
-  // The Copilot introduced the run focus and still owns its automatic view.
+  // The Ember introduced the run focus and still owns its automatic view.
   systemFocused: boolean;
-  // The browser Copilot's latest call named is one the studio can stream now.
-  copilotBrowserFocused: boolean;
+  // The browser Ember's latest call named is one the studio can stream now.
+  emberBrowserFocused: boolean;
   // The inspected run executed in the live debug session, so that browser is
   // still the run's evidence once it finishes.
   runInDebugSession: boolean;
@@ -38,8 +38,8 @@ type ResolveLiveSurfaceArgs = {
   // A browser recording pins the live surface to the debug browser (the
   // recorder drives it), even if an inspected run streams elsewhere.
   recording: boolean;
-  // Which live browser Copilot's latest call named, when the studio can stream it.
-  copilotBrowserSurface: "debug" | "run" | null;
+  // Which live browser Ember's latest call named, when the studio can stream it.
+  emberBrowserSurface: "debug" | "run" | null;
   running: boolean;
   runInDebugSession: boolean;
   hasRunId: boolean;
@@ -93,13 +93,13 @@ export function resolveReplayAvailability(
  */
 export function resolveLiveSurface({
   recording,
-  copilotBrowserSurface,
+  emberBrowserSurface,
   running,
   runInDebugSession,
   hasRunId,
 }: ResolveLiveSurfaceArgs): "debug" | "run" {
   if (recording) return "debug";
-  if (copilotBrowserSurface) return copilotBrowserSurface;
+  if (emberBrowserSurface) return emberBrowserSurface;
   return running && !runInDebugSession && hasRunId ? "run" : "debug";
 }
 
@@ -118,7 +118,7 @@ export function resolveBrowserPaneView({
   inspectingRun,
   blockRunInDebugSession,
   systemFocused,
-  copilotBrowserFocused,
+  emberBrowserFocused,
   runInDebugSession,
   running,
   hasRecording,
@@ -149,7 +149,7 @@ export function resolveBrowserPaneView({
   if (scrubbing && screenshotsAvailable) {
     return "screenshots";
   }
-  if (copilotBrowserFocused) {
+  if (emberBrowserFocused) {
     return "live";
   }
   // System focus keeps Live only while the run is still on that browser; a

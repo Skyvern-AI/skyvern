@@ -19,16 +19,6 @@ from tests.unit._mcp_browser_fakes import patch_get_page
 # ═══════════════════════════════════════════════════
 
 
-def test_make_page_handlers_includes_pageerror() -> None:
-    state = _make_session_state()
-    raw_page = MagicMock()
-    raw_page.url = "https://example.com"
-
-    handlers = mcp_inspection._make_page_handlers(state, raw_page)
-
-    assert "pageerror" in handlers
-
-
 def test_pageerror_handler_appends_to_buffer() -> None:
     state = _make_session_state()
     raw_page = MagicMock()
@@ -64,18 +54,6 @@ def test_pageerror_handler_survives_exception() -> None:
     handler(BadError())
     # Should not raise — errors are silently caught
     assert len(state.page_errors) == 1
-
-
-def test_register_hooks_registers_pageerror() -> None:
-    state = _make_session_state()
-    raw_page = MagicMock()
-    raw_page.url = "https://example.com"
-
-    mcp_inspection._register_hooks_on_page(state, raw_page)
-
-    # Check that pageerror was registered
-    on_calls = [call for call in raw_page.on.call_args_list if call[0][0] == "pageerror"]
-    assert len(on_calls) == 1
 
 
 # ═══════════════════════════════════════════════════

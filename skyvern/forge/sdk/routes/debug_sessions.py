@@ -9,7 +9,7 @@ from fastapi import Depends, HTTPException, Query, Response, status
 from sqlalchemy.exc import IntegrityError
 
 from skyvern.config import settings
-from skyvern.exceptions import BrowserSessionNotRenewable
+from skyvern.exceptions import BrowserSessionNotRenewable, ProxyPolicyError
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.active_run_session import get_active_run_session
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -46,6 +46,7 @@ from skyvern.forge.sdk.workflow.service import (
 )
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import runtime_proxy_location
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 
 LOG = structlog.get_logger()
 BROWSER_SESSION_PREWARM_FLAG = "BROWSER_SESSION_PREWARM"
@@ -109,7 +110,30 @@ async def _claim_compatible_prewarm(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
     )
-    if browser_session.proxy_location != runtime_proxy_location(workflow.proxy_location):
+    approved_location: ProxyLocationInput = runtime_proxy_location(workflow.proxy_location)
+    if approved_location == ProxyLocation.RESIDENTIAL and (
+        isinstance(browser_session.proxy_location, GeoTarget)
+        or browser_session.proxy_location == ProxyLocation.RESIDENTIAL
+    ):
+        resolved_location = await app.PERSISTENT_SESSIONS_MANAGER.resolve_session_proxy_location(
+            browser_session, approved_location, workflow_permanent_id=workflow_permanent_id
+        )
+        if isinstance(browser_session.proxy_location, GeoTarget) or resolved_location != approved_location:
+            if browser_session.proxy_session_id or browser_session.browser_profile_id != workflow.browser_profile_id:
+                await _retire_prewarm(browser_session, organization_id, bound_key)
+                return None
+            profile = (
+                await app.DATABASE.browser_sessions.get_browser_profile(
+                    browser_session.browser_profile_id, organization_id
+                )
+                if browser_session.browser_profile_id
+                else None
+            )
+            if browser_session.browser_profile_id and (profile is None or profile.proxy_session_id):
+                await _retire_prewarm(browser_session, organization_id, bound_key)
+                return None
+        approved_location = resolved_location
+    if browser_session.proxy_location != approved_location:
         await _retire_prewarm(browser_session, organization_id, bound_key)
         return None
 
@@ -398,7 +422,7 @@ async def get_debug_session_viewer_state(
 async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
     workflow_permanent_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+    current_user_id: str = Depends(org_auth_service.get_debug_session_owner_id),
 ) -> DebugSession:
     """
     `current_user_id` is a unique identifier for a user, but does not map to an
@@ -407,7 +431,7 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
     If the debug session does not exist, a new one will be created.
 
     In addition, the timeout for the debug session's browser session will be
-    extended to 4 hours from the time of the request. If the browser session
+    extended to DEBUG_SESSION_TIMEOUT_MINUTES (20 minutes) from the time of the request. If the browser session
     cannot be renewed, a new one will be created and assigned to the debug
     session. The browser_session that could not be renewed will be closed.
     """
@@ -427,6 +451,8 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
                 user_id=current_user_id,
             )
             claimed_prewarm = debug_session is not None
+        except ProxyPolicyError:
+            raise
         except Exception:
             LOG.warning(
                 "Failed to claim debug-session prewarm; falling back to cold start",

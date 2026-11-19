@@ -226,11 +226,6 @@ async def click_handle(
     await handle.click(**_opts(timeout=timeout, force=force, position=position))
 
 
-async def click_at(page: Page, x: float, y: float) -> None:
-    await _hold_submit(page)
-    await page.mouse.click(x, y)
-
-
 async def hover(realm: Realm, selector: str, *, timeout: float | None = None) -> None:
     await realm.hover(selector, **_opts(timeout=timeout))
 

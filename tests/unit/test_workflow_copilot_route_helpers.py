@@ -17,14 +17,23 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge import app
+from skyvern.forge.api_app import create_api_app
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload, _build_timeout_exit_result
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.interruption import UNTESTED_DRAFT_PRESERVED, cancel_notice
 from skyvern.forge.sdk.copilot.tools.run_execution import _record_executed_block_labels
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
+from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml
+from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
+from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
+from skyvern.forge.sdk.routes import workflow_copilot as routes
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _assistant_execution_receipts,
     _attachment_filenames_from_history,
@@ -36,7 +45,6 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _effective_auto_accept,
     _ensure_terminal_frame,
     _history_with_resolved_attachments,
-    _normalize_copilot_yaml,
     _preserved_draft_disposition,
     _prior_copilot_workflow_yaml,
     _prior_global_llm_context,
@@ -49,6 +57,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _workflow_copilot_ingress_log_fields,
     convert_to_history_messages,
 )
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotAttachedFile,
     CopilotVideoEvidenceArtifact,
@@ -79,6 +88,69 @@ def test_workflow_copilot_ingress_log_fields_are_content_free() -> None:
 
     assert fields == {"message_length": len(f"The password is {literal}")}
     assert literal not in repr(fields)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/workflow/copilot/chat-post", "/v1/ember/chat-post"])
+@pytest.mark.parametrize(
+    "recovery_fields",
+    [
+        {
+            "supports_credential_pause": False,
+            "supports_credential_pause_recovery": True,
+            "credential_recovery_token": "ab" * 32,
+        },
+        {
+            "supports_credential_pause": True,
+            "supports_credential_pause_recovery": False,
+            "credential_recovery_token": "ab" * 32,
+        },
+        {
+            "supports_credential_pause": True,
+            "supports_credential_pause_recovery": True,
+            "credential_recovery_token": "zz" * 32,
+        },
+        {"supports_credential_pause": True, "supports_credential_pause_recovery": True},
+    ],
+)
+async def test_detached_chat_post_without_card_recovery_is_refused_before_the_turn_starts(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, path: str, recovery_fields: dict[str, bool | str]
+) -> None:
+    validation_handler = create_api_app().exception_handlers[RequestValidationError]
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    chat = await repo.create_workflow_copilot_chat(organization_id="org", workflow_permanent_id="wpid")
+    api = FastAPI()
+    api.add_api_route(path, routes.workflow_copilot_chat_post, methods=["POST"])
+    api.add_exception_handler(RequestValidationError, validation_handler)
+    api.dependency_overrides[routes.org_auth_service.get_current_org] = lambda: Organization(
+        organization_id="org",
+        organization_name="Fixture",
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    api.dependency_overrides[routes.org_auth_service.get_current_user_id_or_none] = lambda: None
+    body = {
+        "workflow_permanent_id": "wpid",
+        "workflow_id": "wf",
+        "workflow_copilot_chat_id": chat.workflow_copilot_chat_id,
+        "message": "build it",
+        "workflow_yaml": "title: Portal\n",
+        "client_detached": True,
+        **recovery_fields,
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=api), base_url="http://fixture") as client:
+        response = await client.post(path, json=body)
+
+    assert response.status_code == 422
+    [error] = response.json()["detail"]
+    assert error["loc"] == ["body"]
+    assert error["type"] == "value_error"
+    if token := recovery_fields.get("credential_recovery_token"):
+        assert token not in response.text
+    stored = await repo.get_workflow_copilot_chat_by_id("org", chat.workflow_copilot_chat_id)
+    assert stored is not None and stored.pending_turns == {}
 
 
 def test_proposed_workflow_persists_exact_version_execution_receipts() -> None:
@@ -210,6 +282,7 @@ def _agent_result(
     # doesn't accidentally trigger the degraded-path branch in
     # `_should_restore_persisted_workflow`.
     r.canonical_was_persisted_due_to_param_change = canonical_was_persisted_due_to_param_change
+    r.run_card_saved_workflow = None
     for k, v in kwargs.items():
         setattr(r, k, v)
     return r
@@ -300,6 +373,7 @@ class TestEffectiveAutoAccept:
         validated = MagicMock()
         validated.proposal_disposition = "auto_applicable"
         validated.cancelled = False
+        validated.run_card_saved_workflow = None
 
         assert _effective_auto_accept(True, validated) is True
         assert _effective_auto_accept(False, validated) is False

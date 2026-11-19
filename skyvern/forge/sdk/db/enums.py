@@ -68,11 +68,16 @@ class WorkflowRunTriggerType(StrEnum):
     seo_recipe_submit = "seo_recipe_submit"
 
 
+PERSON_STARTED_TRIGGER_TYPES = frozenset(
+    {None, WorkflowRunTriggerType.manual, WorkflowRunTriggerType.mcp, WorkflowRunTriggerType.api}
+)
+
+
 class WorkflowBuildSource(StrEnum):
     """Which surface wrote a workflow version.
 
     - ui: the Skyvern app
-    - copilot: the workflow copilot
+    - copilot: Ember, Skyvern's agent builder (the value keeps the old name)
     - mcp: a first-party MCP client
     - cli: the Skyvern CLI
     - api: any other API or SDK caller
@@ -80,7 +85,7 @@ class WorkflowBuildSource(StrEnum):
     """
 
     ui = "ui"
-    copilot = "copilot"
+    ember = "copilot"
     mcp = "mcp"
     cli = "cli"
     api = "api"

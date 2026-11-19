@@ -1,7 +1,10 @@
 import asyncio
 import contextlib
+import hmac
+import json
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
+from hashlib import sha256
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -9,8 +12,9 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.config import settings
 from skyvern.exceptions import (
@@ -39,7 +43,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     HttpRequestBlock,
     WorkflowTriggerBlock,
 )
-from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import (
     COPILOT_TEST_WORKFLOW_CREATOR,
     Workflow,
@@ -49,7 +53,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflow_run_groups import (
+    DEFAULT_MAX_CONCURRENCY,
+    IN_FLIGHT_ITEM_STATES,
+    RunGroupLimits,
+    WorkflowRunGroup,
     WorkflowRunGroupCreateRequest,
+    WorkflowRunGroupItem,
     WorkflowRunGroupItemOutcome,
     WorkflowRunGroupItemState,
     WorkflowRunGroupStatus,
@@ -90,11 +99,33 @@ def env(run_group_env: GroupEnv) -> GroupEnv:
 
 
 def _request(
-    key: str = "sub-1", count: int = 3, items: Sequence[Mapping[str, object]] | None = None
+    key: str = "sub-1",
+    count: int = 3,
+    items: Sequence[Mapping[str, object]] | None = None,
+    max_concurrency: int = 1,
 ) -> WorkflowRunGroupCreateRequest:
     if items is None:
         items = [{"key": f"acct-{i}", "parameters": {"login": "cred_1" if i % 2 else "cred_2"}} for i in range(count)]
-    return WorkflowRunGroupCreateRequest.model_validate({"workflow_id": WPID, "submission_key": key, "items": items})
+    return WorkflowRunGroupCreateRequest.model_validate(
+        {"workflow_id": WPID, "submission_key": key, "items": items, "max_concurrency": max_concurrency}
+    )
+
+
+def _set_limits(monkeypatch: pytest.MonkeyPatch, max_items: int, max_concurrency: int) -> AsyncMock:
+    limits = AsyncMock(return_value=RunGroupLimits(max_items, max_concurrency))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "workflow_run_group_limits", limits)
+    return limits
+
+
+async def _in_flight(database: AgentDB, group_id: str) -> int:
+    async with database.Session() as session:
+        count = await session.scalar(
+            select(func.count())
+            .select_from(WorkflowRunGroupItemModel)
+            .where(WorkflowRunGroupItemModel.workflow_run_group_id == group_id)
+            .where(WorkflowRunGroupItemModel.state.in_([state.value for state in IN_FLIGHT_ITEM_STATES]))
+        )
+        return int(count or 0)
 
 
 async def _set_child_status(env: GroupEnv, workflow_run_id: str, status: WorkflowRunStatus) -> None:
@@ -605,6 +636,30 @@ async def test_cancel_while_a_child_runs_gives_every_item_an_outcome(env: GroupE
 
 
 @pytest.mark.asyncio
+async def test_cancel_with_two_children_in_flight_cancels_both_and_gives_every_item_an_outcome(
+    env: GroupEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_limits(monkeypatch, 25, 2)
+    group_id = await _submit(env, _request(count=4, max_concurrency=2))
+    run_ids = await _run_ids(env, group_id)
+    await group_service.advance_workflow_run_group(group_id)
+    assert await _in_flight(env.database, group_id) == 2
+    for run_id in run_ids[:2]:
+        await _set_child_status(env, run_id, WorkflowRunStatus.running)
+
+    await group_service.cancel_workflow_run_group(group_id, ORG)
+    await group_service.recover_workflow_run_groups()
+
+    assert env.executor.executed == run_ids[:2]
+    group = await group_service.get_workflow_run_group(group_id, ORG)
+    assert group.status == WorkflowRunGroupStatus.finished
+    assert [item.run_status for item in group.items] == [WorkflowRunStatus.canceled] * 2 + [None] * 2
+    assert [item.outcome for item in group.items] == [WorkflowRunGroupItemOutcome.unknown] * 2 + [
+        WorkflowRunGroupItemOutcome.canceled
+    ] * 2
+
+
+@pytest.mark.asyncio
 async def test_cancel_cascades_to_a_running_childs_nested_runs_and_keeps_final_statuses(env: GroupEnv) -> None:
     group_id = await _submit(env)
     run_ids = await _run_ids(env, group_id)
@@ -671,6 +726,33 @@ async def test_failed_child_keeps_earlier_results_and_later_items_run(env: Group
         WorkflowRunGroupItemOutcome.completed,
         WorkflowRunGroupItemOutcome.failed,
         WorkflowRunGroupItemOutcome.completed,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_each_failed_child_is_classified_by_its_own_step_count(env: GroupEnv) -> None:
+    group_id = await _submit(env)
+    run_ids = await _run_ids(env, group_id)
+    for run_id in run_ids:
+        await group_service.advance_workflow_run_group(group_id)
+        await _set_child_status(env, run_id, WorkflowRunStatus.failed)
+    task = await env.database.tasks.create_task(
+        url="https://example.com",
+        title="login",
+        navigation_goal=None,
+        data_extraction_goal=None,
+        navigation_payload=None,
+        organization_id=ORG,
+        workflow_run_id=run_ids[1],
+    )
+    await env.database.tasks.create_step(task.task_id, order=0, retry_index=0, organization_id=ORG)
+
+    group = await group_service.get_workflow_run_group(group_id, ORG)
+
+    assert [item.outcome for item in group.items] == [
+        WorkflowRunGroupItemOutcome.failed,
+        WorkflowRunGroupItemOutcome.unknown,
+        WorkflowRunGroupItemOutcome.failed,
     ]
 
 
@@ -1017,9 +1099,13 @@ async def test_an_edit_landing_between_validation_and_insert_refuses_the_submit(
     validate = app.WORKFLOW_SERVICE.validate_schedule_parameters
 
     async def edit_after_validation(
-        workflow: Workflow, organization: Organization, request_data: dict[str, Any] | None
+        workflow: Workflow,
+        organization: Organization,
+        request_data: dict[str, Any] | None,
+        *,
+        workflow_parameters: list[WorkflowParameter] | None = None,
     ) -> None:
-        await validate(workflow, organization, request_data)
+        await validate(workflow, organization, request_data, workflow_parameters=workflow_parameters)
         async with env.database.Session() as session:
             await session.execute(update(WorkflowModel).values(modified_at=naive_utc_now() + timedelta(seconds=1)))
             await session.commit()
@@ -1206,3 +1292,209 @@ async def test_two_concurrent_repeat_checked_creations_on_postgres_admit_one_gro
         await database.engine.dispose()
 
     assert sum(isinstance(result, GroupAccountsRanSinceReview) for result in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_one_advance_fills_every_slot_the_group_allows(env: GroupEnv, monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_limits(monkeypatch, 500, 4)
+    read_parameters = AsyncMock(wraps=app.WORKFLOW_SERVICE.get_workflow_parameters)
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_parameters", read_parameters)
+    response = await group_service.submit_workflow_run_group(env.organization, _request(count=30, max_concurrency=4))
+    assert len(response.items) == 30
+    assert read_parameters.await_count == 1
+
+    await group_service.advance_workflow_run_group(response.workflow_run_group_id)
+
+    assert await _in_flight(env.database, response.workflow_run_group_id) == 4
+    assert len(env.executor.submitted) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_finished_child_frees_exactly_one_slot_for_the_next_item(
+    env: GroupEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_limits(monkeypatch, 25, 3)
+    group_id = await _submit(env, _request(count=6, max_concurrency=3))
+    run_ids = await _run_ids(env, group_id)
+    await group_service.advance_workflow_run_group(group_id)
+    assert env.executor.submitted == run_ids[:3]
+
+    await _set_child_status(env, run_ids[1], WorkflowRunStatus.completed)
+    await group_service.advance_workflow_run_group(group_id)
+
+    assert env.executor.submitted == run_ids[:4]
+    assert await _in_flight(env.database, group_id) == 3
+
+
+@pytest.mark.asyncio
+async def test_children_finishing_together_are_all_reconciled_by_one_advance(
+    env: GroupEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_limits(monkeypatch, 25, 3)
+    group_id = await _submit(env, _request(count=6, max_concurrency=3))
+    run_ids = await _run_ids(env, group_id)
+    await group_service.advance_workflow_run_group(group_id)
+
+    await _set_child_status(env, run_ids[0], WorkflowRunStatus.failed)
+    await _set_child_status(env, run_ids[2], WorkflowRunStatus.completed)
+    await group_service.advance_workflow_run_group(group_id)
+
+    assert env.executor.submitted == run_ids[:5]
+    assert await _in_flight(env.database, group_id) == 3
+
+
+@pytest.mark.asyncio
+async def test_an_item_failed_after_the_unlocked_read_is_not_overwritten_to_done(
+    env: GroupEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    group_id = await _submit(env)
+    await group_service.advance_workflow_run_group(group_id)
+    repository = env.database.workflow_run_groups
+    lock_group = repository._lock_group
+
+    async def fail_the_item_just_before_the_lock(
+        session: AsyncSession, workflow_run_group_id: str
+    ) -> WorkflowRunGroupStatus | None:
+        await session.execute(
+            update(WorkflowRunGroupItemModel)
+            .where(WorkflowRunGroupItemModel.workflow_run_group_id == workflow_run_group_id)
+            .where(WorkflowRunGroupItemModel.position == 0)
+            .values(state=WorkflowRunGroupItemState.failed_to_start.value)
+        )
+        return await lock_group(session, workflow_run_group_id)
+
+    monkeypatch.setattr(repository, "_lock_group", fail_the_item_just_before_the_lock)
+
+    await repository.finish_in_flight_items_done(group_id, [0])
+
+    assert (await _states(env, group_id))[0] == WorkflowRunGroupItemState.failed_to_start
+
+
+@pytest.mark.asyncio
+async def test_finishing_an_already_finished_item_leaves_the_group_row_untouched(
+    env: GroupEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_limits(monkeypatch, 25, 2)
+    group_id = await _submit(env, _request(count=2, max_concurrency=2))
+    run_ids = await _run_ids(env, group_id)
+    await group_service.advance_workflow_run_group(group_id)
+    await _set_child_status(env, run_ids[0], WorkflowRunStatus.completed)
+    await group_service.advance_workflow_run_group(group_id)
+    item = await env.database.workflow_run_groups.get_item_by_workflow_run_id(run_ids[0])
+    assert item is not None and item.state == WorkflowRunGroupItemState.done
+    before = await env.database.workflow_run_groups.get_group(group_id)
+
+    await env.database.workflow_run_groups.finish_in_flight_items_done(group_id, [item.position])
+
+    after = await env.database.workflow_run_groups.get_group(group_id)
+    assert before is not None and after is not None and after.modified_at == before.modified_at
+
+
+def test_fingerprint_at_the_default_concurrency_matches_the_payload_without_the_field() -> None:
+    request = _request()
+    payload = {
+        "workflow_id": request.workflow_id,
+        "version": request.version,
+        "items": [{"key": item.key, "parameters": item.parameters} for item in request.items],
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    expected = hmac.new(
+        settings.SECRET_KEY.encode(),
+        b"skyvern.workflow_run_group_submission.v1\0" + serialized.encode(),
+        sha256,
+    ).hexdigest()
+
+    assert request.max_concurrency == DEFAULT_MAX_CONCURRENCY
+    assert group_service.submission_fingerprint(request) == expected
+
+
+@pytest.mark.asyncio
+async def test_running_group_keeps_its_stored_max_concurrency_when_the_limit_changes(
+    env: GroupEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    limits = _set_limits(monkeypatch, 500, 2)
+    group_id = await _submit(env, _request(count=10, max_concurrency=2))
+    limits.return_value = RunGroupLimits(500, 4)
+
+    await group_service.advance_workflow_run_group(group_id)
+    await group_service.advance_workflow_run_group(group_id)
+
+    assert await _in_flight(env.database, group_id) == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_advances_on_postgres_never_exceed_the_groups_max_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if make_url(str(settings.DATABASE_STRING)).get_backend_name() != "postgresql":
+        pytest.skip("requires PostgreSQL row locks")
+    database = AgentDB(str(settings.DATABASE_STRING))
+    dispatched: list[int] = []
+
+    async def hold_in_flight(group: WorkflowRunGroup, item: WorkflowRunGroupItem, dispatch_token: str) -> bool:
+        dispatched.append(item.position)
+        return True
+
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(group_service, "_dispatch_item", hold_in_flight)
+    try:
+        organization = await database.organizations.create_organization(organization_name=f"race-{uuid4().hex}")
+        group = await database.workflow_run_groups.create_group(
+            organization_id=organization.organization_id,
+            workflow_permanent_id=f"wpid_{uuid4().hex}",
+            requested_version=None,
+            workflow_id=f"wf_{uuid4().hex}",
+            submission_key=f"race-{uuid4().hex}",
+            input_fingerprint="race",
+            items=[(f"acct-{i}", {}) for i in range(10)],
+            max_concurrency=4,
+        )
+        await asyncio.gather(*(group_service.advance_workflow_run_group(group.workflow_run_group_id) for _ in range(6)))
+        in_flight = await _in_flight(database, group.workflow_run_group_id)
+    finally:
+        await database.engine.dispose()
+
+    # No item leaves flight here, so the final count bounds every moment of the race.
+    assert in_flight == 4
+    assert len(dispatched) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("org_limits", "count", "max_concurrency", "limit"),
+    [
+        (None, 26, 1, 25),
+        (RunGroupLimits(500, 4), 3, 8, 4),
+    ],
+    ids=["no_flag_26_items", "concurrency_above_org_limit"],
+)
+async def test_submit_over_the_organizations_limits_is_a_400_naming_the_limit_and_writes_nothing(
+    env: GroupEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    org_limits: RunGroupLimits | None,
+    count: int,
+    max_concurrency: int,
+    limit: int,
+) -> None:
+    if org_limits is not None:
+        _set_limits(monkeypatch, *org_limits)
+
+    with pytest.raises(SkyvernHTTPException) as exc_info:
+        await _submit(env, _request(count=count, max_concurrency=max_concurrency))
+
+    assert exc_info.value.status_code == 400
+    assert f"at most {limit} " in str(exc_info.value)
+    assert await count_rows(env, WorkflowRunGroupModel) == 0
+
+
+@pytest.mark.asyncio
+async def test_resubmitting_a_key_with_a_different_max_concurrency_conflicts(
+    env: GroupEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_limits(monkeypatch, 500, 4)
+    await _submit(env, _request())
+
+    with pytest.raises(SkyvernHTTPException) as exc_info:
+        await _submit(env, _request(max_concurrency=2))
+
+    assert exc_info.value.status_code == 409

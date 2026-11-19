@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import type { AppNode, WorkflowBlockNode } from "../nodes";
+import { actionNodeDefaultData } from "../nodes/ActionNode/types";
 import { agentStepNodeDefaultData } from "../nodes/AgentStepNode/types";
 import { codeBlockNodeDefaultData } from "../nodes/CodeBlockNode/types";
 import { emailInboxNodeDefaultData } from "../nodes/EmailInboxNode/types";
@@ -12,6 +13,7 @@ import { navigationNodeDefaultData } from "../nodes/NavigationNode/types";
 import { powerBIQueryNodeDefaultData } from "../nodes/PowerBIQueryNode/types";
 import { sendEmailNodeDefaultData } from "../nodes/SendEmailNode/types";
 import { createNode, getWorkflowBlocks } from "../workflowEditorUtils";
+import { taskNodeDefaultData } from "../nodes/TaskNode/types";
 import { taskv2NodeDefaultData } from "../nodes/Taskv2Node/types";
 import { workflowTriggerNodeDefaultData } from "../nodes/WorkflowTriggerNode/types";
 import { httpRequestNodeDefaultData } from "../nodes/HttpRequestNode/types";
@@ -22,9 +24,11 @@ import {
   docCustomSettings,
   docKeySettings,
   docLoginCredentialKeys,
+  docSettingRowsSplit,
   yamlKey,
 } from "./docSettingsChips";
 import type { ParametersState } from "../types";
+import { reviewFieldValue } from "../panels/workflowReviewDiff";
 
 // Typed as a record so a new block type fails tsc here until it is listed.
 const BLOCK_TYPES: Record<WorkflowBlockNode["type"], true> = {
@@ -62,6 +66,7 @@ const BLOCK_TYPES: Record<WorkflowBlockNode["type"], true> = {
   googleSheetsWrite: true,
   agentStep: true,
   powerBIQuery: true,
+  integrationAction: true,
 };
 
 describe("docCustomSettings", () => {
@@ -103,6 +108,15 @@ describe("docCustomSettings", () => {
           parameterKeys: ["site"],
           dataSchema: '{"type": "object"}',
         }),
+      ),
+    ).toEqual([]);
+  });
+
+  test("screenshots and prompt images are not custom settings", () => {
+    const shot = { file_id: "file_1", caption: null, placement: "block" };
+    expect(
+      docCustomSettings(
+        extraction({ docImages: [shot], promptImages: [shot] }),
       ),
     ).toEqual([]);
   });
@@ -231,7 +245,7 @@ describe("docCustomSettings", () => {
     },
   );
 
-  test("a Gmail step with a cleared field lists that field and its transport", () => {
+  test("a Gmail step with a cleared field lists that field and its transport; a step on a connected account names its source by the product's term and hides its connection id", () => {
     expect(
       docCustomSettings(
         newStep("sendEmail", { transport: "gmail", bodyFormat: "" }),
@@ -240,6 +254,46 @@ describe("docCustomSettings", () => {
       ["transport", "gmail"],
       ["body_format", "Not set"],
     ]);
+    const connected = { credentialSource: "nango", connectionId: "conn-raw-1" };
+    const steps = [
+      newStep("emailInbox", connected),
+      newStep("sendEmail", { transport: "gmail", ...connected }),
+      newStep("powerBIQuery", connected),
+      newStep("powerBIQuery", { credentialSource: "native" }),
+    ];
+    const rows = steps.map((step) =>
+      (docCustomSettings(step) ?? [])
+        .filter((row) =>
+          ["credential_source", "connection_id"].includes(row.key),
+        )
+        .map((row) => [row.label, row.value]),
+    );
+    expect(rows).toEqual([
+      [
+        ["Credential source", "Connected Gmail"],
+        ["Connection ID", "•••••••• (hidden)"],
+      ],
+      [
+        ["Credential source", "Connected Gmail"],
+        ["Connection ID", "•••••••• (hidden)"],
+      ],
+      [["Connection ID", "•••••••• (hidden)"]],
+      [["Credential source", "Native Power BI connection"]],
+    ]);
+    expect(
+      JSON.stringify(steps.map((step) => docCustomSettings(step))),
+    ).not.toMatch(/nango|conn-raw-1/i);
+    expect(
+      reviewFieldValue("credential_source", "native", {
+        block_type: "email_inbox",
+        email_client: "outlook",
+      }),
+    ).toBe("Microsoft Account");
+    expect(
+      reviewFieldValue("connection_id", "conn-typed-1", {
+        block_type: "integration_action",
+      }),
+    ).toBe("conn-typed-1");
   });
 
   test.each([
@@ -545,6 +599,93 @@ describe("docKeySettings", () => {
     expect(
       rows(node("navigation", navigationNodeDefaultData)).map(([l]) => l),
     ).toEqual(["Engine", "Max steps", "Error codes", "URL"]);
+  });
+});
+
+describe("docSettingRowsSplit", () => {
+  const node = (type: string, data: Record<string, unknown>) =>
+    ({
+      id: "n",
+      position: { x: 0, y: 0 },
+      type,
+      data: { ...data, label: "step_one" },
+    }) as AppNode;
+  // What the summary line shows: [label, value, dashed] per field.
+  const split = (n: AppNode, editable: boolean, opensFirstPage: boolean) =>
+    docSettingRowsSplit(
+      docKeySettings(n, new Set(["site_login"])),
+      editable,
+      opensFirstPage,
+    );
+  const line = (n: AppNode, editable = true, opensFirstPage = false) =>
+    split(n, editable, opensFirstPage).line.map((row) => [
+      row.label,
+      row.value,
+      Boolean(row.unset),
+    ]);
+  const detailsLabels = (n: AppNode, opensFirstPage: boolean) =>
+    split(n, true, opensFirstPage).details.map((row) => row.label);
+  const login = (data: Record<string, unknown>) =>
+    node("login", { ...loginNodeDefaultData, ...data });
+
+  test.each([
+    [
+      "a filled login",
+      login({ parameterKeys: ["site_login"], url: "https://example.com/a" }),
+      [
+        ["Credential", "site_login", false],
+        ["URL", "https://example.com/a", false],
+      ],
+    ],
+    [
+      "a new login gets a dashed chip for each",
+      login({}),
+      [
+        ["Credential", "Not set", true],
+        ["URL", "Not set", true],
+      ],
+    ],
+    [
+      "a login whose first input is not a credential has no credential row, so no chip",
+      login({ parameterKeys: ["plain_input"], url: "" }),
+      [["URL", "Not set", true]],
+    ],
+  ])("%s", (_case, n, expected) => {
+    expect(line(n)).toEqual(expected);
+  });
+
+  test("a read-only Doc shows set fields only; an unset one stays in Details", () => {
+    expect(line(login({ url: "https://example.com/a" }), false)).toEqual([
+      ["URL", "https://example.com/a", false],
+    ]);
+  });
+
+  // The backend fails each of these with MissingStarterUrl when it opens the run's first page with no URL.
+  test.each([
+    ["navigation", navigationNodeDefaultData],
+    ["task", taskNodeDefaultData],
+    ["action", actionNodeDefaultData],
+    ["extraction", extractionNodeDefaultData],
+    ["fileDownload", fileDownloadNodeDefaultData],
+  ])(
+    "a %s step's URL: a dashed chip on the step that opens the first page, nowhere on a later one, on the line when set",
+    (type, data) => {
+      const step = node(type, data);
+      expect(line(step, true, true)).toContainEqual(["URL", "Not set", true]);
+      expect(line(step, true, false)).not.toContainEqual(
+        expect.arrayContaining(["URL"]),
+      );
+      expect(detailsLabels(step, false)).not.toContain("URL");
+      expect(
+        line(node(type, { ...data, url: "https://example.com/a" })),
+      ).toContainEqual(["URL", "https://example.com/a", false]);
+    },
+  );
+
+  test("Send Email always asks for its recipients; an unset subject stays in Details", () => {
+    expect(line(node("sendEmail", sendEmailNodeDefaultData))).toEqual([
+      ["Recipients", "Not set", true],
+    ]);
   });
 });
 

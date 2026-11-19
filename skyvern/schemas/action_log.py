@@ -9,10 +9,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
+from skyvern.utils.typed_value_policy import typed_text_looks_secret
+
 # Deliberate private import: the action log must scrub URLs exactly like synthesis does,
 # without forking the scrubber or modifying the copilot module.
-from skyvern.forge.sdk.copilot.code_block_synthesis import _scrub_url_for_code_literal
-from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
+from skyvern.utils.url_validators import scrub_url_for_code_literal
 
 ACTION_LOG_SCHEMA_VERSION: Literal[1] = 1
 ACTION_LOG_ALLOWED_TOOLS: frozenset[str] = frozenset(
@@ -163,7 +164,7 @@ class ActionLogPage(BaseModel):
 def _scrub_action_log_url(source_url: str) -> str:
     """Apply the replay scrubber, then remove secret-shaped URL components for durable storage."""
 
-    scrubbed = _scrub_url_for_code_literal(source_url)
+    scrubbed = scrub_url_for_code_literal(source_url)
     scheme, separator, _ = scrubbed.partition(":")
     if separator and typed_text_looks_secret(scheme):
         return _REDACTED
@@ -263,7 +264,7 @@ def project_action_event(
     if source_url is None:
         filtered_source_url = None
     elif replay_compatible:
-        filtered_source_url = _scrub_url_for_code_literal(source_url)
+        filtered_source_url = scrub_url_for_code_literal(source_url)
     else:
         filtered_source_url = _scrub_action_log_url(source_url)
 

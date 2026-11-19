@@ -5,8 +5,11 @@ from collections.abc import Iterable
 from typing import Any
 
 import pydantic
-import pydantic.json
 import structlog
+
+# Imported eagerly: `pydantic.json` loads this lazily, and a first load under freezegun keys its encoders on the fake
+# datetime class, so real datetimes stop serializing for the rest of the process.
+from pydantic.deprecated.json import pydantic_encoder
 from sqlalchemy import Column, ColumnElement, Table, func, inspect, or_
 
 from skyvern.constants import SCRUBBED_VALUE
@@ -90,36 +93,8 @@ from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, S
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.actions import (
+    ACTION_TYPE_TO_CLASS,
     Action,
-    ActionType,
-    CheckboxAction,
-    ClickAction,
-    ClosePageAction,
-    CompleteAction,
-    DownloadFileAction,
-    DragAction,
-    ExecuteJsAction,
-    ExtractAction,
-    GoBackAction,
-    GoForwardAction,
-    GotoUrlAction,
-    HoverAction,
-    InputTextAction,
-    KeypressAction,
-    LeftMouseAction,
-    MoveAction,
-    NewTabAction,
-    NullAction,
-    PasteTextAction,
-    ReloadPageAction,
-    ScrollAction,
-    SelectOptionAction,
-    SolveCaptchaAction,
-    SwitchTabAction,
-    TerminateAction,
-    UploadFileAction,
-    VerificationCodeAction,
-    WaitAction,
 )
 
 LOG = structlog.get_logger()
@@ -264,39 +239,6 @@ def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
     return result
 
 
-# Mapping of action types to their corresponding action classes
-ACTION_TYPE_TO_CLASS = {
-    ActionType.CLICK: ClickAction,
-    ActionType.INPUT_TEXT: InputTextAction,
-    ActionType.PASTE_TEXT: PasteTextAction,
-    ActionType.UPLOAD_FILE: UploadFileAction,
-    ActionType.DOWNLOAD_FILE: DownloadFileAction,
-    ActionType.NULL_ACTION: NullAction,
-    ActionType.TERMINATE: TerminateAction,
-    ActionType.COMPLETE: CompleteAction,
-    ActionType.SELECT_OPTION: SelectOptionAction,
-    ActionType.CHECKBOX: CheckboxAction,
-    ActionType.WAIT: WaitAction,
-    ActionType.HOVER: HoverAction,
-    ActionType.SOLVE_CAPTCHA: SolveCaptchaAction,
-    ActionType.RELOAD_PAGE: ReloadPageAction,
-    ActionType.CLOSE_PAGE: ClosePageAction,
-    ActionType.NEW_TAB: NewTabAction,
-    ActionType.SWITCH_TAB: SwitchTabAction,
-    ActionType.EXTRACT: ExtractAction,
-    ActionType.SCROLL: ScrollAction,
-    ActionType.KEYPRESS: KeypressAction,
-    ActionType.MOVE: MoveAction,
-    ActionType.DRAG: DragAction,
-    ActionType.VERIFICATION_CODE: VerificationCodeAction,
-    ActionType.LEFT_MOUSE: LeftMouseAction,
-    ActionType.GOTO_URL: GotoUrlAction,
-    ActionType.GO_BACK: GoBackAction,
-    ActionType.GO_FORWARD: GoForwardAction,
-    ActionType.EXECUTE_JS: ExecuteJsAction,
-}
-
-
 def _scrub_nul_chars(obj: typing.Any) -> typing.Any:
     # PG text/jsonb cannot store NUL; strip it pre-serialization so strings that
     # spell out the escape sequence (\u0000) are not affected.
@@ -318,7 +260,7 @@ def _custom_json_serializer(*args, **kwargs) -> str:
     """
     if args:
         args = (_scrub_nul_chars(args[0]),) + args[1:]
-    return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
+    return json.dumps(*args, default=pydantic_encoder, **kwargs)
 
 
 def as_stored_json(value: typing.Any) -> typing.Any:

@@ -24,8 +24,8 @@ import {
 
 import { ProxyLocation, Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import {
   clearDeferredEdits,
   deferredEdits,
@@ -338,7 +338,7 @@ describe("RunStopButton concurrency with a live block run", () => {
 
   test("an editor-open layout is NOT carried into the run form (full runs reset)", () => {
     mockRun(Status.Completed);
-    renderAt("/workflows/wpid_1/studio?wr=wr_1&panes=editor,copilot");
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&panes=editor,ember");
 
     fireEvent.click(screen.getByRole("button", { name: "Re-run" }));
 
@@ -415,7 +415,7 @@ function renderSaveButton() {
 // list. Each case here has `contentDirty` stale-false to exercise that gap.
 describe("SaveButton confirmation gating", () => {
   afterEach(() => {
-    useCopilotProposalStore.setState({ proposal: null });
+    useEmberProposalStore.setState({ proposal: null });
     useWorkflowSnapshotStore.getState().clearSnapshot();
     useWorkflowHasChangesStore.setState({
       getSaveData: () => null,
@@ -427,7 +427,7 @@ describe("SaveButton confirmation gating", () => {
       draft: "",
       entrySnapshot: "",
       authoringInProgress: false,
-      copilotAcceptance: null,
+      emberAcceptance: null,
     });
   });
 
@@ -437,7 +437,7 @@ describe("SaveButton confirmation gating", () => {
       reason: "Finish the current authoring action before saving",
     },
     {
-      lock: { copilotAcceptance: Symbol("acceptance") },
+      lock: { emberAcceptance: Symbol("acceptance") },
       reason: "Wait for the Copilot change to finish",
     },
   ])(
@@ -461,15 +461,15 @@ describe("SaveButton confirmation gating", () => {
       act(() =>
         useWorkflowYamlEditorStore.setState({
           authoringInProgress: false,
-          copilotAcceptance: null,
+          emberAcceptance: null,
         }),
       );
       expect(save.matches(":disabled")).toBe(false);
     },
   );
 
-  test("disables Save while the Doc has a pending Copilot proposal", () => {
-    useCopilotProposalStore.setState({ proposal: {} as never });
+  test("disables Save while the Doc has a pending Ember proposal", () => {
+    useEmberProposalStore.setState({ proposal: {} as never });
 
     renderSaveButton();
     const save = screen.getByRole("button", {
@@ -481,7 +481,7 @@ describe("SaveButton confirmation gating", () => {
     fireEvent.click(save);
     expect(saveWorkflowSpy).not.toHaveBeenCalled();
 
-    act(() => useCopilotProposalStore.setState({ proposal: null }));
+    act(() => useEmberProposalStore.setState({ proposal: null }));
     expect(save.matches(":disabled")).toBe(false);
   });
 
@@ -655,7 +655,7 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
       getSaveData: () => null,
       saveIsPending: false,
     });
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       pendingGoalChanges: [],
       pendingBuild: null,
       generatingBlockLabel: null,
@@ -664,8 +664,8 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
     });
   });
 
-  test("asks instead of saving, and Apply asks the copilot to follow the new Goal", () => {
-    useCopilotActionStore.setState({
+  test("asks instead of saving, and Apply asks the Ember to follow the new Goal", () => {
+    useEmberActionStore.setState({
       pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: "Old" }],
     });
 
@@ -677,7 +677,7 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Apply new Goal" }));
 
-    expect(useCopilotActionStore.getState().pendingBuild).toEqual({
+    expect(useEmberActionStore.getState().pendingBuild).toEqual({
       blockLabel: "a",
       prompt: "New",
       applyingGoalChange: true,
@@ -691,9 +691,9 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
     useWorkflowHasChangesStore.setState({ getSaveData: () => edited });
     const undoGoalChange = vi.fn(() => {
       useWorkflowHasChangesStore.setState({ getSaveData: afterUndo });
-      useCopilotActionStore.getState().setPendingGoalChanges([]);
+      useEmberActionStore.getState().setPendingGoalChanges([]);
     });
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: "Old" }],
       undoGoalChange,
     });
@@ -710,7 +710,7 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
   });
 
   test("offers no undo when the old Goal is unknown", () => {
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: null }],
     });
 
@@ -729,7 +729,7 @@ describe("TitleSection title link + edit affordance", () => {
     clearDeferredEdits();
     useWorkflowYamlEditorStore.setState({
       commitInProgress: false,
-      copilotAcceptance: null,
+      emberAcceptance: null,
     });
     useWorkflowTitleStore.setState({ title: "My Workflow" });
     useWorkflowHasChangesStore.setState({ hasChanges: false });
@@ -784,7 +784,7 @@ describe("TitleSection title link + edit affordance", () => {
     renderTitleSection();
     const link = screen.getByRole("link", { name: "My Workflow" });
     expect(link.getAttribute("href")).toBe("/agents/wpid_abc/runs");
-    // jsdom can't evaluate :hover; pin the color cue (mirrors WorkflowScriptsPage's runs link).
+    // jsdom can't evaluate :hover; pin the color cue.
     expect(link.className).toContain("hover:text-blue-700");
     expect(link.className).toContain("dark:hover:text-blue-400");
     // Radix mounts the tooltip content on focus (visible + a11y copies), so
@@ -811,8 +811,8 @@ describe("TitleSection title link + edit affordance", () => {
   });
 
   test.each([
-    { commitInProgress: true, copilotAcceptance: null },
-    { commitInProgress: false, copilotAcceptance: Symbol("acceptance") },
+    { commitInProgress: true, emberAcceptance: null },
+    { commitInProgress: false, emberAcceptance: Symbol("acceptance") },
   ])("preserves a rename entered before the editor locks: %s", (lock) => {
     renderTitleSection();
     fireEvent.click(
@@ -832,7 +832,7 @@ describe("TitleSection title link + edit affordance", () => {
     act(() =>
       useWorkflowYamlEditorStore.setState({
         commitInProgress: false,
-        copilotAcceptance: null,
+        emberAcceptance: null,
       }),
     );
     expect(useWorkflowTitleStore.getState().title).toBe("Renamed during save");
@@ -851,7 +851,7 @@ describe("TitleSection title link + edit affordance", () => {
       });
       act(() =>
         useWorkflowYamlEditorStore.setState({
-          copilotAcceptance: Symbol("queued-send"),
+          emberAcceptance: Symbol("queued-send"),
         }),
       );
       view.unmount();
@@ -869,7 +869,7 @@ describe("TitleSection title link + edit affordance", () => {
         expect(useWorkflowTitleStore.getState().title).toBe(storeTitle);
         expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
         act(() =>
-          useWorkflowYamlEditorStore.setState({ copilotAcceptance: null }),
+          useWorkflowYamlEditorStore.setState({ emberAcceptance: null }),
         );
         const applies = storeTitle === "My Workflow";
         expect(useWorkflowTitleStore.getState().title).toBe(

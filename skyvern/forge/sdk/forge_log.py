@@ -1054,11 +1054,7 @@ def _secret_scrub_symbols() -> _SecretScrubSymbols:
     """
     global _secret_scrub_symbols_cache  # noqa: PLW0603
     if _secret_scrub_symbols_cache is None:
-        from skyvern.forge.sdk.copilot.secret_scrub import (
-            REDACTED_SECRET_PLACEHOLDER,
-            encoded_secret_variants,
-            log_scrub_values,
-        )
+        from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER, encoded_secret_variants, log_scrub_values
 
         _secret_scrub_symbols_cache = (REDACTED_SECRET_PLACEHOLDER, encoded_secret_variants, log_scrub_values)
     return _secret_scrub_symbols_cache

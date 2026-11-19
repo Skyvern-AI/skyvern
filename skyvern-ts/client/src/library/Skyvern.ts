@@ -187,7 +187,7 @@ export class Skyvern extends SkyvernClient {
      *
      * @param options - Optional configuration
      * @param options.timeout - Timeout in minutes for the session. Timeout is applied after the session is started.
-     *        Must be between 5 and 1440. Defaults to 60.
+     *        Must be between 5 and 240. Defaults to 60.
      * @param options.proxyLocation - Geographic proxy location to route the browser traffic through.
      *        This is only available in Skyvern Cloud.
      *
@@ -243,7 +243,7 @@ export class Skyvern extends SkyvernClient {
      *
      * @param options - Optional configuration
      * @param options.timeout - Timeout in minutes for the session. Timeout is applied after the session is started.
-     *        Must be between 5 and 1440. Defaults to 60. Only used when creating a new session.
+     *        Must be between 5 and 240. Defaults to 60. Only used when creating a new session.
      * @param options.proxyLocation - Geographic proxy location to route the browser traffic through.
      *        This is only available in Skyvern Cloud. Only used when creating a new session.
      *

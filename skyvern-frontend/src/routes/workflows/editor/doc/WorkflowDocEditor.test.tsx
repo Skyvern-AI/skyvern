@@ -24,7 +24,8 @@ import { ReactFlowProvider } from "@xyflow/react";
 import { MemoryRouter } from "react-router-dom";
 
 import { ProxyLocation } from "@/api/types";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 import {
@@ -45,7 +46,7 @@ import { docDetailsText } from "./docDetailsText";
 import { useDocRunCheckStore } from "./docRunCheckStore";
 import { WorkflowScopeContext } from "../WorkflowScopeContext";
 import { StudioShellContext } from "../../studio/StudioShellContext";
-import { DOC_COPILOT_NUDGE } from "./DocStarter";
+import { DOC_EMBER_NUDGE } from "./DocStarter";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { splitAtCaret } from "./docCaret";
@@ -56,6 +57,19 @@ import {
   noteDemonstrationStartFailed,
   useRecordingLauncherStore,
 } from "@/store/useRecordingLauncherStore";
+
+const toastSpy = vi.hoisted(() => vi.fn());
+vi.mock("@/components/ui/use-toast", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/components/ui/use-toast")>();
+  return {
+    ...actual,
+    toast: (...args: Parameters<typeof actual.toast>) => {
+      toastSpy(...args);
+      return actual.toast(...args);
+    },
+  };
+});
 
 vi.mock("./useDocLatestRunCompleted", () => ({
   useDocLatestRunCompleted: () => false,
@@ -144,7 +158,10 @@ function renderDoc(
 }
 
 // A Doc whose edits change what it renders: rerender() shows the graph the last edit left.
-function renderLiveDoc(blocks: WorkflowBlock[]) {
+function renderLiveDoc(
+  blocks: WorkflowBlock[],
+  workflowId: string | null = null,
+) {
   let current = getElements(blocks, settings(), true) as DocGraph;
   const client = new QueryClient();
   const edits: DocGraphEdits = {
@@ -157,19 +174,21 @@ function renderLiveDoc(blocks: WorkflowBlock[]) {
     addStep: () => null,
     duplicate: () => {},
   };
-  const view = () => (
+  const view = (readOnly: boolean) => (
     <QueryClientProvider client={client}>
       <MemoryRouter>
         <ReactFlowProvider>
-          <WorkflowDocEditor {...current} edits={edits} />
+          <WorkflowScopeContext.Provider value={{ workflowId, readOnly }}>
+            <WorkflowDocEditor {...current} edits={edits} />
+          </WorkflowScopeContext.Provider>
         </ReactFlowProvider>
       </MemoryRouter>
     </QueryClientProvider>
   );
-  const rendered = render(view());
+  const rendered = render(view(false));
   return {
     graph: () => current,
-    rerender: () => rendered.rerender(view()),
+    rerender: (readOnly = false) => rendered.rerender(view(readOnly)),
   };
 }
 
@@ -208,14 +227,14 @@ describe("WorkflowDocEditor navigation", () => {
     vi.unstubAllGlobals();
   });
 
-  describe("the Copilot suggestion", () => {
+  describe("the Ember suggestion", () => {
     const edits = {
       apply: vi.fn(),
       update: vi.fn(),
       addStep: vi.fn(),
       duplicate: vi.fn(),
     };
-    const nudge = () => document.querySelector("[data-doc-copilot-nudge]");
+    const nudge = () => document.querySelector("[data-doc-ember-nudge]");
     const checklist = () =>
       screen.queryByRole("region", { name: "Getting started" }) ??
       screen.queryByLabelText(/^Getting started/);
@@ -226,14 +245,14 @@ describe("WorkflowDocEditor navigation", () => {
     });
     afterEach(() => {
       localStorage.removeItem("skyvern.doc.gettingStarted");
-      useCopilotProposalStore.getState().setProposal(null);
+      useEmberProposalStore.getState().setProposal(null);
     });
 
-    test("a fresh empty Doc suggests Copilot alone; Dismiss hides it for good and the getting-started aids come back", () => {
+    test("a fresh empty Doc suggests Ember alone; Dismiss hides it for good and the getting-started aids come back", () => {
       renderDoc([], edits, "/", "wpid_1");
       // One onboarding aid at a time: no tip and no checklist beside the suggestion.
       const tipOrChecklist = () =>
-        document.querySelector('[role="note"]:not([data-doc-copilot-nudge])') ??
+        document.querySelector('[role="note"]:not([data-doc-ember-nudge])') ??
         checklist();
       expect(nudge()).not.toBeNull();
       expect(tipOrChecklist()).toBeNull();
@@ -245,10 +264,10 @@ describe("WorkflowDocEditor navigation", () => {
       expect(nudge()).toBeNull();
     });
 
-    test("Try Copilot opens the Copilot pane and the suggestion does not come back", () => {
+    test("Try Ember opens the Ember pane and the suggestion does not come back", () => {
       renderDoc([], edits);
       fireEvent.click(screen.getByRole("button", { name: "Try Copilot" }));
-      expect(openPane).toHaveBeenCalledWith("copilot");
+      expect(openPane).toHaveBeenCalledWith("ember");
       expect(nudge()).toBeNull();
       cleanup();
       renderDoc([], edits);
@@ -281,7 +300,7 @@ describe("WorkflowDocEditor navigation", () => {
       expect(nudge()).toBeNull();
     });
 
-    test("asking Copilot while the suggestion shows answers it: it stays answered after the proposal clears", () => {
+    test("asking Ember while the suggestion shows answers it: it stays answered after the proposal clears", () => {
       renderDoc([], edits, "/", "wpid_1");
       expect(nudge()).not.toBeNull();
       const proposed = {
@@ -296,7 +315,7 @@ describe("WorkflowDocEditor navigation", () => {
         },
       } as unknown as WorkflowApiResponse;
       act(() =>
-        useCopilotProposalStore.getState().setProposal({
+        useEmberProposalStore.getState().setProposal({
           proposed,
           baseline: {
             ...proposed,
@@ -309,7 +328,7 @@ describe("WorkflowDocEditor navigation", () => {
         }),
       );
       expect(nudge()).toBeNull();
-      act(() => useCopilotProposalStore.getState().setProposal(null));
+      act(() => useEmberProposalStore.getState().setProposal(null));
       expect(nudge()).toBeNull();
       cleanup();
       renderDoc([], edits, "/", "wpid_1");
@@ -320,7 +339,7 @@ describe("WorkflowDocEditor navigation", () => {
       ["closed, folded, or open but not on screen", false, true],
       ["on screen beside the Doc", true, false],
     ])(
-      "with Copilot %s, the suggestion offers Try Copilot only when Copilot is not on screen",
+      "with Ember %s, the suggestion offers Try Ember only when Ember is not on screen",
       (_state, onScreen, offersTry) => {
         render(
           <QueryClientProvider client={new QueryClient()}>
@@ -328,12 +347,11 @@ describe("WorkflowDocEditor navigation", () => {
               <ReactFlowProvider>
                 <StudioShellContext.Provider
                   value={{
-                    copilotPortalEl: null,
-                    panelPortalEl: null,
+                    emberPortalEl: null,
                     setEditorStreamSlot: () => {},
                     setBrowserStreamSlot: () => {},
                     setRunStreamSlot: () => {},
-                    isPaneOnScreen: (id) => onScreen && id === "copilot",
+                    isPaneOnScreen: (id) => onScreen && id === "ember",
                   }}
                 >
                   <WorkflowDocEditor nodes={[]} edges={[]} edits={edits} />
@@ -343,7 +361,7 @@ describe("WorkflowDocEditor navigation", () => {
           </QueryClientProvider>,
         );
         expect(nudge()?.textContent).toContain(
-          offersTry ? DOC_COPILOT_NUDGE.text : DOC_COPILOT_NUDGE.textBeside,
+          offersTry ? DOC_EMBER_NUDGE.text : DOC_EMBER_NUDGE.textBeside,
         );
         expect(
           screen.queryByRole("button", { name: "Try Copilot" }) !== null,
@@ -853,7 +871,7 @@ describe("WorkflowDocEditor navigation", () => {
     expect(document.querySelector('[data-doc-missing="URL"]')).toBeTruthy();
   });
 
-  test("a step offers its prompt's URL for its empty URL field after Details, with the reason, and not while typing or read-only", () => {
+  test("a step offers its prompt URL with the reason, and not while typing or read-only", () => {
     const task = block("task", "search_step", "next_step", {
       url: "",
       navigation_goal: "Go to https://example.com/page and search for shoes",
@@ -877,6 +895,9 @@ describe("WorkflowDocEditor navigation", () => {
       screen.getByText("This step needs a page to start on."),
     ).toBeTruthy();
     expect(
+      screen.queryByRole("button", { name: /Add Page URL to Search step/ }),
+    ).toBeNull();
+    expect(
       screen.getByText(
         "Without a URL, this step starts on the previous step's page.",
       ),
@@ -885,13 +906,27 @@ describe("WorkflowDocEditor navigation", () => {
     const mainLine = screen.getByRole("textbox", {
       name: "search_step navigationGoal",
     });
-    fireEvent.focus(mainLine);
-    expect(offer()).toBe(null);
+    act(() => mainLine.focus());
+    expect(document.activeElement?.getAttribute("aria-label")).toBe(
+      "search_step navigationGoal",
+    );
+    expect(offer()).not.toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /Add Page URL to Search step/ }),
+    ).toBeNull();
+    const focusedTabStops = [
+      ...document.querySelectorAll<HTMLElement>('[role="textbox"], button'),
+    ];
+    expect(focusedTabStops.indexOf(offer()!)).toBeLessThan(
+      focusedTabStops.indexOf(
+        screen.getByRole("button", { name: /^Details for .*search/i }),
+      ),
+    );
     fireEvent.blur(
       screen.getByRole("textbox", { name: "search_step navigationGoal" }),
     );
 
-    // Forward Tab follows the DOM: the prompt, then Details, then the offer.
+    // The required URL offer is above Details, after the prompt.
     const tabbable = [
       ...document.querySelectorAll<HTMLElement>('[role="textbox"], button'),
     ];
@@ -902,11 +937,11 @@ describe("WorkflowDocEditor navigation", () => {
     const options = screen.getByRole("button", {
       name: /^Details for .*search/i,
     });
-    expect(at(prompt)).toBeLessThan(at(options));
-    expect(at(options)).toBeLessThan(at(offer()!));
+    expect(at(prompt)).toBeLessThan(at(offer()!));
+    expect(at(offer()!)).toBeLessThan(at(options));
     expect(
       tabbable
-        .slice(at(options) + 1, at(offer()!))
+        .slice(at(offer()!) + 1, at(options))
         .some((el) => el.getAttribute("role") === "textbox"),
     ).toBe(false);
 
@@ -926,9 +961,9 @@ describe("WorkflowDocEditor navigation", () => {
     );
 
     // Dismissing an offer puts focus back on its step's prompt line.
-    const nextOffer = document.querySelector<HTMLElement>(
-      '[data-doc-suggestion="url"]',
-    )!;
+    const nextOffer = screen
+      .getByRole("button", { name: "Use https://example.com/other as the URL" })
+      .closest<HTMLElement>('[data-doc-suggestion="url"]')!;
     fireEvent.click(within(nextOffer).getByRole("button", { name: "Dismiss" }));
     expect(nextOffer.isConnected).toBe(false);
     expect(document.activeElement?.getAttribute("aria-label")).toBe(
@@ -940,16 +975,392 @@ describe("WorkflowDocEditor navigation", () => {
     expect(offer()).toBe(null);
   });
 
-  test("a step's URL offer comes back after a demonstration takes editing away while its prompt is focused and focus moves on", () => {
+  test("typing after focus hides the offer without inserting a chip above the prompt", () => {
+    const doc = renderLiveDoc([
+      block("task", "typing_step", null, {
+        url: "",
+        navigation_goal: "Go to https://example.com/page",
+      }),
+    ]);
+    const prompt = screen.getByRole("textbox", {
+      name: "typing_step navigationGoal",
+    });
+    fireEvent.focus(prompt);
+    expect(
+      screen.getByRole("button", {
+        name: "Use https://example.com/page as the URL",
+      }),
+    ).toBeTruthy();
+    const focusedPrompt = screen.getByRole("textbox", {
+      name: "typing_step navigationGoal",
+    });
+    Object.defineProperty(focusedPrompt, "innerText", {
+      value: "Go to https://exa",
+      configurable: true,
+    });
+    fireEvent.input(focusedPrompt);
+    expect(
+      (
+        doc.graph().nodes.find((node) => node.data.label === "typing_step")!
+          .data as Record<string, unknown>
+      ).navigationGoal,
+    ).toBe("Go to https://exa");
+    doc.rerender();
+    expect(
+      screen.queryByRole("button", { name: /Use .* as the URL/ }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /Add Page URL to Typing step/ }),
+    ).toBeNull();
+  });
+
+  test("opening the reference menu does not reset the prompt focus snapshot", async () => {
+    Object.defineProperty(document, "execCommand", {
+      value: vi.fn(() => true),
+      configurable: true,
+    });
+    onTestFinished(() => {
+      Reflect.deleteProperty(document, "execCommand");
+    });
+    const doc = renderLiveDoc([
+      block("task", "reference_step", null, {
+        url: "",
+        navigation_goal: "Search ",
+      }),
+    ]);
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "reference_step navigationGoal" })
+        .focus(),
+    );
+    const prompt = screen.getByRole("textbox", {
+      name: "reference_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Search https://example.com/page ",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    const focusedPrompt = screen.getByRole("textbox", {
+      name: "reference_step navigationGoal",
+    });
+    const selection = window.getSelection()!;
+    const range = document.createRange();
+    range.selectNodeContents(focusedPrompt);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    fireEvent.keyDown(focusedPrompt, { key: "@" });
+    const menu = await screen.findByPlaceholderText("Insert a reference…");
+    expect(document.activeElement).toBe(menu);
+    clearDocAnnouncement();
+    fireEvent.blur(menu, { relatedTarget: document.body });
+    expect(docAnnouncement()).toBe("");
+    expect(
+      screen.getByRole("button", { name: /Add Page URL to Reference step/ }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /Use .* as the URL/ }),
+    ).toBeNull();
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText("Insert a reference…")).toBeNull(),
+    );
+    expect(
+      screen.getByRole("button", { name: /Add Page URL to Reference step/ }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /Use .* as the URL/ }),
+    ).toBeNull();
+    clearDocAnnouncement();
+    fireEvent.blur(focusedPrompt);
+    expect(docAnnouncement()).toBe("A URL suggestion is available.");
+  });
+
+  test("the slash picker preserves the prompt snapshot when focus leaves its menu", async () => {
+    Object.defineProperty(document, "execCommand", {
+      value: vi.fn(() => true),
+      configurable: true,
+    });
+    onTestFinished(() => {
+      Reflect.deleteProperty(document, "execCommand");
+    });
+    const doc = renderLiveDoc([
+      block("task", "slash_step", null, {
+        url: "",
+        navigation_goal: "Search ",
+      }),
+    ]);
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "slash_step navigationGoal" })
+        .focus(),
+    );
+    const prompt = screen.getByRole("textbox", {
+      name: "slash_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Search https://example.com/page\n",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    const line = screen.getByRole("textbox", {
+      name: "slash_step navigationGoal",
+    });
+    line.textContent = "Search https://example.com/page\n";
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    range.collapse(false);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    clearDocAnnouncement();
+    fireEvent.keyDown(line, { key: "/" });
+    const menu = await screen.findByPlaceholderText("Add a step…");
+    expect(document.activeElement).toBe(menu);
+    fireEvent.blur(menu, { relatedTarget: document.body });
+    expect(docAnnouncement()).toBe("");
+    expect(
+      screen.getByRole("button", { name: /Add Page URL to Slash step/ }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /Use .* as the URL/ }),
+    ).toBeNull();
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText("Add a step…")).toBeNull(),
+    );
+    clearDocAnnouncement();
+    fireEvent.blur(
+      screen.getByRole("textbox", { name: "slash_step navigationGoal" }),
+    );
+    expect(docAnnouncement()).toBe("A URL suggestion is available.");
+  });
+
+  test("picking a loop releases the prompt focus snapshot", async () => {
+    const doc = renderLiveDoc([
+      block("task", "pick_step", null, { url: "", navigation_goal: "Search " }),
+    ]);
+    act(() =>
+      screen.getByRole("textbox", { name: "pick_step navigationGoal" }).focus(),
+    );
+    const prompt = screen.getByRole("textbox", {
+      name: "pick_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Search https://example.com/page\n",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    const line = screen.getByRole("textbox", {
+      name: "pick_step navigationGoal",
+    });
+    line.textContent = "Search https://example.com/page\n";
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    range.collapse(false);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.keyDown(line, { key: "/" });
+    const menu = await screen.findByPlaceholderText("Add a step…");
+    fireEvent.change(menu, { target: { value: "loop" } });
+    fireEvent.click(screen.getAllByRole("option")[0]!);
+    doc.rerender();
+    expect(
+      screen.getByRole("button", {
+        name: "Use https://example.com/page as the URL",
+      }),
+    ).toBeTruthy();
+  });
+
+  test.each(["", "Search "])(
+    "locking a %s prompt closes its reference menu and resets focus",
+    async (text) => {
+      const doc = renderLiveDoc([
+        block("task", "lock_step", null, { url: "", navigation_goal: text }),
+      ]);
+      act(() =>
+        screen
+          .getByRole("textbox", { name: "lock_step navigationGoal" })
+          .focus(),
+      );
+      const line = screen.getByRole("textbox", {
+        name: "lock_step navigationGoal",
+      });
+      const range = document.createRange();
+      range.selectNodeContents(line);
+      range.collapse(false);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      fireEvent.keyDown(line, { key: "@" });
+      await screen.findByPlaceholderText("Insert a reference…");
+      doc.rerender(true);
+      expect(screen.queryByPlaceholderText("Insert a reference…")).toBeNull();
+      doc.rerender(false);
+      act(() =>
+        screen
+          .getByRole("textbox", { name: "lock_step navigationGoal" })
+          .focus(),
+      );
+      const prompt = screen.getByRole("textbox", {
+        name: "lock_step navigationGoal",
+      });
+      Object.defineProperty(prompt, "innerText", {
+        value: "Search https://exa",
+        configurable: true,
+      });
+      fireEvent.input(prompt);
+      doc.rerender();
+      expect(
+        screen.queryByRole("button", { name: /Use .* as the URL/ }),
+      ).toBeNull();
+      expect(
+        screen.getByRole("button", { name: /Add Page URL to Lock step/ }),
+      ).toBeTruthy();
+    },
+  );
+
+  test("locking a prompt closes its slash picker", async () => {
+    const doc = renderLiveDoc([
+      block("task", "locked_slash", null, {
+        url: "",
+        navigation_goal: "Search ",
+      }),
+    ]);
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "locked_slash navigationGoal" })
+        .focus(),
+    );
+    const line = screen.getByRole("textbox", {
+      name: "locked_slash navigationGoal",
+    });
+    line.textContent = "Search\n";
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    range.collapse(false);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.keyDown(line, { key: "/" });
+    await screen.findByPlaceholderText("Add a step…");
+    doc.rerender(true);
+    expect(screen.queryByPlaceholderText("Add a step…")).toBeNull();
+    doc.rerender(false);
+    expect(screen.queryByPlaceholderText("Add a step…")).toBeNull();
+  });
+
+  test("unchanged or URL-free edits do not announce a suggestion on blur", () => {
+    const doc = renderLiveDoc([
+      block("task", "quiet_step", null, {
+        url: "",
+        navigation_goal: "Go to https://example.com/page",
+      }),
+    ]);
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "quiet_step navigationGoal" })
+        .focus(),
+    );
+    clearDocAnnouncement();
+    fireEvent.blur(
+      screen.getByRole("textbox", { name: "quiet_step navigationGoal" }),
+    );
+    expect(docAnnouncement()).toBe("");
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "quiet_step navigationGoal" })
+        .focus(),
+    );
+    const prompt = screen.getByRole("textbox", {
+      name: "quiet_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Search for results",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    clearDocAnnouncement();
+    fireEvent.blur(
+      screen.getByRole("textbox", { name: "quiet_step navigationGoal" }),
+    );
+    expect(docAnnouncement()).toBe("");
+  });
+
+  test("an optional later-step URL suggestion is announced without a position", () => {
+    const doc = renderLiveDoc([
+      block("task", "first_page", "later_step", {
+        url: "https://example.com",
+        navigation_goal: "Open page",
+      }),
+      block("task", "later_step", null, { url: "", navigation_goal: "Search" }),
+    ]);
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "later_step navigationGoal" })
+        .focus(),
+    );
+    const prompt = screen.getByRole("textbox", {
+      name: "later_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Search https://example.com/later",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    clearDocAnnouncement();
+    fireEvent.blur(
+      screen.getByRole("textbox", { name: "later_step navigationGoal" }),
+    );
+    expect(docAnnouncement()).toBe("A URL suggestion is available.");
+    expect(
+      screen.getByRole("button", {
+        name: "Use https://example.com/later as the URL",
+      }),
+    ).toBeTruthy();
+  });
+
+  test("dismissing a required URL offer restores the URL settings chip", () => {
     renderDoc(
       [
-        block("task", "focus_step", null, {
+        block("task", "offer_step", null, {
           url: "",
-          navigation_goal: "Go to https://example.com/focus and search",
+          navigation_goal: "Go to https://example.com/page and search",
         }),
       ],
       { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
     );
+    expect(
+      screen.queryByRole("button", { name: /Add Page URL to Offer step/ }),
+    ).toBeNull();
+    const suggestion = document.querySelector<HTMLElement>(
+      '[data-doc-suggestion="url"]',
+    )!;
+    fireEvent.click(
+      within(suggestion).getByRole("button", { name: "Dismiss" }),
+    );
+    expect(
+      screen.getByRole("button", { name: /Add Page URL to Offer step/ }),
+    ).toBeTruthy();
+  });
+
+  test("an invalid browser URL shows the existing address validation on the step", () => {
+    renderDoc([block("navigation", "bad_page", null, { url: "shop" })]);
+    expect(
+      screen.getByText("Enter a full web address, like example.com."),
+    ).toBeTruthy();
+  });
+
+  test("a step's URL offer comes back after a demonstration takes editing away while its prompt is focused and focus moves on", () => {
+    const doc = renderLiveDoc([
+      block("task", "focus_step", null, {
+        url: "",
+        navigation_goal: "Go to https://example.com/focus and search",
+      }),
+    ]);
     const offer = () =>
       screen.queryByRole("button", {
         name: "Use https://example.com/focus as the URL",
@@ -957,7 +1368,17 @@ describe("WorkflowDocEditor navigation", () => {
     fireEvent.focus(
       screen.getByRole("textbox", { name: "focus_step navigationGoal" }),
     );
-    expect(offer()).toBe(null);
+    expect(offer()).not.toBeNull();
+    const prompt = screen.getByRole("textbox", {
+      name: "focus_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Go to https://example.com/focus and search now",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    expect(offer()).toBeNull();
     act(() =>
       useRecordingLauncherStore.setState({
         demonstration: {
@@ -1457,9 +1878,7 @@ describe("WorkflowDocEditor navigation", () => {
     });
     const openPanel = () => {
       fireEvent.click(toggle);
-      fireEvent.click(
-        screen.getByRole("button", { name: "More details in the side panel" }),
-      );
+      fireEvent.click(screen.getByRole("button", { name: "All settings" }));
       expect(
         screen.getByRole("complementary", { name: "Document panel" }),
       ).toBeTruthy();
@@ -1620,7 +2039,8 @@ describe("WorkflowDocEditor navigation", () => {
     const options = within(
       document.getElementById(toggle.getAttribute("aria-controls")!)!,
     );
-    expect(options.getByText("Custom settings")).toBeTruthy();
+    // Both changed fields are key settings, so there is no Custom settings section.
+    expect(options.queryByText("Custom settings")).toBeNull();
     expect(options.getByText("Max steps").nextElementSibling?.textContent).toBe(
       "12",
     );
@@ -1630,9 +2050,7 @@ describe("WorkflowDocEditor navigation", () => {
     // Settings at their default appear only in the side panel.
     expect(options.queryByText("Continue on failure")).toBeNull();
 
-    fireEvent.click(
-      options.getByRole("button", { name: "More details in the side panel" }),
-    );
+    fireEvent.click(options.getByRole("button", { name: "All settings" }));
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     const selected = within(screen.getByLabelText("Selected step"));
     expect(selected.getByText("Find prices")).toBeTruthy();
@@ -1687,7 +2105,7 @@ describe("WorkflowDocEditor navigation", () => {
     // A read-only Doc's side panel cannot show the settings, so Details does not point there.
     expect(
       readOnlyBox.queryByRole("button", {
-        name: "More details in the side panel",
+        name: "All settings",
       }),
     ).toBeNull();
   });
@@ -1974,9 +2392,9 @@ describe("a step that was just added", () => {
 
     fireEvent.pointerDown(document.body);
 
-    expect(screen.getAllByText(docDetailsText.noCredential(true))).toHaveLength(
-      1,
-    );
+    expect(
+      screen.getAllByText(docDetailsText.noCredential(true, false)),
+    ).toHaveLength(1);
     expect(document.querySelector("[data-doc-problems]")?.textContent).toBe(
       "1 problem",
     );
@@ -1986,7 +2404,9 @@ describe("a step that was just added", () => {
   test("a read-only Doc's credential line does not send the user to the side panel, and its Jump leaves Details closed", async () => {
     useWorkflowYamlEditorStore.setState({ commitInProgress: true });
     renderDoc([block("login", "sign_in", null, { url: "" })]);
-    expect(screen.getByText(docDetailsText.noCredential(false))).toBeTruthy();
+    expect(
+      screen.getByText(docDetailsText.noCredential(false, false)),
+    ).toBeTruthy();
     expect(screen.queryByText(/side panel to choose/)).toBeNull();
     fireEvent.click(
       document.querySelector<HTMLElement>("[data-doc-problems]")!,
@@ -2002,6 +2422,249 @@ describe("a step that was just added", () => {
         .getByRole("button", { name: /^Details for/ })
         .getAttribute("aria-expanded"),
     ).toBe("false");
+  });
+
+  test("an editable login's credential and page are on its summary line, not in Details, and its Jump leaves Details closed", async () => {
+    const edits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    renderDoc([block("login", "sign_in", null, { url: "" })], edits);
+    expect(
+      screen.getByRole("button", { name: "Add Credential to Sign in" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(docDetailsText.noCredential(true, true)),
+    ).toBeTruthy();
+    fireEvent.click(
+      document.querySelector<HTMLElement>("[data-doc-problems]")!,
+    );
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByText(
+        /no saved credential/,
+      ),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const toggle = screen.getByRole("button", { name: /^Details for/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    const details = document.getElementById(
+      toggle.getAttribute("aria-controls")!,
+    )!;
+    expect(within(details).queryByText("Credential")).toBeNull();
+    expect(within(details).queryByText("URL")).toBeNull();
+    expect(within(details).getByText("2FA")).toBeTruthy();
+  });
+
+  test("a login in a section the Doc shows read-only gets no chip, its fix line names no control, and its Jump leaves Details closed", async () => {
+    const edits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    // Two branches with one id are a shape the Doc can't show, so the conditional and its steps are read-only.
+    renderDoc(
+      [
+        conditional("route", null, [
+          { id: "same", next: "sign_in", when: "found" },
+          { id: "same", next: null },
+        ]),
+        block("login", "sign_in", null, { url: "" }),
+      ],
+      edits,
+    );
+    fireEvent.pointerDown(document.body);
+    expect(
+      screen.queryByRole("button", { name: "Add Credential to Sign in" }),
+    ).toBeNull();
+    expect(document.querySelector("[data-doc-meta-add]")).toBeNull();
+    expect(
+      screen.getByText(docDetailsText.noCredential(false, false)),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText(/Open this step's settings|Click Credential/),
+    ).toBeNull();
+    fireEvent.click(
+      document.querySelector<HTMLElement>("[data-doc-problems]")!,
+    );
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByText(
+        /no saved credential/,
+      ),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(
+      screen
+        .getByRole("button", { name: "Details for Sign in" })
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
+  });
+
+  test.each([
+    [true, "editable"],
+    [false, "not editable"],
+  ])(
+    "a step that is %s: the line shows the host, and only a step whose settings cannot open lists the full URL in Details",
+    (canEdit) => {
+      const url = "https://example.com/list/page?sort=new";
+      renderDoc(
+        [
+          block("navigation", "the_step", null, {
+            url,
+            navigation_goal: "Read the list",
+          }),
+        ],
+        canEdit
+          ? {
+              apply: vi.fn(),
+              update: vi.fn(),
+              addStep: vi.fn(),
+              duplicate: vi.fn(),
+            }
+          : undefined,
+      );
+      const line = document.querySelector<HTMLElement>("[data-doc-meta]")!;
+      expect(line.textContent).toContain("example.com");
+      expect(line.textContent).not.toContain("/list");
+      const toggle = screen.getByRole("button", {
+        name: "Details for The step",
+      });
+      if (toggle.getAttribute("aria-expanded") !== "true")
+        fireEvent.click(toggle);
+      const details = within(
+        document.getElementById(toggle.getAttribute("aria-controls")!)!,
+      );
+      if (canEdit) expect(details.queryByText(url)).toBeNull();
+      else expect(details.getByText(url)).toBeTruthy();
+    },
+  );
+
+  test("only the first page-opening step without a URL asks for one", () => {
+    renderDoc(
+      [
+        block("navigation", "first_page", "next_page", {
+          url: "",
+          navigation_goal: "Open the list",
+        }),
+        block("navigation", "next_page", null, {
+          url: "",
+          navigation_goal: "Open the next item",
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    expect(
+      screen.getByRole("button", { name: "Add Page URL to First page" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Add Page URL to Next page" }),
+    ).toBeNull();
+  });
+
+  test.each([
+    [
+      "send_email",
+      "Recipients",
+      { recipients: [], subject: "", body: "", file_attachments: [] },
+    ],
+    ["workflow_trigger", "Agent", { workflow_permanent_id: "" }],
+  ])(
+    "an editable %s step asks for its %s with a dashed chip marked required, not also a required pill",
+    (blockType, label, extra) => {
+      renderDoc([block(blockType, "the_step", null, extra)], {
+        apply: vi.fn(),
+        update: vi.fn(),
+        addStep: vi.fn(),
+        duplicate: vi.fn(),
+      });
+      const chip = screen.getByRole("button", {
+        name: `Add ${label} to The step (required)`,
+      });
+      expect(chip.querySelector("[data-doc-meta-required]")).toBeTruthy();
+      expect(document.querySelector("[data-doc-missing]")).toBeNull();
+    },
+  );
+
+  test("re-rendering with the same graph and a new edits object writes nothing new to the run check", () => {
+    const { nodes, edges } = getElements(
+      [block("login", "sign_in", null, { url: "" })],
+      settings(),
+      true,
+    );
+    const view = () => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <WorkflowDocEditor
+              nodes={nodes}
+              edges={edges}
+              edits={{
+                apply: vi.fn(),
+                update: vi.fn(),
+                addStep: vi.fn(),
+                duplicate: vi.fn(),
+              }}
+            />
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    const client = new QueryClient();
+    const rendered = render(view());
+    let writes = 0;
+    const stop = useDocRunCheckStore.subscribe(() => writes++);
+    for (let i = 0; i < 20; i++) rendered.rerender(view());
+    stop();
+    expect(useDocRunCheckStore.getState().critical.length).toBeGreaterThan(0);
+    expect(writes).toBe(0);
+  });
+
+  test("a login's unset 2FA and error codes offer add buttons that open the settings; set ones show the value; read-only offers none", () => {
+    const edits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    const openDetails = () => {
+      const toggle = screen.getByRole("button", { name: /^Details for/ });
+      fireEvent.click(toggle);
+      return within(
+        document.getElementById(toggle.getAttribute("aria-controls")!)!,
+      );
+    };
+    renderDoc([block("login", "sign_in", null, { url: "" })], edits);
+    let details = openDetails();
+    expect(details.getByText("2FA").nextElementSibling?.textContent).toBe(
+      "Not set" + "Add 2FA",
+    );
+    fireEvent.click(details.getByRole("button", { name: "Add error code" }));
+    expect(
+      screen.getByRole("complementary", { name: "Document panel" }),
+    ).toBeTruthy();
+    cleanup();
+    renderDoc(
+      [
+        block("login", "sign_in", null, {
+          url: "",
+          totp_identifier: "codes@example.com",
+        }),
+      ],
+      edits,
+    );
+    details = openDetails();
+    expect(details.getByText("2FA").nextElementSibling?.textContent).toBe(
+      "codes@example.com",
+    );
+    expect(details.queryByRole("button", { name: "Add 2FA" })).toBeNull();
+    cleanup();
+    renderDoc([block("login", "sign_in", null, { url: "" })]);
+    details = openDetails();
+    expect(details.queryByRole("button", { name: /^Add / })).toBeNull();
+    expect(details.queryByRole("button", { name: "All settings" })).toBeNull();
   });
 
   test.each([
@@ -2734,5 +3397,977 @@ describe("Demonstrate task in the step menu", () => {
       );
       expect(applied.apply).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("the Add note button", () => {
+  beforeEach(() => {
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState({ parameters: [] });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.stubGlobal("requestAnimationFrame", (cb: () => void) => {
+      cb();
+      return 0;
+    });
+    vi.stubGlobal("CSS", { escape: (value: string) => value });
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  const steps = () => [
+    block("wait", "open_site", "read_page", { wait_sec: 5 }),
+    block("navigation", "read_page", null, {
+      navigation_goal: "Read the page",
+    }),
+  ];
+  const typeNote = (text: string) => {
+    const note = screen.getByRole("textbox", { name: "Note" });
+    expect(document.activeElement).toBe(note);
+    Object.defineProperty(note, "innerText", {
+      value: text,
+      configurable: true,
+    });
+    fireEvent.input(note);
+  };
+  const notesOf = (doc: ReturnType<typeof renderLiveDoc>) =>
+    Object.fromEntries(
+      doc
+        .graph()
+        .nodes.filter(isWorkflowBlockNode)
+        .map((n) => {
+          const data = n.data as Record<string, unknown>;
+          return [n.data.label, [data.notes ?? "", data.trailingNotes ?? ""]];
+        }),
+    );
+  const addNote = (step: string) =>
+    screen.getByRole("button", { name: `Add note below ${step}` });
+  const addNoteButtons = () =>
+    screen.queryAllByRole("button", { name: /^Add note below / });
+  const firstLine = () => screen.getByRole("textbox", { name: /^open_site / });
+
+  test("is on every step without hovering, and saves the same note as Enter at the end of a step", () => {
+    const byEnter = renderLiveDoc(steps());
+    expect(addNoteButtons().map((b) => b.getAttribute("aria-label"))).toEqual([
+      "Add note below Open site",
+      "Add note below Read page",
+    ]);
+    fireEvent.focus(firstLine());
+    fireEvent.keyDown(firstLine(), { key: "Enter" });
+    typeNote("Check the total");
+    const expected = notesOf(byEnter);
+    cleanup();
+
+    const byButton = renderLiveDoc(steps());
+    fireEvent.click(addNote("Open site"));
+    typeNote("Check the total");
+    expect(notesOf(byButton)).toEqual(expected);
+    expect(expected.read_page).toEqual(["Check the total", ""]);
+  });
+
+  test("after the last step it adds the note that trails it", () => {
+    const doc = renderLiveDoc(steps());
+    fireEvent.click(addNote("Read page"));
+    typeNote("Done here");
+    expect(notesOf(doc).read_page).toEqual(["", "Done here"]);
+  });
+
+  test("where a note already follows the step it goes to that note", () => {
+    const doc = renderLiveDoc([
+      steps()[0]!,
+      block("navigation", "read_page", null, {
+        navigation_goal: "Read the page",
+        notes: "Look closely",
+      }),
+    ]);
+    fireEvent.click(addNote("Open site"));
+    expect(screen.getAllByRole("textbox", { name: "Note" })).toHaveLength(1);
+    expect(document.activeElement).toBe(
+      screen.getByRole("textbox", { name: "Note" }),
+    );
+    expect(notesOf(doc).read_page).toEqual(["Look closely", ""]);
+  });
+
+  test("Escape on the empty note it opened returns focus to + Note", () => {
+    renderLiveDoc(steps());
+    fireEvent.click(addNote("Open site"));
+    const note = screen.getByRole("textbox", { name: "Note" });
+    expect(document.activeElement).toBe(note);
+    fireEvent.keyDown(note, { key: "Escape" });
+    expect(document.activeElement).toBe(addNote("Open site"));
+  });
+
+  test("Enter at the end of a step that keeps a note under it goes to that note, as + Note does", () => {
+    const doc = renderLiveDoc([
+      block("wait", "open_site", "read_page", {
+        wait_sec: 5,
+        trailing_notes: "Wait for the banner",
+      }),
+      steps()[1]!,
+    ]);
+    fireEvent.focus(firstLine());
+    fireEvent.keyDown(firstLine(), { key: "Enter" });
+    expect(screen.getAllByRole("textbox", { name: "Note" })).toHaveLength(1);
+    expect(notesOf(doc).read_page).toEqual(["", ""]);
+  });
+
+  test("is not offered on a loop or a read-only Doc", () => {
+    renderLiveDoc([forLoop("each_row", null, [code("inner_step", null)])]);
+    expect(addNoteButtons()).toHaveLength(1);
+    cleanup();
+    renderDoc([steps()[1]!]);
+    expect(addNoteButtons()).toHaveLength(0);
+  });
+
+  test("on a step that keeps a note under it and has a step after it, it goes to that note", () => {
+    const doc = renderLiveDoc([
+      block("wait", "open_site", "read_page", {
+        wait_sec: 5,
+        trailing_notes: "Wait for the banner",
+      }),
+      steps()[1]!,
+    ]);
+    fireEvent.click(addNote("Open site"));
+    const notes = screen.getAllByRole("textbox", { name: "Note" });
+    expect(notes).toHaveLength(1);
+    expect(document.activeElement).toBe(notes[0]);
+    expect(notes[0]!.getAttribute("contenteditable")).toBe("plaintext-only");
+    expect(notesOf(doc)).toEqual({
+      open_site: ["", "Wait for the banner"],
+      read_page: ["", ""],
+    });
+  });
+});
+
+describe("a long step text", () => {
+  const LONG =
+    "Open the report.\nCheck every row.\nNote each difference.\nWAIT_FOR_THE_LAST_LINE and stop.";
+  beforeEach(() => {
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState({ parameters: [] });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.stubGlobal("requestAnimationFrame", (cb: () => void) => {
+      cb();
+      return 0;
+    });
+    vi.stubGlobal("CSS", { escape: (value: string) => value });
+    Element.prototype.scrollIntoView = vi.fn();
+    // jsdom has no layout: a text with four lines measures four lines high (24.8px each at the default font). It has no
+    // innerText either, so the editing span of a long step is measured by that step's text.
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        const editingLong =
+          this.isContentEditable ||
+          this.getAttribute("contenteditable") === "plaintext-only"
+            ? /^(long_step|other_long) /.test(
+                this.getAttribute("aria-label") ?? "",
+              )
+            : false;
+        const text = editingLong ? LONG : (this.textContent ?? "");
+        return text.split("\n").length * 24.8;
+      },
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    useLocateBlockStore.getState().clearLocate();
+    vi.unstubAllGlobals();
+    // @ts-expect-error removing the jsdom layout stub restores the prototype's own getter
+    delete HTMLElement.prototype.scrollHeight;
+  });
+
+  const steps = () => [
+    block("navigation", "long_step", "short_step", { navigation_goal: LONG }),
+    block("navigation", "short_step", "other_long", {
+      navigation_goal: "Click Next.\nWait.\nStop.",
+    }),
+    block("navigation", "other_long", null, {
+      navigation_goal: LONG.replace("Open the report.", "Read the terms."),
+    }),
+  ];
+  const textbox = (label: string) =>
+    screen.getByRole("textbox", { name: `${label} navigationGoal` });
+  const folded = (label: string) => textbox(label).style.overflow === "hidden";
+
+  test("folds only a text longer than three lines, keeps all of it in the page, and saves nothing", () => {
+    const live = renderLiveDoc(steps());
+    const before = live.graph();
+
+    const controls = screen.getAllByRole("button", { name: /^Show more/ });
+    expect(controls).toHaveLength(2);
+    expect(controls[0]!.getAttribute("aria-expanded")).toBe("false");
+    expect(controls[0]!.getAttribute("aria-controls")).toBe(
+      textbox("long_step").id,
+    );
+    expect(folded("long_step")).toBe(true);
+    expect(textbox("long_step").textContent).toContain(
+      "WAIT_FOR_THE_LAST_LINE",
+    );
+    expect(
+      within(textbox("short_step").parentElement!).queryByRole("button", {
+        name: /^Show/,
+      }),
+    ).toBeNull();
+
+    fireEvent.click(controls[0]!);
+    const less = screen.getByRole("button", { name: /^Show less/ });
+    expect(less.getAttribute("aria-expanded")).toBe("true");
+    expect(folded("long_step")).toBe(false);
+    expect(folded("other_long")).toBe(true);
+
+    fireEvent.click(less);
+    expect(folded("long_step")).toBe(true);
+    expect(live.graph()).toBe(before);
+  });
+
+  test("focusing the text opens it, and it stays open after the edit", () => {
+    renderLiveDoc(steps());
+    fireEvent.focus(textbox("long_step"));
+    const editing = textbox("long_step");
+    expect(editing.getAttribute("contenteditable")).toBe("plaintext-only");
+    fireEvent.blur(editing);
+    expect(folded("long_step")).toBe(false);
+    expect(screen.getAllByRole("button", { name: /^Show less/ })).toHaveLength(
+      1,
+    );
+    expect(folded("other_long")).toBe(true);
+  });
+
+  test("Show less stays mounted after the editing line and keeps focus as the line closes, then folds or opens it", () => {
+    renderLiveDoc(steps());
+    act(() => textbox("long_step").focus());
+    const editing = textbox("long_step");
+    expect(editing.getAttribute("contenteditable")).toBe("plaintext-only");
+    expect(document.activeElement).toBe(editing);
+    const control = screen.getByRole("button", { name: /^Show less: / });
+    expect(control.compareDocumentPosition(editing)).toBe(
+      Node.DOCUMENT_POSITION_PRECEDING,
+    );
+    // The line leaves Tab to the browser, which moves focus to the next control.
+    expect(fireEvent.keyDown(editing, { key: "Tab" })).toBe(true);
+    act(() => control.focus());
+    expect(textbox("long_step").getAttribute("contenteditable")).toBeNull();
+    expect(control.isConnected).toBe(true);
+    expect(document.activeElement).toBe(control);
+
+    fireEvent.click(control);
+    expect(folded("long_step")).toBe(true);
+    expect(document.activeElement).toBe(control);
+    expect(control.getAttribute("aria-label")).toMatch(/^Show more: /);
+    fireEvent.click(control);
+    expect(folded("long_step")).toBe(false);
+
+    act(() => textbox("long_step").focus());
+    expect(textbox("long_step").getAttribute("contenteditable")).toBe(
+      "plaintext-only",
+    );
+  });
+
+  test("read-only, a step whose first field is empty folds the long text that takes its place; an editable one does not", () => {
+    const promoted = () =>
+      block("task", "promoted_step", "primary_step", {
+        navigation_goal: "",
+        data_extraction_goal: LONG,
+      });
+    const primary = block("task", "primary_step", null, {
+      navigation_goal: LONG,
+    });
+    const { nodes, edges } = getElements(
+      [promoted(), primary],
+      settings(),
+      true,
+    );
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <WorkflowScopeContext.Provider
+              value={{ workflowId: null, readOnly: true }}
+            >
+              <WorkflowDocEditor nodes={nodes} edges={edges} />
+            </WorkflowScopeContext.Provider>
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const controls = screen.getAllByRole("button", { name: /^Show more/ });
+    expect(controls.map((c) => c.getAttribute("aria-label"))).toEqual([
+      "Show more: Promoted step",
+      "Show more: Primary step",
+    ]);
+    for (const control of controls) {
+      const text = document.getElementById(
+        control.getAttribute("aria-controls")!,
+      )!;
+      expect(text.style.overflow).toBe("hidden");
+      expect(text.textContent).toContain("WAIT_FOR_THE_LAST_LINE");
+    }
+    cleanup();
+
+    // A task step is read-only in the Doc; a login step is the editable one with a second field.
+    renderLiveDoc([
+      block("login", "editable_step", null, {
+        navigation_goal: "",
+        complete_criterion: LONG,
+      }),
+    ]);
+    expect(
+      screen.getByRole("textbox", { name: "editable_step navigationGoal" })
+        .textContent,
+    ).not.toContain("WAIT_FOR_THE_LAST_LINE");
+    expect(screen.queryByRole("button", { name: /^Show/ })).toBeNull();
+  });
+
+  test("a Locate from the run lands on the whole text", () => {
+    const live = renderLiveDoc(steps());
+    const target = live
+      .graph()
+      .nodes.find((n) => n.data.label === "other_long")!;
+    act(() => useLocateBlockStore.getState().requestLocate(target.id));
+    expect(folded("other_long")).toBe(false);
+    expect(folded("long_step")).toBe(true);
+  });
+
+  test("a search result lands on the whole text", () => {
+    renderLiveDoc(steps());
+    fireEvent.keyDown(
+      screen.getByRole("region", { name: "Workflow document" }),
+      { key: "k", ctrlKey: true },
+    );
+    fireEvent.change(screen.getByPlaceholderText("Search steps…"), {
+      target: { value: "Read the terms" },
+    });
+    fireEvent.click(screen.getByRole("option"));
+    expect(folded("other_long")).toBe(false);
+    expect(folded("long_step")).toBe(true);
+  });
+});
+
+describe("naming a step from its title", () => {
+  beforeEach(() => {
+    useWorkflowParametersStore.setState({ parameters: [] });
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useEmberProposalStore.getState().setProposal(null);
+    useRecordingLauncherStore.setState({ demonstration: null });
+    useEmberActionStore.setState({
+      generatingBlockLabel: null,
+      queuedBuilds: [],
+    });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+  const prompt = (label: string, next: string | null, text: string) =>
+    block("text_prompt", label, next, { prompt: text, parameters: [] });
+
+  test("an unnamed step's placeholder takes a name that becomes its label, shown as saved, and later references follow it", () => {
+    const doc = renderLiveDoc([
+      prompt("block_1", "summary", "Write a short note"),
+      prompt("summary", null, "Summarize {{ block_1_output }}"),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Name this step" }));
+    const input = screen.getByRole("textbox", { name: "Step name" });
+    fireEvent.change(input, { target: { value: "Login (HR)" } });
+    expect(screen.getByText("Saves as Login_HR")).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Enter" });
+    const nodes = doc.graph().nodes;
+    expect(nodes.map((node) => node.data.label)).toContain("Login_HR");
+    const summary = nodes.find((node) => node.data.label === "summary")!;
+    expect(JSON.stringify(summary.data)).toContain("{{ Login_HR_output }}");
+    doc.rerender();
+    expect(
+      screen.getByRole("button", { name: "Login HR", description: "Rename" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Name this step" })).toBeNull();
+  });
+
+  test("a name another step has shows an error and changes nothing", () => {
+    const doc = renderLiveDoc([
+      prompt("first", "second", "Write A"),
+      prompt("second", null, "Write B"),
+    ]);
+    const before = doc.graph();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Second", description: "Rename" }),
+    );
+    const input = screen.getByRole("textbox", { name: "Step name" });
+    fireEvent.change(input, { target: { value: "first" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Another step already uses this name.",
+    );
+    expect(doc.graph()).toBe(before);
+  });
+
+  test("Escape puts the title back, and an empty name leaves the label as it was", () => {
+    const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+    const before = doc.graph();
+    fireEvent.click(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Step name" }), {
+      target: { value: "Something else" },
+    });
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Step name" }), {
+      key: "Escape",
+    });
+    expect(screen.queryByRole("textbox", { name: "Step name" })).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Step name" }), {
+      target: { value: "  " },
+    });
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Step name" }), {
+      key: "Enter",
+    });
+    expect(doc.graph()).toBe(before);
+    expect(screen.queryByRole("textbox", { name: "Step name" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  test("the rename is one structural edit of the graph, never a field update", () => {
+    const edits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    renderDoc([prompt("first", null, "Write A")], edits);
+    fireEvent.click(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    const input = screen.getByRole("textbox", { name: "Step name" });
+    fireEvent.change(input, { target: { value: "Write the note" } });
+    fireEvent.blur(input);
+    expect(edits.apply).toHaveBeenCalledTimes(1);
+    expect(edits.update).not.toHaveBeenCalled();
+    const [graph] = edits.apply.mock.calls[0]!;
+    expect(
+      graph.nodes.some(
+        (node: { data: { label: string } }) =>
+          node.data.label === "Write_the_note",
+      ),
+    ).toBe(true);
+  });
+
+  test("a read-only Doc shows a step's title but never the placeholder or a rename button", () => {
+    renderDoc([
+      prompt("block_1", "second", "Write A"),
+      prompt("second", null, "B"),
+    ]);
+    expect(screen.queryByText("Name this step")).toBeNull();
+    expect(document.querySelector("[data-doc-step-name]")).toBeNull();
+    expect(screen.getByRole("heading", { name: "Second" })).toBeTruthy();
+    expect(screen.getAllByRole("heading").map((h) => h.textContent)).toEqual([
+      "Second",
+    ]);
+  });
+
+  const typeName = (name: string) => {
+    const input = screen.getByRole("textbox", { name: "Step name" });
+    fireEvent.change(input, { target: { value: name } });
+    return input;
+  };
+
+  test("a name that starts with a digit saves with a step_ prefix, the field shows it, and the title reads it back", () => {
+    const doc = renderLiveDoc([prompt("block_1", null, "Write A")]);
+    fireEvent.click(screen.getByRole("button", { name: "Name this step" }));
+    const input = typeName("2FA login");
+    expect(screen.getByText("Saves as step_2FA_login")).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(doc.graph().nodes.map((node) => node.data.label)).toContain(
+      "step_2FA_login",
+    );
+    doc.rerender();
+    // The caption reads the saved label, prefix included.
+    expect(
+      screen.getByRole("button", {
+        name: "Step 2FA login",
+        description: "Rename",
+      }),
+    ).toBeTruthy();
+  });
+
+  test.each(["block", "block_1", "text_prompt", "text_prompt_2"])(
+    "%s reads as a default name, so the field rejects it and nothing changes",
+    (name) => {
+      const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+      const before = doc.graph();
+      fireEvent.click(
+        screen.getByRole("button", { name: "First", description: "Rename" }),
+      );
+      fireEvent.keyDown(typeName(name), { key: "Enter" });
+      expect(screen.getByRole("alert").textContent).toBe(
+        "Add a word: this name reads as a default one",
+      );
+      expect(doc.graph()).toBe(before);
+    },
+  );
+
+  test.each(["日本語", "مرحبا", "!!!"])(
+    "%s has no letter or digit a label can keep: Enter keeps the field open with an error, a blur puts the title back",
+    (name) => {
+      const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+      const before = doc.graph();
+      fireEvent.click(
+        screen.getByRole("button", { name: "First", description: "Rename" }),
+      );
+      const input = typeName(name);
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(screen.getByRole("alert").textContent).toBe(
+        "Use letters or numbers",
+      );
+      expect(
+        (screen.getByRole("textbox", { name: "Step name" }) as HTMLInputElement)
+          .value,
+      ).toBe(name);
+      fireEvent.blur(input);
+      expect(screen.queryByRole("textbox", { name: "Step name" })).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(doc.graph()).toBe(before);
+    },
+  );
+
+  test("a blur with a rejected name puts the title back instead of keeping the error", () => {
+    const doc = renderLiveDoc([
+      prompt("first", "second", "Write A"),
+      prompt("second", null, "Write B"),
+    ]);
+    const before = doc.graph();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Second", description: "Rename" }),
+    );
+    let input = typeName("first");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("alert")).toBeTruthy();
+    fireEvent.blur(input);
+    expect(screen.queryByRole("textbox", { name: "Step name" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Second", description: "Rename" }),
+    );
+    input = typeName("block");
+    fireEvent.blur(input);
+    expect(screen.queryByRole("textbox", { name: "Step name" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(doc.graph()).toBe(before);
+  });
+
+  test("Enter and Escape return focus to the step's title, and the blur after Escape saves nothing", () => {
+    const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+    const before = doc.graph();
+    fireEvent.click(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    const input = typeName("Other name");
+    fireEvent.keyDown(input, { key: "Escape" });
+    fireEvent.blur(input);
+    expect(doc.graph()).toBe(before);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    fireEvent.keyDown(typeName("Write the note"), { key: "Enter" });
+    doc.rerender();
+    const title = screen.getByRole("button", {
+      name: "Write the note",
+      description: "Rename",
+    });
+    expect(title.hasAttribute("data-doc-step-name")).toBe(true);
+    expect(document.activeElement).toBe(title);
+  });
+
+  test("an unnamed editable Conditional is named from its title", () => {
+    const doc = renderLiveDoc([
+      conditional("block_1", null, [
+        { id: "yes", next: "first", when: "the page has a form" },
+        { id: "else", next: null },
+      ]),
+      prompt("first", null, "Write A"),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Name this step" }));
+    fireEvent.keyDown(typeName("Check the page"), { key: "Enter" });
+    expect(doc.graph().nodes.map((node) => node.data.label)).toContain(
+      "Check_the_page",
+    );
+  });
+
+  test("an editable step two branches share, which has no place to move, still offers Name this step", () => {
+    renderLiveDoc([
+      conditional("route", "after", [
+        { id: "yes", next: "first", when: "the page has a form" },
+        { id: "no", next: "second", when: "the page is empty" },
+        { id: "else", next: null },
+      ]),
+      prompt("first", "block_2", "Write A"),
+      prompt("second", "block_2", "Write B"),
+      prompt("block_2", "after", "Write C"),
+      prompt("after", null, "Write D"),
+    ]);
+    expect(screen.getByText(/reached from/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Name this step" })).toBeTruthy();
+  });
+
+  // The step's title control, found by what it shows rather than by its accessible name.
+  const titleOf = (caption: string) =>
+    Array.from(
+      document.querySelectorAll<HTMLButtonElement>("[data-doc-step-name]"),
+    ).find((button) => button.textContent === caption)!;
+  const field = () =>
+    screen.queryByRole("textbox", {
+      name: "Step name",
+    }) as HTMLInputElement | null;
+  const proposalOf = (label: string) => {
+    const proposed = {
+      workflow_id: "w_1",
+      workflow_permanent_id: "wpid_1",
+      title: "Synthetic",
+      description: null,
+      workflow_definition: {
+        version: 2,
+        blocks: [block("text_prompt", label, null, { prompt: "Hi" })],
+        parameters: [],
+      },
+    } as unknown as WorkflowApiResponse;
+    return {
+      proposed,
+      baseline: proposed,
+      review: null,
+      actionable: true,
+      acceptable: true,
+      decide: async () => true,
+    };
+  };
+  const locks: Array<
+    [string, (doc: ReturnType<typeof renderLiveDoc>, on: boolean) => void]
+  > = [
+    [
+      "a save transaction",
+      (_doc, on) =>
+        act(() =>
+          useWorkflowYamlEditorStore.setState({ commitInProgress: on }),
+        ),
+    ],
+    [
+      "a Copilot proposal",
+      (_doc, on) =>
+        act(() =>
+          useEmberProposalStore
+            .getState()
+            .setProposal(on ? proposalOf("proposed_step") : null),
+        ),
+    ],
+    [
+      "a demonstration",
+      (_doc, on) =>
+        act(() =>
+          useRecordingLauncherStore.setState({
+            demonstration: on
+              ? {
+                  phase: "recording",
+                  actionCount: 0,
+                  interrupted: false,
+                  insertion: null,
+                }
+              : null,
+          }),
+        ),
+    ],
+    ["a read-only scope", (doc, on) => doc.rerender(on)],
+  ];
+
+  test.each(locks)(
+    "a name being typed survives %s: nothing is saved while the Doc is locked, and the draft is back after",
+    (name, lock) => {
+      const doc = renderLiveDoc([prompt("first", null, "Write A")], "wpid_1");
+      const before = doc.graph();
+      fireEvent.click(titleOf("First"));
+      fireEvent.change(field()!, { target: { value: "Write the note" } });
+      lock(doc, true);
+      // A proposal shows Ember's steps instead; every other lock leaves the field on screen, read-only, with the caret.
+      if (name !== "a Copilot proposal") {
+        expect(field()?.readOnly).toBe(true);
+        expect(document.activeElement).toBe(field());
+        fireEvent.keyDown(field()!, { key: "Enter" });
+        fireEvent.blur(field()!);
+      }
+      expect(doc.graph()).toBe(before);
+      lock(doc, false);
+      expect(field()?.value).toBe("Write the note");
+      fireEvent.keyDown(field()!, { key: "Enter" });
+      expect(doc.graph().nodes.map((node) => node.data.label)).toContain(
+        "Write_the_note",
+      );
+    },
+  );
+
+  test("a field reopened after Escape saves on a click away again", () => {
+    const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+    fireEvent.click(titleOf("First"));
+    fireEvent.keyDown(typeName("Other name"), { key: "Escape" });
+    fireEvent.click(titleOf("First"));
+    fireEvent.blur(typeName("Write the note"));
+    expect(doc.graph().nodes.map((node) => node.data.label)).toContain(
+      "Write_the_note",
+    );
+  });
+
+  test("a Code step's title is locked while its Goal builds, as its Code line is", () => {
+    const doc = renderLiveDoc([code("build_it", null)]);
+    const before = doc.graph();
+    fireEvent.click(titleOf("Build it"));
+    fireEvent.change(field()!, { target: { value: "Write the note" } });
+    act(() =>
+      useEmberActionStore.setState({ generatingBlockLabel: "build_it" }),
+    );
+    fireEvent.blur(field()!);
+    expect(doc.graph()).toBe(before);
+    expect(field()?.value).toBe("Write the note");
+    fireEvent.keyDown(field()!, { key: "Escape" });
+    expect(document.querySelector("[data-doc-step-name]")).toBeNull();
+    expect(screen.getByRole("heading", { name: "Build it" })).toBeTruthy();
+  });
+
+  test("a Conditional that can't be edited here shows its title without a field", () => {
+    const { nodes, edges } = getElements(
+      [
+        conditional("Check_page", null, [
+          { id: "yes", next: "inside", when: "the page has a form" },
+          { id: "else", next: null },
+        ]),
+        prompt("inside", null, "Write C"),
+      ],
+      settings(),
+      true,
+    );
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <WorkflowDocEditor
+              nodes={nodes.map((node) =>
+                node.data.label === "Check_page"
+                  ? ({
+                      ...node,
+                      data: { ...node.data, editable: false },
+                    } as typeof node)
+                  : node,
+              )}
+              edges={edges}
+              edits={{
+                apply: vi.fn(),
+                update: vi.fn(),
+                addStep: vi.fn(),
+                duplicate: vi.fn(),
+              }}
+            />
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByRole("heading", { name: "Check page" })).toBeTruthy();
+    expect(titleOf("Check page")).toBeUndefined();
+    expect(titleOf("Inside")).toBeTruthy();
+  });
+
+  test("a step whose title hides a version suffix can be renamed to that title", () => {
+    const doc = renderLiveDoc([prompt("Review_v2", null, "Write A")]);
+    fireEvent.click(titleOf("Review"));
+    // Typing over the title passes through other text; a change to the same value would not reach the field.
+    typeName("");
+    fireEvent.keyDown(typeName("Review"), { key: "Enter" });
+    expect(doc.graph().nodes.map((node) => node.data.label)).toContain(
+      "Review",
+    );
+  });
+
+  test.each(
+    ["Review_v2", "_private", "foo__bar"].flatMap((label) =>
+      (["Enter", "a click away"] as const).map((exit) => [label, exit]),
+    ),
+  )(
+    "opening the title of %s and leaving it with %s, with nothing typed, changes nothing",
+    (label, exit) => {
+      const doc = renderLiveDoc([
+        prompt(label, "second", "Write A"),
+        prompt("second", null, `Use {{ ${label}_output }}`),
+      ]);
+      const before = doc.graph();
+      toastSpy.mockClear();
+      fireEvent.click(
+        document.querySelector<HTMLButtonElement>("[data-doc-step-name]")!,
+      );
+      expect(field()).toBeTruthy();
+      if (exit === "Enter") fireEvent.keyDown(field()!, { key: "Enter" });
+      else fireEvent.blur(field()!);
+      expect(doc.graph()).toBe(before);
+      expect(field()).toBeNull();
+      expect(toastSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  test("opening a title and leaving it as it reads changes nothing, even when the label's case differs", () => {
+    const doc = renderLiveDoc([
+      prompt("first", "second", "Write A"),
+      prompt("second", null, "Use {{ first_output }}"),
+    ]);
+    const before = doc.graph();
+    fireEvent.click(titleOf("First"));
+    fireEvent.blur(field()!);
+    expect(doc.graph()).toBe(before);
+  });
+
+  test("a name ending in v and a number is refused, since the title drops it", () => {
+    const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+    const before = doc.graph();
+    fireEvent.click(titleOf("First"));
+    fireEvent.keyDown(typeName("Review v2"), { key: "Enter" });
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Add a word after the v and number: the title drops it",
+    );
+    expect(doc.graph()).toBe(before);
+  });
+
+  test("a name that differs from another step's only in case reads the same, so it is refused", () => {
+    const doc = renderLiveDoc([
+      prompt("Write_note", "second", "Write A"),
+      prompt("second", null, "Write B"),
+    ]);
+    const before = doc.graph();
+    fireEvent.click(titleOf("Second"));
+    fireEvent.keyDown(typeName("write note"), { key: "Enter" });
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Another step already uses this name.",
+    );
+    expect(doc.graph()).toBe(before);
+  });
+
+  test.each(["Yes", "no", "ON", "Off"])(
+    "%s is refused: the saved YAML would read it as true or false",
+    (name) => {
+      const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+      const before = doc.graph();
+      fireEvent.click(titleOf("First"));
+      fireEvent.keyDown(typeName(name), { key: "Enter" });
+      expect(screen.getByRole("alert").textContent).toBe(
+        "Add a word: Yes, No, On and Off save as true or false",
+      );
+      expect(doc.graph()).toBe(before);
+    },
+  );
+
+  test("a click away from a refused name puts the title back and says why in a notice", () => {
+    renderLiveDoc([
+      prompt("first", "second", "Write A"),
+      prompt("second", null, "Write B"),
+    ]);
+    toastSpy.mockClear();
+    fireEvent.click(titleOf("Second"));
+    fireEvent.blur(typeName("first"));
+    expect(field()).toBeNull();
+    expect(toastSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Name not saved",
+        description: "Another step already uses this name.",
+      }),
+    );
+  });
+
+  test("a rename from the title shows no Renamed notice: the title shows the new name", () => {
+    renderLiveDoc([prompt("first", null, "Write A")]);
+    toastSpy.mockClear();
+    fireEvent.click(titleOf("First"));
+    fireEvent.keyDown(typeName("Write the note"), { key: "Enter" });
+    expect(toastSpy).not.toHaveBeenCalled();
+  });
+
+  test("Enter and Escape that confirm or cancel an input-method candidate leave the field open", () => {
+    const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+    const before = doc.graph();
+    fireEvent.click(titleOf("First"));
+    const input = typeName("Login ろぐいん");
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(input, { key: "Escape", keyCode: 229 });
+    expect(field()?.value).toBe("Login ろぐいん");
+    expect(doc.graph()).toBe(before);
+  });
+
+  test("the title's accessible name is the title itself, with Rename as its description", () => {
+    renderLiveDoc([prompt("first", null, "Write A")]);
+    const title = screen.getByRole("button", {
+      name: "First",
+      description: "Rename",
+    });
+    expect(title.hasAttribute("data-doc-step-name")).toBe(true);
+    expect(screen.getByRole("heading", { name: "First" })).toBeTruthy();
+  });
+
+  test("a step in a read-only part of an editable Doc has no title field", () => {
+    const { nodes, edges } = getElements(
+      [
+        prompt("first", "Stray_note", "Write A"),
+        prompt("Stray_note", null, "B"),
+      ],
+      settings(),
+      true,
+    );
+    const stray = nodes.find((node) => node.data.label === "Stray_note")!;
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <WorkflowDocEditor
+              nodes={nodes}
+              edges={edges.filter((edge) => edge.target !== stray.id)}
+              edits={{
+                apply: vi.fn(),
+                update: vi.fn(),
+                addStep: vi.fn(),
+                duplicate: vi.fn(),
+              }}
+            />
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText(/can't be placed/)).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Stray note" })).toBeTruthy();
+    expect(titleOf("Stray note")).toBeUndefined();
   });
 });

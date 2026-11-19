@@ -737,6 +737,7 @@ def run_mcp(
     except Exception:
         LOG.warning("local_browser_profile_startup_sweep_failed", exc_info=True)
     imports_started_at = time.monotonic()
+    from skyvern.cli.core.client import set_standalone_http_server  # noqa: PLC0415
     from skyvern.cli.core.session_manager import (  # noqa: PLC0415
         set_stateless_http_mode,
         set_stdio_local_file_access_enabled,
@@ -804,7 +805,11 @@ def run_mcp(
         # valid API key is already past the gate if auth resolves first. The server card
         # stays outermost so discovery remains public.
         from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
+        from skyvern.forge.forge_app_initializer import start_forge_app  # noqa: PLC0415
 
+        # API-key auth reads the org DB and AGENT_FUNCTION through the ForgeApp; stdio never needs it.
+        start_forge_app()
+        set_standalone_http_server(True)
         middleware = [
             Middleware(_ServerCardMiddleware, transport_type=transport, host=host, port=port, mcp_path=path),
             Middleware(OriginValidationMiddleware),
@@ -827,6 +832,7 @@ def run_mcp(
             eof_watcher_stop.set()
         try:
             set_stateless_http_mode(False)
+            set_standalone_http_server(False)
             set_stdio_local_file_access_enabled(False)
             set_concise_responses(False)
         finally:

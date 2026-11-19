@@ -5,7 +5,6 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_LOGIN_PROMPT
-from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_aws_secret_parameter_id,
@@ -18,6 +17,7 @@ from skyvern.forge.sdk.db.id import (
     generate_output_parameter_id,
     generate_workflow_parameter_id,
 )
+from skyvern.forge.sdk.workflow.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
@@ -67,6 +67,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
 )
+from skyvern.forge.sdk.workflow.models.integration_action_block import IntegrationActionBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     PLATFORM_SMTP_AWS_KEYS,
@@ -95,6 +96,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.schemas.emails import EmailTransport
 from skyvern.schemas.workflows import (
+    BLOCK_IMAGE_FIELDS,
     BLOCK_YAML_TYPES,
     BlockType,
     ForLoopBlockYAML,
@@ -434,7 +436,7 @@ def _build_block_kwargs(
         "model": block_yaml.model,
         "ignore_workflow_system_prompt": block_yaml.ignore_workflow_system_prompt,
     }
-    for field in ("notes", "trailing_notes", "description"):
+    for field in ("notes", "trailing_notes", "description", *BLOCK_IMAGE_FIELDS):
         if field in block_yaml.model_fields_set:
             kwargs[field] = getattr(block_yaml, field)
     return kwargs
@@ -1070,6 +1072,8 @@ def block_yaml_to_block(
             max_results=block_yaml.max_results,
             include_body=block_yaml.include_body,
             download_attachments=block_yaml.download_attachments,
+            organize_action=block_yaml.organize_action,
+            organize_label=block_yaml.organize_label,
             parameters=email_inbox_parameters,
         )
     elif block_yaml.block_type == BlockType.GOOGLE_SHEETS_WRITE:
@@ -1096,6 +1100,15 @@ def block_yaml_to_block(
             query=block_yaml.query,
             max_rows=block_yaml.max_rows,
             parameters=powerbi_query_parameters,
+        )
+    elif block_yaml.block_type == BlockType.INTEGRATION_ACTION:
+        return IntegrationActionBlock(
+            **base_kwargs,
+            integration_id=block_yaml.integration_id,
+            action_id=block_yaml.action_id,
+            connection_id=block_yaml.connection_id,
+            inputs=block_yaml.inputs,
+            parameters=_resolve_block_parameters(block_yaml, parameters),
         )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")

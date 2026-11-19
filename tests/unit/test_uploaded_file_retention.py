@@ -11,142 +11,42 @@ from __future__ import annotations
 
 import io
 import os
+import re
+import struct
 import zipfile
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
+from PIL import Image
+from starlette.datastructures import Headers
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge.sdk.api import files as files_api
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.schemas.files import UploadedFile
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.schemas.runs import RunEngine
 from skyvern.services import uploaded_file_service
+from tests.unit._uploaded_files_fake import FakeUploadedFilesRepository, uploaded_file_uri
 from tests.unit.shared_route_app import shared_route_app
 
 VICTIM_ORG_ID = "o_victim"
 ATTACKER_ORG_ID = "o_attacker"
 
 
-def _uri(organization_id: str, filename: str = "secret.pdf") -> str:
-    return f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{organization_id}/2026-08-15/{filename}"
-
-
-class FakeUploadedFilesRepository:
-    """In-memory stand-in with the same org-scoping and soft-delete semantics as the real one."""
-
-    def __init__(self) -> None:
-        self.rows: dict[str, UploadedFile] = {}
-        self._next_id = 0
-
-    def seed(
-        self,
-        organization_id: str,
-        expires_at: datetime | None = None,
-        filename: str = "secret.pdf",
-        run_id: str | None = None,
-    ) -> str:
-        self._next_id += 1
-        file_id = f"file_{self._next_id}"
-        now = datetime.now(timezone.utc)
-        self.rows[file_id] = UploadedFile(
-            file_id=file_id,
-            organization_id=organization_id,
-            storage_uri=_uri(organization_id, filename),
-            filename=filename,
-            expires_at=expires_at,
-            run_id=run_id,
-            created_at=now,
-            modified_at=now,
-        )
-        return file_id
-
-    def live_ids(self) -> set[str]:
-        return {file_id for file_id, row in self.rows.items() if row.deleted_at is None}
-
-    async def create_uploaded_file(
-        self,
-        file_id: str,
-        organization_id: str,
-        storage_uri: str,
-        filename: str,
-        size_bytes: int | None = None,
-        expires_at: datetime | None = None,
-    ) -> UploadedFile:
-        now = datetime.now(timezone.utc)
-        for row in self.rows.values():
-            if row.organization_id == organization_id and row.storage_uri == storage_uri and row.deleted_at is None:
-                row.deleted_at = now
-        self.rows[file_id] = UploadedFile(
-            file_id=file_id,
-            organization_id=organization_id,
-            storage_uri=storage_uri,
-            filename=filename,
-            size_bytes=size_bytes,
-            expires_at=expires_at,
-            created_at=now,
-            modified_at=now,
-        )
-        return self.rows[file_id]
-
-    async def get_uploaded_file(self, file_id: str, organization_id: str) -> UploadedFile | None:
-        row = self.rows.get(file_id)
-        if row is None or row.organization_id != organization_id or row.deleted_at is not None:
-            return None
-        return row
-
-    async def claim_uploaded_file_for_deletion(self, file_id: str, organization_id: str) -> UploadedFile | None:
-        row = await self.get_uploaded_file(file_id, organization_id)
-        if row is None:
-            return None
-        row.deleted_at = datetime.now(timezone.utc)
-        return row
-
-    async def get_expired_uploaded_files(self, before: datetime, limit: int = 500) -> list[UploadedFile]:
-        return [
-            row
-            for row in self.rows.values()
-            if row.deleted_at is None and row.expires_at is not None and row.expires_at <= before
-        ][:limit]
-
-    async def get_uploaded_files_by_ids(self, file_ids: list[str], organization_id: str) -> list[UploadedFile]:
-        return [
-            row
-            for file_id in file_ids
-            if (row := self.rows.get(file_id)) is not None
-            and row.organization_id == organization_id
-            and row.deleted_at is None
-        ]
-
-    async def get_uploaded_files_for_run(self, run_id: str) -> list[UploadedFile]:
-        return [row for row in self.rows.values() if row.run_id == run_id and row.deleted_at is None]
-
-    async def attach_uploaded_files_to_run(
-        self,
-        file_ids: list[str],
-        organization_id: str,
-        run_id: str,
-        expires_at: datetime,
-    ) -> list[UploadedFile]:
-        attached = []
-        for file_id in file_ids:
-            row = self.rows.get(file_id)
-            if row is None or row.organization_id != organization_id or row.deleted_at is not None:
-                continue
-            if row.run_id is not None and row.run_id != run_id:
-                continue
-            row.run_id = run_id
-            row.expires_at = min(row.expires_at, expires_at) if row.expires_at else expires_at
-            attached.append(row)
-        return attached
-
-
 class FakeStorage:
     """Enforces the same org-prefix rule the real storage backends do."""
+
+    presigned_urls_expire = True
 
     def __init__(self) -> None:
         self.deleted: list[str] = []
@@ -155,6 +55,7 @@ class FakeStorage:
         # anything, as S3, GCS, Azure and local storage all do for an absent key.
         self.absent: set[str] = set()
         self.objects: dict[str, bytes] = {}
+        self.sizes: dict[str, int | None] = {}
         self.downloads: list[str] = []
 
     @staticmethod
@@ -166,6 +67,22 @@ class FakeStorage:
         self.downloads.append(uri)
         self._assert_org_prefix(uri, organization_id)
         return self.objects.get(uri)
+
+    async def managed_file_size(self, uri: str, organization_id: str) -> int | None:
+        self._assert_org_prefix(uri, organization_id)
+        if uri in self.sizes:
+            return self.sizes[uri]
+        return len(self.objects[uri]) if uri in self.objects else None
+
+    async def read_managed_file_head(self, uri: str, organization_id: str, length: int) -> bytes | None:
+        content = await self.download_managed_file(uri, organization_id)
+        return None if content is None else content[:length]
+
+    async def presign_managed_file(
+        self, uri: str, organization_id: str, *, expiry_seconds: int, inline_content_type: str
+    ) -> str:
+        self._assert_org_prefix(uri, organization_id)
+        return f"https://signed.test/{uri.rsplit('/', 1)[-1]}?inline={inline_content_type}&ttl={expiry_seconds}"
 
     async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
         self._assert_org_prefix(uri, organization_id)
@@ -222,9 +139,561 @@ async def test_a_file_past_its_expiry_no_longer_dereferences(
     live = repo.seed(VICTIM_ORG_ID, expires_at=now + timedelta(days=1), filename="live.csv")
 
     assert await uploaded_file_service.resolve_file_reference(file_id=expired, organization_id=VICTIM_ORG_ID) is None
-    assert await uploaded_file_service.resolve_file_reference(file_id=live, organization_id=VICTIM_ORG_ID) == _uri(
-        VICTIM_ORG_ID, "live.csv"
+    assert await uploaded_file_service.resolve_file_reference(
+        file_id=live, organization_id=VICTIM_ORG_ID
+    ) == uploaded_file_uri(VICTIM_ORG_ID, "live.csv")
+
+
+def _png(width: int, height: int) -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        + struct.pack(">II", width, height)
+        + b"\x08\x02\x00\x00\x00"
+        + b"\x00" * 64
     )
+
+
+def _webp(chunk: bytes, payload: bytes) -> bytes:
+    body = chunk + len(payload).to_bytes(4, "little") + payload
+    return b"RIFF" + (len(body) + 4).to_bytes(4, "little") + b"WEBP" + body + b"\x00" * 64
+
+
+def _webp_vp8x(width: int, height: int) -> bytes:
+    return _webp(b"VP8X", b"\x00" * 4 + (width - 1).to_bytes(3, "little") + (height - 1).to_bytes(3, "little"))
+
+
+def _webp_vp8l(width: int, height: int) -> bytes:
+    return _webp(b"VP8L", b"\x2f" + ((width - 1) | (height - 1) << 14).to_bytes(4, "little"))
+
+
+def _webp_vp8(width: int, height: int) -> bytes:
+    return _webp(b"VP8 ", b"\x00" * 3 + b"\x9d\x01\x2a" + struct.pack("<HH", width, height))
+
+
+def _gif(width: int, height: int) -> bytes:
+    frame = b"\x2c" + struct.pack("<HHHH", 0, 0, width, height) + b"\x00"
+    return b"GIF89a" + struct.pack("<HH", width, height) + b"\x00" * 3 + frame + b"\x00" * 64
+
+
+def _pillow(image_format: str, size: tuple[int, int] = (1200, 800), **save: Any) -> bytes:
+    out = io.BytesIO()
+    Image.new("RGB", size, (40, 90, 160)).save(out, image_format, **save)
+    return out.getvalue()
+
+
+# A 1x1 screen whose first frame sits at (20000, 20000): Chromium and Pillow size it 20001x20001.
+_GIF_FRAME_OFF_SCREEN = bytes.fromhex("47494638396101000100800000000000ffffff2c204e204e010001000002024401003b")
+
+
+def _jpeg_decoy(after_soi: bytes) -> bytes:
+    # Bytes a decoder skips without a length (a fill byte, RST0), then a comment that hides a 1x1 SOF where a walker
+    # that reads a length after them lands; the real SOF declares 10000x9000.
+    real = bytearray(_pillow("JPEG", (64, 64)))
+    sof = real.index(b"\xff\xc0")
+    real[sof + 5 : sof + 9] = struct.pack(">HH", 9000, 10000)
+    app0_end = 4 + int.from_bytes(real[4:6], "big")
+    head = bytes(real[:2]) + after_soi + bytes(real[2:app0_end])
+    lands = 4 + int.from_bytes(head[4:6], "big") - len(head) - 4
+    payload = b"\x00" * lands + b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01" + b"\x00" * 32
+    return head + b"\xff\xfe" + (len(payload) + 2).to_bytes(2, "big") + payload + bytes(real[app0_end:])
+
+
+def _sof(width: int, height: int) -> bytes:
+    return b"\xff\xc2\x00\x11\x08" + struct.pack(">HH", height, width) + b"\x03" + b"\x00" * 9
+
+
+_JPEG_SOS = b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"
+
+
+def _jpeg(width: int, height: int, app_segment_bytes: tuple[int, ...] = ()) -> bytes:
+    app = b"".join(b"\xff\xe1" + (size + 2).to_bytes(2, "big") + b"\x00" * size for size in app_segment_bytes)
+    jfif = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    return jfif + app + _sof(width, height) + _JPEG_SOS + b"\x00" * 64
+
+
+def _gif_after_extension(sub_blocks: bytes, width: int = 64, height: int = 64) -> bytes:
+    frame = b"\x2c" + struct.pack("<HHHH", 0, 0, width, height) + b"\x00"
+    return b"GIF89a" + struct.pack("<HH", width, height) + b"\x00" * 3 + b"\x21\xfe" + sub_blocks + frame
+
+
+def _filled(prefix: bytes, unit: bytes) -> bytes:
+    count = (uploaded_file_service.BLOCK_IMAGE_MAX_BYTES - len(prefix)) // len(unit)
+    return prefix + unit * count
+
+
+# Shapes that walk the whole 4 MiB one marker or one sub-block at a time unless the walk is bounded.
+_PAST_THE_STEP_CAP = 4097
+# A sub-block whose size byte reads as an image descriptor of a 1x1 frame.
+_DESCRIPTOR_SUB_BLOCK = b"\x2c" + struct.pack("<HHHH", 0, 0, 1, 1) + b"\x00" * 36
+CRAFTED_4_MIB_HEADERS = {
+    "jpeg-fill-bytes": _filled(b"\xff\xd8", b"\xff"),
+    "jpeg-ff01-pairs": _filled(b"\xff\xd8", b"\xff\x01"),
+    "jpeg-empty-app-segments": _filled(b"\xff\xd8", b"\xff\xe1\x00\x02"),
+    "gif-one-byte-comment-sub-blocks": _filled(b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x21\xfe", b"\x01\x00"),
+}
+
+
+# ImageIO (Safari, iOS) restarts at a mid-stream SOI and sizes the SOF behind it; libjpeg refuses the file.
+_JPEG_SOF_BEHIND_A_SECOND_SOI = _jpeg(64, 64).replace(
+    _JPEG_SOS, b"\xff\xd8" + (2 + len(_sof(10_000, 9_000))).to_bytes(2, "big") + _sof(10_000, 9_000) + _JPEG_SOS
+)
+# Past the first 64 KiB, so a header answered inside it shows whether the route reads the file again.
+_PAST_THE_HEAD = b"\x00" * 70_000
+
+
+_SCREENSHOT_PNG = _png(1920, 1080)
+_RASTER_HEADS = {
+    "image/png": _SCREENSHOT_PNG,
+    "image/jpeg": _jpeg(1920, 1080),
+    "image/gif": _gif(640, 480),
+    "image/webp": _webp_vp8(1920, 1080),
+}
+
+
+class TestFileSignedUrlEndpoint:
+    def _request(
+        self,
+        client: TestClient,
+        file_id: str,
+        caller_org_id: str,
+        workflow_org_id: str,
+        named: list[str],
+        folder_denied: bool = False,
+        version: int | None = None,
+        named_by_version: dict[int, list[str]] | None = None,
+        named_elsewhere: tuple[str, ...] = (),
+    ) -> Any:
+        async def get_workflow(workflow_permanent_id: str, organization_id: str, version: int | None) -> Any:
+            if organization_id != workflow_org_id:
+                raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
+            names = named if version is None else (named_by_version or {}).get(version, named)
+            images = [SimpleNamespace(file_id=file_id) for file_id in names]
+            inner = SimpleNamespace(
+                label="inner",
+                block_type=BlockType.NAVIGATION,
+                notes=" ".join(named_elsewhere),
+                doc_images=images[::2],
+                prompt_images=images[1::2],
+            )
+            loop = SimpleNamespace(
+                label="loop", block_type=BlockType.FOR_LOOP, doc_images=None, prompt_images=None, loop_blocks=[inner]
+            )
+            dumped = {"blocks": [{"notes": inner.notes, "doc_images": [{"file_id": i.file_id} for i in images]}]}
+            return SimpleNamespace(
+                organization_id=workflow_org_id,
+                workflow_definition=SimpleNamespace(blocks=[loop], model_dump=lambda mode: dumped),
+            )
+
+        route_app = MagicMock()
+        route_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(side_effect=get_workflow)
+        route_app.AGENT_FUNCTION.enforce_folder_access = AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="Folder access denied") if folder_denied else None
+        )
+        self.folder_check = route_app.AGENT_FUNCTION.enforce_folder_access
+        with (
+            patch("skyvern.forge.sdk.routes.agent_protocol.app", route_app),
+            patch(
+                "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
+                new=AsyncMock(return_value=_make_org(caller_org_id)),
+            ),
+        ):
+            return client.get(
+                f"/v1/files/{file_id}/signed-url",
+                params={"workflow_permanent_id": "wpid_doc", **({} if version is None else {"version": version})},
+                headers={"x-api-key": "key"},
+            )
+
+    def _seed(self, repo: FakeUploadedFilesRepository, storage: FakeStorage, org: str, body: bytes, **seed: Any) -> str:
+        file_id = repo.seed(org, **seed)
+        storage.objects[repo.rows[file_id].storage_uri] = body
+        return file_id
+
+    @pytest.mark.parametrize(
+        ("media_type", "head"),
+        [
+            *_RASTER_HEADS.items(),
+            ("image/webp", _webp_vp8x(1920, 1080)),
+            ("image/webp", _webp_vp8l(1920, 1080)),
+            ("image/jpeg", _jpeg(1920, 1080, app_segment_bytes=(30_000, 30_000))),
+            ("image/png", _pillow("PNG")),
+            ("image/jpeg", _pillow("JPEG")),
+            ("image/jpeg", _pillow("JPEG", progressive=True)),
+            ("image/jpeg", _pillow("JPEG", icc_profile=b"\x00" * 70_000)),
+            ("image/gif", _pillow("GIF")),
+            ("image/webp", _pillow("WEBP")),
+            ("image/webp", _pillow("WEBP", lossless=True)),
+            ("image/gif", _gif_after_extension(b"\x03abc\x01d\x00")),
+            ("image/jpeg", _jpeg(1920, 1080).replace(b"\xff\xc2", b"\xff\xff\xd0\xff\xff\xff\xc2")),
+        ],
+        ids=[
+            *_RASTER_HEADS,
+            "webp-vp8x",
+            "webp-vp8l",
+            "jpeg-app-segments",
+            "pillow-png",
+            "pillow-jpeg",
+            "pillow-jpeg-progressive",
+            "pillow-jpeg-sof-past-64-kib",
+            "pillow-gif",
+            "pillow-webp-lossy",
+            "pillow-webp-lossless",
+            "gif-after-a-comment",
+            "jpeg-fill-bytes-and-rst0-before-sof",
+        ],
+    )
+    def test_a_named_image_of_the_workflows_organization_gets_an_inline_one_hour_url(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        media_type: str,
+        head: bytes,
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, head, size_bytes=len(head))
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["content_type"] == media_type
+        assert body["signed_url"].endswith(f"?inline={media_type}&ttl=3600")
+        assert abs(body["expires_at"] - (datetime.now(timezone.utc).timestamp() + 3600)) < 60
+
+    @pytest.mark.asyncio
+    async def test_a_local_file_url_reports_no_expiry_because_it_never_expires(
+        self, service_app: Any, repo: FakeUploadedFilesRepository, tmp_path: Any
+    ) -> None:
+        image = tmp_path / settings.ENV / VICTIM_ORG_ID / "uploads" / "shot.png"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(_SCREENSHOT_PNG)
+        file_id = repo.seed(VICTIM_ORG_ID, expires_at=datetime.now(timezone.utc) + timedelta(seconds=60))
+        repo.rows[file_id].storage_uri = f"file://{image}"
+        service_app.STORAGE = LocalStorage(artifact_path=str(tmp_path))
+
+        signed = await uploaded_file_service.mint_file_url(file_id=file_id, organization_id=VICTIM_ORG_ID)
+
+        assert signed is not None
+        assert signed.signed_url == f"file://{image}"
+        assert signed.expires_at is None
+
+    def test_another_organization_never_gets_a_url(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        client = _client(monkeypatch)
+        victim_file = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+
+        # The attacker names the victim's file in its own workflow, or asks through the victim's workflow.
+        own_workflow = self._request(client, victim_file, ATTACKER_ORG_ID, ATTACKER_ORG_ID, [victim_file])
+        victim_workflow = self._request(client, victim_file, ATTACKER_ORG_ID, VICTIM_ORG_ID, [victim_file])
+        repo.rows.clear()
+        never_existed = self._request(client, victim_file, ATTACKER_ORG_ID, ATTACKER_ORG_ID, [victim_file])
+
+        assert own_workflow.status_code == victim_workflow.status_code == never_existed.status_code == 404
+        assert own_workflow.json() == victim_workflow.json() == never_existed.json()
+        assert storage.downloads == []
+
+    def test_version_selects_the_definition_that_must_name_the_file(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        client = _client(monkeypatch)
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+        only_in_v1 = {1: [file_id]}
+
+        v1 = self._request(client, file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [], version=1, named_by_version=only_in_v1)
+        latest = self._request(client, file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [], named_by_version=only_in_v1)
+
+        assert v1.status_code == 200
+        assert latest.status_code == 404
+
+    @pytest.mark.parametrize("version", [0, 2**31])
+    def test_a_version_outside_the_int4_range_is_rejected_like_the_other_versioned_workflow_routes(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        version: int,
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id], version=version)
+
+        assert resp.status_code == 422
+
+    @pytest.mark.boundary
+    def test_the_client_image_limits_match_the_servers(self) -> None:
+        with open("skyvern-frontend/src/routes/workflows/editor/doc/docImageUploads.ts") as source_file:
+            source = source_file.read()
+        max_bytes = re.search(r"export const DOC_IMAGE_MAX_BYTES = ([\d *]+);", source)
+        max_pixels = re.search(r"export const DOC_IMAGE_MAX_PIXELS = ([\d_]+);", source)
+        types = re.search(r"export const DOC_IMAGE_TYPES = \[([^\]]*)\]", source)
+        assert max_bytes and max_pixels and types, "a doc image limit was renamed; update this guard"
+
+        product = 1
+        for factor in max_bytes.group(1).split("*"):
+            product *= int(factor)
+        assert product == uploaded_file_service.BLOCK_IMAGE_MAX_BYTES
+        assert int(max_pixels.group(1).replace("_", "")) == uploaded_file_service.BLOCK_IMAGE_MAX_PIXELS
+        assert set(re.findall(r'"([^"]+)"', types.group(1))) == uploaded_file_service.BLOCK_IMAGE_MEDIA_TYPES
+
+    def test_a_file_the_workflow_does_not_name_is_a_404(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+        longer = f"{file_id}0"
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [longer])
+
+        assert resp.status_code == 404
+
+    def test_a_reader_gets_no_url_for_an_upload_the_version_names_only_outside_its_image_fields(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        client = _client(monkeypatch)
+        doc_image, prompt_image, elsewhere = (
+            self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG) for _ in range(3)
+        )
+        named = [doc_image, prompt_image]
+
+        outside = self._request(client, elsewhere, VICTIM_ORG_ID, VICTIM_ORG_ID, named, named_elsewhere=(elsewhere,))
+        served = [self._request(client, file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, named) for file_id in named]
+
+        assert outside.status_code == 404
+        assert [resp.status_code for resp in served] == [200, 200]
+
+    def test_a_folder_the_caller_cannot_read_is_refused(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id], folder_denied=True)
+
+        assert resp.status_code == 403
+        assert self.folder_check.await_args.args[1:] == ("workflow.read", {"workflow_permanent_id": "wpid_doc"})
+        assert storage.downloads == []
+
+    def test_a_deleted_expired_or_vanished_file_is_no_longer_available(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        client = _client(monkeypatch)
+        expired = self._seed(
+            repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG, expires_at=datetime.now(timezone.utc) - timedelta(minutes=1)
+        )
+        vanished = repo.seed(VICTIM_ORG_ID, filename="vanished.png")
+        deleted = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG, filename="deleted.png")
+        repo.rows[deleted].deleted_at = datetime.now(timezone.utc)
+
+        for file_id in (expired, vanished, deleted):
+            resp = self._request(client, file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+            assert resp.status_code == 404
+            assert resp.json() == {"detail": "File is no longer available"}
+
+    @pytest.mark.parametrize(
+        ("filename", "body"),
+        [
+            ("notes.pdf", b"%PDF-1.7 body"),
+            ("table.csv", b"name,amount\nalpha,1\n"),
+            ("pic.svg", b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
+            ("page.html", b"<!doctype html><html><script>alert(1)</script></html>"),
+            ("clip.mp4", b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64),
+        ],
+    )
+    def test_a_named_file_that_is_not_a_raster_image_answers_like_a_missing_file(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        filename: str,
+        body: bytes,
+    ) -> None:
+        client = _client(monkeypatch)
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, body, filename=filename)
+        missing = "file_missing"
+
+        resp = self._request(client, file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+        missing_resp = self._request(client, missing, VICTIM_ORG_ID, VICTIM_ORG_ID, [missing])
+
+        assert resp.status_code == missing_resp.status_code == 404
+        assert resp.json() == missing_resp.json() == {"detail": "File is no longer available"}
+
+    def test_an_image_is_served_up_to_the_4_mib_cap_and_not_past_it(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        client = _client(monkeypatch)
+        at_cap = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG, filename="at.png", size_bytes=4194304)
+        over_cap = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG, filename="over.png", size_bytes=4194305)
+
+        served = self._request(client, at_cap, VICTIM_ORG_ID, VICTIM_ORG_ID, [at_cap])
+        refused = self._request(client, over_cap, VICTIM_ORG_ID, VICTIM_ORG_ID, [over_cap])
+
+        assert served.status_code == 200
+        assert refused.status_code == 404
+        assert refused.json() == {"detail": "File is no longer available"}
+
+    @pytest.mark.parametrize(("stored_size", "status"), [(4194304, 200), (4194305, 404), (None, 404)])
+    def test_a_row_with_no_recorded_size_is_held_to_the_cap_by_the_stored_size(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        stored_size: int | None,
+        status: int,
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+        storage.sizes[repo.rows[file_id].storage_uri] = stored_size
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == status
+
+    @pytest.mark.parametrize(
+        "head",
+        [
+            _png(10_000, 8_001),
+            _webp_vp8x(16_384, 16_384),
+            _webp_vp8x(10_000, 8_001),
+            _webp_vp8l(10_000, 8_001),
+            _webp_vp8(10_000, 8_001),
+            _gif(10_000, 8_001),
+            _jpeg(10_000, 8_001, app_segment_bytes=(30_000, 30_000)),
+            _png(0, 1080),
+            b"\xff\xd8\xff\xe1\xff\xff" + b"\x00" * 70_000,
+            _GIF_FRAME_OFF_SCREEN,
+            b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x3b" + b"\x00" * 64,
+            _jpeg_decoy(b"\xff"),
+            _jpeg_decoy(b"\xff\xd0"),
+            _jpeg(1, 1).replace(_JPEG_SOS, _sof(10_000, 9_000) + _JPEG_SOS),
+            _jpeg(10_000, 9_000).replace(_JPEG_SOS, _sof(1, 1) + _JPEG_SOS),
+            _JPEG_SOF_BEHIND_A_SECOND_SOI,
+            _jpeg(64, 64).replace(b"\xff\xc2", b"\xff\x01" * _PAST_THE_STEP_CAP + b"\xff\xc2"),
+            _gif_after_extension(_DESCRIPTOR_SUB_BLOCK * _PAST_THE_STEP_CAP + b"\x00"),
+            *CRAFTED_4_MIB_HEADERS.values(),
+        ],
+        ids=[
+            "png",
+            "webp-268-megapixels",
+            "webp-vp8x",
+            "webp-vp8l",
+            "webp-vp8",
+            "gif",
+            "jpeg-late-sof",
+            "png-zero",
+            "jpeg-no-sof",
+            "gif-first-frame-off-screen",
+            "gif-no-frame",
+            "jpeg-fill-byte-decoy",
+            "jpeg-rst0-decoy",
+            "jpeg-second-sof-larger",
+            "jpeg-second-sof-smaller",
+            "jpeg-sof-behind-a-second-soi",
+            "jpeg-bare-markers-past-the-step-cap",
+            "gif-sub-blocks-past-the-step-cap",
+            *CRAFTED_4_MIB_HEADERS,
+        ],
+    )
+    def test_an_image_declaring_more_than_80_megapixels_or_no_size_answers_like_a_missing_file(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        head: bytes,
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, head, size_bytes=len(head))
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == 404
+        assert resp.json() == {"detail": "File is no longer available"}
+
+    @pytest.mark.parametrize(
+        ("body", "status", "reads"),
+        [
+            (_jpeg(1, 1).replace(_JPEG_SOS, _sof(10_000, 9_000) + _JPEG_SOS) + _PAST_THE_HEAD, 404, 1),
+            (_JPEG_SOF_BEHIND_A_SECOND_SOI + _PAST_THE_HEAD, 404, 1),
+            (b"\xff\xd8" + _JPEG_SOS + _PAST_THE_HEAD, 404, 1),
+            (
+                _jpeg(64, 64).replace(b"\xff\xc2", b"\xff\x01" * _PAST_THE_STEP_CAP + b"\xff\xc2") + _PAST_THE_HEAD,
+                404,
+                1,
+            ),
+            (_gif_after_extension(b"\x01\x00" * _PAST_THE_STEP_CAP + b"\x00") + _PAST_THE_HEAD, 404, 1),
+            (b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x3b" + _PAST_THE_HEAD, 404, 1),
+            (_jpeg(64, 64).replace(b"\xff\xc2", b"\x00\xff\xc2") + _PAST_THE_HEAD, 404, 1),
+            (_jpeg(1920, 1080, app_segment_bytes=(40_000, 40_000)), 200, 2),
+            (_gif_after_extension((b"\xff" + b"c" * 255) * 280 + b"\x00"), 200, 2),
+            (b"\xff\xd8\xff\xe1\xff\xff" + _PAST_THE_HEAD, 404, 2),
+        ],
+        ids=[
+            "jpeg-second-sof",
+            "jpeg-sof-behind-a-second-soi",
+            "jpeg-sos-with-no-sof",
+            "jpeg-step-cap",
+            "gif-step-cap",
+            "gif-no-frame",
+            "jpeg-junk-between-segments",
+            "jpeg-late-sof",
+            "gif-frame-past-the-head",
+            "jpeg-segment-past-the-head",
+        ],
+    )
+    def test_the_whole_file_is_read_only_when_the_first_64_kib_ends_inside_the_header(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        body: bytes,
+        status: int,
+        reads: int,
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, body, size_bytes=len(body))
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == status
+        assert len(storage.downloads) == reads
+
+    @pytest.mark.parametrize("header", [_png, _webp_vp8x, _webp_vp8l, _webp_vp8, _gif, _jpeg])
+    def test_an_image_at_80_megapixels_is_served(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        header: Callable[[int, int], bytes],
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, header(10_000, 8_000), size_bytes=1024)
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == 200
+
+    def test_a_run_bound_upload_named_by_the_workflow_is_no_longer_available(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG, run_id="wr_1")
+        presign = AsyncMock(wraps=storage.presign_managed_file)
+
+        with patch.object(storage, "presign_managed_file", presign):
+            resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == 404
+        assert resp.json() == {"detail": "File is no longer available"}
+        presign.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_row_of_another_organization_is_refused_even_if_the_lookup_returns_it(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+        unscoped = AsyncMock(return_value=repo.rows[file_id])
+        with patch.object(repo, "get_uploaded_file", unscoped):
+            assert await uploaded_file_service.mint_file_url(file_id=file_id, organization_id=ATTACKER_ORG_ID) is None
+        assert storage.downloads == []
 
 
 class TestDeleteEndpoint:
@@ -251,7 +720,7 @@ class TestDeleteEndpoint:
         resp = self._request(client, file_id, VICTIM_ORG_ID, storage)
 
         assert resp.status_code == 204  # type: ignore[attr-defined]
-        assert storage.deleted == [_uri(VICTIM_ORG_ID)]
+        assert storage.deleted == [uploaded_file_uri(VICTIM_ORG_ID)]
         assert repo.live_ids() == set()
 
     def test_another_orgs_file_id_is_a_404_that_deletes_nothing(
@@ -301,7 +770,7 @@ class TestDeleteEndpoint:
 
         assert self._request(client, file_id, VICTIM_ORG_ID, storage).status_code == 204  # type: ignore[attr-defined]
         assert self._request(client, file_id, VICTIM_ORG_ID, storage).status_code == 404  # type: ignore[attr-defined]
-        assert storage.deleted == [_uri(VICTIM_ORG_ID)]
+        assert storage.deleted == [uploaded_file_uri(VICTIM_ORG_ID)]
 
 
 class TestDeleteFailureHandling:
@@ -386,7 +855,7 @@ class TestStorageUriUniqueness:
                 # storage key. The per-upload id must survive that normalization.
                 storage_key = os.path.basename(filename)
                 storage_keys.append(storage_key)
-                return ("https://presigned.example/x", _uri(organization_id, storage_key))
+                return ("https://presigned.example/x", uploaded_file_uri(organization_id, storage_key))
 
             async def fake_create_uploaded_file(**kwargs: object) -> UploadedFile:
                 now = datetime.now(timezone.utc)
@@ -433,65 +902,168 @@ def _ole_bytes(*entry_names: str, body: bytes = b"") -> bytes:
 
 _PE_HEAD = b"MZ" + b"\x90" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00" + b"\x00" * 64
 _OOXML_MEMBERS = ("[Content_Types].xml", "word/document.xml")
+_PNG_HEAD = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+_TIFF_HEAD = b"II*\x00" + b"\x00" * 20
+_HEIC_HEAD = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 20
+_MP4_HEAD = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 20
+_WEBM_HEAD = b"\x1a\x45\xdf\xa3" + b"\x00" * 20
+_OCTET = "application/octet-stream"
+_ODF_MEMBERS = ("mimetype", "META-INF/manifest.xml", "content.xml")
+_SPREADSHEETML = (
+    b'<?xml version="1.0"?>\n<?mso-application progid="Excel.Sheet"?>\n'
+    b'<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"></Workbook>'
+)
+_WORD_2003_XML = (
+    b'<?xml version="1.0"?>\n<?mso-application progid="Word.Document"?>\n'
+    b'<w:wordDocument xmlns:w="http://schemas.microsoft.com/office/word/2003/wordml"></w:wordDocument>'
+)
+
+
+def _case(filename: str, content: bytes, expected_status: int, declared: str = _OCTET) -> tuple[str, bytes, str, int]:
+    return filename, content, declared, expected_status
 
 
 class TestUploadTypeRestrictions:
-    """Executables, scripts and browser-renderable markup are refused by name and by content; anything else passes."""
+    """The allowlist refuses anything outside the expected types; the denylist and sniffing then refuse
+    executables, scripts, browser-renderable markup and mislabeled content inside it."""
 
     @pytest.mark.parametrize(
-        ("filename", "content", "expected_status"),
+        ("filename", "content", "declared", "expected_status"),
         [
-            ("tool.exe", _PE_HEAD, 415),
-            ("invoice.pdf.exe", b"%PDF-1.7", 415),
-            ("setup.EXE. ", b"anything", 415),
-            ("page.html", b"hello", 415),
-            ("macro.docm", _zip_bytes(*_OOXML_MEMBERS), 415),
-            ("script.py", b"print(1)", 415),
-            ("report.txt", _PE_HEAD, 415),
-            ("notes.txt", b"\xef\xbb\xbf  <!DOCTYPE html><html></html>", 415),
-            ("logo.png", b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"></svg>', 415),
-            ("run.dat", b"#!/bin/sh\nrm -rf /", 415),
-            ("saved.dat", b"<!-- saved from url -->\n<!--x--><html><body></body></html>", 415),
-            ("icon.dat", b'<?xml version="1.0"?><?xml-stylesheet href="a.css"?><!--c--><svg></svg>', 415),
-            ("utf16.dat", "\ufeff<html><script></script></html>".encode("utf-16-le"), 415),
-            ("padded.txt", b" " * 9000 + b"<html></html>", 415),
-            ("comment.txt", b"<!--" + b"x" * 9000 + b"--><svg></svg>", 415),
-            ("page.shtml", b"hello", 415),
-            ("split_tag.txt", b" " * 8185 + b"<script>alert(1)</script>", 415),
-            ("split_comment.txt", b" " * 8189 + b"<!--x--><script></script>", 415),
-            ("split_doctype.txt", b" " * 8180 + b"<!doctype    html><p></p>", 415),
-            ("saved.bin", b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=x", 415),
-            ("binary.data", b"\x7fELF\x02\x01\x01", 415),
-            ("statement.pdf", b"<html>not a pdf</html>", 415),
-            ("statement.pdf", b"plain text", 415),
-            ("photo.jpg", b"not an image", 415),
-            ("budget.xlsx", _zip_bytes("[Content_Types].xml", "xl/vbaProject.bin"), 415),
-            ("bundle.zip", _zip_bytes("META-INF/MANIFEST.MF", "com/example/Main.class"), 415),
-            ("bundle.zip", _zip_bytes("AndroidManifest.xml", "classes.dex"), 415),
-            ("legacy.doc", _ole_bytes("Root Entry", "WordDocument", "Macros", "VBA", "_VBA_PROJECT"), 415),
-            ("ledger.xls", _ole_bytes("Workbook", "_VBA_PROJECT_CUR", "VBA", "_VBA_PROJECT"), 415),
-            ("renamed.docx", _ole_bytes("Root Entry", "WordDocument"), 415),
-            ("shortcut.lnk", b"anything", 415),
-            ("invoice.txt", b"L\x00\x00\x00\x01\x14\x02\x00\x00\x00\x00\x00\xc0\x00\x00\x00\x00\x00\x00F", 415),
-            ("report.weirdext", bytes(range(256)) * 16, 200),
-            ("no_extension", b"plain bytes", 200),
-            ("statement.pdf", b"%PDF-1.7\n%binary", 200),
-            ("letter.docx", _zip_bytes(*_OOXML_MEMBERS), 200),
-            ("locked.docx", _ole_bytes("Root Entry", "EncryptedInfo", "EncryptedPackage"), 200),
-            ("ledger.xls", _ole_bytes("Workbook", body=b"\x00" + "_VBA_PROJECT\0".encode("utf-16-le")), 200),
-            ("data.csv", b"name,email\nada,ada@example.com\n", 200),
-            ("forwarded.eml", b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=x", 200),
-            ("archive.zip", _zip_bytes("docs/readme.txt", "docs/tool.exe"), 200),
-            ("readme.md", b"# Title\n<p>inline html in markdown</p>", 200),
-            ("notes.md", b"<!-- generated -->\n# Title\n", 200),
-            ("indented.txt", b" " * 9000 + b"plain text", 200),
-            ("split_lt.txt", b" " * 8190 + b"<3 plain text", 200),
-            ("utf16.csv", "\ufeffname,email\n".encode("utf-16-le"), 200),
+            # Gate 1: allowlist by extension, declared type and (for extensionless files) sniffed type.
+            _case("report.weirdext", bytes(range(256)) * 16, 415),
+            _case("no_extension", b"plain bytes", 415),
+            _case("backup.7z", b"7z\xbc\xaf\x27\x1c" + b"\x00" * 20, 415),
+            _case("bundle.tar.gz", b"\x1f\x8b\x08" + b"\x00" * 20, 415),
+            _case("tool.exe", _PE_HEAD, 415),
+            _case("invoice.pdf.exe", b"%PDF-1.7", 415),
+            _case("setup.EXE. ", b"anything", 415),
+            _case("page.html", b"hello", 415),
+            _case("page.shtml", b"hello", 415),
+            _case("macro.docm", _zip_bytes(*_OOXML_MEMBERS), 415),
+            _case("script.py", b"print(1)", 415),
+            _case("shortcut.lnk", b"anything", 415),
+            _case("notes.txt", b"hello", 415, declared="text/html"),
+            _case("logo.png", _PNG_HEAD, 415, declared="image/svg+xml"),
+            _case("data.csv", b"a,b\n", 415, declared="application/javascript"),
+            # Gate 2: content sniffing inside the allowlist.
+            _case("report.txt", _PE_HEAD, 415),
+            _case("notes.txt", b"\xef\xbb\xbf  <!DOCTYPE html><html></html>", 415),
+            _case("logo.png", b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"></svg>', 415),
+            _case("run.txt", b"#!/bin/sh\nrm -rf /", 415),
+            _case("saved.txt", b"<!-- saved from url -->\n<!--x--><html><body></body></html>", 415),
+            _case("icon.xml", b'<?xml version="1.0"?><?xml-stylesheet href="a.css"?><!--c--><svg></svg>', 415),
+            _case("utf16.txt", "\ufeff<html><script></script></html>".encode("utf-16-le"), 415),
+            _case("padded.txt", b" " * 9000 + b"<html></html>", 415),
+            _case("comment.txt", b"<!--" + b"x" * 9000 + b"--><svg></svg>", 415),
+            _case("split_tag.txt", b" " * 8185 + b"<script>alert(1)</script>", 415),
+            _case("split_comment.txt", b" " * 8189 + b"<!--x--><script></script>", 415),
+            _case("split_doctype.txt", b" " * 8180 + b"<!doctype    html><p></p>", 415),
+            _case("saved.txt", b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=x", 415),
+            _case("binary.txt", b"\x7fELF\x02\x01\x01", 415),
+            _case("invoice.txt", b"L\x00\x00\x00\x01\x14\x02\x00\x00\x00\x00\x00\xc0\x00\x00\x00\x00\x00\x00F", 415),
+            # Gate 2: an allowed extension whose content does not carry the format's signature.
+            _case("statement.pdf", b"<html>not a pdf</html>", 415),
+            _case("statement.pdf", b"plain text", 415),
+            _case("photo.jpg", b"not an image", 415),
+            _case("scan.tif", b"not an image", 415),
+            _case("movie.mp4", b"not a video", 415),
+            _case("letter.odt", b"plain text", 415),
+            _case("memo.rtf", b"plain text", 415),
+            _case("renamed.docx", _ole_bytes("Root Entry", "WordDocument"), 415),
+            _case("resume.docx", _zip_bytes("notes.txt"), 415),
+            _case("letter.odt", _zip_bytes("notes.txt"), 415),
+            _case("broken.odt", b"PK\x03\x04" + b"\x00" * 40, 415),
+            # Gate 2: macro and package inspection of archives and compound files.
+            _case("budget.xlsx", _zip_bytes("[Content_Types].xml", "xl/vbaProject.bin"), 415),
+            _case("bundle.zip", _zip_bytes("META-INF/MANIFEST.MF", "com/example/Main.class"), 415),
+            _case("bundle.zip", _zip_bytes("AndroidManifest.xml", "classes.dex"), 415),
+            _case("legacy.doc", _ole_bytes("Root Entry", "WordDocument", "Macros", "VBA", "_VBA_PROJECT"), 415),
+            _case("ledger.xls", _ole_bytes("Workbook", "_VBA_PROJECT_CUR", "VBA", "_VBA_PROJECT"), 415),
+            _case("letter.odt", _zip_bytes(*_ODF_MEMBERS, "Basic/Standard/Module1.xml"), 415),
+            _case("sheet.ods", _zip_bytes(*_ODF_MEMBERS, "Scripts/python/macro.py"), 415),
+            _case("no_mimetype.odt", _zip_bytes("META-INF/manifest.xml", "Basic/Standard/Module1.xml"), 415),
+            # Formats without a positive signature check still get the executable sniff.
+            _case("ledger.xls", _PE_HEAD, 415),
+            _case("legacy.doc", b"\x7fELF\x02\x01\x01", 415),
+            _case("deck.ppt", b"#!/bin/sh\necho", 415),
+            _case("movie.mp4", _PE_HEAD, 415),
+            # Accepted: expected types whose content agrees with the name.
+            _case("statement.pdf", b"%PDF-1.7\n%binary", 200),
+            _case("no_extension_pdf", b"%PDF-1.7\n%binary", 200),
+            _case("no_extension_png", _PNG_HEAD, 200),
+            _case("letter.docx", _zip_bytes(*_OOXML_MEMBERS), 200),
+            _case("locked.docx", _ole_bytes("Root Entry", "EncryptedInfo", "EncryptedPackage"), 200),
+            _case("old.doc", _ole_bytes("Root Entry", "WordDocument"), 200),
+            _case("old.doc", b"{\\rtf1\\ansi saved as .doc}", 200),
+            _case("memo.rtf", b"{\\rtf1\\ansi hello}", 200),
+            _case("letter.odt", _zip_bytes("mimetype", "content.xml"), 200),
+            _case("ledger.xls", _ole_bytes("Workbook", body=b"\x00" + "_VBA_PROJECT\0".encode("utf-16-le")), 200),
+            _case("data.csv", b"name,email\nada,ada@example.com\n", 200),
+            _case("data.csv", b"name,email\n", 200, declared="application/vnd.ms-excel"),
+            _case("utf16.csv", "\ufeffname,email\n".encode("utf-16-le"), 200),
+            _case("report.txt", b"hello", 200, declared="text/plain"),
+            _case("readme.md", b"# Title\n<p>inline html in markdown</p>", 200),
+            _case("notes.md", b"<!-- generated -->\n# Title\n", 200),
+            _case("indented.txt", b" " * 9000 + b"plain text", 200),
+            _case("split_lt.txt", b" " * 8190 + b"<3 plain text", 200),
+            _case("config.yaml", b"retries: 3\n", 200),
+            _case("payload.json", b'{"a": 1}', 200, declared="application/json"),
+            _case("forwarded.eml", b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=x", 200),
+            _case("archive.zip", _zip_bytes("docs/readme.txt", "docs/tool.exe"), 200),
+            _case("scan.tiff", _TIFF_HEAD, 200),
+            _case("photo.heic", _HEIC_HEAD, 200),
+            _case("movie.mp4", _MP4_HEAD, 200, declared="video/mp4"),
+            _case("clip.webm", _WEBM_HEAD, 200),
+            _case("legacy.mov", b"\x00\x00\x00\x08wide\x00\x00\x00\x10mdat" + b"\x00" * 20, 200),
+            _case("fake.mov", _PNG_HEAD, 415),
+            # Real-world variants of the legacy, media, RTF and image formats.
+            _case("table.xls", b"<table><tr><td>1</td></tr></table>", 200),
+            _case("export.xls", b"name\temail\nada\tada@example.com\n", 200),
+            _case("workbook.xls", _SPREADSHEETML, 200),
+            _case("renamed.xls", _zip_bytes("[Content_Types].xml", "xl/workbook.xml"), 200),
+            _case("word2003.doc", _WORD_2003_XML, 200),
+            _case("renamed.doc", _zip_bytes(*_OOXML_MEMBERS), 200),
+            _case("deck.ppt", b"plain text", 200),
+            _case("moov_first.mp4", b"\x00\x00\x00\x08moov" + b"\x00" * 20, 200),
+            _case("free_first.mp4", b"\x00\x00\x00\x08free" + b"\x00" * 20, 200),
+            _case("wide_first.mp4", b"\x00\x00\x00\x08wide" + b"\x00" * 20, 200),
+            _case("bom.rtf", b"\xef\xbb\xbf{\\rtf1\\ansi hello}", 200),
+            _case("crlf.rtf", b"\r\n{\\rtf1\\ansi hello}", 200),
+            _case("heix.heic", b"\x00\x00\x00\x18ftypheix" + b"\x00" * 20, 200),
+            _case("mif1.heic", b"\x00\x00\x00\x18ftypmif1" + b"\x00" * 20, 200),
+            _case("big.tif", b"II+\x00\x08\x00\x00\x00" + b"\x00" * 20, 200),
+            _case(
+                "no_macros.odt", _zip_bytes(*_ODF_MEMBERS, "Basic/script-lc.xml", "Basic/Standard/script-lb.xml"), 200
+            ),
+            # Common non-standard declared types.
+            _case("photo.jpg", b"\xff\xd8\xff\xe0" + b"\x00" * 20, 200, declared="image/jpg"),
+            _case("data.csv", b"a,b\n", 200, declared="text/x-csv"),
+            _case("data.csv", b"a,b\n", 200, declared="application/x-csv"),
+            _case("archive.zip", _zip_bytes("docs/readme.txt"), 200, declared="multipart/x-zip"),
+            _case("clip.mov", _MP4_HEAD, 200, declared="video/x-quicktime"),
+            _case("memo.rtf", b"{\\rtf1 hi}", 200, declared="application/x-rtf"),
+            _case("scan.tif", _TIFF_HEAD, 200, declared="image/x-tiff"),
+            _case("data.csv", b"a,b\n", 200, declared="application/x-msexcel"),
+            _case("logo.png", _PNG_HEAD, 200, declared="image/x-png"),
+            _case("ledger.xls", _ole_bytes("Workbook"), 200, declared="application/x-excel"),
+            # Audio inputs a run may attach, and benign text and image types.
+            _case("song.mp3", b"ID3\x03" + b"\x00" * 20, 200, declared="audio/mpeg"),
+            _case("memo.wav", b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 20, 200),
+            _case("memo.wav", b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 20, 200, declared="audio/vnd.wave"),
+            _case("clip.ogg", b"OggS\x00\x02" + b"\x00" * 20, 200, declared="application/ogg"),
+            _case("meeting.ics", b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n", 200, declared="text/calendar"),
+            _case("contact.vcf", b"BEGIN:VCARD\r\nVERSION:3.0\r\nEND:VCARD\r\n", 200),
+            _case("server.log", b"2026-01-01 started\n", 200, declared="text/plain"),
+            _case("photo.avif", b"\x00\x00\x00\x1cftypavif" + b"\x00" * 20, 200),
+            _case("photo.jfif", b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 20, 200),
+            _case("invite.ics", b"<html><script>alert(1)</script></html>", 415),
+            _case("song.mp3", _PE_HEAD, 415),
         ],
-        ids=lambda value: value if isinstance(value, str) else None,
+        ids=lambda value: value if isinstance(value, str) and "/" not in value else None,
     )
     def test_upload_type_is_enforced_at_the_upload_route(
-        self, filename: str, content: bytes, expected_status: int, monkeypatch: pytest.MonkeyPatch
+        self, filename: str, content: bytes, declared: str, expected_status: int, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with (
             patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
@@ -508,20 +1080,157 @@ class TestUploadTypeRestrictions:
                 return UploadedFile(created_at=now, modified_at=now, **kwargs)  # type: ignore[arg-type]
 
             app_module.STORAGE.save_legacy_file = AsyncMock(
-                return_value=("https://presigned.example/x", _uri(VICTIM_ORG_ID, "stored"))
+                return_value=("https://presigned.example/x", uploaded_file_uri(VICTIM_ORG_ID, "stored"))
             )
             app_module.DATABASE.uploaded_files.create_uploaded_file = AsyncMock(side_effect=fake_create_uploaded_file)
 
             resp = _client(monkeypatch).post(
                 "/v1/upload_file",
                 headers={"x-api-key": "key"},
-                files={"file": (filename, io.BytesIO(content), "application/octet-stream")},
+                files={"file": (filename, io.BytesIO(content), declared)},
             )
 
             assert resp.status_code == expected_status, resp.text
             if expected_status == 415:
                 assert resp.json()["detail"].startswith("File type not allowed: ")
             assert app_module.STORAGE.save_legacy_file.await_count == (0 if expected_status == 415 else 1)
+
+    @pytest.mark.parametrize(
+        ("filename", "content"),
+        [("sop.docx", _zip_bytes(*_OOXML_MEMBERS)), ("sop.png", _PNG_HEAD)],
+    )
+    def test_pdf_import_refuses_types_the_generic_route_takes(
+        self, filename: str, content: bytes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with (
+            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            patch(
+                "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
+                new=AsyncMock(return_value=_make_org(VICTIM_ORG_ID)),
+            ),
+        ):
+            app_module.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE = settings.MAX_UPLOAD_FILE_SIZE
+
+            with capture_logs() as logs:
+                resp = _client(monkeypatch).post(
+                    "/api/v1/workflows/import-pdf",
+                    headers={"x-api-key": "key"},
+                    files={"file": (filename, io.BytesIO(content), _OCTET)},
+                )
+
+            assert resp.status_code == 415, resp.text
+            assert (
+                resp.json()["detail"] == f"File type not allowed: .{filename.rsplit('.', 1)[1]} files are not allowed"
+            )
+            [rejection] = [log for log in logs if log["event"] == "Rejected upload by file type"]
+            assert rejection["purpose"] == "import_pdf"
+            assert rejection["organization_id"] == VICTIM_ORG_ID
+
+    @pytest.mark.parametrize(
+        ("filename", "content", "declared", "expected_reason"),
+        [
+            ("dictation.webm", _MP4_HEAD, "", None),
+            ("dictation.mp4", _MP4_HEAD, "", None),
+            ("dictation.webm", b"OggS\x00\x02" + b"\x00" * 20, "", None),
+            ("dictation.webm", b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 20, "", None),
+            ("dictation.webm", b"ID3\x03" + b"\x00" * 20, "", None),
+            ("dictation.webm", b"fLaC" + b"\x00" * 20, "", None),
+            ("dictation.mp3", b"ID3\x03" + b"\x00" * 20, "", None),
+            ("dictation.m4a", b"\x00\x00\x00\x08free" + b"\x00" * 20, "", None),
+            ("dictation.webm", _PNG_HEAD, "", "content does not match .webm"),
+            ("dictation.pdf", _MP4_HEAD, "", ".pdf files are not allowed"),
+        ],
+    )
+    def test_voice_notes_take_only_audio_types(
+        self, filename: str, content: bytes, declared: str, expected_reason: str | None
+    ) -> None:
+        """Browsers name every dictation .webm whatever container they record into, so the check is by family."""
+        file = UploadFile(file=io.BytesIO(content), filename=filename, headers=Headers({"content-type": declared}))
+        reason = uploaded_file_service._upload_type_rejection_reason(
+            file, uploaded_file_service.VOICE_NOTE_UPLOAD_EXTENSIONS, any_audio_container=True
+        )
+        assert reason == expected_reason
+
+    def test_upload_rejection_runs_after_auth_and_names_the_organization(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unauthenticated callers never reach the content scan, and a refusal says who was refused where."""
+        with patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module:
+            app_module.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE = settings.MAX_UPLOAD_FILE_SIZE
+            client = _client(monkeypatch)
+            with patch.object(uploaded_file_service, "_upload_type_rejection_reason") as scan:
+                resp = client.post("/v1/upload_file", files={"file": ("tool.exe", io.BytesIO(_PE_HEAD), _OCTET)})
+            assert resp.status_code in (401, 403), resp.text
+            scan.assert_not_called()
+
+            with (
+                patch(
+                    "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
+                    new=AsyncMock(return_value=_make_org(VICTIM_ORG_ID)),
+                ),
+                capture_logs() as logs,
+            ):
+                resp = client.post(
+                    "/v1/upload_file",
+                    headers={"x-api-key": "key"},
+                    files={"file": ("backup.7z", io.BytesIO(b"7z"), _OCTET)},
+                )
+            assert resp.status_code == 415, resp.text
+            [rejection] = [log for log in logs if log["event"] == "Rejected upload by file type"]
+            assert rejection["organization_id"] == VICTIM_ORG_ID
+            assert rejection["purpose"] == "upload_file"
+
+    @pytest.mark.parametrize(
+        ("extra", "filename", "content", "declared", "expected_reason"),
+        [
+            ([".ORG"], "todo.org", b"* TODO", "text/plain", None),
+            (["gz"], "bundle.gz", b"\x1f\x8b\x08" + b"\x00" * 20, "application/gzip", None),
+            ([], "todo.org", b"* TODO", "text/plain", ".org files are not allowed"),
+            (["exe"], "tool.exe", _PE_HEAD, "text/plain", ".exe files are not allowed"),
+            # Listing a built-in extension also reopens a declared-type refusal for it.
+            ([], "memo.rtf", b"{\\rtf1 hi}", "application/x-unknown-rtf", "declared type"),
+            (["rtf"], "memo.rtf", b"{\\rtf1 hi}", "application/x-unknown-rtf", None),
+        ],
+    )
+    def test_operators_can_widen_the_generic_allowlist_but_not_past_the_denylist(
+        self,
+        extra: list[str],
+        filename: str,
+        content: bytes,
+        declared: str,
+        expected_reason: str | None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Through the public entry point, so the generic route's default allowlist is the one exercised."""
+        monkeypatch.setattr(settings, "UPLOAD_EXTRA_ALLOWED_EXTENSIONS", extra)
+        file = UploadFile(file=io.BytesIO(content), filename=filename, headers=Headers({"content-type": declared}))
+        if expected_reason is None:
+            uploaded_file_service.validate_upload_type(file, purpose="upload_file")
+            return
+        with pytest.raises(HTTPException) as refused:
+            uploaded_file_service.validate_upload_type(file, purpose="upload_file")
+        assert refused.value.status_code == 415
+        assert expected_reason in refused.value.detail
+
+    def test_operator_extensions_do_not_loosen_other_routes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "UPLOAD_EXTRA_ALLOWED_EXTENSIONS", ["pdf"])
+        file = UploadFile(
+            file=io.BytesIO(b"%PDF-1.7"), filename="sop.pdf", headers=Headers({"content-type": "image/png"})
+        )
+        with pytest.raises(HTTPException) as refused:
+            uploaded_file_service.validate_upload_type(
+                file, purpose="import_pdf", allowed=uploaded_file_service.PDF_UPLOAD_EXTENSIONS
+            )
+        assert "declared type image/png" in refused.value.detail
+
+    def test_every_route_allowlist_is_inside_the_declared_type_table(self) -> None:
+        """A route set outside the table would skip the declared-type check for those extensions."""
+        for allowed in (
+            uploaded_file_service.ALLOWED_UPLOAD_EXTENSIONS,
+            uploaded_file_service.PDF_UPLOAD_EXTENSIONS,
+            uploaded_file_service.RESUME_UPLOAD_EXTENSIONS,
+            uploaded_file_service.VOICE_NOTE_UPLOAD_EXTENSIONS,
+        ):
+            assert allowed <= uploaded_file_service.DECLARED_UPLOAD_TYPES.keys()
+        assert not uploaded_file_service.ALLOWED_UPLOAD_EXTENSIONS & uploaded_file_service.DENIED_UPLOAD_EXTENSIONS
 
 
 class TestExpirySweep:
@@ -539,7 +1248,7 @@ class TestExpirySweep:
         result = await uploaded_file_service.purge_expired_files()
 
         assert result == {"examined": 1, "deleted": 1, "failed": 0}
-        assert storage.deleted == [_uri(VICTIM_ORG_ID, "expired.csv")]
+        assert storage.deleted == [uploaded_file_uri(VICTIM_ORG_ID, "expired.csv")]
         assert repo.live_ids() == {not_yet_expired, no_expiry}
         assert expired not in repo.live_ids()
 
@@ -567,7 +1276,7 @@ class TestExpirySweep:
         """
         past = datetime.now(timezone.utc) - timedelta(days=1)
         file_id = repo.seed(VICTIM_ORG_ID, expires_at=past, filename="lifecycle-expired.csv")
-        storage.absent.add(_uri(VICTIM_ORG_ID, "lifecycle-expired.csv"))
+        storage.absent.add(uploaded_file_uri(VICTIM_ORG_ID, "lifecycle-expired.csv"))
 
         result = await uploaded_file_service.purge_expired_files()
 
@@ -593,7 +1302,7 @@ class TestRunAttachment:
         deleted = await uploaded_file_service.delete_files_attached_to_run(run_id="wr_1")
 
         assert deleted == 1
-        assert storage.deleted == [_uri(VICTIM_ORG_ID, "cv.pdf")]
+        assert storage.deleted == [uploaded_file_uri(VICTIM_ORG_ID, "cv.pdf")]
         assert repo.live_ids() == {other_run, unattached}
 
     @pytest.mark.asyncio
@@ -700,7 +1409,9 @@ class TestFileIdAsFileReference:
     ) -> None:
         file_id = repo.seed(VICTIM_ORG_ID, filename="cv.pdf")
 
-        assert await files_api.resolve_uploaded_file_id(file_id, VICTIM_ORG_ID) == _uri(VICTIM_ORG_ID, "cv.pdf")
+        assert await files_api.resolve_uploaded_file_id(file_id, VICTIM_ORG_ID) == uploaded_file_uri(
+            VICTIM_ORG_ID, "cv.pdf"
+        )
         with pytest.raises(FileNotFoundError):
             await files_api.resolve_uploaded_file_id(file_id, ATTACKER_ORG_ID)
 
@@ -729,7 +1440,7 @@ class TestStorageGuard:
         s3_storage.async_client = MagicMock(delete_file=AsyncMock())
 
         with pytest.raises(PermissionError):
-            await s3_storage.delete_legacy_file(organization_id=ATTACKER_ORG_ID, uri=_uri(VICTIM_ORG_ID))
+            await s3_storage.delete_legacy_file(organization_id=ATTACKER_ORG_ID, uri=uploaded_file_uri(VICTIM_ORG_ID))
 
         s3_storage.async_client.delete_file.assert_not_awaited()
 
@@ -742,4 +1453,4 @@ class TestStorageGuard:
 
     def test_the_orgs_own_file_is_still_reachable(self) -> None:
         """The traversal guard must not reject ordinary keys."""
-        S3Storage().assert_managed_file_access(_uri(ATTACKER_ORG_ID), ATTACKER_ORG_ID)
+        S3Storage().assert_managed_file_access(uploaded_file_uri(ATTACKER_ORG_ID), ATTACKER_ORG_ID)
