@@ -2065,7 +2065,8 @@ def test_every_tool_that_pays_for_a_name_has_something_to_say_about_it() -> None
     from skyvern.forge.taskv3.target_label import TARGET_VERBS
     from skyvern.forge.taskv3.tools import _TARGET_LABEL_TOOL_NAMES
 
-    assert set(TARGET_VERBS) == set(_TARGET_LABEL_TOOL_NAMES)
+    # download runs click's own wrapped handler, so its result already carries click's captured name.
+    assert set(TARGET_VERBS) == set(_TARGET_LABEL_TOOL_NAMES) | {"download"}
 
 
 @pytest.mark.asyncio

@@ -30,7 +30,6 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     deregister_custom_llm_config,
     register_custom_llm_config,
 )
-from skyvern.forge.sdk.copilot.challenge_evidence import is_carrier_backed_category_entry
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -43,6 +42,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunBlockModel,
     WorkflowRunModel,
 )
+from skyvern.forge.sdk.ember.challenge_evidence import is_carrier_backed_category_entry
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.forge.sdk.schemas.har_evidence import (

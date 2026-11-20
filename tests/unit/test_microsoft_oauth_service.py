@@ -12,7 +12,15 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from skyvern.forge.sdk.db.repositories.microsoft_oauth import ActiveCredentialCiphertext, PendingConsentContext
+from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
+from skyvern.forge.sdk.db.models import MicrosoftOAuthCredentialModel
+from skyvern.forge.sdk.db.repositories.microsoft_oauth import (
+    STATE_ACTIVE,
+    STATE_ERROR,
+    ActiveCredentialCiphertext,
+    MicrosoftOAuthRepository,
+    PendingConsentContext,
+)
 from skyvern.forge.sdk.encrypt import Encryptor
 from skyvern.forge.sdk.encrypt.aes import AES
 from skyvern.forge.sdk.encrypt.aes_gcm import AESGCMEncryptor
@@ -23,6 +31,7 @@ from skyvern.forge.sdk.schemas.microsoft_oauth import (
     MicrosoftOAuthCredentialBase,
 )
 from skyvern.forge.sdk.services import microsoft_oauth_service
+from tests.unit.conftest import SqliteEngineFactory
 
 # "rt-legacy" as the retired CBC writer stored it under legacy-test-key / legacy-salt / legacy-iv.
 LEGACY_CBC_REFRESH_TOKEN = "vAV6Q7iRBxtfQM2THvF6pQ=="
@@ -1319,12 +1328,19 @@ async def test_gcm_credentials_are_dual_read_and_missing_key_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_invalid_grant_raises_reconnect_message(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_invalid_grant_raises_reconnect_message_and_expires_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine_factory: SqliteEngineFactory,
+) -> None:
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_SECRET", "secret", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
+    token_error = {"status": 400, "error": "invalid_grant"}
 
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, json={"error": "invalid_grant", "error_description": "expired"})
+        return httpx.Response(token_error["status"], json={"error": token_error["error"], "error_description": "x"})
 
     _install_microsoft_transport(monkeypatch, handler)
 
@@ -1333,6 +1349,44 @@ async def test_invalid_grant_raises_reconnect_message(monkeypatch: pytest.Monkey
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.error_code == "invalid_grant"
+
+    engine = sqlite_engine_factory()
+    repo = MicrosoftOAuthRepository(BaseAlchemyDB(engine).Session, debug_enabled=False)
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    async with engine.begin() as conn:
+        await conn.execute(
+            MicrosoftOAuthCredentialModel.__table__.insert().values(
+                id="cred-1",
+                organization_id="org-1",
+                credential_name="Default",
+                state=STATE_ACTIVE,
+                encrypted_refresh_token="stored-ciphertext",
+                encrypted_method="aes_gcm",
+                created_at=now,
+                modified_at=now,
+            )
+        )
+    monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repo))
+    secrets = microsoft_oauth_service.MicrosoftCredentialSecrets(
+        refresh_token="rt-1", scopes=["Mail.Read"], encrypted_refresh_token="stored-ciphertext"
+    )
+
+    async def stored_states() -> list[tuple[str, str]]:
+        return [(credential.id, credential.state) for credential in await repo.list_visible_for_org("org-1")]
+
+    token_error.update(status=503, error="temporarily_unavailable")
+    with pytest.raises(microsoft_oauth_service.MicrosoftOAuthError):
+        await microsoft_oauth_service.refresh_and_rotate(
+            organization_id="org-1", credential_id="cred-1", credential_secrets=secrets
+        )
+    assert await stored_states() == [("cred-1", STATE_ACTIVE)]
+
+    token_error.update(status=400, error="invalid_grant")
+    with pytest.raises(microsoft_oauth_service.MicrosoftOAuthError, match="Reconnect"):
+        await microsoft_oauth_service.refresh_and_rotate(
+            organization_id="org-1", credential_id="cred-1", credential_secrets=secrets
+        )
+    assert await stored_states() == [("cred-1", STATE_ERROR)]
 
 
 @pytest.mark.asyncio

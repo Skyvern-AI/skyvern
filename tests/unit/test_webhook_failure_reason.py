@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,9 +11,13 @@ from structlog.testing import capture_logs
 
 from skyvern.exceptions import FailedToSendWebhook
 from skyvern.forge import agent as agent_module
+from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.schemas.run_enums import RunType
 from skyvern.services import task_v2_service
 from skyvern.services import webhook_delivery as webhook_delivery_module
+from skyvern.services import webhook_service
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -48,40 +54,107 @@ def task_webhook_agent(monkeypatch: pytest.MonkeyPatch) -> tuple[ForgeAgent, Asy
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delivery_error", "recording_fails"),
+    [
+        pytest.param(httpx.ReadTimeout(""), False, id="recorded"),
+        pytest.param(httpx.ConnectError("unreachable"), True, id="recording-failed"),
+    ],
+)
 async def test_task_webhook_delivery_exception_persists_failure_reason(
     task_webhook_agent: tuple[ForgeAgent, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
+    delivery_error: httpx.RequestError,
+    recording_fails: bool,
 ) -> None:
     agent, update_task = task_webhook_agent
-    monkeypatch.setattr(
-        agent_module,
-        "deliver_webhook_with_retries",
-        AsyncMock(side_effect=httpx.ReadTimeout("")),
-    )
+    reasons: list[str] = []
+
+    async def record_failure(*, webhook_failure_reason: str, **_: object) -> None:
+        if recording_fails:
+            raise RuntimeError("db pool exhausted")
+        reasons.append(webhook_failure_reason)
+
+    update_task.side_effect = record_failure
+    monkeypatch.setattr(agent_module, "deliver_webhook_with_retries", AsyncMock(side_effect=delivery_error))
 
     with pytest.raises(FailedToSendWebhook):
         await agent.execute_task_webhook(task=_make_task(), api_key="api-key")
 
-    update_task.assert_awaited_once()
-    reason = update_task.await_args.kwargs["webhook_failure_reason"]
-    assert "ReadTimeout" in reason
+    if not recording_fails:
+        (reason,) = reasons
+        assert type(delivery_error).__name__ in reason
 
 
 @pytest.mark.asyncio
-async def test_task_webhook_still_raises_when_failure_reason_recording_fails(
-    task_webhook_agent: tuple[ForgeAgent, AsyncMock],
+@pytest.mark.parametrize("entrypoint", ["delivery", "preview"])
+@pytest.mark.parametrize("final_url", ["https://example.test/final.png", None], ids=["final-url", "no-final-url"])
+async def test_task_webhook_payload_uses_first_final_and_both_action_lists(
     monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+    final_url: str | None,
 ) -> None:
-    agent, update_task = task_webhook_agent
-    update_task.side_effect = RuntimeError("db pool exhausted")
+    now = datetime.now(UTC)
+    task = Task(
+        task_id="tsk_1",
+        organization_id="o_1",
+        url="https://example.test",
+        webhook_callback_url="https://example.test/hook",
+        status=TaskStatus.completed,
+        created_at=now,
+        modified_at=now,
+    )
+    agent = ForgeAgent()
+    monkeypatch.setattr(app, "agent", agent)
+    tasks = app.DATABASE.tasks
     monkeypatch.setattr(
-        agent_module,
-        "deliver_webhook_with_retries",
-        AsyncMock(side_effect=httpx.ConnectError("unreachable")),
+        tasks, "get_run", AsyncMock(return_value=SimpleNamespace(run_id=task.task_id, task_run_type=RunType.task_v1))
+    )
+    monkeypatch.setattr(tasks, "get_task", AsyncMock(return_value=task))
+    monkeypatch.setattr(tasks, "get_latest_step", AsyncMock(return_value=SimpleNamespace(step_id="stp_1")))
+    monkeypatch.setattr(tasks, "get_task_step_count", AsyncMock(return_value=1))
+    monkeypatch.setattr(tasks, "get_first_step", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.STORAGE, "get_downloaded_files", AsyncMock(return_value=[]))
+
+    legacy_action_url = "https://example.test/legacy-action.png"
+    run_action_url = "https://example.test/run-action.png"
+    final_artifact = SimpleNamespace(signed_url=final_url) if final_url is not None else None
+    monkeypatch.setattr(
+        app.DATABASE.artifacts,
+        "get_artifact",
+        AsyncMock(side_effect=[final_artifact, RuntimeError("second final screenshot lookup failed")]),
+    )
+    monkeypatch.setattr(
+        app.DATABASE.artifacts,
+        "get_latest_n_artifacts",
+        AsyncMock(side_effect=[[SimpleNamespace(signed_url=url)] for url in (legacy_action_url, run_action_url)]),
+    )
+    monkeypatch.setattr(app.ARTIFACT_MANAGER, "get_share_link", AsyncMock(side_effect=lambda row: row.signed_url))
+    monkeypatch.setattr(
+        app.ARTIFACT_MANAGER,
+        "get_share_links_with_bundle_support",
+        AsyncMock(side_effect=lambda rows: [row.signed_url for row in rows]),
     )
 
-    with pytest.raises(FailedToSendWebhook):
-        await agent.execute_task_webhook(task=_make_task(), api_key="api-key")
+    if entrypoint == "preview":
+        monkeypatch.setattr(webhook_service, "_get_api_key", AsyncMock(return_value="test-key"))
+        preview = await webhook_service.build_run_preview(task.organization_id, task.task_id)
+        signed_payload = preview.payload
+    else:
+        sent: list[str] = []
+
+        async def deliver(*, payload: str, **_: object) -> httpx.Response:
+            sent.append(payload)
+            return httpx.Response(200)
+
+        monkeypatch.setattr(agent_module, "deliver_webhook_with_retries", deliver)
+        await agent.execute_task_webhook(task=task, api_key="test-key")
+        (signed_payload,) = sent
+
+    payload = json.loads(signed_payload)
+    assert payload["screenshot_url"] == final_url
+    assert payload["action_screenshot_urls"] == [legacy_action_url]
+    assert payload["screenshot_urls"] == [run_action_url]
 
 
 @pytest.mark.asyncio

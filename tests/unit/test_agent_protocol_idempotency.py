@@ -19,18 +19,18 @@ from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AuditEvent
 from skyvern.forge.api_app import create_api_app, handle_skyvern_http_exception
-from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.models import OutputParameterModel, WorkflowModel
 from skyvern.forge.sdk.db.repositories import workflows as workflows_repository
+from skyvern.forge.sdk.ember.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.routes import agent_protocol
-from skyvern.forge.sdk.routes.workflow_copilot import (
+from skyvern.forge.sdk.routes.ember import (
     _commit_staged_workflow,
     _restore_workflow_definition,
-    workflow_copilot_apply_proposed_workflow,
+    ember_apply_proposed_workflow,
 )
+from skyvern.forge.sdk.schemas.ember import EmberApplyProposedWorkflowRequest
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotApplyProposedWorkflowRequest
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow, NonTerminalFinallyBlock
 from skyvern.forge.sdk.workflow.models.block import NavigationBlock
@@ -1094,11 +1094,11 @@ async def test_workflow_setting_presence_preserves_persisted_values(
                 if entrypoint == "legacy_proposal":
                     proposal[field_name] = None
                 proposal["_copilot_yaml"] = document
-                chat = await lab.database.workflow_params.create_workflow_copilot_chat(
+                chat = await lab.database.workflow_params.create_ember_chat(
                     organization_id=lab.organization.organization_id,
                     workflow_permanent_id=stored.workflow_permanent_id,
                 )
-                await lab.database.workflow_params.update_workflow_copilot_chat(
+                await lab.database.workflow_params.update_ember_chat(
                     organization_id=lab.organization.organization_id,
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                     proposed_workflow=proposal,
@@ -1114,8 +1114,8 @@ async def test_workflow_setting_presence_preserves_persisted_values(
                     ):
                         assert staged.extra_http_headers == {"X-Test": "stored-value"}
                         expected = {"X-Test": "updated-value"}
-                saved = await workflow_copilot_apply_proposed_workflow(
-                    WorkflowCopilotApplyProposedWorkflowRequest(workflow_copilot_chat_id=chat.workflow_copilot_chat_id),
+                saved = await ember_apply_proposed_workflow(
+                    EmberApplyProposedWorkflowRequest(workflow_copilot_chat_id=chat.workflow_copilot_chat_id),
                     lab.organization,
                 )
                 saved_id = saved.workflow_id

@@ -137,7 +137,9 @@ def test_workflow_detail_masks_inline_secrets_without_mutating_stored_workflow(c
     )
     mock_app = MagicMock()
     mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)
-    mock_app.DATABASE.workflows.is_workflow_copilot_authored = AsyncMock(return_value=False)
+    mock_app.DATABASE.workflows.is_ember_authored = AsyncMock(return_value=False)
+    # A failed creator read must not take the agent page down; the key is omitted so the server decides deletes.
+    mock_app.DATABASE.workflows.get_workflow_original_creators = AsyncMock(side_effect=RuntimeError("db down"))
     with (
         patch("skyvern.forge.sdk.routes.agent_protocol.app", mock_app),
         patch("skyvern.forge.sdk.routes.agent_protocol.effective_default_engine", AsyncMock(return_value=None)),
@@ -145,6 +147,7 @@ def test_workflow_detail_masks_inline_secrets_without_mutating_stored_workflow(c
         response = client.get("/v1/workflows/wpid_test")
 
     assert response.status_code == 200, response.text
+    assert "original_created_by" not in response.json()
     visible_block = response.json()["workflow_definition"]["blocks"][0]
     assert visible_block["sftp_private_key"] == "[REDACTED]"
     assert visible_block["sftp_password"] == "[REDACTED]"
@@ -162,7 +165,10 @@ def test_only_the_detail_get_carries_the_effective_default_engine(
     mock_app.WORKFLOW_SERVICE.get_workflow_versions_by_permanent_id = AsyncMock(return_value=[_stored_workflow()])
     mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=(_stored_workflow(), ()))
     mock_app.WORKFLOW_SERVICE.get_workflows_by_organization_id = AsyncMock(return_value=[_stored_workflow()])
-    mock_app.DATABASE.workflows.is_workflow_copilot_authored = AsyncMock(return_value=False)
+    mock_app.DATABASE.workflows.is_ember_authored = AsyncMock(return_value=False)
+    mock_app.DATABASE.workflows.get_workflow_original_creators = AsyncMock(
+        return_value={"wpid_other": "user_other", "wpid_test": "user_creator"}
+    )
     mock_app.AGENT_FUNCTION.on_workflow_updated_by_user = AsyncMock()
     mock_app.AGENT_FUNCTION.record_audit_event = AsyncMock()
     mock_app.AGENT_FUNCTION.enforce_folder_access_for_references = AsyncMock()
@@ -180,9 +186,12 @@ def test_only_the_detail_get_carries_the_effective_default_engine(
 
     assert detail.status_code == 200, detail.text
     assert detail.json()["effective_default_engine"] == (computed and computed.value)
+    assert detail.json()["original_created_by"] == "user_creator"
     assert versions.status_code == 200, versions.text
     assert "effective_default_engine" not in versions.json()[0]
+    assert "original_created_by" not in versions.json()[0]
     assert listed.status_code == 200, listed.text
     assert "effective_default_engine" not in listed.json()[0]
     assert saved.status_code == 200, saved.text
     assert "effective_default_engine" not in saved.json()
+    assert "original_created_by" not in saved.json()

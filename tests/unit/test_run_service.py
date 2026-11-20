@@ -21,7 +21,14 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
-from skyvern.schemas.runs import RunResponse, RunStatus, RunType, TaskRunResponse, WorkflowRunResponse
+from skyvern.schemas.runs import (
+    RunResponse,
+    RunStatus,
+    RunType,
+    TaskRunResponse,
+    WorkflowRunRequest,
+    WorkflowRunResponse,
+)
 from skyvern.services import run_service
 from tests.unit.conftest import RUN_GROUP_ORG, RUN_GROUP_WPID, GroupEnv
 from tests.unit.force_stub_app import released_session_stub
@@ -47,9 +54,15 @@ class _GatedBuild:
         self.release = asyncio.Event()
         self.status = RunStatus.running
         self.error: Exception | None = None
+        self.run_request: WorkflowRunRequest | None = None
 
     async def __call__(
-        self, run_id: str, organization_id: str | None = None, cap_output_values: bool = False
+        self,
+        run_id: str,
+        organization_id: str | None = None,
+        cap_output_values: bool = False,
+        need_browser_log: bool = True,
+        need_final_screenshot: bool = True,
     ) -> WorkflowRunResponse | None:
         self.calls.append((organization_id, run_id, cap_output_values))
         self.entered.set()
@@ -60,7 +73,12 @@ class _GatedBuild:
             return None
         now = datetime.now(UTC)
         return WorkflowRunResponse(
-            run_id=run_id, run_type=RunType.workflow_run, status=self.status, created_at=now, modified_at=now
+            run_id=run_id,
+            run_type=RunType.workflow_run,
+            status=self.status,
+            created_at=now,
+            modified_at=now,
+            run_request=self.run_request,
         )
 
 
@@ -82,15 +100,36 @@ async def _settle() -> None:
 
 
 @pytest.mark.asyncio
-async def test_identical_overlapping_polls_share_one_build(build: _GatedBuild) -> None:
-    polls = [asyncio.create_task(_get()) for _ in range(20)]
+@pytest.mark.parametrize("has_run_request", [False, True])
+async def test_identical_overlapping_polls_share_one_build(
+    build: _GatedBuild, monkeypatch: pytest.MonkeyPatch, has_run_request: bool
+) -> None:
+    address = "wss://browser.example.test/pbs_test"
+    if has_run_request:
+        build.run_request = WorkflowRunRequest(workflow_id="wpid_1", browser_address=address)
+    decisions = iter([set(), {"pbs_test"}])
+
+    async def authorize_connect(principal: object, organization_id: str, browser_session_ids: set[str]) -> set[str]:
+        return next(decisions)
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "browser_session_ids_authorized_for_connect", authorize_connect)
+
+    polls = [asyncio.create_task(_get()) for _ in range(2)]
     await asyncio.wait_for(build.entered.wait(), timeout=5)
     await _settle()
     build.release.set()
-    results = await asyncio.gather(*polls)
+    first, second = await asyncio.gather(*polls)
 
     assert len(build.calls) == 1
-    assert all(result == results[0] for result in results)
+    assert first is not second
+    if build.run_request is None:
+        assert first.run_request is second.run_request is None
+    else:
+        assert first.run_request is not None
+        assert second.run_request is not None
+        assert first.run_request is not second.run_request
+        assert {first.run_request.browser_address, second.run_request.browser_address} == {None, address}
+        assert build.run_request.browser_address == address
     assert run_service._IN_FLIGHT == {}
 
 

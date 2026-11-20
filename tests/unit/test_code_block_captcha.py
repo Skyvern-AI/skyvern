@@ -35,7 +35,7 @@ from skyvern.webeye.utils.captcha_solver import (
     solve_challenge_ladder,
 )
 from tests.unit.conftest import OcrRecordingAgentFunction, ScopeRecordingAgentFunction
-from tests.unit.copilot_test_helpers import (
+from tests.unit.ember_test_helpers import (
     AUTO_RENDER_TURNSTILE_HTML,
     CHALLENGE_URL,
     FIXTURE_SITE_ORIGIN,
@@ -48,6 +48,7 @@ CHALLENGE_SUBDOMAIN_URL = "https://edge.challenges.cloudflare.com/cdn-cgi/challe
 SOLVED = ChallengeOutcome(ChallengeStatus.SOLVED, None, "extension")
 ABSENT = ChallengeOutcome(ChallengeStatus.ABSENT, page_state="clear")
 UNSOLVED = ChallengeOutcome(ChallengeStatus.UNSOLVED, "datadome", "vendor_handler", "challenged")
+_EXTENSION_SOLVED = challenge_signature.SolverExtensionCheck(found=True, solved=True)
 
 
 class FakeLocator:
@@ -251,7 +252,7 @@ async def test_real_sandbox_solve_captcha_is_fast_noop_without_challenge(monkeyp
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -263,7 +264,7 @@ async def test_real_sandbox_solve_captcha_is_fast_noop_without_challenge(monkeyp
     await fn()
 
     assert await solve_challenge_ladder(FakePage()) is False
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
     agent_function.solve_recaptcha_token.assert_not_awaited()
 
 
@@ -275,7 +276,7 @@ async def test_real_sandbox_solve_captcha_clicks_unique_structural_checkbox(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -288,7 +289,7 @@ async def test_real_sandbox_solve_captcha_clicks_unique_structural_checkbox(
     page.checkbox.click.assert_awaited_once_with()
     page.continue_button.click.assert_awaited_once_with()
     assert await page.checkbox.is_checked() is True
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -307,7 +308,7 @@ async def test_real_sandbox_solve_captcha_clicks_recaptcha_anchor_in_frame(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -325,7 +326,7 @@ async def test_real_sandbox_solve_captcha_clicks_recaptcha_anchor_in_frame(
     anchor.click.assert_awaited_once_with()
     assert await anchor.is_checked() is True
     assert parent_frame.recaptcha_token._input_value_calls == 2
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
     agent_function.solve_recaptcha_token.assert_not_awaited()
 
 
@@ -345,7 +346,7 @@ async def test_real_sandbox_solve_captcha_does_not_click_untrusted_anchor_host(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -360,7 +361,7 @@ async def test_real_sandbox_solve_captcha_does_not_click_untrusted_anchor_host(
     await block.generate_async_user_function(block.code, page)()
 
     anchor.click.assert_not_awaited()
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
 
 
 @pytest.mark.asyncio
@@ -371,7 +372,7 @@ async def test_real_sandbox_solve_captcha_does_not_click_after_anchor_frame_navi
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -390,7 +391,7 @@ async def test_real_sandbox_solve_captcha_does_not_click_after_anchor_frame_navi
     await block.generate_async_user_function(block.code, page)()
 
     anchor.click.assert_not_awaited()
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
 
 
 @pytest.mark.asyncio
@@ -410,7 +411,7 @@ async def test_real_sandbox_solve_captcha_returns_after_callback_navigation(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=not navigation_solved),
+            "solver_extension_check": AsyncMock(return_value=None if navigation_solved else _EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -435,9 +436,9 @@ async def test_real_sandbox_solve_captcha_returns_after_callback_navigation(
 
     anchor.click.assert_awaited_once_with()
     if navigation_solved:
-        agent_function.auto_solve_captchas.assert_not_awaited()
+        agent_function.solver_extension_check.assert_not_awaited()
     else:
-        agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+        agent_function.solver_extension_check.assert_awaited_once_with(page)
     agent_function.solve_recaptcha_token.assert_not_awaited()
 
 
@@ -449,7 +450,7 @@ async def test_real_sandbox_solve_captcha_rejects_prechecked_anchor_without_fres
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=True),
         },
     )()
@@ -465,7 +466,7 @@ async def test_real_sandbox_solve_captcha_rejects_prechecked_anchor_without_fres
     await block.generate_async_user_function(block.code, page)()
 
     anchor.click.assert_not_awaited()
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
     agent_function.solve_recaptcha_token.assert_awaited_once()
 
 
@@ -477,7 +478,7 @@ async def test_real_sandbox_solve_captcha_falls_through_when_anchor_stays_unchec
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -493,7 +494,7 @@ async def test_real_sandbox_solve_captcha_falls_through_when_anchor_stays_unchec
     await block.generate_async_user_function(block.code, page)()
 
     anchor.click.assert_awaited_once_with()
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
     agent_function.solve_recaptcha_token.assert_not_awaited()
 
 
@@ -505,7 +506,7 @@ async def test_real_sandbox_solve_captcha_falls_through_when_token_lags_checked_
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=True),
         },
     )()
@@ -521,7 +522,7 @@ async def test_real_sandbox_solve_captcha_falls_through_when_token_lags_checked_
     await block.generate_async_user_function(block.code, page)()
 
     assert await anchor.is_checked() is True
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
     agent_function.solve_recaptcha_token.assert_awaited_once()
 
 
@@ -533,7 +534,7 @@ async def test_real_sandbox_solve_captcha_rejects_preexisting_token(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=True),
         },
     )()
@@ -549,7 +550,7 @@ async def test_real_sandbox_solve_captcha_rejects_preexisting_token(
     await block.generate_async_user_function(block.code, page)()
 
     anchor.click.assert_awaited_once_with()
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
     agent_function.solve_recaptcha_token.assert_awaited_once()
 
 
@@ -561,7 +562,7 @@ async def test_real_sandbox_solve_captcha_rejects_inconclusive_token_baseline(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=True),
         },
     )()
@@ -578,7 +579,7 @@ async def test_real_sandbox_solve_captcha_rejects_inconclusive_token_baseline(
     await block.generate_async_user_function(block.code, page)()
 
     anchor.click.assert_awaited_once_with()
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
     agent_function.solve_recaptcha_token.assert_awaited_once()
 
 
@@ -590,7 +591,7 @@ async def test_real_sandbox_solve_captcha_bounds_unresponsive_anchor_arm(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -611,7 +612,7 @@ async def test_real_sandbox_solve_captcha_bounds_unresponsive_anchor_arm(
     await asyncio.wait_for(block.generate_async_user_function(block.code, page)(), timeout=0.25)
 
     anchor.click.assert_awaited_once_with()
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
     agent_function.solve_recaptcha_token.assert_not_awaited()
 
 
@@ -623,7 +624,7 @@ async def test_real_sandbox_solve_captcha_raises_constant_sanitized_error(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -641,7 +642,7 @@ async def test_real_sandbox_solve_captcha_raises_constant_sanitized_error(
 
     assert str(exc_info.value) == "CAPTCHA could not be solved."
     assert "recaptcha" not in str(exc_info.value).lower()
-    agent_function.auto_solve_captchas.assert_awaited_once()
+    agent_function.solver_extension_check.assert_awaited_once()
     agent_function.solve_recaptcha_token.assert_awaited_once_with(
         page,
         organization_id="org-1",
@@ -658,7 +659,7 @@ async def test_builtin_reports_whether_an_arm_ran(monkeypatch: pytest.MonkeyPatc
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=True),
         },
     )()
@@ -979,7 +980,7 @@ async def test_extension_arm_is_bounded_and_falls_through_on_hang(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(side_effect=_never_returns),
+            "solver_extension_check": AsyncMock(side_effect=_never_returns),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -993,7 +994,7 @@ async def test_extension_arm_is_bounded_and_falls_through_on_hang(
     with pytest.raises(CodeBlockCaptchaError):
         await asyncio.wait_for(block.generate_async_user_function(block.code, page)(), timeout=5)
 
-    agent_function.auto_solve_captchas.assert_awaited_once()
+    agent_function.solver_extension_check.assert_awaited_once()
     agent_function.solve_recaptcha_token.assert_awaited_once()
 
 
@@ -1005,7 +1006,7 @@ async def test_an_unsolved_anchor_click_closes_the_challenge_it_opened(monkeypat
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1035,7 +1036,7 @@ async def test_an_anchor_click_that_left_a_token_is_not_reset_away(monkeypatch: 
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1069,7 +1070,7 @@ async def test_hcaptcha_marker_reaches_extension_arm(monkeypatch: pytest.MonkeyP
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1077,7 +1078,7 @@ async def test_hcaptcha_marker_reaches_extension_arm(monkeypatch: pytest.MonkeyP
     page = FakePage(hcaptcha=True)
 
     assert await solve_challenge_ladder(page) is True
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
 
 
 @pytest.mark.asyncio
@@ -1091,7 +1092,7 @@ async def test_nested_visible_frame_marker_reaches_extension_arm_with_hcaptcha_b
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1112,7 +1113,7 @@ async def test_nested_visible_frame_marker_reaches_extension_arm_with_hcaptcha_b
 
     assert await solve_challenge_ladder(page, probe_child_frames=True) is True
 
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
     assert resolve_calls == [captcha_solver_module._HCAPTCHA_ARM_TIMEOUT_SECONDS]
 
 
@@ -1124,7 +1125,7 @@ async def test_nested_invisible_frame_marker_is_not_detected(monkeypatch: pytest
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1139,7 +1140,7 @@ async def test_nested_invisible_frame_marker_is_not_detected(monkeypatch: pytest
 
     assert await solve_challenge_ladder(page, probe_child_frames=True) is False
 
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1150,7 +1151,7 @@ async def test_nested_invisible_marker_in_visible_frame_is_not_detected(monkeypa
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1164,7 +1165,7 @@ async def test_nested_invisible_marker_in_visible_frame_is_not_detected(monkeypa
 
     assert await solve_challenge_ladder(page, probe_child_frames=True) is False
 
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
 
 
 class _MatchList:
@@ -1187,7 +1188,7 @@ async def test_nested_visible_marker_after_many_hidden_ones_is_detected(monkeypa
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1204,7 +1205,7 @@ async def test_nested_visible_marker_after_many_hidden_ones_is_detected(monkeypa
         "a visible match after hidden ones must count"
     )
 
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
 
 
 @pytest.mark.asyncio
@@ -1216,7 +1217,7 @@ async def test_page_marker_that_raises_does_not_hide_a_presented_one(monkeypatch
 
     assert await solve_challenge_ladder(page) is True, "an unreadable marker must not read as no challenge"
 
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
 
 
 @pytest.mark.asyncio
@@ -1228,7 +1229,7 @@ async def test_page_checkbox_that_raises_does_not_hide_a_presented_one(monkeypat
 
     assert await solve_challenge_ladder(page) is True, "an unreadable checkbox must not read as no challenge"
 
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
 
 
 @pytest.mark.asyncio
@@ -1243,7 +1244,7 @@ async def test_nested_marker_that_raises_does_not_hide_a_presented_one(monkeypat
         "an unreadable nested marker must not read as no challenge"
     )
 
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
 
 
 @pytest.mark.asyncio
@@ -1255,7 +1256,7 @@ async def test_hidden_checkbox_only_page_is_absent(monkeypatch: pytest.MonkeyPat
 
     assert await solve_challenge_ladder(page) is False
 
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1265,7 +1266,7 @@ async def test_nested_offscreen_marker_is_not_detected(monkeypatch: pytest.Monke
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1280,7 +1281,7 @@ async def test_nested_offscreen_marker_is_not_detected(monkeypatch: pytest.Monke
 
     assert await solve_challenge_ladder(page, probe_child_frames=True) is False, "an off-screen match must not count"
 
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1290,7 +1291,7 @@ async def test_nested_onscreen_match_after_an_offscreen_one_is_detected(monkeypa
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1396,6 +1397,9 @@ class _DetachedFrame:
     async def frame_element(self) -> None:
         raise PlaywrightError("Frame was detached")
 
+    def is_detached(self) -> bool:
+        return True
+
 
 @pytest.mark.asyncio
 async def test_a_frame_that_raises_does_not_abort_the_scan(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1404,7 +1408,7 @@ async def test_a_frame_that_raises_does_not_abort_the_scan(monkeypatch: pytest.M
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1424,7 +1428,7 @@ async def test_a_challenge_frame_behind_wedged_frames_is_still_found(monkeypatch
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1446,7 +1450,7 @@ async def test_child_frames_are_not_probed_unless_the_caller_opts_in(monkeypatch
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1461,7 +1465,7 @@ async def test_child_frames_are_not_probed_unless_the_caller_opts_in(monkeypatch
 
     assert await solve_challenge_ladder(page) is False, "default path must not probe child frames"
 
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1472,15 +1476,15 @@ async def test_hcaptcha_arm_bound_cuts_extension_before_default_timeout(monkeypa
     monkeypatch.setattr(captcha_solver_module, "_HCAPTCHA_ARM_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(captcha_solver_module, "_EXTENSION_ARM_TIMEOUT_SECONDS", 5)
 
-    async def slow_solve(_page: FakePage) -> bool:
+    async def slow_solve(_page: FakePage) -> challenge_signature.SolverExtensionCheck:
         await asyncio.sleep(0.1)
-        return True
+        return _EXTENSION_SOLVED
 
     agent_function = type(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(side_effect=slow_solve),
+            "solver_extension_check": AsyncMock(side_effect=slow_solve),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1503,15 +1507,15 @@ async def test_extension_arm_bound_falls_back_to_default_when_no_hcaptcha_marker
     monkeypatch.setattr(captcha_solver_module, "_HCAPTCHA_ARM_TIMEOUT_SECONDS", 5)
     monkeypatch.setattr(captcha_solver_module, "_EXTENSION_ARM_TIMEOUT_SECONDS", 0.05)
 
-    async def slow_solve(_page: FakePage) -> bool:
+    async def slow_solve(_page: FakePage) -> challenge_signature.SolverExtensionCheck:
         await asyncio.sleep(0.1)
-        return True
+        return _EXTENSION_SOLVED
 
     agent_function = type(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(side_effect=slow_solve),
+            "solver_extension_check": AsyncMock(side_effect=slow_solve),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1532,15 +1536,14 @@ async def test_token_arm_skipped_when_ladder_budget_exhausted(monkeypatch: pytes
     monkeypatch.setattr(captcha_solver_module, "_LADDER_BUDGET_SECONDS", 0.1)
     monkeypatch.setattr(captcha_solver_module, "_HCAPTCHA_ARM_TIMEOUT_SECONDS", 0.2)
 
-    async def slow_solve(_page: FakePage) -> bool:
+    async def slow_solve(_page: FakePage) -> None:
         await asyncio.sleep(0.25)
-        return False
 
     agent_function = type(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(side_effect=slow_solve),
+            "solver_extension_check": AsyncMock(side_effect=slow_solve),
             "solve_recaptcha_token": AsyncMock(return_value=True),
         },
     )()
@@ -1596,9 +1599,9 @@ class _SlowExtensionSolverAgent(AgentFunction):
     def resolve_captcha_solver_extension_timeout(self, page: object, default_timeout: float) -> float:
         return default_timeout if self._resolved is None else self._resolved
 
-    async def auto_solve_captchas(self, page: object) -> bool:
+    async def solver_extension_check(self, page: object) -> challenge_signature.SolverExtensionCheck:
         await asyncio.sleep(0.05)
-        return True
+        return _EXTENSION_SOLVED
 
 
 @pytest.mark.asyncio
@@ -1675,7 +1678,7 @@ def _stub_solver_agent(*, solves: bool = True) -> AgentFunction:
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=solves),
+            "solver_extension_check": AsyncMock(return_value=_EXTENSION_SOLVED if solves else None),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1690,7 +1693,7 @@ async def test_browser_auto_render_turnstile_is_present(monkeypatch: pytest.Monk
     async with challenge_browser_page(AUTO_RENDER_TURNSTILE_HTML) as page:
         assert await solve_challenge_ladder(page) is True
 
-    agent_function.auto_solve_captchas.assert_awaited_once()
+    agent_function.solver_extension_check.assert_awaited_once()
 
 
 @skip_no_browser
@@ -1706,7 +1709,7 @@ async def test_browser_closed_shadow_root_turnstile_is_present(monkeypatch: pyte
 
         assert await solve_challenge_ladder(page) is True
 
-    agent_function.auto_solve_captchas.assert_awaited_once()
+    agent_function.solver_extension_check.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1723,7 +1726,7 @@ async def test_visible_cloudflare_challenge_frame_reaches_extension_arm(
 
     assert await solve_challenge_ladder(page, probe_child_frames=probe_child_frames) is True
 
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
 
 
 @pytest.mark.asyncio
@@ -1736,7 +1739,7 @@ async def test_builtin_reaches_extension_arm_for_a_visible_cloudflare_challenge_
 
     assert await block_module._code_block_solve_captcha_builtin(page) is True
 
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
 
 
 @pytest.mark.asyncio
@@ -1762,7 +1765,7 @@ async def test_decoy_and_hidden_cloudflare_frames_stay_absent(
 
     assert await solve_challenge_ladder(page) is False
 
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1793,7 +1796,7 @@ async def test_an_uncommitted_challenge_frame_matches_on_its_iframe_src(monkeypa
 
     assert await solve_challenge_ladder(page) is True
 
-    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    agent_function.solver_extension_check.assert_awaited_once_with(page)
 
 
 @pytest.mark.asyncio
@@ -1811,7 +1814,7 @@ async def test_an_uncommitted_frame_with_a_decoy_src_stays_absent(monkeypatch: p
 
     assert await solve_challenge_ladder(page) is False
 
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2037,7 +2040,7 @@ async def test_browser_invisible_hcaptcha_is_absent(monkeypatch: pytest.MonkeyPa
 
         assert await solve_challenge_ladder(page) is False
 
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
     agent_function.solve_recaptcha_token.assert_not_awaited()
 
 
@@ -2074,7 +2077,7 @@ async def test_browser_unrendered_recaptcha_container_is_absent(monkeypatch: pyt
 
         assert await solve_challenge_ladder(page) is False
 
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
     agent_function.solve_recaptcha_token.assert_not_awaited()
 
 
@@ -2091,7 +2094,7 @@ async def test_browser_hidden_recaptcha_badge_is_absent(monkeypatch: pytest.Monk
 
         assert await solve_challenge_ladder(page, probe_child_frames=True) is False
 
-    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solver_extension_check.assert_not_awaited()
     agent_function.solve_recaptcha_token.assert_not_awaited()
 
 
@@ -2105,7 +2108,7 @@ async def test_browser_marker_below_the_fold_is_present(monkeypatch: pytest.Monk
     async with challenge_browser_page(_BELOW_THE_FOLD_RECAPTCHA_HTML, expect_challenge_frame=False) as page:
         assert await solve_challenge_ladder(page) is True
 
-    agent_function.auto_solve_captchas.assert_awaited_once()
+    agent_function.solver_extension_check.assert_awaited_once()
 
 
 @skip_no_browser
@@ -2117,7 +2120,7 @@ async def test_browser_rendered_marker_after_a_hidden_one_is_present(monkeypatch
     async with challenge_browser_page(_HIDDEN_THEN_RENDERED_RECAPTCHA_HTML, expect_challenge_frame=False) as page:
         assert await solve_challenge_ladder(page) is True
 
-    agent_function.auto_solve_captchas.assert_awaited_once()
+    agent_function.solver_extension_check.assert_awaited_once()
 
 
 @skip_no_browser
@@ -2313,7 +2316,7 @@ async def test_the_anchor_arm_reports_the_variant_of_the_frame_it_clicked(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solver_extension_check": AsyncMock(return_value=None),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -2328,4 +2331,4 @@ async def test_the_anchor_arm_reports_the_variant_of_the_frame_it_clicked(
         "recaptcha_anchor_frame",
         expected,
     )
-    assert set(outcome.receipt()) == {"status", "vendor", "arm", "page_state"}
+    assert set(outcome.receipt()) == {"status", "vendor", "arm", "page_state", "attempts", "unread"}

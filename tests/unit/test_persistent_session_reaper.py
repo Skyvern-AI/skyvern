@@ -442,14 +442,14 @@ async def test_protects_expired_session_when_owner_lookup_fails() -> None:
 
 
 @pytest.mark.asyncio
-async def test_skips_session_held_by_active_copilot_turn() -> None:
+async def test_skips_session_held_by_active_ember_turn() -> None:
     # Past timeout and held here, but an active copilot turn is driving it (copilot sessions have no
     # runnable_id and aren't renewed). The registry marks it in-use, so the reaper must not close it.
     sessions = [_session("pbs_copilot", started_minutes_ago=40, timeout_minutes=30)]
     manager = _make_manager(sessions)
     manager.close_session = AsyncMock()
 
-    with patch(f"{MODULE}.active_copilot_session_ids", return_value={"pbs_copilot"}):
+    with patch(f"{MODULE}.active_ember_session_ids", return_value={"pbs_copilot"}):
         await manager.reap_expired_sessions()
 
     manager.close_session.assert_not_awaited()
@@ -868,7 +868,7 @@ async def test_reconcile_handles_mixed_states_independently() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reconcile_preserves_session_with_active_copilot_turn() -> None:
+async def test_reconcile_preserves_session_with_active_ember_turn() -> None:
     # An active copilot turn is a live, local "in use now" signal — do not reclaim it even if the DB row
     # reads completed; the next pass reclaims once the copilot registry clears it.
     manager = _make_manager([], owned_ids=[])
@@ -878,7 +878,7 @@ async def test_reconcile_preserves_session_with_active_copilot_turn() -> None:
     )
     manager._release_local_browser_session = AsyncMock()
 
-    with patch(f"{MODULE}.active_copilot_session_ids", return_value={"pbs_copilot"}):
+    with patch(f"{MODULE}.active_ember_session_ids", return_value={"pbs_copilot"}):
         await manager.reconcile_local_sessions()
 
     manager._release_local_browser_session.assert_not_awaited()

@@ -136,7 +136,7 @@ async def test_get_workflows_by_organization_id_reports_the_first_versions_creat
 
     assert workflow.version == 2
     assert workflow.created_by == "user_editor"
-    assert workflow.original_created_by == "user_author"
+    assert workflow.model_dump()["original_created_by"] == "user_author"
     assert workflow.original_created_at == first_version.created_at
     assert workflow.created_at != first_version.created_at
 
@@ -144,3 +144,5 @@ async def test_get_workflows_by_organization_id_reports_the_first_versions_creat
     [workflow] = await agent_db.workflows.get_workflows_by_organization_id(organization_id=org.organization_id)
 
     assert workflow.original_created_at == first_version.created_at
+    assert workflow.original_created_by == "user_author"
+    assert await agent_db.workflows.get_workflow_original_creators({wpid}, org.organization_id) == {wpid: "user_author"}

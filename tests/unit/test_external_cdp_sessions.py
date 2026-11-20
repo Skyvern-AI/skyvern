@@ -225,7 +225,7 @@ async def test_expiry_closes_a_registration_no_process_holds(stack: SimpleNamesp
     live_id = (await register_external(stack.client, timeout=5)).json()["browser_session_id"]
     await backdate_registration(stack, expired_id, minutes=10)
 
-    with patch.object(manager_mod, "active_copilot_session_ids", lambda: {expired_id}):
+    with patch.object(manager_mod, "active_ember_session_ids", lambda: {expired_id}):
         await stack.manager.reap_expired_sessions()
     reaped = await stack.repo.get_persistent_browser_session(expired_id, ORG_A)
     assert reaped is not None and reaped.completed_at is not None and reaped.upstream_cdp_url is None

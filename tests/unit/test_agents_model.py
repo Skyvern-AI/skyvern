@@ -48,42 +48,42 @@ from skyvern.forge.sdk.api.llm.agents_model import (
 )
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.prompt_cache_envelope import CacheableSystemInstructions
-from skyvern.forge.sdk.copilot import agent as copilot_agent_module
-from skyvern.forge.sdk.copilot import enforcement as enforcement_module
-from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
-from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.cost_telemetry import copilot_cost_scope, current_copilot_cost
-from skyvern.forge.sdk.copilot.enforcement import (
-    _TOOL_OUTPUT_TRUNCATION_SUFFIX,
-    NUDGE_SENTINEL,
-    SCREENSHOT_SENTINEL,
-    CopilotTotalTimeoutError,
-    _prune_input_list,
-    estimate_tokens,
-    stable_prefix_anchors,
-)
-from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
-from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
-from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
-from skyvern.forge.sdk.copilot.session_factory import (
-    copilot_session_input_callback,
-    make_copilot_call_model_input_filter,
-)
 from skyvern.forge.sdk.core.pending_operation import (
     _turn_operations,
     install_pending_operation_slot,
     pending_operation,
     pending_operation_fields,
 )
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.forge.sdk.ember import agent as ember_agent_module
+from skyvern.forge.sdk.ember import enforcement as enforcement_module
+from skyvern.forge.sdk.ember.browser_ablation import EmberEvalMode
+from skyvern.forge.sdk.ember.config import EmberConfig
+from skyvern.forge.sdk.ember.cost_telemetry import current_ember_cost, ember_cost_scope
+from skyvern.forge.sdk.ember.enforcement import (
+    _TOOL_OUTPUT_TRUNCATION_SUFFIX,
+    NUDGE_SENTINEL,
+    SCREENSHOT_SENTINEL,
+    EmberTotalTimeoutError,
+    _prune_input_list,
+    estimate_tokens,
+    stable_prefix_anchors,
+)
+from skyvern.forge.sdk.ember.llm_errors import is_retriable_llm_error
+from skyvern.forge.sdk.ember.mcp_adapter import _ember_to_call_tool_result
+from skyvern.forge.sdk.ember.model_resolver import resolve_model_config
+from skyvern.forge.sdk.ember.recoverable_failure import build_recoverable_failure
+from skyvern.forge.sdk.ember.session_factory import (
+    ember_session_input_callback,
+    make_ember_call_model_input_filter,
+)
+from skyvern.forge.sdk.schemas.ember import EmberChatRequest
 from skyvern.schemas.llm import LLMConfig
-from tests.unit.copilot_test_helpers import make_model_input_data
+from tests.unit.ember_test_helpers import make_model_input_data
 
 pytestmark = pytest.mark.usefixtures("gpt56_litellm_models")
 
 # Most cases here replay Copilot inputs, so they build the model the way Copilot's resolver does.
-_copilot_model = partial(SkyvernLitellmModel, prefix_anchors=stable_prefix_anchors)
+_ember_model = partial(SkyvernLitellmModel, prefix_anchors=stable_prefix_anchors)
 
 
 @pytest.fixture(autouse=True)
@@ -250,7 +250,7 @@ async def test_model_adapter_attaches_exact_tools_for_nonstream_and_stream_reque
 
     monkeypatch.setattr(model_telemetry_module, "attach_tool_surface_to_pending_capture", attached.append)
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
-    model = _copilot_model(model="openai/gpt-5.6", next_model_call_index=lambda: 1)
+    model = _ember_model(model="openai/gpt-5.6", next_model_call_index=lambda: 1)
 
     await model.get_response(
         system_instructions="system",
@@ -288,7 +288,7 @@ async def test_nonstream_capture_preserves_request_and_result(monkeypatch: pytes
 
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
     base_result = await _get_response(LitellmModel(model="openai/gpt-5.6"))
-    adapter_result = await _get_response(_copilot_model(model="openai/gpt-5.6", next_model_call_index=lambda: 4))
+    adapter_result = await _get_response(_ember_model(model="openai/gpt-5.6", next_model_call_index=lambda: 4))
 
     assert requests[0] == requests[1]
     assert adapter_result == base_result
@@ -326,7 +326,7 @@ async def test_sent_tool_schemas_drop_generated_titles_only_on_replay_checked_mo
     monkeypatch.setattr(model_telemetry_module, "attach_tool_surface_to_pending_capture", attached.append)
     original = copy.deepcopy(_pick.params_json_schema)
 
-    await _copilot_model(model=model_name, next_model_call_index=lambda: 1).get_response(
+    await _ember_model(model=model_name, next_model_call_index=lambda: 1).get_response(
         system_instructions=_CACHED_PROMPT,
         input=[{"role": "user", "content": "Pick one"}],
         model_settings=ModelSettings(temperature=0, include_usage=True, extra_args=_GPT_REASONING),
@@ -394,12 +394,12 @@ async def test_direct_gpt56_adds_one_stable_prefix_breakpoint_without_changing_p
     )
     model_settings = ModelSettings(temperature=0, include_usage=True, extra_args=_GPT_REASONING)
     await _get_response(
-        _copilot_model(model="gpt-5.6-sol", next_model_call_index=lambda: 1),
+        _ember_model(model="gpt-5.6-sol", next_model_call_index=lambda: 1),
         system_instructions=str(prompt),
         model_settings=model_settings,
     )
     await _get_response(
-        _copilot_model(model="gpt-5.6-sol", next_model_call_index=lambda: 2),
+        _ember_model(model="gpt-5.6-sol", next_model_call_index=lambda: 2),
         system_instructions=prompt,
         model_settings=model_settings,
     )
@@ -450,7 +450,7 @@ async def test_cacheable_system_instructions_survive_provider_message_copy(
         return _completion()
 
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
-    model = _copilot_model(model=model_name, next_model_call_index=lambda: 1)
+    model = _ember_model(model=model_name, next_model_call_index=lambda: 1)
     if stream:
         events = [
             event
@@ -493,7 +493,7 @@ async def test_stream_capture_preserves_events_order_and_backpressure(monkeypatc
     monkeypatch.setattr("agents.extensions.models.litellm_model.time.time", lambda: 1.0)
     base_events, _ = await _stream_response(LitellmModel(model="openai/gpt-5.6"))
     adapter_events, telemetry_seen = await _stream_response(
-        _copilot_model(model="openai/gpt-5.6", next_model_call_index=lambda: 9)
+        _ember_model(model="openai/gpt-5.6", next_model_call_index=lambda: 9)
     )
 
     assert requests[0] == requests[1]
@@ -542,7 +542,7 @@ async def test_explicit_responses_stream_captures_raw_cache_write_before_convers
     )
 
     telemetry_seen: list[tuple[str, int | None, int | None]] = []
-    model = _copilot_model(model="gpt-5.6-sol", next_model_call_index=lambda: 8)
+    model = _ember_model(model="gpt-5.6-sol", next_model_call_index=lambda: 8)
     async for _ in model.stream_response(
         system_instructions=CacheableSystemInstructions(
             "stable instructions",
@@ -640,7 +640,7 @@ async def test_a_streamed_gpt_turn_keeps_the_providers_encrypted_reasoning(monke
         return raw_stream()
 
     monkeypatch.setattr("litellm.aresponses", fake_aresponses)
-    model = _copilot_model(model="gpt-5.6-sol", next_model_call_index=lambda: 1)
+    model = _ember_model(model="gpt-5.6-sol", next_model_call_index=lambda: 1)
 
     outputs = [
         event.response.output
@@ -671,7 +671,7 @@ async def test_missing_usage_is_nonfatal_and_context_resets(monkeypatch: pytest.
 
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
 
-    result = await _get_response(_copilot_model(model="openai/gpt-5.6", next_model_call_index=lambda: 1))
+    result = await _get_response(_ember_model(model="openai/gpt-5.6", next_model_call_index=lambda: 1))
 
     assert result.output
     assert current_model_call_telemetry() is None
@@ -690,7 +690,7 @@ async def test_attempt_telemetry_captures_stop_metadata_and_missing_usage(
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
 
     with model_attempt_telemetry_scope() as attempt:
-        await _get_response(_copilot_model(model="openai/gpt-5.6", next_model_call_index=lambda: 7))
+        await _get_response(_ember_model(model="openai/gpt-5.6", next_model_call_index=lambda: 7))
 
     assert attempt.latest_stop_metadata.model_call_index == 7
     assert attempt.latest_stop_metadata.finish_reason == "stop"
@@ -774,7 +774,7 @@ async def test_model_error_resets_context(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
 
     with pytest.raises(RuntimeError, match="provider failed"):
-        await _get_response(_copilot_model(model="openai/gpt-5.6", next_model_call_index=lambda: 1))
+        await _get_response(_ember_model(model="openai/gpt-5.6", next_model_call_index=lambda: 1))
 
     assert current_model_call_telemetry() is None
 
@@ -927,7 +927,7 @@ async def test_stream_cost_uses_bedrock_chunk_profile_without_hidden_model_name(
     chunks[-1].usage = Usage(prompt_tokens=100_001, completion_tokens=7, total_tokens=100_008)
 
     with (
-        copilot_cost_scope() as ledger,
+        ember_cost_scope() as ledger,
         _model_call_telemetry_scope(1, model="anthropic/claude-haiku-5-5") as telemetry,
     ):
         stream = model_telemetry_module._UsageCapturingStream(_ChunkStream(chunks), telemetry)
@@ -984,7 +984,7 @@ def test_actor_cost_uses_actual_or_recovered_served_tier_and_preserves_missing_t
         return (0.005 if kwargs["service_tier"] == "flex" else 0.01), 0.0
 
     monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", price)
-    with copilot_cost_scope() as ledger, _model_call_telemetry_scope(1, model="gpt-6.1-sol") as telemetry:
+    with ember_cost_scope() as ledger, _model_call_telemetry_scope(1, model="gpt-6.1-sol") as telemetry:
         telemetry.capture({"input_tokens": 100, "output_tokens": 10})
         model_telemetry_module._capture_served_provider(
             telemetry,
@@ -1001,7 +1001,7 @@ def test_actor_cost_uses_actual_or_recovered_served_tier_and_preserves_missing_t
 
 
 def test_reported_cost_remains_usable_without_a_served_tier() -> None:
-    with copilot_cost_scope() as ledger, _model_call_telemetry_scope(1, model="gpt-6.1-sol") as telemetry:
+    with ember_cost_scope() as ledger, _model_call_telemetry_scope(1, model="gpt-6.1-sol") as telemetry:
         telemetry.capture({"input_tokens": 100, "output_tokens": 10, "cost": 0.02})
     assert ledger.snapshot()["known_cost_usd"] == pytest.approx(0.02)
     assert ledger.snapshot()["pricing_sources"] == ["provider_reported"]
@@ -1153,14 +1153,14 @@ def test_turn_cost_ledger_uses_provider_cost_then_estimate_and_preserves_unprice
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", lambda **kwargs: (0.01, 0.02))
-    with copilot_cost_scope():
+    with ember_cost_scope():
         with _model_call_telemetry_scope(1, model="model") as telemetry:
             telemetry.capture({"input_tokens": 10, "output_tokens": 3, "cost": 0.125})
         with _model_call_telemetry_scope(2, model="model") as telemetry:
             telemetry.capture({"input_tokens": 10, "output_tokens": 3})
         with _model_call_telemetry_scope(3, model="model"):
             pass
-        result = current_copilot_cost()
+        result = current_ember_cost()
     assert result is not None
     assert result["known_cost_usd"] == pytest.approx(0.155)
     assert result["observed_call_count"] == 3
@@ -1206,7 +1206,7 @@ async def test_concurrent_calls_keep_usage_and_indices_isolated(monkeypatch: pyt
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
 
     indices = iter([1, 2])
-    model = _copilot_model(model="openai/gpt-5.6", next_model_call_index=lambda: next(indices))
+    model = _ember_model(model="openai/gpt-5.6", next_model_call_index=lambda: next(indices))
 
     async def run(prompt_number: int) -> tuple[int, int | None]:
         task = model.get_response(
@@ -1243,7 +1243,7 @@ async def test_stream_cancellation_resets_context_without_changing_stream_owners
         return cast(AsyncStream[ChatCompletionChunk], stream)
 
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
-    events = _copilot_model(
+    events = _ember_model(
         model="openai/gpt-5.6",
         next_model_call_index=lambda: 3,
     ).stream_response(
@@ -1517,19 +1517,17 @@ async def test_the_result_names_the_fallback_model_that_actually_returned(
             return None
 
     def fake_resolve_model_config(
-        _handler: object, *, copilot_config: object = None, llm_key_override: str | None = None
+        _handler: object, *, ember_config: object = None, llm_key_override: str | None = None
     ) -> tuple[str, object, str, bool]:
-        del copilot_config
+        del ember_config
         key = llm_key_override or "PRIMARY"
         return f"model-{key}", object(), key, True
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr("skyvern.forge.sdk.ember.agent._resolve_live_browser_session_id", AsyncMock(return_value=None))
     monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
+    monkeypatch.setattr("skyvern.forge.sdk.ember.model_resolver.resolve_model_config", fake_resolve_model_config)
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+        "skyvern.forge.sdk.ember.enforcement.run_with_enforcement",
         AsyncMock(
             side_effect=[
                 FakeRateLimitError("rate limit"),
@@ -1538,10 +1536,10 @@ async def test_the_result_names_the_fallback_model_that_actually_returned(
         ),
     )
 
-    result = await copilot_agent_module.run_copilot_agent(
+    result = await ember_agent_module.run_ember_agent(
         stream=MagicMock(),
         organization_id="org-1",
-        chat_request=WorkflowCopilotChatRequest(
+        chat_request=EmberChatRequest(
             message="build it",
             workflow_id="wf-1",
             workflow_permanent_id="wfp-1",
@@ -1559,7 +1557,7 @@ async def test_the_result_names_the_fallback_model_that_actually_returned(
             return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
         ),
         api_key="sk-test",
-        config=CopilotConfig(fallback_llm_key="SECONDARY"),
+        config=EmberConfig(fallback_llm_key="SECONDARY"),
     )
 
     assert result.resolved_model == "model-SECONDARY"
@@ -1581,23 +1579,21 @@ async def test_model_setup_failure_does_not_claim_the_unstarted_model(
             return None
 
     def fake_resolve_model_config(
-        _handler: object, *, copilot_config: object = None, llm_key_override: str | None = None
+        _handler: object, *, ember_config: object = None, llm_key_override: str | None = None
     ) -> tuple[str, object, str, bool]:
-        del copilot_config, llm_key_override
+        del ember_config, llm_key_override
         return "model-PRIMARY", object(), "PRIMARY", True
 
     enforcement = AsyncMock()
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr("skyvern.forge.sdk.ember.agent._resolve_live_browser_session_id", AsyncMock(return_value=None))
     monkeypatch.setattr("agents.mcp.MCPServerManager", FailingMCPServerManager)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", enforcement)
+    monkeypatch.setattr("skyvern.forge.sdk.ember.model_resolver.resolve_model_config", fake_resolve_model_config)
+    monkeypatch.setattr("skyvern.forge.sdk.ember.enforcement.run_with_enforcement", enforcement)
 
-    result = await copilot_agent_module.run_copilot_agent(
+    result = await ember_agent_module.run_ember_agent(
         stream=MagicMock(send=AsyncMock(return_value=True)),
         organization_id="org-1",
-        chat_request=WorkflowCopilotChatRequest(
+        chat_request=EmberChatRequest(
             message="build it",
             workflow_id="wf-1",
             workflow_permanent_id="wfp-1",
@@ -1615,7 +1611,7 @@ async def test_model_setup_failure_does_not_claim_the_unstarted_model(
             return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
         ),
         api_key="sk-test",
-        config=CopilotConfig(),
+        config=EmberConfig(),
     )
 
     assert result.resolved_model is None
@@ -1651,9 +1647,9 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
             return None
 
     def fake_resolve_model_config(
-        _handler: object, *, copilot_config: object = None, llm_key_override: str | None = None
+        _handler: object, *, ember_config: object = None, llm_key_override: str | None = None
     ) -> tuple[str, object, str, bool]:
-        del copilot_config
+        del ember_config
         key = llm_key_override or "PRIMARY"
         return f"model-{key}", object(), key, True
 
@@ -1664,30 +1660,28 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
         attempt_count += 1
         if fallback_enabled and attempt_count == 1:
             raise FakeRateLimitError("rate limit")
-        ctx = cast(copilot_agent_module.CopilotContext, kwargs["ctx"])
+        ctx = cast(ember_agent_module.EmberContext, kwargs["ctx"])
         ctx.budget_expiry_state.hard_backstop_reached = True
-        enforcement_module._mark_copilot_total_timeout(ctx, elapsed_seconds=990.0, iteration=0)
+        enforcement_module._mark_ember_total_timeout(ctx, elapsed_seconds=990.0, iteration=0)
         ctx.eval_tool_activity = [{"tool_name": "navigate_browser", "success": True}]
-        raise CopilotTotalTimeoutError
+        raise EmberTotalTimeoutError
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr("skyvern.forge.sdk.ember.agent._resolve_live_browser_session_id", AsyncMock(return_value=None))
     monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
+    monkeypatch.setattr("skyvern.forge.sdk.ember.model_resolver.resolve_model_config", fake_resolve_model_config)
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.mcp_adapter.SkyvernOverlayMCPServer.list_tools",
+        "skyvern.forge.sdk.ember.mcp_adapter.SkyvernOverlayMCPServer.list_tools",
         AsyncMock(return_value=[]),
     )
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+        "skyvern.forge.sdk.ember.enforcement.run_with_enforcement",
         AsyncMock(side_effect=timeout_after_browser_activity),
     )
 
-    result = await copilot_agent_module.run_copilot_agent(
+    result = await ember_agent_module.run_ember_agent(
         stream=MagicMock(send=AsyncMock(return_value=True)),
         organization_id="org-1",
-        chat_request=WorkflowCopilotChatRequest(
+        chat_request=EmberChatRequest(
             message="research it",
             workflow_id="wf-1",
             workflow_permanent_id="wfp-1",
@@ -1705,8 +1699,8 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
             return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
         ),
         api_key="sk-test",
-        config=CopilotConfig(fallback_llm_key="SECONDARY" if fallback_enabled else None),
-        eval_mode=CopilotEvalMode.BROWSER_ABLATION,
+        config=EmberConfig(fallback_llm_key="SECONDARY" if fallback_enabled else None),
+        eval_mode=EmberEvalMode.BROWSER_ABLATION,
     )
 
     assert result.resolved_model == expected_model
@@ -1741,7 +1735,7 @@ def _tool_turn(output: object) -> list[TResponseInputItem]:
 
 
 async def _block_schema_tool_output(block_type: str) -> tuple[object, str]:
-    call_result = _copilot_to_call_tool_result(await skyvern_block_schema(block_type), "get_block_schema")
+    call_result = _ember_to_call_tool_result(await skyvern_block_schema(block_type), "get_block_schema")
     server = SimpleNamespace(
         name="skyvern", use_structured_content=False, call_tool=AsyncMock(return_value=call_result)
     )
@@ -1863,7 +1857,7 @@ async def test_anthropic_route_marks_stable_system_prefix_and_the_stable_anchor(
     with capture_logs() as logs:
         request = await _sent_request(
             monkeypatch,
-            _copilot_model(model=model_name, next_model_call_index=lambda: 1),
+            _ember_model(model=model_name, next_model_call_index=lambda: 1),
             turn,
             None,
             system_instructions=_CACHED_PROMPT,
@@ -1883,7 +1877,7 @@ async def test_anthropic_route_marks_stable_system_prefix_and_the_stable_anchor(
 @pytest.mark.parametrize("model_name", _SONNET_ROUTES)
 @pytest.mark.parametrize(
     "next_call_input",
-    [copilot_session_input_callback, lambda history, new_items: _prune_input_list([*history, *new_items])],
+    [ember_session_input_callback, lambda history, new_items: _prune_input_list([*history, *new_items])],
     ids=["session", "no_session"],
 )
 @pytest.mark.parametrize(
@@ -1927,7 +1921,7 @@ async def test_anthropic_rolling_marker_prefix_is_resent_unchanged_on_the_next_c
         requests.append(
             await _sent_request(
                 monkeypatch,
-                _copilot_model(model=model_name, next_model_call_index=lambda: 1),
+                _ember_model(model=model_name, next_model_call_index=lambda: 1),
                 turn,
                 None,
                 system_instructions=_CACHED_PROMPT,
@@ -1960,7 +1954,7 @@ async def test_anthropic_over_budget_rolling_marker_sits_before_the_summary_wind
         *(item for index in range(1, 6) for item in json_round(index)),
     ]
     next_history = [*history, *json_round(6)]
-    model_input_filter = make_copilot_call_model_input_filter(token_budget=estimate_tokens(next_history) // 2)
+    model_input_filter = make_ember_call_model_input_filter(token_budget=estimate_tokens(next_history) // 2)
     requests = []
     for turn in (history, next_history):
         filtered = model_input_filter(make_model_input_data(turn)).input
@@ -1968,7 +1962,7 @@ async def test_anthropic_over_budget_rolling_marker_sits_before_the_summary_wind
         requests.append(
             await _sent_request(
                 monkeypatch,
-                _copilot_model(model=model_name, next_model_call_index=lambda: 1),
+                _ember_model(model=model_name, next_model_call_index=lambda: 1),
                 filtered,
                 None,
                 system_instructions=_CACHED_PROMPT,
@@ -1998,7 +1992,7 @@ async def test_anthropic_cache_breakpoints_opt_out_off_an_all_anthropic_chain_or
     with capture_logs() as logs:
         request = await _sent_request(
             monkeypatch,
-            _copilot_model(model=model_name, next_model_call_index=lambda: 1),
+            _ember_model(model=model_name, next_model_call_index=lambda: 1),
             _tool_turn("tool result"),
             extra_args,
             system_instructions=_CACHED_PROMPT,
@@ -2066,7 +2060,7 @@ async def test_gemini_on_the_model_chain_receives_ref_tool_results_as_literal_te
     usage_events: list[dict[str, Any]] = []
     monkeypatch.setattr(model_telemetry_module.LOG, "info", lambda event, **fields: usage_events.append(fields))
     sent = await _sent_messages(
-        monkeypatch, _copilot_model(model=model_name, next_model_call_index=lambda: 1), turn, extra_args, stream
+        monkeypatch, _ember_model(model=model_name, next_model_call_index=lambda: 1), turn, extra_args, stream
     )
 
     assert [event["llm.ref_tool_outputs_escaped"] for event in usage_events] == [1]
@@ -2086,7 +2080,7 @@ async def test_a_tool_result_too_deep_to_walk_is_still_sent_to_a_gemini_chain(mo
 
     sent = await _sent_messages(
         monkeypatch,
-        _copilot_model(model="openai/gpt-5.6", next_model_call_index=lambda: 1),
+        _ember_model(model="openai/gpt-5.6", next_model_call_index=lambda: 1),
         _tool_turn(deep),
         {"fallbacks": [_GEMINI]},
     )
@@ -2118,7 +2112,7 @@ async def test_tool_results_off_the_gemini_escape_reach_the_provider_unchanged(
 
     raw = await _sent_messages(monkeypatch, LitellmModel(model=model_name), turn, None)
     sent = await _sent_messages(
-        monkeypatch, _copilot_model(model=model_name, next_model_call_index=lambda: 1), turn, None
+        monkeypatch, _ember_model(model=model_name, next_model_call_index=lambda: 1), turn, None
     )
 
     assert sent == raw
@@ -2138,7 +2132,7 @@ async def test_gemini_route_leaves_an_unresolved_media_reference_for_the_provide
     )
 
     raw = await _sent_messages(monkeypatch, LitellmModel(model=_GEMINI), turn, None)
-    sent = await _sent_messages(monkeypatch, _copilot_model(model=_GEMINI, next_model_call_index=lambda: 1), turn, None)
+    sent = await _sent_messages(monkeypatch, _ember_model(model=_GEMINI, next_model_call_index=lambda: 1), turn, None)
 
     assert sent == raw
     [function_response] = _gemini_function_responses(sent)
@@ -2238,7 +2232,7 @@ async def test_gpt56_plus_chain_marks_the_stable_prefix_and_anchor_and_keeps_fal
     monkeypatch.setattr("litellm.aresponses", fake_aresponses)
     model_settings = _gpt_route_settings(model_name, copy.deepcopy(fallbacks))
     with capture_logs() as logs:
-        await _copilot_model(model=model_name, base_url=base_url, next_model_call_index=lambda: 1).get_response(
+        await _ember_model(model=model_name, base_url=base_url, next_model_call_index=lambda: 1).get_response(
             system_instructions=_CACHED_PROMPT,
             input=turn,
             model_settings=model_settings,
@@ -2282,7 +2276,7 @@ async def test_gpt_route_keeps_every_earlier_breakpoint_so_the_next_call_reads_w
     monkeypatch.setattr("litellm.aresponses", fake_aresponses)
     turn = [_USER_BUILD, *(item for call in range(4) for item in _tool_round(f"call_{call}"))]
     for model_input in (turn, [*turn, *_tool_round("call_4")]):
-        await _copilot_model(model=model_name, base_url=_AZURE_BASE, next_model_call_index=lambda: 1).get_response(
+        await _ember_model(model=model_name, base_url=_AZURE_BASE, next_model_call_index=lambda: 1).get_response(
             system_instructions=_CACHED_PROMPT,
             input=model_input,
             model_settings=_gpt_route_settings(model_name, [_router_hop(fallback)]),
@@ -2355,7 +2349,7 @@ async def test_chain_with_an_ineligible_hop_or_chat_transport_sends_no_cache_mar
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
     monkeypatch.setattr("litellm.aresponses", fake_aresponses)
     with capture_logs() as logs:
-        await _copilot_model(model=model_name, base_url=_AZURE_BASE, next_model_call_index=lambda: 1).get_response(
+        await _ember_model(model=model_name, base_url=_AZURE_BASE, next_model_call_index=lambda: 1).get_response(
             system_instructions=_CACHED_PROMPT,
             input=_GPT_TOOL_HISTORY,
             model_settings=ModelSettings(extra_args=copy.deepcopy(extra_args)),
@@ -2428,7 +2422,7 @@ async def test_a_failed_azure_primary_reaches_the_openai_hop_with_its_credential
     monkeypatch.setenv("OPENAI_BASE_URL", f"{responses_stub.base}/openai/v1")
     model_settings = _gpt_route_settings(primary, [_router_hop(hop_model)])
     with capture_logs() as logs:
-        await _copilot_model(
+        await _ember_model(
             model=primary,
             base_url=f"{responses_stub.base}/fail",
             api_key="azure-key",
@@ -2489,7 +2483,7 @@ async def test_a_streamed_fallback_is_attributed_to_the_hop_that_answered(monkey
     monkeypatch.setattr("litellm.aresponses", fake_aresponses)
     monkeypatch.setattr(_RESPONSE_ITERATOR, _drained_then_chunks)
     with capture_logs() as logs:
-        async for _ in _copilot_model(
+        async for _ in _ember_model(
             model="azure/gpt-5.6-terra",
             base_url=_AZURE_BASE,
             api_key="azure-key",
@@ -2511,7 +2505,7 @@ async def test_a_streamed_fallback_is_attributed_to_the_hop_that_answered(monkey
 
 
 @pytest.mark.asyncio
-async def test_a_stream_that_drops_midway_raises_the_typed_error_copilot_retries(
+async def test_a_stream_that_drops_midway_raises_the_typed_error_ember_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def dropped_stream() -> AsyncIterator[SimpleNamespace]:
@@ -2524,7 +2518,7 @@ async def test_a_stream_that_drops_midway_raises_the_typed_error_copilot_retries
     monkeypatch.setattr("litellm.aresponses", fake_aresponses)
     monkeypatch.setattr(_RESPONSE_ITERATOR, _drained_then_chunks)
     with pytest.raises(litellm.APIConnectionError) as raised:
-        async for _ in _copilot_model(
+        async for _ in _ember_model(
             model="azure/gpt-5.6-terra",
             base_url=_AZURE_BASE,
             api_key="azure-key",
@@ -2588,7 +2582,7 @@ async def test_a_stream_without_progress_is_cut_as_a_retriable_timeout_but_slow_
     events: list[Any] = []
     with pytest.raises(litellm.Timeout) if stalls else contextlib.nullcontext() as raised:
         async with asyncio.timeout(5):
-            async for event in _copilot_model(
+            async for event in _ember_model(
                 model=model_name,
                 base_url=_AZURE_BASE if model_name.startswith("azure/") else None,
                 api_key="test-key",
@@ -2617,7 +2611,7 @@ async def test_every_failed_hop_is_logged_and_an_exhausted_chain_raises_litellms
 ) -> None:
     monkeypatch.setenv("OPENAI_BASE_URL", f"{responses_stub.base}/fail/openai/v1")
     with capture_logs() as logs, pytest.raises(Exception) as raised:
-        await _copilot_model(
+        await _ember_model(
             model="azure/gpt-5.6-terra",
             base_url=f"{responses_stub.base}/fail",
             api_key="azure-key",
@@ -2702,7 +2696,7 @@ async def test_explicit_responses_request_forwards_every_setting_the_sdk_sends_t
         extra_args={**_GPT_REASONING, "api_version": "2025-04-01-preview", "custom_arg": 1},
     )
     for system_instructions in (str(_CACHED_PROMPT), _CACHED_PROMPT):
-        await _copilot_model(
+        await _ember_model(
             model="azure/gpt-5.6-terra",
             base_url=_AZURE_BASE,
             api_key="azure-key",

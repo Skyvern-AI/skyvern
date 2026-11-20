@@ -46,7 +46,7 @@ from skyvern.forge.request_logging import (
     set_request_organization,
 )
 from skyvern.forge.sdk.core.run_submission_gate import RunSubmissionGate
-from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_routes
+from skyvern.forge.sdk.routes import ember as ember_routes
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services.org_auth_service import apply_request_org_context
 
@@ -638,8 +638,8 @@ class TestSanitizeBody:
     def test_every_ember_post_body_is_opaque_and_each_old_route_has_a_twin(self) -> None:
         routes = [
             route
-            for route in workflow_copilot_routes.base_router.routes
-            if isinstance(route, APIRoute) and route.endpoint.__module__ == workflow_copilot_routes.__name__
+            for route in ember_routes.base_router.routes
+            if isinstance(route, APIRoute) and route.endpoint.__module__ == ember_routes.__name__
         ]
         neutral = {"/workflow/suggest-goal", "/workflow/convert-yaml-to-blocks"}
         old = {
@@ -1573,7 +1573,7 @@ class TestRawRequestLogLevel:
 @pytest.mark.parametrize(
     "recovery_header", ["X-Ember-Credential-Recovery-Token", "X-Copilot-Credential-Recovery-Token"]
 )
-def test_copilot_recovery_capabilities_never_enter_request_logs(
+def test_ember_recovery_capabilities_never_enter_request_logs(
     log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, status_code: int, recovery_header: str
 ) -> None:
     monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS_SUCCESSFUL_READS", True)

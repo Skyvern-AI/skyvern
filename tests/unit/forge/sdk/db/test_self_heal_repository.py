@@ -68,7 +68,7 @@ def _workflow_run_model(
         created_at=created_at,
         modified_at=created_at,
         parent_workflow_run_id=parent_workflow_run_id,
-        copilot_session_id=copilot_session_id,
+        ember_session_id=copilot_session_id,
         debug_session_id=debug_session_id,
     )
 

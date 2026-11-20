@@ -45,14 +45,14 @@ from skyvern.cli.mcp_tools.browser import (
     skyvern_type,
 )
 from skyvern.exceptions import StaleFrameSelectionError
-from skyvern.forge.sdk.copilot import mcp_adapter
-from skyvern.forge.sdk.copilot.browser_ablation import CopilotToolSurface, CopilotToolSurfaceIdentity
-from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
-from skyvern.forge.sdk.copilot.runtime import AgentContext
-from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
+from skyvern.forge.sdk.ember import mcp_adapter
+from skyvern.forge.sdk.ember.browser_ablation import EmberToolSurface, EmberToolSurfaceIdentity
+from skyvern.forge.sdk.ember.mcp_adapter import SkyvernOverlayMCPServer
+from skyvern.forge.sdk.ember.runtime import AgentContext
+from skyvern.forge.sdk.ember.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.ember_test_helpers import make_ember_ctx
 
 LOG = structlog.get_logger()
 
@@ -159,7 +159,7 @@ class _LocalToolResult:
         self.content: list[Any] = []
 
 
-class _LocalCopilotMCPClient:
+class _LocalEmberMCPClient:
     def __init__(self, tools: list[MCPTool]) -> None:
         self._tools = tools
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -179,7 +179,7 @@ class _LocalCopilotMCPClient:
         return _LocalToolResult(await self._dispatch[name](**args))
 
 
-async def _copilot_payload(server: SkyvernOverlayMCPServer, name: str, args: dict[str, Any]) -> dict[str, Any]:
+async def _ember_payload(server: SkyvernOverlayMCPServer, name: str, args: dict[str, Any]) -> dict[str, Any]:
     result = await server._call_tool(name, args)
     return json.loads(result.content[0].text)
 
@@ -226,7 +226,7 @@ async def test_mcp_frame_list_real_browser(mcp_session: SessionState) -> None:
 
 
 @pytest.mark.asyncio
-async def test_copilot_advertised_frame_tool_chain_real_browser(
+async def test_ember_advertised_frame_tool_chain_real_browser(
     mcp_session: SessionState,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -253,14 +253,14 @@ async def test_copilot_advertised_frame_tool_chain_real_browser(
     overlays = {name: canonical_overlays[name] for name in surface_names}
     registered = await mcp.list_tools(run_middleware=False)
     raw_names = frozenset(aliases.values())
-    client = _LocalCopilotMCPClient(
+    client = _LocalEmberMCPClient(
         [
             MCPTool(name=tool.name, description=tool.description, inputSchema=tool.parameters)
             for tool in registered
             if tool.name in raw_names
         ]
     )
-    copilot_ctx = make_copilot_ctx(browser_session_id=None)
+    ember_ctx = make_ember_ctx(browser_session_id=None)
     server = SkyvernOverlayMCPServer(
         transport=object(),
         overlays=overlays,
@@ -268,7 +268,7 @@ async def test_copilot_advertised_frame_tool_chain_real_browser(
         allowlist=raw_names,
         ordered_allowlist=tuple(aliases.values()),
         enforce_dispatch_allowlist=True,
-        context_provider=lambda: copilot_ctx,
+        context_provider=lambda: ember_ctx,
     )
     server._client = client  # type: ignore[assignment]
 
@@ -279,26 +279,26 @@ async def test_copilot_advertised_frame_tool_chain_real_browser(
     assert all(tool.description for tool in frame_contracts)
     assert all("session_id" not in tool.inputSchema["properties"] for tool in frame_contracts)
     assert all("cdp_url" not in tool.inputSchema["properties"] for tool in frame_contracts)
-    surface = CopilotToolSurface(
+    surface = EmberToolSurface(
         native_tools=(),
         alias_map=aliases,
         overlays=overlays,
         ordered_native_names=(),
         ordered_mcp_names=surface_names,
-        identity=CopilotToolSurfaceIdentity.OPTIONAL,
+        identity=EmberToolSurfaceIdentity.OPTIONAL,
     )
     without_frames = [tool for tool in advertised if not tool.name.startswith("skyvern_frame_")]
-    old_surface = CopilotToolSurface(
+    old_surface = EmberToolSurface(
         native_tools=(),
         alias_map={tool.name: aliases[tool.name] for tool in without_frames},
         overlays={tool.name: overlays[tool.name] for tool in without_frames},
         ordered_native_names=(),
         ordered_mcp_names=tuple(tool.name for tool in without_frames),
-        identity=CopilotToolSurfaceIdentity.OPTIONAL,
+        identity=EmberToolSurfaceIdentity.OPTIONAL,
     )
     assert surface.advertised_sha256(advertised) != old_surface.advertised_sha256(without_frames)
 
-    listed = await _copilot_payload(server, "skyvern_frame_list", {})
+    listed = await _ember_payload(server, "skyvern_frame_list", {})
     assert listed["ok"] is True
     assert {"payment", "editor"} <= {frame["name"] for frame in listed["data"]["frames"]}
 
@@ -307,16 +307,16 @@ async def test_copilot_advertised_frame_tool_chain_real_browser(
     editor_sentinel = "document.querySelector('#editor-only-sentinel')?.textContent ?? null"
     editor_text = "document.querySelector('#editor-root')?.textContent ?? null"
 
-    host_from_main = await _copilot_payload(server, "evaluate", {"expression": host_sentinel})
+    host_from_main = await _ember_payload(server, "evaluate", {"expression": host_sentinel})
     assert host_from_main["ok"] is True
     assert host_from_main["data"]["result"] == "main-page"
 
-    entered = await _copilot_payload(server, "skyvern_frame_switch", {"selector": "#pay-frame"})
+    entered = await _ember_payload(server, "skyvern_frame_switch", {"selector": "#pay-frame"})
     assert entered["ok"] is True
     assert entered["data"]["frame_name"] == "payment"
 
     frame_before_evaluate = mcp_session._working_frame
-    in_payment = await _copilot_payload(server, "evaluate", {"expression": payment_sentinel})
+    in_payment = await _ember_payload(server, "evaluate", {"expression": payment_sentinel})
     assert in_payment["ok"] is True
     assert in_payment["data"]["result"] == "payment-frame"
     assert mcp_session._working_frame is frame_before_evaluate
@@ -325,52 +325,50 @@ async def test_copilot_advertised_frame_tool_chain_real_browser(
     assert raw_in_payment["data"]["result"] == "payment-frame"
     assert "page.locator_scope.evaluate(" in raw_in_payment["data"]["sdk_equivalent"]
 
-    host_from_payment = await _copilot_payload(server, "evaluate", {"expression": host_sentinel})
+    host_from_payment = await _ember_payload(server, "evaluate", {"expression": host_sentinel})
     assert host_from_payment["ok"] is True
     assert host_from_payment["data"]["result"] is None
 
     card_value = "document.querySelector('#card').value"
-    card_before = await _copilot_payload(server, "evaluate", {"expression": card_value})
-    card_typed = await _copilot_payload(server, "type_text", {"selector": "#card", "text": "4242"})
-    card_after = await _copilot_payload(server, "evaluate", {"expression": card_value})
+    card_before = await _ember_payload(server, "evaluate", {"expression": card_value})
+    card_typed = await _ember_payload(server, "type_text", {"selector": "#card", "text": "4242"})
+    card_after = await _ember_payload(server, "evaluate", {"expression": card_value})
     assert card_before["data"]["result"] == ""
     assert card_typed["ok"] is True
     assert card_after["data"]["result"] == "4242"
 
-    left_payment = await _copilot_payload(server, "skyvern_frame_main", {})
+    left_payment = await _ember_payload(server, "skyvern_frame_main", {})
     assert left_payment["ok"] is True
-    host_after_payment = await _copilot_payload(server, "evaluate", {"expression": host_sentinel})
-    payment_after_main = await _copilot_payload(server, "evaluate", {"expression": payment_sentinel})
+    host_after_payment = await _ember_payload(server, "evaluate", {"expression": host_sentinel})
+    payment_after_main = await _ember_payload(server, "evaluate", {"expression": payment_sentinel})
     assert host_after_payment["data"]["result"] == "main-page"
     assert payment_after_main["data"]["result"] is None
 
-    nested = await _copilot_payload(server, "skyvern_frame_switch", {"name": "editor"})
+    nested = await _ember_payload(server, "skyvern_frame_switch", {"name": "editor"})
     assert nested["ok"] is True
     assert nested["data"]["frame_name"] == "editor"
 
-    in_editor = await _copilot_payload(server, "evaluate", {"expression": editor_sentinel})
-    host_from_editor = await _copilot_payload(server, "evaluate", {"expression": host_sentinel})
+    in_editor = await _ember_payload(server, "evaluate", {"expression": editor_sentinel})
+    host_from_editor = await _ember_payload(server, "evaluate", {"expression": host_sentinel})
     assert in_editor["data"]["result"] == "editor-frame"
     assert host_from_editor["data"]["result"] is None
 
-    editor_before = await _copilot_payload(server, "evaluate", {"expression": editor_text})
-    editor_typed = await _copilot_payload(server, "type_text", {"selector": "#editor-root", "text": "updated"})
-    editor_after = await _copilot_payload(server, "evaluate", {"expression": editor_text})
+    editor_before = await _ember_payload(server, "evaluate", {"expression": editor_text})
+    editor_typed = await _ember_payload(server, "type_text", {"selector": "#editor-root", "text": "updated"})
+    editor_after = await _ember_payload(server, "evaluate", {"expression": editor_text})
     assert editor_before["data"]["result"] == "Edit me"
     assert editor_typed["ok"] is True, editor_typed
     assert editor_after["data"]["result"] == "updated"
 
-    returned = await _copilot_payload(server, "skyvern_frame_main", {})
+    returned = await _ember_payload(server, "skyvern_frame_main", {})
     assert returned["ok"] is True
-    host_after_editor = await _copilot_payload(server, "evaluate", {"expression": host_sentinel})
-    editor_after_main = await _copilot_payload(server, "evaluate", {"expression": editor_sentinel})
+    host_after_editor = await _ember_payload(server, "evaluate", {"expression": host_sentinel})
+    editor_after_main = await _ember_payload(server, "evaluate", {"expression": editor_sentinel})
     assert host_after_editor["data"]["result"] == "main-page"
     assert editor_after_main["data"]["result"] is None
 
-    continued = await _copilot_payload(server, "type_text", {"selector": "#main-input", "text": "continued"})
-    main_value = await _copilot_payload(
-        server, "evaluate", {"expression": "document.querySelector('#main-input').value"}
-    )
+    continued = await _ember_payload(server, "type_text", {"selector": "#main-input", "text": "continued"})
+    main_value = await _ember_payload(server, "evaluate", {"expression": "document.querySelector('#main-input').value"})
     assert continued["ok"] is True
     assert main_value["data"]["result"] == "continued"
 

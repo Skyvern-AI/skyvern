@@ -45,7 +45,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import (
-    COPILOT_TEST_WORKFLOW_CREATOR,
+    EMBER_TEST_WORKFLOW_CREATOR,
     Workflow,
     WorkflowDefinition,
     WorkflowRun,
@@ -280,7 +280,7 @@ async def test_identical_retry_after_workflow_saves_returns_the_same_group(env: 
                 organization_id=ORG,
                 title="Workflow",
                 version=2,
-                created_by=COPILOT_TEST_WORKFLOW_CREATOR,
+                created_by=EMBER_TEST_WORKFLOW_CREATOR,
                 workflow_definition=run_group_definition(run_group_task_block()),
             )
         )

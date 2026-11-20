@@ -11,8 +11,8 @@ import pytest
 
 from skyvern.cli.mcp_tools.code_block import skyvern_code_block_lint
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot import code_block_preflight as code_block_preflight_module
-from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
+from skyvern.forge.sdk.ember import code_block_preflight as code_block_preflight_module
+from skyvern.forge.sdk.ember.code_block_preflight import CodeBlockScanFinding
 
 
 @pytest.fixture(autouse=True)

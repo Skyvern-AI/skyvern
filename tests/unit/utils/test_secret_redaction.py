@@ -264,13 +264,29 @@ def test_redact_har_bytes_redacts_base64_response_content() -> None:
     assert secret not in decoded_text
 
 
-def test_redact_har_bytes_redacts_raw_url_query_by_sensitive_name() -> None:
+@pytest.mark.parametrize(
+    ("url", "secret_values", "leaked"),
+    [
+        ("https://example.test/callback?access_token=serverissued123&safe=ok", set(), "serverissued123"),
+        # An unclosed IPv6 bracket makes urlsplit raise, so the query takes the pattern scrub.
+        ("https://[example.test/callback?access_token=serverissued123&safe=ok", set(), "serverissued123"),
+        # The name pattern stops at the space; the registered value's second word must still go.
+        (
+            "https://[example.test/callback?access_token=firstword suffixword&safe=ok",
+            {"firstword suffixword"},
+            "suffixword",
+        ),
+    ],
+)
+def test_redact_har_bytes_redacts_raw_url_query_by_sensitive_name(
+    url: str, secret_values: set[str], leaked: str
+) -> None:
     har = {
         "log": {
             "entries": [
                 {
                     "request": {
-                        "url": "https://example.test/callback?access_token=serverissued123&safe=ok",
+                        "url": url,
                         "queryString": [],
                     },
                     "response": {},
@@ -279,11 +295,11 @@ def test_redact_har_bytes_redacts_raw_url_query_by_sensitive_name() -> None:
         }
     }
 
-    result = json.loads(redact_har_bytes(json.dumps(har).encode(), set()))
+    result = json.loads(redact_har_bytes(json.dumps(har).encode(), secret_values))
     url = result["log"]["entries"][0]["request"]["url"]
 
     assert f"access_token={REDACTED_SECRET_PLACEHOLDER}" in url
-    assert "serverissued123" not in url
+    assert leaked not in url
     assert "safe=ok" in url
 
 
@@ -333,8 +349,50 @@ def test_redact_har_bytes_leaves_json_post_data_to_value_matching() -> None:
     assert result["log"]["entries"][0]["request"]["postData"]["text"] == '{"password":"notinvault"}'
 
 
-def test_redact_har_bytes_falls_back_to_plain_replacement_for_invalid_json() -> None:
-    assert redact_har_bytes(b"{not-json hunter2", {"hunter2"}) == b"{not-json [REDACTED_SECRET]"
+def test_redact_har_bytes_scrubs_sensitive_names_in_a_truncated_har() -> None:
+    har = {
+        "log": {
+            "entries": [
+                {
+                    "request": {
+                        "url": "https://example.test/login?password=urlpass123&page=2",
+                        "headers": [
+                            {"name": "Accept", "value": "text/html"},
+                            {"name": "Authorization", "value": "Bearer header-token-123"},
+                        ],
+                        "cookies": [{"name": "sid", "value": "cookie-value-123", "httpOnly": True}],
+                        "postData": {
+                            "mimeType": "application/x-www-form-urlencoded",
+                            "text": "username=alice&password=formpass123",
+                            "params": [{"name": "cvv", "value": "987"}],
+                        },
+                    },
+                    "response": {"content": {"text": "welcome vault-secret-123 password=firstword suffixword"}},
+                },
+                {"request": {"url": "https://example.test/next"}},
+            ]
+        }
+    }
+    truncated = json.dumps(har).encode()[:-40]
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(truncated)
+
+    result = redact_har_bytes(truncated, {"vault-secret-123", "firstword suffixword"})
+
+    for leaked in (
+        b"header-token-123",
+        b"cookie-value-123",
+        b"formpass123",
+        b"urlpass123",
+        b"987",
+        b"vault-secret",
+        b"suffixword",
+    ):
+        assert leaked not in result
+    assert REDACTED_SECRET_PLACEHOLDER.encode() in result
+    assert b"text/html" in result
+    assert b"username=alice" in result
+    assert b"page=2" in result
 
 
 def test_get_secret_values_for_run_returns_empty_for_unknown_run(monkeypatch: pytest.MonkeyPatch) -> None:
