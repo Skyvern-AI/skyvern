@@ -767,6 +767,7 @@ Whoever can start a task chooses the URLs Skyvern fetches. With validation off, 
 |---|---|---|
 | `ARTIFACT_STORAGE_PATH` | `artifacts/` inside the installed `skyvern` package (`/data/artifacts` in Docker) | `local` |
 | `VIDEO_PATH`, `HAR_PATH`, `LOG_PATH` | `./video`, `./har`, `./log` | All. Recordings are written here, then uploaded to the backend. |
+| `BROWSER_HAR_RECORDING_ENABLED` | `true` | All. Set to `false` to stop recording HAR files of browser network traffic. Skyvern then writes nothing to `HAR_PATH`. |
 | `PRESIGNED_URL_EXPIRATION` | `86400` (24 hours) | `s3`. Lifetime of the signed links in run responses, such as links to downloaded files. Screenshot and recording links last at most 1 hour. On `azureblob` and `gcs`, links last 24 hours (1 hour for screenshots and recordings) and this variable is not used. |
 | `MAX_UPLOAD_FILE_SIZE` | `31457280` (30 MB) | All |
 
