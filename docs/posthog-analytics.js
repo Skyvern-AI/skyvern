@@ -382,7 +382,9 @@
         var normalized = path === "/" ? path : path.replace(/\/$/, "");
         if (
           PUBLIC_PATHS.has(normalized) ||
-          /^\/blog\/(?!preview\/?$)[a-z0-9]+(?:-[a-z0-9]+)*\/?$/.test(path)
+          /^\/(?:blog\/(?!preview\/?$)|integrations\/)[a-z0-9]+(?:-[a-z0-9]+)*\/?$/.test(
+            path,
+          )
         ) {
           return path;
         }
