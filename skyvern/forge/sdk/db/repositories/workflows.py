@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Collection
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1051,7 +1051,10 @@ class WorkflowsRepository(BaseRepository):
             rows = (await session.execute(main_query)).all()
             template_permanent_ids: set[str] = set()
             if rows and organization_id:
-                template_permanent_ids = await self.get_org_template_permanent_ids(organization_id)
+                page_permanent_ids = {workflow_model.workflow_permanent_id for workflow_model, _, _ in rows}
+                template_permanent_ids = await self.get_org_template_permanent_ids(
+                    organization_id, workflow_permanent_ids=page_permanent_ids
+                )
 
             workflows: list[Workflow] = []
             for workflow_model, original_created_by, original_created_at in rows:
@@ -1741,14 +1744,22 @@ class WorkflowsRepository(BaseRepository):
     async def get_org_template_permanent_ids(
         self,
         organization_id: str,
+        *,
+        workflow_permanent_ids: Collection[str] | None = None,
     ) -> set[str]:
-        """Get all workflow_permanent_ids that are templates for an organization."""
+        """Get active template IDs for an organization, optionally restricted to the given IDs."""
+        if workflow_permanent_ids is not None and not workflow_permanent_ids:
+            return set()
+
+        query = (
+            select(WorkflowTemplateModel.workflow_permanent_id)
+            .where(WorkflowTemplateModel.organization_id == organization_id)
+            .where(WorkflowTemplateModel.deleted_at.is_(None))
+        )
+        if workflow_permanent_ids is not None:
+            query = query.where(WorkflowTemplateModel.workflow_permanent_id.in_(workflow_permanent_ids))
         async with self.Session() as session:
-            result = await session.scalars(
-                select(WorkflowTemplateModel.workflow_permanent_id)
-                .where(WorkflowTemplateModel.organization_id == organization_id)
-                .where(WorkflowTemplateModel.deleted_at.is_(None))
-            )
+            result = await session.scalars(query)
             return set(result.all())
 
     @db_operation("is_workflow_template")
