@@ -153,6 +153,11 @@ def create_forge_app() -> ForgeApp:
             secret_key=settings.ENCRYPTOR_AES_SECRET_KEY,
             salt=settings.ENCRYPTOR_AES_SALT,
             iv=settings.ENCRYPTOR_AES_IV,
+            v2_secret_key=settings.ENCRYPTOR_AES_SECRET_KEY_V2,
+            v2_salt=settings.ENCRYPTOR_AES_SALT_V2,
+            scoped_secret_key=settings.ENCRYPTOR_AES_SCOPED_SECRET_KEY,
+            write_scoped=settings.ENCRYPTOR_AES_WRITE_SCOPED,
+            write_version=settings.ENCRYPTOR_AES_WRITE_VERSION,
         )
 
     app.ARTIFACT_MANAGER = ArtifactManager()

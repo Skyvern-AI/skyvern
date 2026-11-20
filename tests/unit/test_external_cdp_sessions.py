@@ -30,7 +30,9 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.models import PersistentBrowserSessionModel
-from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt import VERSIONED_CIPHERTEXT_PREFIX, encryptor
+from skyvern.forge.sdk.encrypt.aes_gcm import AESGCMEncryptor
+from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.routes import agent_protocol as agent_protocol_mod
 from skyvern.forge.sdk.routes.streaming import verify as verify_mod
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -54,6 +56,8 @@ from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.real_browser_state import RealBrowserState
 from tests.unit._external_cdp_fakes import (
     CDP_URL,
+    CDP_V2_TEST_KEY,
+    CDP_V2_TEST_SALT,
     ORG_A,
     ORG_B,
     TOKEN,
@@ -414,6 +418,18 @@ async def test_the_stored_address_is_ciphertext_that_attach_decrypts(stack: Simp
     connect = AsyncMock(return_value=attached)
     with patch.object(external_mod, "connect_external_cdp_browser", connect):
         assert await stack.manager.get_browser_state(session_id, ORG_A) is attached
+    connect.assert_awaited_once_with(CDP_URL)
+
+    v2_fixture_encryptor = AESGCMEncryptor(
+        secret_key=CDP_V2_TEST_KEY,
+        salt=CDP_V2_TEST_SALT,
+        method=EncryptMethod.AES_GCM_V2,
+    )
+    v2_ciphertext = await v2_fixture_encryptor.encrypt(CDP_URL)
+    versioned_v2 = f"{VERSIONED_CIPHERTEXT_PREFIX}{EncryptMethod.AES_GCM_V2.value}:{v2_ciphertext}"
+    connect.reset_mock()
+    with patch.object(external_mod, "connect_external_cdp_browser", connect):
+        assert await external_mod.attach_registered_cdp_browser(versioned_v2) is attached
     connect.assert_awaited_once_with(CDP_URL)
 
 
