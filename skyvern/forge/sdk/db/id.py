@@ -81,9 +81,9 @@ WORKFLOW_RUN_PREFIX = "wr"
 WORKFLOW_SCRIPT_PREFIX = "ws"
 WORKFLOW_TEMPLATE_PREFIX = "wt"
 ORGANIZATION_BILLING_PREFIX = "ob"
-WORKFLOW_COPILOT_CHAT_PREFIX = "wcc"
-WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX = "wccm"
-WORKFLOW_COPILOT_COMPLETION_CRITERIA_SET_PREFIX = "wccs"
+EMBER_CHAT_PREFIX = "wcc"
+EMBER_CHAT_MESSAGE_PREFIX = "wccm"
+EMBER_COMPLETION_CRITERIA_SET_PREFIX = "wccs"
 WORKFLOW_RUN_CREDENTIAL_SELECTION_PREFIX = "wrcs"
 SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
 HEAL_EPISODE_PREFIX = "he"
@@ -397,19 +397,19 @@ def generate_billing_id() -> str:
     return f"{ORGANIZATION_BILLING_PREFIX}_{int_id}"
 
 
-def generate_workflow_copilot_chat_id() -> str:
+def generate_ember_chat_id() -> str:
     int_id = generate_id()
-    return f"{WORKFLOW_COPILOT_CHAT_PREFIX}_{int_id}"
+    return f"{EMBER_CHAT_PREFIX}_{int_id}"
 
 
-def generate_workflow_copilot_chat_message_id() -> str:
+def generate_ember_chat_message_id() -> str:
     int_id = generate_id()
-    return f"{WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX}_{int_id}"
+    return f"{EMBER_CHAT_MESSAGE_PREFIX}_{int_id}"
 
 
-def generate_workflow_copilot_completion_criteria_set_id() -> str:
+def generate_ember_completion_criteria_set_id() -> str:
     int_id = generate_id()
-    return f"{WORKFLOW_COPILOT_COMPLETION_CRITERIA_SET_PREFIX}_{int_id}"
+    return f"{EMBER_COMPLETION_CRITERIA_SET_PREFIX}_{int_id}"
 
 
 def generate_workflow_run_credential_selection_id() -> str:

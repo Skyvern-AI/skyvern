@@ -95,9 +95,13 @@ class IntegrationActionBlock(Block):
             raise IntegrationActionError(f"Unknown integration action {self.integration_id}.{self.action_id}.")
         entry, action = found
         kind, _, block_type = action.runs_via.partition(":")
+        if kind != "block":
+            raise IntegrationActionError(
+                f"{entry.name}: {action.name} cannot run: every action must run through a block."
+            )
         # A Nango account's per-run hop token is minted only for the concrete block types, so the inner block would
         # fail its capability check.
-        if kind != "block" or _nango_only(entry):
+        if _nango_only(entry):
             raise IntegrationActionError(f"{entry.name}: {action.name} is not supported yet.")
         if is_connected_gmail_id(self.connection_id):
             raise IntegrationActionError(f"{entry.name}: {action.name} with this account is not supported yet.")

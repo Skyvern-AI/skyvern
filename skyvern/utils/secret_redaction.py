@@ -1,4 +1,6 @@
 import base64
+import contextvars
+import dataclasses
 import functools
 import html
 import json
@@ -7,9 +9,15 @@ import urllib.parse
 from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 
+import structlog
+
 from skyvern.forge.sdk.core import skyvern_context
 
+LOG = structlog.get_logger()
+
 REDACTED_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
+# Stored in place of an artifact whose redaction failed. A JSON string, so JSON readers still parse it.
+REDACTION_FAILED_STUB = b'"[REDACTED_SECRET] artifact withheld: secret redaction failed"'
 MIN_SECRET_LENGTH = 4
 MIN_NUMERIC_SECRET_LENGTH = 6
 # Shorter variants only match on token boundaries, so they cannot redact inside an unrelated word.
@@ -60,6 +68,27 @@ SENSITIVE_FORM_FIELD_NAMES: frozenset[str] = SENSITIVE_QUERY_PARAM_NAMES | froze
         "pin",
     }
 )
+
+_JSON_STRING_BODY = r'(?:[^"\\]|\\.)*'
+_SENSITIVE_NAME_VALUE_PAIR_RE = re.compile(
+    r'("name"\s*:\s*"(?:'
+    + "|".join(re.escape(name) for name in sorted(SENSITIVE_HEADER_NAMES | SENSITIVE_FORM_FIELD_NAMES))
+    + r')"\s*,\s*"value"\s*:\s*")'
+    + _JSON_STRING_BODY,
+    re.IGNORECASE,
+)
+_JSON_VALUE_FIELD_RE = re.compile(r'("value"\s*:\s*")' + _JSON_STRING_BODY)
+_COOKIES_ARRAY_START_RE = re.compile(r'"cookies"\s*:\s*\[')
+_JSON_ARRAY_TOKEN_RE = re.compile(r'"' + _JSON_STRING_BODY + r'"?|[\[\]]|[^"\[\]]+')
+
+
+def _named_urlencoded_value_re(names: frozenset[str]) -> re.Pattern[str]:
+    alternatives = "|".join(re.escape(name) for name in sorted(names))
+    return re.compile(r"(?<![A-Za-z0-9_.\-])((?:" + alternatives + r")=)[^&#\"\s\\]*", re.IGNORECASE)
+
+
+_NAMED_FORM_VALUE_RE = _named_urlencoded_value_re(SENSITIVE_FORM_FIELD_NAMES)
+_NAMED_QUERY_VALUE_RE = _named_urlencoded_value_re(SENSITIVE_QUERY_PARAM_NAMES)
 
 # Source constants: BitwardenConstants.TOTP, OnePasswordConstants.TOTP, AzureVaultConstants.TOTP.
 _TOTP_SENTINEL_VALUES = frozenset({"BW_TOTP", "OP_TOTP", "AZ_TOTP"})
@@ -256,12 +285,18 @@ def redact_har_bytes(
     multi_field_totp: bool = True,
     placeholder_ids: Collection[str] = (),
 ) -> bytes:
+    if not har_data.strip():
+        return har_data
     try:
         har = json.loads(har_data)
     except Exception:
-        return redact_secrets_from_bytes(
+        # A HAR cut short (a killed browser or worker) still holds header and cookie values.
+        LOG.warning("HAR is not valid JSON; storing it with a pattern scrub", artifact_type="har")
+        # Exact values go first: the name scrub stops at a space or quote and would split a registered value.
+        scrubbed = redact_secrets_from_bytes(
             har_data, secret_values, multi_field_totp=multi_field_totp, placeholder_ids=placeholder_ids
         )
+        return _pattern_scrub_har_text(scrubbed.decode()).encode()
 
     original_serialized_har = json.dumps(har)
     base64_containers: set[int] = set()
@@ -279,28 +314,39 @@ def redact_har_bytes(
 
     log = har.get("log", {}) if isinstance(har, dict) else {}
     entries = log.get("entries", []) if isinstance(log, dict) else []
-    if isinstance(entries, list):
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            request = entry.get("request", {})
-            response = entry.get("response", {})
-            if isinstance(request, dict):
-                _redact_headers(request.get("headers", []))
-                _redact_query_string(request.get("queryString", []))
-                _redact_cookies(request.get("cookies", []))
-                _redact_url_query_params(request)
-                post_data = request.get("postData", {})
-                if isinstance(post_data, dict):
-                    _redact_form_fields(post_data.get("params", []))
-                    _redact_urlencoded_post_data_text(post_data)
-                redact_body(post_data)
-            if isinstance(response, dict):
-                _redact_headers(response.get("headers", []))
-                _redact_cookies(response.get("cookies", []))
-                content = response.get("content", {})
-                if isinstance(content, dict):
-                    redact_body(content)
+    fallback_state = _UrlencodedFallbackState(secret_values, multi_field_totp, placeholder_ids)
+    state_token = _URLENCODED_FALLBACK_STATE.set(fallback_state)
+    try:
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                request = entry.get("request", {})
+                response = entry.get("response", {})
+                if isinstance(request, dict):
+                    _redact_headers(request.get("headers", []))
+                    _redact_query_string(request.get("queryString", []))
+                    _redact_cookies(request.get("cookies", []))
+                    _redact_url_query_params(request)
+                    post_data = request.get("postData", {})
+                    if isinstance(post_data, dict):
+                        _redact_form_fields(post_data.get("params", []))
+                        _redact_urlencoded_post_data_text(post_data)
+                    redact_body(post_data)
+                if isinstance(response, dict):
+                    _redact_headers(response.get("headers", []))
+                    _redact_cookies(response.get("cookies", []))
+                    content = response.get("content", {})
+                    if isinstance(content, dict):
+                        redact_body(content)
+    finally:
+        _URLENCODED_FALLBACK_STATE.reset(state_token)
+    if fallback_state.count:
+        LOG.warning(
+            "Urlencoded HAR values did not parse; stored them with a pattern scrub",
+            artifact_type="har",
+            count=fallback_state.count,
+        )
 
     if base64_containers:
         task_ids = skyvern_context.multi_field_totp_masking_task_ids() if multi_field_totp else set()
@@ -348,6 +394,61 @@ def redact_console_log_bytes(
     return redact_secrets_from_bytes(log_data, secret_values, placeholder_ids=placeholder_ids)
 
 
+def _pattern_scrub_har_text(text: str) -> str:
+    """Name-based HAR scrub for text that does not parse as JSON; errs toward removing values."""
+    text = _SENSITIVE_NAME_VALUE_PAIR_RE.sub(lambda m: m.group(1) + REDACTED_SECRET_PLACEHOLDER, text)
+    text = _NAMED_FORM_VALUE_RE.sub(lambda m: m.group(1) + REDACTED_SECRET_PLACEHOLDER, text)
+    parts: list[str] = []
+    position = 0
+    while (start := _COOKIES_ARRAY_START_RE.search(text, position)) is not None:
+        end = len(text)
+        depth = 1
+        for token in _JSON_ARRAY_TOKEN_RE.finditer(text, start.end()):
+            if token.group() == "[":
+                depth += 1
+            elif token.group() == "]":
+                depth -= 1
+                if depth == 0:
+                    end = token.start()
+                    break
+        parts.append(text[position : start.end()])
+        parts.append(
+            _JSON_VALUE_FIELD_RE.sub(lambda m: m.group(1) + REDACTED_SECRET_PLACEHOLDER, text[start.end() : end])
+        )
+        position = end
+    parts.append(text[position:])
+    return "".join(parts)
+
+
+@dataclasses.dataclass
+class _UrlencodedFallbackState:
+    secret_values: Collection[str]
+    multi_field_totp: bool
+    placeholder_ids: Collection[str]
+    count: int = 0
+
+
+_URLENCODED_FALLBACK_STATE: contextvars.ContextVar[_UrlencodedFallbackState | None] = contextvars.ContextVar(
+    "urlencoded_fallback_state", default=None
+)
+
+
+def _pattern_scrub_urlencoded(text: str, pattern: re.Pattern[str]) -> str:
+    state = _URLENCODED_FALLBACK_STATE.get()
+    if state is None:
+        LOG.warning("Urlencoded HAR value did not parse; storing it with a pattern scrub", artifact_type="har")
+    else:
+        state.count += 1
+        # Exact values go first: the name pattern stops at a space or quote and would split a registered value.
+        text = redact_secrets_from_bytes(
+            text.encode(),
+            state.secret_values,
+            multi_field_totp=state.multi_field_totp,
+            placeholder_ids=state.placeholder_ids,
+        ).decode()
+    return pattern.sub(lambda m: m.group(1) + REDACTED_SECRET_PLACEHOLDER, text)
+
+
 def _redact_headers(headers: Any) -> None:
     if not isinstance(headers, list):
         return
@@ -382,10 +483,11 @@ def _redact_form_fields(params: Any) -> None:
 
 
 def _redact_named_urlencoded_values(text: str, sensitive_names: frozenset[str]) -> str:
+    fallback = _NAMED_QUERY_VALUE_RE if sensitive_names == SENSITIVE_QUERY_PARAM_NAMES else _NAMED_FORM_VALUE_RE
     try:
         pairs = urllib.parse.parse_qsl(text, keep_blank_values=True)
     except Exception:
-        return text
+        return _pattern_scrub_urlencoded(text, fallback)
 
     changed = False
     redacted_pairs: list[tuple[str, str]] = []
@@ -400,7 +502,7 @@ def _redact_named_urlencoded_values(text: str, sensitive_names: frozenset[str]) 
     try:
         return urllib.parse.urlencode(redacted_pairs, safe="[]")
     except Exception:
-        return text
+        return _pattern_scrub_urlencoded(text, fallback)
 
 
 def _redact_url_query_params(request: dict[str, Any]) -> None:
@@ -410,6 +512,7 @@ def _redact_url_query_params(request: dict[str, Any]) -> None:
     try:
         split_url = urllib.parse.urlsplit(url)
     except Exception:
+        request["url"] = _pattern_scrub_urlencoded(url, _NAMED_QUERY_VALUE_RE)
         return
     if not split_url.query:
         return
@@ -421,7 +524,7 @@ def _redact_url_query_params(request: dict[str, Any]) -> None:
             (split_url.scheme, split_url.netloc, split_url.path, redacted_query, split_url.fragment)
         )
     except Exception:
-        return
+        request["url"] = _pattern_scrub_urlencoded(url, _NAMED_QUERY_VALUE_RE)
 
 
 def _redact_urlencoded_post_data_text(post_data: dict[str, Any]) -> None:

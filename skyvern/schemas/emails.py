@@ -23,7 +23,7 @@ class GmailHopRefusal(StrEnum):
     account_unavailable = "account_unavailable"
     resave_required = "resave_required"
     owner_unconfirmed = "owner_unconfirmed"
-    copilot_test_run = "copilot_test_run"
+    ember_test_run = "copilot_test_run"
 
 
 # Shared by the inbox and send blocks, which word the rest of their refusal differently.
@@ -50,7 +50,7 @@ def is_connected_gmail_id(value: str | None) -> bool:
     return bool(value) and str(value).startswith(_CONNECTED_GMAIL_ID_PREFIX)
 
 
-CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON = (
+CONNECTED_ACCOUNT_EMBER_TEST_RUN_REASON = (
     "Copilot test runs can't use a Connected Gmail account. Save the workflow, then run it to use this account."
 )
 

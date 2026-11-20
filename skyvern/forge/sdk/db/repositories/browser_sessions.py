@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from skyvern.config import settings
+from skyvern.constants import EMBER_RUN_CREATOR
 from skyvern.exceptions import (
     BrowserProfileNotFound,
     BrowserSessionAlreadyEndedError,
@@ -61,7 +62,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     resolve_terminal_status,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.schemas.browser_session_kind import COPILOT_PRESTART_RUNNABLE_TYPE
+from skyvern.schemas.browser_session_kind import EMBER_PRESTART_RUNNABLE_TYPE
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, parse_proxy_location_input
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -115,14 +116,14 @@ def _managed_browser_profile_query(
     )
 
 
-def unattributed_copilot_session(organization_id: str) -> ColumnElement[bool]:
+def unattributed_ember_session(organization_id: str) -> ColumnElement[bool]:
     """A Copilot browser that names no workflow and that no run, task, debug session, recording, binding or managed
     profile ties to one: it predates the record of the workflow it authors, so whose browser it is cannot be known."""
     browser = PersistentBrowserSessionModel
     session_id = browser.persistent_browser_session_id
     return and_(
         # NULL-safe: a plain session has no creator, and NOT of a NULL comparison would hide it from every list.
-        browser.created_by.is_not_distinct_from("copilot"),
+        browser.created_by.is_not_distinct_from(EMBER_RUN_CREATOR),
         browser.created_for_workflow_permanent_id.is_(None),
         browser.created_for_workflow_run_id.is_(None),
         browser.bound_workflow_permanent_id.is_(None),
@@ -173,7 +174,7 @@ async def _session_folder_filter(organization_id: str) -> ColumnElement[bool] | 
         return None
     if not hidden:
         # Restrictions exist but hide no workflow from this caller: only the unattributed rule applies, as in authorize.
-        return ~unattributed_copilot_session(organization_id)
+        return ~unattributed_ember_session(organization_id)
     session_id = PersistentBrowserSessionModel.persistent_browser_session_id
     bound = PersistentBrowserSessionModel.bound_workflow_permanent_id
     created_for = PersistentBrowserSessionModel.created_for_workflow_permanent_id
@@ -182,7 +183,7 @@ async def _session_folder_filter(organization_id: str) -> ColumnElement[bool] | 
         # A Copilot chat's own browser belongs to the workflow being authored. One from before that was recorded is
         # judged by whatever else links it, and hidden only when nothing does.
         or_(created_for.is_(None), created_for.not_in(hidden)),
-        ~unattributed_copilot_session(organization_id),
+        ~unattributed_ember_session(organization_id),
         # A session being provisioned for a run belongs to that run before the run row records it.
         ~exists().where(
             WorkflowRunModel.organization_id == organization_id,
@@ -1179,14 +1180,14 @@ class BrowserSessionsRepository(BaseRepository):
             return result.first() is not None
 
     @db_operation("claim_copilot_prestart")
-    async def claim_copilot_prestart(self, *, session_id: str, organization_id: str) -> bool:
+    async def claim_ember_prestart(self, *, session_id: str, organization_id: str) -> bool:
         async with self.Session() as session:
             result = await session.scalars(
                 update(PersistentBrowserSessionModel)
                 .where(
                     PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
                     PersistentBrowserSessionModel.organization_id == organization_id,
-                    PersistentBrowserSessionModel.runnable_type == COPILOT_PRESTART_RUNNABLE_TYPE,
+                    PersistentBrowserSessionModel.runnable_type == EMBER_PRESTART_RUNNABLE_TYPE,
                     PersistentBrowserSessionModel.runnable_id.is_(None),
                     PersistentBrowserSessionModel.deleted_at.is_(None),
                     PersistentBrowserSessionModel.completed_at.is_(None),

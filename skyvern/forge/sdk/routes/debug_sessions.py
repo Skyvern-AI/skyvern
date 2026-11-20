@@ -11,8 +11,8 @@ from sqlalchemy.exc import IntegrityError
 from skyvern.config import settings
 from skyvern.exceptions import BrowserSessionNotRenewable, ProxyPolicyError
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.active_run_session import get_active_run_session
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.ember.active_run_session import get_active_run_session
 from skyvern.forge.sdk.routes.pagination import MAX_INT4
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.debug_sessions import (
@@ -264,7 +264,7 @@ async def _retire_prewarm(
 async def prewarm_debug_session(
     request: DebugSessionPrewarmRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+    current_user_id: str = Depends(org_auth_service.get_debug_session_owner_id),
 ) -> Response:
     organization_id = current_org.organization_id
     try:
@@ -362,7 +362,7 @@ async def prewarm_debug_session(
 async def get_debug_session_viewer_state(
     workflow_permanent_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+    current_user_id: str = Depends(org_auth_service.get_debug_session_owner_id),
 ) -> DebugSessionViewerState:
     """Return the active run viewer target without creating or renewing a debug session."""
     debug_session = await app.DATABASE.debug.get_debug_session(
@@ -537,7 +537,7 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
 async def new_debug_session(
     workflow_permanent_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+    current_user_id: str = Depends(org_auth_service.get_debug_session_owner_id),
 ) -> DebugSession:
     """
     Create a new debug session, along with a new browser session. If any
@@ -685,6 +685,7 @@ async def get_block_outputs_for_debug_session(
     workflow_permanent_id: str,
     version: t.Annotated[int | None, Query(ge=1, le=MAX_INT4)] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    # Must match the user_id run_block writes block_runs under, or the editor reads no outputs.
     current_user_id: str = Depends(org_auth_service.get_current_user_id),
 ) -> dict[str, dict[str, t.Any]]:
     with browser_session_artifact_read(get_request_principal()):
@@ -705,7 +706,7 @@ async def get_login_block_compatibility(
     workflow_permanent_id: str,
     block_label: str = Query(..., min_length=1),
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+    current_user_id: str = Depends(org_auth_service.get_debug_session_owner_id),
 ) -> DebugLoginBlockCompatibility:
     """Backend-authoritative compatibility verdict for one debugger LoginBlock.
 

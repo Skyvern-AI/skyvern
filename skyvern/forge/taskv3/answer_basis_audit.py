@@ -18,6 +18,7 @@ import structlog
 
 from skyvern.forge.taskv3.loop import (
     ANSWER_BASIS_HOLD_BOUND_GUARD,
+    CLICK_TOOL_NAMES,
     CODE_TOOL_NAME,
     GUARD_END_DATA_KEY,
     OPENED_LIST_ERROR_CLASSES,
@@ -77,7 +78,7 @@ def _selector(args: dict[str, Any]) -> str:
 
 def _may_move_on(tool: str, args: dict[str, Any]) -> bool:
     # A click on a listed menu row picks an answer; it moves nothing on.
-    return _may_submit(tool, args) and not (tool == "click" and _MENU_ROW.search(_selector(args)))
+    return _may_submit(tool, args) and not (tool in CLICK_TOOL_NAMES and _MENU_ROW.search(_selector(args)))
 
 
 def apply_answer_basis_audit(
@@ -143,7 +144,7 @@ def apply_answer_basis_audit(
             return False, {}
         # A click cannot be told from a submit before it lands, so only the flagged field's own control, or a row of an
         # open list, goes through: that is the repair. A ref or mark is compared as the field was recorded, resolved.
-        if spec.name == "click":
+        if spec.name in CLICK_TOOL_NAMES:
             selector, menu_row = await spec.address_probe(args) if spec.address_probe else (_selector(args), False)
             if menu_row or any(selector == field[1] for field in flagged):
                 return True, {}
@@ -183,7 +184,14 @@ def apply_answer_basis_audit(
         )
 
     for spec in tools:
-        if spec.name not in ("click", "drag", "type", "select_option", "select_combobox", "press_key", CODE_TOOL_NAME):
+        if spec.name not in CLICK_TOOL_NAMES | {
+            "drag",
+            "type",
+            "select_option",
+            "select_combobox",
+            "press_key",
+            CODE_TOOL_NAME,
+        }:
             continue
 
         async def wrapped(
@@ -212,7 +220,11 @@ def apply_answer_basis_audit(
             repair, kept = await hold(_spec, args, entering, appends) if _may_move_on(_tool, args) else (False, {})
             result = await _handler(args)
             data = _data(result)
-            picked = str(data.get(PICKED_OPTION_DATA_KEY) or "") if _tool == "click" and result.status == "ok" else ""
+            picked = (
+                str(data.get(PICKED_OPTION_DATA_KEY) or "")
+                if _tool in CLICK_TOOL_NAMES and result.status == "ok"
+                else ""
+            )
             opened = bool(data.get(_MENU_NOTE_KEY)) or result.error_class in OPENED_LIST_ERROR_CLASSES
             if repair:
                 # A click let through as a repair that neither opened a list nor picked a row went somewhere else.

@@ -534,6 +534,12 @@ def _is_readiness_timeout(exc: BaseException, engine_selection: BrowserEngineSel
     )
 
 
+class HttpUrlResponse(NamedTuple):
+    body: bytes
+    content_type: str
+    content_disposition: str
+
+
 class BlobTooLargeError(Exception):
     pass
 
@@ -1905,6 +1911,7 @@ async (args) => {
             return { ok: false, status: response.status };
         }
         const contentType = response.headers.get('content-type') || '';
+        const contentDisposition = response.headers.get('content-disposition') || '';
         if (!response.body) return { ok: false, error: 'no_readable_stream' };
         const reader = response.body.getReader();
         const chunks = [];
@@ -1931,7 +1938,7 @@ async (args) => {
                     resolve({ ok: false, error: 'no_data_url_payload' });
                     return;
                 }
-                resolve({ ok: true, base64: result.substring(comma + 1), contentType });
+                resolve({ ok: true, base64: result.substring(comma + 1), contentType, contentDisposition });
             };
             reader.onerror = () => resolve({ ok: false, error: 'file_reader_error' });
             reader.readAsDataURL(blob);
@@ -2722,6 +2729,29 @@ class SkyvernFrame:
         redirect: Literal["follow", "error"] = "follow",
         check_active: Callable[[], None] | None = None,
     ) -> bytes | None:
+        response = await SkyvernFrame.read_http_url_response(
+            page,
+            url,
+            workflow_run_id=workflow_run_id,
+            max_size_bytes=max_size_bytes,
+            timeout_ms=timeout_ms,
+            headers=headers,
+            redirect=redirect,
+            check_active=check_active,
+        )
+        return response.body if response is not None else None
+
+    @staticmethod
+    async def read_http_url_response(
+        page: Page,
+        url: str,
+        workflow_run_id: str | None = None,
+        max_size_bytes: int | None = None,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        headers: dict[str, str] | None = None,
+        redirect: Literal["follow", "error"] = "follow",
+        check_active: Callable[[], None] | None = None,
+    ) -> HttpUrlResponse | None:
         """Fetch an http(s) URL's bytes via an in-page fetch() inside a same-origin frame.
 
         Recovers a resource whose inline iframe render was refused by a frame-embedding policy
@@ -2787,9 +2817,12 @@ class SkyvernFrame:
             if not isinstance(b64_payload, str):
                 continue
             try:
-                return base64.b64decode(b64_payload, validate=True)
+                body = base64.b64decode(b64_payload, validate=True)
             except Exception:
                 continue
+            return HttpUrlResponse(
+                body, str(result.get("contentType") or ""), str(result.get("contentDisposition") or "")
+            )
         return None
 
     # -- cursor overlay helpers ------------------------------------------------

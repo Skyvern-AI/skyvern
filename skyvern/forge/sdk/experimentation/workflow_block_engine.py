@@ -199,13 +199,13 @@ def _born_at_or_after(born_at: datetime | None, cutoff: datetime | None) -> bool
 
 
 def _is_kept_workflow_run(
-    workflow_status: WorkflowStatus, trigger_type: WorkflowRunTriggerType | None, *, copilot_test_copy: bool
+    workflow_status: WorkflowStatus, trigger_type: WorkflowRunTriggerType | None, *, ember_test_copy: bool
 ) -> bool:
     # auto_generated marks the per-call workflows the login, download_files, credential test-login and SDK endpoints
     # mint and run in one request, except Copilot's test copy, a version of a kept workflow. Job-recipe runs are
     # per-call by trigger kind whatever their status.
     return (
-        workflow_status != WorkflowStatus.auto_generated or copilot_test_copy
+        workflow_status != WorkflowStatus.auto_generated or ember_test_copy
     ) and trigger_type not in PER_CALL_WORKFLOW_RUN_TRIGGER_TYPES
 
 
@@ -284,7 +284,7 @@ async def resolve_workflow_block_engine_arm(
     takes_default_engine: bool | None,
     pinned_v1_blocks: int = 0,
     would_be_code: bool = False,
-    copilot_test_copy: bool = False,
+    ember_test_copy: bool = False,
 ) -> None:
     """Resolve the workflow-block engine A/B once at execution start and pin the arm on the context.
 
@@ -346,7 +346,7 @@ async def resolve_workflow_block_engine_arm(
         chosen_engine_candidate = (
             settings.TASK_V3_CHOSEN_ENGINE_CUTOFF is not None
             and takes_default_engine is not None
-            and _is_kept_workflow_run(workflow_status, trigger_type, copilot_test_copy=copilot_test_copy)
+            and _is_kept_workflow_run(workflow_status, trigger_type, ember_test_copy=ember_test_copy)
         )
         # Both cutoff rules compare the same birth timestamp, so it is read at most once per run.
         birth_reads: list[datetime | None] = []
@@ -402,7 +402,7 @@ async def resolve_workflow_block_engine_arm(
                     takes_new_workflow_default = (
                         not would_be_code
                         and billing_tier == BillingTier.SELF_SERVE
-                        and _is_kept_workflow_run(workflow_status, trigger_type, copilot_test_copy=copilot_test_copy)
+                        and _is_kept_workflow_run(workflow_status, trigger_type, ember_test_copy=ember_test_copy)
                         and await born_at_or_after(settings.TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF)
                     )
                     if takes_new_workflow_default:

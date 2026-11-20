@@ -43,7 +43,7 @@ class UsageEventLogger(Protocol):
     def info(self, event: str, **fields: UsageScalar) -> None: ...
 
 
-def is_workflow_copilot_prompt_name(prompt_name: str | None) -> bool:
+def is_ember_prompt_name(prompt_name: str | None) -> bool:
     if prompt_name is None:
         return False
     return prompt_name == "workflow-copilot" or prompt_name.startswith("workflow-copilot-")
@@ -160,8 +160,8 @@ def _emit_model_usage(event: ModelUsageEvent, *, logger: UsageEventLogger) -> No
     logger.info("Model usage", **fields)
 
 
-def _emit_direct_copilot_model_usage(event: ModelUsageEvent, *, logger: UsageEventLogger) -> bool:
-    if not is_workflow_copilot_prompt_name(event.prompt_name):
+def _emit_direct_ember_model_usage(event: ModelUsageEvent, *, logger: UsageEventLogger) -> bool:
+    if not is_ember_prompt_name(event.prompt_name):
         return False
     _emit_model_usage(replace(event, agent_name="ember"), logger=logger)
     return True

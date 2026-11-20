@@ -47,6 +47,7 @@ _REPORTED_URL_RES = {
     "observe": re.compile(r"url=(\S+)"),
     "navigate": re.compile(r"navigated to (\S+)"),
     "click": re.compile(r"clicked [^\n]* — now at (\S+)"),
+    "download": re.compile(r"clicked [^\n]* — now at (\S+)"),
 }
 _QUOTE_FOLD = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "`": "'", "\u00b4": "'"})
 

@@ -36,6 +36,7 @@ from openai.types.shared import Reasoning
 from pydantic import JsonValue, ValidationError
 
 from skyvern.config import settings
+from skyvern.constants import EMBER_RUN_CREATOR
 from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.agents.skills import (
@@ -59,7 +60,6 @@ from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.integrations.account_fit import block_fit, block_needs, connection_fit
 from skyvern.forge.sdk.integrations.catalog import IntegrationAction, IntegrationEntry
 from skyvern.forge.sdk.integrations.connected_accounts import (
-    COPILOT_RUN_CREATOR,
     OrgConnection,
     org_connections_by_id,
     run_connection_ids,
@@ -1366,7 +1366,7 @@ async def _connected_accounts(organization_id: str | None, workflow_run_id: str)
         )
         return []
     connections = await org_connections_by_id(organization_id, workflow_run.created_by)
-    if root.created_by == COPILOT_RUN_CREATOR:
+    if root.created_by == EMBER_RUN_CREATOR:
         allowed = await run_connection_ids(organization_id, root.workflow_run_id)
         # A record is always enforced. Without one, narrowing on means none; off, the dispatching API predates
         # the record and required every account, so every account stays offered. That is why every worker turns

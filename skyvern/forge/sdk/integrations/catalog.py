@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Collection, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from functools import partial
 from typing import Any, Literal
 
@@ -48,6 +48,7 @@ IntegrationCategory = Literal[
 ]
 OAuthProvider = Literal["google", "microsoft"]
 AccountsUnavailable = Literal["not_enabled", "read_failed"]
+IntegrationUnavailableReason = Literal["hipaa"]
 OAUTH_ACCOUNT_PROVIDERS: frozenset[str] = frozenset({"google", "microsoft"})
 ACCOUNT_READ_TIMEOUT_SECONDS = 5.0
 
@@ -76,7 +77,7 @@ class IntegrationAction(BaseModel):
     # Provider scope strings, compared against IntegrationAccount.scopes_granted.
     needs: list[str] = Field(default_factory=list)
     acts: bool = False
-    # "block:<BlockType value>": the existing block that runs the action.
+    # Always "block:<BlockType value>", the existing block that runs the action; there is no "nango:" or other kind.
     runs_via: str
     agent_step: Literal["tool", "saved_block_only"] = "tool"
 
@@ -120,6 +121,8 @@ class IntegrationEntry(BaseModel):
     triggers: list[IntegrationTrigger] = Field(default_factory=list)
     accounts: list[IntegrationAccount] | None = None
     accounts_unavailable: AccountsUnavailable | None = None
+    # Set only on the page's list: the page shows the entry's managed connection as disabled, with this reason.
+    unavailable_reason: IntegrationUnavailableReason | None = None
 
 
 def serialize_oauth_account(
@@ -150,7 +153,7 @@ def page_payload(entry: IntegrationEntry) -> dict[str, Any]:
     return entry.model_dump(by_alias=True, exclude_none=True, exclude=excluded)
 
 
-def copilot_payload(entry: IntegrationEntry) -> dict[str, Any]:
+def ember_payload(entry: IntegrationEntry) -> dict[str, Any]:
     data = entry.model_dump(exclude_none=True, exclude={"accounts", "keywords", "logo"})
     data["accounts"] = None if entry.accounts is None else [a.model_dump(exclude_none=True) for a in entry.accounts]
     return data
@@ -322,7 +325,7 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         id=_GOOGLE_GMAIL_ENTRY_ID,
         name="Gmail",
         category="Communication",
-        description="Read verification codes and send email from your agents.",
+        description="Read emails, including verification codes, and send emails from your agents.",
         keywords=[
             "email",
             "mail",
@@ -330,6 +333,7 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
             "2fa",
             "otp",
             "verification",
+            "read verification codes",
             "magic link",
             "google mail",
             "send",
@@ -618,13 +622,12 @@ async def _microsoft_accounts(organization_id: str, user_id: str | None = None) 
     entries = _entries_for_provider("microsoft")
     if not entries:
         return {}
-    credentials = await microsoft_oauth_service.get_credentials_for_org(organization_id, user_id=user_id)
+    credentials = await microsoft_oauth_service.get_visible_credentials_for_org(organization_id, user_id=user_id)
     return {
         entry.id: [
             oauth_account(credential, "microsoft")
             for credential in credentials
-            if credential.state == "active"
-            and microsoft_oauth_service.has_required_scopes(
+            if microsoft_oauth_service.has_required_scopes(
                 credential.scopes_requested or credential.scopes_granted, entry.required_scopes or []
             )
         ]
@@ -704,6 +707,7 @@ def integration_entries(
     powerbi_available: bool = False,
     gmail_available: bool = False,
     hidden_ids: frozenset[str] = frozenset(),
+    unavailable: Mapping[str, IntegrationUnavailableReason] | None = None,
 ) -> list[IntegrationEntry]:
     added_triggers = app.AGENT_FUNCTION.get_cloud_integration_triggers()
     entries = [
@@ -714,7 +718,12 @@ def integration_entries(
     ]
     if not email_forwarding_available:
         hidden_ids = hidden_ids | {"email_forwarding"}
-    entries = [entry for entry in entries if entry.id not in hidden_ids]
+    unavailable = unavailable or {}
+    entries = [
+        entry.model_copy(update={"unavailable_reason": unavailable[entry.id]}) if entry.id in unavailable else entry
+        for entry in entries
+        if entry.id not in hidden_ids or entry.id in unavailable
+    ]
     if gmail_available:
         entries = [
             entry.model_copy(update={"additional_credential_backends": ["nango"]})
@@ -746,7 +755,21 @@ def all_integration_entries() -> list[IntegrationEntry]:
     return integration_entries(powerbi_available=True, gmail_available=True)
 
 
-async def integration_entries_for_org(organization_id: str) -> list[IntegrationEntry]:
+async def _unavailable_reasons(organization_id: str) -> dict[str, IntegrationUnavailableReason]:
+    try:
+        return await app.AGENT_FUNCTION.integration_unavailable_reasons(organization_id)
+    except Exception:
+        LOG.warning(
+            "Integration unavailable reasons failed; leaving those entries as they were",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return {}
+
+
+async def integration_entries_for_org(
+    organization_id: str, *, include_unavailable: bool = False
+) -> list[IntegrationEntry]:
     try:
         email_forwarding_available = await app.AGENT_FUNCTION.ensure_email_forwarding_available(
             organization_id, fresh=False
@@ -784,6 +807,7 @@ async def integration_entries_for_org(organization_id: str) -> list[IntegrationE
         powerbi_available=powerbi_available,
         gmail_available=gmail_available,
         hidden_ids=await app.AGENT_FUNCTION.hidden_integration_ids(organization_id),
+        unavailable=await _unavailable_reasons(organization_id) if include_unavailable else None,
     )
     # Neither the page nor Copilot's integration list has a use for an entry with nothing to connect yet;
     # Copilot reads every trigger through its trigger tools.

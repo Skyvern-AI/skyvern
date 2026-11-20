@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import UUID
 
+from skyvern.constants import EMBER_TEST_RUN_UNSUPPORTED_CODE
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, human_user_id
 
 DEFAULT_MAX_ROWS = 1_000
@@ -49,7 +50,7 @@ SAFE_AUDIT_FAILURE_REASONS = frozenset(
         "trigger_parent_owner_mismatch",
         "trigger_parent_source_unconfirmed",
         "unsafe_query_input_source",
-        "copilot_test_run_unsupported",
+        EMBER_TEST_RUN_UNSUPPORTED_CODE,
         "workflow_owner_resave_required",
         "connection_unavailable",
         "invalid_credential_source",

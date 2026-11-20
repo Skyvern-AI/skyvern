@@ -1064,8 +1064,8 @@ def _registered_secret_scrubber(
     *, logging_envelope: bool = False, protocol_level: str | None = None
 ) -> Callable[[Any, int], Any] | None:
     placeholder, encoded_secret_variants, log_scrub_values = _secret_scrub_symbols()
-    copilot_values, short_values = log_scrub_values()
-    copilot_variants = set(copilot_values)
+    ember_values, short_values = log_scrub_values()
+    ember_variants = set(ember_values)
     # The line's own values are already replaced as text by then, so this pass needs no exclusion for them.
     short_scrub = _short_value_scrubber(short_values, placeholder)
     registered: set[str] = set()
@@ -1096,9 +1096,9 @@ def _registered_secret_scrubber(
     for value in registered:
         if isinstance(value, str) and value:
             run_variants.update(encoded_secret_variants(value))
-    if not copilot_variants and not run_variants and short_scrub is None:
+    if not ember_variants and not run_variants and short_scrub is None:
         return None
-    secrets = sorted(copilot_variants | run_variants, key=len, reverse=True)
+    secrets = sorted(ember_variants | run_variants, key=len, reverse=True)
     seen: set[int] = set()
     remaining = 10_000
 
@@ -1119,9 +1119,7 @@ def _registered_secret_scrubber(
             # A Copilot value replaces only a number that is the value, since a short one among a duration's
             # digits is chance. The run's own secrets replace any number that contains them.
             forms = _number_log_forms(node)
-            if not forms.isdisjoint(copilot_variants) or any(
-                secret in form for form in forms for secret in run_variants
-            ):
+            if not forms.isdisjoint(ember_variants) or any(secret in form for form in forms for secret in run_variants):
                 return placeholder
             return node
 
