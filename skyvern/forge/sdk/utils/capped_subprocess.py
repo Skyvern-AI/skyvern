@@ -59,9 +59,11 @@ _PROCESS_GROUP_ENV = "SKYVERN_CAPPED_SUBPROCESS_GROUP"
 
 
 class CappedSubprocessError(Exception):
-    def __init__(self, message: str, kind: CappedSubprocessFailure) -> None:
+    def __init__(self, message: str, kind: CappedSubprocessFailure, error_type: str | None = None) -> None:
         super().__init__(message)
         self.kind = kind
+        # The class name of the exception the work raised in the child, when kind is "error".
+        self.error_type = error_type
 
 
 class _ResultTooLarge(Exception):
@@ -524,7 +526,8 @@ def _wait_for_exit(process: subprocess.Popen[bytes], owns_process_group: bool = 
 
 def _raise_failure(kind: CappedSubprocessFailure, message: str, **log_fields: object) -> NoReturn:
     LOG.warning("Capped subprocess failed", failure=kind, **log_fields)
-    raise CappedSubprocessError(message, kind=kind)
+    error_type = log_fields.get("error_type")
+    raise CappedSubprocessError(message, kind=kind, error_type=error_type if isinstance(error_type, str) else None)
 
 
 def _describe_bytes(count: int) -> str:

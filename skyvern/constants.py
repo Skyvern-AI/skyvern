@@ -214,3 +214,8 @@ DEFAULT_WORKFLOW_TITLES = ("New Workflow", "New Agent")
 
 # What the data-retention scrubber writes over a stored value it removed.
 SCRUBBED_VALUE = "[removed]"
+
+# Rows and other services already hold these bytes, so renaming the code must not change them.
+EMBER_RUN_CREATOR = "copilot"
+EMBER_ANTIBOT_CLIENT = "copilot"
+EMBER_TEST_RUN_UNSUPPORTED_CODE = "copilot_test_run_unsupported"

@@ -650,6 +650,10 @@ class MissingWorkflowRunBrowserState(SkyvernException):
         super().__init__(f"Browser state for workflow run {workflow_run_id} and task {task_id} is missing.")
 
 
+class GestureNotSent(RuntimeError):
+    """A click or key was refused before it reached the page."""
+
+
 class CaptchaSolveError(SkyvernException):
     """Base for captcha-solve failures.
 
@@ -880,7 +884,7 @@ class SyncTriggeredSequentialCredentialUnsupported(SkyvernException):
         )
 
 
-class CopilotInlineSequentialCredentialUnsupported(SkyvernException):
+class EmberInlineSequentialCredentialUnsupported(SkyvernException):
     def __init__(self, workflow_run_id: str) -> None:
         super().__init__(
             f"Copilot run {workflow_run_id} resolves to a sequential credential, but the copilot inline "

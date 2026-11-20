@@ -40,7 +40,7 @@ from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
@@ -586,7 +586,7 @@ def test_response_provider_is_string_or_none(response: object, expected: str | N
     assert api_handler_factory._response_provider(response) == expected
 
 
-def test_copilot_model_usage_extraction_preserves_response_model_for_malformed_usage() -> None:
+def test_ember_model_usage_extraction_preserves_response_model_for_malformed_usage() -> None:
     class BrokenResponse:
         model = "gpt-4.1"
 
@@ -594,7 +594,7 @@ def test_copilot_model_usage_extraction_preserves_response_model_for_malformed_u
         def usage(self) -> None:
             raise RuntimeError("malformed usage")
 
-    event = api_handler_factory._copilot_model_usage_event(
+    event = api_handler_factory._ember_model_usage_event(
         BrokenResponse(),
         request_model="gpt-4",
         provider_name="openai",
@@ -612,13 +612,13 @@ def test_copilot_model_usage_extraction_preserves_response_model_for_malformed_u
     }
 
 
-def test_copilot_model_usage_logging_failure_cannot_fail_a_completed_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ember_model_usage_logging_failure_cannot_fail_a_completed_handler(monkeypatch: pytest.MonkeyPatch) -> None:
     logger = MagicMock()
     logger.info.side_effect = RuntimeError("logger unavailable")
     logger.warning.side_effect = RuntimeError("logger unavailable")
     monkeypatch.setattr(api_handler_factory, "LOG", logger)
 
-    api_handler_factory._emit_copilot_model_usage_for_response(
+    api_handler_factory._emit_ember_model_usage_for_response(
         FakeLLMResponse("gpt-4.1"),
         request_model="gpt-4",
         prompt_name="workflow-copilot-narration",
@@ -626,7 +626,7 @@ def test_copilot_model_usage_logging_failure_cannot_fail_a_completed_handler(mon
     )
 
 
-def test_copilot_model_usage_metadata_failure_cannot_fail_a_completed_handler(
+def test_ember_model_usage_metadata_failure_cannot_fail_a_completed_handler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class BrokenResponse:
@@ -637,7 +637,7 @@ def test_copilot_model_usage_metadata_failure_cannot_fail_a_completed_handler(
     logger = DummyLogger()
     monkeypatch.setattr(api_handler_factory, "LOG", logger)
 
-    api_handler_factory._emit_copilot_model_usage_for_response(
+    api_handler_factory._emit_ember_model_usage_for_response(
         BrokenResponse(),
         request_model="gpt-4",
         prompt_name="workflow-copilot-narration",
@@ -774,7 +774,7 @@ async def test_custom_model_response_key_and_provider_cannot_gain_log_provenance
 
 
 @pytest.mark.asyncio
-async def test_llm_caller_emits_one_copilot_model_usage_event(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_llm_caller_emits_one_ember_model_usage_event(monkeypatch: pytest.MonkeyPatch) -> None:
     caller, logger = _stub_successful_llm_caller(monkeypatch)
 
     result = await caller.call(prompt="test", prompt_name="workflow-copilot-page-evidence-vision")
@@ -3634,6 +3634,35 @@ def _record_step_cost_writes(monkeypatch: pytest.MonkeyPatch) -> list[float | No
     return costs
 
 
+_STALE_SPECULATIVE_STASH = SpeculativeLLMMetadata(prompt="earlier call", llm_request_json="{}")
+
+
+def _speculative_step_with_stale_stash(monkeypatch: pytest.MonkeyPatch, *, secret_lookup_fails: bool) -> Step:
+    if secret_lookup_fails:
+
+        def failing_lookup(*_: Any, **__: Any) -> set[str]:
+            raise RuntimeError("secret lookup failed")
+
+        monkeypatch.setattr(api_handler_factory.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+        monkeypatch.setattr(
+            api_handler_factory.app,
+            "WORKFLOW_CONTEXT_MANAGER",
+            SimpleNamespace(get_secret_values_for_run=failing_lookup),
+        )
+    step = _step(is_speculative=True)
+    step.speculative_llm_metadata = _STALE_SPECULATIVE_STASH
+    return step
+
+
+def _assert_speculative_stash(step: Step, *, secret_lookup_fails: bool) -> None:
+    # A failed lookup must leave no stash: neither this call's unscrubbed text nor an earlier call's.
+    if secret_lookup_fails:
+        assert step.speculative_llm_metadata is None
+    else:
+        assert step.speculative_llm_metadata is not None
+        assert step.speculative_llm_metadata != _STALE_SPECULATIVE_STASH
+
+
 def _openrouter_router_response(billed_cost: float) -> FakeLLMResponse:
     response = FakeLLMResponse(
         "openai/gpt-5.6-luna",
@@ -3661,18 +3690,26 @@ async def test_router_step_cost_is_openrouters_billed_cost(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_router_speculative_call_cost_reaches_its_step(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("secret_lookup_fails", [False, True])
+async def test_router_speculative_call_cost_reaches_its_step(
+    monkeypatch: pytest.MonkeyPatch, secret_lookup_fails: bool
+) -> None:
     _run_flex_router_test(monkeypatch, "TEST_ROUTER_SPECULATIVE_COST", [_openrouter_router_response(0.0042)])
     costs = _record_step_cost_writes(monkeypatch)
+    step = _speculative_step_with_stale_stash(monkeypatch, secret_lookup_fails=secret_lookup_fails)
 
     handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_ROUTER_SPECULATIVE_COST")
-    await handler(prompt='{"actions": []}', prompt_name="extract-actions", step=_step(is_speculative=True))
+    await handler(prompt='{"actions": []}', prompt_name="extract-actions", step=step)
 
     assert costs == [0.0042]
+    _assert_speculative_stash(step, secret_lookup_fails=secret_lookup_fails)
 
 
 @pytest.mark.asyncio
-async def test_single_model_speculative_call_cost_reaches_its_step(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("secret_lookup_fails", [False, True])
+async def test_single_model_speculative_call_cost_reaches_its_step(
+    monkeypatch: pytest.MonkeyPatch, secret_lookup_fails: bool
+) -> None:
     llm_config = LLMConfig(
         model_name="vertex_ai/gemini-3-flash-preview",
         required_env_vars=[],
@@ -3692,21 +3729,39 @@ async def test_single_model_speculative_call_cost_reaches_its_step(monkeypatch: 
         AsyncMock(return_value=FakeLLMResponse("vertex_ai/gemini-3-flash-preview")),
     )
     costs = _record_step_cost_writes(monkeypatch)
+    step = _speculative_step_with_stale_stash(monkeypatch, secret_lookup_fails=secret_lookup_fails)
 
     handler = LLMAPIHandlerFactory.get_llm_api_handler("TEST_SINGLE_MODEL_SPECULATIVE_COST")
-    await handler(prompt="test", prompt_name=EXTRACT_ACTION_PROMPT_NAME, step=_step(is_speculative=True))
+    await handler(prompt="test", prompt_name=EXTRACT_ACTION_PROMPT_NAME, step=step)
 
     assert costs == [0.01]
+    _assert_speculative_stash(step, secret_lookup_fails=secret_lookup_fails)
 
 
 @pytest.mark.asyncio
-async def test_llm_caller_speculative_call_cost_reaches_its_step(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("secret_lookup_fails", [False, True])
+async def test_llm_caller_speculative_call_cost_reaches_its_step(
+    monkeypatch: pytest.MonkeyPatch, secret_lookup_fails: bool
+) -> None:
     caller, _ = _stub_successful_llm_caller(monkeypatch)
     costs = _record_step_cost_writes(monkeypatch)
+    stored_artifact_types: list[ArtifactType] = []
 
-    await caller.call(prompt="test", prompt_name="extract-actions", step=_step(is_speculative=True))
+    async def record_llm_artifact(*, artifact_type: ArtifactType, **_: Any) -> None:
+        stored_artifact_types.append(artifact_type)
 
-    assert costs == [0.25]
+    monkeypatch.setattr(api_handler_factory.app.ARTIFACT_MANAGER, "prepare_llm_artifact", record_llm_artifact)
+    step = _speculative_step_with_stale_stash(monkeypatch, secret_lookup_fails=secret_lookup_fails)
+
+    await caller.call(prompt="test", prompt_name="extract-actions", step=step)
+    await caller.call(prompt="test", prompt_name="extract-actions", step=_step())
+
+    assert costs == [0.25, 0.25]
+    _assert_speculative_stash(step, secret_lookup_fails=secret_lookup_fails)
+    # The non-speculative call stores its LLM artifacts only when its text could be scrubbed.
+    assert (ArtifactType.LLM_PROMPT in stored_artifact_types) is not secret_lookup_fails
+    if secret_lookup_fails:
+        assert stored_artifact_types == []
 
 
 def _exhaustion_receipts(logger: DummyLogger) -> list[dict[str, Any]]:

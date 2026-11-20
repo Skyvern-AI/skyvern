@@ -14,6 +14,18 @@ from skyvern.services import otp_email, otp_service
 from skyvern.services.otp_email import MAX_SEEN_EMAIL_MESSAGE_IDS, EmailOTPVerificationContext
 
 
+@pytest.fixture(autouse=True)
+def _visible_credentials_follow_active_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def list_visible(organization_id: str) -> list[SimpleNamespace]:
+        active = await google_oauth_service.get_credentials_for_org(organization_id)
+        return [
+            SimpleNamespace(**{"state": google_oauth_service.STATE_ACTIVE, "email_address": None, **vars(credential)})
+            for credential in active
+        ]
+
+    monkeypatch.setattr(google_oauth_service, "get_visible_credentials_for_org", list_visible)
+
+
 def test_email_otp_source_context_caps_seen_message_ids() -> None:
     context = EmailOTPVerificationContext().for_source("gmail")
 

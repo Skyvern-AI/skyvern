@@ -234,7 +234,7 @@ class WorkflowDefinition(BaseModel):
                     raise NonTerminalFinallyBlock(self.finally_block_label)
 
 
-COPILOT_TEST_WORKFLOW_CREATOR = "copilot_test"
+EMBER_TEST_WORKFLOW_CREATOR = "copilot_test"
 
 
 class Workflow(BaseModel):
@@ -306,8 +306,10 @@ class Workflow(BaseModel):
     _effective_default_engine_computed: bool = PrivateAttr(default=False)
     original_created_by: str | None = Field(
         default=None,
-        description="Who created the agent's first version. Populated by the list endpoint only.",
+        description="Who created the agent's first version. Populated by the list and detail endpoints only.",
     )
+    # Elsewhere the key is omitted: a null claims no user created the agent, which denies an own-agent delete.
+    _original_created_by_computed: bool = PrivateAttr(default=False)
     original_created_at: datetime | None = Field(
         default=None,
         description="When the agent's first version was created. Populated by the list endpoint only.",
@@ -324,15 +326,21 @@ class Workflow(BaseModel):
 
     # No return annotation: pydantic would publish it as the response schema in place of the model's fields.
     @model_serializer(mode="wrap")
-    def _omit_uncomputed_engine(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+    def _omit_uncomputed_fields(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
         data = handler(self)
         if not self._effective_default_engine_computed:
             data.pop("effective_default_engine", None)
+        if not self._original_created_by_computed:
+            data.pop("original_created_by", None)
         return data
 
     def set_effective_default_engine(self, engine: RunEngine | None) -> None:
         self.effective_default_engine = engine
         self._effective_default_engine_computed = True
+
+    def set_original_created_by(self, created_by: str | None) -> None:
+        self.original_created_by = created_by
+        self._original_created_by_computed = True
 
     created_at: datetime
     modified_at: datetime

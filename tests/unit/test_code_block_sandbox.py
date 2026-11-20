@@ -2862,10 +2862,10 @@ class TestCodeBlockOtpNoLeak:
 
         import pyotp
 
-        from skyvern.forge.sdk.copilot.output_utils import build_run_blocks_response, sanitize_tool_result_for_llm
-        from skyvern.forge.sdk.copilot.tools import _attach_action_traces
-        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
-        from skyvern.forge.sdk.copilot.tools.run_execution import _summarize_action_trace
+        from skyvern.forge.sdk.ember.output_utils import build_run_blocks_response, sanitize_tool_result_for_llm
+        from skyvern.forge.sdk.ember.tools import _attach_action_traces
+        from skyvern.forge.sdk.ember.tools import run_execution as run_execution_module
+        from skyvern.forge.sdk.ember.tools.run_execution import _summarize_action_trace
         from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
         from skyvern.webeye.actions.actions import Action
 

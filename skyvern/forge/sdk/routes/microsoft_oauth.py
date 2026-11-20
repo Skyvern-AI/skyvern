@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event
+from skyvern.forge.sdk.db.repositories.microsoft_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.integrations.catalog import integration_is_live
 from skyvern.forge.sdk.schemas.microsoft_oauth import (
     CreateMicrosoftOAuthAuthorizeRequest,
@@ -54,6 +55,7 @@ async def _backfill_microsoft_email_addresses(
         credential
         for credential in credentials
         if credential.email_address is None
+        and credential.state == STATE_ACTIVE
         and credential.id not in _EMAIL_BACKFILL_FAILURES
         and not microsoft_oauth_service.is_powerbi_connection(credential.scopes_requested, credential.scopes_granted)
     ]
@@ -369,7 +371,7 @@ async def list_microsoft_oauth_credentials(
     current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
     include_email: bool = False,
 ) -> MicrosoftOAuthCredentialListResponse:
-    credentials = await microsoft_oauth_service.get_credentials_for_org(
+    credentials = await microsoft_oauth_service.get_visible_credentials_for_org(
         organization_id=current_org.organization_id,
         user_id=current_user_id,
     )
@@ -384,6 +386,11 @@ async def list_microsoft_oauth_credentials(
             LOG.warning("Timed out backfilling Microsoft account emails")
         except Exception:
             LOG.warning("Failed to backfill Microsoft account emails", exc_info=True)
+        # A rejected refresh during the backfill moves a row to error; re-read so the response shows it.
+        credentials = await microsoft_oauth_service.get_visible_credentials_for_org(
+            organization_id=current_org.organization_id,
+            user_id=current_user_id,
+        )
     return MicrosoftOAuthCredentialListResponse(credentials=credentials)
 
 

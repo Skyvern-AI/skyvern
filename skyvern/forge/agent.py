@@ -29,6 +29,7 @@ from playwright.async_api import BrowserContext, Page
 from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import (
+    BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME,
     BROWSER_DOWNLOAD_TIMEOUT,
     BROWSER_DOWNLOADING_SUFFIX,
     BROWSER_PAGE_CLOSE_TIMEOUT,
@@ -237,6 +238,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
     DEFAULT_MAX_SETTLE_DEFERRALS,
     DownloadSettle,
+    DownloadUntil,
     DownloadWait,
     LoopOutcome,
     RoundAction,
@@ -580,6 +582,7 @@ def mark_pdf_source_downloaded(pdf_src: str) -> None:
 
 _TASKV3_TOOL_ACTION_TYPES = {
     "click": ActionType.CLICK,
+    "download": ActionType.CLICK,
     "hover": ActionType.HOVER,
     "drag": ActionType.DRAG,
     "type": ActionType.INPUT_TEXT,
@@ -791,6 +794,8 @@ def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields:
     selector = str(args.get("selector") or "")
     if tool_name == "click":
         return ClickAction(element_id=selector, **fields)
+    if tool_name == "download":
+        return ClickAction(element_id=selector, download=True, **fields)
     if tool_name == "hover":
         return HoverAction(element_id=selector, **fields)
     if tool_name == "drag":
@@ -3535,6 +3540,7 @@ class ForgeAgent:
             return any(Path(name).suffix != BROWSER_DOWNLOADING_SUFFIX for name in landed)
 
         download_wait: DownloadWait | None = None
+        download_until: DownloadUntil | None = None
         download_settle: DownloadSettle | None = None
         unsaved_downloads: UnsavedDownloads | None = None
         if task_block is not None and task_block.complete_on_download and task.workflow_run_id:
@@ -3714,6 +3720,26 @@ class ForgeAgent:
                     )
 
             download_wait = _download_wait
+            # V1's no-signal rule for a download action: the block's download_timeout capped at the grace time.
+            no_signal_seconds = (
+                min(float(wait_only_block.download_timeout), BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME)
+                if wait_only_block.download_timeout is not None
+                else BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME
+            )
+
+            async def _download_until(arrived: Callable[[], Awaitable[bool]]) -> None:
+                deadline = time.monotonic() + min(no_signal_seconds, loop_deadline_at - time.monotonic())
+                while not await arrived() and not await _should_cancel():
+                    # A vendor session keeps the file, so no arrival shows here. The browser beginning a download is
+                    # the signal, and download_wait then reads the file back.
+                    if provider_recovery is not None and provider_recovery.download_began():
+                        return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    await asyncio.sleep(min(_IN_FLIGHT_DOWNLOAD_CANCEL_POLL_SECONDS, remaining))
+
+            download_until = _download_until
 
         # Honor a step cap (per-request override, task, or org, else the same MAX_STEPS_PER_RUN default
         # the step engine uses) as the ACTION-round budget: a v3 step is one action round (a turn that
@@ -4384,6 +4410,7 @@ class ForgeAgent:
                     part for part in (auth_guidance, captcha_guidance, workflow_system_guidance) if part
                 ),
                 download_wait=download_wait,
+                download_until=download_until,
                 download_settle=download_settle,
                 unsaved_downloads=unsaved_downloads,
                 native_download_attempt=native_download_attempt,
@@ -10738,6 +10765,8 @@ class ForgeAgent:
             run_response = await run_service.get_run_response(
                 run_id=task.task_id,
                 organization_id=task.organization_id,
+                need_browser_log=False,
+                need_final_screenshot=False,
             )
             if run_response is not None:
                 task_run_response_json = run_response.model_dump_json(exclude={"run_request"})
@@ -10830,6 +10859,8 @@ class ForgeAgent:
         failure_reason: str | None = None,
         need_browser_log: bool = False,
         step_count: int | None = None,
+        *,
+        need_final_screenshot: bool = True,
     ) -> TaskResponse:
         access = await browser_session_artifact_access(
             task.organization_id,
@@ -10865,7 +10896,7 @@ class ForgeAgent:
         downloaded_files: list[FileInfo] | None = None
 
         # get the artifact of the screenshot and get the screenshot_url
-        if artifacts_accessible:
+        if need_final_screenshot and artifacts_accessible:
             screenshot_artifact = await app.DATABASE.artifacts.get_artifact(
                 task_id=task.task_id,
                 step_id=last_step.step_id,

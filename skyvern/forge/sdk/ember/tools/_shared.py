@@ -1,0 +1,1145 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
+
+import structlog
+import yaml
+from playwright.async_api import Page
+from typing_extensions import TypedDict
+
+from skyvern.cli.core.js_dispatch import outer_cap_seconds
+from skyvern.cli.core.session_manager import ensure_browser_hooks, get_current_session
+from skyvern.exceptions import InvalidUrl
+from skyvern.forge import app
+from skyvern.forge.sdk.ember.blocker_signal import EmberToolBlockerSignal, stash_blocker_signal
+from skyvern.forge.sdk.ember.composition_browser_expressions import (
+    COMPOSITION_STRIPPED_HTML_EXPRESSION as _COMPOSITION_STRIPPED_HTML_EXPRESSION,
+)
+from skyvern.forge.sdk.ember.composition_browser_expressions import (
+    COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS,
+)
+from skyvern.forge.sdk.ember.composition_browser_expressions import (
+    COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS as _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
+)
+from skyvern.forge.sdk.ember.composition_browser_expressions import (
+    composition_structured_evidence_expression,
+)
+from skyvern.forge.sdk.ember.composition_evidence import (
+    clearable_dismiss_texts,
+    has_bounded_page_schema,
+    packet_describes_a_clearable_overlay,
+    parse_composition_structured,
+)
+from skyvern.forge.sdk.ember.context import EmberContext
+from skyvern.forge.sdk.ember.enforcement import (
+    TOTAL_TIMEOUT_SECONDS,
+    _elapsed_run_seconds,
+    _requested_output_labels_by_path,
+    proxy_hop_failure_reason,
+)
+from skyvern.forge.sdk.ember.mcp_adapter import (
+    _browser_session_error_disposition,
+    _browser_session_loss_result,
+    is_redaction_withheld,
+)
+from skyvern.forge.sdk.ember.nav_attribution import proxy_owns_nav_codes
+from skyvern.forge.sdk.ember.runtime import (
+    AgentContext,
+    BrowserProbeOutcome,
+    EmberBrowserGenerationRetired,
+    EmberBrowserSessionUnavailable,
+    _browser_context_attachability,
+    browser_evidence_commit_lock,
+    browser_session_turn,
+    effective_browser_session_id,
+    live_working_page,
+    mcp_browser_context,
+    resolve_browser_state_for_context,
+)
+from skyvern.forge.sdk.ember.task_output_envelope import (
+    _TASK_ENVELOPE_BLOCK_TYPES,
+    _TASK_OUTPUT_PAYLOAD_FIELDS,
+)
+from skyvern.forge.sdk.ember.tracing_setup import ember_span
+from skyvern.forge.sdk.ember.turn_halt import stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.ember.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.proxy_location import ProxyLocationInput
+from skyvern.schemas.workflows import BlockType
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
+from skyvern.utils.url_validators import canonical_navigation_host
+from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.webeye.browser_errors import BrowserAutomationError
+
+LOG = structlog.get_logger()
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.ember.mcp_adapter import _BrowserCallOutcome
+
+
+_FAILED_BLOCK_STATUSES: frozenset[str] = frozenset(
+    {
+        WorkflowRunStatus.failed.value,
+        WorkflowRunStatus.terminated.value,
+        WorkflowRunStatus.canceled.value,
+        WorkflowRunStatus.timed_out.value,
+    }
+)
+
+
+_DATA_PRODUCING_BLOCK_TYPES = frozenset({"EXTRACTION", "TEXT_PROMPT"})
+
+
+_EVIDENCE_ERROR_DETAIL_MAX_CHARS = 300
+
+
+async def _call_internal_browser_tool(
+    server: Any,
+    tool_name: Literal["skyvern_evaluate", "skyvern_screenshot"],
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], _BrowserCallOutcome | None]:
+    """Use typed provenance in production while retaining lightweight test adapters."""
+    from skyvern.forge.sdk.ember.mcp_adapter import SkyvernOverlayMCPServer
+
+    if isinstance(server, SkyvernOverlayMCPServer):
+        call = await server.call_internal_browser_tool(tool_name, arguments)
+        return call.result, call.outcome
+    result = await server.call_internal_tool(tool_name, arguments)
+    return result if isinstance(result, dict) else {}, None
+
+
+# Block types whose output can demonstrate an end-state outcome. Until a workflow
+# contains one of these, an unmet outcome criterion means the build is still
+# incomplete (no confirmation step yet), not a completed run that failed the goal.
+_OUTCOME_EVIDENCE_BLOCK_TYPES = frozenset({BlockType.EXTRACTION.value, BlockType.VALIDATION.value})
+
+
+# Absolute upper bound on a single ``run_blocks`` tool invocation, including a run
+# whose rows have gone silent. The OpenAI Agents SDK wraps the tool in
+# ``asyncio.wait_for(..., timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS)``; the
+# inner poll loop leaves a 10 s headroom below this ceiling for orderly
+# cleanup before the SDK cancels.
+RUN_BLOCKS_SAFETY_CEILING_SECONDS = 1200  # 20 min
+
+
+def _workflow_definition_as_dict(workflow_definition: Any) -> dict[str, Any]:
+    if workflow_definition is None:
+        return {}
+    if isinstance(workflow_definition, dict):
+        return workflow_definition
+    if hasattr(workflow_definition, "model_dump"):
+        try:
+            dumped = workflow_definition.model_dump(mode="json")
+        except Exception:
+            return {}
+        return dumped if isinstance(dumped, dict) else {}
+    return {}
+
+
+def _workflow_verification_evidence(ctx: AgentContext) -> WorkflowVerificationEvidence:
+    return ctx.workflow_verification_evidence
+
+
+def _run_result_label_list(data: Mapping[str, object], key: str) -> list[str]:
+    values = data.get(key)
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _run_result_blocks(data: Mapping[str, object]) -> list[Mapping[str, object]]:
+    blocks = data.get("blocks")
+    return [block for block in blocks if isinstance(block, dict)] if isinstance(blocks, list) else []
+
+
+def _completed_run_block_labels(data: Mapping[str, object]) -> list[str]:
+    labels = [
+        str(block.get("label") or "").strip()
+        for block in _run_result_blocks(data)
+        if _enum_or_string_name(block.get("status")) == WorkflowRunStatus.completed.value
+    ]
+    labels = list(dict.fromkeys(label for label in labels if label))
+    return labels or _run_result_label_list(data, "executed_block_labels")
+
+
+def _failed_run_block_labels(data: Mapping[str, object]) -> list[str]:
+    labels = [
+        str(block.get("label") or "").strip()
+        for block in _run_result_blocks(data)
+        if _enum_or_string_name(block.get("status")) in _FAILED_BLOCK_STATUSES
+    ]
+    labels = list(dict.fromkeys(label for label in labels if label))
+    if labels:
+        return labels
+    frontier = data.get("frontier_start_label")
+    return [frontier] if isinstance(frontier, str) and frontier.strip() else []
+
+
+def _enum_or_string_name(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    if not isinstance(raw, str):
+        raw = getattr(value, "name", raw)
+    return str(raw).strip().lower()
+
+
+def _is_meaningful_extracted_data(extracted: Any) -> bool:
+    """Return True when extracted data contains at least one non-null, non-empty value.
+
+    A dict like ``{"price": None}`` is technically present but carries no signal —
+    treat it the same as no output at all so enforcement can nudge the agent to
+    investigate instead of declaring success.
+    """
+    if extracted is None:
+        return False
+    if isinstance(extracted, (str, bytes)):
+        return bool(extracted)
+    if isinstance(extracted, dict):
+        return any(_is_meaningful_extracted_data(v) for v in extracted.values())
+    if isinstance(extracted, (list, tuple, set)):
+        return any(_is_meaningful_extracted_data(v) for v in extracted)
+    # Numbers, booleans, and other scalars count as meaningful output.
+    return True
+
+
+_TASK_OUTPUT_PARAMETER_SUFFIX = "_output"
+
+
+def _workflow_output_parameter_payloads(extracted_data: Any) -> dict[str, Any]:
+    """Return workflow output-parameter values embedded in a block output."""
+    if not isinstance(extracted_data, dict):
+        return {}
+    return {
+        key: value
+        for key, value in extracted_data.items()
+        if isinstance(key, str) and key.endswith(_TASK_OUTPUT_PARAMETER_SUFFIX)
+    }
+
+
+def _registered_output_parameter_payloads(data: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """``workflow_run_output_parameters`` is the runtime's authoritative persisted
+    value surface. Keep this scoped to the run result carrying it so prior-run
+    accumulated outputs cannot satisfy the current run's completion contract.
+    """
+    run_id = data.get("workflow_run_id")
+    registered_values = data.get("registered_output_parameter_values")
+    registered_outputs = data.get("workflow_run_output_parameters")
+    registered = []
+    if isinstance(registered_values, list):
+        registered.extend(registered_values)
+    if isinstance(registered_outputs, list):
+        registered.extend(registered_outputs)
+    if not registered:
+        return []
+    if not isinstance(run_id, str):
+        # Without a current run id the payloads can't be attributed to this run;
+        # fail closed so prior-run accumulated outputs can't satisfy its contract.
+        return []
+    payloads: list[Mapping[str, Any]] = []
+    for item in registered:
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("workflow_run_id") != run_id:
+            continue
+        payloads.append(item)
+    return payloads
+
+
+def _block_data_payload(extracted_data: Any, block_type: str | None) -> Any:
+    """Return the payload view of a block's output for the meaningful-data check.
+
+    For task-envelope block types (``_TASK_ENVELOPE_BLOCK_TYPES``), slice the
+    envelope down to ``_TASK_OUTPUT_PAYLOAD_FIELDS`` so envelope metadata
+    can't mask an empty result. Other data-producing types pass through
+    unchanged — e.g. TEXT_PROMPT's ``block.output`` is the raw LLM response
+    dict (TextPromptBlock.execute records ``output_parameter_value=response``
+    directly), so scoping the unwrap avoids slicing a user-defined
+    json_schema that happens to include an ``extracted_information`` field.
+    """
+    if block_type in _TASK_ENVELOPE_BLOCK_TYPES and isinstance(extracted_data, dict):
+        payload = {field: extracted_data.get(field) for field in _TASK_OUTPUT_PAYLOAD_FIELDS}
+        payload.update(_workflow_output_parameter_payloads(extracted_data))
+        return payload
+    return extracted_data
+
+
+def _registered_output_payload_view(value: Any, block_type: str | None) -> Any:
+    """Slice a registered task-envelope value (``_TASK_ENVELOPE_BLOCK_TYPES``) down to
+    ``_TASK_OUTPUT_PAYLOAD_FIELDS`` so always-populated envelope metadata can't read a
+    reach-state task that produced no content as meaningful; non-envelope values (e.g. a
+    code block emitting a user schema that happens to carry a ``task_id``) pass through
+    unsliced. Registered block types arrive lowercased, so normalize before matching."""
+    if (block_type or "").upper() in _TASK_ENVELOPE_BLOCK_TYPES and isinstance(value, Mapping):
+        payload = {field: value.get(field) for field in _TASK_OUTPUT_PAYLOAD_FIELDS}
+        payload.update(_workflow_output_parameter_payloads(value))
+        return payload
+    return value
+
+
+def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
+    return any(
+        _is_meaningful_extracted_data(_registered_output_payload_view(item.get("value"), item.get("block_type")))
+        for item in _registered_output_parameter_payloads(data)
+    )
+
+
+CREDENTIAL_METADATA_TOOLS = frozenset({"list_credentials"})
+
+
+PAGE_INSPECTION_TOOLS = frozenset({"inspect_page_for_composition", "evaluate", "get_browser_screenshot"})
+
+
+PAGE_SCHEMA_CONTEXT_TOOLS = frozenset({"inspect_page_for_composition"})
+
+
+_CURRENT_PAGE_INSPECTION_TARGETS = frozenset({"", "current", "current_page", "__current_page__"})
+
+
+def _ember_seconds_remaining(ctx: AgentContext) -> float | None:
+    started_at = getattr(ctx, "ember_run_start_monotonic", None)
+    if not isinstance(started_at, int | float):
+        return None
+    return TOTAL_TIMEOUT_SECONDS - _elapsed_run_seconds(ctx, float(started_at))
+
+
+def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except Exception as exc:
+        LOG.debug("copilot_same_page_url_parse_failed", left=left, right=right, error=str(exc))
+        return False
+    left_url = left_parsed._replace(fragment="").geturl().rstrip("/")
+    right_url = right_parsed._replace(fragment="").geturl().rstrip("/")
+    return left_url == right_url
+
+
+def _emit_tool_blocker_signal(ctx: AgentContext, signal: EmberToolBlockerSignal) -> str:
+    payload = stash_blocker_signal(ctx, signal)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="tool_blocker_signal")
+    return payload
+
+
+def _block_type_name(block: object) -> str:
+    """Lowercase string name of a block's type, for both YAML and runtime blocks."""
+    bt = getattr(block, "block_type", None)
+    if bt is None:
+        return ""
+    name = getattr(bt, "value", None) or getattr(bt, "name", None) or str(bt)
+    return str(name).lower()
+
+
+def _workflow_definition_block_labels(workflow_definition: object | None) -> list[str]:
+    blocks = getattr(workflow_definition, "blocks", None) if workflow_definition else None
+    labels: list[str] = []
+    if not blocks:
+        return labels
+    for block in blocks:
+        label = getattr(block, "label", None)
+        if isinstance(label, str) and label:
+            labels.append(label)
+    return labels
+
+
+def _executable_workflow_block_labels(workflow_definition: object | None) -> list[str]:
+    """Block labels in traversal order. The finally block runs outside it, so it is never the head."""
+    finally_label = getattr(workflow_definition, "finally_block_label", None)
+    return [label for label in _workflow_definition_block_labels(workflow_definition) if label != finally_label]
+
+
+def _current_workflow_block_labels(ctx: object) -> list[str]:
+    workflow = getattr(ctx, "last_workflow", None)
+    labels = _workflow_definition_block_labels(getattr(workflow, "workflow_definition", None))
+    if labels:
+        return labels
+    workflow_yaml = getattr(ctx, "last_workflow_yaml", None)
+    if not isinstance(workflow_yaml, str):
+        return []
+    blocks = _parse_workflow_blocks(workflow_yaml)
+    if not blocks:
+        return []
+    yaml_labels: list[str] = []
+    for block in blocks:
+        if isinstance(block, dict):
+            label = _block_label_from_yaml(block)
+            if label:
+                yaml_labels.append(label)
+    return yaml_labels
+
+
+def _current_workflow_has_evidence_block(ctx: object) -> bool:
+    workflow = getattr(ctx, "last_workflow", None)
+    blocks = getattr(getattr(workflow, "workflow_definition", None), "blocks", None)
+    if blocks:
+        if any(_block_type_name(block) in _OUTCOME_EVIDENCE_BLOCK_TYPES for block in blocks):
+            return True
+        code_labels = [
+            getattr(block, "label", None) for block in blocks if _block_type_name(block) == BlockType.CODE.value
+        ]
+        return _code_artifact_metadata_covers_terminal_criterion(ctx, code_labels)
+    workflow_yaml = getattr(ctx, "last_workflow_yaml", None)
+    if not isinstance(workflow_yaml, str):
+        return False
+    parsed_blocks = [block for block in (_parse_workflow_blocks(workflow_yaml) or []) if isinstance(block, dict)]
+    if any(_enum_or_string_name(block.get("block_type")) in _OUTCOME_EVIDENCE_BLOCK_TYPES for block in parsed_blocks):
+        return True
+    code_labels = [
+        _block_label_from_yaml(block)
+        for block in parsed_blocks
+        if _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value
+    ]
+    return _code_artifact_metadata_covers_terminal_criterion(ctx, code_labels)
+
+
+def _code_artifact_metadata_covers_terminal_criterion(ctx: object, labels: list[str | None]) -> bool:
+    metadata = getattr(ctx, "code_artifact_metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    return any(
+        isinstance(metadata.get(label), dict) and _artifact_entry_claims_terminal_criterion(metadata[label])
+        for label in labels
+        if isinstance(label, str)
+    )
+
+
+def _artifact_entry_claims_terminal_criterion(entry: dict[str, Any]) -> bool:
+    criteria = entry.get("completion_criteria")
+    criteria_rows = [row for row in criteria if isinstance(row, dict)] if isinstance(criteria, list) else []
+    terminal_ids = {
+        str(row.get("id") or "").strip()
+        for row in criteria_rows
+        if row.get("terminal") is True or str(row.get("level") or "").strip() == "terminal"
+    } - {""}
+    if not terminal_ids:
+        return False
+    claims = entry.get("claimed_outcomes")
+    if not isinstance(claims, list):
+        return False
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        covered: set[str] = set()
+        for field_name in ("covered_criteria", "criteria_ids"):
+            values = claim.get(field_name)
+            if isinstance(values, list):
+                covered.update(str(item).strip() for item in values)
+        if covered & terminal_ids:
+            return True
+    return False
+
+
+def _unverified_current_workflow_labels(ctx: object) -> list[str]:
+    labels = _current_executable_workflow_block_labels(ctx)
+    settled = set(getattr(ctx, "verified_prefix_labels", []) or []) | set(
+        getattr(ctx, "untaken_branch_labels", {}) or {}
+    )
+    return [label for label in labels if label not in settled]
+
+
+def _current_finally_block_label(ctx: object) -> str | None:
+    """The finally block of the workflow in context, from whichever source its labels came from."""
+    definition = getattr(getattr(ctx, "last_workflow", None), "workflow_definition", None)
+    finally_label = getattr(definition, "finally_block_label", None)
+    if isinstance(finally_label, str) and finally_label:
+        return finally_label
+    # Labels fall back to the YAML when no model object is loaded yet, so this has to as well;
+    # reading only the model would leave the fallback treating the finally block as body work.
+    parsed = _parse_workflow_definition(getattr(ctx, "last_workflow_yaml", None))
+    yaml_label = parsed.get("finally_block_label") if parsed else None
+    return yaml_label if isinstance(yaml_label, str) and yaml_label else None
+
+
+def _current_executable_workflow_block_labels(ctx: object) -> list[str]:
+    """Traversal order for the workflow in context; the finally block runs outside it."""
+    finally_label = _current_finally_block_label(ctx)
+    labels = _current_workflow_block_labels(ctx)
+    return [label for label in labels if label != finally_label] if finally_label else labels
+
+
+def _composition_unverified_current_workflow_labels(ctx: object) -> list[str]:
+    labels = _current_executable_workflow_block_labels(ctx)
+    settled = set(getattr(ctx, "composition_verified_labels", []) or []) | set(
+        getattr(ctx, "untaken_branch_labels", {}) or {}
+    )
+    return [label for label in labels if label not in settled]
+
+
+def _iter_yaml_blocks(blocks: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if not isinstance(blocks, list):
+        return found
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        found.append(block)
+        loop_blocks = block.get("loop_blocks")
+        if isinstance(loop_blocks, list):
+            found.extend(_iter_yaml_blocks(loop_blocks))
+    return found
+
+
+def _workflow_yaml_blocks_by_label(workflow_yaml: str | None) -> dict[str, dict[str, Any]]:
+    if not workflow_yaml:
+        return {}
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return {}
+    by_label: dict[str, dict[str, Any]] = {}
+    for block in _iter_yaml_blocks(workflow_definition.get("blocks")):
+        label = block.get("label")
+        if isinstance(label, str):
+            by_label[label] = block
+    return by_label
+
+
+def _valid_runtime_anchor_url(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    url = value.strip()
+    if not url or url in {"about:blank", ":"}:
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return url
+
+
+async def _fallback_page_info(
+    ctx: AgentContext, session_id_override: str | None = None, *, read_title: bool = True
+) -> tuple[str, str]:
+    session_id = session_id_override or effective_browser_session_id(ctx)
+    if not session_id:
+        return "", ""
+
+    # page.url is a synchronous property, so it is already in hand when the title stalls, and most
+    # callers here destructure the title away and want only the url.
+    url = ""
+    page: Page | None = None
+
+    async def _read() -> str:
+        nonlocal url, page
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
+        if not browser_state:
+            return ""
+        page = await browser_state.get_or_create_page()
+        if not page:
+            return ""
+        url = page.url
+        return await page.title() if read_title else ""
+
+    # page.title() waits on the renderer, so a wedged or busy page hangs here forever rather than
+    # raising — and every caller reaches this path, since a tool result's browser_context carries
+    # no url. Without the bound, one unreachable page deadlocks the whole turn.
+    title = ""
+    try:
+        title = await asyncio.wait_for(_read(), timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS)
+    except TimeoutError:
+        LOG.info("copilot page title read timed out", session_id=session_id, page_url=url)
+    except Exception:
+        pass
+    # A document committed during title() would pair one document's url with another's title.
+    if page is not None and page.url != url:
+        return page.url, ""
+    return url, title
+
+
+def _composition_evidence_page_url(evidence: dict[str, Any] | None) -> str | None:
+    if not isinstance(evidence, dict):
+        return None
+    for key in ("current_url", "inspected_url"):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip() and value != "current_page":
+            return value.strip()
+    return None
+
+
+def _proxy_location_trace_value(proxy_location: Any) -> Any:
+    if proxy_location is None:
+        return None
+    if hasattr(proxy_location, "value"):
+        return proxy_location.value
+    if hasattr(proxy_location, "model_dump"):
+        return proxy_location.model_dump(mode="json")
+    return proxy_location
+
+
+def _raw_yaml_proxy_location(workflow_yaml: str) -> tuple[bool, Any]:
+    try:
+        parsed_yaml = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return False, None
+
+    if not isinstance(parsed_yaml, dict) or "proxy_location" not in parsed_yaml:
+        return False, None
+    return True, _proxy_location_trace_value(parsed_yaml.get("proxy_location"))
+
+
+def _parse_workflow_definition(yaml_str: str | None) -> dict[str, Any] | None:
+    """``workflow_definition`` as a plain dict, or None when the YAML cannot supply one."""
+    # The loader treats anything that is not a string as a stream and reads until it gets an empty
+    # chunk, so a non-string that never runs dry (a mocked context attribute) would never return.
+    if not isinstance(yaml_str, str) or not yaml_str:
+        return None
+    try:
+        parsed = safe_load_no_dates(yaml_str)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    definition = parsed.get("workflow_definition")
+    return definition if isinstance(definition, dict) else None
+
+
+def _parse_workflow_blocks(yaml_str: str | None) -> list[Any] | None:
+    """Parse ``yaml_str`` and return ``workflow_definition.blocks`` as a list,
+    or ``None`` if the YAML is missing, unparseable, or not in the expected
+    shape. Graceful on every failure so callers can treat ``None`` as 'nothing
+    to compare against.'"""
+    if not yaml_str:
+        return None
+    try:
+        parsed = safe_load_no_dates(yaml_str)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    definition = parsed.get("workflow_definition")
+    if not isinstance(definition, dict):
+        return None
+    blocks = definition.get("blocks")
+    return blocks if isinstance(blocks, list) else None
+
+
+def _block_label_from_yaml(block: dict[str, Any]) -> str | None:
+    label = block.get("label")
+    return label if isinstance(label, str) and label else None
+
+
+_DISCOVERY_ANTI_BOT_PATTERNS = (
+    "just a moment",
+    "captcha",
+    "challenge",
+    "turnstile",
+    "cf-turnstile",
+    "human-verification",
+    "human verification",
+    "verify you are human",
+    "access denied",
+    "are you a robot",
+)
+
+
+# Per-call timeout for each MCP primitive inside the discovery walker. The
+# walker also checks the cumulative 60s wall clock between steps, but without
+# a per-call cap a single hung navigate or get_html could block past the
+# cumulative cap (cumulative is only checked between awaits).
+_DISCOVERY_PER_CALL_TIMEOUT_SECONDS = 20.0
+
+
+async def _discovery_navigate(
+    ctx: EmberContext,
+    url: str,
+    *,
+    wait_until: str | None = None,
+    timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return {"ok": False, "error": "discovery MCP server not attached to context"}
+    nav_args: dict[str, Any] = {"url": url, "timeout": int(timeout_seconds * 1000)}
+    if wait_until:
+        # `load` waits for every resource (analytics/marketing beacons on heavy
+        # commerce pages keep it pending past the cap, so the navigate aborts before
+        # any HTML is captured). `domcontentloaded` returns once the server-rendered
+        # DOM is parsed — the forms/links are already present — and the recapture
+        # loop settles anything still hydrating.
+        nav_args["wait_until"] = wait_until
+    cap_seconds = outer_cap_seconds(nav_args["timeout"])
+    started_wall = time.time()
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool("skyvern_navigate", nav_args),
+            timeout=cap_seconds,
+        )
+    except TimeoutError:
+        return {"ok": False, "error": f"skyvern_navigate timed out after {cap_seconds:g}s"}
+    return await attribute_navigation_failure(ctx, result, target_url=url, since_wall=started_wall)
+
+
+async def browser_session_hop_proxy(
+    ctx: AgentContext, session_id: str | None = None
+) -> tuple[bool, ProxyLocationInput]:
+    """Whether a browser session made this hop, and the proxy it was given.
+
+    The session's answer governs even when it is None. The browser layer reuses an attached session's
+    existing state instead of applying the workflow's declared proxy, so falling back to that
+    declaration would name a location the hop never used.
+    """
+    session_id = session_id or effective_browser_session_id(ctx)
+    if not session_id:
+        return False, None
+    try:
+        session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(session_id, ctx.organization_id)
+    except Exception:
+        LOG.warning(
+            "Could not read the browser session's proxy for failure attribution",
+            organization_id=ctx.organization_id,
+            exc_info=True,
+        )
+        return True, None
+    return True, session.proxy_location if session is not None else None
+
+
+async def provider_refusal_fact(*, browser_session_id: str, url: str | None, since_wall: float) -> str | None:
+    """The proxy provider's stated refusal of this browser's connection to ``url``'s host, recorded no earlier than
+    the proxy's clock-skew allowance before ``since_wall``."""
+    try:
+        host = canonical_navigation_host(url) if url else None
+    except InvalidUrl:
+        host = None
+    if not host:
+        return None
+    refusal = await app.AGENT_FUNCTION.proxy_provider_refusal(
+        browser_session_id=browser_session_id, host=host, since_wall=since_wall
+    )
+    if refusal is None:
+        return None
+    return (
+        f"The proxy provider recently refused this browser's connection to {host} "
+        f"(status {refusal.status}, reason {refusal.reason})."
+    )
+
+
+async def attribute_navigation_failure(
+    ctx: AgentContext,
+    result: dict[str, Any],
+    *,
+    target_url: str | None = None,
+    since_wall: float | None = None,
+) -> dict[str, Any]:
+    """Name Skyvern's proxy hop in a failed navigation before anything downstream renders it.
+
+    Scouting has no run row to read codes from, so the code comes off the call that failed and the
+    proxy off the browser state that made the hop. The failure text is rendered, never inspected --
+    an MCP error string is as reproducible as any other prose.
+    """
+    if result.get("ok") or not isinstance(result.get("error"), str):
+        return result
+    # Only the code this call reported. The browser state's code is cleared by a successful
+    # state-managed navigation, which an MCP hop never performs, so reading it here would let an
+    # earlier failure's code attach to a later call that reported none of its own.
+    #
+    # Asked before the state is resolved: every other failure then leaves this seam without paying
+    # for a session lookup, and a lookup that fails cannot replace a failure it was only labelling.
+    if not proxy_owns_nav_codes([result.get("nav_error_code")]):
+        return result
+    browser_session_id = effective_browser_session_id(ctx)
+    if not browser_session_id:
+        return result
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx)
+    except Exception:  # noqa: BLE001 - an unreadable session costs the proxy name, not the failure.
+        LOG.warning("Could not resolve the browser state to name the proxy hop", exc_info=True)
+        browser_state = None
+    # With no state the proxy is unknown, and proxy_hop_failure_reason drops the parenthetical
+    # rather than naming one the hop may not have used.
+    attributed = proxy_hop_failure_reason(
+        ctx,
+        result["error"],
+        browser_state.built_with_proxy_location if browser_state is not None else None,
+        session_made_hop=True,
+    )
+    if since_wall is not None:
+        refusal = await provider_refusal_fact(
+            browser_session_id=browser_session_id, url=target_url, since_wall=since_wall
+        )
+        if refusal is not None:
+            attributed = f"{attributed} {refusal}"
+    return {**result, "error": attributed}
+
+
+async def _discovery_get_html(ctx: EmberContext) -> dict[str, Any]:
+    """Read the full page body. ``skyvern_get_html`` requires a selector arg;
+    pass ``body`` so the walker receives the full document body. Without this
+    the raw MCP call fails validation since the inspection tool has a
+    required positional ``selector``.
+    """
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return {"ok": False, "error": "discovery MCP server not attached to context"}
+    try:
+        return await asyncio.wait_for(
+            server.call_internal_tool("skyvern_get_html", {"selector": "body"}),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        return {"ok": False, "error": f"skyvern_get_html timed out after {_DISCOVERY_PER_CALL_TIMEOUT_SECONDS:g}s"}
+
+
+def _discovery_extract_html_payload(result: dict[str, Any]) -> str:
+    data = result.get("data")
+    if isinstance(data, dict):
+        for key in ("html", "outer_html", "text", "content"):
+            value = data.get(key)
+            if isinstance(value, str):
+                return value
+    return ""
+
+
+def _discovery_extract_current_url(result: dict[str, Any], fallback: str) -> str:
+    data = result.get("data")
+    if isinstance(data, dict):
+        url = data.get("url") or data.get("current_url")
+        if isinstance(url, str) and url:
+            return url
+    return fallback
+
+
+# Large enough for long single-turn reconnaissance: block_observation_refs are
+# chosen after scouting, so this cap must stay above the citation window a turn
+# can realistically compose against. Entries carry bounded parse summaries, not
+# raw HTML or screenshots.
+_MAX_FLOW_EVIDENCE = 64
+
+
+def _append_flow_evidence(ember_ctx: Any, evidence: dict[str, Any], *, reached_via: str) -> int | None:
+    """Append a typed entry to the bounded flow-evidence trajectory (SKY-10562).
+
+    One entry per scouted page: the page-evidence packet plus how it was reached
+    and whether bounded schema was captured. Feeds the per-acted-page composition
+    gate and the cross-turn observed-page summary; never written into the YAML.
+    """
+    trajectory = getattr(ember_ctx, "flow_evidence", None)
+    if not isinstance(trajectory, list):
+        return None
+    prior_steps = [entry.get("step") for entry in trajectory if isinstance(entry, dict)]
+    step = (
+        max((value for value in prior_steps if isinstance(value, int) and not isinstance(value, bool)), default=-1) + 1
+    )
+    trajectory.append(
+        {
+            "evidence": evidence,
+            "reached_via": reached_via,
+            "had_bounded_schema": has_bounded_page_schema(evidence),
+            "obstructed": packet_describes_a_clearable_overlay(evidence),
+            "dismiss_texts": sorted(clearable_dismiss_texts(evidence)),
+            "step": step,
+        }
+    )
+    if len(trajectory) > _MAX_FLOW_EVIDENCE:
+        overflow_entry_count = len(trajectory) - _MAX_FLOW_EVIDENCE
+        LOG.warning(
+            "copilot_flow_evidence_evicted",
+            overflow_entry_count=overflow_entry_count,
+            max_flow_evidence=_MAX_FLOW_EVIDENCE,
+            retained_window_size=_MAX_FLOW_EVIDENCE,
+            latest_step=step,
+        )
+        del trajectory[:-_MAX_FLOW_EVIDENCE]
+    return step
+
+
+async def _composition_get_stripped_html(ember_ctx: Any) -> tuple[str | None, bool]:
+    """Return (stripped_body_html, truncated). truncated is True when the expression sliced
+    the body at the cap, so the tail (below-fold forms/controls) is missing from the evidence."""
+    server = getattr(ember_ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None, False
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _COMPOSITION_STRIPPED_HTML_EXPRESSION, "verbosity": "full"},
+            ),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None, False
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None, False
+    value = (result.get("data") or {}).get("result")
+    if not isinstance(value, str):
+        return None, False
+    return value, len(value) >= _COMPOSITION_STRIPPED_HTML_MAX_CHARS
+
+
+async def _composition_get_html(
+    ember_ctx: Any, *, skip_raw: bool = False, rendered_style_snapshot: bool = False
+) -> tuple[str, str | None, bool, bool]:
+    """Return body HTML for composition parsing, surviving the MCP response size cap.
+
+    Composition capture requests the bounded evaluate first because it serializes
+    the computed style facts needed by the parsed extractor's interaction-blocking evidence.
+    Other discovery callers retain `skyvern_get_html("body")` as their fast path.
+    Returns (html, error, truncated, used_stripped): error is set only on
+    a hard read failure; truncated is True when the stripped fallback was sliced at
+    the cap; used_stripped is True when the bounded read was the source (raw skipped
+    or cap-dropped). `skip_raw` goes straight to the stripped read so a caller that
+    has already seen the raw serialization get cap-dropped for this page need not
+    re-issue it.
+    """
+    if rendered_style_snapshot:
+        rendered, rendered_truncated = await _composition_get_stripped_html(ember_ctx)
+        if rendered and rendered.strip():
+            return rendered, None, rendered_truncated, True
+    html_result: dict[str, Any] = {}
+    if not skip_raw:
+        html_result = await _discovery_get_html(ember_ctx)
+        if html_result.get("ok"):
+            html = _discovery_extract_html_payload(html_result)
+            if html.strip():
+                return html, None, False, False
+    stripped, truncated = await _composition_get_stripped_html(ember_ctx)
+    if stripped and stripped.strip():
+        return stripped, None, truncated, True
+    error = html_result.get("error")
+    return "", str(error) if error else None, False, True
+
+
+class RequestedOutputRead(TypedDict):
+    """A requested output and the exact label/value the model sees on the current page."""
+
+    output_path: str
+    value_text: str
+    label: str
+
+
+_MAX_REQUESTED_OUTPUT_READS = 8
+
+
+@dataclass(frozen=True)
+class AdmittedOutputRead:
+    output_path: str
+    value_text: str
+    label: str
+
+
+def admitted_requested_output_reads(
+    reads: Sequence[RequestedOutputRead],
+) -> tuple[tuple[AdmittedOutputRead, ...], list[dict[str, str]]]:
+    """Admit the designations this turn may act on, and say why the rest were refused.
+
+    Capture and the designation verifier read the same admission, so a turn cannot seed a target the
+    verifier would have rejected or probe one capture already addressed.
+    """
+    admitted: list[AdmittedOutputRead] = []
+    rejected: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    if len(reads) > _MAX_REQUESTED_OUTPUT_READS:
+        rejected.append({"output_path": "", "reason": f"only-first-{_MAX_REQUESTED_OUTPUT_READS}-reads-verified"})
+    for read in reads[:_MAX_REQUESTED_OUTPUT_READS]:
+        raw_path = str(read.get("output_path") or "").strip()
+        value_text = str(read.get("value_text") or "").strip()
+        label = str(read.get("label") or "").strip()
+        if not raw_path or not value_text:
+            rejected.append({"output_path": raw_path, "reason": "malformed"})
+            continue
+        output_path = raw_path if raw_path.startswith("output.") else f"output.{raw_path}"
+        if output_path in seen_paths:
+            rejected.append({"output_path": output_path, "reason": "duplicate-output-path"})
+            continue
+        seen_paths.add(output_path)
+        admitted.append(AdmittedOutputRead(output_path=output_path, value_text=value_text, label=label))
+    return tuple(admitted), rejected
+
+
+def _requested_capture_targets(ember_ctx: object) -> tuple[str, ...]:
+    """The labels this turn asked for, so capture resolves them rather than guessing which relations matter."""
+    if not isinstance(ember_ctx, AgentContext):
+        return ()
+    targets: list[str] = []
+    for labels in _requested_output_labels_by_path(ember_ctx).values():
+        for label in labels:
+            text = label.strip()
+            if text and text not in targets:
+                targets.append(text)
+    return tuple(targets)
+
+
+def _bounded_evidence_error_detail(value: object) -> str:
+    # A hostile __str__ raising here would escape the caller's except clause and turn a handled
+    # evidence-capture failure into an unhandled one.
+    try:
+        text = str(value).strip()
+    except BaseException:
+        return ""
+    return redact_raw_secrets_for_prompt(text)[:_EVIDENCE_ERROR_DETAIL_MAX_CHARS]
+
+
+async def _composition_get_structured_evidence_result(
+    ember_ctx: Any,
+    *,
+    inspected_url: str,
+    current_url: str,
+    timeout_seconds: float | None = None,
+    requested_targets: tuple[str, ...] | None = None,
+    witnessed_values: tuple[str, ...] = (),
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Capture composition evidence and preserve why the observation failed.
+
+    This read carries no deadline of its own. The whole-turn deadline owns ordinary authoring and
+    scout calls and the post-run capture deadline owns run-session failure capture, so a nested
+    ceiling here only discarded slow-but-returning observations inside a budget that had not expired.
+    """
+    server = getattr(ember_ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None, "structured page evidence failed: discovery MCP server not attached to context"
+    with ember_span("composition_structured_extract"):
+        try:
+            evaluate = _call_internal_browser_tool(
+                server,
+                "skyvern_evaluate",
+                {
+                    "expression": composition_structured_evidence_expression(
+                        _requested_capture_targets(ember_ctx) if requested_targets is None else requested_targets,
+                        witnessed_values,
+                    )
+                },
+            )
+            if timeout_seconds is None:
+                result, outcome = await evaluate
+            else:
+                result, outcome = await asyncio.wait_for(evaluate, timeout=timeout_seconds)
+        except TimeoutError:
+            elapsed = f" after {timeout_seconds:g}s" if timeout_seconds is not None else ""
+            return (
+                None,
+                f"skyvern_evaluate timed out{elapsed} while capturing structured page evidence",
+            )
+        except Exception as exc:
+            # Read the message once, through the guard: an unguarded str(exc) here would raise on a
+            # hostile __str__ before the guarded read below could contain it.
+            detail = _bounded_evidence_error_detail(exc)
+            LOG.warning(
+                "copilot_composition_structured_extract_failed",
+                error_type=type(exc).__name__,
+                detail_present=bool(detail),
+            )
+            if detail:
+                return None, f"skyvern_evaluate raised while capturing structured page evidence: {detail}"
+            return None, (
+                "skyvern_evaluate raised while capturing structured page evidence, "
+                f"and {type(exc).__name__} carried no message"
+            )
+    if outcome is not None and outcome.payload_omitted:
+        if is_redaction_withheld(result):
+            return None, f"structured page evidence was withheld: {result.get('error')}"
+        return None, "structured page evidence was omitted at the MCP boundary"
+    if not result.get("ok"):
+        LOG.warning(
+            "copilot_composition_structured_extract_rejected",
+            result_is_mapping=True,
+            error_present=bool(result.get("error")),
+        )
+        raw_error = result.get("error")
+        detail = _bounded_evidence_error_detail(raw_error) if raw_error else ""
+        if detail:
+            return None, f"skyvern_evaluate returned an error while capturing structured page evidence: {detail}"
+        return None, (
+            "skyvern_evaluate returned an error while capturing structured page evidence, "
+            "and the result carried no error detail"
+        )
+    raw = (result.get("data") or {}).get("result")
+    if isinstance(raw, str):
+        if len(raw) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
+            return None, "structured page evidence exceeded the bounded payload size"
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            return None, "structured page evidence returned invalid JSON"
+    elif isinstance(raw, dict):
+        try:
+            serialized = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None, "structured page evidence returned an unsupported result type"
+        if len(serialized) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
+            return None, "structured page evidence exceeded the bounded payload size"
+        payload = raw
+    else:
+        return None, "structured page evidence returned an unsupported result type"
+    evidence = parse_composition_structured(payload, inspected_url=inspected_url, current_url=current_url)
+    if evidence is None:
+        return None, "structured page evidence did not match the bounded schema"
+    return evidence, None
+
+
+async def _composition_get_structured_evidence(
+    ember_ctx: Any,
+    *,
+    inspected_url: str,
+    current_url: str,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any] | None:
+    """Compatibility wrapper for best-effort scout observers that intentionally ignore failures."""
+    evidence, _ = await _composition_get_structured_evidence_result(
+        ember_ctx,
+        inspected_url=inspected_url,
+        current_url=current_url,
+        timeout_seconds=timeout_seconds,
+    )
+    return evidence
+
+
+def browser_is_lost(page: Page) -> bool:
+    return (
+        page.is_closed() or _browser_context_attachability(page.context) is BrowserProbeOutcome.positively_unreachable
+    )
+
+
+async def on_working_page(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    no_page_error: str,
+    act: Callable[[Page], Awaitable[dict[str, Any]]],
+) -> dict[str, Any]:
+    async with browser_session_turn(ctx), browser_evidence_commit_lock(ctx):
+        entered_browser = False
+        try:
+            async with mcp_browser_context(ctx):
+                entered_browser = True
+                page = await live_working_page(ctx)
+                if page is None:
+                    return {"ok": False, "error": no_page_error}
+                # An MCP call attaches this turn's inspection listeners in get_page, which a native action skips.
+                if (browser := get_current_session().browser) is not None:
+                    ensure_browser_hooks(browser)
+                return await act(page)
+        except (EmberBrowserGenerationRetired, EmberBrowserSessionUnavailable) as exc:
+            disposition = await _browser_session_error_disposition(ctx, exc, tool_name=tool_name, call_path="model")
+            return _browser_session_loss_result(
+                {},
+                disposition=disposition,
+                deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
+            )
+        except Exception as exc:
+            if entered_browser:
+                raise
+            # Only a classified error's message has been through CDP-endpoint redaction; an
+            # unclassified one is named by type, and its text stays in the log.
+            detail = (str(exc).rstrip(".") if isinstance(exc, BrowserAutomationError) else "") or type(exc).__name__
+            LOG.warning(
+                "copilot native browser tool could not enter its browser",
+                tool_name=tool_name,
+                browser_session_id=ctx.browser_session_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return {"ok": False, "error": f"{tool_name} could not reach its browser: {detail}. Nothing was done."}

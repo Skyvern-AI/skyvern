@@ -101,6 +101,7 @@ from skyvern.config import settings
 from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     BROWSER_DOWNLOADING_SUFFIX,
+    EMBER_RUN_CREATOR,
     FILE_PARSE_STEP_TIMEOUT_SECONDS,
     FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS,
     GET_DOWNLOADED_FILES_TIMEOUT,
@@ -201,7 +202,6 @@ from skyvern.forge.sdk.api.llm.utils import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import run_stoppable_comparison, unique_pdf_paths
-from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
@@ -212,6 +212,7 @@ from skyvern.forge.sdk.db.enums import PERSON_STARTED_TRIGGER_TYPES, TaskType, W
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
+from skyvern.forge.sdk.ember.turn_origin import TurnOrigin
 from skyvern.forge.sdk.executor.run_liveness import (
     block_outcome_authority,
     run_lease_final_write_blocked,
@@ -384,7 +385,7 @@ from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_settings import requested_timezone_id
 from skyvern.schemas.emails import (
-    CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON,
+    CONNECTED_ACCOUNT_EMBER_TEST_RUN_REASON,
     CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON,
     CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON,
     CONNECTED_ACCOUNT_RESAVE_REASON,
@@ -2108,18 +2109,18 @@ class Block(BaseModel, abc.ABC):
     def get_workflow_run_context(workflow_run_id: str) -> WorkflowRunContext:
         return app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
 
-    async def _workflow_copilot_lineage(self, workflow_run_context: WorkflowRunContext) -> bool | None:
+    async def _ember_lineage(self, workflow_run_context: WorkflowRunContext) -> bool | None:
         """Whether Copilot wrote any version of this workflow, or None when the lookup failed."""
         workflow = workflow_run_context.workflow
         if workflow is None:
             return False
-        if "copilot" in (workflow.created_by, workflow.edited_by):
+        if EMBER_RUN_CREATOR in (workflow.created_by, workflow.edited_by):
             return True
         # User saves re-stamp both fields with the user id, so the current version alone is
         # not durable; fall back to lineage (copilot stamps every version it writes). A lookup
         # failure must never mask a block failure.
         try:
-            copilot_authored = await app.DATABASE.workflows.is_workflow_copilot_authored(
+            copilot_authored = await app.DATABASE.workflows.is_ember_authored(
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 organization_id=workflow.organization_id,
             )
@@ -6328,90 +6329,6 @@ _OTP_VERB_BY_TYPE = {
     OTPType.MAGIC_LINK: "await <credential>.magic_link(page)",
 }
 
-_OTP_NOUN_BY_TYPE = {
-    OTPType.TOTP: "code",
-    OTPType.MAGIC_LINK: "sign-in link",
-}
-
-
-def _otp_sources_checked(
-    totp_identifier: str,
-    expected_otp_type: OTPType,
-    email_context: otp_email.EmailOTPVerificationContext,
-    raw_context: otp_service.RawOTPVerificationContext,
-) -> str:
-    """Counts only: addresses, credential ids, identifiers and codes must never reach this text."""
-    inbox_facts: list[str] = []
-    # An identifier without an "@" never reaches the inbox search, so no mailbox fact holds for it.
-    inboxes_apply = "@" in totp_identifier
-    connected_everywhere_empty = inboxes_apply
-    if inboxes_apply:
-        for label, source_name in (
-            ("Gmail", otp_email.GmailOTPSource.name),
-            ("Outlook", otp_email.OutlookOTPSource.name),
-        ):
-            source = email_context.per_source.get(source_name)
-            if source is None:
-                inbox_facts.append(f"{label} inboxes not checked")
-                connected_everywhere_empty = False
-            elif source.credential_ids is None:
-                inbox_facts.append(f"{label} inbox list never loaded")
-                connected_everywhere_empty = False
-            elif not source.credential_ids:
-                if source.credential_list_refresh_failed:
-                    inbox_facts.append(f"{label} inbox list not refreshed")
-                    connected_everywhere_empty = False
-                else:
-                    inbox_facts.append(f"no {label} inbox connected")
-            else:
-                connected_everywhere_empty = False
-                connected = set(source.credential_ids)
-                inboxes = len(connected)
-                # Counted here rather than pruned on refresh: the message sets also drive dedupe,
-                # and forgetting a key would re-parse a message the caller already paid for.
-                messages = sum(1 for credential_id, _ in source.seen_message_keys if credential_id in connected)
-                unreadable = sum(1 for credential_id, _ in source.unreadable_message_keys if credential_id in connected)
-                capped = source.messages_evicted
-                shown = f"{messages}+" if capped else str(messages)
-                if messages and unreadable:
-                    reached = messages + unreadable
-                    # One count carries both: an appended clause would not survive the shortest
-                    # consumer, and a bare checked count hides the candidates the parser refused.
-                    read_fact = f"{shown} of {reached}{'+' if capped else ''} messages read"
-                elif messages:
-                    read_fact = f"{shown} message{'s' if messages != 1 else ''} checked"
-                elif source.failed_credential_ids:
-                    read_fact = "search failed"
-                elif unreadable:
-                    read_fact = f"{unreadable} message{'s' if unreadable != 1 else ''} could not be read"
-                else:
-                    read_fact = "no messages read"
-                plural = "es" if inboxes != 1 else ""
-                # Coverage shares the clause with the read fact, which on its own would hide an inbox
-                # that failed or was still in flight whenever a sibling inbox answered.
-                searched = len(source.completed_credential_ids & connected)
-                coverage = (
-                    f"{searched} of {inboxes} {label} inbox{plural} searched"
-                    if searched < inboxes
-                    else f"{inboxes} {label} inbox{plural} connected"
-                )
-                inbox_facts.append(f"{coverage}, {read_fact}")
-    rows = len(raw_context.seen_row_ids)
-    noun = _OTP_NOUN_BY_TYPE.get(expected_otp_type, "OTP")
-    store_empty = raw_context.store_queried and not rows
-    if connected_everywhere_empty and store_empty:
-        return f"No Gmail or Outlook inbox is connected and no {noun} has been stored."
-    if not raw_context.store_queried and all(fact.endswith("not checked") for fact in inbox_facts):
-        return "No delivery source was checked before the wait ended."
-    if not raw_context.store_queried:
-        row_fact = f"stored {noun}s not checked"
-    elif rows:
-        # "found", not "checked": the reparse budget stops the scan before every row is parsed.
-        row_fact = f"{rows} stored OTP message{'s' if rows != 1 else ''} found"
-    else:
-        row_fact = f"no {noun} has been stored"
-    return f"Sources checked: {'; '.join([*inbox_facts, row_fact])}."
-
 
 def _otp_wait_failure(
     totp_identifier: str,
@@ -6432,7 +6349,7 @@ def _otp_wait_failure(
         # Sources first: every downstream cap slices a prefix, and the shortest (120 chars in
         # copilot turn compaction) starts after a ~45-char platform frame.
         return CodeBlockOTPError(
-            f"{_otp_sources_checked(totp_identifier, expected_otp_type, email_context, raw_context)} "
+            f"{otp_service.otp_sources_checked(totp_identifier, expected_otp_type, email_context, raw_context)} "
             f"OTP was not received within {budget_seconds} seconds."
         )
     found = ", ".join(observed.value for observed in mismatched)
@@ -8795,7 +8712,7 @@ async def wrapper({default_args}):
         LOG.warning(
             "codeblock.download_intent_unregistered",
             engine=engine,
-            copilot_authored=await self._workflow_is_copilot_authored(workflow_run_context),
+            copilot_authored=await self._workflow_is_ember_authored(workflow_run_context),
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             block_label=self.label,
@@ -8804,8 +8721,8 @@ async def wrapper({default_args}):
             organization_id=organization_id,
         )
 
-    async def _workflow_is_copilot_authored(self, workflow_run_context: WorkflowRunContext) -> bool:
-        return await self._workflow_copilot_lineage(workflow_run_context) is True
+    async def _workflow_is_ember_authored(self, workflow_run_context: WorkflowRunContext) -> bool:
+        return await self._ember_lineage(workflow_run_context) is True
 
     async def _ai_fallback_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         workflow = workflow_run_context.workflow
@@ -9062,7 +8979,7 @@ async def wrapper({default_args}):
             recovery_release_parameter_keys = [
                 parameter.key for parameter in self.parameters if _is_secret_or_credential_parameter(parameter)
             ]
-            recovery_enforce_vault_sites = await self._workflow_copilot_lineage(workflow_run_context) is not False
+            recovery_enforce_vault_sites = await self._ember_lineage(workflow_run_context) is not False
 
             workflow_system_prompt = (
                 None
@@ -10471,11 +10388,11 @@ async def wrapper({default_args}):
             authorized_file_materializations: dict[str, AuthorizedFileMaterialization] = {}
             credential_parameter_keys: set[str] = set()
             credential_release_guard = CredentialReleaseGuard(workflow_run_id=workflow_run_id, block_label=self.label)
-            copilot_lineage = await self._workflow_copilot_lineage(workflow_run_context)
-            copilot_authored = copilot_lineage is True
+            ember_lineage = await self._ember_lineage(workflow_run_context)
+            copilot_authored = ember_lineage is True
             # Editor-built vault logins are only logged off their item's sites until production counts show refusing
             # them would not break working workflows. Unknown lineage still enforces.
-            enforce_vault_sites = copilot_lineage is not False
+            enforce_vault_sites = ember_lineage is not False
             sheets_read_output_keys = _sheets_read_output_keys(workflow_run_context)
             sheets_read_parameter_keys: list[str] = []
             for parameter in self.parameters:
@@ -14598,9 +14515,9 @@ class SendEmailBlock(Block):
                 raise _GmailSendRefused(
                     GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON} Nothing was sent."
                 )
-            if refusal == GmailHopRefusal.copilot_test_run:
+            if refusal == GmailHopRefusal.ember_test_run:
                 raise _GmailSendRefused(
-                    GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON} Nothing was sent."
+                    GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_EMBER_TEST_RUN_REASON} Nothing was sent."
                 )
             if refusal == GmailHopRefusal.run_not_supported or (
                 refusal is None and await _is_unsupported_connected_account_run(workflow_run_id, organization_id)
@@ -18897,7 +18814,7 @@ class HttpRequestBlock(Block):
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         if workflow_run_context.bitwarden_login_sites:
             # As on the code-block seam, vault sites bind only Copilot-written workflows; others keep the tested URL.
-            self._enforce_vault_sites = await self._workflow_copilot_lineage(workflow_run_context) is not False
+            self._enforce_vault_sites = await self._ember_lineage(workflow_run_context) is not False
 
         try:
             self.format_potential_template_parameters(workflow_run_context)

@@ -306,6 +306,32 @@ export function buildEmberContext(
   return { snapshot, document };
 }
 
+// The withheld values never leave the browser; the digest only lets the route see that they changed between turns.
+// Synchronous (cyrb53, not SubtleCrypto) so the send path gains no await; the server keys it before storing it.
+export function withheldEmberSettingsDigest(
+  snapshot: WorkflowCreateYAMLRequest,
+): string {
+  const withheld: Record<string, unknown> = Object.fromEntries(
+    withheldEmberSettings.map((field) => [field, snapshot[field] ?? null]),
+  );
+  withheld.proxy_location = isPrivateProxyLocation(snapshot.proxy_location)
+    ? snapshot.proxy_location
+    : null;
+  const text = JSON.stringify(withheld);
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16);
+}
+
 export function restoreEmberSettings(
   workflow: WorkflowApiResponse,
   snapshot: WorkflowSettings,

@@ -398,7 +398,7 @@ async def test_default_input_strategy_forwards_timeout_to_every_locator_operatio
 
 
 @pytest.mark.asyncio
-async def test_default_input_strategy_batches_when_copilot_surface_allows_it() -> None:
+async def test_default_input_strategy_batches_when_ember_surface_allows_it() -> None:
     page = MagicMock()
     locator = MagicMock()
     locator.type = AsyncMock()

@@ -3,7 +3,7 @@
 from enum import StrEnum
 
 # runnable_type of an unclaimed Copilot pre-started browser; uptime billing skips it until a test claims it.
-COPILOT_PRESTART_RUNNABLE_TYPE = "copilot_build_test_prestart"
+EMBER_PRESTART_RUNNABLE_TYPE = "copilot_build_test_prestart"
 
 
 class BrowserSessionKind(StrEnum):
@@ -14,5 +14,5 @@ class BrowserSessionKind(StrEnum):
     api = "api"
     editor = "editor"
     editor_prewarm = "editor_prewarm"
-    copilot = "copilot"
+    ember = "copilot"
     workflow_run = "workflow_run"

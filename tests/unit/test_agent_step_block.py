@@ -112,7 +112,7 @@ from skyvern.services import script_service
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import ActionStatus, UploadFileAction
 from tests.unit.conftest import make_block_output_parameter
-from tests.unit.copilot_test_helpers import (
+from tests.unit.ember_test_helpers import (
     RecordingSkills,
     available_skill,
     scripted_call,
@@ -1154,7 +1154,7 @@ async def _google_accounts(database: AgentDB, scopes: list[str] | None = None) -
 
 
 @pytest.mark.asyncio
-async def test_a_copilot_run_offers_and_accepts_only_the_account_the_chat_approved(
+async def test_a_ember_run_offers_and_accepts_only_the_account_the_chat_approved(
     monkeypatch: pytest.MonkeyPatch, database: AgentDB
 ) -> None:
     async with database.Session() as session:
@@ -1217,7 +1217,7 @@ async def test_a_copilot_run_offers_and_accepts_only_the_account_the_chat_approv
 
 
 @pytest.mark.asyncio
-async def test_a_copilot_runs_record_holds_whatever_the_workers_setting_and_a_broken_chain_offers_none(
+async def test_a_ember_runs_record_holds_whatever_the_workers_setting_and_a_broken_chain_offers_none(
     monkeypatch: pytest.MonkeyPatch, database: AgentDB
 ) -> None:
     async with database.Session() as session:

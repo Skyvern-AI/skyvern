@@ -3,6 +3,7 @@ import { NodeBaseData } from "../types";
 import { RunEngine } from "@/api/types";
 import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 export type TaskNodeData = NodeBaseData & {
+  completeVerification?: boolean;
   url: string;
   navigationGoal: string;
   dataExtractionGoal: string;

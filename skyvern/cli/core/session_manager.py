@@ -21,7 +21,7 @@ from skyvern.webeye.browser_errors import is_context_lost_message, is_target_clo
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import get_active_api_key, get_skyvern, has_api_key_override
-from .copilot_sessions import registered_copilot_session, unregister_copilot_session
+from .ember_sessions import registered_ember_session, unregister_ember_session
 from .result import BrowserContext, ErrorCode, count_browser_attach, make_error
 from .trajectory_store import delete_session_trajectories
 
@@ -746,7 +746,7 @@ async def resolve_browser(
     # does not propagate through FastMCP in-process transport).
     organization_id = _current_organization_id.get()
     registered = (
-        registered_copilot_session(session_id, organization_id=organization_id)
+        registered_ember_session(session_id, organization_id=organization_id)
         if session_id and organization_id
         else None
     )
@@ -937,7 +937,7 @@ async def _finish_close_session_state(current: SessionState, *, close_via_active
             delete_session_trajectories(current.context.session_id)
             organization_id = _current_organization_id.get() or current.organization_id
             if organization_id is not None:
-                unregister_copilot_session(
+                unregister_ember_session(
                     current.context.session_id,
                     organization_id=organization_id,
                     expected_state=current,

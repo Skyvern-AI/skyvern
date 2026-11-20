@@ -23,6 +23,7 @@ import {
 } from "@/routes/integrations/googleOAuth";
 import { markGoogleOAuthPopup } from "@/routes/integrations/googleOAuthPopup";
 import { useCurrentOrgId } from "@/hooks/useCurrentOrgId";
+import { stripBidiIsolates } from "@/util/bidiText";
 import {
   type ConnectedGmailFlow,
   useHasCapability,
@@ -221,7 +222,7 @@ function ConnectionCardBody({
       connection_id: connection.connection_id,
       name: connection.name,
       state: "active" as const,
-      email_address: null,
+      email_address: connection.email_address ?? null,
     })),
   ];
 
@@ -371,7 +372,7 @@ function ConnectionCardBody({
             <>
               <div className="font-medium">Connected</div>
               <div className="mt-1 text-xs text-muted-foreground">
-                {connected.name}
+                <bdi>{stripBidiIsolates(connected.name)}</bdi>
                 {connected.email_address
                   ? ` (${connected.email_address})`
                   : ""}{" "}

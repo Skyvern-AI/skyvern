@@ -16,9 +16,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from skyvern.exceptions import WorkflowNotFound
-from skyvern.forge.sdk.copilot.tools.workflow_update import CodeArtifactCompletionCriterion
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.models import WorkflowRunAttemptModel
+from skyvern.forge.sdk.ember.tools.workflow_update import CodeArtifactCompletionCriterion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
@@ -778,8 +778,8 @@ async def test_each_declared_deliverable_kind_is_met_only_by_its_own_registered_
     assert statuses == [expected_status]
 
 
-def test_interactive_copilot_routes_do_not_own_completion_contract_lifecycle() -> None:
-    from skyvern.forge.sdk.routes import workflow_copilot as route
+def test_interactive_ember_routes_do_not_own_completion_contract_lifecycle() -> None:
+    from skyvern.forge.sdk.routes import ember as route
 
     assert not hasattr(route, "_load_completion_criteria_snapshot")
     assert not hasattr(route, "_persist_completion_criteria_state")
@@ -790,11 +790,11 @@ def test_interactive_copilot_routes_do_not_own_completion_contract_lifecycle() -
 def test_apply_proposed_workflow_route_is_bound_to_the_route_handler() -> None:
     """A helper inserted between the decorator and its function silently rebinds the endpoint to the
     helper, and the route then 422s on the helper's arguments."""
-    from skyvern.forge.sdk.routes.workflow_copilot import base_router
+    from skyvern.forge.sdk.routes.ember import base_router
 
     routes = [r for r in base_router.routes if getattr(r, "path", "") == "/workflow/copilot/apply-proposed-workflow"]
     assert routes, "route not registered"
-    assert routes[0].endpoint.__name__ == "workflow_copilot_apply_proposed_workflow"
+    assert routes[0].endpoint.__name__ == "ember_apply_proposed_workflow"
 
 
 @pytest.mark.asyncio

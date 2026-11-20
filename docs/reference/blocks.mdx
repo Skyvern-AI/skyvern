@@ -507,11 +507,11 @@ The Agent block is available to selected organizations. Contact support to enabl
 | **Max Turns** | number | Turns the model may take, from 1 to 200. Defaults to 25. When the turns run out, the model gets one more turn in which it can only return its answer; the block fails if that turn does not produce a valid answer |
 | **Tools** | multi-select | The tools the model may call |
 
-The model can always read this run's data (`read_run_data`) and return its answer (`finish`). Without a Tools list it has no other tools. A new Agent block starts with these checked: **Browser Task**, **Download**, **File Download**, **Web Search**, **Go to URL**, **Click**, **Input Text** and **Extract Data**. The Tools checklist in the editor lists every optional tool, and checking one offers it to the model, except Login, which also needs a credential in Inputs.
+The model can always read this run's data (`read_run_data`) and return its answer (`finish`). Without a Tools list it has no other tools. A new Agent block starts with these checked: **Browser Task**, **Code**, **Download**, **File Download**, **Login**, **Web Search**, **Go to URL**, **Click**, **Input Text** and **Extract Data**. The Tools checklist in the editor lists every optional tool, and checking one offers it to the model, except Login, which also needs a credential in Inputs.
 
 A tool named after a block, such as **Browser Task** or **HTTP Request**, runs that block as an ordinary block and is billed as usual. **Go to URL**, **Click**, **Input Text** and **Extract Data** act on the run's current page. **Browser Task**, **File Download** and **Login** each start a separate browser agent that uses your organization's default step limit.
 
-To sign in, check **Login** in Tools and add a credential to Inputs. Login is not checked by default. Skyvern masks the run's registered secrets in the tool results the model reads and in the recorded tool calls. The answer is saved as the model returns it, so do not ask the model to return a secret.
+To sign in, check **Login** in Tools and add a credential to Inputs. Login is checked by default; it is offered to the model only when Inputs has a credential. Skyvern masks the run's registered secrets in the tool results the model reads and in the recorded tool calls. The answer is saved as the model returns it, so do not ask the model to return a secret.
 
 [Copilot](/cloud/studio#build-with-copilot) can add an Agent block to your agent and choose its Tools.
 

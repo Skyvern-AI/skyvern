@@ -286,8 +286,24 @@ def _validate_script_files(
     return file_bytes_by_path
 
 
-def validate_uploaded_script_files(files: list[ScriptFileCreate]) -> dict[str, bytes]:
-    return _validate_script_files(files)
+# Written by ensure_static_script as the first line of a platform static pin's main.py.
+STATIC_MODULE_MARKER = "# __static_module__: "
+
+
+def validate_uploaded_script_files(
+    files: list[ScriptFileCreate],
+    *,
+    allow_static_module_marker: bool = False,
+) -> dict[str, bytes]:
+    file_bytes_by_path = _validate_script_files(files)
+    if not allow_static_module_marker:
+        for file_path, content_bytes in file_bytes_by_path.items():
+            if content_bytes.startswith(STATIC_MODULE_MARKER.encode("utf-8")):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File {file_path!r} starts with a reserved platform header line",
+                )
+    return file_bytes_by_path
 
 
 async def build_file_tree(

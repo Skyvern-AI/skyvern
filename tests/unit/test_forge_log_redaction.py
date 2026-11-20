@@ -34,10 +34,10 @@ from skyvern.forge.log_redaction import (
 )
 from skyvern.forge.sdk import forge_log, log_artifacts
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.copilot.runtime import AgentContext
-from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value, scrub_secrets_from_text
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.ember.runtime import AgentContext
+from skyvern.forge.sdk.ember.secret_scrub import register_secret_scrub_value, scrub_secrets_from_text
 from skyvern.forge.sdk.forge_log import (
     CODEBLOCK_LOG_REDACTED,
     _generated_log_value,
@@ -179,7 +179,7 @@ def _register_credential(value: str) -> None:
     secret_scrub._SESSION_SCRUB_VALUES.setdefault("pbs_1", []).append(value)
 
 
-def _copilot_turn(browser_session_id: str = "pbs_1") -> AgentContext:
+def _ember_turn(browser_session_id: str = "pbs_1") -> AgentContext:
     return AgentContext(
         organization_id="o_1",
         workflow_id="w_1",
@@ -190,12 +190,12 @@ def _copilot_turn(browser_session_id: str = "pbs_1") -> AgentContext:
     )
 
 
-def _register_in_copilot_turn(*values: str) -> SkyvernContext:
+def _register_in_ember_turn(*values: str) -> SkyvernContext:
     """Register values the way a Copilot tool does, inside its own request; returns that request."""
     request = SkyvernContext(request_id="req_copilot", copilot_session_id="wcc_1")
     with skyvern_context.scoped(request):
         for value in values:
-            register_secret_scrub_value(_copilot_turn(), value)
+            register_secret_scrub_value(_ember_turn(), value)
     return request
 
 
@@ -305,7 +305,7 @@ def test_redacts_a_credential_inside_a_tuple_value() -> None:
 
 
 def test_a_short_value_from_another_session_leaves_unrelated_request_lines_alone() -> None:
-    _register_in_copilot_turn("1")
+    _register_in_ember_turn("1")
     line = _request_log_line()
 
     with skyvern_context.scoped(SkyvernContext(request_id="req_unrelated", browser_session_id="pbs_2")):
@@ -326,7 +326,7 @@ def test_a_short_value_from_another_session_leaves_unrelated_request_lines_alone
     ],
 )
 def test_a_short_value_is_still_scrubbed_on_its_own_sessions_lines(scope: str) -> None:
-    request = _register_in_copilot_turn("1")
+    request = _register_in_ember_turn("1")
     if scope == "registering_request_after_close":
         clear_session_scrub_values("pbs_1")
     line_context = {
@@ -341,7 +341,7 @@ def test_a_short_value_is_still_scrubbed_on_its_own_sessions_lines(scope: str) -
     with skyvern_context.scoped(line_context):
         if scope.startswith("reader"):
             # Another chat's turn on the same browser scrubs a readback with the session's values.
-            scrub_secrets_from_text(_copilot_turn(), "readback")
+            scrub_secrets_from_text(_ember_turn(), "readback")
         if scope == "reader":
             clear_session_scrub_values("pbs_1")
         if scope == "reader_after_context_replaced":
@@ -355,7 +355,7 @@ def test_a_short_value_is_still_scrubbed_on_its_own_sessions_lines(scope: str) -
 
 
 def test_a_value_from_another_session_applies_from_four_characters() -> None:
-    _register_in_copilot_turn(_FAKE_CREDENTIAL, "q7x", "z9k4", "48392017")
+    _register_in_ember_turn(_FAKE_CREDENTIAL, "q7x", "z9k4", "48392017")
     event = {"event": f"login failed for {_FAKE_CREDENTIAL}", "codes": "aq7xb xz9k4x", "code": 48392017}
 
     with skyvern_context.scoped(SkyvernContext(request_id="req_unrelated")):
@@ -370,7 +370,7 @@ def test_a_value_from_another_session_applies_from_four_characters() -> None:
 def test_a_short_value_from_another_session_is_still_scrubbed_as_a_whole_token(
     request_context: SkyvernContext | None,
 ) -> None:
-    _register_in_copilot_turn("123", "401", "1", "10", "45", "#7")
+    _register_in_ember_turn("123", "401", "1", "10", "45", "#7")
     masked = REDACTED_SECRET_PLACEHOLDER
     scrubbed = {
         '{"value":"123","cvv": 123,"status":"401"}': f'{{"value":"{masked}","cvv": {masked},"status":"{masked}"}}',
@@ -390,16 +390,16 @@ def test_a_short_value_from_another_session_is_still_scrubbed_as_a_whole_token(
     assert out["status_code"] == 401
 
 
-def test_a_copilot_value_replaces_only_its_own_number_and_a_run_secret_any_number_containing_it() -> None:
-    _register_in_copilot_turn("483920")
-    copilot_numbers = [483920, 483920.0, Decimal("483920"), 1483920, 4839201, 0.48392, 48392, 401]
+def test_a_ember_value_replaces_only_its_own_number_and_a_run_secret_any_number_containing_it() -> None:
+    _register_in_ember_turn("483920")
+    ember_numbers = [483920, 483920.0, Decimal("483920"), 1483920, 4839201, 0.48392, 48392, 401]
     run_numbers = [15551234567, 0.5551234567, Decimal("5551234567.25")]
-    event = {"event": "numbers", "copilot": copilot_numbers, "run": run_numbers}
+    event = {"event": "numbers", "copilot": ember_numbers, "run": run_numbers}
 
     with skyvern_context.scoped(SkyvernContext(request_id="req_run", runtime_secret_values={"5551234567"})):
         out = redact_registered_secrets(None, "info", event)  # type: ignore[arg-type]
 
-    assert out["copilot"] == [REDACTED_SECRET_PLACEHOLDER] * 3 + copilot_numbers[3:]
+    assert out["copilot"] == [REDACTED_SECRET_PLACEHOLDER] * 3 + ember_numbers[3:]
     assert out["run"] == [REDACTED_SECRET_PLACEHOLDER] * 3
 
 
@@ -831,8 +831,8 @@ def test_generated_string_subclasses_cannot_bypass_caller_text_scrubbing() -> No
         "from skyvern.forge.sdk.forge_log import _GeneratedLogInt\n",
         "from skyvern.forge.sdk.forge_log import _GeneratedLogValue\n",
         "from skyvern.forge.sdk.api.llm.model_usage import _emit_model_usage\n",
-        "from skyvern.forge.sdk.api.llm.model_usage import _emit_direct_copilot_model_usage\n",
-        "from skyvern.forge.sdk.routes.workflow_copilot import _bind_copilot_session_id\n",
+        "from skyvern.forge.sdk.api.llm.model_usage import _emit_direct_ember_model_usage\n",
+        "from skyvern.forge.sdk.routes.ember import _bind_ember_session_id\n",
         "from skyvern.forge.sdk.api.llm.agents_model import _model_call_telemetry_scope\n",
         "from skyvern.forge.sdk.api.llm.config_registry import _register_builtin_config\n",
         "from skyvern.forge.sdk.forge_log import _model_log_value\n",

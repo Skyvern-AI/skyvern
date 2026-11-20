@@ -55,11 +55,26 @@ skyvern init
 
 ```bash
 skyvern run server            # Start the local API server
+skyvern run ui                # Start the local UI on port 8080 (--force stops whatever already uses the port)
+skyvern run all               # Start the API server and the UI together, in this terminal
+skyvern run dev               # Start the API server and the UI in the background and return
+skyvern run docker            # Run docker compose up -d with the docker-compose.yml in this directory
 skyvern run mcp               # Start the MCP server (stdio transport)
 skyvern run mcp --transport streamable-http  # Start the MCP server (HTTP transport)
+skyvern run code --params-file params.json main.py  # Run a Skyvern Python script with parameters from a JSON file
+skyvern run code -p name=value main.py              # Or one -p per parameter, or --params with a JSON string
 skyvern status                # Check if services are running
-skyvern stop all              # Stop the services on ports 8000, 8080 and 9090
+skyvern stop all              # Stop whatever listens on ports 8000, 8080 and 9090
+skyvern stop server           # Stop whatever listens on the API port (--port, default 8000)
+skyvern stop ui               # Stop whatever listens on ports 8080 and 9090
+skyvern stop docker           # Stop the Docker Compose services
 ```
+
+`run ui`, `run all` and `run dev` need the UI's source, which a `pip install` doesn't include. Use a source checkout or Docker Compose for the UI. On a `pip` install, `run all` starts only the API server.
+
+`run code` takes its options before the script path. After the path, they are rejected.
+
+`stop all`, `stop server` and `stop ui` don't check that a process on those ports is Skyvern's, so they also end any other program listening there.
 
 ### Browser automation
 
@@ -102,10 +117,46 @@ skyvern browser evaluate --expression "document.title"
 # Full task automation (multi-step agent)
 skyvern browser run-task --prompt "Find the cheapest flight from NYC to LA"
 skyvern browser login --url https://app.example.com --credential-id cred_xxx
+
+# One-shot QA: creates a cloud session, runs the task, returns the result with recording links, closes the session.
+# It exits 0 even when the task fails, so check the status it prints (with --json, the top-level status).
+skyvern browser qa "Log in and check the dashboard" --url https://app.example.com
+
+# Read the page (these read the main frame, even after frame switch)
+skyvern browser get-html "#main"            # innerHTML; --outer for outerHTML
+skyvern browser get-value "#email"          # Current value of a form field
+skyvern browser get-styles ".banner" color font-size  # Computed styles; omit the names to get all (at most 100)
+skyvern browser find role button            # Playwright locators: role, text, label, placeholder, alt or testid
+
+# Frames
+skyvern browser frame list
+skyvern browser frame switch --selector "iframe#checkout"  # Or --name, or --index (0 is the main frame)
+skyvern browser frame main                  # Back to the main frame
+
+# Sign-in state, storage and clipboard
+skyvern browser state save auth.json        # Cookies, plus this page's localStorage and sessionStorage
+# auth.json can sign in as you. Keep it out of version control.
+# state load writes storage to the open page and doesn't check its origin,
+# so first open a page with the saved page's scheme, host and port.
+skyvern browser state load auth.json
+skyvern browser storage get-session         # Prints keys and values, which can hold session data. Name keys to limit it
+skyvern browser storage set-session theme dark
+skyvern browser storage clear-session
+skyvern browser storage clear-local
+# The clipboard commands ignore the saved session, so pass --session or --cdp.
+# They need an HTTPS or localhost page.
+skyvern browser clipboard-write "text to paste" --session pbs_xxx
+skyvern browser clipboard-read --session pbs_xxx
 ```
 
+The `skyvern browser extension-*` commands set up the Skyvern Agent Chrome extension. See [Share tabs with a local MCP server](/browsers#share-tabs-with-a-local-mcp-server).
+
+The `skyvern browser network` commands (`requests`, `detail`, `route`, `unroute`), `har-start`, `har-stop` and `get-errors` don't work as separate shell commands. They keep captured requests, routes, the HAR recording and page errors in the memory of the process that runs them, and each `skyvern` command is a new process. So `network requests` starts empty, `har-stop` after a `har-start` reports no active recording, `get-errors` reports no errors even when the page threw some, and a route stops applying when its command exits.
+
+To capture or mock traffic, or read page errors, across several steps, run a [local MCP server](/developers/getting-started/mcp#run-the-server-locally-stdio), attach it before the action, and use its `skyvern_network_*`, `skyvern_har_*` and `skyvern_get_errors` tools in one session. Mock and abort cover the top-level page and same-process frames, not out-of-process cross-site iframes. The hosted MCP server keeps no state between requests, so those tools return an error there.
+
 <Tip>
-Most browser commands support `--json` for machine-readable output. Commands that act on a page also take `--session` or `--cdp` to target a specific session. If you omit both, the CLI uses the session saved by `session create` or `session connect`, for up to 24 hours.
+Most browser commands support `--json` for machine-readable output. Commands that act on a page also take `--session` or `--cdp` to target a specific session. If you omit both, the CLI uses the session saved by `session create` or `session connect`, for up to 24 hours. `clipboard-read`, `clipboard-write`, `har-start`, `har-stop` and `get-errors` ignore the saved session and always need one of the two.
 </Tip>
 
 ### Connect your local browser to Skyvern Cloud
@@ -141,10 +192,12 @@ skyvern workflow update --id wpid_xxx --definition @updated.json
 skyvern workflow delete --id wpid_xxx --force       # --force confirms the permanent delete
 skyvern workflow run --id wpid_xxx                  # Execute a workflow
 skyvern workflow run --id wpid_xxx --params '{"url": "https://example.com"}'
+skyvern workflow run --id wpid_xxx --wait --timeout 600  # Return when the run finishes (--timeout in seconds, default 300)
 skyvern workflow runs --id wpid_xxx                 # List runs of a workflow (--status, --search-key, --error-code, --page, --page-size)
 skyvern workflow status --run-id wr_xxx              # Check run status
 skyvern workflow cancel --run-id wr_xxx              # Cancel a running workflow
 skyvern workflow retry --run-id wr_xxx               # Retry a finished workflow run
+skyvern tasks list --workflow-run-id wr_xxx          # List the tasks of a workflow run (the 100 newest)
 ```
 
 ### Schedules
@@ -217,6 +270,7 @@ skyvern setup windsurf           # Register with Windsurf
 skyvern setup openclaw           # Register with OpenClaw
 skyvern setup opencode           # Register with OpenCode (API key auth; avoids OAuth timeouts)
 skyvern setup hermes             # Register with Hermes (~/.hermes/config.yaml and each profile that has a config.yaml)
+skyvern setup mcporter           # Show which configs have a Skyvern entry for MCPorter to find (writes nothing)
 skyvern mcp switch                    # Interactively switch existing Skyvern MCP configs
 skyvern mcp switch --dry-run          # Preview changes without writing files
 skyvern mcp profile list              # List saved switch sources
@@ -231,6 +285,8 @@ For the local self-hosted path, `skyvern quickstart` or `skyvern init` can also 
 
 ```bash
 skyvern docs                     # Open documentation in your browser
+skyvern login                    # Sign in to Skyvern Cloud in your browser and save the API key (--base-url, --timeout)
+skyvern capabilities workflow    # The command tree as JSON, for agents; omit the group for all (--depth 0 to 5, default 1)
 skyvern quickstart               # One-command setup + start
 skyvern init                     # Interactive setup wizard (does not start the Skyvern server)
 skyvern init browser             # Initialize browser configuration only
@@ -265,6 +321,7 @@ skyvern skill path skyvern          # Print the absolute path to a skill file
 skyvern skill path                  # Print the skills directory
 skyvern skill copy --output ./docs  # Copy all skills to a local directory
 skyvern skill copy skyvern -o .     # Copy a single skill
+skyvern skill post-qa-report        # Post or update .qa/latest-report.md as a comment on the current branch's open PR (needs gh)
 ```
 
 <Accordion title="Loading skills into AI tools">
@@ -328,7 +385,7 @@ OpenClaw's MCP config provides the callable Skyvern tools; the workspace skill i
 
 ## JSON output
 
-The `browser`, `workflow`, `schedule`, `config`, `credential`, `credentials`, `block`, `tasks`, `status` and `stop` commands, and `doctor streaming`, take `--json` for structured output you can pipe to `jq`. The `skill`, `setup`, `mcp`, `run`, `init`, `quickstart` and `docs` commands, and plain `doctor`, do not. The output is an envelope (`ok`, `action`, `data`, `error`, …), and the command's result is under `data`:
+The `browser`, `workflow`, `schedule`, `config`, `credential`, `credentials`, `block`, `tasks`, `status` and `stop` commands, and `doctor streaming`, take `--json` for structured output you can pipe to `jq`. The `skill`, `setup`, `mcp`, `run`, `init`, `quickstart` and `docs` commands, and plain `doctor`, do not. The output is an envelope (`ok`, `action`, `data`, `error`, …), and the command's result is under `data`. `browser qa` is the exception once its task runs: it prints its fields (`status`, `output`, `failure_reason`, …) at the top level, with no envelope. If the command fails before the task runs, for example when the session can't be created, it prints the usual envelope with `error` and exits 1.
 
 ```bash
 # Extract the session ID from a new session
@@ -339,6 +396,10 @@ skyvern browser extract --prompt "Get all links" --json | jq '.data.extracted' >
 
 # Check workflow run status in a script
 STATUS=$(skyvern workflow status --run-id wr_xxx --json | jq -r '.data.status')
+
+# browser qa exits 0 even when the task fails, so check its top-level status
+STATUS=$(skyvern browser qa "Log in and check the dashboard" --url https://app.example.com --json | jq -r '.status')
+[ "$STATUS" = completed ] || { echo "QA did not pass: $STATUS"; exit 1; }
 ```
 
 ## Troubleshooting

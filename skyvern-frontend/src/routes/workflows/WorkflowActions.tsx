@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { DisabledReasonMenuItem } from "@/components/DisabledReasonMenuItem";
 import { GarbageIcon } from "@/components/icons/GarbageIcon";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -22,6 +23,7 @@ import {
   DownloadIcon,
   MixerHorizontalIcon,
 } from "@radix-ui/react-icons";
+import { useWorkflowDeleteAccess } from "./hooks/useWorkflowDeleteAccess";
 import { useWorkflowRowActions } from "./hooks/useWorkflowRowActions";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 
@@ -49,6 +51,8 @@ function WorkflowActions({
     isTogglingTemplate,
   } = useWorkflowRowActions(workflow);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const deleteAccess = useWorkflowDeleteAccess();
+  const canDelete = deleteAccess.canDelete(workflow.original_created_by);
 
   return (
     <>
@@ -115,13 +119,23 @@ function WorkflowActions({
               </DropdownMenuSubContent>
             </DropdownMenuPortal>
           </DropdownMenuSub>
-          <DropdownMenuItem
-            className="p-2"
-            onSelect={() => setDeleteOpen(true)}
-          >
-            <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
-            Delete Agent
-          </DropdownMenuItem>
+          {canDelete ? (
+            <DropdownMenuItem
+              className="p-2"
+              onSelect={() => setDeleteOpen(true)}
+            >
+              <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
+              Delete Agent
+            </DropdownMenuItem>
+          ) : (
+            <DisabledReasonMenuItem
+              item={DropdownMenuItem}
+              className="p-2"
+              icon={<GarbageIcon className="mr-2 h-4 w-4 text-destructive" />}
+              label="Delete Agent"
+              reason={deleteAccess.deniedReason}
+            />
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
       <ConfirmDialog

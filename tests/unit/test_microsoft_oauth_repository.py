@@ -9,6 +9,7 @@ from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.models import MicrosoftOAuthCredentialModel
 from skyvern.forge.sdk.db.repositories.microsoft_oauth import (
     STATE_ACTIVE,
+    STATE_ERROR,
     STATE_REVOKED,
     IncompatibleScopeProfileError,
     MicrosoftOAuthRepository,
@@ -420,7 +421,7 @@ async def test_powerbi_rows_are_listed_and_managed_only_by_their_owner(
 
 
 @pytest.mark.asyncio
-async def test_update_active_refresh_token_only_rewrites_expected_ciphertext(
+async def test_token_guarded_writes_only_apply_to_the_expected_ciphertext(
     repo: MicrosoftOAuthRepository,
     engine: AsyncEngine,
 ) -> None:
@@ -466,6 +467,29 @@ async def test_update_active_refresh_token_only_rewrites_expected_ciphertext(
     assert rotated is True
     assert stale is False
     assert stored == "encrypted-rotated"
+
+    # A refresh that loaded the pre-rotation token must not expire the row that was rotated since.
+    stale_expiry = await repo.mark_needs_reconnect(
+        organization_id="o_test",
+        credential_id="msoac_rotation",
+        expected_encrypted_refresh_token="encrypted-old",
+        now=now + datetime.timedelta(minutes=3),
+    )
+    assert stale_expiry is False
+    assert [credential.id for credential in await repo.list_active_for_org("o_test")] == ["msoac_rotation"]
+
+    expired = await repo.mark_needs_reconnect(
+        organization_id="o_test",
+        credential_id="msoac_rotation",
+        expected_encrypted_refresh_token="encrypted-rotated",
+        now=now + datetime.timedelta(minutes=4),
+    )
+    assert expired is True
+    assert await repo.list_active_for_org("o_test") == []
+    assert await repo.load_active_ciphertext(organization_id="o_test", credential_id="msoac_rotation") is None
+    assert [(credential.id, credential.state) for credential in await repo.list_visible_for_org("o_test")] == [
+        ("msoac_rotation", STATE_ERROR)
+    ]
 
 
 @pytest.mark.asyncio

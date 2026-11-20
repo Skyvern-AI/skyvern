@@ -1182,7 +1182,7 @@ class WorkflowRunsRepository(BaseRepository):
                 retried_from_workflow_run_id=retried_from_workflow_run_id,
                 fallback_attempt=fallback_attempt,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
-                copilot_session_id=copilot_session_id,
+                ember_session_id=copilot_session_id,
                 created_by=created_by,
                 # created_by names who to show; run start judges the actor that authorized the request instead.
                 requested_by=requested_by or api_key_actor,
@@ -2089,7 +2089,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
-                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .filter(WorkflowRunModel.ember_session_id.is_(None))
             )
             folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
             if folder_access_filter is not None:
@@ -2248,7 +2248,6 @@ class WorkflowRunsRepository(BaseRepository):
                     TaskRunModel.script_run.label("script_run"),
                     WorkflowRunModel.trigger_type.label("trigger_type"),
                     created_by_expr.label("created_by"),
-                    TaskRunModel.searchable_text.label("searchable_text"),
                     workflow_deleted_expr,
                 )
                 .select_from(TaskRunModel)
@@ -2265,7 +2264,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(effective_status.isnot(None))
                 .filter(TaskRunModel.parent_workflow_run_id.is_(None))
                 .filter(TaskRunModel.debug_session_id.is_(None))
-                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .filter(WorkflowRunModel.ember_session_id.is_(None))
             )
             # A task v2 row records no workflow, and the join above skips its run, so it follows its own workflow run.
             task_v2_wpid = (
@@ -2327,9 +2326,9 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.offset(offset)
 
             result = await execute_list_query(query)
-            rows = [dict(row) for row in result.mappings().all()]
 
             if use_fallback_merge:
+                rows: list[RowMapping] = list(result.mappings().all())
                 # The fallback only yields workflow_run rows, so skip it when the run_type filter excludes them.
                 if not run_type or RunType.workflow_run in run_type:
                     task_run_exists = (
@@ -2355,7 +2354,6 @@ class WorkflowRunsRepository(BaseRepository):
                             WorkflowRunModel.script_run.label("script_run"),
                             WorkflowRunModel.trigger_type.label("trigger_type"),
                             WorkflowRunModel.created_by.label("created_by"),
-                            WorkflowModel.title.label("searchable_text"),
                             self._workflow_deleted_expr(
                                 WorkflowRunModel.workflow_permanent_id,
                                 WorkflowRunModel.organization_id,
@@ -2366,7 +2364,7 @@ class WorkflowRunsRepository(BaseRepository):
                         .filter(WorkflowRunModel.organization_id == organization_id)
                         .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                         .filter(WorkflowRunModel.debug_session_id.is_(None))
-                        .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                        .filter(WorkflowRunModel.ember_session_id.is_(None))
                         .filter(~task_run_exists)
                     )
                     if folder_access_filter is not None:
@@ -2396,11 +2394,11 @@ class WorkflowRunsRepository(BaseRepository):
                             session, max(remaining_budget_seconds, _RUNS_LIST_EXHAUSTED_BUDGET_SECONDS)
                         )
                     fallback_result = await execute_list_query(fallback_query)
-                    rows.extend(dict(row) for row in fallback_result.mappings().all())
+                    rows.extend(fallback_result.mappings().all())
                 rows.sort(key=lambda row: row["created_at"], reverse=True)
-                rows = rows[offset : offset + page_size]
+                return [dict(row) for row in rows[offset : offset + page_size]]
 
-            return rows
+            return [dict(row) for row in result.mappings().all()]
 
     @read_retry()
     @db_operation("get_workflow_run", log_errors=False)
@@ -3645,7 +3643,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
-                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .filter(WorkflowRunModel.ember_session_id.is_(None))
             )
             folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
             if folder_access_filter is not None:
@@ -3807,7 +3805,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
-                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .filter(WorkflowRunModel.ember_session_id.is_(None))
             )
             folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
             if folder_access_filter is not None:
@@ -3860,7 +3858,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.browser_session_id == browser_session_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
-                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .filter(WorkflowRunModel.ember_session_id.is_(None))
             )
             folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
             if folder_access_filter is not None:
@@ -3962,7 +3960,7 @@ class WorkflowRunsRepository(BaseRepository):
                     WorkflowRunModel.organization_id,
                     WorkflowRunModel.browser_session_id,
                     WorkflowRunModel.workflow_permanent_id,
-                    WorkflowRunModel.copilot_session_id,
+                    WorkflowRunModel.ember_session_id.label("copilot_session_id"),
                     WorkflowRunModel.status,
                     WorkflowRunModel.created_at,
                     WorkflowRunModel.finished_at,

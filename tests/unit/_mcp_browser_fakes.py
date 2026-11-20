@@ -17,12 +17,12 @@ from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import StaleFrameSelectionError
-from skyvern.forge.sdk.copilot.mcp_adapter import ReportedPageCrash
+from skyvern.forge.sdk.ember.mcp_adapter import ReportedPageCrash
 from skyvern.webeye import action_deadline
 from skyvern.webeye.browser_state import PageCrashRecord
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.runtime import AgentContext
+    from skyvern.forge.sdk.ember.runtime import AgentContext
 
 HANGING_PAGE_URL = "https://fixture.test/metrics"
 HANGING_BOUND_MS = 200

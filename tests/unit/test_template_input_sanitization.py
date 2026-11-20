@@ -687,7 +687,7 @@ class TestPageContentTrustBoundary:
             assert _PAGE_DATA_BEGIN not in rendered
 
     @pytest.mark.parametrize("template", ["check-user-goal", "check-user-goal-with-termination"])
-    def test_copilot_wrapped_user_authored_complete_criterion_remains_trusted(self, template: str) -> None:
+    def test_ember_wrapped_user_authored_complete_criterion_remains_trusted(self, template: str) -> None:
         criterion = "The user-authored success state is visible"
         main_goal = "Complete the user-authored workflow"
         unwrapped = unwrap_goal_fields(

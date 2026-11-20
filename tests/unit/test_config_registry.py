@@ -12,9 +12,9 @@ import structlog
 from skyvern.forge.sdk.api.llm import config_registry
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, _build_litellm_router
 from skyvern.forge.sdk.api.llm.model_usage import ModelUsageEvent, _emit_model_usage
-from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.ember.model_resolver import resolve_model_config
 from skyvern.forge.sdk.forge_log import _model_log_value, redact_registered_log_payload
 from skyvern.schemas import llm as llm_schemas
 from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
@@ -81,7 +81,7 @@ def test_real_router_serving_group_retains_only_its_configuration_provenance(
 
 
 @pytest.mark.parametrize("builtin", [True, False])
-def test_copilot_router_provider_model_retains_only_its_source_provenance(
+def test_ember_router_provider_model_retains_only_its_source_provenance(
     monkeypatch: pytest.MonkeyPatch, builtin: bool
 ) -> None:
     monkeypatch.setattr(config_registry.LLMConfigRegistry, "_configs", {})

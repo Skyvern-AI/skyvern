@@ -73,6 +73,7 @@ from skyvern.forge.taskv3.loop import (
     ActivityRecency,
     CompletionGate,
     DownloadSettle,
+    DownloadUntil,
     DownloadWait,
     LoopOutcome,
     SemanticCommitStats,
@@ -98,8 +99,10 @@ from skyvern.forge.taskv3.tools import (
     BlankWorkingPageGuard,
     DownloadFailureWatch,
     PageProvider,
+    RequestRecord,
     TotpPlaceholderResolver,
     apply_blank_page_guard,
+    apply_request_record,
     build_browser_tools,
 )
 from skyvern.forge.taskv3.turn_dom import TurnDomCapture
@@ -328,6 +331,7 @@ async def run_task_v3_agent_loop(
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     download_wait: DownloadWait | None = None,
+    download_until: DownloadUntil | None = None,
     download_settle: DownloadSettle | None = None,
     unsaved_downloads: UnsavedDownloads | None = None,
     native_download_attempt: NativeDownloadAttempt | None = None,
@@ -484,11 +488,18 @@ async def run_task_v3_agent_loop(
             return await recover_page(page)
 
     unseen_text = None if page_free else UnseenPageText()
+    # A block that only waits on downloads still gets what each frame received, without the failure facts and holds.
     failure_watch = (
         None
-        if page_free or download_settle is None
-        else DownloadFailureWatch(page_provider, refs, native_download_attempt=native_download_attempt)
+        if page_free or (download_settle is None and download_wait is None)
+        else DownloadFailureWatch(
+            page_provider,
+            refs,
+            native_download_attempt=native_download_attempt,
+            report_failures=download_settle is not None,
+        )
     )
+    download_facts = failure_watch.facts if failure_watch is not None and download_settle is not None else None
     browser_tools = (
         []
         if page_free
@@ -506,6 +517,7 @@ async def run_task_v3_agent_loop(
             unseen_text=unseen_text,
             download_failures=failure_watch,
             download_wait=download_wait,
+            download_until=download_until,
             recover_page=_recover if recover_page is not None else None,
         )
     )
@@ -737,7 +749,7 @@ async def run_task_v3_agent_loop(
         terminate_premise=_terminate_premise if premise_on else None,
         document_identity=None if page_free else document_identity,
         completion_gate=None if page_free else completion_gate,
-        download_facts=failure_watch.facts if failure_watch is not None else None,
+        download_facts=download_facts,
         error_code_mapping=error_code_mapping,
         intercepted_submissions=block_submissions,
         justify_stops=justify_on,
@@ -767,6 +779,10 @@ async def run_task_v3_agent_loop(
         + ([application_context.tool] if application_context else [])
         + [finish_tool]
     )
+    # Inside the guards and the answer audit, so listening starts only once a call runs: the audit's judge can take
+    # 20 s, and requests sent meanwhile are not this call's. Answers behind a refusal reach the model at the next turn.
+    request_record = None if page_free else RequestRecord(page_provider, refs)
+    apply_request_record(tools, request_record)
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
     # are appended here and would otherwise be able to inspect and act on a blank page.
     apply_blank_page_guard(tools, blank_page_guard)
@@ -886,6 +902,7 @@ async def run_task_v3_agent_loop(
             on_llm_call_exhausted=lambda error: llm_caller.emit_retry_chain_exhausted(error, prompt_name),
             activity=activity,
             submit_watch=None if page_free else submit_watch,
+            late_request_lines=None if request_record is None else request_record.late_lines,
             verification_blocker=verification_blocker,
             staged_downloads=staged_downloads,
             initial_navigation_status=initial_navigation_status,
@@ -918,6 +935,8 @@ async def run_task_v3_agent_loop(
         loop_ended = True
         if failure_watch is not None:
             failure_watch.close()
+        if request_record is not None:
+            request_record.close()
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
         # on the next block's first action.
         _exit_ctx = skyvern_context.current()

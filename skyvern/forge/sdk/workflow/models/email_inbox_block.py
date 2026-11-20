@@ -8,7 +8,7 @@ import httpx
 import structlog
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
+from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, EMBER_TEST_RUN_UNSUPPORTED_CODE
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory, resolve_run_download_id
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
@@ -24,7 +24,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.emails import (
-    CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON,
+    CONNECTED_ACCOUNT_EMBER_TEST_RUN_REASON,
     CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON,
     CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON,
     CONNECTED_ACCOUNT_RESAVE_REASON,
@@ -54,7 +54,7 @@ _CONNECTED_ACCOUNT_REFUSAL_CODES = frozenset(
     {
         "resave_required",
         "owner_unconfirmed",
-        "copilot_test_run_unsupported",
+        EMBER_TEST_RUN_UNSUPPORTED_CODE,
         "run_not_supported",
         "account_unavailable",
         "organize_failed",
@@ -458,11 +458,11 @@ class EmailInboxBlock(Block):
                             message="This run cannot use Connected Gmail to organize email. Start the workflow as a "
                             "person, or use a supported schedule or event trigger. Nothing was changed.",
                         )
-                    if refusal == GmailHopRefusal.copilot_test_run:
+                    if refusal == GmailHopRefusal.ember_test_run:
                         raise email.GmailAPIError(
                             status=403,
-                            code="copilot_test_run_unsupported",
-                            message=CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON,
+                            code=EMBER_TEST_RUN_UNSUPPORTED_CODE,
+                            message=CONNECTED_ACCOUNT_EMBER_TEST_RUN_REASON,
                         )
                     if refusal == GmailHopRefusal.run_not_supported:
                         raise email.GmailAPIError(

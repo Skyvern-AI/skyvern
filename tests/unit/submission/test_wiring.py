@@ -187,59 +187,11 @@ async def test_workflow_har_cleanup_does_not_schedule_submission_shadow_when_fla
     ):
         mock_app.BROWSER_MANAGER.get_browser_console_log = AsyncMock(return_value=b"")
         mock_app.BROWSER_MANAGER.get_har_data = AsyncMock(return_value=b'{"log":{"entries":[]}}')
-        mock_app.ARTIFACT_MANAGER.create_artifact = AsyncMock()
         mock_app.ARTIFACT_MANAGER.create_task_archive = AsyncMock()
 
-        await service.persist_har_data(browser_state, last_step, workflow, workflow_run)
         await service._persist_debug_artifacts_bundled(browser_state, last_step, workflow, workflow_run)
 
     assert scheduled == []
-
-
-@pytest.mark.asyncio
-async def test_workflow_standalone_har_schedules_submission_shadow_with_the_har_context() -> None:
-    service = WorkflowService()
-    browser_state = _browser_state()
-    last_step = _step()
-    workflow = _workflow()
-    workflow_run = _workflow_run()
-    har_data = b'{"log":{"entries":[]}}'
-    calls: list[str] = []
-    scheduled: list[dict[str, object]] = []
-
-    async def get_har_data(**_: object) -> bytes:
-        calls.append("har")
-        return har_data
-
-    def schedule_submission_signal_shadow(**kwargs: object) -> None:
-        calls.append("shadow")
-        scheduled.append(kwargs)
-
-    async def create_artifact(**_: object) -> None:
-        calls.append("artifact")
-
-    with (
-        patch("skyvern.forge.sdk.workflow.service.settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW", True),
-        patch(
-            "skyvern.forge.sdk.workflow.service.submission_shadow.schedule_submission_signal_shadow",
-            side_effect=schedule_submission_signal_shadow,
-        ),
-        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
-    ):
-        mock_app.BROWSER_MANAGER.get_har_data = AsyncMock(side_effect=get_har_data)
-        mock_app.ARTIFACT_MANAGER.create_artifact = AsyncMock(side_effect=create_artifact)
-
-        await service.persist_har_data(browser_state, last_step, workflow, workflow_run)
-
-    assert calls == ["har", "shadow", "artifact"]
-    assert scheduled == [
-        {
-            "har_data": har_data,
-            "browser_state": browser_state,
-            "last_step": last_step,
-            "workflow_run": workflow_run,
-        }
-    ]
 
 
 @pytest.mark.asyncio
@@ -317,19 +269,14 @@ async def test_wiring_persists_har_when_shadow_scheduler_setup_fails() -> None:
         agent_app.ARTIFACT_MANAGER.create_task_archive = AsyncMock()
         workflow_app.BROWSER_MANAGER.get_browser_console_log = AsyncMock(return_value=b"")
         workflow_app.BROWSER_MANAGER.get_har_data = AsyncMock(return_value=har_data)
-        workflow_app.ARTIFACT_MANAGER.create_artifact = AsyncMock()
         workflow_app.ARTIFACT_MANAGER.create_task_archive = AsyncMock()
 
         await agent.cleanup_browser_and_create_artifacts(True, last_step, task, browser_session_id="pbs_1")
-        await service.persist_har_data(browser_state, last_step, workflow, workflow_run)
         await service._persist_debug_artifacts_bundled(browser_state, last_step, workflow, workflow_run)
 
     agent_app.ARTIFACT_MANAGER.create_task_archive.assert_awaited_once_with(
         step=last_step,
         entries={"har.har": (ArtifactType.HAR, har_data)},
-    )
-    workflow_app.ARTIFACT_MANAGER.create_artifact.assert_awaited_once_with(
-        step=last_step, artifact_type=ArtifactType.HAR, data=har_data
     )
     workflow_app.ARTIFACT_MANAGER.create_task_archive.assert_awaited_once_with(
         step=last_step,

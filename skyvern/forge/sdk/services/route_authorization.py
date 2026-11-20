@@ -14,6 +14,11 @@ from skyvern.forge.sdk.services.request_principal import (
 
 LOG = structlog.get_logger()
 
+EMBER_READ_ACTION = "workflow_copilot.read"
+EMBER_MANAGE_ACTION = "workflow_copilot.manage"
+EMBER_UPDATE_ACTION = "workflow_copilot.update"
+EMBER_SUGGEST_ACTION = "workflow_copilot.suggest"
+
 ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.apply_run_tags": "workflow_run.update",
     "skyvern.forge.sdk.routes.agent_protocol.apply_workflow_tags": "workflow.update",
@@ -275,26 +280,26 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.webhooks.preview_webhook_replay": "webhook.read",
     "skyvern.forge.sdk.routes.webhooks.test_webhook": "webhook.test",
     "skyvern.forge.sdk.routes.webhooks.trigger_webhook_replay": "webhook.trigger",
-    "skyvern.forge.sdk.routes.workflow_copilot.list_workflow_copilot_chats": "workflow_copilot.read",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_apply_proposed_workflow": "workflow.update",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_cancel": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_chat_audio": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_chat_history": "workflow_copilot.read",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_chat_post": "workflow.update",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_clear_proposed_workflow": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_convert_yaml_to_blocks": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_credential_deletion": "credential.delete",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_credential_generate": "credential.create",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_credential_response": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_active": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_control": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_record": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_upload": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_disable_auto_accept": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_message_feedback": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_question_response": "workflow_copilot.manage",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_steer": "workflow.update",
-    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_suggest_goal": "workflow_copilot.suggest",
+    "skyvern.forge.sdk.routes.ember.list_ember_chats": EMBER_READ_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_apply_proposed_workflow": "workflow.update",
+    "skyvern.forge.sdk.routes.ember.ember_cancel": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_chat_audio": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_chat_history": EMBER_READ_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_chat_post": "workflow.update",
+    "skyvern.forge.sdk.routes.ember.ember_clear_proposed_workflow": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_convert_yaml_to_blocks": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_credential_deletion": "credential.delete",
+    "skyvern.forge.sdk.routes.ember.ember_credential_generate": "credential.create",
+    "skyvern.forge.sdk.routes.ember.ember_credential_response": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_demonstration_active": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_demonstration_control": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_demonstration_record": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_demonstration_upload": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_disable_auto_accept": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_message_feedback": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_question_response": EMBER_MANAGE_ACTION,
+    "skyvern.forge.sdk.routes.ember.ember_steer": "workflow.update",
+    "skyvern.forge.sdk.routes.ember.ember_suggest_goal": EMBER_SUGGEST_ACTION,
     "skyvern.forge.sdk.routes.workflow_run_groups.cancel_workflow_run_group": "workflow_run.cancel",
     "skyvern.forge.sdk.routes.workflow_run_groups.get_workflow_run_group": "workflow_run.read",
     "skyvern.forge.sdk.routes.workflow_run_groups.submit_workflow_run_group": "workflow.run",

@@ -20,6 +20,7 @@ import { toast } from "@/components/ui/use-toast";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useUpdateWorkflowFolderMutation } from "../hooks/useFolderMutations";
 import { useApplyWorkflowTagsMutation } from "../hooks/useWorkflowTagMutations";
+import { useWorkflowDeleteAccess } from "../hooks/useWorkflowDeleteAccess";
 import { useWorkflowRowActions } from "../hooks/useWorkflowRowActions";
 import { workflowEditorPath } from "../studioNavigation";
 import { Tag, TagKey } from "../types/tagTypes";
@@ -66,6 +67,8 @@ function WorkflowRowActions({
   // Right-click still targets the single clicked row; until SKY-11504 lets it act
   // on the whole selection, steer multi-select to the bulk Actions bar.
   const isMultiSelect = selectedCount > 1;
+  const deleteAccess = useWorkflowDeleteAccess();
+  const canDelete = deleteAccess.canDelete(workflow.original_created_by);
 
   const {
     clone,
@@ -244,6 +247,7 @@ function WorkflowRowActions({
       icon: <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />,
       destructive: true,
       disabled: isMultiSelect,
+      denied: canDelete ? undefined : { reason: deleteAccess.deniedReason },
       onSelect: () => setDeleteOpen(true),
     },
   );

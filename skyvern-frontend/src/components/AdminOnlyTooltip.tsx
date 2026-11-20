@@ -16,18 +16,25 @@ function AdminOnlyTooltip({
   allowed,
   children,
   className = "inline-flex",
+  reason = ADMIN_ONLY_REASON,
+  alwaysShowReason = false,
+  side,
 }: {
   allowed: boolean;
   children: ReactNode;
   className?: string;
+  reason?: string;
+  // For a reason that holds whatever the viewer's role, so it shows before or without permissions.
+  alwaysShowReason?: boolean;
+  side?: "top" | "bottom" | "left";
 }) {
   const { permissions } = usePageSlots();
 
   if (allowed) return children;
 
   const message =
-    permissions?.status === "ready"
-      ? ADMIN_ONLY_REASON
+    alwaysShowReason || permissions?.status === "ready"
+      ? reason
       : permissions?.status === "loading"
         ? PERMISSIONS_LOADING
         : undefined;
@@ -47,7 +54,7 @@ function AdminOnlyTooltip({
             {children}
           </div>
         </TooltipTrigger>
-        <TooltipContent>{message}</TooltipContent>
+        <TooltipContent side={side}>{message}</TooltipContent>
       </Tooltip>
     </TooltipProvider>
   );

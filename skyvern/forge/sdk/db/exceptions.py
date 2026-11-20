@@ -50,17 +50,17 @@ class RunsListSearchCanceled(Exception):
         self.statement_timeout_seconds = statement_timeout_seconds
 
 
-class CopilotTurnRunningError(Exception):
+class EmberTurnRunningError(Exception):
     """Another live turn holds the chat, and the new turn asked not to stop it."""
 
 
-class DuplicateCopilotTurnError(Exception):
+class DuplicateEmberTurnError(Exception):
     def __init__(self, turn_id: str) -> None:
         super().__init__(f"Copilot turn {turn_id} already owns this idempotency key")
         self.turn_id = turn_id
 
 
-CopilotProposalConflictReason = Literal[
+EmberProposalConflictReason = Literal[
     "token_changed",
     "candidate_missing",
     "metadata_invalid",
@@ -73,10 +73,10 @@ CopilotProposalConflictReason = Literal[
 ]
 
 
-class CopilotProposalConflictError(Exception):
+class EmberProposalConflictError(Exception):
     """The candidate changed after the caller read its owner/revision token."""
 
-    def __init__(self, message: str, *, reason: CopilotProposalConflictReason) -> None:
+    def __init__(self, message: str, *, reason: EmberProposalConflictReason) -> None:
         super().__init__(message)
         self.reason = reason
 

@@ -135,7 +135,7 @@ def test_create_workflow_route_returns_422(client: TestClient, monkeypatch: pyte
     assert BLOCK_LABEL in resp.json()["detail"]
 
 
-def test_copilot_convert_yaml_route_returns_400(client: TestClient) -> None:
+def test_ember_convert_yaml_route_returns_400(client: TestClient) -> None:
     resp = client.post(
         "/v1/workflow/copilot/convert-yaml-to-blocks",
         json={"workflow_definition_yaml": WAIT_BLOCK_YAML, "workflow_id": "wf_test"},

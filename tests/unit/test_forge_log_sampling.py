@@ -80,7 +80,7 @@ def test_structured_fields_are_not_duplicated_into_message() -> None:
     assert result["action_type"] == "click"
 
 
-def test_add_log_context_includes_copilot_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_add_log_context_includes_ember_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(skyvern_context, "current", lambda: SkyvernContext(copilot_session_id="chat_1"))
     result = add_log_context(None, "info", {"msg": "Handling action"})  # type: ignore[arg-type]
     assert result["copilot_session_id"] == "chat_1"

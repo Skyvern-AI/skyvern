@@ -8,12 +8,12 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 import structlog
-from sqlalchemy import exists, func, or_, select, text, update
+from sqlalchemy import Subquery, exists, func, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import aliased
 
-from skyvern.constants import DEFAULT_SCRIPT_RUN_ID, DEFAULT_WORKFLOW_TITLES
+from skyvern.constants import DEFAULT_SCRIPT_RUN_ID, DEFAULT_WORKFLOW_TITLES, EMBER_RUN_CREATOR
 from skyvern.exceptions import WorkflowPinnedByRunGroup
 from skyvern.forge import app
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy, declare_policy
@@ -54,7 +54,7 @@ from skyvern.forge.sdk.workflow.browser_action_policy_enrollment import (
 )
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
-from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR, Workflow, WorkflowDefinition
+from skyvern.forge.sdk.workflow.models.workflow import EMBER_TEST_WORKFLOW_CREATOR, Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.runtime_completion import carried_contract, with_contract
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflow_run_groups import WorkflowRunGroupStatus
@@ -67,9 +67,24 @@ LOG = structlog.get_logger()
 WORKFLOW_CREATION_LOCK_TIMEOUT_SECONDS = 10
 
 
-def _copilot_edited_for(organization_id: str | None, edited_by: str | None) -> str | None:
+def _ember_edited_for(organization_id: str | None, edited_by: str | None) -> str | None:
     # Copilot saves inside the live request of the person it works for; a background save records nobody.
-    return requesting_user_id(organization_id) if organization_id and edited_by == "copilot" else None
+    return requesting_user_id(organization_id) if organization_id and edited_by == EMBER_RUN_CREATOR else None
+
+
+def _first_version_subquery(organization_id: str, workflow_permanent_ids: set[str] | None = None) -> Subquery:
+    """Earliest non-test version per agent, deleted versions included: the row that names the agent's creator."""
+    query = select(
+        WorkflowModel.organization_id,
+        WorkflowModel.workflow_permanent_id,
+        func.min(WorkflowModel.version).label("min_version"),
+    ).where(
+        WorkflowModel.organization_id == organization_id,
+        or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR),
+    )
+    if workflow_permanent_ids is not None:
+        query = query.where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))
+    return query.group_by(WorkflowModel.organization_id, WorkflowModel.workflow_permanent_id).subquery()
 
 
 class WorkflowCreationLockTimeout(Exception):
@@ -259,7 +274,7 @@ class WorkflowsRepository(BaseRepository):
             .filter_by(workflow_permanent_id=workflow_permanent_id, organization_id=organization_id)
             .filter(WorkflowModel.workflow_id != workflow_id)
             .filter(WorkflowModel.deleted_at.is_(None))
-            .filter(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR))
+            .filter(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR))
             .filter(
                 WorkflowModel.version
                 > select(WorkflowModel.version).filter_by(workflow_id=workflow_id).scalar_subquery()
@@ -368,7 +383,7 @@ class WorkflowsRepository(BaseRepository):
                 folder_id=folder_id,
                 created_by=created_by,
                 edited_by=edited_by,
-                edited_for=_copilot_edited_for(organization_id, edited_by),
+                edited_for=_ember_edited_for(organization_id, edited_by),
                 build_source=build_source,
             )
             if workflow_permanent_id:
@@ -466,19 +481,19 @@ class WorkflowsRepository(BaseRepository):
             await session.commit()
 
     @db_operation("is_workflow_copilot_authored")
-    async def is_workflow_copilot_authored(self, workflow_permanent_id: str, organization_id: str) -> bool:
+    async def is_ember_authored(self, workflow_permanent_id: str, organization_id: str) -> bool:
         """Any saved version stamped by copilot marks the lineage. Test snapshots do not. The latest row is not a
         durable signal: user saves re-stamp created_by/edited_by. Deleted versions still count —
         provenance is historical."""
-        copilot_version_exists = (
+        ember_version_exists = (
             select(WorkflowModel.workflow_id)
             .filter_by(workflow_permanent_id=workflow_permanent_id, organization_id=organization_id)
-            .filter(or_(WorkflowModel.created_by == "copilot", WorkflowModel.edited_by == "copilot"))
-            .filter(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR))
+            .filter(or_(WorkflowModel.created_by == EMBER_RUN_CREATOR, WorkflowModel.edited_by == EMBER_RUN_CREATOR))
+            .filter(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR))
             .limit(1)
         )
         async with self.Session() as session:
-            return (await session.scalar(copilot_version_exists)) is not None
+            return (await session.scalar(ember_version_exists)) is not None
 
     @db_operation("get_workflow")
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow | None:
@@ -519,7 +534,7 @@ class WorkflowsRepository(BaseRepository):
             # saved-workflow resolution must not select an in-flight test snapshot.
             get_workflow_query = get_workflow_query.filter(
                 WorkflowModel.deleted_at.is_(None),
-                or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR),
+                or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR),
             )
         if organization_id:
             get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
@@ -563,20 +578,7 @@ class WorkflowsRepository(BaseRepository):
                 .group_by(WorkflowModel.organization_id, WorkflowModel.workflow_permanent_id)
                 .subquery()
             )
-            first_versions = (
-                select(
-                    WorkflowModel.organization_id,
-                    WorkflowModel.workflow_permanent_id,
-                    func.min(WorkflowModel.version).label("min_version"),
-                )
-                .where(
-                    WorkflowModel.organization_id == organization_id,
-                    WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids),
-                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR),
-                )
-                .group_by(WorkflowModel.organization_id, WorkflowModel.workflow_permanent_id)
-                .subquery()
-            )
+            first_versions = _first_version_subquery(organization_id, workflow_permanent_ids)
             result = await session.execute(
                 select(workflow_ids.c.workflow_permanent_id, WorkflowModel.created_by)
                 .select_from(workflow_ids)
@@ -665,7 +667,7 @@ class WorkflowsRepository(BaseRepository):
         if filter_deleted:
             get_workflows_query = get_workflows_query.filter(
                 WorkflowModel.deleted_at.is_(None),
-                or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR),
+                or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR),
             )
         if organization_id:
             get_workflows_query = get_workflows_query.filter_by(organization_id=organization_id)
@@ -710,9 +712,7 @@ class WorkflowsRepository(BaseRepository):
                 )
                 .where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))
                 .where(WorkflowModel.deleted_at.is_(None))
-                .where(
-                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
-                )
+                .where(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR))
                 .group_by(
                     WorkflowModel.workflow_permanent_id,
                 )
@@ -843,21 +843,20 @@ class WorkflowsRepository(BaseRepository):
                     WorkflowModel.organization_id,
                     WorkflowModel.workflow_permanent_id,
                     func.max(WorkflowModel.version).label("max_version"),
-                    func.min(WorkflowModel.version).label("min_version"),
                 )
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.deleted_at.is_(None))
-                .where(
-                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
-                )
+                .where(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR))
                 .group_by(
                     WorkflowModel.organization_id,
                     WorkflowModel.workflow_permanent_id,
                 )
                 .subquery()
             )
-            # Saves re-stamp created_by on each new version, so the true creator is the earliest version's row.
+            # Saves re-stamp created_by on each new version, so the true creator is the earliest version's row,
+            # found the same way as get_workflow_original_creators so the list and the delete check agree.
             origin = aliased(WorkflowModel)
+            first_versions = _first_version_subquery(organization_id)
             # Deleted versions still count toward when the agent was born, as in get_workflow_permanent_id_created_at.
             lineage = aliased(WorkflowModel)
             first_created_at = (
@@ -878,10 +877,15 @@ class WorkflowsRepository(BaseRepository):
                     & (WorkflowModel.version == subquery.c.max_version),
                 )
                 .join(
+                    first_versions,
+                    (first_versions.c.organization_id == subquery.c.organization_id)
+                    & (first_versions.c.workflow_permanent_id == subquery.c.workflow_permanent_id),
+                )
+                .join(
                     origin,
-                    (origin.organization_id == subquery.c.organization_id)
-                    & (origin.workflow_permanent_id == subquery.c.workflow_permanent_id)
-                    & (origin.version == subquery.c.min_version),
+                    (origin.organization_id == first_versions.c.organization_id)
+                    & (origin.workflow_permanent_id == first_versions.c.workflow_permanent_id)
+                    & (origin.version == first_versions.c.min_version),
                 )
                 .outerjoin(
                     FolderModel,
@@ -1056,7 +1060,7 @@ class WorkflowsRepository(BaseRepository):
                     self.debug_enabled,
                     is_template=workflow_model.workflow_permanent_id in template_permanent_ids,
                 )
-                workflow.original_created_by = original_created_by
+                workflow.set_original_created_by(original_created_by)
                 workflow.original_created_at = original_created_at
                 workflows.append(workflow)
             return workflows
@@ -1077,9 +1081,7 @@ class WorkflowsRepository(BaseRepository):
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.deleted_at.is_(None))
                 .where(WorkflowModel.browser_profile_id.is_(None))
-                .where(
-                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
-                )
+                .where(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR))
                 .values(browser_profile_id=browser_profile_id)
             )
             await session.commit()
@@ -1203,7 +1205,7 @@ class WorkflowsRepository(BaseRepository):
                     workflow.edited_by = cast(str | None, edited_by)
                     # A restore passes the original row's value back; a new save is stamped from the live request.
                     workflow.edited_for = (
-                        _copilot_edited_for(workflow.organization_id, workflow.edited_by)
+                        _ember_edited_for(workflow.organization_id, workflow.edited_by)
                         if edited_for is _UNSET
                         else cast(str | None, edited_for)
                     )
@@ -1246,9 +1248,7 @@ class WorkflowsRepository(BaseRepository):
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.version > expected_version)
                 .where(WorkflowModel.deleted_at.is_(None))
-                .where(
-                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
-                )
+                .where(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR))
                 .exists()
             )
             update_workflow_query = (
@@ -1334,9 +1334,7 @@ class WorkflowsRepository(BaseRepository):
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.version > expected_version)
                 .where(WorkflowModel.deleted_at.is_(None))
-                .where(
-                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
-                )
+                .where(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR))
                 .exists()
             )
             update_workflow_query = (
@@ -1600,7 +1598,7 @@ class WorkflowsRepository(BaseRepository):
                 workflow.edited_by = cast(str | None, edited_by)
                 # A restore passes the original row's value back; a new save is stamped from the live request.
                 workflow.edited_for = (
-                    _copilot_edited_for(workflow.organization_id, workflow.edited_by)
+                    _ember_edited_for(workflow.organization_id, workflow.edited_by)
                     if edited_for is _UNSET
                     else cast(str | None, edited_for)
                 )

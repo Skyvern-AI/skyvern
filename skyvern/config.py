@@ -137,6 +137,7 @@ class Settings(BaseSettings):
     VIDEO_COMPRESSION_TIMEOUT_SECONDS: float = 300.0
     VIDEO_FINAL_SYNC_TIMEOUT_SECONDS: float = 750.0
     HAR_PATH: str | None = "./har"
+    BROWSER_HAR_RECORDING_ENABLED: bool = True
     LOG_PATH: str = "./log"
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
