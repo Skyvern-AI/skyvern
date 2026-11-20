@@ -1341,6 +1341,7 @@ def _install_fake_context(monkeypatch: pytest.MonkeyPatch, values: dict[str, Any
     mock_app = MagicMock()
     mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
     mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+    mock_app.AGENT_FUNCTION.validate_block_execution = AsyncMock()
     monkeypatch.setattr("skyvern.forge.sdk.workflow.models.pdf_fill_block.app", mock_app)
     monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.app", mock_app)
     return context
