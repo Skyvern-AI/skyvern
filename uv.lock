@@ -3406,6 +3406,15 @@ wheels = [
 ]
 
 [[package]]
+name = "llm-prices"
+version = "1.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0d/08/f11310db506a4ce63e0ea220ede2a61980fd735ec0d232c14d7b9fc8810e/llm_prices-1.8.0.tar.gz", hash = "sha256:3212c251ee3ed66694b2c637dbb7fef4bd296958a3b33f8949a71e3ffe8865cd", size = 98387, upload-time = "2026-11-18T16:27:25.5Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3a/72/5211d6fa7715509835bbd1d498b0469bbe5db260da1394cdb2e54d6ee9aa/llm_prices-1.8.0-py3-none-any.whl", hash = "sha256:9bb73b94bf99a127e1eea60706b1c4672af6315b8980bd7e98bc354d80b6cebd", size = 82123, upload-time = "2026-11-18T16:27:24.079Z" },
+]
+
+[[package]]
 name = "lxml"
 version = "6.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -6908,6 +6917,7 @@ local = [
     { name = "lark" },
     { name = "libcst" },
     { name = "litellm" },
+    { name = "llm-prices" },
     { name = "onepassword-sdk" },
     { name = "openai" },
     { name = "opentelemetry-api" },
@@ -6976,6 +6986,7 @@ server = [
     { name = "lark" },
     { name = "libcst" },
     { name = "litellm" },
+    { name = "llm-prices" },
     { name = "onepassword-sdk" },
     { name = "openai" },
     { name = "openai-agents" },
@@ -7153,6 +7164,8 @@ requires-dist = [
     { name = "libcst", marker = "extra == 'server'", specifier = ">=1.9.0,<2" },
     { name = "litellm", marker = "extra == 'local'", specifier = ">=1.85.0" },
     { name = "litellm", marker = "extra == 'server'", specifier = ">=1.85.0" },
+    { name = "llm-prices", marker = "extra == 'local'", specifier = ">=1.8.0,<2" },
+    { name = "llm-prices", marker = "extra == 'server'", specifier = ">=1.8.0,<2" },
     { name = "onepassword-sdk", marker = "extra == 'local'", specifier = "==0.4.1" },
     { name = "onepassword-sdk", marker = "extra == 'server'", specifier = "==0.4.1" },
     { name = "openai", marker = "extra == 'local'", specifier = ">=1.68.2" },
