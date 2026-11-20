@@ -380,6 +380,7 @@ export type ConditionalBlock = WorkflowBlockBase & {
 
 export type TaskBlock = WorkflowBlockBase & {
   block_type: "task";
+  complete_verification?: boolean;
   url: string | null;
   title: string;
   navigation_goal: string | null;
@@ -568,6 +569,8 @@ export type DataExportBlock = WorkflowBlockBase & {
 
 export type ActionBlock = WorkflowBlockBase & {
   block_type: "action";
+  selector?: string | null;
+  ai_fallback?: "fallback" | "proactive";
   url: string | null;
   title: string;
   navigation_goal: string | null;
@@ -586,6 +589,8 @@ export type ActionBlock = WorkflowBlockBase & {
 
 export type NavigationBlock = WorkflowBlockBase & {
   block_type: "navigation";
+  complete_verification?: boolean;
+  complete_criterion_is_untrusted?: boolean;
   url: string | null;
   title: string;
   navigation_goal: string | null;
@@ -625,6 +630,8 @@ export type ExtractionBlock = WorkflowBlockBase & {
 
 export type LoginBlock = WorkflowBlockBase & {
   block_type: "login";
+  complete_verification?: boolean;
+  skip_saved_profile?: boolean;
   url: string | null;
   title: string;
   navigation_goal: string | null;

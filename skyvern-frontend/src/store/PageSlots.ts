@@ -59,7 +59,14 @@ export type ConnectedGmailFlow = Readonly<{
   // A message to show for a failed attempt; a cancelled sign-in has none.
   failure: string | null;
   // Active connections, named as the Integrations page names them.
-  connections: ReadonlyArray<Readonly<{ connection_id: string; name: string }>>;
+  connections: ReadonlyArray<
+    Readonly<{
+      connection_id: string;
+      name: string;
+      // The masked account, set when a user-chosen name leads.
+      email_address?: string | null;
+    }>
+  >;
   start: () => void;
 }>;
 

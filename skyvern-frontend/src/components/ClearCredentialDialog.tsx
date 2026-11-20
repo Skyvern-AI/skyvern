@@ -16,6 +16,9 @@ type Props = {
   disabled: boolean;
   isPending: boolean;
   onConfirm: () => void;
+  // When set, the dialog is opened from elsewhere (such as a menu item) and renders no trigger button.
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 };
 
 export function ClearCredentialDialog({
@@ -25,8 +28,19 @@ export function ClearCredentialDialog({
   disabled,
   isPending,
   onConfirm,
+  open: controlledOpen,
+  onOpenChange,
 }: Props) {
-  const [open, setOpen] = useState(false);
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+  const controlled = controlledOpen !== undefined;
+  const open = controlled ? controlledOpen : uncontrolledOpen;
+  const setOpen = (next: boolean) => {
+    if (controlled) {
+      onOpenChange?.(next);
+    } else {
+      setUncontrolledOpen(next);
+    }
+  };
 
   const handleConfirm = () => {
     onConfirm();
@@ -35,11 +49,13 @@ export function ClearCredentialDialog({
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button type="button" variant="destructive" disabled={disabled}>
-          {label}
-        </Button>
-      </DialogTrigger>
+      {controlled ? null : (
+        <DialogTrigger asChild>
+          <Button type="button" variant="destructive" disabled={disabled}>
+            {label}
+          </Button>
+        </DialogTrigger>
+      )}
       {/* z-[60]: this dialog can be nested inside another Dialog (cloud
           integrations tile); all overlays/contents share z-50, so paint order
           otherwise depends on portal DOM order alone. */}

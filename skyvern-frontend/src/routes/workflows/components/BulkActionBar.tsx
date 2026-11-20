@@ -1,5 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { useState } from "react";
+import { DisabledReasonMenuItem } from "@/components/DisabledReasonMenuItem";
 import { FolderIcon } from "@/components/icons/FolderIcon";
 import { GarbageIcon } from "@/components/icons/GarbageIcon";
 import { SelectionBar } from "@/components/SelectionBar";
@@ -33,6 +34,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { strToU8, zipSync } from "fflate";
 import { stringify as convertToYAML } from "yaml";
 import { convert } from "../editor/workflowEditorUtils";
+import { useWorkflowDeleteAccess } from "../hooks/useWorkflowDeleteAccess";
 import { Tag, TagKey } from "../types/tagTypes";
 import { WorkflowApiResponse } from "../types/workflowTypes";
 import { FolderPickerCommand } from "./FolderPickerCommand";
@@ -113,6 +115,10 @@ function BulkActionBar({
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const count = selectedWorkflows.length;
+  const deleteAccess = useWorkflowDeleteAccess();
+  const canDeleteAll = selectedWorkflows.every((workflow) =>
+    deleteAccess.canDelete(workflow.original_created_by),
+  );
   const nonTemplates = selectedWorkflows.filter(
     (workflow) => !workflow.is_template,
   );
@@ -402,13 +408,22 @@ function BulkActionBar({
             </DropdownMenuPortal>
           </DropdownMenuSub>
           <DropdownMenuSeparator />
-          <DropdownMenuItem
-            className="text-destructive focus:text-destructive"
-            onSelect={() => onDeleteRequest()}
-          >
-            <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
-            Delete {count}
-          </DropdownMenuItem>
+          {canDeleteAll ? (
+            <DropdownMenuItem
+              className="text-destructive focus:text-destructive"
+              onSelect={() => onDeleteRequest()}
+            >
+              <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
+              Delete {count}
+            </DropdownMenuItem>
+          ) : (
+            <DisabledReasonMenuItem
+              item={DropdownMenuItem}
+              icon={<GarbageIcon className="mr-2 h-4 w-4 text-destructive" />}
+              label={`Delete ${count}`}
+              reason={deleteAccess.bulkDeniedReason}
+            />
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
     </SelectionBar>
