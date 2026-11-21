@@ -4053,6 +4053,11 @@ async def upload_file(
         prompt = _render_template_with_label(prompt, label)
     if path:
         path = _render_template_with_label(path, label)
+    # Read from the current definition, not the generated call: a cached script outlives edits to this switch.
+    definition = _find_block_definition(
+        block_validation_output.workflow.workflow_definition.blocks, block_validation_output.label
+    )
+    google_drive_save_as_sheet = isinstance(definition, FileUploadBlock) and definition.google_drive_save_as_sheet
     file_upload_block = FileUploadBlock(
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
@@ -4068,6 +4073,7 @@ async def upload_file(
         azure_blob_container_name=azure_blob_container_name,
         google_credential_id=google_credential_id,
         google_drive_folder_id=google_drive_folder_id,
+        google_drive_save_as_sheet=google_drive_save_as_sheet,
         sftp_host=sftp_host,
         sftp_port=sftp_port,
         sftp_username=sftp_username,

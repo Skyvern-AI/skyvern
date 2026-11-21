@@ -3755,6 +3755,7 @@ class AgentFunction:
                     access_token=destination.google_access_token,
                     file_path=file_path,
                     folder_id=destination.google_drive_folder_id,
+                    save_as_sheet=destination.google_drive_save_as_sheet,
                 )
             except google_drive_service.GoogleDriveAPIError as exc:
                 explained = google_drive_service.explain_access_error(exc, operation="upload")

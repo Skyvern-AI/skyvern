@@ -222,6 +222,7 @@ from skyvern.forge.sdk.executor.run_liveness import (
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.drive_shared_drive_search import drive_shared_drive_search_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
+from skyvern.forge.sdk.experimentation.sheets_save_as_sheet import sheets_save_as_sheet_enabled
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     run_honors_chosen_engine,
     task_v3_disabled,
@@ -12937,6 +12938,7 @@ class FileDestinationBlock(Block):
         *,
         access_token: str,
         folder_id: str | None,
+        google_drive_save_as_sheet: bool,
     ) -> FileUploadDestination:
         uri = (
             f"https://drive.google.com/drive/folders/{folder_id}"
@@ -12949,6 +12951,7 @@ class FileDestinationBlock(Block):
             sdk_uri=uri,
             google_access_token=access_token,
             google_drive_folder_id=folder_id,
+            google_drive_save_as_sheet=google_drive_save_as_sheet,
         )
 
     def _build_sftp_destination(
@@ -12996,6 +12999,7 @@ class FileDestinationBlock(Block):
         organization_id: str | None,
         workflow_run_context: WorkflowRunContext,
         google_access_token: str | None = None,
+        google_drive_save_as_sheet: bool = False,
     ) -> list[str]:
         uploaded_uris: list[str] = []
         if not files_to_upload:
@@ -13093,11 +13097,17 @@ class FileDestinationBlock(Block):
                 google_access_token = drive_access
 
             folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id)
+            if google_drive_save_as_sheet and not await sheets_save_as_sheet_enabled(org_id):
+                raise ValueError(
+                    "Save as Google Sheet is not available for this organization. "
+                    "Turn it off on this File Upload block to upload the original files."
+                )
             for file_path in files_to_upload:
                 LOG.info("Uploading file to Google Drive customer storage", file_path=file_path)
                 destination = self._build_google_drive_destination(
                     access_token=google_access_token,
                     folder_id=folder_id,
+                    google_drive_save_as_sheet=google_drive_save_as_sheet,
                 )
                 customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
                     file_path=file_path,
@@ -13492,6 +13502,7 @@ class FileUploadBlock(FileDestinationBlock):
     block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
 
     storage_type: FileStorageType = FileStorageType.S3
+    google_drive_save_as_sheet: bool = False
 
     def get_all_parameters(
         self,
@@ -13697,6 +13708,7 @@ class FileUploadBlock(FileDestinationBlock):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
                 workflow_run_context=workflow_run_context,
+                google_drive_save_as_sheet=self.google_drive_save_as_sheet,
             )
 
         except Exception as e:

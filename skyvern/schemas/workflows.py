@@ -717,6 +717,7 @@ class FileUploadDestination(BaseModel):
 
     google_access_token: str | None = None
     google_drive_folder_id: str | None = None
+    google_drive_save_as_sheet: bool = False
     sftp_host: str | None = None
     sftp_port: int | None = None
     sftp_username: str | None = None
@@ -1358,6 +1359,7 @@ class FileUploadBlockYAML(BlockYAML):
         json_schema_extra=_connected_account_field(acts=True, storage_type=FileStorageType.GOOGLE_DRIVE.value),
     )
     google_drive_folder_id: str | None = None
+    google_drive_save_as_sheet: bool = False
     sftp_host: str | None = None
     sftp_port: int | None = None
     sftp_username: str | None = None

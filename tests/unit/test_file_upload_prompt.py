@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
@@ -27,6 +28,7 @@ from skyvern.forge.sdk.workflow.models.block import FileUploadBlock, Unsupported
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
 from skyvern.schemas.workflows import BlockStatus, FileStorageType, FileUploadBlockYAML
+from skyvern.services import script_service
 from tests.unit.helpers import make_pdf
 
 
@@ -574,32 +576,77 @@ def test_file_upload_yaml_conversion_preserves_prompt() -> None:
     assert block.prompt == "Only upload invoices."
 
 
-@pytest.mark.parametrize("prompt", ["Only upload invoices.", ""])
-def test_generated_script_emits_prompt_when_set(prompt: str) -> None:
-    statement = _build_file_upload_statement(
-        {
-            "label": "upload",
-            "parameters": [],
-            "storage_type": "s3",
-            "prompt": prompt,
-        }
-    )
+@pytest.mark.parametrize("prompt", ["Only upload invoices.", "", None])
+def test_generated_script_emits_prompt_only_when_set(prompt: str | None) -> None:
+    block: dict[str, Any] = {"label": "upload", "parameters": [], "storage_type": "s3"}
+    if prompt is not None:
+        block["prompt"] = prompt
+    statement = _build_file_upload_statement(block)
     await_expression = statement.body[0].value
     assert isinstance(await_expression, cst.Await)
     assert isinstance(await_expression.expression, cst.Call)
-    prompt_arg = next(
+    prompt_args = [
         arg for arg in await_expression.expression.args if arg.keyword is not None and arg.keyword.value == "prompt"
+    ]
+
+    if prompt is None:
+        assert prompt_args == []
+        return
+    assert isinstance(prompt_args[0].value, cst.SimpleString)
+    assert prompt_args[0].value.evaluated_value == prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_setting", [True, False])
+async def test_cached_upload_follows_the_workflows_current_save_as_sheet_setting(
+    monkeypatch: pytest.MonkeyPatch, current_setting: bool
+) -> None:
+    script_block = {
+        "label": "upload",
+        "parameters": [],
+        "storage_type": "google_drive",
+        "google_drive_save_as_sheet": not current_setting,
+    }
+    statement = _build_file_upload_statement(script_block)
+    call = statement.body[0].value.expression
+    script_kwargs = {
+        arg.keyword.value: ast.literal_eval(cst.Module(body=[]).code_for_node(arg.value))
+        for arg in call.args
+        if arg.keyword is not None
+    }
+    current_definition = FileUploadBlock(
+        label="upload",
+        output_parameter=_output_parameter(),
+        storage_type=FileStorageType.GOOGLE_DRIVE,
+        google_drive_save_as_sheet=current_setting,
     )
+    executed: list[FileUploadBlock] = []
 
-    assert isinstance(prompt_arg.value, cst.SimpleString)
-    assert prompt_arg.value.evaluated_value == prompt
+    async def record_execution(self: FileUploadBlock, **_: object) -> SimpleNamespace:
+        executed.append(self)
+        return SimpleNamespace(status=BlockStatus.completed, failure_reason=None)
 
+    monkeypatch.setattr(
+        script_service,
+        "_validate_and_get_output_parameter",
+        AsyncMock(
+            return_value=script_service.BlockValidationOutput(
+                context=SimpleNamespace(parent_workflow_run_block_id=None),
+                label="upload",
+                output_parameter=_output_parameter(),
+                input_parameters=[],
+                workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[current_definition])),
+                workflow_id="w_1",
+                workflow_run_id="wr_1",
+                organization_id="o_1",
+            )
+        ),
+    )
+    monkeypatch.setattr(script_service.FileUploadBlock, "execute_safe", record_execution)
 
-def test_generated_script_omits_absent_prompt() -> None:
-    statement = _build_file_upload_statement({"label": "upload", "parameters": [], "storage_type": "s3"})
-    code = cst.Module(body=[statement]).code
+    await script_service.upload_file(**script_kwargs)
 
-    assert "prompt=" not in code
+    assert [block.google_drive_save_as_sheet for block in executed] == [current_setting]
 
 
 def test_file_upload_selection_prompt_renders_filenames_as_contained_json_data() -> None:

@@ -235,6 +235,7 @@ class WorkflowDefinitionYamlBlocksItem_FileUpload(UniversalBaseModel):
     azure_folder_path: typing.Optional[str] = None
     google_credential_id: typing.Optional[str] = None
     google_drive_folder_id: typing.Optional[str] = None
+    google_drive_save_as_sheet: typing.Optional[bool] = None
     sftp_host: typing.Optional[str] = None
     sftp_port: typing.Optional[int] = None
     sftp_username: typing.Optional[str] = None
