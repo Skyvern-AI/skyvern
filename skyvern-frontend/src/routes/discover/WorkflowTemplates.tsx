@@ -173,6 +173,7 @@ function WorkflowTemplates({ folderId }: { folderId?: string | null } = {}) {
                   { asNewWorkflow: true },
                 ),
                 folder_id: folderId,
+                mask_secrets: true,
                 _via: TEMPLATE_VIA,
               });
             }}
