@@ -283,12 +283,44 @@ def _deepcopy_element_tree(element_tree: list[dict]) -> list[dict]:
 # These input types carry page-authored label or constant text in `value`, not user input.
 _INPUT_TYPES_WITH_PAGE_VALUE = frozenset({"button", "submit", "reset", "checkbox", "radio", "image"})
 _TEXT_ENTRY_INPUT_TYPES = frozenset({"text", "email", "search", "tel", "url", "password", "number"})
+# A host wrapping one of these keeps a page constant (a radio or checkbox choice, a hidden id), not a typed value.
+_INPUT_TYPES_WITHOUT_USER_VALUE = _INPUT_TYPES_WITH_PAGE_VALUE | {"hidden"}
+_USER_VALUE_HOST_TYPES = _TEXT_ENTRY_INPUT_TYPES | {
+    "date",
+    "datetime-local",
+    "time",
+    "month",
+    "week",
+    "range",
+    "file",
+    "color",
+}
 # Roles whose value the user sets; widgets with these roles mirror it in the aria value attributes.
 _VALUE_ENTRY_ROLES = frozenset({"textbox", "combobox", "searchbox", "spinbutton", "slider"})
 # Of those, the roles whose text is the typed value; a combobox or slider shows an option label or a thumb instead.
 _TEXT_ENTRY_ROLES = frozenset({"textbox", "searchbox", "spinbutton"})
 # Attributes that mirror a control's current value (the OTP serializer in domUtils treats the same set).
 _VALUE_MIRROR_ATTRIBUTES = ("aria-valuenow", "aria-valuetext", "data-value", "defaultvalue")
+
+
+def _has_text_entry_field(element: dict) -> bool:
+    """Whether the element's own subtree, up to the next custom element, holds a text input or textarea."""
+    seen: set[int] = set()
+    pending: list[Any] = list(element.get("children") or [])
+    while pending:
+        child = pending.pop()
+        if not isinstance(child, dict) or id(child) in seen:
+            continue
+        seen.add(id(child))
+        tag = str(child.get("tagName", "")).lower()
+        attributes = child.get("attributes")
+        input_type = str(attributes.get("type") or "text").lower() if isinstance(attributes, dict) else "text"
+        if tag == "textarea" or (tag == "input" and input_type not in _INPUT_TYPES_WITHOUT_USER_VALUE):
+            return True
+        children = child.get("children")
+        if "-" not in tag and isinstance(children, list):
+            pending.extend(children)
+    return False
 
 
 def _holds_input_value(element: dict, attributes: dict, editable: bool) -> bool:
@@ -299,8 +331,11 @@ def _holds_input_value(element: dict, attributes: dict, editable: bool) -> bool:
         return str(attributes.get("type") or "text").lower() not in _INPUT_TYPES_WITH_PAGE_VALUE
     if editable or str(attributes.get("role", "")).lower() in _VALUE_ENTRY_ROLES:
         return True
-    # A custom element text field can reflect its typed value into `value`; other `value`s on custom tags are constants.
-    return "-" in tag and str(attributes.get("type", "")).lower() in _TEXT_ENTRY_INPUT_TYPES
+    # A custom element text field can reflect its typed value into `value`; the scraper nests its open shadow root's
+    # field under it. Other `value`s on custom tags are constants.
+    return "-" in tag and (
+        str(attributes.get("type", "")).lower() in _USER_VALUE_HOST_TYPES or _has_text_entry_field(element)
+    )
 
 
 def _input_value_marker(value: Any) -> Any:
