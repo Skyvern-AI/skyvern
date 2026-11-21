@@ -6,7 +6,7 @@ import html
 import json
 import re
 import urllib.parse
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import Any
 
 import structlog
@@ -17,6 +17,7 @@ from skyvern.utils.raw_secret_redaction import (
     is_hex_credential,
     iter_auth_scheme_credentials,
     iter_jwt_runs,
+    percent_decoded,
 )
 
 LOG = structlog.get_logger()
@@ -95,20 +96,69 @@ _NORMALIZED_HEADER_NAMES = frozenset(_normalized_name(name) for name in SENSITIV
 _NORMALIZED_QUERY_PARAM_NAMES = frozenset(_normalized_name(name) for name in SENSITIVE_QUERY_PARAM_NAMES)
 _NORMALIZED_FORM_FIELD_NAMES = frozenset(_normalized_name(name) for name in SENSITIVE_FORM_FIELD_NAMES)
 _URL_HEADER_NAMES = frozenset({"referer", "location", "contentlocation", ":path"})
-_BRACKETED_PART_RE = re.compile(r"\[([^\[\]]*)\]")
+_NAME_PART_SEPARATOR_RE = re.compile(r"[\[\]$:.]+")
+# A twin of a listed name (`new_password`, `password_confirmation`, `password2`) still has the listed name as its exact
+# residue once these closed modifier words and trailing digits come off; nothing else may sit in the name.
+_TWIN_PREFIXES = ("new", "old", "current", "confirm", "repeat", "retype", "verify", "user", "account", "login", "re")
+_TWIN_SUFFIXES = ("confirmation", "confirmed", "confirm", "again", "repeat", "verify", "verification")
+_DIGITS = frozenset("0123456789")
+# No form field name is this long; a longer one is checked for exact membership only, which keeps the twin check cheap.
+_MAX_TWIN_NAME_CHARS = 256
 
 
 def _leaf_name(name: str) -> str:
-    """The field a structured form name ends in: `user[password]` and `a[b][token]` by the last non-empty bracket,
-    `ctl00$Password` after the last `$`."""
-    if name.endswith("]"):
-        leaves = [part for part in _BRACKETED_PART_RE.findall(name) if part]
-        name = leaves[-1] if leaves else name.split("[", 1)[0]
-    return name.rpartition("$")[2]
+    """The field a structured name ends in: the last non-empty part after `[`, `]`, `$`, `:` or `.`
+    (`user[password]`, `a[b][token]`, `ctl00$Password`, `form1:password`, `login.password`)."""
+    parts = [part for part in _NAME_PART_SEPARATOR_RE.split(name) if part]
+    return parts[-1] if parts else name
+
+
+@functools.lru_cache(maxsize=8)
+def _name_lengths(normalized_names: frozenset[str]) -> tuple[int, ...]:
+    return tuple(sorted({len(name) for name in normalized_names}))
+
+
+@functools.lru_cache(maxsize=4096)
+def _is_listed_or_twin(normalized: str, normalized_names: frozenset[str]) -> bool:
+    """Collects the positions reachable by stripping modifier words from the front and from the back, then looks for
+    a listed name between two such positions. Linear in the name, with no regex to backtrack."""
+    if normalized in normalized_names:
+        return True
+    size = len(normalized)
+    if size > _MAX_TWIN_NAME_CHARS or not any(name in normalized for name in normalized_names):
+        return False
+    starts = {0}
+    pending = [0]
+    while pending:
+        index = pending.pop()
+        for word in _TWIN_PREFIXES:
+            if normalized.startswith(word, index) and index + len(word) not in starts:
+                starts.add(index + len(word))
+                pending.append(index + len(word))
+    ends = {size}
+    pending = [size]
+    while pending:
+        index = pending.pop()
+        candidates = [index - len(word) for word in _TWIN_SUFFIXES if normalized.endswith(word, 0, index)]
+        if index and normalized[index - 1] in _DIGITS:
+            candidates.append(index - 1)
+        for candidate in candidates:
+            if candidate not in ends:
+                ends.add(candidate)
+                pending.append(candidate)
+    lengths = _name_lengths(normalized_names)
+    return any(
+        start + length in ends and normalized[start : start + length] in normalized_names
+        for start in starts
+        for length in lengths
+    )
 
 
 def _is_sensitive_name(name: str, normalized_names: frozenset[str]) -> bool:
-    return _normalized_name(name) in normalized_names or _normalized_name(_leaf_name(name)) in normalized_names
+    decoded = percent_decoded(name)
+    return _is_listed_or_twin(_normalized_name(decoded), normalized_names) or _is_listed_or_twin(
+        _normalized_name(_leaf_name(decoded)), normalized_names
+    )
 
 
 def _is_sensitive_header_name(name: str) -> bool:
@@ -120,47 +170,44 @@ def _is_sensitive_header_name(name: str) -> bool:
 
 
 _JSON_STRING_BODY = r'(?:[^"\\]|\\.)*'
-# Whole string tokens or runs between them, so a scan never restarts inside a string: linear on any input.
-_JSON_TEXT_TOKEN_RE = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"?|[^"]+')
-_JSON_KEY_SEPARATOR_RE = re.compile(r"(\s*:\s*)(-?[0-9][0-9.eE+-]*)?")
-_JSON_NUMBER_RE = re.compile(r"-?[0-9][0-9.eE+-]*")
-_JSON_STRUCTURE_PIECE_RE = re.compile(r"[\[\]{}]|-?[0-9][0-9.eE+-]*|[^\[\]{}0-9-]+|-")
-_JSON_OPENERS = frozenset("{[")
-_JSON_CLOSERS = frozenset("}]")
 _DIGEST_RESPONSE_VALUE_RE = re.compile(r'(?:\\?")?[^"\\,\r\n]{0,256}')
 _JSON_TEXT_LEADING_CHARS = "\ufeff \t\r\n"
-_MAX_PERCENT_DECODE_ROUNDS = 3
 _TRAILING_EXTENSION_RE = re.compile(r"\.[A-Za-z0-9]{1,5}\Z")
 # A quoted or `=`-delimited value, so the text scan applies the same whole-value hex rule as the parsed walk.
 _DELIMITED_HEX_VALUE_RE = re.compile(r'(?<=")[0-9A-Fa-f]{32,}(?=\\?")|(?<==)[0-9A-Fa-f]{32,}(?![A-Za-z0-9_.~%+-])')
 _MAX_BASE64_POST_DATA_CHARS = 16 * 1024 * 1024
-_BASE64_HEAD_CHARS = 4096
+# Urlencoding encodes both, so raw whitespace or a quote means the text is not urlencoded.
+_NOT_URLENCODED_RE = re.compile(r'[\s"]')
 
 
-def _name_alternatives(names: frozenset[str]) -> str:
-    """Pattern text for the sensitive names under the same normalization: any case, an optional `_` or `-` anywhere."""
-    normalized = sorted({_normalized_name(name) for name in names}, key=len, reverse=True)
-    return "|".join("[_-]?".join(re.escape(char) for char in name) for name in normalized)
+@dataclasses.dataclass(frozen=True)
+class _NamedValueScrub:
+    """Blanks the value of each `name=value` pair in unparsed text whose name the parsed path's name rule flags.
+    The pattern only finds bounded candidate names, so it stays linear; the name rule decides."""
+
+    pattern: re.Pattern[str]
+    is_sensitive: Callable[[str], bool]
+
+    def scrub(self, text: str) -> str:
+        return self.pattern.sub(
+            lambda m: m.group(1) + REDACTED_SECRET_PLACEHOLDER if self.is_sensitive(m.group("name")) else m.group(),
+            text,
+        )
 
 
-_SENSITIVE_NAME_VALUE_PAIR_RE = re.compile(
-    r'("name"\s*:\s*"(?:x[_-]?)?(?:'
-    + _name_alternatives(SENSITIVE_HEADER_NAMES | SENSITIVE_FORM_FIELD_NAMES)
-    + r')"\s*,\s*"value"\s*:\s*")'
-    + _JSON_STRING_BODY,
-    re.IGNORECASE,
+_NAME_CHARS = r"A-Za-z0-9_.\-\[\]$:%"
+_URLENCODED_NAME_VALUE_RE = re.compile(rf"(?<![{_NAME_CHARS}])((?P<name>[{_NAME_CHARS}]{{1,128}})=)[^&#\"\s\\]*")
+_NAME_VALUE_PAIR_RE = re.compile(r'("name"\s*:\s*"(?P<name>[^"\\]{1,256})"\s*,\s*"value"\s*:\s*")' + _JSON_STRING_BODY)
+_SENSITIVE_NAME_VALUE_PAIR_SCRUB = _NamedValueScrub(_NAME_VALUE_PAIR_RE, _is_sensitive_header_name)
+_NAMED_FORM_VALUE_SCRUB = _NamedValueScrub(
+    _URLENCODED_NAME_VALUE_RE, lambda name: _is_sensitive_name(name, _NORMALIZED_FORM_FIELD_NAMES)
+)
+_NAMED_QUERY_VALUE_SCRUB = _NamedValueScrub(
+    _URLENCODED_NAME_VALUE_RE, lambda name: _is_sensitive_name(name, _NORMALIZED_QUERY_PARAM_NAMES)
 )
 _JSON_VALUE_FIELD_RE = re.compile(r'("value"\s*:\s*")' + _JSON_STRING_BODY)
 _COOKIES_ARRAY_START_RE = re.compile(r'"cookies"\s*:\s*\[')
 _JSON_ARRAY_TOKEN_RE = re.compile(r'"' + _JSON_STRING_BODY + r'"?|[\[\]]|[^"\[\]]+')
-
-
-def _named_urlencoded_value_re(names: frozenset[str]) -> re.Pattern[str]:
-    return re.compile(r"(?<![A-Za-z0-9_.\-])((?:" + _name_alternatives(names) + r")=)[^&#\"\s\\]*", re.IGNORECASE)
-
-
-_NAMED_FORM_VALUE_RE = _named_urlencoded_value_re(SENSITIVE_FORM_FIELD_NAMES)
-_NAMED_QUERY_VALUE_RE = _named_urlencoded_value_re(SENSITIVE_QUERY_PARAM_NAMES)
 
 # Source constants: BitwardenConstants.TOTP, OnePasswordConstants.TOTP, AzureVaultConstants.TOTP.
 _TOTP_SENTINEL_VALUES = frozenset({"BW_TOTP", "OP_TOTP", "AZ_TOTP"})
@@ -404,9 +451,7 @@ def redact_har_bytes(
                     post_data = request.get("postData", {})
                     if isinstance(post_data, dict):
                         _redact_form_fields(post_data.get("params", []))
-                        _redact_urlencoded_post_data_text(post_data)
-                        _redact_json_post_data_text(post_data)
-                        _redact_base64_post_data_text(post_data)
+                        _redact_post_data_text(post_data)
                     redact_body(post_data)
                 if isinstance(response, dict):
                     _redact_headers(response.get("headers", []))
@@ -473,8 +518,8 @@ def redact_console_log_bytes(
 
 def _pattern_scrub_har_text(text: str) -> str:
     """Name-based HAR scrub for text that does not parse as JSON; errs toward removing values."""
-    text = _SENSITIVE_NAME_VALUE_PAIR_RE.sub(lambda m: m.group(1) + REDACTED_SECRET_PLACEHOLDER, text)
-    text = _NAMED_FORM_VALUE_RE.sub(lambda m: m.group(1) + REDACTED_SECRET_PLACEHOLDER, text)
+    text = _SENSITIVE_NAME_VALUE_PAIR_SCRUB.scrub(text)
+    text = _NAMED_FORM_VALUE_SCRUB.scrub(text)
     text = _redact_credential_shapes_in_text(text)
     parts: list[str] = []
     position = 0
@@ -513,7 +558,7 @@ _HAR_REDACTION_STATE: contextvars.ContextVar[_HarRedactionState | None] = contex
 )
 
 
-def _pattern_scrub_urlencoded(text: str, pattern: re.Pattern[str]) -> str:
+def _pattern_scrub_urlencoded(text: str, pattern: _NamedValueScrub) -> str:
     state = _HAR_REDACTION_STATE.get()
     if state is None:
         LOG.warning("Urlencoded HAR value did not parse; storing it with a pattern scrub", artifact_type="har")
@@ -526,7 +571,7 @@ def _pattern_scrub_urlencoded(text: str, pattern: re.Pattern[str]) -> str:
             multi_field_totp=state.multi_field_totp,
             placeholder_ids=state.placeholder_ids,
         ).decode()
-    return pattern.sub(lambda m: m.group(1) + REDACTED_SECRET_PLACEHOLDER, text)
+    return pattern.scrub(text)
 
 
 def _redact_headers(headers: Any) -> None:
@@ -559,14 +604,21 @@ def _is_sensitive_pair(name: Any, value: Any, normalized_names: frozenset[str]) 
     return isinstance(value, str) and has_credential_shape(value)
 
 
+def _is_bare_credential_name(name: Any, value: Any) -> bool:
+    """A blank-valued pair is often a bare token parsed as a name (`?<jwt>`), so the name is what gets replaced."""
+    return value == "" and isinstance(name, str) and has_credential_shape(name)
+
+
 def _redact_query_string(query_string: Any) -> None:
     if not isinstance(query_string, list):
         return
     for query_param in query_string:
-        if isinstance(query_param, dict) and _is_sensitive_pair(
-            query_param.get("name"), query_param.get("value"), _NORMALIZED_QUERY_PARAM_NAMES
-        ):
+        if not isinstance(query_param, dict):
+            continue
+        if _is_sensitive_pair(query_param.get("name"), query_param.get("value"), _NORMALIZED_QUERY_PARAM_NAMES):
             query_param["value"] = REDACTED_SECRET_PLACEHOLDER
+        elif _is_bare_credential_name(query_param.get("name"), query_param.get("value")):
+            query_param["name"] = REDACTED_SECRET_PLACEHOLDER
 
 
 def _redact_form_fields(params: Any) -> None:
@@ -580,10 +632,12 @@ def _redact_form_fields(params: Any) -> None:
         # A JSON body posted under a form mime type is parsed into one param whose name is the whole body.
         for key in ("name", "value"):
             if isinstance(field.get(key), str) and _looks_like_json(field[key]):
-                field[key] = _scrub_json_text(field[key])
+                field[key] = _scrub_json_text(field[key]) or REDACTED_SECRET_PLACEHOLDER
+        if _is_bare_credential_name(field.get("name"), field.get("value")):
+            field["name"] = REDACTED_SECRET_PLACEHOLDER
 
 
-def _redact_named_urlencoded_values(text: str, normalized_names: frozenset[str], fallback: re.Pattern[str]) -> str:
+def _redact_named_urlencoded_values(text: str, normalized_names: frozenset[str], fallback: _NamedValueScrub) -> str:
     try:
         pairs = urllib.parse.parse_qsl(text, keep_blank_values=True)
     except Exception:
@@ -595,6 +649,9 @@ def _redact_named_urlencoded_values(text: str, normalized_names: frozenset[str],
         if _is_sensitive_pair(name, value, normalized_names):
             redacted_pairs.append((name, REDACTED_SECRET_PLACEHOLDER))
             changed = True
+        elif _is_bare_credential_name(name, value):
+            redacted_pairs.append((REDACTED_SECRET_PLACEHOLDER, ""))
+            changed = True
         else:
             redacted_pairs.append((name, value))
     if not changed:
@@ -605,34 +662,21 @@ def _redact_named_urlencoded_values(text: str, normalized_names: frozenset[str],
         return _pattern_scrub_urlencoded(text, fallback)
 
 
-def _percent_decoded(text: str) -> str:
-    for _ in range(_MAX_PERCENT_DECODE_ROUNDS):
-        decoded = urllib.parse.unquote(text)
-        if decoded == text:
-            break
-        text = decoded
-    return text
-
-
-def _path_piece_has_credential(piece: str) -> bool:
-    return has_credential_shape(_percent_decoded(piece))
-
-
 def _scrub_path_piece(piece: str) -> str:
-    """The decision reads the decoded piece, but the whole raw piece is replaced, keeping an extension the stem had."""
-    if not _path_piece_has_credential(piece):
-        return piece
+    """A credential stem keeps its extension (`<hex>.js` stays a `.js`); otherwise the whole raw piece is replaced."""
     extension = _TRAILING_EXTENSION_RE.search(piece)
-    if extension and _path_piece_has_credential(piece[: extension.start()]):
+    if extension and has_credential_shape(piece[: extension.start()]):
         return _path_placeholder(piece[: extension.start()]) + extension.group()
-    return _path_placeholder(piece)
+    if has_credential_shape(piece):
+        return _path_placeholder(piece)
+    return piece
 
 
 def _path_placeholder(token: str) -> str:
     state = _HAR_REDACTION_STATE.get()
     if state is None:
         return _PATH_SEGMENT_PLACEHOLDER
-    key = _percent_decoded(token)
+    key = percent_decoded(token)
     if key not in state.path_placeholders:
         state.path_placeholders[key] = f"{_PATH_SEGMENT_PLACEHOLDER}_{len(state.path_placeholders) + 1}"
     return state.path_placeholders[key]
@@ -648,7 +692,7 @@ def _scrub_url_path(path: str) -> str:
             if not separator:
                 pieces.append(_scrub_path_piece(param))
             elif not _PATH_PLACEHOLDER_RE.fullmatch(value) and (
-                _is_sensitive_pair(name, value, _NORMALIZED_QUERY_PARAM_NAMES) or _path_piece_has_credential(value)
+                _is_sensitive_pair(name, value, _NORMALIZED_QUERY_PARAM_NAMES)
             ):
                 pieces.append(f"{name}={_path_placeholder(value)}")
             else:
@@ -658,7 +702,7 @@ def _scrub_url_path(path: str) -> str:
 
 
 def _scrub_url_query(query: str) -> str:
-    return _redact_named_urlencoded_values(query, _NORMALIZED_QUERY_PARAM_NAMES, _NAMED_QUERY_VALUE_RE)
+    return _redact_named_urlencoded_values(query, _NORMALIZED_QUERY_PARAM_NAMES, _NAMED_QUERY_VALUE_SCRUB)
 
 
 def _scrub_url_fragment(fragment: str) -> str:
@@ -674,13 +718,13 @@ def _scrub_url_fragment(fragment: str) -> str:
     return _scrub_url_path(route) + _scrub_url_query(params)
 
 
-def _scrub_userinfo_password(netloc: str) -> str:
-    """`user:pass@host` keeps the user and host; the bracket-free placeholder keeps the authority parseable."""
+def _scrub_userinfo(netloc: str) -> str:
+    """The whole userinfo goes, since a token can occupy the username; the host stays, and the bracket-free
+    placeholder keeps the authority parseable."""
     userinfo, at, host = netloc.rpartition("@")
-    user, colon, password = userinfo.partition(":")
-    if not at or not colon or not password or password == _PATH_SEGMENT_PLACEHOLDER:
+    if not at or not userinfo or userinfo == _PATH_SEGMENT_PLACEHOLDER:
         return netloc
-    return f"{user}:{_PATH_SEGMENT_PLACEHOLDER}@{host}"
+    return f"{_PATH_SEGMENT_PLACEHOLDER}@{host}"
 
 
 def _scrub_url(url: str) -> str:
@@ -689,8 +733,8 @@ def _scrub_url(url: str) -> str:
     try:
         split_url = urllib.parse.urlsplit(url)
     except Exception:
-        return _redact_credential_shapes_in_text(_pattern_scrub_urlencoded(url, _NAMED_QUERY_VALUE_RE))
-    netloc = _scrub_userinfo_password(split_url.netloc)
+        return _redact_credential_shapes_in_text(_pattern_scrub_urlencoded(url, _NAMED_QUERY_VALUE_SCRUB))
+    netloc = _scrub_userinfo(split_url.netloc)
     path = _scrub_url_path(split_url.path)
     query = _scrub_url_query(split_url.query)
     fragment = _scrub_url_fragment(split_url.fragment)
@@ -699,17 +743,7 @@ def _scrub_url(url: str) -> str:
     try:
         return urllib.parse.urlunsplit((split_url.scheme, netloc, path, query, fragment))
     except Exception:
-        return _redact_credential_shapes_in_text(_pattern_scrub_urlencoded(url, _NAMED_QUERY_VALUE_RE))
-
-
-def _redact_urlencoded_post_data_text(post_data: dict[str, Any]) -> None:
-    mime_type = post_data.get("mimeType")
-    text = post_data.get("text")
-    if not isinstance(mime_type, str) or "application/x-www-form-urlencoded" not in mime_type.lower():
-        return
-    if post_data.get("encoding") == "base64" or not isinstance(text, str) or _looks_like_json(text):
-        return
-    post_data["text"] = _redact_named_urlencoded_values(text, _NORMALIZED_FORM_FIELD_NAMES, _NAMED_FORM_VALUE_RE)
+        return _redact_credential_shapes_in_text(_pattern_scrub_urlencoded(url, _NAMED_QUERY_VALUE_SCRUB))
 
 
 def _looks_like_json(text: str) -> bool:
@@ -737,74 +771,8 @@ def _scrub_json_value(node: Any, under_sensitive_key: bool) -> tuple[Any, bool]:
     return node, False
 
 
-def _json_key(token: str) -> str:
-    try:
-        key = json.loads(token if len(token) > 1 and token.endswith('"') else token + '"')
-    except ValueError:
-        return token[1:]
-    return key if isinstance(key, str) else token[1:]
-
-
-def _scrub_unparsed_json_text(text: str) -> str:
-    """Blanks the value under a sensitive key, and every string and number inside it when the value is a container."""
-    tokens = [match.group() for match in _JSON_TEXT_TOKEN_RE.finditer(text)]
-    placeholder = f'"{REDACTED_SECRET_PLACEHOLDER}"'
-    parts: list[str] = []
-    depth = 0
-    after_sensitive_key = False
-    value_is_next_string = False
-
-    def scan_structure(piece: str) -> str:
-        nonlocal depth
-        pieces: list[str] = []
-        for match in _JSON_STRUCTURE_PIECE_RE.finditer(piece):
-            part = match.group()
-            if part in _JSON_OPENERS:
-                depth += 1
-            elif part in _JSON_CLOSERS:
-                depth = max(depth - 1, 0)
-            elif depth and _JSON_NUMBER_RE.fullmatch(part):
-                part = placeholder
-            pieces.append(part)
-        return "".join(pieces)
-
-    for index, token in enumerate(tokens):
-        if token.startswith('"'):
-            following = tokens[index + 1] if index + 1 < len(tokens) else ""
-            is_key = _JSON_KEY_SEPARATOR_RE.match(following) is not None
-            if (depth and not is_key) or value_is_next_string:
-                parts.append(placeholder)
-            else:
-                parts.append(token)
-            value_is_next_string = False
-            after_sensitive_key = (
-                is_key and not depth and _is_sensitive_name(_json_key(token), _NORMALIZED_FORM_FIELD_NAMES)
-            )
-            continue
-        value_is_next_string = False
-        if not after_sensitive_key:
-            parts.append(scan_structure(token) if depth else token)
-            continue
-        after_sensitive_key = False
-        separator = _JSON_KEY_SEPARATOR_RE.match(token)
-        if separator is None:
-            parts.append(token)
-            continue
-        parts.append(separator.group(1))
-        rest = token[separator.end(1) :]
-        if separator.group(2):
-            parts.append(placeholder)
-            parts.append(rest[len(separator.group(2)) :])
-        elif not rest:
-            value_is_next_string = True
-        elif rest[0] in _JSON_OPENERS:
-            parts.append(scan_structure(rest))
-        else:
-            parts.append(rest)
-    return _redact_credential_shapes_in_text("".join(parts))
-
-
-def _scrub_json_text(text: str) -> str:
+def _scrub_json_text(text: str) -> str | None:
+    """The scrubbed text, or None when it does not parse: a caller withholds what it cannot scrub."""
     duplicate_keys = False
 
     def pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -815,48 +783,54 @@ def _scrub_json_text(text: str) -> str:
     try:
         body, changed = _scrub_json_value(json.loads(text.lstrip("﻿"), object_pairs_hook=pairs_hook), False)
     except (ValueError, RecursionError):
-        return _scrub_unparsed_json_text(text)
+        return None
     # A duplicate key's earlier value is dropped by parsing, so the text is rewritten even when nothing else changed.
     if changed or duplicate_keys:
         return json.dumps(body, ensure_ascii=False)
     return text
 
 
-def _redact_json_post_data_text(post_data: dict[str, Any]) -> None:
-    text = post_data.get("text")
-    if post_data.get("encoding") == "base64" or not isinstance(text, str):
-        return
-    mime_type = post_data.get("mimeType")
-    if _looks_like_json(text) or (isinstance(mime_type, str) and "json" in mime_type.lower()):
-        post_data["text"] = _scrub_json_text(text)
+def _scrubbed_body_text(mime_type: Any, text: str) -> str | None:
+    """The scrubbed body, or None when no parser reads all of it."""
+    if not text:
+        return text
+    mime = mime_type.lower() if isinstance(mime_type, str) else ""
+    # Urlencoded text is read first: its scrub can start the text with the `[REDACTED_SECRET]` name, which would look
+    # like JSON on the next pass.
+    if "application/x-www-form-urlencoded" in mime and not _NOT_URLENCODED_RE.search(text):
+        return _redact_named_urlencoded_values(text, _NORMALIZED_FORM_FIELD_NAMES, _NAMED_FORM_VALUE_SCRUB)
+    if "json" in mime or _looks_like_json(text):
+        return _scrub_json_text(text)
+    return None
 
 
-def _redact_base64_post_data_text(post_data: dict[str, Any]) -> None:
-    """Runs the urlencoded and JSON passes on the decoded body, re-encoding only when they changed it."""
-    text = post_data.get("text")
-    if post_data.get("encoding") != "base64" or not isinstance(text, str):
-        return
+def _strict_base64_text(text: str) -> str | None:
     if len(text) > _MAX_BASE64_POST_DATA_CHARS:
-        # Too large to decode here; a body the structural passes would read is withheld rather than stored unscrubbed.
-        try:
-            head: str | None = base64.b64decode(text[:_BASE64_HEAD_CHARS]).decode("utf-8", errors="ignore")
-        except ValueError:
-            head = None
-        mime_type = post_data.get("mimeType")
-        mime = mime_type.lower() if isinstance(mime_type, str) else ""
-        if head is None or "json" in mime or "application/x-www-form-urlencoded" in mime or _looks_like_json(head):
-            post_data.pop("encoding")
-            post_data["text"] = REDACTED_SECRET_PLACEHOLDER
-        return
+        return None
     try:
-        decoded = base64.b64decode(text, validate=True).decode("utf-8")
+        return base64.b64decode(text, validate=True).decode("utf-8")
     except ValueError:
+        return None
+
+
+def _redact_post_data_text(post_data: dict[str, Any]) -> None:
+    """Keeps a request body only when it is empty, JSON that parses, or plain urlencoded text, scrubbed; anything
+    else is withheld. The recorder stores no body text today, so this withholds nothing it writes."""
+    text = post_data.get("text")
+    if text is None or text in ("", REDACTED_SECRET_PLACEHOLDER):
         return
-    plain: dict[str, Any] = {"mimeType": post_data.get("mimeType"), "text": decoded}
-    _redact_urlencoded_post_data_text(plain)
-    _redact_json_post_data_text(plain)
-    if plain["text"] != decoded:
-        post_data["text"] = base64.b64encode(plain["text"].encode()).decode()
+    if not isinstance(text, str):
+        post_data.pop("encoding", None)
+        post_data["text"] = REDACTED_SECRET_PLACEHOLDER
+        return
+    encoded = post_data.get("encoding") == "base64"
+    decoded = _strict_base64_text(text) if encoded else text
+    scrubbed = _scrubbed_body_text(post_data.get("mimeType"), decoded) if decoded is not None else None
+    if scrubbed is None:
+        post_data.pop("encoding", None)
+        post_data["text"] = REDACTED_SECRET_PLACEHOLDER
+    elif scrubbed != decoded:
+        post_data["text"] = base64.b64encode(scrubbed.encode()).decode() if encoded else scrubbed
 
 
 def _redact_credential_shapes_in_text(text: str) -> str:

@@ -245,6 +245,7 @@ def test_redact_har_bytes_redacts_base64_bodies(monkeypatch: pytest.MonkeyPatch)
     body = f"token={secret}"
     large_json = base64.b64encode(json.dumps({"password": "big-secret-1", "pad": "x" * 80}).encode()).decode()
     large_binary = base64.b64encode(bytes(range(256))).decode()
+    padded_json = base64.b64encode((" " * 4000 + json.dumps({"password": "ws-prefix-secret"})).encode()).decode()
     har = {
         "log": {
             "entries": [
@@ -265,6 +266,10 @@ def test_redact_har_bytes_redacts_base64_bodies(monkeypatch: pytest.MonkeyPatch)
                     "request": {"postData": {"mimeType": "image/png", "encoding": "base64", "text": large_binary}},
                     "response": {},
                 },
+                {
+                    "request": {"postData": {"mimeType": "text/plain", "encoding": "base64", "text": padded_json}},
+                    "response": {},
+                },
             ]
         }
     }
@@ -276,11 +281,11 @@ def test_redact_har_bytes_redacts_base64_bodies(monkeypatch: pytest.MonkeyPatch)
 
     assert decoded_text == f"token={REDACTED_SECRET_PLACEHOLDER}"
     assert secret not in decoded_text
-    assert result["log"]["entries"][1]["request"]["postData"] == {
-        "mimeType": "text/plain",
-        "text": REDACTED_SECRET_PLACEHOLDER,
-    }
-    assert result["log"]["entries"][2]["request"]["postData"]["text"] == large_binary
+    for index, mime_type in ((1, "text/plain"), (2, "image/png"), (3, "text/plain")):
+        assert result["log"]["entries"][index]["request"]["postData"] == {
+            "mimeType": mime_type,
+            "text": REDACTED_SECRET_PLACEHOLDER,
+        }
     assert redact_har_bytes(once, {secret}) == once
 
 
@@ -411,11 +416,34 @@ def _har_entry(
                     ("X-Status", "Token expired"),
                     ("X-Note", "token 2024-11-20"),
                     ("X-Help", "send the token abc-12345 again"),
+                    ("X-Prose-1", "Bearer of bad news"),
+                    ("X-Prose-2", "Token unrecognized"),
+                    ("X-Prose-3", "Bearer authentication required"),
+                    ("X-Prose-4", "Token verification failed"),
+                    ("X-Short", "Bearer abcdefghijklmno"),
+                    ("X-Prose-5", "Token internationalization"),
                 ),
                 response_headers=(("WWW-Authenticate", 'Bearer realm="example"'),),
             ),
             [],
-            ["Basic Information", "Token expired", "token 2024-11-20", "token abc-12345", "Bearer realm="],
+            [
+                "Basic Information",
+                "Token expired",
+                "token 2024-11-20",
+                "token abc-12345",
+                "Bearer realm=",
+                "Bearer of bad news",
+                "Token unrecognized",
+                "Bearer authentication required",
+                "Token verification failed",
+                "Bearer abcdefghijklmno",
+                "Token internationalization",
+            ],
+        ),
+        (
+            _har_entry(headers=(("X-Custom", "Bearer abcdefghijklmnopqrstuvwxyz"),)),
+            ["abcdefghijklmnopqrstuvwxyz"],
+            [],
         ),
         (
             _har_entry(f"https://example.test/r?ref={_HEX40}&page=2", query=(("ref", _HEX40), ("page", "2"))),
@@ -428,11 +456,11 @@ def _har_entry(
                 f"?n={'1234' * 8}&w={'abcdef' * 6}&author=alice&credential_id=cred42",
                 query=(("author", "alice"), ("credential_id", "cred42")),
             ),
-            [],
+            [f"{'0f1e2d3c' * 4}"],
             [
                 _DASHED_UUID,
                 "/abc123/",
-                f"{'0f1e2d3c' * 4}.js",
+                "/REDACTED_SECRET_1.js?",
                 f"n={'1234' * 8}",
                 f"w={'abcdef' * 6}",
                 "author=alice",
@@ -502,8 +530,8 @@ def _har_entry(
             _har_entry(
                 post={"mimeType": "application/json", "text": '{"password": "broken-secret-1", "pin": 7788, "n": "kept'}
             ),
-            ["broken-secret-1", "7788"],
-            ["kept"],
+            ["broken-secret-1", "7788", "kept"],
+            ['"text": "[REDACTED_SECRET]"'],
         ),
         (
             _har_entry(
@@ -571,8 +599,8 @@ def _har_entry(
                     '"note": "after-nest", "count": 12,',
                 }
             ),
-            ["nest-secret-1", "4455", "arr-secret-1", "6677"],
-            ["current", "after-nest", '\\"count\\": 12'],
+            ["nest-secret-1", "4455", "arr-secret-1", "6677", "current", "after-nest"],
+            ['"text": "[REDACTED_SECRET]"'],
         ),
         (
             _har_entry(
@@ -592,9 +620,14 @@ def _har_entry(
             _har_entry(
                 "https://alice:userinfo-pass-1@example.test/a",
                 headers=(("Referer", "https://bob@example.test/b"),),
+                response_headers=(("Content-Location", "https://Ab3dEf6hIj9kLm2nOp5qRs8t@example.test/c"),),
             ),
-            ["userinfo-pass-1"],
-            ["https://alice:REDACTED_SECRET@example.test/a", "https://bob@example.test/b"],
+            ["userinfo-pass-1", "alice", "bob@", "Ab3dEf6hIj9kLm2nOp5qRs8t"],
+            [
+                "https://REDACTED_SECRET@example.test/a",
+                "https://REDACTED_SECRET@example.test/b",
+                "https://REDACTED_SECRET@example.test/c",
+            ],
         ),
         (
             _har_entry(
@@ -635,6 +668,123 @@ def _har_entry(
             [_HEX40, _HEX40_OTHER],
             ["/a/REDACTED_SECRET_1/b/REDACTED_SECRET_2/c/REDACTED_SECRET_1"],
         ),
+        (
+            _har_entry(
+                f"https://example.test/?v={_jwt('pqd').replace('.', '%252E')}",
+                headers=(("X-T", _jwt("phd").replace(".", "%2E")), ("X-H", "%30" + _HEX40[1:])),
+                post={"mimeType": "application/json", "text": json.dumps({"t": _jwt("pjd").replace(".", "%2E")})},
+            ),
+            [
+                _jwt("pqd").replace(".", "%252E"),
+                _jwt("phd").replace(".", "%2E"),
+                _jwt("pjd").replace(".", "%2E"),
+                "%30" + _HEX40[1:],
+            ],
+            [],
+        ),
+        (
+            _har_entry(
+                post={
+                    "mimeType": "application/x-www-form-urlencoded",
+                    "params": [
+                        {"name": name, "value": f"twin-{index}-secret"}
+                        for index, name in enumerate(
+                            [
+                                "user[password_confirmation]",
+                                "user[current_password]",
+                                "new_password",
+                                "confirm_password",
+                                "user_password",
+                                "form1:password",
+                                "login.password",
+                                "passwordConfirm",
+                                "password2",
+                            ]
+                        )
+                    ]
+                    + [
+                        {"name": name, "value": f"kept-{name}"}
+                        for name in ("password_hint", "token_type", "next_token", "passenger")
+                    ],
+                }
+            ),
+            [f"twin-{index}-secret" for index in range(9)],
+            ["kept-password_hint", "kept-token_type", "kept-next_token", "kept-passenger"],
+        ),
+        (
+            _har_entry(post={"mimeType": "application/json", "encoding": "base64", "text": '{"password":"leak-me"}'}),
+            ["leak-me"],
+            ['"text": "[REDACTED_SECRET]"'],
+        ),
+        (
+            _har_entry(
+                post={
+                    "mimeType": "multipart/form-data; boundary=b",
+                    "text": '--b\r\nContent-Disposition: form-data; name="password"\r\n\r\nmulti-secret-1\r\n--b--\r\n',
+                }
+            ),
+            ["multi-secret-1"],
+            ["multipart/form-data; boundary=b"],
+        ),
+        (
+            _har_entry(
+                post={"mimeType": "text/plain", "text": f"note with {_jwt('prose').replace('.', '%2E')} inside"}
+            ),
+            ["note with"],
+            ['"mimeType": "text/plain"'],
+        ),
+        (
+            _har_entry(
+                post={"mimeType": "application/x-www-form-urlencoded", "text": "user=alice&password=raw space secret"}
+            ),
+            ["raw space secret", "user=alice"],
+            ['"mimeType": "application/x-www-form-urlencoded"'],
+        ),
+        (
+            _har_entry(
+                post={"mimeType": "application/x-www-form-urlencoded", "params": [{"name": _jwt("blank"), "value": ""}]}
+            ),
+            [_jwt("blank")],
+            [],
+        ),
+        (
+            _har_entry(
+                headers=(
+                    ("X-C1", "Bearer ab%3Bcd1234567"),
+                    ("X-C2", "Bearer %22abcdef123456%22"),
+                    ("X-C3", "Bearer %7Bghijkl123456%7D"),
+                    ("X-C4", "%2" + _jwt("glued-2")),
+                    ("X-C5", "x%E" + _jwt("glued-e")),
+                ),
+                post={"mimeType": "application/json", "text": json.dumps({"a": "%2" + _jwt("glued-json")})},
+            ),
+            ["ab%3Bcd1234567", "abcdef123456", "ghijkl123456", _jwt("glued-2"), _jwt("glued-e"), _jwt("glued-json")],
+            [],
+        ),
+        (
+            _har_entry(post={"mimeType": "application/x-www-form-urlencoded", "text": f"{_jwt('bare-body')}&x=1"}),
+            [_jwt("bare-body")],
+            ["x=1"],
+        ),
+        (
+            _har_entry(post={"mimeType": "application/json", "text": {"password": "leak-me-dict"}}),
+            ["leak-me-dict"],
+            ['"text": "[REDACTED_SECRET]"'],
+        ),
+        (
+            _har_entry(
+                f"https://[example.test/?token{'1' * 40}x=kept-fallback&password{'1' * 40}=gone-fallback",
+                post={
+                    "mimeType": "application/x-www-form-urlencoded",
+                    "params": [
+                        {"name": "password" + "1" * 40, "value": "digit-twin-secret"},
+                        {"name": "token" + "1" * 40 + "x", "value": "kept-digit-run"},
+                    ],
+                },
+            ),
+            ["digit-twin-secret", "gone-fallback"],
+            ["kept-digit-run", "kept-fallback"],
+        ),
     ],
     ids=[
         "jwt-custom-request-header",
@@ -642,6 +792,7 @@ def _har_entry(
         "basic-custom-header",
         "digest-custom-header",
         "scheme-words-in-prose-survive",
+        "all-letters-bearer",
         "hex-query-value",
         "asset-hash-uuid-slug-and-names-survive",
         "jwt-path-segment",
@@ -672,6 +823,17 @@ def _har_entry(
         "structured-and-common-form-names",
         "field-names-as-header-names",
         "distinct-path-tokens-stay-distinct",
+        "percent-encoded-dots-jwt",
+        "name-twins",
+        "malformed-base64-post-data",
+        "unparsed-multipart-withheld",
+        "unparsed-prose-withheld",
+        "urlencoded-with-raw-whitespace-withheld",
+        "blank-valued-jwt-param",
+        "raw-and-decoded-shapes",
+        "bare-token-urlencoded-body-is-idempotent",
+        "non-string-body-withheld",
+        "long-digit-run-names",
     ],
 )
 def test_redact_har_bytes_scrubs_credentials_by_name_and_shape(
@@ -690,8 +852,9 @@ def test_redact_har_bytes_scrubs_credentials_by_name_and_shape(
     for fragment in kept:
         assert fragment in text
     assert redact_har_bytes(once, set()) == once
-    body = entry["request"].get("postData", {}).get("text", "")
-    if body.startswith(("{", "[")) and body.endswith(("}", "]")):
+    post = entry["request"].get("postData", {})
+    body = post.get("text", "")
+    if isinstance(body, str) and body.startswith(("{", "[")) and body.endswith(("}", "]")) and "encoding" not in post:
         json.loads(json.loads(once)["log"]["entries"][0]["request"]["postData"]["text"])
 
 
@@ -706,6 +869,8 @@ def test_redact_har_bytes_scrubs_sensitive_names_in_a_truncated_har() -> None:
                             {"name": "Accept", "value": "text/html"},
                             {"name": "Authorization", "value": "Bearer header-token-123"},
                             {"name": "X-Session-Assertion", "value": _jwt("truncated")},
+                            {"name": "X-Encoded-Assertion", "value": _jwt("trunc-pct").replace(".", "%2E")},
+                            {"name": "X-Glued-Assertion", "value": "%2" + _jwt("trunc-glued")},
                             {"name": "X-Upstream-Credential", "value": "Bearer trunc-bearer-9z"},
                             {"name": "X-API_KEY", "value": "trunc-apikey-1"},
                             {"name": "X-Trace-Sig", "value": _HEX40},
@@ -732,6 +897,8 @@ def test_redact_har_bytes_scrubs_sensitive_names_in_a_truncated_har() -> None:
     for leaked in (
         b"header-token-123",
         _jwt("truncated").encode(),
+        _jwt("trunc-pct").split(".")[1].encode(),
+        _jwt("trunc-glued").encode(),
         b"trunc-bearer-9z",
         b"trunc-apikey-1",
         b"trunc-camel-1",

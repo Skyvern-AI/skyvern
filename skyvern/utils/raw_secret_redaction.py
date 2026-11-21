@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import re
+import urllib.parse
 from collections.abc import Iterator
 from typing import TypeVar, cast
 
@@ -205,7 +206,11 @@ def is_secret_shaped(token: str) -> bool:
 
 # Credential shapes for stored network data. Unlike is_secret_shaped they match whole values only, so an asset name
 # such as `<hash>.js` and a mixed-case site key survive.
-_TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
+_TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9_.%\-]+")
+_MAX_PERCENT_DECODE_ROUNDS = 3
+# The whole value is one scheme and one token68 run, so a letters-only Bearer token counts once it is long enough.
+_WHOLE_SCHEME_TOKEN_RE = re.compile(r"\s*(bearer|token)\s+([A-Za-z0-9._~+/-]+=*)\s*", re.I)
+_MIN_WHOLE_SCHEME_TOKEN_CHARS = 16
 _JWT_JSON_PART_RE = re.compile(r"eyJ[A-Za-z0-9_-]{8,}")
 _HEX_CREDENTIAL_RE = re.compile(r"[0-9A-Fa-f]{32,}")
 AUTH_SCHEME_CREDENTIAL_RE = re.compile(
@@ -233,9 +238,25 @@ def _is_jwt_run(run: str) -> bool:
     )
 
 
+def percent_decoded(text: str) -> str:
+    """Decodes to a fixed point, at most three rounds; `unquote`, not `unquote_plus`, so a base64 `+` survives."""
+    for _ in range(_MAX_PERCENT_DECODE_ROUNDS):
+        decoded = urllib.parse.unquote(text)
+        if decoded == text:
+            break
+        text = decoded
+    return text
+
+
+def _carries_jwt(run: str) -> bool:
+    # Raw and decoded both count: a decode can consume the `e` of `eyJ` (`%2eyJ...`) or split a run.
+    return _is_jwt_run(run) or _is_jwt_run(percent_decoded(run))
+
+
 def iter_jwt_runs(text: str) -> Iterator[re.Match[str]]:
-    """Runs of token characters that carry a JWT anywhere, so `bearer.<jwt>`, `jwt_<jwt>` and `3D<jwt>` are one run."""
-    return (match for match in _TOKEN_RUN_RE.finditer(text) if _is_jwt_run(match.group()))
+    """Runs of token characters that carry a JWT anywhere, so `bearer.<jwt>`, `jwt_<jwt>` and `3D<jwt>` are one run.
+    A run is judged raw and decoded, so `%2E` separators count, and the raw run is what a caller replaces."""
+    return (match for match in _TOKEN_RUN_RE.finditer(text) if _carries_jwt(match.group()))
 
 
 def _is_basic_credential(encoded: str) -> bool:
@@ -285,12 +306,30 @@ def is_hex_credential(value: str) -> bool:
     )
 
 
-def has_credential_shape(value: str) -> bool:
+def _is_whole_scheme_token(value: str) -> bool:
+    match = _WHOLE_SCHEME_TOKEN_RE.fullmatch(value)
+    if match is None or len(match.group(2)) < _MIN_WHOLE_SCHEME_TOKEN_CHARS:
+        return False
+    token = match.group(2)
+    # A long word after `Token` is prose ("Token internationalization"), so that scheme needs a non-letter or an
+    # uppercase letter past the first, which a capitalized word does not have.
+    mixed_case = any(char.isupper() for char in token[1:]) and any(char.islower() for char in token)
+    return match.group(1).lower() == "bearer" or not token.isalpha() or mixed_case
+
+
+def _has_shape(value: str) -> bool:
     return (
         is_hex_credential(value)
-        or next(iter_jwt_runs(value), None) is not None
+        or any(_is_jwt_run(match.group()) for match in _TOKEN_RUN_RE.finditer(value))
         or _starts_with_auth_scheme_credential(value)
+        or _is_whole_scheme_token(value)
     )
+
+
+def has_credential_shape(value: str) -> bool:
+    """Judges the raw and the percent-decoded value, a match on either counts; callers replace the raw one."""
+    decoded = percent_decoded(value)
+    return _has_shape(value) or (decoded != value and _has_shape(decoded))
 
 
 def redact_secretlike_filename(name: str) -> str:
