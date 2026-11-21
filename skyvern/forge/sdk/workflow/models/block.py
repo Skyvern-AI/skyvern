@@ -14526,7 +14526,8 @@ class SendEmailBlock(Block):
                 raise _GmailSendRefused(
                     GmailSendErrorCode.CONFIGURATION,
                     "This Gmail account cannot send in a run started with an API key, or in a webhook, job recipe or "
-                    "directory submission run; use a natively connected Google account for those. Nothing was sent.",
+                    "directory submission run; use a natively connected Google account for those. For a scheduled run, "
+                    "open the schedule on the Schedules page and save it. Nothing was sent.",
                 )
             raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
         to = self._resolve_recipient_entries(self.recipients, workflow_run_context)

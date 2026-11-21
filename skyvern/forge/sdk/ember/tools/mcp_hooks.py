@@ -6,7 +6,7 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar
 from enum import StrEnum
 from typing import Any, get_args
@@ -14,8 +14,9 @@ from typing import Any, get_args
 import structlog
 import yaml
 from fastapi import HTTPException
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError, validate_call
 
+from skyvern.cli.core.client import reset_api_key_override, set_api_key_override
 from skyvern.cli.core.guards import VALID_WAIT_UNTIL
 from skyvern.cli.core.js_dispatch import outer_cap_seconds
 from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS, DEFAULT_DIRECT_ACTION_TIMEOUT_MS
@@ -26,6 +27,14 @@ from skyvern.cli.mcp_tools.blocks import (
     WORKFLOW_KNOWLEDGE_TOPIC_ALIASES,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
     _parse_knowledge_topics,
+)
+from skyvern.cli.mcp_tools.schedule import (
+    schedule_writes_override,
+    skyvern_schedule_cancel,
+    skyvern_schedule_create,
+    skyvern_schedule_disable,
+    skyvern_schedule_enable,
+    skyvern_schedule_update,
 )
 from skyvern.config import settings
 from skyvern.forge import app
@@ -79,6 +88,7 @@ from skyvern.forge.sdk.ember.runtime import (
     AgentContext,
     browser_valid_tab_count,
     current_demonstrated_action,
+    mcp_to_ember,
     tab_switch_refusal,
 )
 from skyvern.forge.sdk.ember.screenshot_utils import viewport_visible_effect
@@ -2534,21 +2544,87 @@ _SCHEDULE_ROLE_DENIED_ERROR = (
 
 
 def _schedule_denial_error(exc: HTTPException) -> str:
+    if isinstance(exc.detail, dict) and exc.detail.get("error_code") == "workflow_folder_access_denied":
+        return "Nothing was changed: ask a folder admin for edit access to this workflow's folder."
     message = exc.detail.get("message") if isinstance(exc.detail, dict) else exc.detail
     return f"Nothing was changed: {message}" if isinstance(message, str) and message else _SCHEDULE_ROLE_DENIED_ERROR
 
 
 def _schedule_role_pre_hook(action: str, inner: PreHook | None) -> PreHook:
-    # Schedule tools call the API with the org key, which the role check admits; judge the chat user instead.
+    # A route reached in-process or with the chat's key would not judge the chat user, so judge them here.
     async def pre_hook(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
         try:
-            await enforce_principal_role(get_request_principal(), action)
+            principal = await enforce_principal_role(get_request_principal(), action)
+            # The cloud folder guard is installed on the HTTP routes, which an in-process write never passes through;
+            # like it, check every resource the arguments name, not only the chat's workflow.
+            await app.AGENT_FUNCTION.enforce_folder_access_for_references(
+                principal, action, {**params, "workflow_permanent_id": ctx.workflow_permanent_id}
+            )
         except HTTPException as exc:
             return {"ok": False, "error": _schedule_denial_error(exc)}
         return await inner(params, ctx) if inner is not None else None
 
     # The tool-surface fingerprint reads pre-hooks by qualified name; name the action and inner hook in it.
     pre_hook.__qualname__ = f"{pre_hook.__qualname__}[{action}:{getattr(inner, '__qualname__', None)}]"
+    return pre_hook
+
+
+async def _run_schedule_write(
+    tool: Callable[..., Awaitable[dict[str, Any]]], ctx: AgentContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    # Over HTTP the write would carry the chat user's API key and mark the schedule key-made, which refuses its runs
+    # Connected Gmail; run in-process, the schedule is recorded as the chat's signed-in person.
+    # Circular import: schedule_writes imports the routes package, which imports the Copilot agent and these hooks.
+    from skyvern.forge.sdk.ember.schedule_writes import ChatRequestScheduleWrites, validation_errors
+
+    # Another member steered or answered this turn, or recorded or added to the demonstration it replays, so the write is
+    # not the starter's own request: it goes over HTTP with the turn's key, key-made for an API key and ownerless for the
+    # dashboard's session key, so either way its runs get no Connected Gmail.
+    # A context that cannot say whether it was steered is treated as steered.
+    steered = not isinstance(ctx, EmberContext) or ctx.steered_by_another
+    writes = None
+    if not steered:
+        organization = await app.DATABASE.organizations.get_organization(ctx.organization_id)
+        if organization is None:
+            return {"ok": False, "error": "Nothing was changed: this organization could not be loaded."}
+        writes = ChatRequestScheduleWrites(organization)
+    token = schedule_writes_override.set(writes)
+    key_token = set_api_key_override(ctx.api_key) if steered else None
+    try:
+        return await tool(workflow_permanent_id=ctx.workflow_permanent_id, **args)
+    # The shared tool turns every failure of its own call into a result, so this is argument validation, before a write.
+    except ValidationError as exc:
+        return {"ok": False, "error": f"Nothing was changed: invalid arguments {validation_errors(exc)}"}
+    finally:
+        if key_token is not None:
+            reset_api_key_override(key_token)
+        schedule_writes_override.reset(token)
+
+
+def _in_process_schedule_write(
+    tool: Callable[..., Awaitable[dict[str, Any]]], hidden: frozenset[str], inner: PreHook | None
+) -> PreHook:
+    # The write's result is returned as the pre-hook's refusal, so the adapter's dispatch, post-hook and timing log
+    # never run for it; the post-hook is applied here instead.
+    # The signature MCP registers the tool with, so arguments are checked as an MCP call would check them.
+    validated_tool = validate_call(tool)
+
+    async def pre_hook(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
+        if inner is not None and (refusal := await inner(params, ctx)) is not None:
+            return refusal
+        args = {key: value for key, value in params.items() if key not in hidden}
+        raw = await _run_schedule_write(validated_tool, ctx, args)
+        try:
+            return await _workflow_schedule_post_hook(mcp_to_ember(raw), raw, ctx)
+        except Exception:  # noqa: BLE001 - fails closed like the adapter's post_hook_fails_closed path
+            LOG.warning("Schedule write post-hook failed", tool=tool.__name__, exc_info=True)
+            outcome = "reported success" if raw.get("ok") else "reported an error"
+            return {
+                "ok": False,
+                "error": f"The schedule change reached the server, which {outcome}, but its result is withheld.",
+            }
+
+    pre_hook.__qualname__ = f"{pre_hook.__qualname__}[{tool.__name__}:{getattr(inner, '__qualname__', None)}]"
     return pre_hook
 
 
@@ -2560,12 +2636,18 @@ def _workflow_schedule_overlay(
     pre_hook: PreHook | None = None,
     mutates: bool = True,
     role_action: str | None = None,
+    in_process: Callable[..., Awaitable[dict[str, Any]]] | None = None,
 ) -> SchemaOverlay:
     if mutates and role_action is None:
         raise ValueError("A schedule write overlay needs role_action so the chat user's role is checked")
+    if in_process is not None and not mutates:
+        raise ValueError("An in-process schedule write must be a mutating overlay so its role is checked")
+    hidden = hide_params | {"workflow_permanent_id"}
+    if in_process is not None:
+        pre_hook = _in_process_schedule_write(in_process, hidden, pre_hook)
     return SchemaOverlay(
         description=description,
-        hide_params=hide_params | {"workflow_permanent_id"},
+        hide_params=hidden,
         param_patches=param_patches or {},
         binds_chat_workflow=True,
         requires_run_authority=mutates,
@@ -2993,6 +3075,7 @@ def _build_skyvern_mcp_overlays(
             },
             pre_hook=_create_workflow_schedule_pre_hook,
             role_action="workflow_schedule.create",
+            in_process=skyvern_schedule_create,
         ),
         "update_workflow_schedule": _workflow_schedule_overlay(
             "Change a schedule by wfs_ ID, passing only the fields that change; parameters, name and paused "
@@ -3012,20 +3095,24 @@ def _build_skyvern_mcp_overlays(
             },
             pre_hook=_schedule_parameters_credential_pre_hook,
             role_action="workflow_schedule.update",
+            in_process=skyvern_schedule_update,
         ),
         "enable_workflow_schedule": _workflow_schedule_overlay(
             "Resume a paused schedule by wfs_ ID. Ask which one when several could match.",
             pre_hook=_schedule_parameters_credential_pre_hook,
             role_action="workflow_schedule.update",
+            in_process=skyvern_schedule_enable,
         ),
         "disable_workflow_schedule": _workflow_schedule_overlay(
             "Pause a schedule by wfs_ ID without deleting it. Ask which one when several could match.",
             role_action="workflow_schedule.update",
+            in_process=skyvern_schedule_disable,
         ),
         "cancel_workflow_schedule": _workflow_schedule_overlay(
             "Cancel a one-time schedule by wfs_ ID before it fires; it stays listed with dispatch_status canceled. "
             "Pause or delete a recurring schedule instead. Ask which one when several could match.",
             role_action="workflow_schedule.cancel",
+            in_process=skyvern_schedule_cancel,
         ),
         "delete_workflow_schedule": _workflow_schedule_overlay(
             "Delete a schedule by wfs_ ID; irreversible. Pass force=true only when the user clearly asked to "

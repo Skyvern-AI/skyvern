@@ -133,6 +133,8 @@ class DemonstrationRecord:
     # The person who started the demonstration; None for an organization key, a bare scoped key, or a record from before
     # this was kept.
     human_user_id: str | None = None
+    # Another member sent a note, upload or browser control, so the replayed turn is not only the starter's request.
+    steered_by_another: bool = False
 
 
 @dataclass(frozen=True)
@@ -205,6 +207,7 @@ def encode_demonstration_record(record: DemonstrationRecord) -> str:
             "recording_started_at": record.recording_started_at.isoformat() if record.recording_started_at else None,
             "value_chars": record.value_chars,
             "human_user_id": record.human_user_id,
+            "steered_by_another": record.steered_by_another,
         },
         separators=(",", ":"),
     )
@@ -262,6 +265,7 @@ def decode_demonstration_record(raw: Any) -> DemonstrationRecord | None:
         replay_token=data.get("replay_token") if isinstance(data.get("replay_token"), str) else None,
         recording_started_at=_decode_timestamp(data.get("recording_started_at")),
         human_user_id=data.get("human_user_id") if isinstance(data.get("human_user_id"), str) else None,
+        steered_by_another=data.get("steered_by_another") is True,
     )
 
 
@@ -403,6 +407,8 @@ async def claim_demonstration_recording(
                 record.owner_seen_at = datetime.now(UTC)
                 record.stop_reason = None
                 record.final_url = None
+                # Someone else resuming the recording adds their own actions to the starter's demonstration.
+                record.steered_by_another = record.steered_by_another or human_user_id != record.human_user_id
                 await cache.set(
                     demonstration_record_key(organization_id, demonstration_id),
                     encode_demonstration_record(record),
@@ -480,6 +486,7 @@ async def append_demonstration_control(
     organization_id: str,
     request: EmberDemonstrationControlRequest,
     file_id: str | None = None,
+    requester_user_id: str | None = None,
 ) -> int:
     record_key = demonstration_record_key(organization_id, request.demonstration_id)
     controls_key = demonstration_controls_key(organization_id, request.demonstration_id)
@@ -527,6 +534,10 @@ async def append_demonstration_control(
             if file_id is not None:
                 entry["file_id"] = file_id
             controls.append(entry)
+            # The flag goes first, so a control that is queued is never missing it.
+            if requester_user_id != record.human_user_id and not record.steered_by_another:
+                record.steered_by_another = True
+                await cache.set(record_key, encode_demonstration_record(record), ex=DEMONSTRATION_TTL)
             await cache.set(controls_key, json.dumps(controls, separators=(",", ":")), ex=DEMONSTRATION_TTL)
             return seq
     await expire_demonstration_payload(

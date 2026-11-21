@@ -3274,6 +3274,13 @@ def _schedule_server(
     monkeypatch.setattr(mcp_hooks, "get_request_principal", lambda: requester)
     server = _make_server(ctx, payload, SchemaOverlay(), alias_map=get_skyvern_mcp_alias_map())
     server._overlays = _build_skyvern_mcp_overlays()
+
+    # Writes run in-process rather than over MCP; record them where the MCP calls are recorded.
+    async def run_schedule_write(tool: Any, ctx: AgentContext, args: dict[str, Any]) -> dict[str, Any]:
+        server._client.calls.append((tool.__name__, {**args, "workflow_permanent_id": ctx.workflow_permanent_id}))
+        return payload
+
+    monkeypatch.setattr(mcp_hooks, "_run_schedule_write", run_schedule_write)
     return server
 
 
