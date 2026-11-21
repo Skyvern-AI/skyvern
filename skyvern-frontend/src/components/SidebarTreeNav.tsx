@@ -36,6 +36,7 @@ type SidebarNavItem = {
   icon: ReactNode;
   external?: boolean;
   badge?: string;
+  active?: boolean;
   defaultOpen?: boolean | (() => boolean);
   initialVisibleChildren?: number;
   children?: Array<SidebarNavChild>;
@@ -385,7 +386,8 @@ function SidebarTreeNav({ items, collapsed: collapsedOverride }: Props) {
             childPathsWithQuerySiblings.has(normalizePath(child.to));
           return isActive(child.to, true, requireExactQuery);
         });
-        const itemIsActive = isActive(item.to, item.to === "/discover");
+        const itemIsActive =
+          item.active ?? isActive(item.to, item.to === "/discover");
         const active = itemIsActive || childIsActive;
         const hasChildren = item.children && item.children.length > 0;
         const open = openGroups[groupStorageKey] ?? resolveDefaultOpen(item);
