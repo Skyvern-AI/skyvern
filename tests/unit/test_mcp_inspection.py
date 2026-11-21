@@ -18,7 +18,7 @@ from tests.unit._mcp_browser_fakes import logged_request_failures
 from tests.unit._mcp_browser_fakes import make_page as _make_page
 from tests.unit._mcp_browser_fakes import make_session_state as _make_state
 from tests.unit._socket_closing_fixture import BODY_SENTINEL, socket_closing_fixture_page
-from tests.unit.copilot_test_helpers import skip_no_browser
+from tests.unit.ember_test_helpers import skip_no_browser
 
 
 def _patch(monkeypatch: pytest.MonkeyPatch, state: SessionState) -> None:

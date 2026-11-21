@@ -856,7 +856,7 @@ async def test_completed_run_bails_before_flag_check_and_db_reads() -> None:
 
 
 @pytest.mark.asyncio
-async def test_copilot_scoped_run_does_not_retry() -> None:
+async def test_ember_scoped_run_does_not_retry() -> None:
     workflow_run = _workflow_run(
         failure_category=[{"category": "AUTH_FAILURE"}],
         copilot_session_id="cs_1",

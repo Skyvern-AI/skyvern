@@ -17,6 +17,7 @@ import {
   getWorkflowBlocks,
   getWorkflowErrors,
   getUniqueLabelForExistingNode,
+  keepUneditedBlockFields,
   pendingGoalChangesOf,
   removeKeyFromNodesParameterKeys,
   replaceJinjaReferenceInNodes,
@@ -30,6 +31,7 @@ import {
 } from "./doc/docImageHandles";
 import { collectKnownErrorCodes } from "./nodes/StartNode/retryPolicyUtils";
 import { terminateNodeDefaultData } from "./nodes/TerminateNode/types";
+import { createBranchCondition } from "./nodes/ConditionalNode/types";
 
 function minimalTaskBlock(
   overrides: { engine?: RunEngine; engine_pinned?: boolean } = {},
@@ -576,6 +578,273 @@ describe("agent block load and save", () => {
       ]);
     },
   );
+});
+
+describe("editor save keeps unedited block fields", () => {
+  const block = (label: string, fields: Record<string, unknown>) => ({
+    label,
+    continue_on_failure: false,
+    next_loop_on_failure: false,
+    model: null,
+    parameters: [],
+    ...fields,
+  });
+  const code = (label: string, next: string | null = null) =>
+    block(label, {
+      block_type: "code",
+      code: `x = '${label}'`,
+      next_block_label: next,
+    });
+  const branch = (
+    expression: string | null,
+    next: string,
+    isDefault = false,
+  ) => ({
+    id: `${expression}-${next}`,
+    criteria: expression
+      ? { criteria_type: "jinja2_template", expression, description: null }
+      : null,
+    next_block_label: next,
+    description: null,
+    is_default: isDefault,
+  });
+  const workflow = (blocks: Array<unknown>, version = 2) =>
+    ({
+      proxy_location: ProxyLocation.Residential,
+      workflow_definition: { version, parameters: [], blocks },
+    }) as unknown as WorkflowApiResponse;
+  const gateBranches = [
+    branch("{{ a }}", "capture"),
+    branch("{{ b }}", "verify"),
+  ];
+  const ticket = [
+    block("login", {
+      block_type: "login",
+      title: "Log in to the site",
+      url: "https://example.com",
+      navigation_goal: "Log in",
+      complete_criterion: null,
+      terminate_criterion: null,
+      complete_verification: false,
+      skip_saved_profile: true,
+      parameters: [{ key: "account" }],
+      next_block_label: "gate",
+    }),
+    block("gate", {
+      block_type: "conditional",
+      next_block_label: null,
+      branch_conditions: gateBranches,
+    }),
+    block("capture", {
+      block_type: "extraction",
+      title: "Capture the details",
+      url: null,
+      data_extraction_goal: "Get the heading",
+      export_data_schema: null,
+      next_block_label: null,
+    }),
+    { ...code("verify"), model: { model_name: "" } },
+  ];
+  type Edit = (node: AppNode) => AppNode;
+  const editCode =
+    (label: string): Edit =>
+    (node) =>
+      node.data.label === label
+        ? ({ ...node, data: { ...node.data, code: "x = 'edited'" } } as AppNode)
+        : node;
+  const editData =
+    (label: string, data: Record<string, unknown>): Edit =>
+    (node) =>
+      node.data.label === label
+        ? ({ ...node, data: { ...node.data, ...data } } as AppNode)
+        : node;
+  // The branches editor adds a default branch on render to a conditional saved without one.
+  const withRenderedDefault: Edit = (node) =>
+    node.type === "conditional" && !node.data.branches.some((b) => b.is_default)
+      ? ({
+          ...node,
+          data: {
+            ...node.data,
+            branches: [
+              ...node.data.branches,
+              createBranchCondition({ is_default: true }),
+            ],
+          },
+        } as AppNode)
+      : node;
+  // The canvas is not rebuilt after a save, so it can hold an older version than the saved one.
+  const save = (saved: WorkflowApiResponse, edit: Edit, canvas = saved) => {
+    const { nodes, edges } = getElements(
+      canvas.workflow_definition.blocks,
+      SETTINGS,
+      true,
+    );
+    const blocks = keepUneditedBlockFields(
+      getWorkflowBlocks(nodes.map(withRenderedDefault).map(edit), edges),
+      saved,
+    );
+    const byLabel: Record<string, Record<string, unknown>> = {};
+    const index = (list: Array<unknown>) =>
+      list.forEach((item) => {
+        const built = item as Record<string, unknown>;
+        byLabel[built.label as string] = built;
+        if (Array.isArray(built.loop_blocks)) index(built.loop_blocks);
+      });
+    index(blocks);
+    return byLabel;
+  };
+
+  test.each([
+    {
+      name: "only one code block edited",
+      saved: workflow(ticket),
+      edit: editCode("verify"),
+      expected: {
+        verify: { code: "x = 'edited'", model: null },
+        login: {
+          title: "Log in to the site",
+          complete_criterion: null,
+          complete_verification: false,
+          skip_saved_profile: true,
+          parameter_keys: ["account"],
+        },
+        capture: {
+          title: "Capture the details",
+          url: null,
+          export_data_schema: null,
+        },
+        gate: { branch_conditions: gateBranches },
+      },
+    },
+    {
+      name: "a second save after the branch ids changed",
+      canvas: workflow(ticket),
+      saved: workflow(
+        ticket.map((saved) =>
+          saved.label === "gate"
+            ? {
+                ...saved,
+                branch_conditions: [
+                  { ...branch("{{ a }}", "capture"), id: "new-1" },
+                  { ...branch("{{ b }}", "verify"), id: "new-2" },
+                ],
+              }
+            : saved,
+        ),
+      ),
+      edit: editCode("verify"),
+      expected: {
+        gate: { branch_conditions: [{ id: "new-1" }, { id: "new-2" }] },
+      },
+    },
+    {
+      name: "a canvas built from an unsaved draft",
+      canvas: workflow(
+        ticket.map((saved) =>
+          saved.label === "login"
+            ? {
+                ...saved,
+                skip_saved_profile: false,
+                complete_verification: true,
+              }
+            : saved,
+        ),
+      ),
+      saved: workflow(ticket),
+      edit: editCode("verify"),
+      expected: {
+        login: { skip_saved_profile: false, complete_verification: true },
+      },
+    },
+    {
+      name: "export turned on over a null export schema",
+      saved: workflow(ticket),
+      edit: editData("capture", { exportEnabled: true }),
+      expected: {
+        capture: {
+          export_enabled: true,
+          export_data_schema: expect.anything(),
+        },
+      },
+    },
+    {
+      name: "renaming the merge target an existing default branch points to",
+      saved: workflow([
+        block("gate", {
+          block_type: "conditional",
+          next_block_label: "finish",
+          branch_conditions: [
+            branch("{{ a }}", "work"),
+            branch(null, "finish", true),
+          ],
+        }),
+        code("work", "finish"),
+        code("finish"),
+      ]),
+      edit: editData("finish", { label: "done" }),
+      expected: {
+        gate: {
+          branch_conditions: [
+            { next_block_label: "work" },
+            { next_block_label: "done" },
+          ],
+        },
+      },
+    },
+    {
+      name: "a v1 chain linked by list order",
+      saved: workflow([code("a"), code("b"), code("c")], 1),
+      edit: editCode("c"),
+      expected: {
+        a: { next_block_label: "b" },
+        b: { next_block_label: "c" },
+        c: { code: "x = 'edited'" },
+      },
+    },
+    {
+      name: "a conditional inside a loop",
+      saved: workflow([
+        block("loop", {
+          block_type: "for_loop",
+          loop_over: null,
+          loop_variable_reference: "{{ items }}",
+          next_block_label: "after",
+          loop_blocks: [
+            block("check", {
+              block_type: "conditional",
+              next_loop_on_failure: true,
+              next_block_label: null,
+              branch_conditions: [branch("{{ a }}", "inner")],
+            }),
+            block("inner", {
+              block_type: "extraction",
+              title: "Read the row",
+              url: null,
+              data_extraction_goal: "Read it",
+              next_block_label: null,
+            }),
+          ],
+        }),
+        code("after"),
+      ]),
+      edit: editCode("after"),
+      expected: {
+        check: { next_loop_on_failure: true },
+        inner: { title: "Read the row", url: null },
+      },
+    },
+  ] as Array<{
+    name: string;
+    saved: WorkflowApiResponse;
+    canvas?: WorkflowApiResponse;
+    edit: Edit;
+    expected: Record<string, Record<string, unknown>>;
+  }>)("$name", ({ saved, edit, canvas, expected }) => {
+    const byLabel = save(saved, edit, canvas);
+    for (const [label, fields] of Object.entries(expected)) {
+      expect(byLabel[label]).toMatchObject(fields);
+    }
+  });
 });
 
 function loadAndSave(

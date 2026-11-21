@@ -29,9 +29,12 @@ from skyvern.forge.log_redaction import (
     REDACTED,
     is_proxy_observability_key,
     is_sensitive_key,
+    is_url_log_key,
     redact_bearer_tokens_in_text,
     redact_proxy_observability_value,
     redact_sensitive_fields,
+    strip_url_queries_in_text,
+    strip_url_query,
 )
 from skyvern.forge.request_privacy import (
     PrivateRequestLogFilter,
@@ -1064,8 +1067,8 @@ def _registered_secret_scrubber(
     *, logging_envelope: bool = False, protocol_level: str | None = None
 ) -> Callable[[Any, int], Any] | None:
     placeholder, encoded_secret_variants, log_scrub_values = _secret_scrub_symbols()
-    copilot_values, short_values = log_scrub_values()
-    copilot_variants = set(copilot_values)
+    ember_values, short_values = log_scrub_values()
+    ember_variants = set(ember_values)
     # The line's own values are already replaced as text by then, so this pass needs no exclusion for them.
     short_scrub = _short_value_scrubber(short_values, placeholder)
     registered: set[str] = set()
@@ -1096,9 +1099,9 @@ def _registered_secret_scrubber(
     for value in registered:
         if isinstance(value, str) and value:
             run_variants.update(encoded_secret_variants(value))
-    if not copilot_variants and not run_variants and short_scrub is None:
+    if not ember_variants and not run_variants and short_scrub is None:
         return None
-    secrets = sorted(copilot_variants | run_variants, key=len, reverse=True)
+    secrets = sorted(ember_variants | run_variants, key=len, reverse=True)
     seen: set[int] = set()
     remaining = 10_000
 
@@ -1119,9 +1122,7 @@ def _registered_secret_scrubber(
             # A Copilot value replaces only a number that is the value, since a short one among a duration's
             # digits is chance. The run's own secrets replace any number that contains them.
             forms = _number_log_forms(node)
-            if not forms.isdisjoint(copilot_variants) or any(
-                secret in form for form in forms for secret in run_variants
-            ):
+            if not forms.isdisjoint(ember_variants) or any(secret in form for form in forms for secret in run_variants):
                 return placeholder
             return node
 
@@ -1241,6 +1242,32 @@ def redact_bearer_tokens(logger: logging.Logger, method_name: str, event_dict: E
     return event_dict
 
 
+# Free-text fields that carry a failing request's URL: Playwright and aiohttp errors and rendered tracebacks.
+_URL_TEXT_LOG_KEYS = frozenset({"error", "exception", "error_message", "failure_reason"})
+# Rendered from run parameters, so it can hold any value a cache-key template names; a short hash still groups lines.
+_HASHED_LOG_KEYS = frozenset({"cache_key_value"})
+
+
+def strip_url_query_strings(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Keep only query key names in top-level URL fields and in URLs inside error text, and hash cache-key values;
+    runs before ``skyvern_logs_processor``, so the emitted line and the run's context.log carry the same text."""
+    for key, value in list(event_dict.items()):
+        try:
+            if key in _HASHED_LOG_KEYS and isinstance(value, str):
+                event_dict[key] = "sha256:" + hashlib.sha256(value.encode()).hexdigest()[:12]
+            elif key in _URL_TEXT_LOG_KEYS and isinstance(value, str):
+                event_dict[key] = strip_url_queries_in_text(value)
+            elif not is_url_log_key(key):
+                continue
+            elif isinstance(value, str):
+                event_dict[key] = strip_url_query(value)
+            elif isinstance(value, (list, tuple)):
+                event_dict[key] = [strip_url_query(item) if isinstance(item, str) else item for item in value]
+        except Exception:
+            event_dict[key] = REDACTED
+    return event_dict
+
+
 def redact_sensitive_event_fields(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
     """Mask sensitive-named kwargs (auth headers, tokens, credentials) before rendering.
 
@@ -1279,6 +1306,16 @@ def _compact_action(action: Any) -> Any:
     }
 
 
+def _result_summary(results: Any) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "count": len(results),
+        "success": all(getattr(r, "success", False) for r in results),
+    }
+    if exception_types := [t for r in results if (t := getattr(r, "exception_type", None))]:
+        summary["exception_types"] = exception_types
+    return summary
+
+
 def compact_action_objects(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
     """Compact verbose Action / ActionResult kwargs to a few key fields.
 
@@ -1288,10 +1325,10 @@ def compact_action_objects(logger: logging.Logger, method_name: str, event_dict:
     queryable there; logs only need enough to correlate.
 
     ``actions=`` is handled the same way for the same reason: a batch of ten renders ten full
-    reprs. It happens to keep a signed ``file_url`` out of that one shape, but this is a LOG VOLUME
-    control and NOT a redaction control — it inspects two fixed keys and nothing else, so no part of
-    it should be relied on to keep credentials out of logs. Credential redaction across the logging
-    stack is a separate concern with its own ticket.
+    reprs. For the action and result keys it handles, the compaction also keeps typed text and
+    extracted data out of the line; it inspects only those fixed keys, so a call site that logs an
+    action under another key must log ids and types itself. Credential redaction is the job of
+    ``redact_sensitive_event_fields`` and ``redact_registered_secrets``.
     """
     action = event_dict.get("action")
     if action is not None and not isinstance(action, (str, int, float, bool, dict, list, type(None))):
@@ -1307,13 +1344,28 @@ def compact_action_objects(logger: logging.Logger, method_name: str, event_dict:
         except Exception:
             pass
 
+    # Each Action carries typed text and each ActionResult its data, extracted values included.
+    actions_and_results = event_dict.get("actions_and_results")
+    if isinstance(actions_and_results, (list, tuple)) and actions_and_results:
+        try:
+            event_dict["actions_and_results"] = [
+                {"action": _compact_action(action), **_result_summary(results)}
+                for action, results in actions_and_results
+            ]
+        except Exception:
+            pass
+
+    action_results = event_dict.get("action_results")
+    if isinstance(action_results, (list, tuple)) and action_results:
+        try:
+            event_dict["action_results"] = _result_summary(action_results)
+        except Exception:
+            pass
+
     action_result = event_dict.get("action_result")
     if isinstance(action_result, list) and action_result:
         try:
-            event_dict["action_result"] = {
-                "count": len(action_result),
-                "success": all(getattr(r, "success", False) for r in action_result),
-            }
+            event_dict["action_result"] = _result_summary(action_result)
         except Exception:
             pass
 
@@ -1769,6 +1821,7 @@ def setup_logger() -> None:
             # Models and containers must be normalized before value scrubbing;
             # capture only copied, scrubbed values for later artifact serialization.
             redact_registered_secrets,
+            strip_url_query_strings,
             redact_private_log_event,
             skyvern_logs_processor,
             sample_logs_processor,
@@ -1796,6 +1849,7 @@ def setup_logger() -> None:
                 add_error_processor,
                 structlog.processors.format_exc_info,
                 redact_sensitive_event_fields,
+                strip_url_query_strings,
             ]
             + foreign_msg_chain,
             processors=[

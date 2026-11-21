@@ -90,6 +90,7 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_STALL_TERMINATE_AFTER,
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
+    REQUEST_RECORD_DATA_KEY,
     STALE_READ_MAX_HOLDS,
     SUBMISSION_HELD_WAIT_MAX_SECONDS,
     TARGET_ACTION_ROUND_EVENT,
@@ -132,6 +133,7 @@ from skyvern.forge.taskv3.loop import (
     record_resolve_seconds,
     record_text_delta,
     run_agent_tool_loop,
+    set_request_record_on_error,
     submissions_across_contexts,
     submissions_since,
 )
@@ -11633,113 +11635,6 @@ async def test_non_form_run_reads_false_on_the_partition_and_still_carries_canon
 
 
 @pytest.mark.asyncio
-async def test_telemetry_omits_the_ledger_fields_when_the_ledger_is_disabled() -> None:
-    # The partition must be TOTAL, not conditional on an unrelated flag. The canonical tracker is
-    # built and updated unconditionally, so its record does not depend on the ledger existing —
-    # gating it on `progress` would drop BOTH records whenever progress_window is None and silently
-    # restore the "floor, not prevalence" hole this record exists to close.
-    rounds = 4
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
-    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
-    script.append([("finish", {"status": "completed", "reason": "done"})])
-    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500, progress_window=None)
-
-    assert outcome.status == "completed"
-    assert outcome.telemetry is not None
-    fields = outcome.telemetry.log_fields()
-    assert fields["form_ever_armed"] is False
-    assert "would_fire" not in fields, fields
-
-
-@pytest.mark.asyncio
-async def test_telemetry_carries_the_ledger_fields_when_the_ledger_is_enabled() -> None:
-    # The other half of the partition, and the compatibility guarantee: the existing record's
-    # population is untouched, so run-level survival rates stay comparable across this change. Its
-    # field set is not — both records gained keys.
-    rounds = 10
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
-    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
-    script.append([("finish", {"status": "completed", "reason": "done"})])
-    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
-
-    assert outcome.status == "completed"
-    fields = outcome.telemetry.log_fields()
-    assert fields["form_ever_armed"] is True
-    assert "would_fire" in fields, fields
-
-
-@pytest.mark.asyncio
-async def test_telemetry_carries_a_count_for_every_clear_evidence_class_including_silent_ones() -> None:
-    # The clear reason was LOG.debug-only, which production INFO workers never emit, so the ring's
-    # clear behaviour was unmeasurable. Every class rides the terminal record with an explicit 0, so
-    # "never fired" cannot be read as "field missing", and a count survives every later clear.
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [
-        _form_observe("observe", [3, 3, 3]),
-        _billable_tool("click", clicks, data={"page_transitioned": True}),
-        make_finish_tool(),
-    ]
-    script: list[list[tuple[str, dict[str, Any]]]] = [
-        [("observe", {})],
-        [("observe", {})],
-        [("observe", {})],
-        [("click", {"selector": "#next"})],
-        [("finish", {"status": "completed", "reason": "done"})],
-    ]
-    outcome, _ = await _run(
-        script, tools, max_turns=200, max_tool_calls=500, semantic_commit_stats=SemanticCommitStats()
-    )
-
-    assert outcome.status == "completed"
-    record = outcome.telemetry.log_fields()
-    assert record["form_ever_armed"] is True
-    # Two observes landed distinct content digests, then a URL-moving click cleared on the
-    # transition: the earlier count must still be there after the later clear.
-    assert record["clear_perception_digest"] == 2, record
-    assert record["clear_page_transitioned"] == 1, record
-    fired = {_ProgressEvidence.PERCEPTION_DIGEST, _ProgressEvidence.PAGE_TRANSITIONED}
-    silent = {f"clear_{member.value}": 0 for member in _ProgressEvidence if member not in fired}
-    assert len(silent) == 7, silent
-    assert {key: record.get(key, "MISSING") for key in silent} == silent, record
-    # Both groups ride the same telemetry object, so moving either off it cannot stay green.
-    assert record["semantic_commit_opportunities"] == 0, record
-    assert record["semantic_commit_accepts"] == 0, record
-
-
-@pytest.mark.asyncio
-async def test_telemetry_reports_the_peak_page_state_stall_and_not_the_streak_recovery_erased() -> None:
-    # A run that stalls, recovers, then finishes leaves the live counter at 0, so a trailing read
-    # reports a frozen page as never having frozen. PAGE_STATE_STALL_TERMINATE_AFTER is tuned off
-    # this distribution, and a recovery-erased value biases it low, toward over-termination.
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    click = _recording_tool("click", clicks, billable=True)
-    fp_state = {"n": 0}
-
-    async def thawing_fingerprint() -> str:
-        fp_state["n"] += 1
-        # Two samples per round: frozen through round 4's after-sample (8 calls), moving after.
-        return "FROZEN" if fp_state["n"] <= 8 else f"dom-{fp_state['n']}"
-
-    script: list[list[tuple[str, dict[str, Any]]]] = [[("click", {"selector": f"#try-{i}"})] for i in range(7)]
-    script.append([("finish", {"status": "completed", "reason": "done"})])
-    outcome, _ = await _run(
-        script,
-        [click, make_finish_tool()],
-        page_fingerprint=thawing_fingerprint,
-        max_action_steps=24,
-        max_turns=60,
-        max_tool_calls=200,
-    )
-
-    assert outcome.status == "completed"
-    fields = outcome.telemetry.log_fields()
-    assert fields["form_ever_armed"] is False
-    assert fields["peak_page_state_stall_rounds"] == 4, fields
-
-
-@pytest.mark.asyncio
 async def test_a_solve_record_carries_the_stall_rounds_behind_it_and_no_other_record_does() -> None:
     # A solve-only batch takes no page reading, so "solved, page unchanged, solved again" is read off the stall
     # counter the billable batches around it already keep. Asserted at its value, so a constant fails.
@@ -13778,17 +13673,35 @@ async def test_the_action_loop_verdict_never_lands_before_its_warning_was_delive
         # verdict landing at the 6th click is visible as a short count rather than hidden by a batch
         # that happened to end there anyway.
         [("click", {"selector": "#next"})] * 5,
+        [],
         [("finish", {"status": "completed"})],
     ]
     clicks: list[tuple[str, dict[str, Any]]] = []
     tools = [_billable_tool("click", clicks), make_finish_tool()]
+    # Request answers that arrive during the nudged batch, then during a turn with no tool call, still reach the model
+    # before its finish.
+    late = {3: "POST answered 422 after 0.4 s", 4: "POST answered 409 after 2.1 s"}
+    drains: list[int] = []
 
-    outcome, _ = await _run(
-        script, tools, max_turns=10, action_nudge_after=nudge_after, action_terminate_after=terminate_after
+    def late_request_lines() -> str | None:
+        drains.append(len(drains))
+        return late.get(len(drains))
+
+    outcome, caller = await _run(
+        script,
+        tools,
+        max_turns=10,
+        action_nudge_after=nudge_after,
+        action_terminate_after=terminate_after,
+        late_request_lines=late_request_lines,
     )
 
     assert outcome.guard != ACTION_LOOP_GUARD
     assert len(clicks) == 8
+    history = caller.message_history
+    # On messages of their own, which no read store entry can rebuild without them.
+    for line in late.values():
+        assert {"role": "user", "content": line} in history, history
 
 
 @pytest.mark.asyncio
@@ -14355,6 +14268,10 @@ def test_the_understood_tools_keep_their_existing_submit_verdicts() -> None:
     one name.
     """
     assert _may_submit("click", {}) is True
+    # download is a click for every guard except the failure-evidence one: it has already waited for its outcome.
+    assert _may_submit("download", {}) is True
+    assert _arms_failure_evidence("click", {}, True) is True
+    assert _arms_failure_evidence("download", {}, True) is False
     assert _may_submit("press_key", {"key": "Enter"}) is True
     assert _may_submit("type", {"text": "x", "press_enter": True}) is True
 
@@ -15158,6 +15075,38 @@ async def test_a_re_read_that_differs_only_by_a_download_failure_gets_the_marker
     assert reread.endswith(f"\n{failure}")
 
 
+@pytest.mark.asyncio
+async def test_request_record_lines_reach_the_model_without_becoming_page_content() -> None:
+    body = "<form #a>" + "y" * 2_000
+    line = "POST site.test/apply, sent while your click at turn 1 ran, answered 422 after 0.1 s."
+    results = [ToolResult.ok(body), ToolResult.ok(body, data={REQUEST_RECORD_DATA_KEY: line})]
+
+    # A read that raises after its record lines were built still delivers them.
+    async def get_html(_args: dict[str, Any]) -> ToolResult:
+        if not results:
+            set_request_record_on_error(line)
+            raise RuntimeError("page closed")
+        return results.pop(0)
+
+    reader = _get_html_tool()
+    reader.handler = get_html
+    script = [[("get_html", {"selector": "#a"})] for _ in range(3)]
+    script.append([("finish", {"status": "completed", "reason": "ok"})])
+    trail = ToolTrail()
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [reader, make_finish_tool()], tool_trail=trail, telemetry_salt=_SALT)
+
+    reread = _tool_contents(outcome, "get_html")[1]
+    assert reread.startswith("[get_html(selector=#a) returned the same "), reread[:120]
+    assert reread.endswith(f"\n{line}")
+    assert _tool_contents(outcome, "get_html")[2].endswith(f"\n{line}")
+    assert outcome.status == "completed"
+    records = [entry for entry in logs if entry["event"] == "taskv3 tool call finished" and entry["tool"] == "get_html"]
+    assert [entry["result_chars"] for entry in records][:2] == [len(body), len(body)]
+    assert records[0]["snapshot_digest"] == records[1]["snapshot_digest"]
+    assert [entry.content for entry in trail.entries] == [body, body, "tool_error: RuntimeError: page closed"]
+
+
 def test_perception_store_does_not_charge_the_unread_round() -> None:
     # SKY-16330. The prompt asks the model to batch, so one turn routinely lands several large reads.
     # Charging that unread round against the budget would let one batch evict every earlier read — and
@@ -15430,17 +15379,26 @@ async def test_navigation_guard_refuses_url_changing_tools_but_not_click(url_too
         [("click", {"selector": "#details"})],
         [("finish", {"status": "completed", "reason": "read"})],
     ]
+    # An answer that arrives while the loop refuses on its own, with no tool run to report it.
+    drains: list[int] = []
+
+    def late_request_lines() -> str | None:
+        drains.append(len(drains))
+        return "POST answered 422 after 0.4 s" if len(drains) == 2 else None
+
     with capture_logs() as logs:
-        outcome, caller = await _run(script, tools, refuse_navigation=refuse)
+        outcome, caller = await _run(script, tools, refuse_navigation=refuse, late_request_lines=late_request_lines)
 
     dispatched = [name for name, _ in calls]
     refusals = [e for e in logs if e["event"] == loop_module.VALIDATION_NAVIGATION_REFUSED_EVENT]
-    results = [m["content"].split(":")[0] for m in caller.message_history if m.get("role") == "tool"]
+    tool_messages = [m["content"] for m in caller.message_history if m.get("role") == "tool"]
+    results = [content.split(":")[0] for content in tool_messages]
     if refuse:
         assert dispatched == ["click"]
         assert [e["tool"] for e in refusals] == [url_tool]
         # The verdict batched behind the refused call was written as if it had landed.
         assert results[:2] == ["refused", "skipped"]
+        assert {"role": "user", "content": "POST answered 422 after 0.4 s"} in caller.message_history
         assert outcome.reason == "read"
     else:
         assert dispatched == [url_tool]

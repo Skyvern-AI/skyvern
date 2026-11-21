@@ -7,6 +7,7 @@ import pytest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import MODEL_HIDDEN_PLACEHOLDER, SkyvernContext
+from skyvern.forge.sdk.schemas.har_evidence import HarEvidence, HarEvidenceAvailability
 from skyvern.forge.sdk.workflow import context_manager as context_manager_module
 from skyvern.forge.sdk.workflow import service as workflow_service_module
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
@@ -46,6 +47,12 @@ def _fake_app(
     redaction_enabled: bool = True,
     runtime_secret_values: set[str] | None = None,
 ) -> SimpleNamespace:
+    captured_hars: list[bytes] = []
+
+    async def _capture_har(*, har_data: bytes, **_: object) -> HarEvidence:
+        captured_hars.append(har_data)
+        return HarEvidence.unavailable(HarEvidenceAvailability.not_collected)
+
     return SimpleNamespace(
         BROWSER_MANAGER=SimpleNamespace(
             get_har_data=AsyncMock(return_value=har_data),
@@ -60,6 +67,8 @@ def _fake_app(
             get_secret_values_for_run=Mock(return_value={SECRET}),
             runtime_secret_values_for_artifacts=Mock(return_value=set(runtime_secret_values or set())),
         ),
+        AGENT_FUNCTION=SimpleNamespace(on_run_har_captured=AsyncMock(side_effect=_capture_har)),
+        captured_hars=captured_hars,
     )
 
 
@@ -67,79 +76,8 @@ def _workflow_objects() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespa
     browser_state = SimpleNamespace(browser_context=None, browser_artifacts=SimpleNamespace(traces_dir=None))
     last_step = SimpleNamespace(step_id="step_1", task_id="task_1")
     workflow = SimpleNamespace(workflow_id="wf_1")
-    workflow_run = SimpleNamespace(workflow_run_id=WORKFLOW_RUN_ID)
+    workflow_run = SimpleNamespace(workflow_run_id=WORKFLOW_RUN_ID, organization_id="org_1", browser_session_id=None)
     return browser_state, last_step, workflow, workflow_run
-
-
-@pytest.mark.asyncio
-async def test_persist_har_data_redacts_secret_and_sensitive_header(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_app = _fake_app(har_data=_har_bytes())
-    monkeypatch.setattr(workflow_service_module, "app", fake_app)
-
-    browser_state, last_step, workflow, workflow_run = _workflow_objects()
-    service = WorkflowService()
-
-    await service.persist_har_data(browser_state, last_step, workflow, workflow_run)
-
-    fake_app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run.assert_called_once_with(WORKFLOW_RUN_ID)
-    fake_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.assert_called_once_with(WORKFLOW_RUN_ID)
-    fake_app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts.assert_not_called()
-    fake_app.ARTIFACT_MANAGER.create_artifact.assert_awaited_once()
-    artifact_kwargs = fake_app.ARTIFACT_MANAGER.create_artifact.await_args.kwargs
-    stored_data = artifact_kwargs["data"]
-    stored_har = json.loads(stored_data)
-    request = stored_har["log"]["entries"][0]["request"]
-
-    assert artifact_kwargs["artifact_type"] == ArtifactType.HAR
-    assert request["headers"][0]["value"] == REDACTED_SECRET_PLACEHOLDER
-    assert REDACTED_SECRET_PLACEHOLDER.encode() in stored_data
-    assert SECRET.encode() not in stored_data
-
-
-@pytest.mark.asyncio
-async def test_persist_har_data_skips_all_redaction_when_run_not_opted_in(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    original_har = _har_bytes()
-    fake_app = _fake_app(har_data=original_har, redaction_enabled=False)
-    monkeypatch.setattr(workflow_service_module, "app", fake_app)
-
-    browser_state, last_step, workflow, workflow_run = _workflow_objects()
-    service = WorkflowService()
-
-    await service.persist_har_data(browser_state, last_step, workflow, workflow_run)
-
-    fake_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.assert_not_called()
-    fake_app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts.assert_called_once()
-    artifact_kwargs = fake_app.ARTIFACT_MANAGER.create_artifact.await_args.kwargs
-    stored_data = artifact_kwargs["data"]
-    request = json.loads(stored_data)["log"]["entries"][0]["request"]
-
-    assert stored_data == original_har
-    assert request["headers"][0]["value"] == f"Bearer {SECRET}"
-
-
-@pytest.mark.asyncio
-async def test_persist_har_data_redacts_runtime_secret_when_not_opted_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_app = _fake_app(
-        har_data=_har_bytes(RUNTIME_SECRET),
-        redaction_enabled=False,
-        runtime_secret_values={RUNTIME_SECRET},
-    )
-    monkeypatch.setattr(workflow_service_module, "app", fake_app)
-
-    browser_state, last_step, workflow, workflow_run = _workflow_objects()
-    service = WorkflowService()
-
-    await service.persist_har_data(browser_state, last_step, workflow, workflow_run)
-
-    fake_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.assert_not_called()
-    fake_app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts.assert_called_once()
-    artifact_kwargs = fake_app.ARTIFACT_MANAGER.create_artifact.await_args.kwargs
-    stored_data = artifact_kwargs["data"]
-
-    assert REDACTED_SECRET_PLACEHOLDER.encode() in stored_data
-    assert RUNTIME_SECRET.encode() not in stored_data
 
 
 @pytest.mark.asyncio
@@ -211,25 +149,27 @@ async def test_bundled_debug_artifacts_redact_har_and_console_log(monkeypatch: p
 
 
 @pytest.mark.asyncio
-async def test_bundled_debug_artifacts_skip_redaction_when_not_opted_in(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_bundled_debug_artifacts_hand_antibot_the_live_har_when_not_opted_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Antibot joins HAR entry URLs to live page URLs, so a default run's HAR reaches it unscrubbed;
+    # the artifact manager scrubs the stored copy.
     original_har = _har_bytes()
     original_log = f"console leaked {SECRET}".encode()
     fake_app = _fake_app(har_data=original_har, browser_log=original_log, redaction_enabled=False)
     monkeypatch.setattr(workflow_service_module, "app", fake_app)
+    monkeypatch.setattr(workflow_service_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
 
     browser_state, last_step, workflow, workflow_run = _workflow_objects()
     service = WorkflowService()
 
     await service._persist_debug_artifacts_bundled(browser_state, last_step, workflow, workflow_run)
 
-    fake_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.assert_not_called()
-    fake_app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts.assert_called_once()
     entries = fake_app.ARTIFACT_MANAGER.create_task_archive.await_args.kwargs["entries"]
-    _, har_data = entries["har.har"]
-    _, browser_log = entries["browser_console.log"]
-
-    assert har_data == original_har
-    assert browser_log == original_log
+    assert fake_app.captured_hars == [original_har]
+    assert f"?token={SECRET}".encode() in fake_app.captured_hars[0]
+    assert entries["har.har"] == (ArtifactType.HAR, original_har)
+    assert entries["browser_console.log"] == (ArtifactType.BROWSER_CONSOLE_LOG, original_log)
 
 
 @pytest.mark.asyncio
@@ -349,9 +289,15 @@ def test_task_artifact_gate_floors_runtime_secret_for_har_and_console(monkeypatc
     assert llm_out == f"code={RUNTIME_SECRET}".encode()
 
 
-def test_task_artifact_gate_untouched_when_no_runtime_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("artifact_type", "kill_switch_on"), [(ArtifactType.BROWSER_CONSOLE_LOG, True), (ArtifactType.HAR, False)]
+)
+def test_task_artifact_gate_untouched_when_no_runtime_secrets(
+    monkeypatch: pytest.MonkeyPatch, artifact_type: ArtifactType, kill_switch_on: bool
+) -> None:
     from skyvern.forge.sdk.artifact import manager as artifact_manager_module
 
+    monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", kill_switch_on)
     fake_app = SimpleNamespace(
         WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
             artifact_redaction_enabled=Mock(return_value=False),
@@ -359,6 +305,6 @@ def test_task_artifact_gate_untouched_when_no_runtime_secrets(monkeypatch: pytes
         )
     )
     monkeypatch.setattr(artifact_manager_module, "app", fake_app)
-    payload = _har_bytes(SECRET)
-    out = artifact_manager_module._maybe_redact_artifact_data(ArtifactType.HAR, payload, WORKFLOW_RUN_ID)
+    payload = _har_bytes(SECRET) if artifact_type == ArtifactType.HAR else f"console {SECRET}".encode()
+    out = artifact_manager_module._maybe_redact_artifact_data(artifact_type, payload, WORKFLOW_RUN_ID)
     assert out == payload

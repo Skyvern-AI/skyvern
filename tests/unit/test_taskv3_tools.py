@@ -66,7 +66,7 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.taskv3 import captcha_tools, input_dispatch
 from skyvern.forge.taskv3.answer_basis_audit import RecordedAnswer, apply_answer_basis_audit
-from skyvern.forge.taskv3.auth_tools import VerificationState
+from skyvern.forge.taskv3.auth_tools import VerificationState, _register_link_for_redaction
 from skyvern.forge.taskv3.code_surface import (
     CodeToolSurface,
     apply_surface,
@@ -78,12 +78,15 @@ from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     CODE_TOOL_NAME,
     PICKED_OPTION_DATA_KEY,
+    REQUEST_RECORD_DATA_KEY,
     SemanticCommitStats,
     ToolRefusal,
     ToolResult,
     ToolSpec,
     UnseenPageText,
     _navigate_record_fields,
+    set_request_record_on_error,
+    with_request_record_of,
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.run_arms import LOGIN_PACE_FLAG
@@ -114,6 +117,7 @@ from skyvern.forge.taskv3.tools import (
     PAGE_UNAVAILABLE_ERROR,
     BlankWorkingPageGuard,
     DownloadFailureWatch,
+    RequestRecord,
     _annotate_screenshot,
     _exact_tier_key,
     _invalid_selector_result,
@@ -125,6 +129,7 @@ from skyvern.forge.taskv3.tools import (
 from skyvern.forge.taskv3.tools import _upload_submit_delay as _REAL_UPLOAD_SUBMIT_DELAY
 from skyvern.forge.taskv3.tools import (
     apply_blank_page_guard,
+    apply_request_record,
     build_browser_tools,
     pending_marker,
 )
@@ -132,7 +137,7 @@ from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secr
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus
 from tests.unit.conftest import CARD_SECRET_RUN_ID
-from tests.unit.copilot_test_helpers import page_with_unprobeable_vendor_embedder
+from tests.unit.ember_test_helpers import page_with_unprobeable_vendor_embedder
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 
@@ -9237,13 +9242,20 @@ async def test_observe_surfaces_a_same_origin_full_viewport_iframe() -> None:
             context = await browser.new_context(viewport={"width": 1024, "height": 900})
             page = await context.new_page()
 
+            # The frame's address is one the task's payload carries masked, signed in its path and its query.
+            signed = (
+                "http://sameorigin.test/files/tok-9f8e7d6c5b4a3f2e/frame"
+                "?X-Amz-Signature=3f9a1c7e5b2d8f4a6c0e9b1d3f5a7c9e"
+            )
+            refs = mask_opaque_urls({"bill": signed})
+
             async def _serve(route: Any) -> None:
-                if route.request.url.endswith("/frame"):
+                if "/frame" in route.request.url:
                     body = "<p>challenge content</p>"
                 else:
                     body = (
                         "<!doctype html><html><body>"
-                        '<iframe src="/frame" style="position:fixed;top:0;left:0;border:none" '
+                        f'<iframe src="{signed}" style="position:fixed;top:0;left:0;border:none" '
                         'width="1024" height="900"></iframe>'
                         '<iframe src="/helper" width="4" height="4"></iframe>'
                         "</body></html>"
@@ -9259,13 +9271,42 @@ async def test_observe_surfaces_a_same_origin_full_viewport_iframe() -> None:
             assert entries[0]["sameOrigin"] is True, entries[0]
             assert entries[0]["viewportPct"] >= 50, entries[0]
 
-            r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+            tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=refs)
+            r = await _tool(tools, "observe").handler({})
             line = next((ln for ln in r.content.splitlines() if ln.startswith("iframes:")), None)
             assert line is not None, r.content
             assert "[same-origin]" in line, line
             assert "% of viewport]" in line, line
+            # The frame is listed by the payload's token, never by a path that carries the signing value.
+            assert refs.mask(signed) in line, line
+            assert "tok-9f8e7d6c5b4a3f2e" not in r.content and "3f9a1c7e5b2d8f4a" not in r.content, r.content
         finally:
             await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_without_a_download_wait_frames_still_get_refs_and_no_download_tool_is_offered() -> None:
+    async def serve(route: Route) -> None:
+        if urlparse(route.request.url).path == "/statement":
+            body = "<p>Statement for May</p>"
+        else:
+            body = '<button id="go">Go</button><iframe src="/statement" width="900" height="500"></iframe>'
+        await route.fulfill(status=200, content_type="text/html", body=body)
+
+    async with _page_context(viewport={"width": 1024, "height": 900}) as context:
+        await context.route("**/*", serve)
+        page = await context.new_page()
+        await page.goto("http://statements.test/")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        line = next((ln for ln in observed.content.splitlines() if ln.startswith("iframes:")), "")
+        ref = re.search(r"ref=(\d+) \[same-origin\]", line)
+        assert ref is not None, line
+        read = await _tool(tools, "get_html").handler({"selector": f"ref={ref.group(1)}"})
+
+    assert read.status == "ok" and "/statement" in read.content, read.content
+    assert "download" not in {tool.name for tool in tools}
 
 
 @_skip_no_browser
@@ -9682,10 +9723,12 @@ async def test_observe_reports_a_captcha_iframe_packaged_inside_a_component() ->
         assert r.status == "ok"
         line = next((ln for ln in r.content.splitlines() if ln.startswith("iframes:")), None)
         # Pinned whole: asserting a substring lets the scope clause silently revert to the old
-        # "component roots not scanned", which is the false claim this change exists to retire.
+        # "component roots not scanned", which is the false claim this change exists to retire. The test host
+        # does not resolve, so Chromium shows its error page in the frame, and no document reached it to report.
         assert line == (
-            "iframes: 1 in the page and its open component roots (contents are among the elements above and "
-            "actionable by ref, same as the page's own): [captcha] challenges.antibot-vendor.test 'Sign-in widget'"
+            "iframes: 1 in the page, counting frames inside frames (contents are among the elements above and "
+            "actionable by ref, same as the page's own): ref=3 [captcha] challenges.antibot-vendor.test "
+            "'Sign-in widget', the browser shows its own error page here"
         ), line
 
 
@@ -10092,6 +10135,173 @@ async def test_a_download_saved_under_a_generated_id_is_reported_by_the_pages_na
     assert "Downloaded: dl1_receipt.txt (46 B)" in result.content, result.content
 
 
+def _request_record_lines(result: ToolResult) -> str:
+    return (result.data or {}).get(REQUEST_RECORD_DATA_KEY, "")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_click_reports_how_the_site_answered_the_request_it_sent() -> None:
+    answer = asyncio.Event()
+    async with _page_context() as context:
+        page = await context.new_page()
+
+        async def _serve(route: Route) -> None:
+            if route.request.method == "POST":
+                await answer.wait()
+                await route.fulfill(status=422 if "/apply" in route.request.url else 204)
+            else:
+                # A beacon before the submit and an autosave burst after it, more than the record holds.
+                send = "fetch('/beacon', {method: 'POST'}); fetch('/apply?id=7', {method: 'POST', body: '{}'}); "
+                send += "for (let i = 0; i < 8; i++) fetch('/autosave', {method: 'POST'});"
+                one = "fetch('/one', {method: 'POST'})"
+                await route.fulfill(
+                    content_type="text/html",
+                    body=f"<button id='go' onclick=\"{send}\">Submit</button><button id='one' onclick=\"{one}\">1</button>",
+                )
+
+        await page.route("**/*", _serve)
+        await page.goto("http://site.test/form")
+        record = RequestRecord(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observe = _tool(tools, "observe")
+        observe_handler = observe.handler
+        failing = False
+
+        async def observe_or_fail(args: dict[str, Any]) -> ToolResult:
+            result = await observe_handler(args)
+            if failing:
+                raise RuntimeError("page closed")
+            return result
+
+        observe.handler = observe_or_fail
+        apply_request_record(tools, record)
+
+        clicked = await _tool(tools, "click").handler({"selector": "#go"})
+        click = _request_record_lines(clicked)
+        await page.evaluate("void fetch('/late', {method: 'POST', body: '{}'})")
+        unanswered = _request_record_lines(await _tool(tools, "observe").handler({}))
+        # Full, so this click's one request pushes out the oldest earlier one: the beacon, not the submit.
+        second = _request_record_lines(await _tool(tools, "click").handler({"selector": "#one"}))
+        answer.set()
+        # Every later read raises: a raising call's lines reach the result the loop makes from the error.
+        failing = True
+        later = []
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            set_request_record_on_error(None)
+            with pytest.raises(RuntimeError):
+                await _tool(tools, "observe").handler({})
+            later.append(_request_record_lines(with_request_record_of(ToolResult.error("page closed"))))
+        # Every held entry was reported, so pushing them out says nothing about dropped answers.
+        again = _request_record_lines(await _tool(tools, "click").handler({"selector": "#go"}))
+        record.close()
+
+    assert "POST site.test/apply not answered" in click and "; 2 more not listed." in click, click
+    assert "sent while your click" in unanswered and "not answered" in unanswered, unanswered
+    assert "POST site.test/one not answered" in second and "more not listed" not in second, second
+    assert "dropped from the record before an answer was reported: 1." in second, second
+    assert sum("answered 422" in text for text in later) == 1, later
+    assert not later[-1], later
+    assert "id=7" not in "".join([click, unanswered, *later])
+    assert "/late" not in "".join([unanswered, *later]) and "/beacon" not in "".join(later), later
+    assert "/apply" not in clicked.content, clicked.content
+    assert "POST site.test/apply" in again and "dropped" not in again, again
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_click_whose_request_is_answered_at_once_reports_the_answer_only_on_its_own_result() -> None:
+    async with _page_context() as context:
+        page = await context.new_page()
+
+        async def _serve(route: Route) -> None:
+            if route.request.method == "POST":
+                await route.fulfill(status=422, content_type="application/json", body="{}")
+            else:
+                await route.fulfill(
+                    content_type="text/html",
+                    body="<button id='go' onclick=\"fetch('/apply', {method: 'POST', body: '{}'})\">Submit</button>",
+                )
+
+        await page.route("**/*", _serve)
+        await page.goto("http://site.test/form")
+        finished = asyncio.Event()
+        page.on("requestfinished", lambda request: finished.set() if request.method == "POST" else None)
+        record = RequestRecord(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click_spec = _tool(tools, "click")
+        click_handler = click_spec.handler
+
+        # Click returns as soon as the page takes the input, often before the answer is read; hold it until then.
+        async def click_until_answered(args: dict[str, Any]) -> ToolResult:
+            result = await click_handler(args)
+            await asyncio.wait_for(finished.wait(), 5)
+            return result
+
+        click_spec.handler = click_until_answered
+        apply_request_record(tools, record)
+        click = _request_record_lines(await _tool(tools, "click").handler({"selector": "#go"}))
+        after = _request_record_lines(await _tool(tools, "observe").handler({}))
+        record.close()
+
+    assert "POST site.test/apply answered 422" in click, click
+    assert not after, after
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_request_record_shows_no_address_once_a_sign_in_link_is_opened() -> None:
+    # Short and letters-free, so nothing that looks for token-shaped values would catch it.
+    token = "ab12cd9"
+    back = (
+        f"fetch('/verify/{token}', {{method: 'POST'}}); fetch('/api/verify/{token}', {{method: 'POST'}}); "
+        f"fetch('http://{token}.site.test/save', {{method: 'POST'}}).catch(() => 0)"
+    )
+    async with _page_context() as context:
+        page = await context.new_page()
+
+        async def _serve(route: Route) -> None:
+            if route.request.method != "POST":
+                # The form posts into a new tab.
+                await route.fulfill(
+                    content_type="text/html",
+                    body=(
+                        "<form action='/popped' method='post' target='_blank'>"
+                        "<button id='go' onclick=\"fetch('/down', {method: 'POST'}).catch(() => 0); "
+                        "fetch('/odd', {method: 'SUBMISSION_ACCEPTED'}).catch(() => 0)\">Submit</button></form>"
+                        f"<button id='back' onclick=\"{back}\">Confirm</button>"
+                    ),
+                )
+            elif route.request.url.endswith("/down"):
+                await route.abort("failed")
+            else:
+                await route.fulfill(status=422, body="{}")
+
+        # On the context, so the tab the form opens is served too.
+        await context.route("**/*", _serve)
+        await page.goto("http://site.test/form")
+        record = RequestRecord(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page))
+        apply_request_record(tools, record)
+        with skyvern_context.scoped(SkyvernContext(task_id="tsk_v3")):
+            shown = _request_record_lines(await _tool(tools, "click").handler({"selector": "#go"}))
+            for _ in range(20):
+                if "failed (" in shown:
+                    break
+                await asyncio.sleep(0.05)
+                shown += _request_record_lines(await _tool(tools, "observe").handler({}))
+            _register_link_for_redaction(f"http://site.test/verify/{token}?next=home")
+            confirmed = _request_record_lines(await _tool(tools, "click").handler({"selector": "#back"}))
+        record.close()
+
+    assert "failed (" in shown, shown
+    assert "OTHER site.test/odd" in shown and "SUBMISSION_ACCEPTED" not in shown, shown
+    assert "POST site.test/popped" in shown, shown
+    assert len(set(re.findall(r"POST request \d+ ", confirmed))) == 3 and token not in confirmed, confirmed
+    assert "site.test" not in confirmed, confirmed
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("block", ["complete_on_download", "download_timeout_only"])
 async def test_a_download_stored_only_in_the_browser_session_is_reported(
@@ -10106,15 +10316,14 @@ async def test_a_download_stored_only_in_the_browser_session_is_reported(
     async def download_wait() -> None:
         return None
 
-    # A download_timeout-only block waits on downloads but has no failure watch.
-    watch = DownloadFailureWatch(_fixed_page_provider(page)) if block == "complete_on_download" else None
+    # A download_timeout-only block waits on downloads and watches its frames, without the failure facts.
+    watch = DownloadFailureWatch(_fixed_page_provider(page), report_failures=block == "complete_on_download")
     tools = build_browser_tools(
         _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
     )
     with skyvern_context.scoped(SkyvernContext(organization_id="o_1", browser_session_id="pbs_1")):
         result = await _tool(tools, "click").handler({"selector": "#dl"})
-    if watch is not None:
-        watch.close()
+    watch.close()
 
     assert "Downloaded: statement.pdf (in the browser session's storage)" in result.content, result.content
     assert "earlier.pdf" not in result.content
@@ -10129,7 +10338,12 @@ async def test_a_session_baseline_hides_old_files_and_absence_is_claimed_only_af
         TimeoutError(),
         [earlier],
         [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"],
+        # The download call lists once before its click and once for its result.
         [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"],
+        [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"],
+        # The last download call cannot read the storage before its click, and afterwards it holds one more file.
+        TimeoutError(),
+        [earlier, "s3://bucket/o_1/pbs_1/statement.pdf", "s3://bucket/o_1/pbs_1/late.pdf"],
     ]
 
     async def listing(**_kwargs: str) -> list[str]:
@@ -10147,18 +10361,56 @@ async def test_a_session_baseline_hides_old_files_and_absence_is_claimed_only_af
     tools = build_browser_tools(
         _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
     )
+    frame = MagicMock(parent_frame=object(), url="chrome-error://chromewebdata/")
+    page.frames = [frame]  # type: ignore[attr-defined]
+    plain_click = page.click
+
+    async def click_that_opens_a_refused_frame(selector: str, timeout: int | None = None) -> None:
+        await plain_click(selector, timeout=timeout)
+        bill = _FakeRequest(method="GET", resource_type="document", url="https://app.example.test/bill")
+        bill.frame = frame  # type: ignore[attr-defined]
+        headers = {"content-type": "application/pdf", "content-length": "891"}
+        answer = SimpleNamespace(request=bill, status=200, ok=True, frame=frame, url=bill.url, headers=headers)
+        for hook, event in (("request", bill), ("response", answer), ("requestfailed", bill)):
+            watch._hooks[hook](event)
+
     with skyvern_context.scoped(SkyvernContext(organization_id="o_1", browser_session_id="pbs_1")):
         first = await _tool(tools, "click").handler({"selector": "#go"})
         second = await _tool(tools, "click").handler({"selector": "#dl"})
-        third = await _tool(tools, "click").handler({"selector": "#again"})
+        third = await _tool(tools, "download").handler({"selector": "#again"})
+        page.click = click_that_opens_a_refused_frame  # type: ignore[method-assign]
+        fourth = await _tool(tools, "download").handler({"selector": "#again"})
     watch.close()
 
     assert "earlier.pdf" not in first.content + second.content
     # The first click's listing only set the baseline, so what is missing is unknown and nothing is said.
     assert DOWNLOAD_NO_FILE_THIS_ACTION not in first.content and DOWNLOAD_NO_SESSION_FILE_YET not in first.content
     assert "Downloaded: statement.pdf (in the browser session's storage)" in second.content, second.content
-    # A session's storage can get a file after the call returns, so its absence is stated as "yet".
+    # A session's storage can get a file after the call returns, so its absence is stated as "yet", and only by download.
+    assert DOWNLOAD_NO_SESSION_FILE_YET not in first.content + second.content
     assert DOWNLOAD_NO_SESSION_FILE_YET in third.content and DOWNLOAD_NO_FILE_THIS_ACTION not in third.content
+    # With no reading from before its click, the new file could be an earlier call's: it is named, absence is not
+    # claimed, and the document the frame was refused is still stated.
+    assert "Downloaded: late.pdf (in the browser session's storage)" in fourth.content, fourth.content
+    assert "A frame received a document and did not show it: /bill (application/pdf, 891 B)." in fourth.content
+    assert DOWNLOAD_NO_SESSION_FILE_YET not in fourth.content
+
+    # A block whose first call is a download: the first read fails, the download's own read before its click works
+    # and is the baseline, so the file the click stores is named and not absorbed as one that was already there.
+    with_first = [earlier, "s3://bucket/o_1/pbs_1/first.pdf"]
+    listings[:] = [TimeoutError(), [earlier], with_first, with_first]
+    fresh = build_browser_tools(
+        _fixed_page_provider(_DownloadFakePage(tmp_path)), downloads_dir=str(tmp_path), download_wait=download_wait
+    )
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_1", browser_session_id="pbs_1")):
+        first_download = await _tool(fresh, "download").handler({"selector": "#dl"})
+        looked = await _tool(fresh, "observe").handler({})
+    assert "Downloaded: first.pdf (in the browser session's storage)" in first_download.content, first_download.content
+    assert "earlier.pdf" not in first_download.content
+    # That baseline came before every action, so the next look states the block's files.
+    assert "files downloaded in this block: 1 (first.pdf, in the browser session's storage)" in looked.content, (
+        looked.content
+    )
 
 
 @pytest.mark.asyncio
@@ -10218,133 +10470,83 @@ async def test_download_signal_surfaces_file_created_between_calls(tmp_path: Pat
     r2 = await _tool(tools, "get_html").handler({})
     assert "Downloaded: invoice.csv" in r2.content
 
+    # A file that landed before a download call is reported by it and is neither the file its wait is for nor its
+    # answer: the call still says it got none, and still names a document a frame received and did not show.
+    frame = MagicMock(parent_frame=object(), url="chrome-error://chromewebdata/")
+    page.frames = [frame]  # type: ignore[attr-defined]
+    watch = DownloadFailureWatch(_fixed_page_provider(page), report_failures=False)
+    frame_is_refused = [False, True]
+    arrived_answers: list[bool] = []
 
-class _BlockedInlineFramePage(_DownloadFakePage):
-    """A click that renders the target inline in an <iframe> the browser refuses to display: no
-    download event fires and no file lands, while the element keeps the src it was refused."""
-
-    def __init__(self, downloads_dir: Path) -> None:
-        super().__init__(downloads_dir)
-        self.iframe_srcs: list[str] = []
-        self.click_opens: str | None = None
-        self.clicked = False
-
-    async def click(self, selector: str, timeout: int | None = None) -> None:
-        self.clicked = True
-        if self.click_opens:
-            self.iframe_srcs = [self.click_opens]
-        await super().click(selector, timeout=timeout)
-
-    # The iframe enumeration arrives through SkyvernFrame.evaluate, which passes its expression by
-    # keyword; observe and the text delta call page.evaluate(js) positionally.
-    async def evaluate(self, expression: str = "", arg: Any = None) -> Any:
-        if "querySelectorAll('iframe')" in expression:
-            return list(self.iframe_srcs)
-        return await super().evaluate(expression)
-
-
-_BLOCKED_BILL_SRC = "https://portal.test/api/ViewBill?token=abc"
-
-
-@pytest.mark.asyncio
-async def test_a_bill_the_browser_refuses_to_frame_is_recovered_as_this_calls_download(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # v1 recovers these bytes same-origin (SKY-12559); on a download block v3 must too, or the model
-    # is told no file arrived for a click that did reach the right document (SKY-19922).
-    page = _BlockedInlineFramePage(tmp_path)
-    page.click_opens = _BLOCKED_BILL_SRC
-    pdf = b"%PDF-1.7 statement bytes"
-    monkeypatch.setattr("skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes", AsyncMock(return_value=pdf))
+    async def download_until(arrived: Callable[[], Awaitable[bool]]) -> None:
+        if frame_is_refused.pop(0):
+            bill = _FakeRequest(method="GET", resource_type="document", url="https://app.example.test/bill")
+            bill.frame = frame  # type: ignore[attr-defined]
+            headers = {"content-type": "application/pdf", "content-length": "891"}
+            answer = SimpleNamespace(request=bill, status=200, ok=True, frame=frame, url=bill.url, headers=headers)
+            for hook, event in (("request", bill), ("response", answer), ("requestfailed", bill)):
+                watch._hooks[hook](event)
+        arrived_answers.append(await arrived())
 
     async def download_wait() -> None:
         return None
 
-    watch = DownloadFailureWatch(_fixed_page_provider(page))
-    tools = build_browser_tools(
-        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
-    )
-    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
-    watch.close()
-
-    # Named by the same path a browser download takes: the run-unique prefix plus the frame's own basename.
-    assert re.search(r"Downloaded: [0-9a-f-]{36}-ViewBill\.pdf \(24 B\)", result.content), result.content
-    assert DOWNLOAD_NO_FILE_THIS_ACTION not in result.content
-    assert [path.read_bytes() for path in sorted(tmp_path.iterdir())] == [pdf]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("why_not", ["frame_was_already_there", "page_was_replaced", "not_a_download_block"])
-async def test_a_pdf_frame_this_call_did_not_open_is_not_recovered(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, why_not: str
-) -> None:
-    page = _BlockedInlineFramePage(tmp_path)
-    if why_not == "frame_was_already_there":
-        # A viewer left by an earlier click is not this click's file: attribution comes from the
-        # pre-call snapshot, so recovering it would mean saving an unrelated document.
-        page.iframe_srcs = [_BLOCKED_BILL_SRC]
-    else:
-        page.click_opens = _BLOCKED_BILL_SRC
-    monkeypatch.setattr(
-        "skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes",
-        AsyncMock(return_value=b"%PDF-1.7 statement bytes"),
-    )
-
-    async def download_wait() -> None:
-        return None
-
-    replacement: _BlockedInlineFramePage | None = None
-    if why_not == "page_was_replaced":
-        # The click opened a tab that took the working-page slot, so the baseline describes a
-        # document this call no longer holds and nothing readable now is attributable to it.
-        replacement = _BlockedInlineFramePage(tmp_path)
-        replacement.iframe_srcs = [_BLOCKED_BILL_SRC]
-
-    async def page_provider() -> Any:
-        return replacement if replacement is not None and page.clicked else page
-
-    watch = DownloadFailureWatch(page_provider)
-    tools = build_browser_tools(
-        page_provider,
+    waiting = build_browser_tools(
+        _fixed_page_provider(page),
         downloads_dir=str(tmp_path),
         download_failures=watch,
-        # A block the engine built no download machinery for pays none of this and recovers nothing.
-        download_wait=download_wait if why_not != "not_a_download_block" else None,
+        download_wait=download_wait,
+        download_until=download_until,
     )
-    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
+    await _prime(waiting)
+    (tmp_path / "guide.pdf").write_bytes(b"guide")
+    r3 = await _tool(waiting, "download").handler({"selector": "#export"})
+    (tmp_path / "faq.pdf").write_bytes(b"faq")
+    r4 = await _tool(waiting, "download").handler({"selector": "#export"})
     watch.close()
 
-    assert "Downloaded:" not in result.content, result.content
-    assert DOWNLOAD_NO_FILE_THIS_ACTION in result.content
-    assert list(tmp_path.iterdir()) == []
+    assert arrived_answers == [False, True]
+    assert "Downloaded: guide.pdf" in r3.content and DOWNLOAD_NO_FILE_THIS_ACTION in r3.content, r3.content
+    assert "Downloaded: faq.pdf" in r4.content and DOWNLOAD_NO_FILE_THIS_ACTION in r4.content, r4.content
+    assert "A frame received a document and did not show it: /bill (application/pdf, 891 B)." in r4.content
+
+
+class _LateDownloadPage(_DownloadFakePage):
+    """A download control whose click starts its file from a timer, after the click call has returned."""
+
+    def __init__(self, downloads_dir: Path, name: str, delay: float) -> None:
+        super().__init__(downloads_dir)
+        self._late = (name, delay)
+
+    async def click(self, selector: str, timeout: int | None = None) -> None:
+        await super().click(selector, timeout=timeout)
+        name, delay = self._late
+        asyncio.get_running_loop().call_later(delay, (self._downloads_dir / name).write_bytes, b"x" * 500)
 
 
 @pytest.mark.asyncio
-async def test_a_click_that_landed_its_file_does_not_also_recover_the_frame_it_opened(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A site that both downloads the bill and shows it in a viewer would otherwise record the same
-    # invoice twice, and the block would report two files for one statement.
-    page = _BlockedInlineFramePage(tmp_path)
-    page.click_opens = _BLOCKED_BILL_SRC
-    page._click_writes = "statement.pdf"
-    monkeypatch.setattr(
-        "skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes",
-        AsyncMock(return_value=b"%PDF-1.7 statement bytes"),
-    )
+async def test_download_stops_waiting_at_a_file_in_progress_and_lets_download_wait_finish_it(tmp_path: Path) -> None:
+    page = _DownloadFakePage(tmp_path)
+    page._click_writes = "statement.pdf.crdownload"
+    arrived_answers: list[bool] = []
+
+    async def download_until(arrived: Callable[[], Awaitable[bool]]) -> None:
+        arrived_answers.append(await arrived())
 
     async def download_wait() -> None:
-        return None
+        (tmp_path / "statement.pdf.crdownload").rename(tmp_path / "statement.pdf")
 
-    watch = DownloadFailureWatch(_fixed_page_provider(page))
     tools = build_browser_tools(
-        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
+        _fixed_page_provider(page),
+        downloads_dir=str(tmp_path),
+        download_wait=download_wait,
+        download_until=download_until,
     )
-    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
-    watch.close()
+    result = await _tool(tools, "download").handler({"selector": "#dl"})
 
-    assert "Downloaded: statement.pdf" in result.content, result.content
-    assert [path.name for path in tmp_path.iterdir()] == ["statement.pdf"]
+    # A download the browser has started counts as arrived, so the wait ends there and the file is finished after it.
+    assert arrived_answers == [True]
+    assert "Downloaded: statement.pdf (500 B)" in result.content, result.content
 
 
 @pytest.mark.asyncio
@@ -10378,6 +10580,20 @@ async def test_download_signal_lifecycle_started_then_completed_or_never(tmp_pat
     (tmp_path / ("export." + "f" * 32 + ".crdownload")).write_bytes(b"partial")
     r6 = await _tool(tools, "wait").handler({"time_ms": 1})
     assert "Download started: export (in progress — not yet complete)" in r6.content
+
+    # The browser saves a download with no extension and adds one a moment later: still one download.
+    (tmp_path / "53b6cbff").write_bytes(b"pdf")
+    r7 = await _tool(tools, "wait").handler({"time_ms": 1})
+    assert "Downloaded: 53b6cbff" in r7.content
+    (tmp_path / "53b6cbff").rename(tmp_path / "53b6cbff.pdf")
+    r8 = await _tool(tools, "wait").handler({"time_ms": 1})
+    assert "Downloaded:" not in r8.content
+    # Two files that share a stem and both exist are two downloads.
+    (tmp_path / "ledger").write_bytes(b"a")
+    await _tool(tools, "wait").handler({"time_ms": 1})
+    (tmp_path / "ledger.csv").write_bytes(b"b")
+    r9 = await _tool(tools, "wait").handler({"time_ms": 1})
+    assert "Downloaded: ledger.csv" in r9.content
 
 
 @pytest.mark.asyncio
@@ -10605,7 +10821,7 @@ async def test_a_download_action_whose_request_fails_late_reports_the_status(tmp
 
     tail = _failure_tail(result)
     assert "Request failed: POST /api/export returned HTTP 503" in tail, result.content
-    assert tail.endswith(DOWNLOAD_NO_FILE_THIS_ACTION), tail
+    assert DOWNLOAD_NO_FILE_THIS_ACTION not in tail, tail
     assert not (result.data or {}).get("download_notice") and not (result.data or {}).get("download_new")
 
 
@@ -10776,6 +10992,55 @@ async def test_the_failure_watch_waits_only_on_its_own_call_and_reports_only_the
         on["requestfinished"](poll)
         reports.append(await watch.settle(await watch.begin(), wait=True))
     assert reports == [["Request failed: GET /api/poll returned HTTP 503"], []]
+
+    # What a frame received and did not show follows the navigation it came from.
+    frame = MagicMock(parent_frame=object(), url="chrome-error://chromewebdata/")
+    bill = "https://app.example.test/bill"
+
+    def load(url: str) -> _FakeRequest:
+        request = _FakeRequest(method="GET", resource_type="document", url=url)
+        request.frame = frame  # type: ignore[attr-defined]
+        return request
+
+    def answered(request: _FakeRequest) -> _FakeRequest:
+        headers = {"content-type": "application/pdf", "content-length": "891"}
+        on["request"](request)
+        on["response"](
+            SimpleNamespace(request=request, status=200, ok=True, frame=frame, url=request.url, headers=headers)
+        )
+        return request
+
+    # An earlier browser download of the same address does not hide a document a frame is refused later.
+    watch._on_download(SimpleNamespace(url=bill))
+    on["requestfailed"](answered(load(bill)))
+    assert watch.frame_document(frame) == (bill, "application/pdf", 891)
+    # A load the browser saves as a download is not a document left unshown, whichever event comes first.
+    for download_first in (True, False):
+        saved_load = answered(load(bill))
+        if download_first:
+            watch._on_download(SimpleNamespace(url=bill))
+        on["requestfailed"](saved_load)
+        if not download_first:
+            watch._on_download(SimpleNamespace(url=bill))
+        assert watch.frame_document(frame) is None
+    # A load given up for the frame's next navigation is not one either.
+    superseded = answered(load(bill))
+    on["request"](load("https://app.example.test/next"))
+    on["requestfailed"](superseded)
+    assert watch.frame_document(frame) is None
+    watch.close()
+
+    # A block that only waits on downloads keeps the frame documents and none of the failure facts.
+    quiet = DownloadFailureWatch(_fixed_page_provider(_FakePage()), report_failures=False)
+    on = quiet._hooks
+    call = await quiet.begin()
+    failed = _FakeRequest(resource_type="fetch", url="https://app.example.test/api/export")
+    on["request"](failed)
+    on["response"](SimpleNamespace(request=failed, status=503))
+    on["requestfailed"](answered(load(bill)))
+    assert await quiet.settle(call, wait=True) == []
+    assert quiet.frame_document(frame) == (bill, "application/pdf", 891)
+    quiet.close()
 
 
 @pytest.mark.asyncio
@@ -26999,7 +27264,7 @@ async def test_disabled_click_refusal_names_only_a_rendered_challenge_frame(
     assert refused.error_class == "disabled", refused.content
     if hinted:
         assert refused.content == (
-            f"{unhinted}. A challenge frame (challenges.cloudflare) is rendered on screen. solve_captcha acts on it."
+            f"{unhinted}. Frames on screen whose address names a captcha vendor: 'challenges.cloudflare' 300x65 px."
         )
     else:
         assert refused.content == unhinted
@@ -27021,7 +27286,7 @@ async def test_disabled_click_refusal_in_a_child_frame_names_the_challenge_frame
         await _mount_challenge_frame(child, page, "#widget")
         refused = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#submit"})
     assert refused.error_class == "disabled", refused.content
-    assert "A challenge frame (challenges.cloudflare) is rendered on screen." in refused.content, refused.content
+    assert "captcha vendor: 'challenges.cloudflare' 300x65 px." in refused.content, refused.content
 
 
 @pytest.mark.asyncio

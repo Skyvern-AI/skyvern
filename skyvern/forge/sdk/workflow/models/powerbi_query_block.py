@@ -8,6 +8,7 @@ from uuid import UUID
 import structlog
 from pydantic import Field, field_validator
 
+from skyvern.constants import EMBER_TEST_RUN_UNSUPPORTED_CODE
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import FailureCategory
 from skyvern.forge.sdk.services.powerbi_query_service import PowerBIQueryError
@@ -76,7 +77,7 @@ class PowerBIQueryBlock(Block):
     block_type: Literal[BlockType.POWERBI_QUERY] = BlockType.POWERBI_QUERY  # type: ignore
 
     connection_id: str
-    credential_source: Literal["nango"] = "nango"
+    credential_source: Literal["nango", "native"] = "nango"
     dataset_id: str
     query: str
     max_rows: int = Field(default=1_000, ge=1, le=100_000, strict=True)
@@ -352,13 +353,13 @@ class PowerBIQueryBlock(Block):
                     error_code="human_run_required",
                     failure_reason=HUMAN_RUN_REQUIRED_REASON,
                 )
-            if exc.code == "copilot_test_run_unsupported":
+            if exc.code == EMBER_TEST_RUN_UNSUPPORTED_CODE:
                 return await self._failure(
                     workflow_run_context=workflow_run_context,
                     workflow_run_id=workflow_run_id,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=effective_org_id,
-                    error_code="copilot_test_run_unsupported",
+                    error_code=EMBER_TEST_RUN_UNSUPPORTED_CODE,
                     failure_reason="Power BI blocks can't run in Copilot test runs yet; run the saved workflow instead.",
                 )
             if exc.code == "row_limit_exceeded":

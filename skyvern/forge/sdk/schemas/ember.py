@@ -1,0 +1,1468 @@
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import StrEnum
+from typing import Annotated, Any, Literal
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    JsonValue,
+    PlainSerializer,
+    PrivateAttr,
+    SecretStr,
+    StringConstraints,
+    computed_field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
+
+from skyvern.forge.sdk.ember.ask_user import (
+    QUESTION_CLIENT_GRACE,
+    AccountGroupDecision,
+    QuestionInteraction,
+    QuestionResponse,
+)
+from skyvern.forge.sdk.ember.code_write_diff import CodeWriteDiff
+from skyvern.forge.sdk.ember.context import (
+    ActivityBucket,
+    EmberTestInput,
+    LiveTurnNarrative,
+    ProposalDisposition,
+    ResponseType,
+    SkippedPrefixBlock,
+    TurnNarrativePayload,
+)
+from skyvern.forge.sdk.ember.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
+from skyvern.forge.sdk.schemas.ember_turn_outcome import (
+    EmberCancelSource,
+    EmberRequestBrowserAllocations,
+    PersistedEmberComposerMode,
+    TurnOutcome,
+)
+from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_definition_secrets
+from skyvern.utils.secret_headers import mask_header_values
+from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
+
+
+def client_visible_proposed_workflow(proposal: dict[str, Any]) -> dict[str, Any]:
+    visible = deepcopy(proposal)
+    visible.pop(EMBER_PRIVATE_SETTINGS_KEY, None)
+    mask_workflow_definition_secrets(visible.get("workflow_definition"))
+    if "cdp_connect_headers" in visible:
+        headers = visible["cdp_connect_headers"]
+        visible["cdp_connect_headers"] = mask_header_values(headers) if isinstance(headers, dict) else None
+    if EMBER_PROPOSAL_YAML_KEY in visible:
+        try:
+            document = safe_load_no_dates(visible[EMBER_PROPOSAL_YAML_KEY])
+            if not isinstance(document, dict):
+                visible.pop(EMBER_PROPOSAL_YAML_KEY)
+            else:
+                changed = False
+                if isinstance(document.get("workflow_definition"), dict):
+                    changed = mask_workflow_definition_secrets(document["workflow_definition"])
+                if "cdp_connect_headers" in document:
+                    headers = document["cdp_connect_headers"]
+                    masked_headers = mask_header_values(headers) if isinstance(headers, dict) else None
+                    changed = changed or masked_headers != headers
+                    document["cdp_connect_headers"] = masked_headers
+                if changed:
+                    visible[EMBER_PROPOSAL_YAML_KEY] = dump_workflow_yaml(document)
+        except Exception:  # noqa: BLE001 - Malformed legacy YAML must never bypass redaction.
+            visible.pop(EMBER_PROPOSAL_YAML_KEY)
+    return visible
+
+
+ClientVisibleProposedWorkflow = Annotated[
+    dict[str, Any], PlainSerializer(client_visible_proposed_workflow, when_used="json")
+]
+
+_CHAT_ID_ALIASES = AliasChoices("ember_chat_id", "workflow_copilot_chat_id")
+_CHAT_MESSAGE_ID_ALIASES = AliasChoices("ember_chat_message_id", "workflow_copilot_chat_message_id")
+EMBER_PROPOSAL_METADATA_KEY = "_copilot_proposal"
+EMBER_PRIVATE_SETTINGS_KEY = "_copilot_private_settings"
+EMBER_PROPOSAL_YAML_KEY = "_copilot_yaml"
+EMBER_PROPOSAL_UNVALIDATED_KEY = "_copilot_unvalidated"
+EMBER_PROPOSAL_CODE_ARTIFACT_METADATA_KEY = "_copilot_code_artifact_metadata"
+EMBER_PROPOSAL_TESTED_BLOCK_FINGERPRINTS_KEY = "_copilot_tested_block_fingerprints"
+EMBER_PROPOSAL_INTERNAL_KEY_PREFIX = "_copilot_"
+
+
+def credential_recovery_token_is_valid(token: str) -> bool:
+    if len(token) != 64:
+        return False
+    try:
+        return len(bytes.fromhex(token)) == 32
+    except ValueError:
+        return False
+
+
+EmberCandidateDisposition = Literal[
+    "no_proposal",
+    "auto_applicable",
+    "review_untested",
+    "review_tested",
+    "accepting",
+]
+
+
+# An accept holds the candidate exclusively between its claim and its canonical write, so nothing
+# can slip a newer candidate underneath the bytes it already read. The claim expires because the
+# same outage that kills an accept mid-flight also kills the write that would release it.
+EMBER_PROPOSAL_CLAIM_LEASE = timedelta(minutes=5)
+
+
+class EmberProposalMetadata(BaseModel):
+    """CAS token and exact run ownership for one durable Copilot candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    owner_turn_id: str
+    revision: int = Field(ge=1)
+    canonical_fingerprint: str
+    # The canonical title at publication, or None on proposals written before it was recorded. A
+    # write-back compares against it to tell a rename that landed since from the title it froze.
+    canonical_title: str | None = None
+    disposition: EmberCandidateDisposition
+    workflow_run_id: str | None = None
+    claimed_at: datetime | None = None
+
+    def claim_is_live(self, now: datetime) -> bool:
+        if self.disposition != "accepting":
+            return False
+        if self.claimed_at is None:
+            return False
+        return now - self.claimed_at < EMBER_PROPOSAL_CLAIM_LEASE
+
+    def claim_expires_in(self, now: datetime) -> float | None:
+        """Seconds left on a live claim, or None when no claim holds the candidate."""
+        if self.claimed_at is None or not self.claim_is_live(now):
+            return None
+        return (self.claimed_at + EMBER_PROPOSAL_CLAIM_LEASE - now).total_seconds()
+
+
+class EmberProposalRunOutput(BaseModel):
+    output_parameter_id: str
+    value: JsonValue
+
+
+class EmberProposalRunFacts(BaseModel):
+    workflow_run_id: str
+    status: str | None = None
+    available: bool
+    failure_reason: str | None = None
+    outputs: list[EmberProposalRunOutput] = Field(default_factory=list)
+
+
+def ember_proposal_metadata(value: object) -> EmberProposalMetadata | None:
+    if not isinstance(value, dict):
+        return None
+    raw = value.get(EMBER_PROPOSAL_METADATA_KEY)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return EmberProposalMetadata.model_validate(raw)
+    except ValueError:
+        return None
+
+
+MAX_STEER_MESSAGES_PER_TURN = 20
+
+
+class EmberSteerMessage(BaseModel):
+    """A message the user sent into a running turn, stored as screened text only."""
+
+    steer_id: str
+    text: str
+    raw_secret_detected: bool = Field(default=False, exclude_if=lambda detected: not detected)
+    # Sent by the turn's starter, whose authority the turn's writes use.
+    from_starter: bool = False
+    created_at: datetime
+    # None until the running loop hands the message to the model.
+    delivered_at: datetime | None = None
+
+
+class EmberPendingTurn(BaseModel):
+    """Durable write-ahead marker for one in-flight copilot turn.
+
+    Written in the same transaction as the turn's user message so a hard kill
+    leaves enough state to reconcile the turn and roll canonical back.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    turn_id: str
+    started_at: datetime
+    pre_turn_workflow: dict[str, Any] | None = None
+    pre_turn_proposed_workflow: dict[str, Any] | None = None
+    keep_pending_proposal: bool = False
+    idempotency_digest: str | None = None
+    copilot_effective_mode: PersistedEmberComposerMode | None = None
+    copilot_code_available: bool = False
+    user_message_id: str | None = None
+    recovering_at: datetime | None = None
+    # A credential pause stops the turn's budget clock, so reconcile measures abandonment from here
+    # too, as it does from a resolved question.
+    credential_resumed_at: datetime | None = None
+    # Fingerprint of the canonical workflow as this turn last left it. None means the turn
+    # never wrote canonical, so it owns no write to roll back.
+    canonical_write_fingerprint: str | None = None
+    question_interactions: list[QuestionInteraction] = Field(default_factory=list)
+    question_heartbeat_at: datetime | None = None
+    question_client_seen_at: datetime | None = None
+    question_client_grace_seconds: int | None = None
+    cancel_token: str | None = None
+    # The person who started the turn; None for a turn started by an organization API key or before this was recorded.
+    starter_user_id: str | None = None
+    request_browser_allocations: EmberRequestBrowserAllocations | None = None
+    # Build-test runs this turn ended so it could take the chat's browser. Copilot owns this list;
+    # the run row's failure_reason carries the same fact but a later finalizer can overwrite it.
+    superseded_build_test_run_ids: list[str] = Field(default_factory=list)
+    steer_messages: list[EmberSteerMessage] = Field(default_factory=list)
+    # Each draft frame overwrites this, never appends, so an entry holds at most one workflow.
+    latest_draft: ClientVisibleProposedWorkflow | None = None
+    latest_draft_at: datetime | None = None
+
+    def question_client_deadline(self, item: QuestionInteraction) -> datetime:
+        grace = (
+            timedelta(seconds=self.question_client_grace_seconds)
+            if self.question_client_grace_seconds is not None
+            else QUESTION_CLIENT_GRACE
+        )
+        return (self.question_client_seen_at or item.created_at) + grace
+
+
+# "approve" answers a card whose change is written as the starter's, so only the starter may, roles on or off.
+EmberTurnControl = Literal["steer", "answer", "approve", "cancel"]
+
+
+class EmberInFlightTurn(BaseModel):
+    turn_id: str
+    cancel_token: str | None = None
+    latest_draft: ClientVisibleProposedWorkflow | None = None
+    latest_draft_at: datetime | None = None
+    steer_messages: list[EmberSteerMessage] = Field(default_factory=list)
+    # The running turn's narrative as last copied to the cache; set only when the caller asks for it.
+    narrative: LiveTurnNarrative | None = None
+    question_open_until: datetime | None = None
+
+
+class EmberAcceptedTestedRun(BaseModel):
+    workflow_id: str
+    modified_at: datetime
+    workflow_run_id: str | None = None
+
+
+class EmberChat(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="ID for the workflow copilot chat"
+    )
+    organization_id: str = Field(..., description="Organization ID for the chat")
+    workflow_permanent_id: str = Field(..., description="Workflow permanent ID for the chat")
+    proposed_workflow: ClientVisibleProposedWorkflow | None = Field(
+        None, description="Latest workflow proposed by the copilot"
+    )
+    accepted_turn_ids: list[str] = Field(
+        default_factory=list, description="Turns whose manual Accept completed on the server"
+    )
+    auto_accept: bool | None = Field(False, description="Whether copilot auto-accepts workflow updates")
+    pending_turns: dict[str, EmberPendingTurn] = Field(
+        default_factory=dict, description="In-flight turns keyed by turn id"
+    )
+    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
+    accepted_tested_run: EmberAcceptedTestedRun | None = Field(
+        None, description="The run that tested the draft this chat last accepted, keyed by the saved version"
+    )
+
+    @field_validator("accepted_turn_ids", mode="before")
+    @classmethod
+    def _accepted_turn_ids_or_empty(cls, value: Any) -> Any:
+        return [] if value is None else value
+
+    @field_serializer("pending_turns", when_used="json")
+    def _client_visible_pending_turns(self, turns: dict[str, EmberPendingTurn]) -> dict[str, Any]:
+        serialized = {turn_id: turn.model_dump(mode="json") for turn_id, turn in turns.items()}
+        for turn in serialized.values():
+            proposal = turn.get("pre_turn_proposed_workflow")
+            if proposal is not None:
+                turn["pre_turn_proposed_workflow"] = client_visible_proposed_workflow(proposal)
+        return serialized
+
+    @field_validator("pending_turns", mode="before")
+    @classmethod
+    def _default_pending_turns(cls, value: dict[str, Any] | None) -> dict[str, Any]:
+        return value or {}
+
+    @field_validator("work_plan", mode="before")
+    @classmethod
+    def _default_work_plan(cls, value: list[str] | None) -> list[str]:
+        return value or []
+
+    created_at: datetime = Field(..., description="When the chat was created")
+    modified_at: datetime = Field(..., description="When the chat was last modified")
+
+
+class EmberCompletionCriteriaSet(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    completion_criteria_set_id: str
+    organization_id: str
+    workflow_copilot_chat_id: str = Field(validation_alias=_CHAT_ID_ALIASES)
+    goal_epoch: int
+    status: str
+    criteria: list[dict[str, Any]]
+    source_turn_id: str | None = None
+    source_goal_text: str | None = None
+    consecutive_all_no_evidence: int = 0
+    tripwire_fired: bool = False
+    last_fully_satisfied_workflow_yaml: str | None = None
+    superseded_by_set_id: str | None = None
+    superseded_at: datetime | None = None
+    supersede_reason: str | None = None
+    created_at: datetime
+    modified_at: datetime
+
+
+CriteriaSetNonAdoptableReason = Literal["unknown_shape", "undecodable_v1_criteria"]
+
+
+@dataclass(frozen=True)
+class NonAdoptableCriteriaSet:
+    """A persisted criteria-set row whose shape cannot be decoded into the current
+    model; callers must treat the row as absent/superseded, never as an empty contract."""
+
+    reason: CriteriaSetNonAdoptableReason
+    completion_criteria_set_id: str
+    goal_epoch: int
+
+
+class EmberChatSender(StrEnum):
+    USER = "user"
+    AI = "ai"
+    PRODUCT = "product"
+
+
+# A product row records a click the user made, so it opens a turn on the human side of
+# the conversation; it is never rendered to the model as an assistant utterance.
+TURN_OPENER_SENDERS = frozenset({EmberChatSender.USER, EmberChatSender.PRODUCT})
+
+
+def chat_history_role(sender: EmberChatSender) -> str:
+    """The label a transcript line carries into the model. ``product`` is not a role the model is
+    told about, so a product row speaks in the same voice as the user whose click created it."""
+    return EmberChatSender.USER.value if sender in TURN_OPENER_SENDERS else sender.value
+
+
+_MAX_ATTACHED_FILENAME_CHARS = 255
+# The prompt lists this many files per turn, current message first, so every file one message
+# can carry is always visible to the model.
+MAX_ATTACHED_FILES_PER_MESSAGE = 20
+
+
+def _bounded_filename(value: Any) -> Any:
+    """Cap a stored display name: the upload limit measures only file contents, and this name is
+    replayed into every later prompt of the chat."""
+    return value[:_MAX_ATTACHED_FILENAME_CHARS] if isinstance(value, str) else value
+
+
+def _attached_files_or_empty(value: Any) -> Any:
+    """A row written before the column existed reads back as NULL, and ``model_validate`` on the
+    row passes that key explicitly — so a ``default_factory`` never fires and validation fails."""
+    return [] if value is None else value
+
+
+class EmberVideoObservation(BaseModel):
+    timestamp_seconds: float = Field(..., ge=0, le=300)
+    description: str = Field(..., min_length=1, max_length=500)
+    confidence: Literal["low", "medium", "high"]
+
+
+class EmberVideoEvidenceArtifact(BaseModel):
+    """Compact, reusable perception output; raw video frames never enter the acting-model loop."""
+
+    version: Literal["1"]
+    duration_seconds: float = Field(..., gt=0, le=300)
+    sampled_frame_count: int = Field(..., ge=1, le=120)
+    observations: tuple[EmberVideoObservation, ...] = Field(..., min_length=1, max_length=80)
+
+
+class EmberAttachedFile(BaseModel):
+    """An uploaded file the user attached to a copilot turn.
+
+    ``file_id`` is the only value a workflow dereferences: the storage URI behind it is read from
+    the organization's ``uploaded_files`` row, never from this record. ``available`` is resolved
+    fresh on every read, so an expired or deleted file reports as missing rather than as a
+    reference the model can still use.
+    """
+
+    file_id: str = Field(..., description="Uploaded file id from POST /v1/upload_file")
+    filename: Annotated[str, BeforeValidator(_bounded_filename)] = Field(
+        ..., description="Display name recorded at upload time"
+    )
+    size_bytes: int | None = Field(None, description="Size recorded at upload time")
+    available: bool = Field(True, description="Whether the file still resolves for this organization")
+    video_safety_status: Literal["unsafe"] | None = Field(
+        None,
+        description="Server-owned sticky status for a video in which the safety boundary detected a raw secret",
+    )
+    video_processing_status: Literal["too_long"] | None = Field(
+        None,
+        description="Server-owned terminal status for a video that exceeds the supported duration",
+    )
+    video_evidence: EmberVideoEvidenceArtifact | None = Field(
+        None,
+        description="Server-owned, reusable visual-observation timeline derived from an attached video",
+    )
+
+
+EmberMessageFeedbackRating = Literal["up", "down"]
+
+
+class EmberMessageFeedback(BaseModel):
+    rating: EmberMessageFeedbackRating = Field(..., description="Whether the turn did what the user asked")
+    reason: str | None = Field(None, description="Optional free-text reason the user gave")
+    rated_at: datetime = Field(..., description="When the rating was last set")
+
+
+class EmberMessageFeedbackRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="Chat that owns the rated message"
+    )
+    workflow_copilot_chat_message_id: str | None = Field(
+        None, validation_alias=_CHAT_MESSAGE_ID_ALIASES, description="Assistant message being rated"
+    )
+    turn_id: str | None = Field(
+        None, description="Turn whose assistant row is rated; a live turn knows this before the row id"
+    )
+    rating: EmberMessageFeedbackRating | None = Field(
+        None, description="Thumbs up or down; null clears a previous rating"
+    )
+    reason: str | None = Field(None, max_length=2000, description="Optional free-text reason")
+
+    @model_validator(mode="after")
+    def _require_a_target(self) -> "EmberMessageFeedbackRequest":
+        if not self.workflow_copilot_chat_message_id and not self.turn_id:
+            raise ValueError("workflow_copilot_chat_message_id or turn_id is required")
+        return self
+
+
+class EmberMessageFeedbackResponse(BaseModel):
+    workflow_copilot_chat_message_id: str
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_message_id(self) -> str:
+        return self.workflow_copilot_chat_message_id
+
+    feedback: EmberMessageFeedback | None
+
+
+class EmberChatMessage(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    _narrative_payload_unreadable: bool = PrivateAttr(default=False)
+
+    workflow_copilot_chat_message_id: str = Field(
+        ..., validation_alias=_CHAT_MESSAGE_ID_ALIASES, description="ID for the workflow copilot chat message"
+    )
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="ID of the parent workflow copilot chat"
+    )
+    sender: EmberChatSender = Field(..., description="Message sender")
+    content: str = Field(..., description="Message content")
+    audio_artifact_id: str | None = Field(None, description="Artifact ID for audio captured during dictation")
+    attached_files: Annotated[list[EmberAttachedFile], BeforeValidator(_attached_files_or_empty)] = Field(
+        default_factory=list, description="Uploaded files the user attached to this message"
+    )
+    global_llm_context: str | None = Field(None, description="Optional global LLM context for the message")
+    turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows)")
+    narrative_payload: TurnNarrativePayload | None = Field(
+        None,
+        description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
+    )
+    feedback: EmberMessageFeedback | None = Field(None, description="User's rating of this assistant turn")
+    created_at: datetime = Field(..., description="When the message was created")
+    modified_at: datetime = Field(..., description="When the message was last modified")
+
+
+class EmberDemonstrationInsertion(BaseModel):
+    after_label: str | None = Field(default=None, max_length=200)
+    before_label: str | None = Field(default=None, max_length=200)
+    replace_label: str | None = Field(default=None, max_length=200)
+
+
+class EmberChatRequest(BaseModel):
+    workflow_permanent_id: str = Field(..., description="Workflow permanent ID for the chat")
+    workflow_id: str = Field(..., description="Workflow ID (mutable version ID)")
+    workflow_copilot_chat_id: str | None = Field(
+        None, validation_alias=_CHAT_ID_ALIASES, description="The chat ID to send the message to"
+    )
+    workflow_run_id: str | None = Field(None, description="The workflow run ID to use for the context")
+    browser_session_id: str | None = Field(
+        None,
+        description="Optional persistent browser session ID to reuse instead of creating a new one.",
+    )
+    message: str = Field(..., description="The message that user sends")
+    selected_connected_account_id: str | None = Field(
+        None, description="Google account explicitly selected in the chat picker; validated against this organization."
+    )
+    selected_connected_account_from_pending_proposal: bool = Field(
+        False,
+        description=(
+            "Server-set provenance for selected_connected_account_id: true when the route derived it from the "
+            "pending proposal's binding instead of the user picking it. Carries no authority; a client-sent "
+            "value can only weaken the recorded claim."
+        ),
+    )
+    audio_artifact_id: str | None = Field(
+        None,
+        description="Artifact ID for audio captured while dictating this message.",
+    )
+    attached_file_ids: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=64)]] = Field(
+        default_factory=list,
+        max_length=MAX_ATTACHED_FILES_PER_MESSAGE,
+        description=(
+            "Ids of files uploaded through POST /v1/upload_file that the user attached to this message. "
+            "Only ids are accepted; the display name is read from this organization's own upload record."
+        ),
+    )
+    workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
+    mode: Literal["build"] | None = Field(
+        None,
+        description="Deprecated Build-only compatibility field; cached Build clients may still send it.",
+    )
+    code_block: bool | None = Field(
+        None,
+        description="Per-request code-block authoring selection. Omission means plain non-code Build.",
+    )
+    doc_editor_enabled: bool = Field(
+        False,
+        description="The client may opt out of Doc note-aware Copilot behavior; the server controls enablement.",
+        json_schema_extra={"x-internal": True},
+    )
+    editor_settings_digest: str | None = Field(
+        None,
+        max_length=128,
+        description="Digest of the private settings the client withholds from workflow_yaml, so an edit to them is seen.",
+        json_schema_extra={"x-internal": True},
+    )
+    cancel_token: str | None = Field(
+        None,
+        description=(
+            "Client-generated UUID. POST it to /workflow/copilot/cancel to hard-cancel this turn. "
+            "Optional; legacy clients omit it and cancel becomes a no-op for those requests."
+        ),
+    )
+    idempotency_key: str | None = Field(
+        None,
+        max_length=256,
+        description="Stable key for deduplicating a retried product action within this chat.",
+    )
+    target_block_label: str | None = Field(
+        None,
+        description=(
+            "When set, the copilot regenerates only this code block from its goal and leaves every "
+            "other block unchanged. Used by the block-level Generate action."
+        ),
+    )
+    selected_block_label: str | None = Field(
+        None,
+        description=(
+            "Label of the block currently selected on the studio canvas, if any. An ambient fact for "
+            "resolving references like 'this block' — never a directive to act on that block."
+        ),
+    )
+    supports_question_tool: bool = Field(False, description="The client can display and answer ask_user requests.")
+    supports_account_group_card: bool = Field(
+        False, description="The client can display account group review and receipt cards."
+    )
+    supports_single_run_card: bool = Field(
+        False, description="The client can display the single saved-workflow run review and its receipt."
+    )
+    supports_input_group_card: bool = Field(
+        False, description="The client can display the one-run-per-input-row group review, receipt and cancel cards."
+    )
+    supports_credential_delete_card: bool = Field(
+        False, description="The client can display the credential deletion card and post its confirmation."
+    )
+    supports_skill_write_card: bool = Field(
+        False, description="The client can display the organization skill save and delete approval card."
+    )
+    supports_connection_card: bool = Field(
+        False, description="The client can display the account connection card for an integration list entry."
+    )
+    supports_demonstration_offer: bool = Field(
+        False, description="The client can display the demonstration offer card and start a demonstration from it."
+    )
+    credential_recovery_token: SecretStr | None = Field(
+        None,
+        repr=False,
+        exclude=True,
+        description="Client-held capability for restoring this turn's pending credential card.",
+    )
+    supports_credential_pause_recovery: bool = Field(
+        False, description="The client restores pending credential cards from chat history."
+    )
+    refuse_if_turn_running: bool = Field(
+        False,
+        description="Refuse this message, instead of stopping it, when another turn is still running on this workflow.",
+    )
+    client_detached: bool = Field(
+        False,
+        description=(
+            "The client closes the stream after turn_start and follows the turn through chat history. "
+            "Requires supports_credential_pause, supports_credential_pause_recovery and a valid "
+            "credential_recovery_token."
+        ),
+    )
+    supports_credential_generation: bool = Field(
+        False, description="The client can render a registration card and post its Generate and save answer."
+    )
+    supports_credential_pause: bool = Field(
+        False,
+        description=(
+            "True when the client can render the credential_required frame. Older clients default to False "
+            "and silently drop unknown frame types, so the backend must not pause for them even if the "
+            "server-side flag is on."
+        ),
+    )
+    keep_pending_proposal: bool = Field(
+        False,
+        description=(
+            "When true, a pending proposed_workflow from an earlier turn survives turns that end without "
+            "a new proposal, so the client can keep rendering an actionable review gate."
+        ),
+    )
+    product_action: Literal["test_end_to_end", "diagnose_run", "demonstrate"] | None = Field(
+        None,
+        description=(
+            "Structured product action for this turn, dispatched by the server instead of the agent. "
+            "'test_end_to_end' runs every block of the pending proposal in a browser session minted "
+            "for that run. 'diagnose_run' opens repair on the finished run named by workflow_run_id. "
+            "'demonstrate' replays a completed browser demonstration before the first model call."
+        ),
+    )
+    demonstration_id: str | None = Field(default=None, max_length=64)
+    demonstration_insertion: EmberDemonstrationInsertion | None = Field(
+        None,
+        description="Optional placement bounds for blocks authored after a demonstration.",
+    )
+    eval_entrypoint_url: str | None = Field(
+        None,
+        description=(
+            "Benchmark-only starting URL. Rejected unless the eval setting and the X-Copilot-Eval header "
+            "are both present; never sent by the product."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _detached_client_can_recover_cards(self) -> "EmberChatRequest":
+        if self.client_detached and not (
+            self.supports_credential_pause
+            and self.supports_credential_pause_recovery
+            and self.credential_recovery_token is not None
+            and credential_recovery_token_is_valid(self.credential_recovery_token.get_secret_value())
+        ):
+            raise ValueError(
+                "client_detached requires supports_credential_pause, supports_credential_pause_recovery "
+                "and a valid credential_recovery_token"
+            )
+        return self
+
+
+class EmberCancelRequest(BaseModel):
+    workflow_copilot_chat_id: str | None = Field(None, validation_alias=_CHAT_ID_ALIASES)
+    cancel_token: str = Field(..., description="The cancel_token sent on the original /chat-post request")
+    source: EmberCancelSource | None = Field(
+        default=None,
+        description=(
+            "Which gesture asked for the cancel, so cancel volume is attributable by source. "
+            "Absent from a client too old to send it, which is recorded as unattributed rather "
+            "than as an API caller."
+        ),
+    )
+
+
+class EmberSteerRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(validation_alias=_CHAT_ID_ALIASES)
+    cancel_token: str = Field(..., description="The cancel_token sent on the running turn's /chat-post request")
+    steer_id: str = Field(..., max_length=64, description="Client-generated id; a retry with the same id is a no-op")
+    message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class EmberQuestionResponseRequest(QuestionResponse):
+    workflow_copilot_chat_id: str = Field(validation_alias=_CHAT_ID_ALIASES)
+    interaction_id: str
+    account_group_decision: AccountGroupDecision | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_old_chat_id_key_when_both_sent(cls, data: Any) -> Any:
+        # QuestionResponse forbids extra keys, so the alias that loses would otherwise fail as extra_forbidden.
+        if isinstance(data, dict) and "ember_chat_id" in data and "workflow_copilot_chat_id" in data:
+            return {key: value for key, value in data.items() if key != "workflow_copilot_chat_id"}
+        return data
+
+
+class EmberCredentialDeletionRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(validation_alias=_CHAT_ID_ALIASES)
+    interaction_id: str
+    credential_ids: list[str] = Field(min_length=1)
+
+
+CredentialSiteAnswer = Literal["add", "no"]
+
+
+class EmberCredentialSiteQuestion(BaseModel):
+    credential_id: str
+    name: str
+    site: str = Field(..., description="The origin this card signs in on")
+    saved_sites: list[str] = Field(..., description="Origins the login is saved for")
+    vault_sourced: bool = Field(..., description="The sites come from a connected vault, so only the vault can add one")
+
+
+class EmberCredentialResponseRequest(BaseModel):
+    turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="chat ID from the matching credential_required frame"
+    )
+    resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
+    action: Literal["connected", "skip", "signing_in", "signed_in"] = Field(
+        ...,
+        description=(
+            "The user's response to the credential card: 'signing_in' when they start signing in themselves in "
+            "the live browser, 'signed_in' when they finish"
+        ),
+    )
+    credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
+    asks_site: bool = Field(False, description="Ask before connecting a login saved for another site than the card's")
+    site_answer: CredentialSiteAnswer | None = Field(
+        None, description="The answer to the site question this card asked about the same credential"
+    )
+
+
+class EmberDemonstrationControlRequest(BaseModel):
+    demonstration_id: str = Field(max_length=64)
+    action: Literal["navigate", "fill_credential", "upload_file", "note", "stop", "cancel"]
+    url: str | None = Field(default=None, max_length=2048)
+    text: str | None = Field(default=None, max_length=2000)
+    selector: str | None = Field(default=None, max_length=2000)
+    credential_id: str | None = Field(default=None, max_length=128)
+    field: Literal["password", "totp"] | None = None
+    # A stop the user did not ask for, e.g. a browser restart, so replay reports the recording as interrupted.
+    stop_reason: Literal["browser_gone"] | None = None
+
+
+class EmberDemonstrationControlResult(BaseModel):
+    seq: int
+    action_count: int | None = None
+    file_id: str | None = None
+
+
+class EmberDemonstrationRecordRequest(BaseModel):
+    workflow_permanent_id: str = Field(max_length=128)
+    browser_session_id: str = Field(max_length=128)
+    demonstration_id: str | None = Field(default=None, max_length=64)
+    insertion: EmberDemonstrationInsertion | None = None
+
+
+class EmberDemonstrationActiveResult(BaseModel):
+    demonstration_id: str
+    status: Literal["recording", "stopping", "stopped"]
+    action_count: int
+    action_labels: list[str]
+    can_fill_credentials: bool
+    can_resume: bool
+    insertion: EmberDemonstrationInsertion | None = None
+
+
+class EmberCredentialGenerateRequest(BaseModel):
+    turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="chat ID from the matching credential_required frame"
+    )
+    resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
+
+
+class EmberCredentialGenerateResult(BaseModel):
+    result: Literal["connected", "rejected", "unknown", "created_not_connected"] = Field(
+        ...,
+        description=(
+            "'rejected' means nothing was saved; 'unknown' means the vault did not confirm the save, and the "
+            "card stays open without Generate"
+        ),
+    )
+    credential_id: str | None = Field(None, description="The saved credential, when one is known to exist")
+    name: str | None = None
+    username: str | None = None
+    expires_at: datetime | None = Field(
+        None, description="The reopened card's new deadline after 'rejected' or 'unknown'"
+    )
+
+
+class EmberCredentialResponseResult(BaseModel):
+    result: Literal[
+        "accepted",
+        "signed_in",
+        "no_sign_in_found",
+        "save_failed",
+        "site_question",
+        "site_changed_not_connected",
+        "site_change_unknown",
+    ] = Field(
+        ...,
+        description=(
+            "'site_question' asks the user first; 'site_changed_not_connected' saved the site after the pause "
+            "ended; 'site_change_unknown' could not confirm the save, and the paused turn reads the login back"
+        ),
+    )
+    site_question: EmberCredentialSiteQuestion | None = None
+    expires_at: datetime | None = Field(None, description="The pause's new deadline after 'signing_in'")
+    host: str | None = Field(None, description="The sign-in site the browser cookies were read for")
+    browser_profile_id: str | None = Field(None, description="The profile saved from the user's sign-in")
+
+
+class EmberClearProposedWorkflowRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(..., validation_alias=_CHAT_ID_ALIASES, description="The chat ID to update")
+    auto_accept: bool = Field(..., description="Whether to auto-accept future workflow updates")
+    owner_turn_id: str | None = Field(None, description="Owner token returned with a typed proposal")
+    revision: int | None = Field(None, ge=1, description="Revision token returned with a typed proposal")
+
+
+class EmberDisableAutoAcceptRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="The chat whose auto-accept should be turned off"
+    )
+
+
+class EmberApplyProposedWorkflowRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="The chat whose proposed workflow should be applied"
+    )
+    auto_accept: bool = Field(
+        False,
+        description="If true, flip the chat to auto-accept mode so future turns persist directly without review",
+    )
+    owner_turn_id: str | None = Field(
+        None, description="Owner turn for the proposal; used to match typed proposals and record tokenless Accepts"
+    )
+    revision: int | None = Field(None, ge=1, description="Revision token returned with a typed proposal")
+
+
+class EmberChatHistoryMessage(BaseModel):
+    workflow_copilot_chat_message_id: str | None = Field(
+        None, description="Persisted row id; absent on rows synthesized in-process"
+    )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_message_id(self) -> str | None:
+        return self.workflow_copilot_chat_message_id
+
+    sender: EmberChatSender = Field(..., description="Message sender")
+    content: str = Field(..., description="Message content")
+    turn_id: str | None = Field(None, description="Turn that owns this row")
+    feedback: EmberMessageFeedback | None = Field(None, description="User's rating of this assistant turn")
+    audio_artifact_id: str | None = Field(None, description="Artifact ID for captured dictation audio")
+    attached_files: Annotated[list[EmberAttachedFile], BeforeValidator(_attached_files_or_empty)] = Field(
+        default_factory=list, description="Uploaded files the user attached to this message"
+    )
+    turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows only)")
+    narrative_payload: dict[str, Any] | None = Field(
+        None,
+        description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
+    )
+    created_at: datetime = Field(..., description="When the message was created")
+    modified_at: datetime | None = Field(
+        None,
+        description="When this version was persisted; legacy in-process constructors may omit it",
+    )
+
+
+class EmberChatSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    workflow_copilot_chat_id: str = Field(
+        ..., validation_alias=_CHAT_ID_ALIASES, description="ID for the workflow copilot chat"
+    )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str:
+        return self.workflow_copilot_chat_id
+
+    workflow_permanent_id: str = Field(..., description="Workflow permanent ID the chat belongs to")
+    workflow_title: str | None = Field(None, description="Title of the workflow the chat belongs to")
+    title: str = Field(..., description="Single-line preview derived from the chat's first message")
+    created_at: datetime = Field(..., description="When the chat was created")
+    modified_at: datetime = Field(..., description="When the chat was last modified")
+    awaiting_user_input: bool = Field(
+        False,
+        description="Whether the chat has a pending question record still waiting on the user",
+    )
+    in_flight: bool = Field(
+        False,
+        description="Whether the chat has a turn marker no reply has answered and recovery has not claimed;"
+        " a dead turn reads true until a chat-history read reconciles it",
+    )
+
+
+class EmberAudioUploadResponse(BaseModel):
+    workflow_copilot_chat_id: str = Field(..., description="Chat ID the audio artifact is associated with")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str:
+        return self.workflow_copilot_chat_id
+
+    audio_artifact_id: str = Field(..., description="Stored audio artifact ID")
+
+
+class EmberStreamMessageType(StrEnum):
+    PROCESSING_UPDATE = "processing_update"
+    RESPONSE = "response"
+    ERROR = "error"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    CONDENSING = "condensing"
+    NARRATION = "narration"
+    BLOCK_PROGRESS = "block_progress"
+    RUN_STARTED = "run_started"
+    RUN_OUTCOME = "run_outcome"
+    TURN_START = "turn_start"
+    DESIGN_START = "design_start"
+    DESIGN_END = "design_end"
+    WORKFLOW_DRAFT = "workflow_draft"
+    CREDENTIAL_REQUIRED = "credential_required"
+    CREDENTIAL_PAUSE_RESOLVED = "credential_pause_resolved"
+    CODEGEN_PROGRESS = "codegen_progress"
+    TITLE_UPDATE = "title_update"
+    SCREENSHOT = "screenshot"
+
+
+class EmberProcessingUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.PROCESSING_UPDATE, description="Message type")
+    status: str = Field(..., description="Processing status text")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class EmberStreamResponseUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.RESPONSE, description="Message type")
+    workflow_copilot_chat_id: str = Field(..., description="The chat ID")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str:
+        return self.workflow_copilot_chat_id
+
+    message: str = Field(..., description="The message sent to the user")
+    updated_workflow: ClientVisibleProposedWorkflow | None = Field(None, description="The updated workflow")
+    response_time: datetime = Field(..., description="When the assistant message was created")
+    total_tokens: int | None = Field(
+        None,
+        description="Total tokens consumed by the agent during this turn; None when no provider reported usage",
+    )
+    response_type: ResponseType = Field("REPLY", description="Agent response classification")
+    resolved_model: str | None = Field(
+        None,
+        description=(
+            "Model name for the terminal attempt (primary or fallback), including an interrupted attempt; "
+            "None when unknown."
+        ),
+    )
+    eval_llm_config_overrides: dict[str, str] | None = None
+    eval_llm_config_overrides_sha256: str | None = None
+    llm_cost: dict[str, Any] | None = None
+    proposal_disposition: ProposalDisposition = Field(
+        "auto_applicable",
+        description="Whether this proposal may auto-apply or must be reviewed explicitly.",
+    )
+    workflow_applied: bool = Field(
+        False,
+        description="True when the backend already committed this terminal workflow proposal.",
+    )
+    proposed_workflow_metadata: EmberProposalMetadata | None = None
+    proposed_workflow_run: EmberProposalRunFacts | None = None
+    cancelled: bool = Field(
+        False,
+        description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",
+    )
+    output_policy_diagnostics: dict[str, Any] | None = Field(
+        None,
+        description="Diagnostic output-policy labels for raw-vs-final quality reporting.",
+    )
+    turn_id: str | None = Field(
+        None,
+        description="UUID generated by the route at turn start; correlates this terminal frame to the matching turn_start envelope.",
+    )
+    narrative_summary: str | None = Field(
+        None,
+        description="One-line accomplishment summary for the turn. Optional; the frontend falls back to the response message when absent.",
+    )
+    narrative_payload: TurnNarrativePayload | None = Field(
+        None,
+        description="Terminal narrative bubble snapshot for live clients; mirrors the persisted assistant chat row.",
+    )
+    work_plan: list[str] | None = Field(
+        None,
+        description=(
+            "Latest work plan the copilot model wrote, as of this turn's end. An empty list means the "
+            "model cleared it; None means this frame carries no snapshot and clients keep what they have."
+        ),
+    )
+
+
+class EmberBrowserAblationResponseUpdate(EmberStreamResponseUpdate):
+    eval_mode: Literal["browser_ablation"]
+    browser_session_id: str | None
+    prompt_sha256: str | None
+    tool_surface_sha256: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    tool_activity: list[dict[str, Any]]
+    screenshot_frames: list[dict[str, Any]]
+
+
+EmberFailureKind = Literal["provider", "server", "configuration"]
+
+
+class EmberStreamErrorUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.ERROR, description="Message type")
+    error: str = Field(..., description="Error message")
+    failure_kind: EmberFailureKind | None = Field(
+        None,
+        description=(
+            "Coarse cause when the turn failed for a reason outside the agent's own reasoning. "
+            "None means the agent itself produced this terminal error, which is a real product outcome."
+        ),
+    )
+    turn_id: str | None = Field(
+        None,
+        description="UUID generated by the route at turn start; correlates this terminal frame to the matching turn_start envelope.",
+    )
+    narrative_summary: str | None = Field(
+        None,
+        description="One-line accomplishment summary; None for route-level error frames where no agent context was available.",
+    )
+
+
+class EmberToolCallUpdate(BaseModel):
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.TOOL_CALL, description="Message type")
+    tool_name: str = Field(..., description="Name of the tool being called")
+    display_label: str | None = Field(
+        None,
+        description="Product-safe label for rendering the tool call in user-visible activity surfaces",
+    )
+    tool_input: dict = Field(default_factory=dict, description="Sanitized tool input (no secrets)")
+    iteration: int = Field(..., description="Agent loop iteration number")
+    tool_call_id: str = Field(..., description="Unique ID for this tool invocation")
+    timestamp: datetime | None = Field(
+        None,
+        description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
+    )
+    browser_session_id: str | None = Field(
+        None,
+        description=(
+            "Browser session a page-acting call resolves to when it is emitted; null for other tools and for "
+            "an unavailable target. Not persisted on the activity entry."
+        ),
+    )
+
+
+class EmberToolResultUpdate(BaseModel):
+    activity_started_at: datetime | None = None
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.TOOL_RESULT, description="Message type")
+    tool_name: str = Field(..., description="Name of the tool that was called")
+    display_label: str | None = Field(
+        None,
+        description="Product-safe label for rendering the tool result in user-visible activity surfaces",
+    )
+    success: bool = Field(..., description="Whether the tool call succeeded")
+    summary: str = Field(..., description="Brief human-readable summary of the result")
+    iteration: int = Field(..., description="Agent loop iteration number")
+    tool_call_id: str = Field(..., description="Unique ID for this tool invocation")
+    code_diffs: list[CodeWriteDiff] | None = Field(
+        None,
+        description="Per changed code block: its label, the +N/-M line delta, and a size-capped scrubbed patch",
+    )
+    work_plan: list[str] | None = Field(
+        None,
+        description="The plan a successful set_work_plan stored, as stored. None for every other tool",
+    )
+    browser_steps: list[str] | None = Field(
+        None,
+        description="A successful run_browser_code call's reported operations as display phrases, in order",
+    )
+    detail: str | None = Field(
+        None,
+        description=(
+            "Longer-cap sanitized failure text for tooltip display. None on success. "
+            "Distinct from `summary`, which is capped tighter for the visible bullet."
+        ),
+    )
+    workflow_run_id: str | None = Field(
+        None,
+        description=(
+            "The workflow run a block-running tool created, when this result came from one "
+            "(update_and_run_blocks / run_blocks_and_collect_debug). Present whether the run "
+            "passed or failed; None for non-run tools."
+        ),
+    )
+    test_inputs: list[EmberTestInput] | None = Field(
+        None,
+        description="Where each input of the run this result dispatched came from. Keys and sources only, never values",
+    )
+    debug_session_id: str | None = Field(
+        None,
+        description="The debug session a start_fresh_browser result moved the Studio browser to; None otherwise.",
+    )
+    executed_source_reference: str | None = Field(
+        None,
+        description=(
+            "Opaque reference to the exact source executed by a run_browser_code result. "
+            "Present for that tool only so a later promotion can be tied to the executed cell."
+        ),
+    )
+    timestamp: datetime | None = Field(
+        None,
+        description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
+    )
+
+
+class EmberCondensingUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.CONDENSING, description="Message type")
+    status: str = Field(..., description="Condensing status: 'started' or 'completed'")
+
+
+class EmberNarrationUpdate(BaseModel):
+    # User-facing narration for one unit of work: why the step is happening,
+    # plus the row titles that describe it while it runs and once it finishes.
+    # Distinct from PROCESSING_UPDATE (terse status text) so the frontend can
+    # style narration as a separate "thinking" channel. Persisted into the
+    # turn's design activity so a reload shows what was live at the time.
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.NARRATION, description="Message type")
+    narration: str = Field(..., description="One-sentence reason this step is happening")
+    active_label: str | None = Field(None, description="Narrator-authored row title while the step is running")
+    outcome_label: str | None = Field(
+        None, description="Narrator-authored row title once the step finished, naming the outcome"
+    )
+    iteration: int = Field(..., description="Agent loop iteration number this narration describes")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class EmberBlockProgressUpdate(BaseModel):
+    # Per-block lifecycle event from inside long-running tool calls.
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.BLOCK_PROGRESS, description="Message type")
+    workflow_run_block_id: str = Field(..., description="Stable per-block id; used as the row key in the activity pane")
+    workflow_run_id: str | None = Field(
+        None,
+        description="Dispatched run id for this block; lets the FE fetch recorded actions live during execution. "
+        "Optional for backward compatibility with clients that only read the run id from run_outcome.",
+    )
+    parent_workflow_run_block_id: str | None = Field(
+        None, description="Run-block id of the block that ran this one (an agent step, loop or code-block fallback)"
+    )
+    block_label: str = Field(..., description="Workflow block label (e.g. 'enter_name')")
+    block_type: str = Field(..., description="Workflow block type (e.g. 'navigation', 'extraction')")
+    status: str = Field(
+        ..., description="BlockStatus value: running, completed, failed, terminated, timed_out, canceled, skipped"
+    )
+    iteration: int = Field(..., description="Agent loop iteration number this block belongs to")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class EmberRunStartedUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.RUN_STARTED, description="Message type")
+    workflow_run_id: str = Field(..., description="Run id, emitted once the run row exists and before it produces work")
+    skipped_prefix: list[SkippedPrefixBlock] = Field(
+        default_factory=list,
+        description="Requested blocks before the run's start that it will not execute; shown before its first block",
+    )
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class EmberRunOutcomeUpdate(BaseModel):
+    # Current authoring emits one factual terminal record. Legacy persisted
+    # frames may still carry the older evaluating/adjudicated shape.
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.RUN_OUTCOME, description="Message type")
+    workflow_run_id: str = Field(..., description="Workflow run the record applies to")
+    workflow_run_block_ids: list[str] = Field(
+        default_factory=list, description="Run-block ids of the recorded run; match the FE per-row keys"
+    )
+    block_labels: list[str] = Field(
+        default_factory=list, description="Block labels of the recorded run; key the persisted narrative payload"
+    )
+    verdict: RunOutcomeVerdict = Field(..., description="Legacy-compatible recorded run state")
+    role: RunOutcomeRole = Field("recorded", description="Display scope of the run record")
+    reason_code: RunOutcomeReasonCode | None = Field(
+        None, description="Machine-readable cause for a not_demonstrated verdict"
+    )
+    display_reason: str | None = Field(None, description="Short product-safe reason for user-facing rendering")
+    browser_session_id: str | None = Field(
+        None, description="Browser session that owned this run's recorded execution state"
+    )
+    workflow_permanent_id: str | None = Field(None, description="Workflow whose Copilot turn created this run")
+    turn_id: str | None = Field(None, description="Parent Copilot turn for this child run")
+    workflow_copilot_chat_id: str | None = Field(None, description="Parent Copilot chat for this child run")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str | None:
+        return self.workflow_copilot_chat_id
+
+    continuity_source: Literal["workflow_run"] = Field(
+        "workflow_run", description="Distinguishes authoritative run state from pane-stream presentation state"
+    )
+    terminal_disposition: str | None = Field(
+        None, description="Recorded run status or watchdog disposition that ended this run observation"
+    )
+    iteration: int = Field(..., description="Agent loop iteration number")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class EmberTurnStartUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.TURN_START, description="Message type")
+    turn_id: str = Field(..., description="UUID for this turn; correlates with the matching terminal frame")
+    turn_index: int = Field(..., description="Zero-based ordinal of this turn within the chat")
+    timestamp: datetime = Field(..., description="Server timestamp")
+    prior_block_count: int | None = Field(
+        None,
+        description="Block count of the canonical workflow at turn entry; drives the FE edit-vs-build chip.",
+    )
+    workflow_copilot_chat_id: str | None = Field(
+        None, description="The chat this turn runs in, known to a client that opened the chat with this turn"
+    )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str | None:
+        return self.workflow_copilot_chat_id
+
+
+class EmberDesignStartUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.DESIGN_START, description="Message type")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class EmberDesignEndUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.DESIGN_END, description="Message type")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class EmberWorkflowDraftUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.WORKFLOW_DRAFT, description="Message type")
+    block_count: int = Field(..., description="Number of blocks in the drafted workflow")
+    block_labels: list[str] = Field(default_factory=list, description="Ordered block labels in the drafted workflow")
+    summary: str | None = Field(None, description="Optional one-line description; populated by a follow-up PR")
+    timestamp: datetime = Field(..., description="Server timestamp")
+    workflow: ClientVisibleProposedWorkflow | None = Field(
+        None,
+        description="Staged workflow API response (same shape as terminal RESPONSE.updated_workflow). Drives mid-turn canvas updates.",
+    )
+    # A write and its test share one tool call, so waiting for the tool_result would show the
+    # patch only after the run. These carry it at the moment the code is written instead.
+    code_diffs: list[dict] | None = Field(
+        None,
+        description="Per changed code block: label, added/removed line counts, and a size-capped scrubbed patch.",
+    )
+    tool_call_id: str | None = Field(
+        None,
+        description="The write's originating tool call, so the frontend attaches the diffs to that call's row.",
+    )
+
+
+class EmberTitleUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.TITLE_UPDATE, description="Message type")
+    turn_id: str = Field(..., description="UUID for the turn that named the agent")
+    workflow_permanent_id: str = Field(..., description="The agent that was named")
+    title: str = Field(..., description="The persisted title; only ever emitted after the write succeeded")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class EmberScreenshotUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.SCREENSHOT, description="Message type")
+    artifact_id: str = Field(..., description="Chat-owned artifact holding the full-size PNG")
+    captured_at: datetime = Field(..., description="Server clock read when the frame was staged for the model")
+    tool_call_id: str | None = Field(None, description="The tool call that staged the frame, when known")
+
+
+class CredentialRegistration(BaseModel):
+    username: str = Field(..., description="Username or email to register with, exactly as the user gave it")
+    credential_name: str = Field(..., description="Name to save the new credential under")
+    password_length: int = Field(24, description="Generated password length; 24 to 128")
+    charset: Literal["alphanumeric", "alphanumeric_symbols"] = Field(
+        "alphanumeric_symbols", description="Characters the site accepts in a password"
+    )
+
+
+class EmberCredentialRegistration(CredentialRegistration):
+    attempted: bool = Field(False, description="Generate and save was used; the card offers it once")
+    outcome: Literal["rejected", "unknown"] | None = Field(None, description="Why an attempt did not connect")
+
+
+CredentialBinding = Literal["saved_workflow", "matched_by_saved_url", "not_bound"]
+
+
+class EmberCredentialRequiredUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.CREDENTIAL_REQUIRED, description="Message type")
+    turn_id: str = Field(..., description="UUID for the paused turn; correlates with credential-response POSTs")
+    workflow_copilot_chat_id: str = Field(..., description="The chat ID")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str:
+        return self.workflow_copilot_chat_id
+
+    resume_token: str = Field(..., description="One-time token the credential-response POST must echo back to resume")
+    reason: Literal[
+        "workflow_credential_inputs_unbound",
+        "missing_credential_run_failure",
+        "credential_deferred_draft",
+        "login_credentials_unresolved",
+        "credential_missing_totp",
+        "credential_rejected_by_site",
+        "credential_registration",
+    ] = Field(..., description="Typed signal that triggered the pause")
+    message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
+    login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")
+    credential_refs: list[str] = Field(default_factory=list, description="Credential IDs or names referenced")
+    named_credential_id: str | None = Field(
+        None, description="The one credential the user named this turn, offered for a one-click confirmation"
+    )
+    timeout_seconds: int = Field(..., description="How long the backend will wait before degrading to terminal")
+    expires_at: datetime = Field(..., description="Server time after which the pause degrades to terminal")
+    anchor_tool_call_id: str | None = Field(
+        None, description="Tool call whose activity row was newest when the pause was raised"
+    )
+    sign_in_browser_session_id: str | None = Field(
+        None, description="The live browser the user may sign in to themselves; absent when the card does not offer it"
+    )
+    signing_in: bool = Field(False, description="The user has started signing in themselves")
+    credential_binding: CredentialBinding | None = Field(
+        None, description="How the credential an update card names is bound; absent on other cards"
+    )
+    registration: EmberCredentialRegistration | None = Field(
+        None, description="Account details a Generate and save answer would store; never a password"
+    )
+    site_question: EmberCredentialSiteQuestion | None = Field(
+        None, description="The site question asked about a picked login, so a reloaded card asks it again"
+    )
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+CredentialPauseResolvedOutcome = Literal["connected", "skipped", "not_admitted", "signed_in"]
+
+
+class EmberCredentialPauseResolvedUpdate(BaseModel):
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.CREDENTIAL_PAUSE_RESOLVED, description="Message type")
+    turn_id: str = Field(..., description="UUID for the paused turn")
+    workflow_copilot_chat_id: str = Field(..., description="The chat ID")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str:
+        return self.workflow_copilot_chat_id
+
+    resume_token: str = Field(..., description="Token of the credential_required card this answer resolves")
+    outcome: CredentialPauseResolvedOutcome = Field(
+        ..., description="The waiter's final verdict, after admission; never the raw POSTed action"
+    )
+    credential_id: str | None = Field(None, description="The connected credential; set only when connected")
+    name: str | None = Field(
+        None, description="Display name of the connected credential, or of the profile saved from a sign-in"
+    )
+    browser_profile_id: str | None = Field(None, description="The profile saved from the user's own sign-in")
+    site_answer: CredentialSiteAnswer | None = Field(None, description="The user's answer to the site question")
+    site_a: str | None = Field(None, description="The origin the login was saved for before the answer")
+    saved_sites: list[str] | None = Field(None, description="Every origin the login was saved for before the answer")
+    site_b: str | None = Field(None, description="The origin the card signs in on")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class EmberChatHistoryResponse(BaseModel):
+    pending_credential_requests: list[EmberCredentialRequiredUpdate] = Field(default_factory=list)
+    question_interactions: list[QuestionInteraction] = Field(default_factory=list)
+    pending_question_cancel_token: str | None = None
+    workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ember_chat_id(self) -> str | None:
+        return self.workflow_copilot_chat_id
+
+    request_turn_id: str | None = Field(
+        None, description="Turn matched by request_cancel_token when recovery requests provide one"
+    )
+    request_browser_allocations: EmberRequestBrowserAllocations | None = None
+    in_flight_turn: EmberInFlightTurn | None = None
+    chat_history: list[EmberChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
+    workflow_permanent_id: str | None = Field(None, description="Workflow the chat belongs to")
+    app_url: str | None = Field(None, description="Base URL of the web app, without a trailing slash")
+    accepted_turn_ids: list[str] = Field(
+        default_factory=list, description="Turns whose manual Accept completed on the server"
+    )
+    proposed_workflow: ClientVisibleProposedWorkflow | None = Field(
+        None, description="Latest workflow proposed by the copilot"
+    )
+    proposed_workflow_metadata: EmberProposalMetadata | None = None
+    proposed_claim_expires_in_seconds: float | None = Field(
+        None,
+        description=(
+            "Seconds the server's accepting claim has left. None when no live claim holds the proposal. "
+            "A duration rather than a deadline, so a client with a skewed clock still agrees with the server."
+        ),
+    )
+    proposed_workflow_run: EmberProposalRunFacts | None = None
+    auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
+
+    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
+
+
+class EmberCodegenProgressUpdate(BaseModel):
+    """Live-only drafting progress while the LLM streams authoring-tool arguments. Not persisted; the
+    workflow_draft frame supersedes it."""
+
+    type: EmberStreamMessageType = Field(EmberStreamMessageType.CODEGEN_PROGRESS, description="Message type")
+    tool_name: str = Field(..., description="Authoring tool whose arguments are being streamed")
+    blocks_drafted: list[str] = Field(
+        default_factory=list, description="Cumulative ordered unique block labels seen so far in this call"
+    )
+    chars_streamed: int = Field(..., description="Cumulative argument characters streamed so far in this call")
+    iteration: int = Field(..., description="Agent loop iteration number; matches the TOOL_CALL frame that follows")
+    generation_id: str | None = Field(
+        None,
+        description="New for every model response; the authoring calls within one response share it",
+    )
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class WorkflowYAMLConversionRequest(BaseModel):
+    workflow_definition_yaml: str = Field(..., description="Workflow definition YAML to convert to blocks")
+    workflow_id: str = Field(..., description="Workflow ID")
+
+
+class WorkflowYAMLConversionResponse(BaseModel):
+    workflow_definition: dict = Field(..., description="Converted workflow definition with blocks")
+
+
+class EmberGoalSuggestionRequest(BaseModel):
+    label: str = Field(..., max_length=256, description="Label of the code block whose Goal is suggested")
+    code: str = Field(..., max_length=200_000, description="The block's code as the person edited it")
+    current_goal: str = Field("", max_length=20_000, description="The block's Goal before the suggestion")
+    parameter_keys: list[Annotated[str, StringConstraints(max_length=256)]] = Field(
+        default_factory=list, max_length=500, description="Workflow parameters the block can read"
+    )
+
+
+class EmberGoalSuggestionResponse(BaseModel):
+    goal: str | None = Field(None, description="Suggested Goal written from the code; null when none was produced")

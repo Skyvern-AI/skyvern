@@ -42,11 +42,11 @@ from skyvern.forge.sdk.artifact.storage import s3 as s3_module
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
-from skyvern.forge.sdk.copilot.tools.run_execution import build_test_evidence_packet
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.utils import downloaded_file_count_from_output
+from skyvern.forge.sdk.ember.tools.run_execution import build_test_evidence_packet
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow import code_block_authorized_files
 from skyvern.forge.sdk.workflow.code_block_authorized_files import (
@@ -72,7 +72,7 @@ from skyvern.services import uploaded_file_service
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from tests.unit.conftest import SESSION_DOWNLOAD_BYTES, make_claimed_download_mock, registered_download_row
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.ember_test_helpers import make_ember_ctx
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 _BLOCK_CREATED_AT = datetime(2026, 6, 14, 11, 0, tzinfo=UTC)
@@ -120,7 +120,7 @@ def _isolated_download_path(tmp_path, monkeypatch: pytest.MonkeyPatch) -> str:
     return str(download_root)
 
 
-def _copilot_workflow() -> SimpleNamespace:
+def _ember_workflow() -> SimpleNamespace:
     return SimpleNamespace(
         created_by="copilot",
         edited_by=None,
@@ -1115,13 +1115,13 @@ async def test_download_intent_block_registering_nothing_is_counted(
 
 
 @pytest.mark.asyncio
-async def test_copilot_authored_download_block_registering_nothing_is_counted_with_lineage(
+async def test_ember_authored_download_block_registering_nothing_is_counted_with_lineage(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
     skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
 
     _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
-    _wire_block_runtime(monkeypatch, workflow=_copilot_workflow())
+    _wire_block_runtime(monkeypatch, workflow=_ember_workflow())
 
     # The production shape, executed: page is a stub, so page.expect_download raises inside the
     # try, the bare except converts it into the blocker string, and the code returns normally.
@@ -1140,7 +1140,7 @@ async def test_copilot_authored_download_block_registering_nothing_is_counted_wi
 
 
 @pytest.mark.asyncio
-async def test_copilot_authored_download_block_that_registers_a_file_succeeds(
+async def test_ember_authored_download_block_that_registers_a_file_succeeds(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
     skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
@@ -1153,7 +1153,7 @@ async def test_copilot_authored_download_block_that_registers_a_file_succeeds(
         modified_at=datetime(2026, 6, 14, 12, 0, tzinfo=UTC),
     )
     _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(side_effect=[[], [file_info]]))
-    _wire_block_runtime(monkeypatch, workflow=_copilot_workflow())
+    _wire_block_runtime(monkeypatch, workflow=_ember_workflow())
 
     block = CodeBlock(
         label="download_invoice",
@@ -1284,7 +1284,7 @@ async def test_secure_runner_download_intent_is_counted_too(
     skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
 
     _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
-    _wire_block_runtime(monkeypatch, workflow=_copilot_workflow())
+    _wire_block_runtime(monkeypatch, workflow=_ember_workflow())
     _wire_secure_runner(monkeypatch, output={"downloaded_files": [], "blocker": "no downloadable file"})
 
     block = CodeBlock(
@@ -1347,7 +1347,7 @@ async def test_secure_runner_registered_download_is_not_counted(
     skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
 
     _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
-    _wire_block_runtime(monkeypatch, workflow=_copilot_workflow())
+    _wire_block_runtime(monkeypatch, workflow=_ember_workflow())
     _wire_secure_runner(monkeypatch, output={"downloaded_files": [{"filename": "invoice.pdf"}]})
 
     block = CodeBlock(
@@ -2829,7 +2829,7 @@ async def test_secure_runner_typed_download_waits_for_delayed_final_session_row(
     assert persisted["downloaded_file_artifact_ids"] == [_SESSION_FILE.artifact_id]
 
     packet = build_test_evidence_packet(
-        make_copilot_ctx(),
+        make_ember_ctx(),
         {
             "ok": True,
             "data": {

@@ -912,15 +912,15 @@ async def test_multi_field_totp_browser_privacy_after_fill(monkeypatch: pytest.M
                     native_html = await get_html.handler({"selector": selector})
                     native_parsed = BeautifulSoup(native_html.content, "html.parser")
                     assert native_parsed.select_one("#secret-0")["value"] == "******"
-                from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+                from skyvern.forge.sdk.ember.composition_browser_expressions import (
                     COMPOSITION_STRIPPED_HTML_EXPRESSION,
                 )
-                from skyvern.forge.sdk.copilot.tools.locator_inspection import inspect_locator_matches
+                from skyvern.forge.sdk.ember.tools.locator_inspection import inspect_locator_matches
 
-                copilot_html = BeautifulSoup(
+                ember_html = BeautifulSoup(
                     await live_page.evaluate(COMPOSITION_STRIPPED_HTML_EXPRESSION), "html.parser"
                 )
-                assert copilot_html.select_one("#secret-0")["value"] == "******"
+                assert ember_html.select_one("#secret-0")["value"] == "******"
                 inspected = await inspect_locator_matches(live_page, ["#secret-0"])
                 assert (
                     BeautifulSoup(inspected["selectors"][0]["matches"][0]["outer_html"], "html.parser").input[

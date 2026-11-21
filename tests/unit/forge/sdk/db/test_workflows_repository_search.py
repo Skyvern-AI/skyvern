@@ -9,14 +9,17 @@ only matched `workflows.title`, `folders.title`, and parameter metadata — typi
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, insert
 
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowTemplateModel
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
+from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 
 class _SessionContext:
@@ -105,6 +108,51 @@ async def test_get_workflow_by_permanent_id_bounds_the_latest_version_lookup(age
     assert all("LIMIT" in s.upper() for s in version_lookups)
 
 
+async def _seed_template_page(agent_db: AgentDB, organization_id: str, latest: Workflow) -> list[str]:
+    foreign_org = await agent_db.organizations.create_organization(organization_name="Other Template Org")
+    template_id = "wpid_page_template"
+    plain_id = "wpid_page_plain"
+    deleted_id = "wpid_page_deleted_template"
+    foreign_id = "wpid_page_foreign_template"
+    new_page_ids = [template_id, plain_id, deleted_id, foreign_id]
+    off_page_ids = [f"wpid_off_page_{index:04d}" for index in range(1_000)]
+    offsets = [*range(len(new_page_ids), 0, -1), *range(-1, -len(off_page_ids) - 1, -1)]
+    workflow_rows = [
+        {
+            "organization_id": organization_id,
+            "workflow_permanent_id": permanent_id,
+            "title": permanent_id,
+            "workflow_definition": {"parameters": [], "blocks": []},
+            "created_at": latest.created_at + timedelta(seconds=offset),
+            "modified_at": latest.created_at + timedelta(seconds=offset),
+        }
+        for permanent_id, offset in zip(new_page_ids + off_page_ids, offsets, strict=True)
+    ]
+    workflow_rows.append({**workflow_rows[len(new_page_ids) - 1], "organization_id": foreign_org.organization_id})
+    active_template_ids = [template_id, latest.workflow_permanent_id, *off_page_ids]
+    template_times = {"created_at": latest.created_at, "modified_at": latest.created_at}
+    template_rows = [
+        {"organization_id": organization_id, "workflow_permanent_id": permanent_id, **template_times}
+        for permanent_id in active_template_ids
+    ]
+    template_rows.extend(
+        [
+            {
+                "organization_id": organization_id,
+                "workflow_permanent_id": deleted_id,
+                "deleted_at": latest.created_at,
+                **template_times,
+            },
+            {"organization_id": foreign_org.organization_id, "workflow_permanent_id": foreign_id, **template_times},
+        ]
+    )
+    async with agent_db.Session() as session:
+        await session.execute(insert(WorkflowModel), workflow_rows)
+        await session.execute(insert(WorkflowTemplateModel), template_rows)
+        await session.commit()
+    return [*new_page_ids, latest.workflow_permanent_id]
+
+
 @pytest.mark.asyncio
 async def test_get_workflows_by_organization_id_reports_the_first_versions_creator_and_date(agent_db: AgentDB) -> None:
     """Every save inserts a new version row; the list must still report the original author and creation date."""
@@ -136,7 +184,7 @@ async def test_get_workflows_by_organization_id_reports_the_first_versions_creat
 
     assert workflow.version == 2
     assert workflow.created_by == "user_editor"
-    assert workflow.original_created_by == "user_author"
+    assert workflow.model_dump()["original_created_by"] == "user_author"
     assert workflow.original_created_at == first_version.created_at
     assert workflow.created_at != first_version.created_at
 
@@ -144,3 +192,15 @@ async def test_get_workflows_by_organization_id_reports_the_first_versions_creat
     [workflow] = await agent_db.workflows.get_workflows_by_organization_id(organization_id=org.organization_id)
 
     assert workflow.original_created_at == first_version.created_at
+    assert workflow.original_created_by == "user_author"
+    assert await agent_db.workflows.get_workflow_original_creators({wpid}, org.organization_id) == {wpid: "user_author"}
+
+    page_ids = await _seed_template_page(agent_db, org.organization_id, workflow)
+    page = await agent_db.workflows.get_workflows_by_organization_id(
+        organization_id=org.organization_id, page_size=len(page_ids)
+    )
+    assert [item.workflow_permanent_id for item in page] == page_ids
+    assert [item.is_template for item in page] == [True, False, False, False, True]
+    assert page[-1].created_by == "user_editor"
+    assert page[-1].original_created_by == "user_author"
+    assert page[-1].original_created_at == first_version.created_at

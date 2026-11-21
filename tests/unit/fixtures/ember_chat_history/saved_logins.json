@@ -1,0 +1,83 @@
+[
+  {
+    "credential_id": "cred_598620695317752898",
+    "credential": {
+      "username": "ember-parity-4fa000bd@example.com",
+      "totp_type": "none",
+      "totp_identifier": null,
+      "has_totp": false
+    },
+    "credential_type": "password",
+    "name": "ember-parity-4fa000bd",
+    "vault_type": "skyvern",
+    "vault_id": null,
+    "item_id": null,
+    "upstream_missing_at": null,
+    "browser_profile_id": null,
+    "auto_profile_disabled": false,
+    "pin_saved_session_ip": false,
+    "tested_url": null,
+    "extra_site_urls": [],
+    "user_context": null,
+    "save_browser_session_intent": false,
+    "run_sequentially": false,
+    "folder_id": null,
+    "proxy_location": null,
+    "proxy_session_id": null,
+    "created_by": null
+  },
+  {
+    "credential_id": "cred_598619896453835778",
+    "credential": {
+      "username": "sky20628-gs-194918@example.com",
+      "totp_type": "none",
+      "totp_identifier": null,
+      "has_totp": false
+    },
+    "credential_type": "password",
+    "name": "sky20628-gs-194918",
+    "vault_type": "skyvern",
+    "vault_id": null,
+    "item_id": null,
+    "upstream_missing_at": null,
+    "browser_profile_id": null,
+    "auto_profile_disabled": false,
+    "pin_saved_session_ip": false,
+    "tested_url": null,
+    "extra_site_urls": [],
+    "user_context": null,
+    "save_browser_session_intent": false,
+    "run_sequentially": false,
+    "folder_id": null,
+    "proxy_location": null,
+    "proxy_session_id": null,
+    "created_by": null
+  },
+  {
+    "credential_id": "cred_598611108767106226",
+    "credential": {
+      "username": "demo_business_user",
+      "totp_type": "none",
+      "totp_identifier": null,
+      "has_totp": false
+    },
+    "credential_type": "password",
+    "name": "harbor-utility-login",
+    "vault_type": "bitwarden",
+    "vault_id": null,
+    "item_id": null,
+    "upstream_missing_at": null,
+    "browser_profile_id": null,
+    "auto_profile_disabled": false,
+    "pin_saved_session_ip": false,
+    "tested_url": null,
+    "extra_site_urls": [],
+    "user_context": null,
+    "save_browser_session_intent": false,
+    "run_sequentially": false,
+    "folder_id": null,
+    "proxy_location": null,
+    "proxy_session_id": null,
+    "created_by": null
+  }
+]

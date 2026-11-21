@@ -1,17 +1,19 @@
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
+from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
+from skyvern.forge.sdk.ember.active_run_session import ActiveRunSessionAssociation
 from skyvern.forge.sdk.routes import debug_sessions as debug_sessions_mod
 from skyvern.forge.sdk.schemas.debug_sessions import DebugSession
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -1095,10 +1097,40 @@ _OWNER_ORG = Organization(
 )
 
 
+@dataclass(frozen=True)
+class _OwnerRoute:
+    method: str
+    path: str
+    endpoint: Callable[..., Awaitable[BaseModel | Response]]
+    success_status: int = 200
+    json: dict[str, str] | None = None
+    query: str = ""
+
+
+_OWNER_ROUTES = [
+    _OwnerRoute(
+        "GET",
+        "/debug-session/{workflow_permanent_id}",
+        debug_sessions_mod.get_or_create_debug_session_by_user_and_workflow_permanent_id,
+    ),
+    _OwnerRoute("POST", "/debug-session/prewarm", debug_sessions_mod.prewarm_debug_session, 202, json={}),
+    _OwnerRoute(
+        "GET", "/debug-session/{workflow_permanent_id}/viewer-state", debug_sessions_mod.get_debug_session_viewer_state
+    ),
+    _OwnerRoute("POST", "/debug-session/{workflow_permanent_id}/new", debug_sessions_mod.new_debug_session),
+    _OwnerRoute(
+        "GET",
+        "/debug-session/{workflow_permanent_id}/login-block-compatibility",
+        debug_sessions_mod.get_login_block_compatibility,
+        query="?block_label=login",
+    ),
+]
+
+
 async def _debug_session_owner(
-    monkeypatch: pytest.MonkeyPatch, principal: RequestPrincipal, headers: dict[str, str]
+    monkeypatch: pytest.MonkeyPatch, route: _OwnerRoute, principal: RequestPrincipal, headers: dict[str, str]
 ) -> tuple[int, list[str]]:
-    """GET the mounted debug-session route; the principal becomes readable only once get_current_org has run."""
+    """Call the mounted route; the principal becomes readable only once get_current_org has run."""
     resolved: list[RequestPrincipal] = []
 
     async def current_org() -> Organization:
@@ -1123,71 +1155,89 @@ async def _debug_session_owner(
             status="created",
         )
 
+    async def get_live_bound_persistent_browser_session(
+        *, organization_id: str, workflow_permanent_id: str, bound_key: str
+    ) -> SimpleNamespace:
+        owners.extend(
+            uid
+            for uid in ("o_owner_user", "user_member")
+            if debug_sessions_mod._prewarm_bound_key(organization_id, uid) == bound_key
+        )
+        return SimpleNamespace(persistent_browser_session_id="pbs_prewarm")
+
     monkeypatch.setattr(org_auth_service, "get_request_principal", lambda: resolved[-1] if resolved else None)
     monkeypatch.setattr(org_auth_service, "get_current_org_cached", AsyncMock(return_value=_OWNER_ORG))
     monkeypatch.setattr(org_auth_service.app, "authenticate_user_function", authenticate_user)
+    monkeypatch.setattr(debug_sessions_mod, "get_active_run_session", AsyncMock(return_value=None))
     app_mock = MagicMock()
     app_mock.DATABASE.debug.get_debug_session = AsyncMock(side_effect=get_debug_session)
     app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=None)
-    app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock()
-    fastapi_app = FastAPI()
-    fastapi_app.add_api_route(
-        "/debug-session/{workflow_permanent_id}",
-        debug_sessions_mod.get_or_create_debug_session_by_user_and_workflow_permanent_id,
-        methods=["GET"],
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
+        side_effect=get_live_bound_persistent_browser_session
     )
+    app_mock.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock()
+    app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=None)
+    fastapi_app = FastAPI()
+    fastapi_app.add_api_route(route.path, route.endpoint, methods=[route.method])
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = current_org
     with _patched_app(app_mock):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
-            response = await client.get("/debug-session/wpid_test", headers=headers)
+            response = await client.request(
+                route.method,
+                route.path.format(workflow_permanent_id="wpid_test") + route.query,
+                headers=headers,
+                json=route.json,
+            )
     return response.status_code, owners
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", _OWNER_ROUTES, ids=lambda route: f"{route.method} {route.path}")
 @pytest.mark.parametrize(
-    ("principal", "headers", "expected"),
+    ("principal", "headers", "expected_owner"),
     [
-        (RequestPrincipal("o_owner", AuthKind.api_key), {"x-api-key": "org-key"}, (200, ["o_owner_user"])),
+        (RequestPrincipal("o_owner", AuthKind.api_key), {"x-api-key": "org-key"}, "o_owner_user"),
         (
             RequestPrincipal("o_owner", AuthKind.api_key),
             {"x-api-key": "org-key", "x-user-agent": "skyvern-ui"},
-            (200, ["o_owner_user"]),
+            "o_owner_user",
         ),
         (
             RequestPrincipal("o_owner", AuthKind.ui_session),
             {"x-api-key": "ui-session-key", "x-user-agent": "skyvern-ui"},
-            (200, ["o_owner_user"]),
+            "o_owner_user",
         ),
         (
             RequestPrincipal("o_owner", AuthKind.member_api_key, "user_member", "org:member"),
             {"x-api-key": "member-key"},
-            (200, ["user_member"]),
+            "user_member",
         ),
         (
             RequestPrincipal("o_owner", AuthKind.bearer, "user_member", "org:member"),
             {"Authorization": "Bearer valid-bearer"},
-            (200, ["user_member"]),
+            "user_member",
         ),
-        (RequestPrincipal("o_owner", AuthKind.scoped_api_key), {"x-api-key": "scoped-key"}, (403, [])),
+        (RequestPrincipal("o_owner", AuthKind.scoped_api_key), {"x-api-key": "scoped-key"}, None),
         (
             RequestPrincipal("o_owner", AuthKind.scoped_api_key),
             {"x-api-key": "scoped-key", "x-user-agent": "skyvern-ui"},
-            (403, []),
+            None,
         ),
         (
             RequestPrincipal("o_owner", AuthKind.scoped_api_key),
             {"x-api-key": "scoped-key", "Authorization": "Bearer invalid-bearer"},
-            (403, []),
+            None,
         ),
         (
             RequestPrincipal("o_owner", AuthKind.scoped_api_key),
             {"x-api-key": "scoped-key", "Authorization": "Bearer valid-bearer"},
-            (403, []),
+            None,
         ),
         (
             RequestPrincipal("o_owner", AuthKind.scoped_api_key_and_bearer, "user_member", "org:member"),
             {"x-api-key": "scoped-key", "Authorization": "Bearer valid-bearer"},
-            (200, ["user_member"]),
+            "user_member",
         ),
     ],
     ids=[
@@ -1205,8 +1255,10 @@ async def _debug_session_owner(
 )
 async def test_debug_session_owner_for_each_credential_kind(
     monkeypatch: pytest.MonkeyPatch,
+    route: _OwnerRoute,
     principal: RequestPrincipal,
     headers: dict[str, str],
-    expected: tuple[int, list[str]],
+    expected_owner: str | None,
 ) -> None:
-    assert await _debug_session_owner(monkeypatch, principal, headers) == expected
+    expected = (403, []) if expected_owner is None else (route.success_status, [expected_owner])
+    assert await _debug_session_owner(monkeypatch, route, principal, headers) == expected

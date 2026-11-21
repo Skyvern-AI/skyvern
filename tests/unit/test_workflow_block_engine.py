@@ -72,7 +72,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     v3_ab_ineligibility_reason,
 )
 from skyvern.forge.sdk.workflow.models.workflow import (
-    COPILOT_TEST_WORKFLOW_CREATOR,
+    EMBER_TEST_WORKFLOW_CREATOR,
     Workflow,
     WorkflowDefinition,
     WorkflowRunStatus,
@@ -833,12 +833,12 @@ async def test_execute_workflow_blocks_hands_the_resolver_the_runs_trigger_type(
 @pytest.mark.parametrize(
     ("created_by", "expected_engine"),
     [
-        (COPILOT_TEST_WORKFLOW_CREATOR, RunEngine.skyvern_v3),
+        (EMBER_TEST_WORKFLOW_CREATOR, RunEngine.skyvern_v3),
         ("some-user-id", RunEngine.skyvern_v1),
     ],
 )
 @pytest.mark.asyncio
-async def test_execute_workflow_blocks_routes_a_copilot_test_copy_like_the_workflow_it_copies(
+async def test_execute_workflow_blocks_routes_a_ember_test_copy_like_the_workflow_it_copies(
     scoped_context: SkyvernContext,
     monkeypatch: pytest.MonkeyPatch,
     created_by: str,
@@ -1656,7 +1656,7 @@ async def _resolve_chosen_engine_run(
     strict_error_flags: set[str] | None = None,
     trigger_type: WorkflowRunTriggerType | None = WorkflowRunTriggerType.api,
     billing_tier: BillingTier = BillingTier.ENTERPRISE,
-    copilot_test_copy: bool = False,
+    ember_test_copy: bool = False,
 ) -> tuple[FakeExperimentationProvider, Any]:
     # Eligibility and the unset-engine fact are computed from the blocks by the same helpers the
     # workflow service calls, so a block-level regression in either reaches these assertions.
@@ -1676,7 +1676,7 @@ async def _resolve_chosen_engine_run(
         first_version_created_at=born_at,
         workflow_status=workflow_status,
         trigger_type=trigger_type,
-        copilot_test_copy=copilot_test_copy,
+        ember_test_copy=ember_test_copy,
     )
     return provider, resolution
 
@@ -1936,7 +1936,7 @@ async def test_a_per_call_workflow_born_after_the_chosen_engine_cutoff_keeps_ab_
     ids=["post-cutoff-v3-pin", "post-cutoff-no-pin", "pre-cutoff", "job-recipe", "self-serve-default"],
 )
 @pytest.mark.asyncio
-async def test_a_copilot_test_copy_routes_like_the_workflow_it_copies(
+async def test_a_ember_test_copy_routes_like_the_workflow_it_copies(
     scoped_context: SkyvernContext,
     monkeypatch: pytest.MonkeyPatch,
     v3_default_cutoff: datetime,
@@ -1963,7 +1963,7 @@ async def test_a_copilot_test_copy_routes_like_the_workflow_it_copies(
         workflow_status=WorkflowStatus.auto_generated,
         trigger_type=trigger_type,
         billing_tier=billing_tier,
-        copilot_test_copy=True,
+        ember_test_copy=True,
     )
 
     assert unset.resolve_engine("wr_copilot_test") == expected_engine
@@ -2216,7 +2216,7 @@ def _pin_added_logs(mock_log: MagicMock) -> list[dict[str, Any]]:
         ),
         pytest.param(None, [], [_v1_pin("a")], None, (0, 1, None), id="first_version_with_pin"),
         pytest.param([_nav("a")], [_v1_pin("a")], [_v1_pin("a")], None, None, id="in_place_edit_keeps_pin"),
-        pytest.param([_nav("a")], [], [_v1_pin("a")], COPILOT_TEST_WORKFLOW_CREATOR, None, id="copilot_test_row"),
+        pytest.param([_nav("a")], [], [_v1_pin("a")], EMBER_TEST_WORKFLOW_CREATOR, None, id="copilot_test_row"),
     ],
 )
 @pytest.mark.asyncio

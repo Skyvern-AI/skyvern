@@ -395,11 +395,10 @@ def build_captcha_tools(
         recorded = f"\nRecorded challenge solves for this task: {evidence}" if evidence else ""
 
         if outcome.status in (ChallengeStatus.UNSOLVED, ChallengeStatus.UNSUPPORTED):
-            failed_attempts += 1
-            unsolved = (
-                "a captcha challenge is present but could not be solved this attempt; wait briefly and "
-                "re-check, or report the captcha as blocking if it persists."
-            ) + recorded
+            # A call where no solver acted on a challenge is a no-op, like absent, and does not spend the cap.
+            if outcome.acted:
+                failed_attempts += 1
+            unsolved = outcome.facts("solve_captcha") + recorded
             # Three literal returns rather than one with a computed class: the error-class census reads literals.
             if outcome.status is ChallengeStatus.UNSUPPORTED:
                 return ToolResult.error(unsolved, error_class="challenge_unsupported")
@@ -415,18 +414,20 @@ def build_captcha_tools(
                 "captcha solved; re-observe the page and continue (e.g. retry submit)." + lifetime + recorded,
                 ok_class="solved",
             )
-        # Absent: no challenge is presented, including a widget the page loaded but never showed. No solver
-        # arm ran, so this cheap structural no-op does not count toward the failure cap.
-        return ToolResult.ok(
-            _ABSENT
-            + (
-                " This detects widget captchas only: an image of distorted characters is not detected here -- "
-                "pass image_selector='img' to list the page's images and read the captcha one."
-                if reads_images
-                else ""
-            ),
-            ok_class="absent",
+        image_hint = (
+            " This detects widget captchas only: an image of distorted characters is not detected here -- "
+            "pass image_selector='img' to list the page's images and read the captcha one."
+            if reads_images
+            else ""
         )
+        # No solver arm ran, so neither of these cheap structural no-ops counts toward the failure cap.
+        if outcome.check_incomplete:
+            return ToolResult.ok(
+                outcome.facts("solve_captcha") + " Re-observe before calling solve_captcha again." + image_hint,
+                ok_class="check_incomplete",
+            )
+        # Absent: no challenge is presented, including a widget the page loaded but never showed.
+        return ToolResult.ok(_ABSENT + image_hint, ok_class="absent")
 
     image_parameter = {
         "image_selector": {

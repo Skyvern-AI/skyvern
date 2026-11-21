@@ -19,7 +19,7 @@ from skyvern.cli.mcp_tools import code_block as code_block_tools
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools import trajectory as mcp_trajectory
 from skyvern.cli.mcp_tools.code_block import skyvern_code_block_lint, skyvern_code_block_synthesize
-from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
+from skyvern.forge.sdk.ember.code_block_synthesis import synthesize_code_block
 
 _HASH_A = "principal-a"
 _HASH_B = "principal-b"

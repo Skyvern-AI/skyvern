@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from mimetypes import guess_type
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import aiofiles
@@ -32,10 +32,19 @@ DRIVE_RESUMABLE_CHUNK_BYTES = 8 * 1024 * 1024
 DRIVE_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 GOOGLE_WORKSPACE_MIME_PREFIX = "application/vnd.google-apps."
 GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
+GOOGLE_SHEET_MIME_TYPE = "application/vnd.google-apps.spreadsheet"
+# Keyed by suffix, not guess_type(): Python's built-in mime table has no .xlsx entry, so hosts without
+# /etc/mime.types would otherwise send XLSX as application/octet-stream and skip the conversion.
+SHEET_CONVERTIBLE_MEDIA_TYPES = {
+    ".csv": "text/csv",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 _DRIVE_FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _DEFAULT_BACKOFF_SECONDS = 1.0
 _RATE_LIMIT_403_REASONS = frozenset({"ratelimitexceeded", "userratelimitexceeded"})
+_FILE_PERMISSION_403_REASONS = frozenset({"insufficientFilePermissions", "teamDriveMembershipRequired"})
 _sleep = asyncio.sleep
 
 
@@ -202,6 +211,40 @@ def _raise_for_error(response: httpx.Response) -> None:
     raise GoogleDriveAPIError(status=status, code=code, message=message)
 
 
+def error_from_response_body(status: int, body: str | None) -> GoogleDriveAPIError:
+    try:
+        _raise_for_error(httpx.Response(status, content=(body or "").encode()))
+    except GoogleDriveAPIError as exc:
+        return exc
+    return GoogleDriveAPIError(status=status, code=None, message="Google Drive API error")
+
+
+def explain_access_error(
+    exc: GoogleDriveAPIError, *, operation: Literal["upload", "download"]
+) -> GoogleDriveAPIError | None:
+    """Clearer text for a Drive permission or visibility error, or None when ``exc`` is neither."""
+    # Google's own message is dropped on purpose: for notFound it echoes the file or folder ID.
+    # Callers raise the result `from None` so the original error stays out of logged tracebacks too.
+    if exc.status == 403 and exc.code in _FILE_PERMISSION_403_REASONS and operation == "upload":
+        hint = (
+            "The connected Google account cannot add or change files in this Drive folder or file. "
+            "On a shared drive, its role must be Contributor or higher."
+        )
+    elif exc.status == 403 and exc.code in _FILE_PERMISSION_403_REASONS:
+        hint = (
+            "The connected Google account cannot download this Drive file. Check that it can view the file "
+            "(on a shared drive, that it is a member) and that the owner has not turned off downloading."
+        )
+    elif exc.status == 404 and exc.code == "notFound":
+        hint = (
+            "The connected Google account cannot see this Drive folder or file. Check the URL, and that "
+            "the account has access to it or is a member of its shared drive."
+        )
+    else:
+        return None
+    return GoogleDriveAPIError(status=exc.status, code=exc.code, message=f"{hint} (Google Drive reason: {exc.code})")
+
+
 def extract_folder_id(value: str | None) -> str | None:
     """Normalize a user-entered folder ID or Drive folder URL. ``None`` means the account's My Drive root."""
     candidate = (value or "").strip()
@@ -259,8 +302,27 @@ def _multipart_body(
     )
 
 
-def _upload_metadata(*, file_name: str, folder_id: str | None) -> dict[str, Any]:
-    metadata: dict[str, Any] = {"name": file_name}
+def _converts_to_sheet(file_path: str, save_as_sheet: bool) -> bool:
+    return save_as_sheet and Path(file_path).suffix.lower() in SHEET_CONVERTIBLE_MEDIA_TYPES
+
+
+def upload_content_type(file_path: str, save_as_sheet: bool = False) -> str:
+    if _converts_to_sheet(file_path, save_as_sheet):
+        return SHEET_CONVERTIBLE_MEDIA_TYPES[Path(file_path).suffix.lower()]
+    return guess_type(file_path)[0] or "application/octet-stream"
+
+
+def _upload_metadata(
+    *,
+    file_path: str,
+    folder_id: str | None,
+    save_as_sheet: bool,
+) -> dict[str, Any]:
+    path = Path(file_path)
+    metadata: dict[str, Any] = {"name": path.name}
+    if _converts_to_sheet(file_path, save_as_sheet):
+        # Drive converts the media to this type on create; the media part keeps its source content type.
+        metadata = {"name": path.stem, "mimeType": GOOGLE_SHEET_MIME_TYPE}
     # Drive puts the file in the account's My Drive root when ``parents`` is omitted.
     if folder_id:
         metadata["parents"] = [folder_id]
@@ -272,6 +334,7 @@ def build_multipart_upload_request(
     access_token: str,
     file_path: str,
     folder_id: str | None,
+    save_as_sheet: bool = False,
 ) -> GoogleDriveMultipartUploadRequest:
     """Build a bounded Google Drive multipart upload request body.
 
@@ -280,9 +343,8 @@ def build_multipart_upload_request(
     before invoking this helper.
     """
     _assert_multipart_upload_size(file_path)
-    file_name = Path(file_path).name
-    content_type = guess_type(file_path)[0] or "application/octet-stream"
-    metadata = _upload_metadata(file_name=file_name, folder_id=folder_id)
+    content_type = upload_content_type(file_path, save_as_sheet)
+    metadata = _upload_metadata(file_path=file_path, folder_id=folder_id, save_as_sheet=save_as_sheet)
     boundary = f"skyvern-{uuid.uuid4().hex}"
     content = _multipart_body(
         metadata=metadata,
@@ -312,11 +374,12 @@ def build_resumable_initiate_request(
     access_token: str,
     file_path: str,
     folder_id: str | None,
+    save_as_sheet: bool = False,
 ) -> GoogleDriveResumableInitiateRequest:
     path = Path(file_path)
     file_size = path.stat().st_size
-    content_type = guess_type(file_path)[0] or "application/octet-stream"
-    metadata = _upload_metadata(file_name=path.name, folder_id=folder_id)
+    content_type = upload_content_type(file_path, save_as_sheet)
+    metadata = _upload_metadata(file_path=file_path, folder_id=folder_id, save_as_sheet=save_as_sheet)
     query = urlencode({"uploadType": "resumable", "fields": "id,name,webViewLink", "supportsAllDrives": "true"})
     return GoogleDriveResumableInitiateRequest(
         target_url=f"{DRIVE_UPLOAD_API_BASE}/files?{query}",
@@ -398,8 +461,9 @@ async def run_chunked_resumable_upload(
     total: int,
     send: Callable[[bytes, dict[str, str]], Awaitable[ResumableChunkResponse]],
     max_attempts: int,
+    save_as_sheet: bool = False,
 ) -> UploadedDriveFile:
-    content_type = guess_type(file_path)[0] or "application/octet-stream"
+    content_type = upload_content_type(file_path, save_as_sheet)
     offset = 0
     attempts = 0
     probe_first = False  # after a chunk transport failure, learn Drive's committed offset before re-sending
@@ -539,11 +603,13 @@ async def _upload_file_resumable(
     access_token: str,
     file_path: str,
     folder_id: str | None,
+    save_as_sheet: bool = False,
 ) -> UploadedDriveFile:
     initiate_request = build_resumable_initiate_request(
         access_token=access_token,
         file_path=file_path,
         folder_id=folder_id,
+        save_as_sheet=save_as_sheet,
     )
 
     async with httpx.AsyncClient(timeout=settings.GOOGLE_DRIVE_API_TIMEOUT_SECONDS) as client:
@@ -584,6 +650,7 @@ async def _upload_file_resumable(
             total=Path(file_path).stat().st_size,
             send=send,
             max_attempts=max(1, settings.GOOGLE_DRIVE_API_MAX_RETRIES),
+            save_as_sheet=save_as_sheet,
         )
 
 
@@ -792,18 +859,21 @@ async def upload_file(
     access_token: str,
     file_path: str,
     folder_id: str | None,
+    save_as_sheet: bool = False,
 ) -> UploadedDriveFile:
     if should_use_resumable_upload(file_path):
         return await _upload_file_resumable(
             access_token=access_token,
             file_path=file_path,
             folder_id=folder_id,
+            save_as_sheet=save_as_sheet,
         )
 
     request = build_multipart_upload_request(
         access_token=access_token,
         file_path=file_path,
         folder_id=folder_id,
+        save_as_sheet=save_as_sheet,
     )
 
     async with httpx.AsyncClient(timeout=settings.GOOGLE_DRIVE_API_TIMEOUT_SECONDS) as client:
@@ -812,3 +882,303 @@ async def upload_file(
     _raise_for_error(response)
     payload = response.json() or {}
     return uploaded_file_from_payload(payload)
+
+
+GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+DRIVE_LIST_FOLDER_MAX_RESULTS = 1000
+_DRIVE_ITEM_FIELDS = "id,name,mimeType,parents,driveId,webViewLink,trashed"
+_DRIVE_LIST_FIELDS = "nextPageToken,files(id,name,mimeType,modifiedTime,size,webViewLink)"
+DriveFolderOperation = Literal["list_folder", "create_folder", "move_file"]
+
+# Reasons Drive gives for a refused move or create, each with what the person can do about it.
+_FOLDER_ACTION_403_HINTS: dict[str, str] = {
+    "teamDrivesFolderMoveInNotSupported": (
+        "Google Drive does not let this account move a folder from My Drive into a shared drive. "
+        "Move the files inside it instead."
+    ),
+    "teamDrivesParentLimit": "An item in a shared drive can be in only one folder.",
+    "cannotMoveTrashedItemIntoTeamDrive": "This item is in the trash. Restore it before moving it.",
+    "cannotMoveTrashedItemOutOfTeamDrive": "This item is in the trash. Restore it before moving it.",
+    "teamDrivesCrossDomainMoveRestriction": (
+        "Google Drive does not allow moving this item to a shared drive owned by another organization."
+    ),
+    "fileOwnerNotMemberOfTeamDrive": (
+        "The item's owner is not a member of the destination shared drive, so Google Drive cannot move it there."
+    ),
+    "numChildrenInNonRootLimitExceeded": "The destination folder has reached Google Drive's item limit.",
+    "teamDriveFileLimitExceeded": "The destination shared drive has reached Google Drive's item limit.",
+}
+_FOLDER_ACTION_PERMISSION_HINTS: dict[DriveFolderOperation, str] = {
+    "list_folder": (
+        "The connected Google account cannot view this Drive folder. On a shared drive, it must be a member."
+    ),
+    "create_folder": (
+        "The connected Google account cannot add folders to this Drive folder. "
+        "On a shared drive, its role must be Contributor or higher."
+    ),
+    "move_file": (
+        "The connected Google account cannot move this item. Inside a shared drive its role must be Content manager "
+        "or higher; moving out of a shared drive needs Manager on it."
+    ),
+}
+
+
+def extract_item_id(value: str | None) -> str:
+    """The ID of a Drive file or folder given as an ID or a drive.google.com or docs.google.com link."""
+    candidate = (value or "").strip()
+    if not candidate:
+        raise ValueError("A Google Drive file or folder ID or link is required")
+    if _DRIVE_FILE_ID_PATTERN.fullmatch(candidate):
+        return candidate
+    parsed = urlparse(candidate)
+    if parsed.scheme.lower() != "https" or parsed.hostname not in ("drive.google.com", "docs.google.com"):
+        raise ValueError("A Google Drive link must use https://drive.google.com or https://docs.google.com")
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    for marker in ("folders", "d"):
+        if marker in segments:
+            index = segments.index(marker)
+            item_id = segments[index + 1] if index + 1 < len(segments) else ""
+            # Publish-to-web links (/d/e/<public-id>/pub) carry an ID Drive cannot resolve.
+            if _DRIVE_FILE_ID_PATTERN.fullmatch(item_id) and item_id != "e":
+                return item_id
+    query_ids = parse_qs(parsed.query).get("id", [])
+    if len(query_ids) == 1 and _DRIVE_FILE_ID_PATTERN.fullmatch(query_ids[0]):
+        return query_ids[0]
+    raise ValueError("Unsupported Google Drive link")
+
+
+class _FolderActionInputError(GoogleDriveAPIError):
+    """A refusal this module makes itself, whose message is already written for the person running the block."""
+
+
+def _folder_action_error(exc: GoogleDriveAPIError, operation: DriveFolderOperation) -> GoogleDriveAPIError:
+    # Google's own message is never passed on: for notFound it echoes the file or folder ID.
+    if exc.code == "upstream_unavailable":
+        return exc
+    if exc.code == "reconnect_required" or exc.status == 401:
+        hint = "Reconnect this Google account with Google Drive access, then run again."
+    elif exc.status == 403 and exc.code in _FOLDER_ACTION_403_HINTS:
+        hint = _FOLDER_ACTION_403_HINTS[exc.code]
+    elif exc.status == 403 and exc.code in _FILE_PERMISSION_403_REASONS:
+        hint = _FOLDER_ACTION_PERMISSION_HINTS[operation]
+    elif exc.status == 404:
+        hint = (
+            "The connected Google account cannot see this Drive folder or file. Check the link, and that "
+            "the account has access to it or is a member of its shared drive."
+        )
+    elif exc.status == 429 or (exc.code or "").lower() in _RATE_LIMIT_403_REASONS:
+        hint = "Google Drive is limiting requests from this account. Run again in a few minutes."
+    else:
+        hint = f"Google Drive could not complete this request (HTTP {exc.status})."
+    return GoogleDriveAPIError(
+        status=exc.status, code=exc.code, message=f"{hint} (Google Drive reason: {exc.code or 'unknown'})"
+    )
+
+
+async def _drive_request(
+    client: httpx.AsyncClient,
+    method: Literal["GET", "POST", "PATCH"],
+    url: str,
+    *,
+    headers: Mapping[str, str],
+    params: Mapping[str, str],
+    json_body: Mapping[str, Any] | None = None,
+) -> Any:
+    # A write is sent once: after a dropped connection Drive may already have applied it, and a resend of a create
+    # would make a second folder.
+    max_attempts = max(1, settings.GOOGLE_DRIVE_API_MAX_RETRIES) if method == "GET" else 1
+    for attempt in range(1, max_attempts + 1):
+        retry_after: str | None = None
+        try:
+            response = await client.request(method, url, headers=headers, params=params, json=json_body)
+        except httpx.TransportError:
+            if attempt == max_attempts:
+                outcome = "" if method == "GET" else " The change may or may not have been made; check Drive."
+                raise GoogleDriveAPIError(
+                    status=503,
+                    code="upstream_unavailable",
+                    message=f"Google Drive could not be reached.{outcome}",
+                ) from None
+        else:
+            if not is_retryable_resumable_response(response.status_code, response.text) or attempt == max_attempts:
+                _raise_for_error(response)
+                return response.json() or {}
+            retry_after = response.headers.get("Retry-After")
+        await _sleep(_compute_backoff(attempt, retry_after))
+    raise AssertionError("Drive request retry loop exited without a response")
+
+
+def _item_url(item_id: str) -> str:
+    return f"{DRIVE_API_BASE}/files/{quote(item_id, safe='')}"
+
+
+async def _get_item(client: httpx.AsyncClient, headers: Mapping[str, str], item_id: str) -> dict[str, Any]:
+    return await _drive_request(
+        client,
+        "GET",
+        _item_url(item_id),
+        headers=headers,
+        params={"fields": _DRIVE_ITEM_FIELDS, "supportsAllDrives": "true"},
+    )
+
+
+async def _get_folder(
+    client: httpx.AsyncClient, headers: Mapping[str, str], folder_id: str, role: str
+) -> dict[str, Any]:
+    folder = await _get_item(client, headers, folder_id)
+    if folder.get("mimeType") != GOOGLE_FOLDER_MIME_TYPE:
+        raise _FolderActionInputError(
+            status=400, code="notAFolder", message=f"The {role} is not a Google Drive folder."
+        )
+    if folder.get("trashed"):
+        raise _FolderActionInputError(status=400, code="folderTrashed", message=f"The {role} is in the Drive trash.")
+    return folder
+
+
+def _listed_item(payload: Mapping[str, Any]) -> dict[str, Any]:
+    mime_type = payload.get("mimeType")
+    raw_size = payload.get("size")
+    return {
+        "id": payload.get("id"),
+        "name": payload.get("name"),
+        "mime_type": mime_type,
+        "is_folder": mime_type == GOOGLE_FOLDER_MIME_TYPE,
+        "modified_time": payload.get("modifiedTime"),
+        "size": int(raw_size) if isinstance(raw_size, str) and raw_size.isdigit() else None,
+        "web_view_link": payload.get("webViewLink"),
+    }
+
+
+async def _run_folder_action(
+    operation: DriveFolderOperation,
+    access_token: str,
+    action: Callable[[httpx.AsyncClient, Mapping[str, str]], Awaitable[dict[str, Any]]],
+) -> dict[str, Any]:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        async with httpx.AsyncClient(timeout=settings.GOOGLE_DRIVE_API_TIMEOUT_SECONDS) as client:
+            return await action(client, headers)
+    except _FolderActionInputError:
+        raise
+    except GoogleDriveAPIError as exc:
+        raise _folder_action_error(exc, operation) from None
+
+
+def _folder_id(value: str | None) -> str:
+    candidate = (value or "").strip()
+    return "root" if candidate.lower() == "root" else extract_item_id(candidate)
+
+
+async def list_folder(*, access_token: str, folder: str, max_results: int = 100) -> dict[str, Any]:
+    """The items directly inside a folder, in My Drive or a shared drive, folders first."""
+    folder_id = _folder_id(folder)
+    limit = max(1, min(max_results, DRIVE_LIST_FOLDER_MAX_RESULTS))
+
+    async def action(client: httpx.AsyncClient, headers: Mapping[str, str]) -> dict[str, Any]:
+        meta = await _get_folder(client, headers, folder_id, "folder to list")
+        drive_id = meta.get("driveId")
+        # A shared drive's own corpus is listed completely; the "user" corpus covers My Drive and shared-with-me.
+        params = {
+            # The ID is checked against Drive's ID alphabet above, so it cannot close the quoted string.
+            "q": f"'{folder_id}' in parents and trashed = false",
+            "fields": _DRIVE_LIST_FIELDS,
+            "orderBy": "folder,name_natural",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+            **({"corpora": "drive", "driveId": str(drive_id)} if drive_id else {"corpora": "user"}),
+        }
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            page = await _drive_request(
+                client,
+                "GET",
+                f"{DRIVE_API_BASE}/files",
+                headers=headers,
+                params={
+                    **params,
+                    "pageSize": str(limit - len(items)),
+                    **({"pageToken": page_token} if page_token else {}),
+                },
+            )
+            items.extend(_listed_item(item) for item in page.get("files") or [] if isinstance(item, dict))
+            page_token = page.get("nextPageToken")
+            if not page_token or len(items) >= limit:
+                break
+        return {
+            "folder_id": meta.get("id") or folder_id,
+            "shared_drive_id": drive_id,
+            "files": items[:limit],
+            "count": len(items[:limit]),
+            "has_more": bool(page_token) or len(items) > limit,
+        }
+
+    return await _run_folder_action("list_folder", access_token, action)
+
+
+async def create_folder(*, access_token: str, parent_folder: str, name: str) -> dict[str, Any]:
+    """Create a subfolder of ``parent_folder``, in My Drive or a shared drive. Drive allows duplicate names."""
+    parent_id = _folder_id(parent_folder)
+    folder_name = name.strip()
+    if not folder_name:
+        raise ValueError("A folder name is required")
+
+    async def action(client: httpx.AsyncClient, headers: Mapping[str, str]) -> dict[str, Any]:
+        parent = await _get_folder(client, headers, parent_id, "parent folder")
+        created = await _drive_request(
+            client,
+            "POST",
+            f"{DRIVE_API_BASE}/files",
+            headers=headers,
+            params={"fields": _DRIVE_ITEM_FIELDS, "supportsAllDrives": "true"},
+            json_body={"name": folder_name, "mimeType": GOOGLE_FOLDER_MIME_TYPE, "parents": [parent.get("id")]},
+        )
+        return {
+            "id": created.get("id"),
+            "name": created.get("name"),
+            "web_view_link": created.get("webViewLink"),
+            "parent_id": parent.get("id"),
+            "shared_drive_id": created.get("driveId"),
+        }
+
+    return await _run_folder_action("create_folder", access_token, action)
+
+
+async def move_file(*, access_token: str, item: str, destination_folder: str) -> dict[str, Any]:
+    """Move a file or folder into ``destination_folder``, within or between My Drive and shared drives."""
+    item_id = extract_item_id(item)
+    destination_id = _folder_id(destination_folder)
+
+    async def action(client: httpx.AsyncClient, headers: Mapping[str, str]) -> dict[str, Any]:
+        source = await _get_item(client, headers, item_id)
+        destination = await _get_folder(client, headers, destination_id, "destination")
+        source_id, target_id = source.get("id") or item_id, destination.get("id") or destination_id
+        if source_id == target_id:
+            raise _FolderActionInputError(status=400, code="sameItem", message="A folder cannot be moved into itself.")
+        parents = [parent for parent in source.get("parents") or [] if isinstance(parent, str)]
+        if not parents:
+            # Without the current folder Drive would add a second parent rather than move it.
+            raise _FolderActionInputError(
+                status=400,
+                code="parentsUnknown",
+                message="The connected Google account cannot see which folder this item is in, so it cannot move it.",
+            )
+        result = {"id": source_id, "name": source.get("name"), "parent_id": target_id, "previous_parent_ids": parents}
+        if parents == [target_id]:
+            return {**result, "web_view_link": source.get("webViewLink"), "moved": False}
+        moved = await _drive_request(
+            client,
+            "PATCH",
+            _item_url(source_id),
+            headers=headers,
+            params={
+                "addParents": target_id,
+                "removeParents": ",".join(parents),
+                "fields": _DRIVE_ITEM_FIELDS,
+                "supportsAllDrives": "true",
+            },
+            json_body={},
+        )
+        return {**result, "web_view_link": moved.get("webViewLink"), "moved": True}
+
+    return await _run_folder_action("move_file", access_token, action)

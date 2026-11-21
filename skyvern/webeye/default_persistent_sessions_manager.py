@@ -13,7 +13,7 @@ from typing import Any, cast
 import structlog
 from playwright._impl._errors import TargetClosedError
 
-from skyvern.cli.core.copilot_sessions import active_copilot_session_ids
+from skyvern.cli.core.ember_sessions import active_ember_session_ids
 from skyvern.config import settings
 from skyvern.exceptions import (
     BrowserSessionAlreadyEndedError,
@@ -1574,7 +1574,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         close_session, which tears down the context (stopping its ffmpeg recorder), syncs the
         recording, and releases the CDP port. One pass; already-completed rows are excluded."""
         now = datetime.now(timezone.utc)
-        copilot_session_ids = active_copilot_session_ids()
+        ember_session_ids = active_ember_session_ids()
         sessions = await self.database.browser_sessions.get_uncompleted_persistent_browser_sessions()
         for db_session in sessions:
             # Only reap browsers this process holds; completing another process's row would hide its leak.
@@ -1593,7 +1593,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             # Leave sessions an active copilot turn is driving (no runnable_id and not renewed). Activity never
             # moves a registration's deadline, so a turn on one does not keep it open.
             if (
-                db_session.persistent_browser_session_id in copilot_session_ids
+                db_session.persistent_browser_session_id in ember_session_ids
                 and db_session.browser_vendor != EXTERNAL_CDP_BROWSER_VENDOR
             ):
                 continue
@@ -1639,9 +1639,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         session. The DB row is authoritative for the closed/gone verdict, but the release is
         local-only: the row is already terminal, so completing it again is either redundant or an
         error."""
-        copilot_session_ids = active_copilot_session_ids()
+        ember_session_ids = active_ember_session_ids()
         for session_id, cached in list(self._browser_sessions.items()):
-            if session_id in copilot_session_ids:
+            if session_id in ember_session_ids:
                 continue
             organization_id = cached.organization_id
             if organization_id is None:

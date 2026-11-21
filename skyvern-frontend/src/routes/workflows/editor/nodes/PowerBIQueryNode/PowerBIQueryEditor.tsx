@@ -74,6 +74,7 @@ function PowerBIQueryEditorBody({
         </div>
         <CredentialSourceSelector
           provider="powerbi"
+          nodeId={blockId}
           credentialSource={data.credentialSource ?? "native"}
           connectionId={data.connectionId}
           disabled={!canEdit}
@@ -89,8 +90,12 @@ function PowerBIQueryEditorBody({
         </Label>
         {DatasetPicker ? (
           <DatasetPicker
+            credentialSource={data.credentialSource}
             connectionId={
-              data.credentialSource === "nango" ? data.connectionId : ""
+              data.credentialSource === "nango" ||
+              data.credentialSource === "native"
+                ? data.connectionId
+                : ""
             }
             value={data.datasetId}
             disabled={!canEdit}

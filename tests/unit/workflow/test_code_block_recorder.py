@@ -566,7 +566,7 @@ async def test_direct_page_actions_are_recorded_with_redaction() -> None:
 
 
 @pytest.mark.asyncio
-async def test_copilot_recording_page_routes_fill_and_type_through_shared_strategy(
+async def test_ember_recording_page_routes_fill_and_type_through_shared_strategy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strategy_aware_input = AsyncMock()
@@ -608,7 +608,7 @@ async def test_copilot_recording_page_routes_fill_and_type_through_shared_strate
         for default_owner in ("context", "page")
     ],
 )
-async def test_copilot_recording_uses_effective_playwright_timeout_when_omitted_or_none(
+async def test_ember_recording_uses_effective_playwright_timeout_when_omitted_or_none(
     monkeypatch: pytest.MonkeyPatch,
     surface: str,
     method: str,
@@ -654,7 +654,7 @@ async def test_copilot_recording_uses_effective_playwright_timeout_when_omitted_
         pytest.param("page", "type", id="page-type-zero-timeout"),
     ],
 )
-async def test_copilot_recording_preserves_zero_timeout(
+async def test_ember_recording_preserves_zero_timeout(
     monkeypatch: pytest.MonkeyPatch,
     surface: str,
     method: str,
@@ -682,7 +682,7 @@ async def test_copilot_recording_preserves_zero_timeout(
 
 
 @pytest.mark.asyncio
-async def test_copilot_recording_authored_playwright_timeout_catch_still_matches(
+async def test_ember_recording_authored_playwright_timeout_catch_still_matches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     raw_page = FakePage()
@@ -702,7 +702,7 @@ async def test_copilot_recording_authored_playwright_timeout_catch_still_matches
 
 
 @pytest.mark.asyncio
-async def test_copilot_recording_page_preserves_page_selector_strictness(
+async def test_ember_recording_page_preserves_page_selector_strictness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strategy_aware_input = AsyncMock()
@@ -750,7 +750,7 @@ def test_playwright_input_defaults_source_registered_runtime_context() -> None:
 @pytest.mark.parametrize("method", ["fill", "type"])
 @pytest.mark.parametrize("strict_form", ["omitted", "none"])
 @pytest.mark.parametrize("context_strict", [False, True])
-async def test_copilot_recording_page_omitted_or_none_strict_uses_context_default_through_strategy(
+async def test_ember_recording_page_omitted_or_none_strict_uses_context_default_through_strategy(
     monkeypatch: pytest.MonkeyPatch,
     method: str,
     strict_form: str,
@@ -786,7 +786,7 @@ async def test_copilot_recording_page_omitted_or_none_strict_uses_context_defaul
 
 
 @pytest.mark.asyncio
-async def test_copilot_recording_element_handle_fill_and_type_keep_raw_playwright_behavior(
+async def test_ember_recording_element_handle_fill_and_type_keep_raw_playwright_behavior(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strategy_aware_input = AsyncMock()
@@ -807,7 +807,7 @@ async def test_copilot_recording_element_handle_fill_and_type_keep_raw_playwrigh
 
 
 @pytest.mark.asyncio
-async def test_copilot_recording_routes_supported_playwright_input_options_through_strategy(
+async def test_ember_recording_routes_supported_playwright_input_options_through_strategy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strategy_aware_input = AsyncMock()
@@ -939,7 +939,7 @@ async def test_recording_context_tracks_runtime_default_timeout_for_strategy_inp
         ("page", "type", "extra_positional"),
     ],
 )
-async def test_copilot_recording_rejects_malformed_playwright_input_before_strategy_side_effect(
+async def test_ember_recording_rejects_malformed_playwright_input_before_strategy_side_effect(
     monkeypatch: pytest.MonkeyPatch,
     surface: str,
     method: str,
@@ -1128,7 +1128,7 @@ async def test_input_values_are_elided_from_descriptions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_copilot_authored_fill_and_type_share_strategy_aware_typing(
+async def test_ember_authored_fill_and_type_share_strategy_aware_typing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = FakePage()
@@ -1166,7 +1166,7 @@ async def test_copilot_authored_fill_and_type_share_strategy_aware_typing(
 
 
 @pytest.mark.asyncio
-async def test_copilot_authored_page_fill_keeps_one_action_and_long_value_split(
+async def test_ember_authored_page_fill_keeps_one_action_and_long_value_split(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     text = "a" * (TEXT_PRESS_MAX_LENGTH + 3)
@@ -1361,16 +1361,16 @@ async def test_goal_code_block_creates_task_and_links_block(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
-async def test_copilot_lineage_tracks_runtime_timeout_during_code_block_execution(
+async def test_ember_lineage_tracks_runtime_timeout_during_code_block_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     page = FakePage()
     context = FakeWorkflowRunContext()
     _patch_execute_environment(monkeypatch, page, context)
-    copilot_lineage = AsyncMock(return_value=True)
+    ember_lineage = AsyncMock(return_value=True)
     clear_field = AsyncMock()
     type_text = AsyncMock()
-    monkeypatch.setattr(CodeBlock, "_workflow_copilot_lineage", copilot_lineage)
+    monkeypatch.setattr(CodeBlock, "_ember_lineage", ember_lineage)
     monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.clear_field", clear_field)
     monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.type_text", type_text)
     setter_block = _make_code_block("page.set_default_timeout(8765)")
@@ -1389,7 +1389,7 @@ async def test_copilot_lineage_tracks_runtime_timeout_during_code_block_executio
 
     assert setter_result.success is True
     assert input_result.success is True
-    assert copilot_lineage.await_args_list == [call(context), call(context)]
+    assert ember_lineage.await_args_list == [call(context), call(context)]
     clear_field.assert_awaited_once_with(
         page,
         page.inner,
@@ -1549,7 +1549,7 @@ async def test_goal_code_block_finalizes_step_on_cancellation(monkeypatch: pytes
 async def test_self_heal_success_finalizes_seat_completed(
     monkeypatch: pytest.MonkeyPatch,
     ai_fallback_flag: Callable[[str | None], None],
-    copilot_workflow_toggle_off: SimpleNamespace,
+    ember_workflow_toggle_off: SimpleNamespace,
 ) -> None:
     """A healed code block finalizes its SEAT task to completed — never a completed block over a failed seat."""
 
@@ -1560,7 +1560,7 @@ async def test_self_heal_success_finalizes_seat_completed(
     page = FakePage()
     page.inner = ExplodingLocator()
     context = FakeWorkflowRunContext()
-    context.workflow = copilot_workflow_toggle_off
+    context.workflow = ember_workflow_toggle_off
     mocks = _patch_execute_environment(monkeypatch, page, context)
     ai_fallback_flag("o_test")
     block = _make_code_block("await page.locator('#x').click()", goal="go")
@@ -1593,7 +1593,7 @@ async def test_self_heal_success_finalizes_seat_completed(
 async def test_self_heal_decline_finalizes_seat_failed(
     monkeypatch: pytest.MonkeyPatch,
     ai_fallback_flag: Callable[[str | None], None],
-    copilot_workflow_toggle_off: SimpleNamespace,
+    ember_workflow_toggle_off: SimpleNamespace,
 ) -> None:
     """When the heal declines (None), the block fails closed and the seat task is finalized failed."""
 
@@ -1604,7 +1604,7 @@ async def test_self_heal_decline_finalizes_seat_failed(
     page = FakePage()
     page.inner = ExplodingLocator()
     context = FakeWorkflowRunContext()
-    context.workflow = copilot_workflow_toggle_off
+    context.workflow = ember_workflow_toggle_off
     mocks = _patch_execute_environment(monkeypatch, page, context)
     ai_fallback_flag("o_test")
     declining_heal = AsyncMock(return_value=None)
@@ -2637,7 +2637,7 @@ async def test_execute_arms_the_guard_from_a_credential_parameter(
 
 
 async def _execute_vault_login_block(
-    monkeypatch: pytest.MonkeyPatch, frame_url: str, sites: list[LoginSite], *, copilot_lineage: bool | None
+    monkeypatch: pytest.MonkeyPatch, frame_url: str, sites: list[LoginSite], *, ember_lineage: bool | None
 ) -> tuple[BlockResult, FakePage, list[dict[str, Any]]]:
     page = FakePage()
     page.inner.frame_url = frame_url
@@ -2662,7 +2662,7 @@ async def _execute_vault_login_block(
     )
     block = _make_code_block('await page.locator("#password").fill(vault_login.password)')
     block.parameters = [vault_parameter]
-    monkeypatch.setattr(type(block), "_workflow_copilot_lineage", AsyncMock(return_value=copilot_lineage))
+    monkeypatch.setattr(type(block), "_ember_lineage", AsyncMock(return_value=ember_lineage))
     with capture_logs() as logs:
         result = await block.execute(
             workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test"
@@ -2680,11 +2680,11 @@ async def _execute_vault_login_block(
         pytest.param([], None, id="item-with-no-checkable-site"),
     ],
 )
-async def test_a_bitwarden_login_off_its_item_site_is_only_logged_outside_copilot_workflows(
+async def test_a_bitwarden_login_off_its_item_site_is_only_logged_outside_ember_workflows(
     monkeypatch: pytest.MonkeyPatch, sites: list[LoginSite], allowed_scope: str | None
 ) -> None:
     result, page, logs = await _execute_vault_login_block(
-        monkeypatch, "https://accounts.example.org/challenge", sites, copilot_lineage=False
+        monkeypatch, "https://accounts.example.org/challenge", sites, ember_lineage=False
     )
 
     assert result.success is True
@@ -2697,7 +2697,7 @@ async def test_a_bitwarden_login_off_its_item_site_is_only_logged_outside_copilo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("frame_url", "sites", "copilot_lineage", "refused_for"),
+    ("frame_url", "sites", "ember_lineage", "refused_for"),
     [
         pytest.param(
             "https://accounts.example.org/challenge",
@@ -2736,14 +2736,14 @@ async def test_a_bitwarden_login_off_its_item_site_is_only_logged_outside_copilo
         ),
     ],
 )
-async def test_a_copilot_workflow_types_a_bitwarden_login_only_on_its_item_sites(
+async def test_a_ember_workflow_types_a_bitwarden_login_only_on_its_item_sites(
     monkeypatch: pytest.MonkeyPatch,
     frame_url: str,
     sites: list[LoginSite],
-    copilot_lineage: bool | None,
+    ember_lineage: bool | None,
     refused_for: str | None,
 ) -> None:
-    result, page, _ = await _execute_vault_login_block(monkeypatch, frame_url, sites, copilot_lineage=copilot_lineage)
+    result, page, _ = await _execute_vault_login_block(monkeypatch, frame_url, sites, ember_lineage=ember_lineage)
 
     assert result.success is (refused_for is None)
     assert any(call.startswith("fill:") for call in page.inner.calls) is (refused_for is None)
@@ -3408,7 +3408,7 @@ async def test_a_code_block_navigation_reports_a_proxy_code_only_for_a_live_targ
 async def test_a_proxy_transport_failure_skips_the_ai_fallback(
     monkeypatch: pytest.MonkeyPatch,
     ai_fallback_flag: Callable[[str | None], None],
-    copilot_workflow_toggle_off: SimpleNamespace,
+    ember_workflow_toggle_off: SimpleNamespace,
     code: str,
     failing_call: str,
     message: str,
@@ -3420,7 +3420,7 @@ async def test_a_proxy_transport_failure_skips_the_ai_fallback(
     page = FakePage()
     setattr(page, failing_call, AsyncMock(side_effect=PlaywrightError(message)))
     context = FakeWorkflowRunContext()
-    context.workflow = copilot_workflow_toggle_off
+    context.workflow = ember_workflow_toggle_off
     _patch_execute_environment(monkeypatch, page, context)
     ai_fallback_flag(fallback_org)
     monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=None))

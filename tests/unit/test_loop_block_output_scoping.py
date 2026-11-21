@@ -5,14 +5,20 @@ Verifies that when the same block runs multiple times inside a for-loop,
 later iterations' extracted_information takes precedence over earlier ones.
 """
 
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from skyvern.exceptions import BrowserStateDiagnostic, MissingBrowserStatePage
+from skyvern.forge import app as forge_app
+from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.integrations.action_runners import ACTION_RUNNERS, ActionRunFailed
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskBlock, TextPromptBlock
+from skyvern.forge.sdk.workflow.models.integration_action_block import IntegrationActionBlock
 from skyvern.forge.sdk.workflow.models.parameter import ContextParameter, OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockStatus
@@ -214,24 +220,48 @@ class TestFailedBlockDoesNotLeakPriorIterationValue:
         assert "browser_context_disconnected" in str(exception)
 
     @pytest.mark.asyncio
-    async def test_failed_loop_block_preserves_value_recorded_this_execution(self) -> None:
+    @pytest.mark.parametrize("kind", ["task", "runner_action"])
+    async def test_failed_loop_block_preserves_value_recorded_this_execution(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         ctx = _make_ctx()
         param = _make_output_parameter("extract_details_output")
         await ctx.register_output_parameter_value_post_execution(param, {"quote": "iteration-1 data"})
 
-        block = _make_task_block("extract_details")
+        block: Block
+        failing: AbstractContextManager[Any]
+        if kind == "task":
+            block = _make_task_block("extract_details")
 
-        async def _record_then_raise(*args: object, **kwargs: object) -> None:
-            await block.record_output_parameter_value(ctx, "wr_test", {"quote": "iteration-2 fresh"})
-            raise MissingBrowserStatePage(workflow_run_id="wr_test")
+            async def _record_then_raise(*args: object, **kwargs: object) -> None:
+                await block.record_output_parameter_value(ctx, "wr_test", {"quote": "iteration-2 fresh"})
+                raise MissingBrowserStatePage(workflow_run_id="wr_test")
+
+            failing = patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, side_effect=_record_then_raise)
+        else:
+            # With a connection set, the runner runs on a rendered copy of the block, which records the error output.
+            async def _refuse(*args: object) -> dict[str, Any]:
+                raise ActionRunFailed("Drive refused", {"quote": "iteration-2 fresh"})
+
+            monkeypatch.setattr(forge_app, "AGENT_FUNCTION", AgentFunction())
+            monkeypatch.setitem(ACTION_RUNNERS, "google_drive_folder", _refuse)
+            block = IntegrationActionBlock(
+                label="extract_details",
+                output_parameter=param,
+                integration_id="google_drive",
+                action_id="move_file",
+                connection_id="goac_drive",
+                inputs={"file_id": "file", "destination_folder_id": "folder"},
+            )
+            failing = nullcontext()
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, side_effect=_record_then_raise),
+            failing,
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
         ):
             _wire_app(mock_app, ctx)
-            result = await block.execute_safe(workflow_run_id="wr_test", current_index=1)
+            result = await block.execute_safe(workflow_run_id="wr_test", current_index=1, organization_id="o_test")
 
         assert result.success is False
         assert ctx.values["extract_details_output"] == {"quote": "iteration-2 fresh"}

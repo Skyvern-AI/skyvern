@@ -8,7 +8,7 @@ import pytest_asyncio
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.workflow.models.workflow import (
-    COPILOT_TEST_WORKFLOW_CREATOR,
+    EMBER_TEST_WORKFLOW_CREATOR,
     MIXED_RUN_DEFINITION_DIGEST,
     WorkflowRunStatus,
     workflow_definition_sha256,
@@ -176,7 +176,7 @@ async def test_create_workflow_run_ignores_ambient_context(agent_db: AgentDB, or
 
 
 @pytest.mark.asyncio
-async def test_copilot_authorship_resolves_from_edited_by_alone(agent_db: AgentDB, org_id: str) -> None:
+async def test_ember_authorship_resolves_from_edited_by_alone(agent_db: AgentDB, org_id: str) -> None:
     """Copilot lineage survives without a created_by='copilot' stamp: the copilot writes
     edited_by unconditionally, while created_by keeps the user who created the workflow."""
     workflow = await agent_db.workflows.create_workflow(
@@ -187,14 +187,14 @@ async def test_copilot_authorship_resolves_from_edited_by_alone(agent_db: AgentD
         edited_by="copilot",
     )
     assert workflow.created_by == f"{org_id}_user"
-    assert await agent_db.workflows.is_workflow_copilot_authored(
+    assert await agent_db.workflows.is_ember_authored(
         workflow_permanent_id=workflow.workflow_permanent_id,
         organization_id=org_id,
     )
 
 
 @pytest.mark.asyncio
-async def test_workflow_never_touched_by_copilot_is_not_copilot_authored(agent_db: AgentDB, org_id: str) -> None:
+async def test_workflow_never_touched_by_ember_is_not_ember_authored(agent_db: AgentDB, org_id: str) -> None:
     workflow = await agent_db.workflows.create_workflow(
         title="user-only",
         workflow_definition={"parameters": [], "blocks": []},
@@ -202,7 +202,7 @@ async def test_workflow_never_touched_by_copilot_is_not_copilot_authored(agent_d
         created_by=f"{org_id}_user",
         edited_by=f"{org_id}_user",
     )
-    assert not await agent_db.workflows.is_workflow_copilot_authored(
+    assert not await agent_db.workflows.is_ember_authored(
         workflow_permanent_id=workflow.workflow_permanent_id,
         organization_id=org_id,
     )
@@ -310,7 +310,7 @@ async def test_a_run_created_before_digests_is_never_stamped_by_a_later_attempt(
 
 
 @pytest.mark.asyncio
-async def test_own_profile_link_skips_live_copilot_test_version(agent_db: AgentDB, org_id: str) -> None:
+async def test_own_profile_link_skips_live_ember_test_version(agent_db: AgentDB, org_id: str) -> None:
     saved = await agent_db.workflows.create_workflow(
         title="saved",
         workflow_definition={"parameters": [], "blocks": []},
@@ -322,7 +322,7 @@ async def test_own_profile_link_skips_live_copilot_test_version(agent_db: AgentD
         organization_id=org_id,
         workflow_permanent_id=saved.workflow_permanent_id,
         version=2,
-        created_by=COPILOT_TEST_WORKFLOW_CREATOR,
+        created_by=EMBER_TEST_WORKFLOW_CREATOR,
     )
     assert test_copy.deleted_at is None
     assert test_copy.browser_profile_id is None

@@ -17,7 +17,7 @@ from playwright.async_api import Page
 from structlog.testing import capture_logs
 
 from skyvern.cli.core import client as client_mod
-from skyvern.cli.core import copilot_sessions, hosted_driver
+from skyvern.cli.core import ember_sessions, hosted_driver
 from skyvern.cli.core import result as result_mod
 from skyvern.cli.core import session_manager, session_ops
 from skyvern.cli.core.browser_ops import do_network_route
@@ -57,7 +57,7 @@ def _clear_singletons() -> None:
     session_manager._current_organization_id.set(None)
     session_manager._global_session = None
     session_manager._organization_sessions.clear()
-    copilot_sessions._copilot_sessions.clear()
+    ember_sessions._ember_sessions.clear()
     session_manager._session_ref_maps.clear()
     session_manager._session_ref_generations.clear()
     session_manager.set_stateless_http_mode(False)
@@ -553,7 +553,7 @@ async def test_resolve_browser_keeps_cdp_urls_on_direct_attach_path(
     ("organization_id", "api_key"),
     [(None, "sk_copilot_org"), ("org_copilot", "sk_other_org")],
 )
-async def test_resolve_browser_requires_matching_organization_and_credential_for_registered_copilot_session(
+async def test_resolve_browser_requires_matching_organization_and_credential_for_registered_ember_session(
     monkeypatch: pytest.MonkeyPatch,
     organization_id: str | None,
     api_key: str,
@@ -563,7 +563,7 @@ async def test_resolve_browser_requires_matching_organization_and_credential_for
         context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
         api_key_hash=session_manager._api_key_hash("sk_copilot_org"),
     )
-    copilot_sessions.register_copilot_session("pbs_copilot", registered_state, organization_id="org_copilot")
+    ember_sessions.register_ember_session("pbs_copilot", registered_state, organization_id="org_copilot")
 
     fallback_browser = MagicMock()
     fake_skyvern = MagicMock()
@@ -585,28 +585,28 @@ async def test_resolve_browser_requires_matching_organization_and_credential_for
     fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_copilot")
 
 
-def test_copilot_session_registry_preserves_each_parallel_registration() -> None:
+def test_ember_session_registry_preserves_each_parallel_registration() -> None:
     first = session_manager.SessionState()
     second = session_manager.SessionState()
 
-    copilot_sessions.register_copilot_session("pbs_shared", first, organization_id="org_shared")
-    copilot_sessions.register_copilot_session("pbs_shared", second, organization_id="org_shared")
+    ember_sessions.register_ember_session("pbs_shared", first, organization_id="org_shared")
+    ember_sessions.register_ember_session("pbs_shared", second, organization_id="org_shared")
 
-    assert copilot_sessions.registered_copilot_session("pbs_shared", organization_id="org_shared") is second
+    assert ember_sessions.registered_ember_session("pbs_shared", organization_id="org_shared") is second
 
-    copilot_sessions.unregister_copilot_session(
+    ember_sessions.unregister_ember_session(
         "pbs_shared",
         organization_id="org_shared",
         expected_state=second,
     )
-    assert copilot_sessions.registered_copilot_session("pbs_shared", organization_id="org_shared") is first
+    assert ember_sessions.registered_ember_session("pbs_shared", organization_id="org_shared") is first
 
-    copilot_sessions.unregister_copilot_session(
+    ember_sessions.unregister_ember_session(
         "pbs_shared",
         organization_id="org_shared",
         expected_state=first,
     )
-    assert copilot_sessions.registered_copilot_session("pbs_shared", organization_id="org_shared") is None
+    assert ember_sessions.registered_ember_session("pbs_shared", organization_id="org_shared") is None
 
 
 @pytest.mark.asyncio
@@ -685,11 +685,11 @@ async def test_tool_calls_disconnect_only_the_stateless_cdp_connections_they_ope
     fake_skyvern = MagicMock()
     fake_skyvern.connect_to_cloud_browser_session = AsyncMock(side_effect=connect)
     monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
-    copilot_browser = _FakeCloudBrowser()
-    copilot_sessions.register_copilot_session(
+    ember_browser = _FakeCloudBrowser()
+    ember_sessions.register_ember_session(
         "pbs_copilot",
         session_manager.SessionState(
-            browser=copilot_browser,
+            browser=ember_browser,
             context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
         ),
         organization_id="org_1",
@@ -710,8 +710,8 @@ async def test_tool_calls_disconnect_only_the_stateless_cdp_connections_they_ope
         # Stateful transports keep the organization's connection for the next call.
         assert len(opened) == 1
         assert opened[0].browser.connected
-    assert copilot_browser.browser.connected
-    assert not any(browser.session_closed for browser in [*opened, copilot_browser])
+    assert ember_browser.browser.connected
+    assert not any(browser.session_closed for browser in [*opened, ember_browser])
 
 
 class _FakeDriverProcess:
@@ -1412,14 +1412,14 @@ async def test_stateful_transport_keeps_one_driver_for_its_session(
 
 
 @pytest.mark.asyncio
-async def test_a_registered_copilot_browser_is_borrowed_not_owned(
+async def test_a_registered_ember_browser_is_borrowed_not_owned(
     fake_playwright: _FakePlaywright, hosted_mcp: None
 ) -> None:
-    copilot_browser = _FakeCloudBrowser()
-    copilot_sessions.register_copilot_session(
+    ember_browser = _FakeCloudBrowser()
+    ember_sessions.register_ember_session(
         "pbs_copilot",
         session_manager.SessionState(
-            browser=cast(SkyvernBrowser, copilot_browser),
+            browser=cast(SkyvernBrowser, ember_browser),
             context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
             api_key_hash=session_manager._api_key_hash("sk_key_a"),
         ),
@@ -1428,10 +1428,10 @@ async def test_a_registered_copilot_browser_is_borrowed_not_owned(
 
     browser = await _hosted_call("sk_key_a", "pbs_copilot")
 
-    assert browser is cast(SkyvernBrowser, copilot_browser)
+    assert browser is cast(SkyvernBrowser, ember_browser)
     assert fake_playwright.drivers == []
-    assert copilot_browser.browser.connected
-    assert not copilot_browser.session_closed
+    assert ember_browser.browser.connected
+    assert not ember_browser.session_closed
     assert await _sweep_after_idle() == 0
 
 

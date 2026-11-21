@@ -11,6 +11,7 @@ class GoogleSpreadsheetSummary(BaseModel):
 class ListGoogleSpreadsheetsResponse(BaseModel):
     spreadsheets: list[GoogleSpreadsheetSummary]
     next_page_token: str | None = None
+    incomplete_search: bool = False
 
 
 class GoogleSheetTab(BaseModel):

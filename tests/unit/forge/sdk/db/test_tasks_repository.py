@@ -57,7 +57,9 @@ async def test_total_unique_step_order_count_deduplicates_retries_in_sqlite(agen
 
 
 @pytest.mark.asyncio
-async def test_task_v3_turn_steps_count_as_steps_but_not_budget_or_latest_steps(agent_db) -> None:
+async def test_task_v3_turn_steps_count_as_steps_but_not_budget_or_latest_steps(
+    agent_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # A Task V3 block's turn steps sit above its own order-0 step (SKY-18790). The step budgets still count that step
     # (the workflow one plus the action rounds), and the latest step stays the one holding the block's final screenshot.
     organization = await agent_db.organizations.create_organization(
@@ -119,6 +121,12 @@ async def test_task_v3_turn_steps_count_as_steps_but_not_budget_or_latest_steps(
     assert finished.output.tool_calls == [StepToolCall(tool="observe", status="ok")]
     latest = await agent_db.tasks.get_latest_step(task.task_id, organization_id=org_id)
     assert latest is not None and latest.step_id == block_step.step_id
+
+    def reject_session() -> None:
+        pytest.fail("Empty task IDs opened a database session")
+
+    monkeypatch.setattr(agent_db.tasks, "Session", reject_session)
+    assert await agent_db.tasks.get_step_counts_by_task_ids([], organization_id=org_id) == (0, 0)
 
 
 @pytest.mark.asyncio
@@ -236,7 +244,7 @@ async def _create_workflow_run_task(agent_db, organization_id: str, workflow_run
 
 
 @pytest.mark.asyncio
-async def test_workflow_run_status_task_read_omits_only_extracted_information(agent_db) -> None:
+async def test_workflow_run_status_task_read_omits_only_extracted_information(agent_db, record_property) -> None:
     organization = await agent_db.organizations.create_organization(
         organization_name="Test organization", organization_id="o_status_tasks"
     )
@@ -252,14 +260,21 @@ async def test_workflow_run_status_task_read_omits_only_extracted_information(ag
     await _create_workflow_run_task(agent_db, org_id, "wr_other", None)
 
     statements: list[str] = []
+    initializations = 0
 
     def capture(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
         statements.append(statement)
 
+    def count_initialization(_target: TaskModel, _args: tuple[Any, ...], _kwargs: dict[str, Any]) -> None:
+        nonlocal initializations
+        initializations += 1
+
     event.listen(agent_db.engine.sync_engine, "before_cursor_execute", capture)
+    event.listen(TaskModel, "init", count_initialization)
     try:
         status_tasks = await agent_db.tasks.get_tasks_for_workflow_run_status("wr_status_tasks")
     finally:
+        event.remove(TaskModel, "init", count_initialization)
         event.remove(agent_db.engine.sync_engine, "before_cursor_execute", capture)
     full_tasks = await agent_db.tasks.get_tasks_by_workflow_run_id("wr_status_tasks")
 
@@ -269,6 +284,10 @@ async def test_workflow_run_status_task_read_omits_only_extracted_information(ag
     assert len(task_selects) == 1
     assert re.search(r"\.extracted_information\b", task_selects[0]) is None
     assert "extracted_information_schema" in task_selects[0]
+
+    record_property("workflow_run_status_select", task_selects[0])
+    record_property("workflow_run_status_task_model_initializations", initializations)
+    assert initializations == 0
 
 
 @pytest.mark.asyncio

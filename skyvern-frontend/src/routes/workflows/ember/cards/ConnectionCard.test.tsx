@@ -181,7 +181,11 @@ describe("ConnectionCard", () => {
 
     expect(screen.getByText("Connected")).toBeTruthy();
     expect(
-      screen.getByText("Work (work@example.com) can use Google Sheets."),
+      screen.getByText(
+        (_, node) =>
+          node?.textContent ===
+          "Work (work@example.com) can use Google Sheets.",
+      ),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: /^(Re)?connect/ })).toBeNull();
   });
@@ -497,7 +501,11 @@ describe("ConnectionCard", () => {
     };
     rerender(tree());
     expect(screen.getByText("Connected")).toBeTruthy();
-    expect(screen.getByText("n***@example.com can use Gmail.")).toBeTruthy();
+    expect(
+      screen.getByText(
+        (_, node) => node?.textContent === "n***@example.com can use Gmail.",
+      ),
+    ).toBeTruthy();
     fireEvent.click(
       screen.getByRole("button", { name: /n\*\*\*@example.com/ }),
     );

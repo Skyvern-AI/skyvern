@@ -29,6 +29,7 @@ from playwright.async_api import BrowserContext, Page
 from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import (
+    BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME,
     BROWSER_DOWNLOAD_TIMEOUT,
     BROWSER_DOWNLOADING_SUFFIX,
     BROWSER_PAGE_CLOSE_TIMEOUT,
@@ -237,6 +238,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
     DEFAULT_MAX_SETTLE_DEFERRALS,
     DownloadSettle,
+    DownloadUntil,
     DownloadWait,
     LoopOutcome,
     RoundAction,
@@ -410,8 +412,12 @@ from skyvern.webeye.cdp_download_interceptor import (
 )
 from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.native_downloads import NativeDownloadAttempt, NativeDownloads
-from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
-from skyvern.webeye.scraper.scraper import page_is_dead_blank, page_is_http_survivor
+from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage, json_to_html
+from skyvern.webeye.scraper.scraper import (
+    page_is_dead_blank,
+    page_is_http_survivor,
+    redact_input_values_in_element_trees,
+)
 from skyvern.webeye.utils.document import get_main_document_loader_id
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, ScreenshotMode, SkyvernFrame, build_open_tabs_context
 
@@ -580,6 +586,7 @@ def mark_pdf_source_downloaded(pdf_src: str) -> None:
 
 _TASKV3_TOOL_ACTION_TYPES = {
     "click": ActionType.CLICK,
+    "download": ActionType.CLICK,
     "hover": ActionType.HOVER,
     "drag": ActionType.DRAG,
     "type": ActionType.INPUT_TEXT,
@@ -791,6 +798,8 @@ def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields:
     selector = str(args.get("selector") or "")
     if tool_name == "click":
         return ClickAction(element_id=selector, **fields)
+    if tool_name == "download":
+        return ClickAction(element_id=selector, download=True, **fields)
     if tool_name == "hover":
         return HoverAction(element_id=selector, **fields)
     if tool_name == "drag":
@@ -3535,6 +3544,7 @@ class ForgeAgent:
             return any(Path(name).suffix != BROWSER_DOWNLOADING_SUFFIX for name in landed)
 
         download_wait: DownloadWait | None = None
+        download_until: DownloadUntil | None = None
         download_settle: DownloadSettle | None = None
         unsaved_downloads: UnsavedDownloads | None = None
         if task_block is not None and task_block.complete_on_download and task.workflow_run_id:
@@ -3714,6 +3724,26 @@ class ForgeAgent:
                     )
 
             download_wait = _download_wait
+            # V1's no-signal rule for a download action: the block's download_timeout capped at the grace time.
+            no_signal_seconds = (
+                min(float(wait_only_block.download_timeout), BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME)
+                if wait_only_block.download_timeout is not None
+                else BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME
+            )
+
+            async def _download_until(arrived: Callable[[], Awaitable[bool]]) -> None:
+                deadline = time.monotonic() + min(no_signal_seconds, loop_deadline_at - time.monotonic())
+                while not await arrived() and not await _should_cancel():
+                    # A vendor session keeps the file, so no arrival shows here. The browser beginning a download is
+                    # the signal, and download_wait then reads the file back.
+                    if provider_recovery is not None and provider_recovery.download_began():
+                        return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    await asyncio.sleep(min(_IN_FLIGHT_DOWNLOAD_CANCEL_POLL_SECONDS, remaining))
+
+            download_until = _download_until
 
         # Honor a step cap (per-request override, task, or org, else the same MAX_STEPS_PER_RUN default
         # the step engine uses) as the ACTION-round budget: a v3 step is one action round (a turn that
@@ -4384,6 +4414,7 @@ class ForgeAgent:
                     part for part in (auth_guidance, captcha_guidance, workflow_system_guidance) if part
                 ),
                 download_wait=download_wait,
+                download_until=download_until,
                 download_settle=download_settle,
                 unsaved_downloads=unsaved_downloads,
                 native_download_attempt=native_download_attempt,
@@ -6711,15 +6742,17 @@ class ForgeAgent:
                         LOG.info(
                             "Previous action succeeded, but we'll still continue.",
                             step_order=step.order,
-                            previous_action=previous_action,
-                            previous_result=previous_result,
+                            previous_action_id=previous_action.action_id,
+                            previous_action_type=previous_action.action_type,
+                            previous_result_success=True,
                         )
                     else:
                         LOG.warning(
                             "Previous action failed, so handle the next action.",
                             step_order=step.order,
-                            previous_action=previous_action,
-                            previous_result=previous_result,
+                            previous_action_id=previous_action.action_id,
+                            previous_action_type=previous_action.action_type,
+                            previous_result_success=False if previous_result else None,
                         )
 
                 element_id_to_last_action[action.element_id] = action_idx
@@ -6925,7 +6958,8 @@ class ForgeAgent:
                         step_retry=step.retry_index,
                         action_idx=action_idx,
                         action=action,
-                        next_action=action_node.next.action,
+                        next_action_id=action_node.next.action.action_id,
+                        next_action_type=action_node.next.action.action_type,
                         action_result=results,
                     )
                     continue
@@ -7573,7 +7607,7 @@ class ForgeAgent:
     ) -> list[Action]:
         LOG.info(
             "Anthropic CU call starts",
-            tool_results=llm_caller.current_tool_results,
+            tool_results_count=len(llm_caller.current_tool_results),
             message_length=len(llm_caller.message_history),
         )
         if llm_caller.current_tool_results:
@@ -9092,8 +9126,13 @@ class ForgeAgent:
         _artifacts_span.set_attribute("element_count", len(scraped_page.elements))
         _artifacts_span.set_attribute("html_bytes", len(scraped_page.html) if scraped_page.html else 0)
 
-        element_tree_format = ElementTreeFormat.HTML
-        element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
+        # Called only for its last_used_element_tree side effect, which later readers depend on. The stored copies
+        # are redacted; the live trees still feed the prompt and origin binding.
+        scraped_page.build_element_tree(ElementTreeFormat.HTML)
+        stored_element_tree, stored_element_tree_trimmed = redact_input_values_in_element_trees(
+            scraped_page.element_tree
+        )
+        element_tree_in_prompt = "".join(json_to_html(element) for element in stored_element_tree_trimmed)
 
         if context:
             attempt = context.multi_field_totp.get(task.task_id)
@@ -9104,8 +9143,8 @@ class ForgeAgent:
                 html=scraped_page.html.encode("utf-8"),
                 id_css_map=json.dumps(scraped_page.id_to_css_dict, indent=2).encode("utf-8"),
                 id_frame_map=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode("utf-8"),
-                element_tree=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
-                element_tree_trimmed=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
+                element_tree=json.dumps(stored_element_tree, indent=2).encode("utf-8"),
+                element_tree_trimmed=json.dumps(stored_element_tree_trimmed, indent=2).encode("utf-8"),
                 element_tree_in_prompt=element_tree_in_prompt.encode("utf-8"),
             )
         else:
@@ -9134,12 +9173,12 @@ class ForgeAgent:
                 app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
                     artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
-                    data=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
+                    data=json.dumps(stored_element_tree, indent=2).encode("utf-8"),
                 ),
                 app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
                     artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
-                    data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
+                    data=json.dumps(stored_element_tree_trimmed, indent=2).encode("utf-8"),
                 ),
                 app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
@@ -10148,7 +10187,10 @@ class ForgeAgent:
                         if action_result.success:
                             LOG.info(
                                 "Extracted information for task",
-                                extracted_information=action_result.data,
+                                extracted_information_type=type(action_result.data).__name__,
+                                extracted_information_size=len(action_result.data)
+                                if isinstance(action_result.data, (dict, list, str))
+                                else None,
                             )
                             return action_result.data
                 # For CUA-style engines, the model returns its answer
@@ -10738,6 +10780,8 @@ class ForgeAgent:
             run_response = await run_service.get_run_response(
                 run_id=task.task_id,
                 organization_id=task.organization_id,
+                need_browser_log=False,
+                need_final_screenshot=False,
             )
             if run_response is not None:
                 task_run_response_json = run_response.model_dump_json(exclude={"run_request"})
@@ -10754,7 +10798,7 @@ class ForgeAgent:
                 "Sending task response to webhook callback url",
                 task_id=task.task_id,
                 webhook_callback_url=task.webhook_callback_url,
-                headers=signed_data.headers,
+                webhook_timestamp=signed_data.headers.get("x-skyvern-timestamp"),
             )
 
             try:
@@ -10798,7 +10842,7 @@ class ForgeAgent:
                     sampling=True,
                     task_id=task.task_id,
                     resp_code=resp.status_code,
-                    resp_text=resp.text,
+                    resp_text_length=len(resp.text),
                 )
                 await app.DATABASE.tasks.update_task(
                     task_id=task.task_id,
@@ -10811,7 +10855,7 @@ class ForgeAgent:
                     "Webhook failed",
                     task_id=task.task_id,
                     resp_code=resp.status_code,
-                    resp_text=resp.text,
+                    resp_text_length=len(resp.text),
                     status_code=resp.status_code,
                     error_reason=format_http_log_reason(resp.status_code),
                 )
@@ -10830,6 +10874,8 @@ class ForgeAgent:
         failure_reason: str | None = None,
         need_browser_log: bool = False,
         step_count: int | None = None,
+        *,
+        need_final_screenshot: bool = True,
     ) -> TaskResponse:
         access = await browser_session_artifact_access(
             task.organization_id,
@@ -10865,7 +10911,7 @@ class ForgeAgent:
         downloaded_files: list[FileInfo] | None = None
 
         # get the artifact of the screenshot and get the screenshot_url
-        if artifacts_accessible:
+        if need_final_screenshot and artifacts_accessible:
             screenshot_artifact = await app.DATABASE.artifacts.get_artifact(
                 task_id=task.task_id,
                 step_id=last_step.step_id,

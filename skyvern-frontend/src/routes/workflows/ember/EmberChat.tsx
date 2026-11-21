@@ -4,6 +4,7 @@ import type {
   RestoreResult,
 } from "../editor/editorStateSnapshot";
 import { ATTACHMENT_SIZE_LIMIT_BYTES } from "./attachmentLimits";
+import { bidiIsolate } from "@/util/bidiText";
 import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
 import { hashKey } from "@tanstack/react-query";
 import {
@@ -96,6 +97,7 @@ import {
   buildEmberContext,
   buildWorkflowYamlDocument,
   restoreEmberSettings,
+  withheldEmberSettingsDigest,
 } from "@/routes/workflows/editor/workflowYamlDocument";
 import { apiWorkflowToSettings } from "@/routes/workflows/editor/apiWorkflowToSettings";
 import { convert } from "@/routes/workflows/editor/workflowEditorUtils";
@@ -229,6 +231,10 @@ import {
   CredentialDeleteReviewCard,
 } from "./cards/CredentialDeleteCard";
 import { QuestionReceipt } from "./cards/QuestionReceipt";
+import {
+  SkillWriteReceipt,
+  SkillWriteReviewCard,
+} from "./cards/SkillWriteCard";
 import {
   QUESTION_DETAIL_ID,
   QUESTION_PROMPT_ID,
@@ -955,7 +961,7 @@ function connectedAccountSelectionReceipt(
     (choice) => choice.connection_id === message.content,
   );
   if (selected) {
-    return `Selected ${selected.name} — ${connectedAccountChoiceLabel(selected, choices)}`;
+    return `Selected ${bidiIsolate(selected.name)} — ${connectedAccountChoiceLabel(selected, choices)}`;
   }
   // A connection card lists accounts made after its turn ended, which no stored choice set holds.
   if (
@@ -7675,7 +7681,8 @@ export function EmberChat({
   const composerQuestion =
     trayQuestion?.account_group_review ||
     trayQuestion?.account_group_cancel ||
-    trayQuestion?.credential_delete_review
+    trayQuestion?.credential_delete_review ||
+    trayQuestion?.skill_write_review
       ? undefined
       : trayQuestion;
   const isDeleting = (item: QuestionInteraction | undefined) =>
@@ -8202,7 +8209,8 @@ export function EmberChat({
           item.status === "pending" &&
           !item.account_group_review &&
           !item.account_group_cancel &&
-          !item.credential_delete_review,
+          !item.credential_delete_review &&
+          !item.skill_write_review,
       );
       // The composer is the text field for the question on screen, so Enter steps through the
       // tray and the last step sends every part's answer together.
@@ -8720,6 +8728,7 @@ export function EmberChat({
         canonicalAtSubmit = saveData?.workflow;
         const workflowId = saveData?.workflow.workflow_id;
         let workflowYaml = "";
+        let editorSettingsDigest: string | null = null;
         let audioArtifactId: string | null = null;
 
         if (!workflowId) {
@@ -8736,11 +8745,12 @@ export function EmberChat({
         }
 
         if (saveData) {
-          const { document } = buildEmberContext({
+          const { document, snapshot } = buildEmberContext({
             ...saveData,
             definitionVersion: saveData.workflowDefinitionVersion,
           });
           workflowYaml = convertToYAML(document);
+          editorSettingsDigest = withheldEmberSettingsDigest(snapshot);
           submittedSettings = structuredClone(saveData.settings);
           pendingSubmitSettings.current = submittedSettings;
 
@@ -9156,6 +9166,7 @@ export function EmberChat({
             workflow_yaml: workflowYaml,
             mode: "build",
             doc_editor_enabled: docEditorEnabled,
+            editor_settings_digest: editorSettingsDigest,
             cancel_token: cancelToken,
             idempotency_key: options.idempotencyKey ?? null,
             target_block_label: targetBlockLabel,
@@ -9177,6 +9188,7 @@ export function EmberChat({
             supports_single_run_card: true,
             supports_input_group_card: true,
             supports_credential_delete_card: true,
+            supports_skill_write_card: true,
             supports_connection_card: true,
             supports_demonstration_offer:
               Boolean(onRecordTask) &&
@@ -10895,6 +10907,12 @@ export function EmberChat({
         interaction={interaction}
         review={interaction.credential_delete_review}
       />
+    ) : interaction.skill_write_review ? (
+      <SkillWriteReceipt
+        key={interaction.interaction_id}
+        interaction={interaction}
+        review={interaction.skill_write_review}
+      />
     ) : (
       <QuestionReceipt
         key={interaction.interaction_id}
@@ -12052,6 +12070,21 @@ export function EmberChat({
             }}
             onCancel={() =>
               void handleQuestionAnswer(trayQuestion, { skipped: true })
+            }
+            upNext={attentionUpNext}
+          />
+        ) : trayQuestion?.skill_write_review ? (
+          <SkillWriteReviewCard
+            key={trayQuestion.interaction_id}
+            review={trayQuestion.skill_write_review}
+            disabled={isSubmittingQuestion || acceptUnresolved}
+            lockReason={acceptUnresolved ? acceptHoldReason : null}
+            collapsed={questionTrayCollapsed}
+            onCollapsedChange={setQuestionTrayCollapsed}
+            onDecide={(approved) =>
+              void handleQuestionAnswer(trayQuestion, {
+                account_group_decision: { approved, credential_ids: [] },
+              })
             }
             upNext={attentionUpNext}
           />

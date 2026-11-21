@@ -1,4 +1,4 @@
-"""Skyvern MCP agent skill tools: list, read and delete an organization's stored skills (Skyvern Cloud only)."""
+"""Skyvern MCP agent skill tools: list, read, save and delete an organization's stored skills (Skyvern Cloud only)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pydantic import Field
 
 from skyvern.client.errors import NotFoundError
 
-from ._common import ErrorCode, Timer, make_error, make_result, raw_http_delete, raw_http_get
+from ._common import ErrorCode, Timer, make_error, make_result, raw_http_delete, raw_http_get, raw_http_put
 
 _NOT_AVAILABLE = "agent skills are not available on this Skyvern server"
 _WORKFLOW_ID = Annotated[
@@ -74,7 +74,8 @@ async def skyvern_agent_skill_get(
     path: Annotated[str, Field(description="File in the skill to return", min_length=1)] = "SKILL.md",
 ) -> dict[str, Any]:
     """Read one file of a stored agent skill, plus its file list, author and version history. Covers stored skills
-    only. Text of a curator-written version is withheld unless your role may read workflow runs. Needs Skyvern Cloud.
+    only. Text of a version made from run data (one with source_run_ids) is withheld unless your role may read workflow
+    runs. Needs Skyvern Cloud.
     """
     action = "skyvern_agent_skill_get"
     params: dict[str, str | int] = _scope(workflow_permanent_id) | ({"version": version} if version is not None else {})
@@ -105,6 +106,60 @@ async def skyvern_agent_skill_get(
                 "Pass one of the listed file paths as path.",
             )
         data["file"] = {"path": path, "text": files[path]}
+    return make_result(action, data=data, timing_ms=timer.timing_ms)
+
+
+async def skyvern_agent_skill_save(
+    name: Annotated[str, Field(description="Skill name; must match the name in SKILL.md frontmatter", min_length=1)],
+    workflow_permanent_id: _WORKFLOW_ID = None,
+    files: Annotated[
+        dict[str, str] | None,
+        Field(
+            description="Every file of the new version, path to text. SKILL.md needs YAML frontmatter with name and "
+            "a one-line description."
+        ),
+    ] = None,
+    restore_version: Annotated[
+        int | None, Field(description="Save a copy of this older version as the new version.", ge=1)
+    ] = None,
+    promote_from_workflow_permanent_id: Annotated[
+        str | None,
+        Field(description="Save that workflow's skill of this name as an org-wide skill. Omit workflow_permanent_id."),
+    ] = None,
+) -> dict[str, Any]:
+    """Save a new version of a stored agent skill from exactly one of files, restore_version or
+    promote_from_workflow_permanent_id. Earlier versions stay readable. Needs a signed-in person and a role that may
+    change skills. A save with an organization API key is refused, and so is one with an OAuth personal-workspace key,
+    because no person is signed in. Needs Skyvern Cloud.
+    """
+    action = "skyvern_agent_skill_save"
+    body = {
+        key: value
+        for key, value in (
+            ("files", files),
+            ("restore_version", restore_version),
+            ("promote_from_workflow_permanent_id", promote_from_workflow_permanent_id),
+        )
+        if value is not None
+    }
+    with Timer() as timer:
+        try:
+            skill = await raw_http_put(_skill_path(name), json_body=body, params=_scope(workflow_permanent_id))
+            timer.mark("http")
+        except NotFoundError:
+            return _failure(
+                action,
+                timer,
+                ErrorCode.INVALID_INPUT,
+                _skill_not_found(name, promote_from_workflow_permanent_id, restore_version)
+                if promote_from_workflow_permanent_id is not None
+                else _skill_not_found(name, workflow_permanent_id, restore_version),
+                "Use skyvern_agent_skill_list to find skill names and skyvern_workflow_list to find workflow IDs.",
+            )
+        except Exception as e:
+            return _failure(action, timer, ErrorCode.API_ERROR, str(e), "Check your API key and your role.")
+    files_saved: dict[str, str] | None = skill.pop("files")
+    data = {**skill, "file_paths": sorted(files_saved) if files_saved is not None else None}
     return make_result(action, data=data, timing_ms=timer.timing_ms)
 
 

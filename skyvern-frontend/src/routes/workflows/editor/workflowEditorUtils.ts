@@ -1,6 +1,7 @@
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { buildWorkflowSaveRequest } from "./workflowYamlDocument";
 import { normalizeRetryPolicy } from "./nodes/StartNode/retryPolicyUtils";
+import { apiWorkflowToSettings } from "./apiWorkflowToSettings";
 import Dagre from "@dagrejs/dagre";
 import type { QueryClient } from "@tanstack/react-query";
 import { queryClient as appQueryClient } from "@/api/QueryClient";
@@ -920,6 +921,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
+          completeVerification: block.complete_verification,
           ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
@@ -989,6 +991,8 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
+          selector: block.selector,
+          aiFallback: block.ai_fallback,
           ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
@@ -1015,6 +1019,8 @@ function convertToNode(
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
           ...blockEngineNodeData(block, effectiveDefaultEngine),
+          completeVerification: block.complete_verification,
+          completeCriterionIsUntrusted: block.complete_criterion_is_untrusted,
           legacyV2Available: isV2Engine,
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
@@ -1095,6 +1101,8 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
+          completeVerification: block.complete_verification,
+          skipSavedProfile: block.skip_saved_profile,
           ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
@@ -1403,6 +1411,7 @@ function convertToNode(
           azureBlobContainerName: block.azure_blob_container_name ?? "",
           googleCredentialId: block.google_credential_id ?? "",
           googleDriveFolderId: block.google_drive_folder_id ?? "",
+          googleDriveSaveAsSheet: block.google_drive_save_as_sheet ?? false,
           sftpHost: block.sftp_host ?? "",
           sftpPort: block.sftp_port != null ? String(block.sftp_port) : "",
           sftpUsername: block.sftp_username ?? "",
@@ -1683,6 +1692,7 @@ function serializeConditionalBlock(
     block_type: "conditional",
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
+    next_loop_on_failure: node.data.nextLoopOnFailure ?? false,
     // An inferred merge point is not written back: the backend routes to the
     // conditional's own next_block_label when no branch target applies.
     next_block_label: mergeIsInferred ? null : mergeLabel,
@@ -3637,7 +3647,7 @@ function getWorkflowBlock(
   const base = {
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
-    next_loop_on_failure: node.data.nextLoopOnFailure,
+    next_loop_on_failure: node.data.nextLoopOnFailure ?? false,
     model: blockModelOverride(node.data.model),
     next_block_label: nextBlockLabel,
     ignore_workflow_system_prompt:
@@ -3672,6 +3682,9 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
+        ...(node.data.completeVerification !== undefined && {
+          complete_verification: node.data.completeVerification,
+        }),
         ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
@@ -3738,6 +3751,12 @@ function getWorkflowBlock(
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         disable_cache: node.data.disableCache ?? false,
+        ...(node.data.selector !== undefined && {
+          selector: node.data.selector,
+        }),
+        ...(node.data.aiFallback !== undefined && {
+          ai_fallback: node.data.aiFallback,
+        }),
         ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
@@ -3781,6 +3800,13 @@ function getWorkflowBlock(
         ...engineYAML(node.data.engine, node.data.enginePinned),
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
+        ...(node.data.completeVerification !== undefined && {
+          complete_verification: node.data.completeVerification,
+        }),
+        ...(node.data.completeCriterionIsUntrusted !== undefined && {
+          complete_criterion_is_untrusted:
+            node.data.completeCriterionIsUntrusted,
+        }),
       };
     }
     case "extraction": {
@@ -3831,6 +3857,12 @@ function getWorkflowBlock(
         terminate_criterion: node.data.terminateCriterion,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
+        ...(node.data.completeVerification !== undefined && {
+          complete_verification: node.data.completeVerification,
+        }),
+        ...(node.data.skipSavedProfile !== undefined && {
+          skip_saved_profile: node.data.skipSavedProfile,
+        }),
         ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
@@ -4049,6 +4081,7 @@ function getWorkflowBlock(
         azure_blob_container_name: node.data.azureBlobContainerName ?? "",
         google_credential_id: node.data.googleCredentialId ?? "",
         google_drive_folder_id: node.data.googleDriveFolderId ?? "",
+        google_drive_save_as_sheet: node.data.googleDriveSaveAsSheet ?? false,
         sftp_host: node.data.sftpHost ?? "",
         sftp_port:
           node.data.sftpPort && Number.isFinite(Number(node.data.sftpPort))
@@ -4520,6 +4553,119 @@ function getWorkflowBlocks(
   edges: Array<Edge>,
 ): Array<BlockYAML> {
   return getWorkflowBlocksUtil(nodes, edges);
+}
+
+function blocksByLabel<T extends { label: string }>(
+  blocks: Array<T>,
+  out: Map<string, Record<string, unknown>> = new Map(),
+): Map<string, Record<string, unknown>> {
+  for (const block of blocks) {
+    out.set(block.label, block);
+    if ("loop_blocks" in block && Array.isArray(block.loop_blocks)) {
+      blocksByLabel(block.loop_blocks, out);
+    }
+  }
+  return out;
+}
+
+// Every save regenerates branch ids, and the branches editor adds a default branch on render when the saved
+// list has none; one that routes where the block itself routes is a no-op, so neither counts as an edit.
+function comparableField(
+  block: Record<string, unknown>,
+  key: string,
+  savedHasDefault: boolean,
+): string {
+  const value = block[key];
+  if (key !== "branch_conditions" || !Array.isArray(value)) {
+    return JSON.stringify(value);
+  }
+  return JSON.stringify(
+    (value as Array<BranchCondition>)
+      .filter(
+        (branch) =>
+          savedHasDefault ||
+          !branch.is_default ||
+          (branch.next_block_label != null &&
+            branch.next_block_label !== block.next_block_label),
+      )
+      .map((branch) => ({ ...branch, id: undefined })),
+  );
+}
+
+// Fields the save rewrites on purpose: web search folds legacy error codes into the new ones, and a Gmail
+// send drops download-directory attachments. A new save-time migration must add its fields here too.
+const SAVE_MIGRATED_FIELDS: Record<string, Array<string>> = {
+  web_search: [
+    "error_code_mapping",
+    "no_results_error_code",
+    "no_match_error_code",
+  ],
+  send_email: ["file_attachments"],
+};
+
+const loadedBlockBaselines = new WeakMap<
+  Array<WorkflowBlock>,
+  Map<string, Record<string, unknown>>
+>();
+
+// Loading a block normalizes fields the editor has no control for (title becomes the label, null becomes "",
+// defaults get filled in), so a field still in that form was not edited and keeps its saved value.
+function keepUneditedBlockFields(
+  blocks: Array<BlockYAML>,
+  workflow: WorkflowApiResponse,
+): Array<BlockYAML> {
+  const savedBlocks = workflow.workflow_definition.blocks;
+  let loaded = loadedBlockBaselines.get(savedBlocks);
+  if (!loaded) {
+    const { nodes, edges } = getElements(
+      savedBlocks,
+      apiWorkflowToSettings(workflow),
+      true,
+      workflowEffectiveDefaultEngine(workflow, appQueryClient),
+    );
+    loaded = blocksByLabel(getWorkflowBlocks(nodes, edges));
+    loadedBlockBaselines.set(savedBlocks, loaded);
+  }
+  const saved = blocksByLabel(savedBlocks);
+  // Routing, block_type and model always save as built: a v1 definition links blocks by list order and the save
+  // upgrades it to v2, where a null next_block_label ends the run; an empty model is dropped on purpose.
+  const kept = new Set(["block_type", "next_block_label", "model"]);
+  if ((workflow.workflow_definition.version ?? 1) < 2) {
+    kept.add("branch_conditions");
+  }
+  const restore = (current: Array<BlockYAML>): Array<BlockYAML> =>
+    current.map((block) => {
+      const built = block as Record<string, unknown>;
+      const before = loaded.get(block.label);
+      // A label now on a block of another type (a type switch or a reused label) has nothing to restore.
+      const savedBlock = saved.get(block.label);
+      const original =
+        savedBlock?.block_type === block.block_type ? savedBlock : undefined;
+      const savedHasDefault =
+        Array.isArray(original?.branch_conditions) &&
+        (original.branch_conditions as Array<BranchCondition>).some(
+          (branch) => branch.is_default,
+        );
+      // Export needs a schema, so the default one the editor shows is kept once export is on.
+      const exportNeedsSchema = built.export_enabled === true;
+      const fields = Object.entries(built).map(([key, value]) => {
+        if (key === "loop_blocks" && Array.isArray(value)) {
+          return [key, restore(value)];
+        }
+        const unedited =
+          before &&
+          original &&
+          !kept.has(key) &&
+          !SAVE_MIGRATED_FIELDS[block.block_type]?.includes(key) &&
+          !(key === "export_data_schema" && exportNeedsSchema) &&
+          key in original &&
+          comparableField(built, key, savedHasDefault) ===
+            comparableField(before, key, savedHasDefault);
+        return [key, unedited ? original[key] : value];
+      });
+      return Object.fromEntries(fields) as BlockYAML;
+    });
+  return restore(blocks);
 }
 
 function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
@@ -5716,6 +5862,7 @@ function convertBlocksToBlockYAML(
           azure_blob_container_name: block.azure_blob_container_name ?? "",
           google_credential_id: block.google_credential_id ?? "",
           google_drive_folder_id: block.google_drive_folder_id ?? "",
+          google_drive_save_as_sheet: block.google_drive_save_as_sheet ?? false,
           sftp_host: block.sftp_host ?? "",
           sftp_port: block.sftp_port ?? null,
           sftp_username: block.sftp_username ?? "",
@@ -6761,6 +6908,7 @@ export {
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   getWorkflowBlocks,
+  keepUneditedBlockFields,
   goalChangeIsPending,
   goalTextEditPatch,
   goalChangeUndoPatch,

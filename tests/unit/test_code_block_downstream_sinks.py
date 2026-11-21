@@ -9,10 +9,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.completion_verification import evaluate_completion_criteria
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
-from skyvern.forge.sdk.copilot.tools.completion import _build_run_evidence_snapshot
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunBlockErrorRow
+from skyvern.forge.sdk.ember.completion_verification import evaluate_completion_criteria
+from skyvern.forge.sdk.ember.request_policy import CompletionCriterion
+from skyvern.forge.sdk.ember.tools.completion import _build_run_evidence_snapshot
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     CodeBlock,

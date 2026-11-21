@@ -262,6 +262,8 @@ const CARD_TOOLS = new Set([
   INPUT_GROUP_TOOL,
   "cancel_account_group",
   "delete_saved_credentials",
+  "save_org_skill",
+  "delete_org_skill",
 ]);
 
 export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {

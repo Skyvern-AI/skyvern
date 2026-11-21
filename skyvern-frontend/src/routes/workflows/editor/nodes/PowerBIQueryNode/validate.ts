@@ -9,10 +9,9 @@ export function validatePowerBIQueryNode(
   const { label, credentialSource, connectionId, datasetId, query, maxRows } =
     node.data;
 
-  if (credentialSource !== "nango") {
-    errors.push(
-      `${label}: Select a verified Power BI connection; native connections are no longer supported.`,
-    );
+  // The server decides whether this organization may use the source it names.
+  if (credentialSource !== "nango" && credentialSource !== "native") {
+    errors.push(`${label}: Select a Power BI connection.`);
   }
 
   if (missing(connectionId)) {

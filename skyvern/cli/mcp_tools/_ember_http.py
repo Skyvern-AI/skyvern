@@ -1,5 +1,5 @@
 """Raw Ember HTTP calls with plain dict bodies, because the Ember routes are not in the public OpenAPI schema.
-Only /v1/ember/* is ever called; there is no Copilot-route fallback."""
+Ember itself is only reached through /v1/ember/*; there is no Copilot-route fallback."""
 
 from __future__ import annotations
 
@@ -427,6 +427,29 @@ async def _get_json(path: str, *, timeout: float | None) -> dict[str, Any] | Non
     except (httpx.HTTPError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+async def list_saved_logins(limit: int, *, timeout: float | None = None) -> list[dict[str, str | None]] | None:
+    """The org's newest `limit` password credentials (id, name, username), with no search like the Studio picker's."""
+    params = {"page": 1, "page_size": limit, "credential_type": "password"}
+    try:
+        response = await _client().request(
+            "v1/credentials", method="GET", params=params, request_options=_options(timeout)
+        )
+    except httpx.HTTPError:
+        return None
+    payload = _json_or_none(response) if response.status_code == 200 else None
+    if not isinstance(payload, list):
+        return None
+    return [
+        {
+            "credential_id": row["credential_id"],
+            "name": row["name"],
+            "username": row["credential"].get("username") if isinstance(row.get("credential"), dict) else None,
+        }
+        for row in payload
+        if isinstance(row, dict) and isinstance(row.get("credential_id"), str) and isinstance(row.get("name"), str)
+    ]
 
 
 async def get_debug_session_browser_id(workflow_permanent_id: str, *, timeout: float) -> str | None:

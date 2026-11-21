@@ -527,6 +527,8 @@ export interface CreateMicrosoftOAuthAuthorizeRequest {
   credential_name?: string;
   scope_profile?: MicrosoftOAuthScopeProfile;
   app_origin?: string;
+  // Existing credential to re-authenticate in place, preserving its id.
+  credential_id?: string;
 }
 
 export interface MicrosoftOAuthAuthorizeResponse {
@@ -549,6 +551,7 @@ export interface GoogleSpreadsheetSummary {
 export interface PagedGoogleSpreadsheets {
   spreadsheets: GoogleSpreadsheetSummary[];
   next_page_token: string | null;
+  incomplete_search?: boolean;
 }
 
 export interface GoogleSheetTab {
@@ -672,7 +675,8 @@ export interface BitwardenCredentialSafe {
 export interface BitwardenOrganizationAuthToken {
   id: string;
   organization_id: string;
-  credential: BitwardenCredentialSafe;
+  // Omitted when the caller cannot read vault provider settings.
+  credential?: BitwardenCredentialSafe;
   created_at: string;
   modified_at: string;
   token_type: string;

@@ -314,6 +314,8 @@ class TasksRepository(BaseRepository):
         self, task_ids: list[str], organization_id: str | None = None
     ) -> tuple[int, int]:
         """Return (total_steps, completed_steps) counts without fetching full step objects."""
+        if not task_ids:
+            return 0, 0
         async with self.Session() as session:
             query = (
                 select(
@@ -1505,10 +1507,7 @@ class TasksRepository(BaseRepository):
         async with self.Session() as session:
             query = select(*columns).where(TaskModel.workflow_run_id == workflow_run_id).order_by(TaskModel.created_at)
             rows = (await session.execute(query)).all()
-        return [
-            convert_to_task(TaskModel(**row._mapping, extracted_information=None), debug_enabled=self.debug_enabled)
-            for row in rows
-        ]
+        return [convert_to_task(row, debug_enabled=self.debug_enabled) for row in rows]
 
     @db_operation("delete_task_steps")
     async def delete_task_steps(self, organization_id: str, task_id: str) -> None:

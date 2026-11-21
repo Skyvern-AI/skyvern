@@ -185,6 +185,7 @@ import {
   layout,
   startNode,
   getWorkflowBlocks,
+  keepUneditedBlockFields,
   getWorkflowErrors,
   upgradeWorkflowDefinitionToVersionTwo,
   withGoalUndoRecordsFrom,
@@ -1821,6 +1822,12 @@ function Workspace({
       workflow_permanent_id: workflow.workflow_permanent_id,
       block_type: blockTypeFromNode(node) ?? nodeType,
       position: previousNodeIndex + 1,
+      ...(integrationAction && node.type === "integrationAction"
+        ? {
+            integration_id: integrationAction.integrationId,
+            integration_action: integrationAction.actionId,
+          }
+        : {}),
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
     if (select) useWorkflowPanelStore.getState().setSelectedBlockId(id);
@@ -2189,7 +2196,13 @@ function Workspace({
         true,
         workflowEffectiveDefaultEngine(saveData.workflow, queryClient),
       );
-      const repairedBlocks = getWorkflowBlocks(repairedNodes, repairedEdges);
+      const repairedBlocks = keepUneditedBlockFields(
+        getWorkflowBlocks(repairedNodes, repairedEdges),
+        {
+          ...saveData.workflow,
+          workflow_definition: response.data.workflow_definition,
+        },
+      );
       settings.finallyBlockLabel = resolveFinallyBlockLabel(
         settings.finallyBlockLabel,
         settingsPatch,
@@ -2352,12 +2365,34 @@ function Workspace({
       workflowEffectiveDefaultEngine(selectedVersion, queryClient),
     );
 
+    // Studio Save ignores a clean editor, so mark the restore as an edit; the
+    // Save dialog diffs it against the existing baseline (or the pre-restore
+    // draft if none). contentDirty too, or the Doc clears it as "back to saved"
+    // before the remount recomputes it. Reselecting the loaded version on a
+    // clean editor changes nothing, so it stays clean.
+    if (
+      selectedVersion.version !== workflow.version ||
+      useWorkflowHasChangesStore.getState().hasChanges
+    ) {
+      useWorkflowSnapshotStore.getState().markUserEdit();
+      useWorkflowSnapshotStore.setState({ contentDirty: true });
+      workflowChangesStore.setHasChanges(true);
+    }
+
     const collapsedSet = useNodeCollapseStore.getState().collapsed;
     const wpid = workflowPermanentId ?? "__global__";
     setNodes(
       replayPersistedCollapseVisibility(elements.nodes, wpid, collapsedSet),
     );
     setEdges(elements.edges);
+    setParameterBaselines((current) => ({
+      ...current,
+      [selectedVersion.workflow_permanent_id]:
+        selectedVersion.workflow_definition.parameters,
+    }));
+    useWorkflowParametersStore
+      .getState()
+      .setParameters(getInitialParameters(selectedVersion));
     const titleStore = useWorkflowTitleStore.getState();
     titleStore.clearEmberMetadata(selectedVersion.workflow_permanent_id);
     titleStore.trackEmberMetadata(

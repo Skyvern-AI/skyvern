@@ -37,12 +37,12 @@ async def raw_http_get(path: str, params: dict[str, Any] | None = None) -> Any:
     return await _raw_http_request("GET", path, params=params)
 
 
-async def raw_http_put(path: str, json_body: dict[str, Any] | None = None) -> Any:
+async def raw_http_put(path: str, json_body: dict[str, Any] | None = None, params: dict[str, str] | None = None) -> Any:
     """PUT request to Skyvern API for endpoints without SDK methods.
 
     Raises NotFoundError on 404, RuntimeError on other HTTP errors.
     """
-    return await _raw_http_request("PUT", path, json_body=json_body)
+    return await _raw_http_request("PUT", path, params=params, json_body=json_body)
 
 
 async def raw_http_post(path: str, json_body: dict[str, Any] | None = None) -> Any:

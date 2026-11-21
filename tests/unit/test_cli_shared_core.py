@@ -24,7 +24,7 @@ from skyvern.cli.core.guards import (
 )
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
 from skyvern.client.types.extensions import Extensions
-from tests.unit.copilot_test_helpers import skip_no_browser
+from tests.unit.ember_test_helpers import skip_no_browser
 
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
 LOCALHOST_RECOVERY_HINT = (

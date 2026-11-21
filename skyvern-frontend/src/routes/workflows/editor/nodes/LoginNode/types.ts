@@ -4,6 +4,8 @@ import { RunEngine } from "@/api/types";
 import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 
 export type LoginNodeData = NodeBaseData & {
+  completeVerification?: boolean;
+  skipSavedProfile?: boolean;
   url: string;
   navigationGoal: string;
   errorCodeMapping: string;

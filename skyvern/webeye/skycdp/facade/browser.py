@@ -8,6 +8,8 @@ property of the browser owned by the provisioner, where it already lives, and ou
 from __future__ import annotations
 
 import asyncio
+import inspect
+import ipaddress
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -619,7 +621,8 @@ def plan_websocket_dial(ws_url: str, headers: dict[str, str] | None) -> WebSocke
         return WebSocketDial(uri=ws_url, connect_host=None, connect_port=None, headers=headers)
 
     parsed = urlparse(ws_url)
-    rewritten = parsed._replace(netloc=host_override).geturl()
+    userinfo, separator, _ = parsed.netloc.rpartition("@")
+    rewritten = parsed._replace(netloc=f"{userinfo}{separator}{host_override}").geturl()
     return WebSocketDial(
         uri=rewritten,
         connect_host=parsed.hostname,
@@ -640,6 +643,14 @@ async def _open_websocket(ws_url: str, *, headers: dict[str, str] | None, timeou
         routing["host"] = dial.connect_host
         if dial.connect_port is not None:
             routing["port"] = dial.connect_port
+    hostname = urlparse(dial.uri).hostname
+    if hostname is not None and "proxy" in inspect.signature(connect).parameters:
+        try:
+            is_loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            is_loopback = hostname.lower() == "localhost" or hostname.lower().endswith(".localhost")
+        if is_loopback:
+            routing["proxy"] = None
 
     try:
         return await asyncio.wait_for(

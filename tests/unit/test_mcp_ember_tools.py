@@ -20,15 +20,15 @@ from pydantic import AliasChoices
 
 from skyvern.cli.mcp_tools import _ember_http, _workflow_http, ember, mcp
 from skyvern.client.core.client_wrapper import AsyncClientWrapper
-from skyvern.forge.sdk.copilot.context import NarrativeCreatedTrigger
-from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_REASON
-from skyvern.forge.sdk.copilot.turn_outcome import CANCEL_TERMINAL_REASON
-from skyvern.forge.sdk.routes import workflow_copilot
-from skyvern.forge.sdk.schemas.workflow_copilot import (
-    CopilotPendingTurn,
-    CopilotTurnControl,
-    WorkflowCopilotChatHistoryResponse,
-    WorkflowCopilotChatRequest,
+from skyvern.forge.sdk.ember.context import NarrativeCreatedTrigger
+from skyvern.forge.sdk.ember.interruption import INTERRUPTED_TERMINAL_REASON
+from skyvern.forge.sdk.ember.turn_outcome import CANCEL_TERMINAL_REASON
+from skyvern.forge.sdk.routes import ember as ember_routes
+from skyvern.forge.sdk.schemas.ember import (
+    EmberChatHistoryResponse,
+    EmberChatRequest,
+    EmberPendingTurn,
+    EmberTurnControl,
 )
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -129,7 +129,7 @@ def _history(
         "chat_history": messages or [],
         **extra,
     }
-    return WorkflowCopilotChatHistoryResponse.model_validate(raw).model_dump(mode="json")
+    return EmberChatHistoryResponse.model_validate(raw).model_dump(mode="json")
 
 
 def _live(**narrative_extra: Any) -> dict[str, Any]:
@@ -200,6 +200,21 @@ RECORDED_MAPPER_CASES: dict[str, tuple[str, str | None, list[str], str]] = {
 
 def _recorded_history(case: str) -> dict[str, Any]:
     return json.loads((RECORDED_HISTORY_DIR / f"{case}.json").read_text())
+
+
+RECORDED_CREDENTIALS = json.loads((RECORDED_HISTORY_DIR / "saved_logins.json").read_text())
+RECORDED_SAVED_LOGINS = [
+    {"credential_id": row["credential_id"], "name": row["name"], "username": row["credential"]["username"]}
+    for row in RECORDED_CREDENTIALS
+]
+LONG_SAVED_LOGINS = [
+    {
+        "credential_id": f"cred_5986206953177528{index:02d}",
+        "name": f"{index:02d} regional payroll portal, finance team shared login",
+        "username": f"finance-{index:02d}@example.com",
+    }
+    for index in range(25)
+]
 
 
 def _recorded_token_values(history: dict[str, Any]) -> set[str]:
@@ -385,7 +400,7 @@ EDITED_MAPPER_CASES: dict[str, tuple[Callable[[], dict[str, Any]], tuple[str, st
         ("stopped", None, [], "skyvern_ember_send"),
     ),
     "server_user_cancelled_reason": (
-        lambda: _ended_with_server_reason("stopped", workflow_copilot.USER_CANCELLED_TERMINAL_REASON),
+        lambda: _ended_with_server_reason("stopped", ember_routes.USER_CANCELLED_TERMINAL_REASON),
         ("stopped", None, [], "skyvern_ember_send"),
     ),
     "server_interrupted_reason": (
@@ -456,11 +471,19 @@ MAPPER_CASES = {
 def test_mapper_contract_on_recorded_history_payloads(case: str) -> None:
     build, (state, waiting_on, kinds, next_hint) = MAPPER_CASES[case]
     history = build()
-    WorkflowCopilotChatHistoryResponse.model_validate(history)
+    EmberChatHistoryResponse.model_validate(history)
 
-    result = ember.map_turn_state(history, now=NOW, login_resolved=case in LOGIN_DECIDED_CASES)
+    result = ember.map_turn_state(
+        history, now=NOW, login_resolved=case in LOGIN_DECIDED_CASES, saved_logins=RECORDED_SAVED_LOGINS
+    )
 
     assert result["state"] == state
+    for action in result["user_actions"]:
+        if action["kind"] == "login_needed":
+            assert (action["facts"]["saved_logins"], action["facts"]["saved_logins_more"]) == (
+                RECORDED_SAVED_LOGINS,
+                False,
+            )
     assert result["waiting_on"] == waiting_on
     assert [action["kind"] for action in result["user_actions"]] == kinds
     assert next_hint in result["next"]
@@ -504,7 +527,9 @@ def test_mapper_contract_on_recorded_history_payloads(case: str) -> None:
         if action["kind"] == "run_approval":
             review = items[action["item_id"]]["account_group_review"]
             facts = action["facts"]
-            assert facts["total_accounts"] == len(review["rows"]) and facts["preselected_note"]
+            assert facts["total_accounts"] == len(review["rows"])
+            # The note explains preselected: false, so a card with no such account must not carry it.
+            assert ("preselected_note" in facts) is any(not row.get("preselected", True) for row in review["rows"])
             shown = (
                 facts["workflow_title"],
                 facts["version"],
@@ -672,6 +697,73 @@ def _registration_card_under_size_pressure() -> dict[str, Any]:
     return history
 
 
+def _registration_card_that_just_fits() -> dict[str, Any]:
+    # Without the saved-login list this card fits with 10 characters to spare and nothing else left to drop.
+    history = _recorded_history("registration_card")
+    history["in_flight_turn"]["narrative"]["designActivity"] = []
+    registration = history["pending_credential_requests"][0]["registration"]
+    registration["credential_name"] = ""
+    spare = ember.SUMMARY_LIMIT_CHARS - 10 - len(json.dumps(ember.map_turn_state(history, now=NOW)))
+    registration["credential_name"] = "n" * spare
+    return history
+
+
+def _proposal_review_beside_a_long_message() -> dict[str, Any]:
+    # The 76-change review fits only once the latest message (a delivered steer) gives up its room.
+    history = _proposal_with_review_blocks(76)
+    history["chat_history"][-1]["content"] = "r" * 500
+    history["chat_history"][-1]["narrative_payload"]["steerMessages"][-1]["text"] = "m" * 500
+    return history
+
+
+def _without_optional_fields(state: dict[str, Any]) -> dict[str, Any]:
+    state = json.loads(json.dumps(state))
+    state.pop("last_user_message", None)
+    for action in state["user_actions"]:
+        for key in ("saved_logins", "saved_logins_more"):
+            (action.get("facts") or {}).pop(key, None)
+    return state
+
+
+def _proposal_review_that_just_fits() -> dict[str, Any]:
+    # Without its optional fields this 76-change review fits with 10 characters to spare, with nothing else to cut.
+    history = _proposal_with_review_blocks(76)
+    owner = history["chat_history"][-1]
+    owner["content"] = "Done."
+    owner["narrative_payload"]["designActivity"] = []
+    last_change = owner["narrative_payload"]["review"]["blocks"][-1]
+    size = len(json.dumps(_without_optional_fields(ember.map_turn_state(history, now=NOW, fit=False))))
+    last_change["label"] += "x" * (ember.SUMMARY_LIMIT_CHARS - 10 - size)
+    return history
+
+
+def _without_user_text(history: dict[str, Any]) -> dict[str, Any]:
+    history = json.loads(json.dumps(history))
+    for row in history.get("chat_history") or []:
+        if row["sender"] == "user":
+            row["content"] = ""
+        for steer in (row.get("narrative_payload") or {}).get("steerMessages") or []:
+            steer["text"] = ""
+    for steer in (history.get("in_flight_turn") or {}).get("steer_messages") or []:
+        steer["text"] = ""
+    return history
+
+
+def _login_cards_with_long_prompts() -> dict[str, Any]:
+    history = _recorded_history("login_card")
+    card = history["pending_credential_requests"][0] | {"message": "Sign in to pull this month's statement. " * 25}
+    history["pending_credential_requests"] = [
+        card
+        | {
+            "turn_id": f"{card['turn_id']}{index}",
+            "resume_token": f"{card['resume_token']}{index}",
+            "login_page_urls": [f"https://site{index}.example.com/login"],
+        }
+        for index in range(3)
+    ]
+    return history
+
+
 def _question_with_a_long_prompt() -> dict[str, Any]:
     part = {
         "part_id": "part_0",
@@ -718,10 +810,14 @@ def _question_with_long_choices() -> dict[str, Any]:
         (_question_with_a_long_prompt, True, True),
         (_run_approval_with_long_account_labels, True, True),
         (_registration_card_under_size_pressure, True, True),
+        (_registration_card_that_just_fits, True, True),
+        (_login_cards_with_long_prompts, True, True),
         (partial(_proposal_with_review_blocks, 300), True, True),
         (partial(_proposal_with_review_blocks, 45), True, True),
         (partial(_proposal_with_review_blocks, None), True, True),
         (_long_review_change_history, True, True),
+        (_proposal_review_beside_a_long_message, True, True),
+        (_proposal_review_that_just_fits, True, True),
     ],
     ids=[
         "oversized_items",
@@ -736,10 +832,14 @@ def _question_with_long_choices() -> dict[str, Any]:
         "question_with_a_long_prompt_and_12_choices",
         "run_approval_with_clipped_account_labels",
         "registration_card_under_size_pressure",
+        "registration_card_that_just_fits",
+        "login_cards_with_long_prompts",
         "proposal_review_too_large_to_show",
         "proposal_review_past_the_old_40_cap",
         "proposal_without_a_review",
         "long_review_change",
+        "proposal_review_beside_a_long_message",
+        "proposal_review_that_just_fits",
     ],
 )
 def test_mapper_fits_an_oversized_history_and_keeps_every_item_id(
@@ -748,9 +848,9 @@ def test_mapper_fits_an_oversized_history_and_keeps_every_item_id(
     history = build()
     with monkeypatch.context() as unbounded:
         unbounded.setattr(ember, "SUMMARY_LIMIT_CHARS", sys.maxsize)
-        full = ember.map_turn_state(history, now=NOW)
+        full = ember.map_turn_state(history, now=NOW, saved_logins=LONG_SAVED_LOGINS)
 
-    result = ember.map_turn_state(history, now=NOW)
+    result = ember.map_turn_state(history, now=NOW, saved_logins=LONG_SAVED_LOGINS)
 
     assert len(json.dumps(result)) <= ember.SUMMARY_LIMIT_CHARS
     kept, every = result["user_actions"], full["user_actions"]
@@ -782,6 +882,11 @@ def test_mapper_fits_an_oversized_history_and_keeps_every_item_id(
         if "prompt" in action and "site_question" in (original.get("facts") or {}):
             for key in ("site", "consent"):
                 assert action["facts"]["site_question"][key] == original["facts"]["site_question"][key]
+        # The saved-login list only shrinks from its end and says so, or is left off when the card leaves no room.
+        if "prompt" in action and "saved_logins" in (original.get("facts") or {}):
+            logins, every_login = action["facts"].get("saved_logins", []), original["facts"]["saved_logins"]
+            assert logins == every_login[: len(logins)]
+            assert action["facts"].get("saved_logins_more", True) is (len(logins) < len(every_login))
         demoted.append(bool((cut or clipped) and answerable))
     shown, review = result["proposal"], _owner_review(history)
     whole_review = (
@@ -812,6 +917,19 @@ def test_mapper_fits_an_oversized_history_and_keeps_every_item_id(
     assert (result["links"], result["progress"]["cursor"]) == (full["links"], full["progress"]["cursor"])
     assert "omitted" not in result["next"]
     assert all("prompt" in action for action in kept) is prompts_kept
+    # The optional fields only take the room the rest leaves, so a state that fits without them is shown whole.
+    if len(json.dumps(_without_optional_fields(full))) <= ember.SUMMARY_LIMIT_CHARS:
+        assert _without_optional_fields(result) == _without_optional_fields(full)
+    # A decision re-reads the card without the saved-login list, so the list never changes anything else shown.
+    for action in kept:
+        for key in ("saved_logins", "saved_logins_more"):
+            (action.get("facts") or {}).pop(key, None)
+    assert result == ember.map_turn_state(history, now=NOW)
+    # A message with no room is left off rather than shown as null, which means the chat has none.
+    assert result.get("last_user_message", "left off") is not None or full["last_user_message"] is None
+    # The latest message is context, so what the user wrote never changes anything else shown.
+    result["last_user_message"] = None
+    assert result == {**ember.map_turn_state(_without_user_text(history), now=NOW), "last_user_message": None}
 
 
 def _sse(*frames: dict[str, Any]) -> bytes:
@@ -854,6 +972,7 @@ class FakeEmber:
         )
         self.workflow_create = httpx.Response(200, json={"workflow_id": "w_new", "workflow_permanent_id": WPID})
         self.browser_session = httpx.Response(200, json={"browser_session_id": "pbs_1", "status": "running"})
+        self.credentials = httpx.Response(404, json={"detail": "Not Found"})
         self.delays: dict[str, float] = {}
         self.errors: dict[str, type[httpx.TransportError]] = {}
         self.on_steer: Callable[[httpx.Request], None] | None = None
@@ -896,6 +1015,13 @@ class FakeEmber:
             return self.debug_session
         if path.startswith("v1/browser_sessions/"):
             return self.browser_session
+        if path == "v1/credentials" and self.credentials.status_code == 200:
+            # Like the route: one page of one credential type, in the order listed.
+            kind = params.get("credential_type")
+            rows = [row for row in self.credentials.json() if kind is None or row["credential_type"] == kind]
+            return httpx.Response(200, json=rows[: int(params.get("page_size", len(rows)))])
+        if path == "v1/credentials":
+            return self.credentials
         if path == "v1/upload_file":
             return httpx.Response(200, json={"file_id": f"file_{len(self.paths('/upload_file')) - 1}"})
         return httpx.Response(404, json={"detail": "Not Found"})
@@ -996,7 +1122,7 @@ async def test_chat_post_body_pins_flags_fresh_cancel_token_and_recovery_header(
     assert pick["idempotency_key"]
     assert len(bodies) == 2
     # Every key sent is a field the server's request model reads, so a renamed field can't be dropped unseen.
-    fields = WorkflowCopilotChatRequest.model_fields
+    fields = EmberChatRequest.model_fields
     names = set(fields) | {
         choice
         for field in fields.values()
@@ -1004,7 +1130,7 @@ async def test_chat_post_body_pins_flags_fresh_cancel_token_and_recovery_header(
         for choice in field.validation_alias.choices
     }
     for body in [*bodies, pick]:
-        WorkflowCopilotChatRequest.model_validate(body)
+        EmberChatRequest.model_validate(body)
         assert set(body) <= names, set(body) - names
     for body in bodies:
         assert {key: body[key] for key in EXPECTED_CHAT_POST_FLAGS} == EXPECTED_CHAT_POST_FLAGS
@@ -1180,14 +1306,21 @@ async def test_steer_on_the_running_chat_posts_steer_with_history_cancel_token(
     server.set_history(CHAT, working_history(), delivered)
 
     def deliver(request: httpx.Request) -> None:
-        steer_id = json.loads(request.content)["steer_id"]
-        receipt = [{"steer_id": steer_id, "text": "t", "created_at": NOW.isoformat(), "delivered_at": NOW.isoformat()}]
+        sent = json.loads(request.content)
+        receipt = [
+            {
+                "steer_id": sent["steer_id"],
+                "text": sent["message"],
+                "created_at": NOW.isoformat(),
+                "delivered_at": NOW.isoformat(),
+            }
+        ]
         if turn_ends_with_the_steer:
             ended = _history(messages=[_message("user", "Build it"), _finished_row(steerMessages=receipt)])
             delivered.clear()
             delivered.update(ended)
         else:
-            delivered["in_flight_turn"]["steer_messages"] = receipt
+            delivered["in_flight_turn"]["steer_messages"] = delivered["in_flight_turn"]["steer_messages"] + receipt
 
     server.on_steer = deliver
 
@@ -1200,6 +1333,8 @@ async def test_steer_on_the_running_chat_posts_steer_with_history_cancel_token(
     assert (
         first["data"]["delivered_steer_ids"] == [first["data"]["steer_id"]] == [server.bodies("/steer")[0]["steer_id"]]
     )
+    # Ember read the steer after the turn's opening message, so the steer is what it was last asked.
+    assert first["data"]["last_user_message"] == "Use the second tab"
     if turn_ends_with_the_steer:
         return
     second = await _call(ember.skyvern_ember_send, message="And the third", if_turn_running="steer", workflow_id=WPID)
@@ -1208,6 +1343,7 @@ async def test_steer_on_the_running_chat_posts_steer_with_history_cancel_token(
     assert steers[0]["steer_id"] != steers[1]["steer_id"]
     assert steers[0] == {**steers[0], "ember_chat_id": CHAT, "message": "Use the second tab"}
     assert second["ok"]
+    assert second["data"]["last_user_message"] == "And the third"
     assert server.paths("/chat-post") == []
 
 
@@ -1474,7 +1610,7 @@ async def test_error_mapping_by_route(server: FakeEmber, monkeypatch: pytest.Mon
     no_workflow = await _call(ember.skyvern_ember_send, message="Build it", workflow_id=WPID, wait_seconds=0)
     assert no_workflow["error"]["code"] == "WORKFLOW_NOT_FOUND"
     # A turn another client started after send's own check is refused by the server, never stopped.
-    refused = {"type": "error", "error": workflow_copilot.COPILOT_TURN_RUNNING_REFUSED}
+    refused = {"type": "error", "error": ember_routes.EMBER_TURN_RUNNING_REFUSED}
     server.chat_post = httpx.Response(200, content=_sse(refused))
     raced = await _call(ember.skyvern_ember_send, message="Build it", workflow_id=WPID, wait_seconds=0)
     assert raced["error"]["code"] == "TURN_IN_PROGRESS"
@@ -1538,15 +1674,15 @@ async def test_error_mapping_by_route(server: FakeEmber, monkeypatch: pytest.Mon
 
 
 async def _server_turn_control_response(
-    monkeypatch: pytest.MonkeyPatch, allowed: bool | None, control: CopilotTurnControl
+    monkeypatch: pytest.MonkeyPatch, allowed: bool | None, control: EmberTurnControl
 ) -> httpx.Response:
     check = AsyncMock(return_value=allowed) if allowed is not None else AsyncMock(side_effect=RuntimeError("down"))
     monkeypatch.setattr(
-        workflow_copilot, "app", SimpleNamespace(AGENT_FUNCTION=SimpleNamespace(copilot_turn_control_allowed=check))
+        ember_routes, "app", SimpleNamespace(AGENT_FUNCTION=SimpleNamespace(ember_turn_control_allowed=check))
     )
-    turn = CopilotPendingTurn(turn_id=TURN, started_at=NOW, starter_user_id="user_1")
+    turn = EmberPendingTurn(turn_id=TURN, started_at=NOW, starter_user_id="user_1")
     with pytest.raises(HTTPException) as raised:
-        await workflow_copilot._require_copilot_turn_control("o_1", turn, control)
+        await ember_routes._require_ember_turn_control("o_1", turn, control)
     return httpx.Response(raised.value.status_code, json={"detail": raised.value.detail}, headers=raised.value.headers)
 
 
@@ -1990,6 +2126,8 @@ async def test_accept_on_a_changed_or_missing_draft_posts_nothing(
     reviewed = _proposal_id(history)
     if change == "new_revision":
         history["proposed_workflow_metadata"]["revision"] += 1
+        # The new draft came from a message steered into the turn from elsewhere, such as the Studio.
+        history["chat_history"][-1]["narrative_payload"]["steerMessages"][-1]["text"] = "Also save it. " + "x" * 600
     elif change == "no_metadata":
         history["proposed_workflow_metadata"] = None
     elif change == "no_proposal":
@@ -2002,6 +2140,9 @@ async def test_accept_on_a_changed_or_missing_draft_posts_nothing(
 
     assert result["error"]["code"] == code
     assert _posts(server) == []
+    if change == "new_revision":
+        shown = result["data"]["last_user_message"]
+        assert shown.startswith("Also save it.") and len(shown) < 600
 
 
 @pytest.mark.asyncio
@@ -2021,6 +2162,16 @@ async def test_saved_login_pick_asks_site_and_relays_the_site_question(
     card = history["pending_credential_requests"][0]
     server.set_history(chat_id, history)
     server.card_routes["credential-response"] = httpx.Response(200, json=response)
+    # 26 password logins and a card: the card lists the newest 25 logins and says there are more.
+    more_logins = [
+        {**RECORDED_CREDENTIALS[0], "credential_id": row["credential_id"], "name": row["name"]}
+        | {"credential": {**RECORDED_CREDENTIALS[0]["credential"], "username": row["username"]}}
+        for row in LONG_SAVED_LOGINS[:23]
+    ]
+    a_card = {**RECORDED_CREDENTIALS[0], "credential_id": "cred_card", "credential_type": "credit_card"}
+    server.credentials = httpx.Response(
+        200, json=[*RECORDED_CREDENTIALS[:1], a_card, *RECORDED_CREDENTIALS[1:], *more_logins]
+    )
     answer = {"site_answer": site_answer} if site_answer else {}
 
     result = await _call_recorded(
@@ -2034,6 +2185,10 @@ async def test_saved_login_pick_asks_site_and_relays_the_site_question(
     )
 
     assert result["ok"], result
+    still_open = [action for action in result["data"]["user_actions"] if action["kind"] == "login_needed"]
+    assert [(action["facts"]["saved_logins"], action["facts"]["saved_logins_more"]) for action in still_open] == [
+        (RECORDED_SAVED_LOGINS + LONG_SAVED_LOGINS[:22], True)
+    ]
     assert server.bodies("/credential-response") == [
         {
             "turn_id": card["turn_id"],
@@ -2363,11 +2518,16 @@ async def test_decide_refusals_post_nothing(
     server: FakeEmber, build: Callable[[], dict[str, Any]], item_id: str, kwargs: dict[str, Any], code: str
 ) -> None:
     server.set_history(CHAT, build())
+    server.credentials = httpx.Response(200, json=RECORDED_CREDENTIALS)
 
     result = await _call(ember.skyvern_ember_decide, ember_chat_id=CHAT, item_id=item_id, **kwargs)
 
     assert result["error"]["code"] == code
     assert _posts(server) == []
+    # A login card still waiting beside the refusal lists the saved logins to pick from, as every turn state does.
+    for action in (result.get("data") or {}).get("user_actions") or []:
+        if action["kind"] == "login_needed":
+            assert action["facts"]["saved_logins"] == RECORDED_SAVED_LOGINS
 
 
 @pytest.mark.parametrize(

@@ -195,7 +195,13 @@ async def run_task(
     return created_task, engine
 
 
-async def get_task_v1_response(task_id: str, organization_id: str | None = None) -> TaskResponse:
+async def get_task_v1_response(
+    task_id: str,
+    organization_id: str | None = None,
+    *,
+    need_browser_log: bool = True,
+    need_final_screenshot: bool = True,
+) -> TaskResponse:
     task_obj = await app.DATABASE.tasks.get_task(task_id, organization_id=organization_id)
     if not task_obj:
         raise TaskNotFound(task_id=task_id)
@@ -228,6 +234,7 @@ async def get_task_v1_response(task_id: str, organization_id: str | None = None)
         task=task_obj,
         last_step=latest_step,
         failure_reason=failure_reason,
-        need_browser_log=True,
+        need_browser_log=need_browser_log,
         step_count=step_count,
+        need_final_screenshot=need_final_screenshot,
     )

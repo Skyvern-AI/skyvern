@@ -286,8 +286,24 @@ def _validate_script_files(
     return file_bytes_by_path
 
 
-def validate_uploaded_script_files(files: list[ScriptFileCreate]) -> dict[str, bytes]:
-    return _validate_script_files(files)
+# Written by ensure_static_script as the first line of a platform static pin's main.py.
+STATIC_MODULE_MARKER = "# __static_module__: "
+
+
+def validate_uploaded_script_files(
+    files: list[ScriptFileCreate],
+    *,
+    allow_static_module_marker: bool = False,
+) -> dict[str, bytes]:
+    file_bytes_by_path = _validate_script_files(files)
+    if not allow_static_module_marker:
+        for file_path, content_bytes in file_bytes_by_path.items():
+            if content_bytes.startswith(STATIC_MODULE_MARKER.encode("utf-8")):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File {file_path!r} starts with a reserved platform header line",
+                )
+    return file_bytes_by_path
 
 
 async def build_file_tree(
@@ -575,7 +591,11 @@ async def execute_script(
     if workflow_run_id and not parameters:
         parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
         parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
-        LOG.info("Script run Parameters is using workflow run parameters", parameters=parameters)
+        LOG.info(
+            "Script run Parameters is using workflow run parameters",
+            parameter_keys=sorted(parameters),
+            parameter_count=len(parameters),
+        )
 
     script_path = os.path.join(settings.TEMP_PATH, script.script_id, script.script_revision_id, "main.py")
     if script_path not in written_paths:
@@ -4037,6 +4057,11 @@ async def upload_file(
         prompt = _render_template_with_label(prompt, label)
     if path:
         path = _render_template_with_label(path, label)
+    # Read from the current definition, not the generated call: a cached script outlives edits to this switch.
+    definition = _find_block_definition(
+        block_validation_output.workflow.workflow_definition.blocks, block_validation_output.label
+    )
+    google_drive_save_as_sheet = isinstance(definition, FileUploadBlock) and definition.google_drive_save_as_sheet
     file_upload_block = FileUploadBlock(
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
@@ -4052,6 +4077,7 @@ async def upload_file(
         azure_blob_container_name=azure_blob_container_name,
         google_credential_id=google_credential_id,
         google_drive_folder_id=google_drive_folder_id,
+        google_drive_save_as_sheet=google_drive_save_as_sheet,
         sftp_host=sftp_host,
         sftp_port=sftp_port,
         sftp_username=sftp_username,

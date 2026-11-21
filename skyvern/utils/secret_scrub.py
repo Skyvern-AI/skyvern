@@ -56,7 +56,7 @@ def _nonempty(value: object) -> str | None:
 
 def _owned_scrub_values(context: object) -> set[str]:
     # Log redaction fails closed on any error, so a partial context (a test double) must not raise here.
-    values = getattr(context, "copilot_scrub_values", None)
+    values = getattr(context, "ember_scrub_values", None)
     return values if isinstance(values, set) else set()
 
 

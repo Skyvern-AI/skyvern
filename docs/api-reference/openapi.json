@@ -468,10 +468,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Idempotency-Key must contain 1 to 255 visible ASCII bytes.",
+              "description": "Makes the create safe to retry: a repeat request with the same key returns the agent the first request created instead of creating another. Must contain 1 to 255 visible ASCII bytes. When this header is sent, the returned `workflow_permanent_id` is derived from the key: `wpid_` followed by 64 hexadecimal characters, instead of the usual `wpid_` followed by digits. The ID is permanent and works like any other agent ID. Omit the header to get the usual format.",
               "title": "Idempotency-Key"
             },
-            "description": "Idempotency-Key must contain 1 to 255 visible ASCII bytes."
+            "description": "Makes the create safe to retry: a repeat request with the same key returns the agent the first request created instead of creating another. Must contain 1 to 255 visible ASCII bytes. When this header is sent, the returned `workflow_permanent_id` is derived from the key: `wpid_` followed by 64 hexadecimal characters, instead of the usual `wpid_` followed by digits. The ID is permanent and works like any other agent ID. Omit the header to get the usual format."
           }
         ],
         "requestBody": {
@@ -17558,6 +17558,11 @@
           "storage_type": {
             "$ref": "#/components/schemas/FileStorageType",
             "default": "s3"
+          },
+          "google_drive_save_as_sheet": {
+            "type": "boolean",
+            "title": "Google Drive Save As Sheet",
+            "default": false
           }
         },
         "type": "object",
@@ -17748,6 +17753,11 @@
               }
             ],
             "title": "Google Drive Folder Id"
+          },
+          "google_drive_save_as_sheet": {
+            "type": "boolean",
+            "title": "Google Drive Save As Sheet",
+            "default": false
           },
           "sftp_host": {
             "anyOf": [
@@ -23526,7 +23536,10 @@
           },
           "credential_source": {
             "type": "string",
-            "const": "nango",
+            "enum": [
+              "nango",
+              "native"
+            ],
             "title": "Credential Source",
             "default": "nango"
           },
@@ -23673,12 +23686,15 @@
             "description": "Power BI connection ID for this user.",
             "x-skyvern-connected-account": true,
             "x-skyvern-connected-account-when": {
-              "credential_source": "nango"
+              "credential_source": "native"
             }
           },
           "credential_source": {
             "type": "string",
-            "const": "nango",
+            "enum": [
+              "nango",
+              "native"
+            ],
             "title": "Credential Source",
             "default": "nango"
           },
@@ -32025,7 +32041,7 @@
               }
             ],
             "title": "Original Created By",
-            "description": "Who created the agent's first version. Populated by the list endpoint only."
+            "description": "Who created the agent's first version. Populated by the list and detail endpoints only."
           },
           "original_created_at": {
             "anyOf": [

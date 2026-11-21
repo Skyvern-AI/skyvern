@@ -15,14 +15,14 @@ from skyvern.forge.sdk.api.llm.prompt_cache_envelope import (
     build_explicit_cache_envelope,
     item_parts_key,
 )
-from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import (
-    CopilotContext,
+from skyvern.forge.sdk.ember import agent as agent_module
+from skyvern.forge.sdk.ember.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.ember.context import (
+    EmberContext,
     model_written_context_fields,
     tool_recorded_context_fields,
 )
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.ember.request_policy import RequestPolicy
 
 pytestmark = pytest.mark.usefixtures("gpt56_litellm_models")
 
@@ -151,7 +151,7 @@ def test_system_prompt_text_is_identical_to_direct_template_render(
             return fixed_now
 
     monkeypatch.setattr(agent_module, "datetime", _FixedDateTime)
-    config = agent_module.CopilotConfig()
+    config = agent_module.EmberConfig()
     expected = agent_module.prompt_engine.load_prompt(
         template=config.prompt_template.removesuffix(".j2"),
         current_datetime=fixed_now.isoformat(),
@@ -206,7 +206,7 @@ def test_template_without_a_datetime_placeholder_still_carries_the_time_fact(
 def test_time_fact_survives_the_dynamic_prompt_early_returns() -> None:
     instructions = agent_module._build_dynamic_system_prompt(
         tool_usage_guide="tool guide",
-        config=agent_module.CopilotConfig(),
+        config=agent_module.EmberConfig(),
     )
 
     for context in (object(), SimpleNamespace(context=object())):
@@ -254,11 +254,11 @@ def test_system_prompt_places_datetime_and_runtime_context_after_breakpoint(
     monkeypatch.setattr(agent_module, "_build_system_prompt", lambda **_: base_prompt)
     instructions = agent_module._build_dynamic_system_prompt(
         tool_usage_guide="tools",
-        config=agent_module.CopilotConfig(),
+        config=agent_module.EmberConfig(),
     )
     prompt = instructions(
         SimpleNamespace(
-            context=CopilotContext(
+            context=EmberContext(
                 organization_id="org_one",
                 workflow_id="workflow_one",
                 workflow_permanent_id="wpid_one",
@@ -281,12 +281,12 @@ def test_system_prompt_places_datetime_and_runtime_context_after_breakpoint(
 
 
 def test_no_authoring_policy_section_reaches_either_prompt_half() -> None:
-    config = agent_module.CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    config = agent_module.EmberConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
 
     base_prompt = agent_module._build_system_prompt(tool_usage_guide="tools", config=config)
     prompt = agent_module._build_dynamic_system_prompt(tool_usage_guide="tools", config=config)(
         SimpleNamespace(
-            context=CopilotContext(
+            context=EmberContext(
                 organization_id="org_one",
                 workflow_id="workflow_one",
                 workflow_permanent_id="wpid_one",

@@ -10,7 +10,7 @@ import textwrap
 
 import pytest
 
-from skyvern.forge.sdk.copilot.code_block_preflight import (
+from skyvern.forge.sdk.ember.code_block_preflight import (
     RENDER_TEMPLATE_SYNTAX_REASON_CODE,
     RENDER_UNDEFINED_NAME_REASON_CODE,
     WRAPPER_SCOPE_GLOBAL_REASON_CODE,

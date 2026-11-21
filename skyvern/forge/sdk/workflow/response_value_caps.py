@@ -391,10 +391,12 @@ def collect_extracted_information(value: Any) -> list[Any]:
                 results.append(extracted)
         else:
             for nested in value.values():
-                results.extend(collect_extracted_information(nested))
+                if isinstance(nested, (dict, list)):
+                    results.extend(collect_extracted_information(nested))
     elif isinstance(value, list):
         for item in value:
-            results.extend(collect_extracted_information(item))
+            if isinstance(item, (dict, list)):
+                results.extend(collect_extracted_information(item))
     return results
 
 

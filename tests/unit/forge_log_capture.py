@@ -4,7 +4,12 @@ from contextlib import contextmanager
 import structlog
 from structlog.testing import capture_logs
 
-from skyvern.forge.sdk.forge_log import add_log_context, redact_registered_secrets, skyvern_logs_processor
+from skyvern.forge.sdk.forge_log import (
+    add_log_context,
+    redact_registered_secrets,
+    skyvern_logs_processor,
+    strip_url_query_strings,
+)
 
 
 @contextmanager
@@ -18,6 +23,7 @@ def capture_runtime_logs() -> Iterator[list[dict]]:
                 structlog.processors.EventRenamer("msg"),
                 add_log_context,
                 redact_registered_secrets,
+                strip_url_query_strings,
                 skyvern_logs_processor,
             ]
             yield logs

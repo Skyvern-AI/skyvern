@@ -46,6 +46,7 @@ from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import (
     DEFAULT_WORKFLOW_TITLES,
+    EMBER_RUN_CREATOR,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
@@ -304,7 +305,7 @@ from skyvern.forge.sdk.workflow.models.tags import (
     TagWriteContext,
 )
 from skyvern.forge.sdk.workflow.models.workflow import (
-    COPILOT_TEST_WORKFLOW_CREATOR,
+    EMBER_TEST_WORKFLOW_CREATOR,
     Workflow,
     WorkflowDefinition,
     WorkflowRequestBody,
@@ -370,7 +371,7 @@ from skyvern.forge.sdk.workflow.runtime_completion import (
     grade_completion_contract,
     parse_completion_contract,
 )
-from skyvern.forge.sdk.workflow.runtime_secret_bridge import publish_copilot_runtime_secret_values
+from skyvern.forge.sdk.workflow.runtime_secret_bridge import publish_ember_runtime_secret_values
 from skyvern.forge.sdk.workflow.secret_encryption import (
     SENSITIVE_DESTINATION_FIELDS,
     SENSITIVE_SEND_EMAIL_FIELDS,
@@ -1545,7 +1546,9 @@ async def _validate_powerbi_workflow_save(
     workflow_permanent_id: str | None = None,
 ) -> None:
     try:
-        powerbi_live = await app.AGENT_FUNCTION.nango_powerbi_catalog_available(organization_id)
+        powerbi_live = await app.AGENT_FUNCTION.nango_powerbi_catalog_available(
+            organization_id
+        ) or await app.AGENT_FUNCTION.powerbi_native_connections_available(organization_id)
     except Exception:  # noqa: BLE001 - fail closed when checking nested Power BI workflow sources.
         powerbi_live = False
 
@@ -1563,6 +1566,7 @@ async def _validate_powerbi_workflow_save(
     root_key = workflow_permanent_id
     definitions: dict[str | None, WorkflowDefinition] = {root_key: workflow_definition}
     direct_connection_ids: list[str] = []
+    credential_sources: set[str] = set()
 
     async def collect_workflows(definition: WorkflowDefinition, depth: int = 0) -> None:
         blocks = get_all_blocks(definition.blocks)
@@ -1574,6 +1578,7 @@ async def _validate_powerbi_workflow_save(
                 error_code="unsafe_query_input_source",
             )
         direct_connection_ids.extend(block.connection_id for block in powerbi_blocks)
+        credential_sources.update(block.credential_source for block in powerbi_blocks)
         if not powerbi_live or depth >= WorkflowTriggerBlock.MAX_TRIGGER_DEPTH:
             return
         for block in blocks:
@@ -1606,7 +1611,9 @@ async def _validate_powerbi_workflow_save(
             error_code="invalid_powerbi_connection_id",
         )
     try:
-        await app.AGENT_FUNCTION.ensure_powerbi_queries_available(organization_id)
+        await app.AGENT_FUNCTION.ensure_powerbi_queries_available(
+            organization_id, credential_sources=frozenset(credential_sources)
+        )
     except NotImplementedError as exc:
         raise SkyvernHTTPException(
             "Power BI queries are not supported in this runtime.",
@@ -1917,17 +1924,23 @@ def _resolve_first_block_url(
     return None
 
 
-# Written by ensure_static_script as the first line of a static pin's main.py;
-# must stay in sync with try_import_static_script's marker parsing.
-_STATIC_MODULE_MARKER = "# __static_module__: "
+# Must stay in sync with try_import_static_script's marker parsing.
+_STATIC_MODULE_MARKER = script_service.STATIC_MODULE_MARKER
 
 
 def _script_has_static_module_marker(script_path: str) -> bool:
+    return _static_module_from_header(script_path) is not None
+
+
+def _static_module_from_header(script_path: str) -> str | None:
     try:
         with open(script_path) as script_file:
-            return script_file.readline().startswith(_STATIC_MODULE_MARKER)
+            first_line = script_file.readline()
     except OSError:
-        return False
+        return None
+    if not first_line.startswith(_STATIC_MODULE_MARKER):
+        return None
+    return first_line[len(_STATIC_MODULE_MARKER) :].strip()
 
 
 async def _load_user_script_module(
@@ -1940,6 +1953,7 @@ async def _load_user_script_module(
     workflow_id: str | None = None,
     script_id: str | None = None,
     script_revision_id: str | None = None,
+    trusted_static_module: str | None = None,
 ) -> Any | None:
     """Load a cached script's main.py for execution.
 
@@ -1951,11 +1965,15 @@ async def _load_user_script_module(
     fails loads as None — blocks drop to the agent — because exec-ing its
     stored body would resurrect the same staleness, and the marker-only pin
     check would never supersede it. Only a markerless pin (a generated script)
-    executes its stored body.
+    executes its stored body. A marker is honoured only when it names
+    ``trusted_static_module``: the module recorded when the platform pinned this
+    revision, provided this run would still be pinned to it. Any other marker
+    script goes through the in-process gate.
     """
-    loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
-    if loaded_script_module is not None:
-        return loaded_script_module
+    if trusted_static_module is not None and _static_module_from_header(script_path) == trusted_static_module:
+        loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
+        if loaded_script_module is not None:
+            return loaded_script_module
 
     await script_service.ensure_in_process_script_execution_allowed(
         seam="workflow.cached_script_module_load",
@@ -4383,7 +4401,7 @@ class WorkflowService:
             # carry the parent's chat id forward without per-call plumbing. Resolved here so
             # the same value reaches both the DB row and the new SkyvernContext below.
             ambient_context: skyvern_context.SkyvernContext | None = skyvern_context.current()
-            resolved_copilot_session_id = (
+            resolved_ember_session_id = (
                 copilot_session_id
                 if copilot_session_id is not None
                 else (ambient_context.copilot_session_id if ambient_context else None)
@@ -4439,7 +4457,7 @@ class WorkflowService:
                 retried_from_workflow_run_id=retried_from_workflow_run_id,
                 fallback_attempt=fallback_attempt,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
-                copilot_session_id=resolved_copilot_session_id,
+                copilot_session_id=resolved_ember_session_id,
                 requested_by=resolved_requested_by,
                 workflow=workflow,
                 block_scoped=block_scoped,
@@ -4516,7 +4534,7 @@ class WorkflowService:
                     max_steps_override=max_steps_override,
                     max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
                     loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
-                    copilot_session_id=resolved_copilot_session_id,
+                    copilot_session_id=resolved_ember_session_id,
                     trigger_type=resolved_trigger_type,
                     # Shared, not copied: a parent run can keep executing in this context (a loop block's
                     # task), so its solve attempt numbers must continue rather than restart.
@@ -4836,7 +4854,7 @@ class WorkflowService:
             if not isinstance(candidate, str) or not is_uuid(candidate):
                 raise InvalidWorkflowParameter(
                     expected_parameter_type="Bitwarden item ID (UUID)",
-                    value=str(candidate),
+                    parameter_key=parameter.key,
                     workflow_permanent_id=workflow.workflow_permanent_id,
                 )
 
@@ -9243,7 +9261,7 @@ class WorkflowService:
                     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(
                         workflow_run.workflow_run_id
                     )
-                    await publish_copilot_runtime_secret_values(
+                    await publish_ember_runtime_secret_values(
                         organization_id=workflow_run.organization_id,
                         workflow_run_id=workflow_run.workflow_run_id,
                         workflow_run_context=workflow_run_context,
@@ -9390,7 +9408,7 @@ class WorkflowService:
                     else 0
                 ),
                 would_be_code=is_script_run,
-                copilot_test_copy=workflow.created_by == COPILOT_TEST_WORKFLOW_CREATOR,
+                ember_test_copy=workflow.created_by == EMBER_TEST_WORKFLOW_CREATOR,
             )
         else:
             LOG.warning(
@@ -9476,9 +9494,23 @@ class WorkflowService:
 
                         spec = importlib.util.spec_from_file_location("user_script", script_path)
                         if spec and spec.loader:
+                            trusted_static_module: str | None = None
+                            if _script_has_static_module_marker(script_path):
+                                # The revision must record a platform pin, and this run must still be one
+                                # the platform would pin to that same module.
+                                recorded_static_module = await app.DATABASE.scripts.get_script_static_module(
+                                    script_revision_id=script.script_revision_id,
+                                    organization_id=organization_id,
+                                )
+                                if recorded_static_module is not None and (
+                                    recorded_static_module
+                                    == await app.AGENT_FUNCTION.static_script_module_for_run(workflow, workflow_run)
+                                ):
+                                    trusted_static_module = recorded_static_module
                             loaded_script_module = await _load_user_script_module(
                                 script_path,
                                 spec,
+                                trusted_static_module=trusted_static_module,
                                 organization_id=organization_id,
                                 workflow_run_id=workflow_run_id,
                                 workflow_permanent_id=workflow.workflow_permanent_id,
@@ -9497,6 +9529,34 @@ class WorkflowService:
                                 url=first_block_url,
                             )
                             if loaded_script_module:
+                                if _script_has_static_module_marker(script_path):
+                                    # The platform module runs in place of the stored body, so each block runs
+                                    # the signature the platform derives from the current workflow, never the
+                                    # stored one.
+                                    platform_signatures = app.AGENT_FUNCTION.static_script_run_signatures(
+                                        workflow, loaded_script_module
+                                    )
+                                    for static_label, static_block in list(script_blocks_by_label.items()):
+                                        if static_block.requires_agent:
+                                            continue
+                                        platform_signature = platform_signatures.get(static_label)
+                                        if platform_signature is None:
+                                            LOG.info(
+                                                "Static-module script block has no platform binding; "
+                                                "block will run via agent",
+                                                block_label=static_label,
+                                                script_id=script.script_id,
+                                            )
+                                            del script_blocks_by_label[static_label]
+                                        elif static_block.run_signature != platform_signature:
+                                            LOG.info(
+                                                "Static-module script block signature replaced with the platform one",
+                                                block_label=static_label,
+                                                script_id=script.script_id,
+                                            )
+                                            static_block = copy.copy(static_block)
+                                            static_block.run_signature = platform_signature
+                                            script_blocks_by_label[static_label] = static_block
                                 # Mark static (pinned) scripts so complete() skips LLM verification
                                 if script_is_pinned:
                                     pinned_ctx = skyvern_context.current()
@@ -13223,7 +13283,7 @@ class WorkflowService:
         overwritten_workflow: Workflow | None, saved_workflow: Workflow, pinned_v1_blocks: int
     ) -> None:
         """One new skyvern-1.0 pin takes every run of the workflow off the v3 A/B, so a save that adds one is logged."""
-        if saved_workflow.created_by == COPILOT_TEST_WORKFLOW_CREATOR:
+        if saved_workflow.created_by == EMBER_TEST_WORKFLOW_CREATOR:
             return
         try:
             baseline = overwritten_workflow
@@ -13895,7 +13955,9 @@ class WorkflowService:
             except (WorkflowAttemptDispatchSuperseded, BrowserSessionCreditAdmissionRefusal):
                 raise
             except Exception as error:
-                if BROWSER_RETIREMENT_DENIED_NOTE in getattr(error, "__notes__", ()):
+                if BROWSER_RETIREMENT_DENIED_NOTE in getattr(
+                    error, "__notes__", ()
+                ) or app.AGENT_FUNCTION.browser_session_creation_disallows_fallback(error):
                     raise
                 LOG.warning(
                     "Failed to force-create browser session for workflow run",
@@ -16256,8 +16318,13 @@ class WorkflowService:
     @staticmethod
     def _serialize_workflow_run_parameter_value(workflow_parameter: WorkflowParameter, value: Any) -> Any:
         value = json.dumps(value) if isinstance(value, (dict, list)) else value
-        # InvalidWorkflowParameter will be raised if the validation fails
-        workflow_parameter.workflow_parameter_type.convert_value(value)
+        try:
+            workflow_parameter.workflow_parameter_type.convert_value(value)
+        except InvalidWorkflowParameter:
+            raise InvalidWorkflowParameter(
+                expected_parameter_type=workflow_parameter.workflow_parameter_type,
+                parameter_key=workflow_parameter.key,
+            ) from None
         return value
 
     async def get_workflow_run_parameter_tuples(
@@ -16663,8 +16730,6 @@ class WorkflowService:
                     artifact_ids=artifact_ids,
                 )
                 workflow_run_downloaded_files = downloaded_files
-                if workflow_run_downloaded_files:
-                    downloaded_file_urls = [file_info.url for file_info in workflow_run_downloaded_files]
                 if task_v2:
                     task_v2_downloaded_files = await app.STORAGE.get_downloaded_files(
                         organization_id=workflow_run.organization_id,
@@ -16697,8 +16762,6 @@ class WorkflowService:
                                 artifact_ids=task_v2_artifact_ids,
                             )
                         )
-                if downloaded_files:
-                    downloaded_file_urls = [file_info.url for file_info in downloaded_files]
         except TimeoutError:
             LOG.warning(
                 "Timeout to get downloaded files",
@@ -17992,7 +18055,7 @@ class WorkflowService:
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
-            headers=signed_data.headers,
+            webhook_timestamp=signed_data.headers.get("x-skyvern-timestamp"),
         )
         return PreparedWorkflowWebhook(
             workflow_id=workflow_id,
@@ -18133,7 +18196,7 @@ class WorkflowService:
             workflow_id=webhook.workflow_id,
             workflow_run_id=webhook.workflow_run_id,
             webhook_callback_url=webhook.webhook_callback_url,
-            headers=webhook.headers,
+            webhook_timestamp=webhook.headers.get("x-skyvern-timestamp"),
         )
         try:
             resp = await deliver_webhook_with_retries(
@@ -18183,7 +18246,7 @@ class WorkflowService:
                 workflow_id=webhook.workflow_id,
                 workflow_run_id=webhook.workflow_run_id,
                 resp_code=resp.status_code,
-                resp_text=resp.text,
+                resp_text_length=len(resp.text),
             )
             try:
                 await record_delivery("", delivered_projection)
@@ -18204,7 +18267,7 @@ class WorkflowService:
                 workflow_id=webhook.workflow_id,
                 workflow_run_id=webhook.workflow_run_id,
                 resp_code=resp.status_code,
-                resp_text=resp.text,
+                resp_text_length=len(resp.text),
                 status_code=resp.status_code,
                 error_reason=format_http_log_reason(resp.status_code),
             )
@@ -18548,40 +18611,6 @@ class WorkflowService:
         if upload_keys:
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(list(upload_keys))
 
-    async def persist_har_data(
-        self,
-        browser_state: BrowserState,
-        last_step: Step,
-        workflow: Workflow,
-        workflow_run: WorkflowRun,
-    ) -> None:
-        har_data = await app.BROWSER_MANAGER.get_har_data(
-            workflow_id=workflow.workflow_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            browser_state=browser_state,
-        )
-        if app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run(workflow_run.workflow_run_id):
-            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
-            har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
-        else:
-            runtime_secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-            if runtime_secret_values:
-                har_data = await asyncio.to_thread(redact_har_bytes, har_data, runtime_secret_values)
-        if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
-            submission_shadow.schedule_submission_signal_shadow(
-                har_data=har_data,
-                browser_state=browser_state,
-                last_step=last_step,
-                workflow_run=workflow_run,
-            )
-        LOG.debug("Persisting har data", har_size=len(har_data))
-        if har_data:
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=last_step,
-                artifact_type=ArtifactType.HAR,
-                data=har_data,
-            )
-
     async def persist_browser_console_log(
         self,
         browser_state: BrowserState,
@@ -18745,7 +18774,7 @@ class WorkflowService:
                 parameter.workflow_id = workflow_id
                 parameter.output_parameter_id = generate_output_parameter_id()
 
-    async def create_copilot_dispatch_draft_version(
+    async def create_ember_dispatch_draft_version(
         self,
         *,
         runtime_workflow: Workflow,
@@ -18795,8 +18824,8 @@ class WorkflowService:
                 workflow_permanent_id=runtime_workflow.workflow_permanent_id,
                 version=version,
                 status=WorkflowStatus.auto_generated,
-                created_by=COPILOT_TEST_WORKFLOW_CREATOR,
-                edited_by="copilot",
+                created_by=EMBER_TEST_WORKFLOW_CREATOR,
+                edited_by=EMBER_RUN_CREATOR,
                 build_source=WorkflowBuildSource.ember,
                 description=runtime_workflow.description,
                 proxy_location=runtime_workflow.proxy_location,
@@ -19039,7 +19068,7 @@ class WorkflowService:
             organization_id=organization_id,
             filter_deleted=False,
         )
-        if latest.created_by != COPILOT_TEST_WORKFLOW_CREATOR:
+        if latest.created_by != EMBER_TEST_WORKFLOW_CREATOR:
             return latest.version, latest
         # Test versions reserve numbers but never supply settings for a normal save.
         settings_base = await self.get_workflow_by_permanent_id(

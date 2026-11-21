@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import copy
 import enum
+import hashlib
 import io
 import json
 import logging
@@ -34,10 +35,10 @@ from skyvern.forge.log_redaction import (
 )
 from skyvern.forge.sdk import forge_log, log_artifacts
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.copilot.runtime import AgentContext
-from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value, scrub_secrets_from_text
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.ember.runtime import AgentContext
+from skyvern.forge.sdk.ember.secret_scrub import register_secret_scrub_value, scrub_secrets_from_text
 from skyvern.forge.sdk.forge_log import (
     CODEBLOCK_LOG_REDACTED,
     _generated_log_value,
@@ -179,7 +180,7 @@ def _register_credential(value: str) -> None:
     secret_scrub._SESSION_SCRUB_VALUES.setdefault("pbs_1", []).append(value)
 
 
-def _copilot_turn(browser_session_id: str = "pbs_1") -> AgentContext:
+def _ember_turn(browser_session_id: str = "pbs_1") -> AgentContext:
     return AgentContext(
         organization_id="o_1",
         workflow_id="w_1",
@@ -190,12 +191,12 @@ def _copilot_turn(browser_session_id: str = "pbs_1") -> AgentContext:
     )
 
 
-def _register_in_copilot_turn(*values: str) -> SkyvernContext:
+def _register_in_ember_turn(*values: str) -> SkyvernContext:
     """Register values the way a Copilot tool does, inside its own request; returns that request."""
     request = SkyvernContext(request_id="req_copilot", copilot_session_id="wcc_1")
     with skyvern_context.scoped(request):
         for value in values:
-            register_secret_scrub_value(_copilot_turn(), value)
+            register_secret_scrub_value(_ember_turn(), value)
     return request
 
 
@@ -228,16 +229,58 @@ def test_redacts_bare_token_without_bearer_prefix() -> None:
     assert "foo=bar" in out["event"]
 
 
-def test_passes_through_when_no_token() -> None:
-    event = {"event": "GET /api/v1/heartbeat HTTP/1.1 200 OK"}
-    out = redact_bearer_tokens(None, "info", event)  # type: ignore[arg-type]
-    assert out == event
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"event": "GET /api/v1/heartbeat HTTP/1.1 200 OK"},
+        {"event": "no token here", "count": 42, "tags": ["a", "b"]},
+    ],
+)
+def test_passes_through_when_no_token(event: dict) -> None:
+    assert redact_bearer_tokens(None, "info", dict(event)) == event  # type: ignore[arg-type]
 
 
-def test_handles_non_string_values() -> None:
-    event = {"event": "no token here", "count": 42, "tags": ["a", "b"]}
-    out = redact_bearer_tokens(None, "info", event)  # type: ignore[arg-type]
-    assert out == event
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        ("url", "https://h.invalid/p?name=Jane%20Doe&dob=1990-01-01", "https://h.invalid/p?[query:name,dob]"),
+        ("current_url", "https://h.invalid/p#account=42", "https://h.invalid/p"),
+        ("webhook_callback_url", "https://user:pw@h.invalid/hook", "https://h.invalid/hook"),
+        ("href", "/form?ssn=123-45-6789&ssn=1&flag", "/form?[query:ssn]"),
+        (
+            "url",
+            "https://h.invalid/p?" + "&".join(f"k{i}=v" for i in range(25)),
+            "https://h.invalid/p?[query:" + ",".join(f"k{i}" for i in range(20)) + "]",
+        ),
+        (
+            "file_urls",
+            ["https://h.invalid/a?sig=s1", "https://h.invalid/b"],
+            ["https://h.invalid/a?[query:sig]", "https://h.invalid/b"],
+        ),
+        ("url", "https://h.invalid/plain/path", "https://h.invalid/plain/path"),
+        ("event", "visit https://h.invalid/p?name=Jane", "visit https://h.invalid/p?name=Jane"),
+        ("totp_url", "https://h.invalid/p?code=1", "https://h.invalid/p?code=1"),
+        (
+            "urls",
+            ["https://h.invalid/a?email=e", "https://h.invalid/b"],
+            ["https://h.invalid/a?[query:email]", "https://h.invalid/b"],
+        ),
+        ("cache_key_value", "jane@x.invalid", "sha256:" + hashlib.sha256(b"jane@x.invalid").hexdigest()[:12]),
+        (
+            "error",
+            "Page.goto: net::ERR_ABORTED at https://h.invalid/p?email=j%40x.invalid\nCall log: navigating",
+            "Page.goto: net::ERR_ABORTED at https://h.invalid/p?[query:email]\nCall log: navigating",
+        ),
+        (
+            "exception",
+            "ClientResponseError: 403, url='https://h.invalid/f?sig=s1&email=e'",
+            "ClientResponseError: 403, url='https://h.invalid/f?[query:sig,email]'",
+        ),
+    ],
+)
+def test_url_fields_keep_only_query_key_names(key: str, value: str | list[str], expected: str | list[str]) -> None:
+    out = forge_log.strip_url_query_strings(None, "info", {key: value})  # type: ignore[arg-type]
+    assert out[key] == expected
 
 
 def test_redacts_in_arbitrary_string_keys() -> None:
@@ -305,7 +348,7 @@ def test_redacts_a_credential_inside_a_tuple_value() -> None:
 
 
 def test_a_short_value_from_another_session_leaves_unrelated_request_lines_alone() -> None:
-    _register_in_copilot_turn("1")
+    _register_in_ember_turn("1")
     line = _request_log_line()
 
     with skyvern_context.scoped(SkyvernContext(request_id="req_unrelated", browser_session_id="pbs_2")):
@@ -326,7 +369,7 @@ def test_a_short_value_from_another_session_leaves_unrelated_request_lines_alone
     ],
 )
 def test_a_short_value_is_still_scrubbed_on_its_own_sessions_lines(scope: str) -> None:
-    request = _register_in_copilot_turn("1")
+    request = _register_in_ember_turn("1")
     if scope == "registering_request_after_close":
         clear_session_scrub_values("pbs_1")
     line_context = {
@@ -341,7 +384,7 @@ def test_a_short_value_is_still_scrubbed_on_its_own_sessions_lines(scope: str) -
     with skyvern_context.scoped(line_context):
         if scope.startswith("reader"):
             # Another chat's turn on the same browser scrubs a readback with the session's values.
-            scrub_secrets_from_text(_copilot_turn(), "readback")
+            scrub_secrets_from_text(_ember_turn(), "readback")
         if scope == "reader":
             clear_session_scrub_values("pbs_1")
         if scope == "reader_after_context_replaced":
@@ -355,7 +398,7 @@ def test_a_short_value_is_still_scrubbed_on_its_own_sessions_lines(scope: str) -
 
 
 def test_a_value_from_another_session_applies_from_four_characters() -> None:
-    _register_in_copilot_turn(_FAKE_CREDENTIAL, "q7x", "z9k4", "48392017")
+    _register_in_ember_turn(_FAKE_CREDENTIAL, "q7x", "z9k4", "48392017")
     event = {"event": f"login failed for {_FAKE_CREDENTIAL}", "codes": "aq7xb xz9k4x", "code": 48392017}
 
     with skyvern_context.scoped(SkyvernContext(request_id="req_unrelated")):
@@ -370,7 +413,7 @@ def test_a_value_from_another_session_applies_from_four_characters() -> None:
 def test_a_short_value_from_another_session_is_still_scrubbed_as_a_whole_token(
     request_context: SkyvernContext | None,
 ) -> None:
-    _register_in_copilot_turn("123", "401", "1", "10", "45", "#7")
+    _register_in_ember_turn("123", "401", "1", "10", "45", "#7")
     masked = REDACTED_SECRET_PLACEHOLDER
     scrubbed = {
         '{"value":"123","cvv": 123,"status":"401"}': f'{{"value":"{masked}","cvv": {masked},"status":"{masked}"}}',
@@ -390,16 +433,16 @@ def test_a_short_value_from_another_session_is_still_scrubbed_as_a_whole_token(
     assert out["status_code"] == 401
 
 
-def test_a_copilot_value_replaces_only_its_own_number_and_a_run_secret_any_number_containing_it() -> None:
-    _register_in_copilot_turn("483920")
-    copilot_numbers = [483920, 483920.0, Decimal("483920"), 1483920, 4839201, 0.48392, 48392, 401]
+def test_a_ember_value_replaces_only_its_own_number_and_a_run_secret_any_number_containing_it() -> None:
+    _register_in_ember_turn("483920")
+    ember_numbers = [483920, 483920.0, Decimal("483920"), 1483920, 4839201, 0.48392, 48392, 401]
     run_numbers = [15551234567, 0.5551234567, Decimal("5551234567.25")]
-    event = {"event": "numbers", "copilot": copilot_numbers, "run": run_numbers}
+    event = {"event": "numbers", "copilot": ember_numbers, "run": run_numbers}
 
     with skyvern_context.scoped(SkyvernContext(request_id="req_run", runtime_secret_values={"5551234567"})):
         out = redact_registered_secrets(None, "info", event)  # type: ignore[arg-type]
 
-    assert out["copilot"] == [REDACTED_SECRET_PLACEHOLDER] * 3 + copilot_numbers[3:]
+    assert out["copilot"] == [REDACTED_SECRET_PLACEHOLDER] * 3 + ember_numbers[3:]
     assert out["run"] == [REDACTED_SECRET_PLACEHOLDER] * 3
 
 
@@ -504,6 +547,7 @@ def test_registered_protocol_words_preserve_emitted_messages_and_severity(
     }
     expected_messages = ["Diagnostic emission", f"Diagnostic emission: {REDACTED_SECRET_PLACEHOLDER}"]
     emitted = re.sub(r"\x1b\[[0-9;]*m", "", registered_log_stream.getvalue())
+    stripped_url = "https://example.invalid/verify?[query:value]"
     record_groups = []
     if settings.JSON_LOGGING or route == "downstream_renamer":
         record_groups.append([json.loads(line) for line in emitted.splitlines()])
@@ -514,7 +558,8 @@ def test_registered_protocol_words_preserve_emitted_messages_and_severity(
         assert f"payload={masked_payload!r}" in emitted
         assert f"model={masked_payload!r}" in emitted
         assert f"user:{REDACTED_SECRET_PLACEHOLDER}={REDACTED_SECRET_PLACEHOLDER}" in emitted
-        assert f"url=https://example.invalid/verify?value={REDACTED_SECRET_PLACEHOLDER}" in emitted
+        assert f"url={stripped_url}" in emitted
+        assert "verify?value=" not in emitted
         assert f"ValueError: {REDACTED_SECRET_PLACEHOLDER}" in emitted
         assert f"Diagnostic emission: {protocol_word}" not in emitted
         assert f"ValueError: {protocol_word}" not in emitted
@@ -528,7 +573,7 @@ def test_registered_protocol_words_preserve_emitted_messages_and_severity(
             assert record["payload"] == masked_payload
             assert record["model"] == masked_payload
             assert record[f"user:{REDACTED_SECRET_PLACEHOLDER}"] == REDACTED_SECRET_PLACEHOLDER
-            assert record["url"] == f"https://example.invalid/verify?value={REDACTED_SECRET_PLACEHOLDER}"
+            assert record["url"] == stripped_url
         assert records[1]["exception"].endswith(f"ValueError: {REDACTED_SECRET_PLACEHOLDER}")
 
 
@@ -831,8 +876,8 @@ def test_generated_string_subclasses_cannot_bypass_caller_text_scrubbing() -> No
         "from skyvern.forge.sdk.forge_log import _GeneratedLogInt\n",
         "from skyvern.forge.sdk.forge_log import _GeneratedLogValue\n",
         "from skyvern.forge.sdk.api.llm.model_usage import _emit_model_usage\n",
-        "from skyvern.forge.sdk.api.llm.model_usage import _emit_direct_copilot_model_usage\n",
-        "from skyvern.forge.sdk.routes.workflow_copilot import _bind_copilot_session_id\n",
+        "from skyvern.forge.sdk.api.llm.model_usage import _emit_direct_ember_model_usage\n",
+        "from skyvern.forge.sdk.routes.ember import _bind_ember_session_id\n",
         "from skyvern.forge.sdk.api.llm.agents_model import _model_call_telemetry_scope\n",
         "from skyvern.forge.sdk.api.llm.config_registry import _register_builtin_config\n",
         "from skyvern.forge.sdk.forge_log import _model_log_value\n",
@@ -1587,7 +1632,8 @@ def test_setup_logger_pins_redactor_processor_order() -> None:
         assert names.index("redact_sensitive_event_fields") < names.index("redact_registered_secrets")
         privacy_boundaries = [index for index, name in enumerate(names) if name == "redact_private_log_event"]
         assert privacy_boundaries[0] == 0
-        assert privacy_boundaries[-1] == names.index("redact_registered_secrets") + 1
+        assert names.index("strip_url_query_strings") == names.index("redact_registered_secrets") + 1
+        assert privacy_boundaries[-1] == names.index("strip_url_query_strings") + 1
         assert privacy_boundaries[-1] + 1 == names.index("skyvern_logs_processor")
     finally:
         structlog.configure(**saved_config)

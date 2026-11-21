@@ -6,6 +6,7 @@ class EncryptMethod(Enum):
     # Retired AES-CBC writer; registered only to decrypt rows written before AES_GCM.
     AES = "aes"
     AES_GCM = "aes_gcm"
+    AES_GCM_V2 = "aes_gcm_v2"
 
 
 DEFAULT_ENCRYPT_METHOD = EncryptMethod.AES_GCM

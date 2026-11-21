@@ -22,10 +22,16 @@ SKILL_FILE = "SKILL.md"
 LOAD_SKILL_TOOL_NAME = "load_skill"
 READ_SKILL_RESOURCE_TOOL_NAME = "read_skill_resource"
 SKILL_TOOL_NAMES = frozenset({LOAD_SKILL_TOOL_NAME, READ_SKILL_RESOURCE_TOOL_NAME})
+SAVE_ORG_SKILL_TOOL_NAME = "save_org_skill"
+DELETE_ORG_SKILL_TOOL_NAME = "delete_org_skill"
+SKILL_WRITE_TOOL_NAMES = frozenset({SAVE_ORG_SKILL_TOOL_NAME, DELETE_ORG_SKILL_TOOL_NAME})
 EVERYONE_SKILL_LABEL = "a Skyvern skill"
 
 SkillOwner = Literal["everyone", "organization", "workflow"]
-SkillError = Literal["unknown_skill", "unknown_file"]
+SkillError = Literal["unknown_skill", "unknown_file", "withheld"]
+SkillWriteReason = Literal[
+    "invalid", "no_workflow", "unknown_skill", "denied", "conflict", "secret", "folder", "declined"
+]
 
 _OWNER_RANK: dict[SkillOwner, int] = {"everyone": 0, "organization": 1, "workflow": 2}
 _NAME_CHARACTERS = frozenset(string.ascii_lowercase + string.digits + "-")
@@ -203,6 +209,12 @@ class AvailableSkill:
     package: SkillPackage
     owner: SkillOwner
     version: str
+    # Versions distilled from run data are not readable by callers whose role cannot read runs.
+    files_withheld: bool = False
+    stored: bool = False
+
+
+EMBER_SKILLS_AGENT = "copilot"
 
 
 class SkillSession:
@@ -219,6 +231,7 @@ class SkillSession:
             if prior is None or _OWNER_RANK[skill.owner] > _OWNER_RANK[prior.owner]:
                 winners[skill.package.name] = skill
         self._skills = dict(sorted(winners.items()))
+        self._stored = sorted({(skill.owner, skill.package.name) for skill in skills if skill.stored})
         self._loaded: set[tuple[str, str]] = set()
         self.agent = agent
         self.log_fields = log_fields
@@ -231,6 +244,12 @@ class SkillSession:
             f"{EVERYONE_SKILL_LABEL} [everyone]" if skill.owner == "everyone" else line
             for line, skill in zip(self.catalog_lines(), self._skills.values(), strict=True)
         ]
+
+    def org_and_workflow_names(self) -> list[str]:
+        return [name for name, skill in self._skills.items() if skill.owner != "everyone"]
+
+    def stored_names(self, owner: SkillOwner) -> list[str]:
+        return [name for stored_owner, name in self._stored if stored_owner == owner]
 
     def owner(self, name: str) -> SkillOwner | None:
         skill = self._skills.get(name)
@@ -284,6 +303,8 @@ class SkillSession:
         skill = self._skills.get(name)
         if skill is None:
             return self._unknown_skill(name)
+        if skill.files_withheld:
+            return _withheld(name)
         if (name, skill.version) in self._loaded:
             return SkillAlreadyLoaded(status="already_loaded", name=name, version=skill.version)
         self._loaded.add((name, skill.version))
@@ -295,6 +316,8 @@ class SkillSession:
         skill = self._skills.get(name)
         if skill is None:
             return self._unknown_skill(name)
+        if skill.files_withheld:
+            return _withheld(name)
         text = skill.package.read(path)
         if text is None:
             return SkillRefusal(
@@ -308,8 +331,12 @@ class SkillSession:
         return SkillRefusal(
             error="unknown_skill",
             message=f"No skill is named {name!r}.",
-            names=[skill_name for skill_name, skill in self._skills.items() if skill.owner != "everyone"],
+            names=self.org_and_workflow_names(),
         )
+
+
+def _withheld(name: str) -> SkillRefusal:
+    return SkillRefusal(error="withheld", message=f"{name} was made from run data, which your role cannot read.")
 
 
 def render_skills_catalog(session: SkillSession) -> str:

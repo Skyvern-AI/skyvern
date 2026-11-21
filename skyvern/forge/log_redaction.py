@@ -19,6 +19,7 @@ import json
 import re
 import typing
 from collections.abc import Mapping
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 from pydantic import BaseModel
 
@@ -181,6 +182,51 @@ def redact_proxy_observability_value(key: object, value: object) -> RedactedProx
 
 def strip_artifact_url_query(value: str) -> str:
     return _ARTIFACT_CONTENT_URL_QUERY_RE.sub(r"\1", value)
+
+
+_MAX_LOGGED_QUERY_NAMES = 20
+
+
+def is_url_log_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    normalized = key.lower()
+    if normalized not in ("url", "urls", "href") and not normalized.endswith(("_url", "_urls")):
+        return False
+    return not (is_sensitive_key(normalized) or is_proxy_observability_key(normalized))
+
+
+def strip_url_query(value: str) -> str:
+    """Drop URL userinfo and fragment, and replace the query with its key names: ``?[query:k1,k2]``."""
+    if "?" not in value and "#" not in value and "@" not in value:
+        return value
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return REDACTED
+    netloc = parts.netloc.rpartition("@")[2]
+    query = ""
+    if parts.query:
+        names: dict[str, None] = {}
+        for item in parts.query.split("&"):
+            name, has_value, _raw = item.partition("=")
+            if not has_value:
+                continue
+            names[unquote_plus(name)] = None
+            if len(names) >= _MAX_LOGGED_QUERY_NAMES:
+                break
+        query = f"[query:{','.join(names)}]" if names else "[query]"
+    stripped = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    return f"{stripped}?{query}" if query else stripped
+
+
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def strip_url_queries_in_text(value: str) -> str:
+    if "?" not in value and "#" not in value and "@" not in value:
+        return value
+    return _URL_IN_TEXT_RE.sub(lambda match: strip_url_query(match.group(0)), value)
 
 
 def redact_bearer_tokens_in_text(value: str) -> str:

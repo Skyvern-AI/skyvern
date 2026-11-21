@@ -614,6 +614,7 @@ def block_yaml_to_block(
             azure_blob_container_name=block_yaml.azure_blob_container_name,
             google_credential_id=block_yaml.google_credential_id,
             google_drive_folder_id=block_yaml.google_drive_folder_id,
+            google_drive_save_as_sheet=block_yaml.google_drive_save_as_sheet,
             sftp_host=block_yaml.sftp_host,
             sftp_port=block_yaml.sftp_port,
             sftp_username=block_yaml.sftp_username,

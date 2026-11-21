@@ -47,7 +47,12 @@ else:
 
 from skyvern.cli.mcp_tools.browser import EITHER_STATE_OUTPUT_SCHEMA
 
-from .agent_skill import skyvern_agent_skill_delete, skyvern_agent_skill_get, skyvern_agent_skill_list
+from .agent_skill import (
+    skyvern_agent_skill_delete,
+    skyvern_agent_skill_get,
+    skyvern_agent_skill_list,
+    skyvern_agent_skill_save,
+)
 from .blocks import (
     skyvern_block_schema,
     skyvern_block_validate,
@@ -473,6 +478,7 @@ mcp.tool(tags={"settings"}, annotations=_mut("Update Organization Settings"))(sk
 # Cloud-only routes; the agent_skill tag is in no named scope, so only the 'all' scope exposes these tools.
 mcp.tool(tags={"agent_skill"}, annotations=_ro("List Agent Skills"))(size_capped(skyvern_agent_skill_list))
 mcp.tool(tags={"agent_skill"}, annotations=_ro("Get Agent Skill"))(size_capped(skyvern_agent_skill_get))
+mcp.tool(tags={"agent_skill"}, annotations=_mut("Save Agent Skill"))(skyvern_agent_skill_save)
 mcp.tool(tags={"agent_skill"}, annotations=_dest("Delete Agent Skill"))(skyvern_agent_skill_delete)
 
 # -- Credential lookup (no browser needed) --
@@ -665,6 +671,7 @@ __all__ = [
     "skyvern_org_update",
     "skyvern_agent_skill_list",
     "skyvern_agent_skill_get",
+    "skyvern_agent_skill_save",
     "skyvern_agent_skill_delete",
     # Credential lookup
     "skyvern_credential_list",

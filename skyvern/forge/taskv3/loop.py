@@ -185,6 +185,8 @@ ToolErrorClass = Literal[
     "challenge_unsupported",
     "challenge_not_attempted",
     "challenge_unsolved",
+    # `download` on a frame: it has no web address, or re-fetching it gave no document to save.
+    "frame_not_saved",
     # An erroring call whose construction site named no class. Deliberately a value rather than an
     # absence, so "errored, unnamed" is countable and cannot be confused with "did not error".
     "other",
@@ -202,6 +204,8 @@ ToolOkClass = Literal[
     "solved",
     "absent",
     "attempts_exhausted",
+    # `solve_captcha` found nothing, but a look it took did not finish, so it cannot say "absent".
+    "check_incomplete",
     # `solve_captcha` with `image_selector`: characters were read off the image. Not "solved" -- only the
     # page can say whether they were right, after the model types them.
     "image_text_read",
@@ -450,6 +454,23 @@ _TEXT_DELTA: ContextVar[tuple[float, int | None, int, bool, str | None, int] | N
 _TEXT_DELTA_SHOWN_FRESH: ContextVar[int] = ContextVar("taskv3_text_delta_shown_fresh", default=0)
 # The ordinal of the tool call being dispatched, so a tool can say how many calls a report spans.
 _TOOL_CALL_SEQ: ContextVar[int | None] = ContextVar("taskv3_tool_call_seq", default=None)
+# The turn the call being dispatched belongs to, numbered as the read markers number it for the model.
+_TURN: ContextVar[int | None] = ContextVar("taskv3_turn", default=None)
+# A result's data key for request-record lines: shown to the model after the result, never part of its page content.
+REQUEST_RECORD_DATA_KEY = "request_record"
+_REQUEST_RECORD_ON_ERROR: ContextVar[str | None] = ContextVar("taskv3_request_record_on_error", default=None)
+
+
+def set_request_record_on_error(lines: str | None) -> None:
+    _REQUEST_RECORD_ON_ERROR.set(lines)
+
+
+def with_request_record_of(result: ToolResult) -> ToolResult:
+    """`result`, made from a call that raised, with the request record lines that call built."""
+    shown = _REQUEST_RECORD_ON_ERROR.get()
+    if not shown:
+        return result
+    return dataclasses.replace(result, data={**(result.data or {}), REQUEST_RECORD_DATA_KEY: shown})
 
 
 def record_resolve_seconds(elapsed: float) -> None:
@@ -516,6 +537,10 @@ def record_text_delta(
 def current_tool_call_seq() -> int | None:
     """The loop's ordinal for the tool call being dispatched; None outside the loop."""
     return _TOOL_CALL_SEQ.get()
+
+
+def current_turn() -> int | None:
+    return _TURN.get()
 
 
 def record_covered_layer(branch: CoveredBranch, *, controls: int, layer_kind: CoveredLayerKind) -> None:
@@ -731,6 +756,9 @@ class _OpenTurn:
 # Awaited after a billable/download-signaling result; it never ends the run. A settle hook awaited from
 # finish(completed) lets a download land, skips files tools staged this run, and never refuses.
 DownloadWait = Callable[[], Awaitable[None]]
+# Polls the predicate until it holds, the block's no-signal download bound runs out, the loop deadline passes or the
+# run is cancelled.
+DownloadUntil = Callable[[Callable[[], Awaitable[bool]]], Awaitable[None]]
 # Its return value is shown to the model verbatim, so it must hold only the `Downloaded:` lines.
 DownloadSettle = Callable[[frozenset[str]], Awaitable[str | None]]
 # Browser downloads the block started that were not saved, by reason; empty once a file of the block landed.
@@ -1780,7 +1808,7 @@ def _tool_call_timed_out(tool_name: str, budget_ms: int, *, call_site: str = "di
             f"{tool_name} did not finish within {budget_ms // 1000} s and was stopped; it may already have "
             "taken effect. Observe the page before acting again."
         )
-        data = {CLICK_DISPATCHED_DATA_KEY: True} if tool_name == "click" else None
+        data = {CLICK_DISPATCHED_DATA_KEY: True} if tool_name in CLICK_TOOL_NAMES else None
     else:
         step = "pre-action capture" if call_site == "on_pre_action" else "page refresh"
         message = (
@@ -1803,13 +1831,17 @@ def _tool_call_timed_out(tool_name: str, budget_ms: int, *, call_site: str = "di
 CODE_TOOL_NAME = "execute_python"
 
 
+# `download` on a control runs click's own handler, so every guard that keys on a click holds for it too.
+CLICK_TOOL_NAMES = frozenset({"click", "download"})
+
+
 def _may_submit(tool_name: str, args: dict[str, Any]) -> bool:
     """A click or drag, an Enter press, or a type or select_combobox that pressed Enter: the loop cannot tell a submit from any of them.
 
     The code tool counts too: its body is opaque to the loop, so it is treated as possibly having
     submitted rather than as certainly not having.
     """
-    return tool_name in ("click", "drag", CODE_TOOL_NAME) or _is_enter_submit(tool_name, args)
+    return tool_name in CLICK_TOOL_NAMES | {"drag", CODE_TOOL_NAME} or _is_enter_submit(tool_name, args)
 
 
 # Secret values reach the model only as `placeholder_...` tokens, so the guard below keys on the
@@ -1886,7 +1918,7 @@ TOGGLE_PROBE_TIMEOUT_SECONDS = 2.0
 
 async def _is_toggle_click(tool_name: str, spec: ToolSpec | None, args: dict[str, Any]) -> bool:
     """A click whose target exposes a toggle state chooses an answer rather than submitting. Fails closed."""
-    if tool_name != "click" or spec is None or spec.toggle_probe is None:
+    if tool_name not in CLICK_TOOL_NAMES or spec is None or spec.toggle_probe is None:
         return False
     try:
         is_toggle = await asyncio.wait_for(spec.toggle_probe(args), timeout=TOGGLE_PROBE_TIMEOUT_SECONDS)
@@ -1920,6 +1952,9 @@ def _arms_failure_evidence(tool_name: str, args: dict[str, Any], ok: bool) -> bo
     if tool_name == "solve_captcha":
         return True
     if not ok:
+        return False
+    # download waits for its own outcome and reports it, so none of its effects is left to land after its result.
+    if tool_name == "download":
         return False
     return _may_submit(tool_name, args)
 
@@ -2088,7 +2123,7 @@ def _names_submit_control(tool_name: str, args: dict[str, Any], ok: bool, data: 
     name, and a captcha dispatch names none at all, so for all three "is that control still in
     flight" has no subject — and the selector they do carry is a text field, whose value is the
     model's own typed text."""
-    if not ok or tool_name not in ("click", "drag"):
+    if not ok or tool_name not in CLICK_TOOL_NAMES | {"drag"}:
         return None
     selector = data.get(DROP_TARGET_DATA_KEY) if tool_name == "drag" else args.get("selector")
     return selector if isinstance(selector, str) and selector else None
@@ -2864,7 +2899,7 @@ def _navigate_record_fields(tool_name: str, args: dict[str, Any], result: ToolRe
 def _menu_note_record_fields(tool_name: str, result: ToolResult | None) -> dict[str, str | int]:
     """Whether a click's menu-open note listed its rows or withheld them, and why, re-checked against the closed
     vocabulary. Empty for every other tool and for clicks with no note."""
-    if tool_name != "click" or result is None:
+    if tool_name not in CLICK_TOOL_NAMES or result is None:
         return {}
     data = result.data or {}
     fields: dict[str, str | int] = {}
@@ -4385,6 +4420,8 @@ async def run_agent_tool_loop(
     # LOGIN_IDENTIFIER_SUBMIT_BUDGET instead of CREDENTIAL_SUBMIT_BUDGET. Read per refusal.
     login_identifier_tokens: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
+    # Request answers no result reported, appended to the batch's last result before the next turn.
+    late_request_lines: Callable[[], str | None] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
     settle_reload_signal: Callable[[bool], Awaitable[bool | None]] | None = None,
     submission_evidence: Callable[[], Awaitable[str | None]] | None = None,
@@ -5069,6 +5106,13 @@ async def run_agent_tool_loop(
         if should_cancel is not None and await should_cancel():
             st.outcome = LoopOutcome("canceled", "run canceled")
             break
+        # Answers no result reported (behind a refusal or skip the loop built itself, or a turn with no tool call). On
+        # their own message: the read store rebuilds an earlier result from what it held at admission.
+        if late_request_lines is not None and (late := late_request_lines()):
+            skyvern_ctx = skyvern_context.current()
+            st.messages.append(
+                {"role": "user", "content": skyvern_ctx.hide_from_model(late) if skyvern_ctx is not None else late}
+            )
         # The final-turn grant (see final_turn_granted above): a budget trip here buys one more
         # turn instead of ending the run, so the checks below are elif'd
         # (only the first tripped cap matters this iteration). A spent grant ends the run BEFORE any
@@ -5834,7 +5878,7 @@ async def run_agent_tool_loop(
                 spec is not None
                 and on_pre_action is not None
                 and tool_name != "solve_captcha"
-                and _arms_failure_evidence(tool_name, args, True)
+                and _may_submit(tool_name, args)
             ):
                 pre_action_budget_ms = _tool_call_budget_ms(deadline_at)
                 pre_action_started_at = time.monotonic()
@@ -5953,7 +5997,9 @@ async def run_agent_tool_loop(
             _ENTRY_RECORD.set(None)
             _TEXT_DELTA.set(None)
             _TEXT_DELTA_SHOWN_FRESH.set(0)
+            _REQUEST_RECORD_ON_ERROR.set(None)
             _TOOL_CALL_SEQ.set(st.total_tool_calls)
+            _TURN.set(st.turns)
             dispatch_ctx = skyvern_context.current()
             runtime_secrets_before = len(dispatch_ctx.runtime_secret_values) if dispatch_ctx is not None else 0
             # As in V1/V2, acting on the page again means an earlier navigation failure is no longer what the
@@ -6000,12 +6046,12 @@ async def run_agent_tool_loop(
                             ):
                                 await settle_reload_signal(True)
                 except ToolRefusal as refusal:
-                    result = refusal.as_result()
+                    result = with_request_record_of(refusal.as_result())
                 except Exception as exc:
                     if tool_budget_ms is not None and _dispatch_bound_expired(exc, tool_started_at, tool_budget_ms):
                         if spec.touches_page:
                             batch_had_failure = True
-                        result = _tool_call_timed_out(tool_name, tool_budget_ms)
+                        result = with_request_record_of(_tool_call_timed_out(tool_name, tool_budget_ms))
                     else:
                         LOG.warning(
                             "taskv3 tool handler raised",
@@ -6015,7 +6061,9 @@ async def run_agent_tool_loop(
                         )
                         browser_gone = _is_browser_gone(exc)
                         raised_class = _raised_error_class(exc)
-                        result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
+                        result = with_request_record_of(
+                            ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
+                        )
             tool_duration_seconds = time.monotonic() - tool_started_at
             st.tool_seconds += tool_duration_seconds
             held_lease = st.layer_lease if layer_held_call else None
@@ -6149,7 +6197,7 @@ async def run_agent_tool_loop(
             # missing a facet -- a partial field would read as a clean result rather than a gap.
             # Gated on `spec is not None` for the same reason the `tool` field is: an unregistered
             # tool logs as `unknown_tool`, and such a row must not also carry a click-only facet.
-            if spec is not None and tool_name == "click":
+            if spec is not None and tool_name in CLICK_TOOL_NAMES:
                 hit = _HIT_CLASS.get() or {}
                 cost_fields["hit_class"] = hit.get("hit_class") or "unknown"
                 cost_fields["click_path"] = _CLICK_PATH.get() or "none"
@@ -6303,6 +6351,14 @@ async def run_agent_tool_loop(
                 if model_facing_content.endswith(delta):
                     delta_at = len(model_facing_content) - len(delta)
             transcript_content = model_facing_content
+            record_lines = (result.data or {}).get(REQUEST_RECORD_DATA_KEY)
+            if isinstance(record_lines, str) and record_lines:
+                # The model reads these after the result; nothing that reads the result itself sees them.
+                if delta_at is None:
+                    delta_at = len(model_facing_content)
+                transcript_content += "\n" + (
+                    skyvern_ctx.hide_from_model(record_lines) if skyvern_ctx is not None else record_lines
+                )
             if spec is not None and spec.compactable and result.status == "ok":
                 transcript_content = st.reads.admit(
                     len(st.messages),
@@ -6310,7 +6366,7 @@ async def run_agent_tool_loop(
                     args=_declared_args_key(spec, args),
                     page=probe_before or "",
                     handles=spec.issues_handles,
-                    content=model_facing_content,
+                    content=transcript_content,
                     turn=st.turns,
                     delta_at=delta_at,
                 )
@@ -6517,7 +6573,7 @@ async def run_agent_tool_loop(
                 )
                 if spec.billable and result.status == "ok":
                     st.billable_actions.append(tool_name)
-                    if not (tool_name == "hover" or (tool_name == "click" and result_data.get("menu_note"))):
+                    if not (tool_name == "hover" or (tool_name in CLICK_TOOL_NAMES and result_data.get("menu_note"))):
                         st.block_action_committed = True
                         st.block_action_may_have_landed |= _may_submit(tool_name, args)
                         if not result.entry_unconfirmed and not _outcome_reports_failure(round_outcome):
@@ -6664,7 +6720,7 @@ async def run_agent_tool_loop(
                 may_have_submitted = (
                     _CLICK_DISPATCHED.get()
                     or bool(result_data.get(CLICK_DISPATCHED_DATA_KEY))
-                    or (tool_name != "click" and _may_submit(tool_name, args))
+                    or (tool_name not in CLICK_TOOL_NAMES and _may_submit(tool_name, args))
                 )
                 if spec is not None and spec.billable and (poisoned or may_have_submitted) and not list_left_open:
                     st.block_action_may_have_landed = True
