@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
+from collections.abc import Iterator
 from typing import TypeVar, cast
 
 from email_validator import EmailNotValidError, validate_email
@@ -197,6 +200,96 @@ def is_secret_shaped(token: str) -> bool:
         and any(char.isupper() for char in token)
         and any(char.islower() for char in token)
         and any(char.isdigit() for char in token)
+    )
+
+
+# Credential shapes for stored network data. Unlike is_secret_shaped they match whole values only, so an asset name
+# such as `<hash>.js` and a mixed-case site key survive.
+_TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
+_JWT_JSON_PART_RE = re.compile(r"eyJ[A-Za-z0-9_-]{8,}")
+_HEX_CREDENTIAL_RE = re.compile(r"[0-9A-Fa-f]{32,}")
+AUTH_SCHEME_CREDENTIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:(?:bearer|token)\s+(?P<token>[A-Za-z0-9._~+/=%-]{8,})"
+    r"|basic\s+(?P<basic>[A-Za-z0-9+/]{8,}={0,2})"
+    r"|(?P<digest>digest)\s+username\s*=)",
+    re.I,
+)
+
+
+_JWT_MIN_PART_LENGTH = len("eyJ") + 8
+
+
+def _ends_with_jwt_part(part: str) -> bool:
+    # The first `eyJ` leaves the longest tail, so one find decides it; a regex search here is quadratic on `eyJeyJ...`.
+    start = part.find("eyJ")
+    return start >= 0 and len(part) - start >= _JWT_MIN_PART_LENGTH
+
+
+def _is_jwt_run(run: str) -> bool:
+    parts = run.split(".")
+    return any(
+        _ends_with_jwt_part(parts[index]) and _JWT_JSON_PART_RE.fullmatch(parts[index + 1])
+        for index in range(len(parts) - 2)
+    )
+
+
+def iter_jwt_runs(text: str) -> Iterator[re.Match[str]]:
+    """Runs of token characters that carry a JWT anywhere, so `bearer.<jwt>`, `jwt_<jwt>` and `3D<jwt>` are one run."""
+    return (match for match in _TOKEN_RUN_RE.finditer(text) if _is_jwt_run(match.group()))
+
+
+def _is_basic_credential(encoded: str) -> bool:
+    try:
+        return ":" in base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return False
+
+
+def _is_auth_scheme_credential(match: re.Match[str]) -> bool:
+    if match.group("digest"):
+        return True
+    if (token := match.group("token")) is not None:
+        return any(char.isalpha() for char in token) and not token.isalpha()
+    return _is_basic_credential(match.group("basic"))
+
+
+_VALUE_START_CHARS = frozenset(":=\"'")
+_MAX_GAP_BEFORE_SCHEME = 16
+
+
+def _starts_a_value(text: str, index: int) -> bool:
+    gap_start = index
+    while gap_start > 0 and index - gap_start < _MAX_GAP_BEFORE_SCHEME and text[gap_start - 1] in " \t":
+        gap_start -= 1
+    return gap_start == 0 or text[gap_start - 1] in _VALUE_START_CHARS
+
+
+def iter_auth_scheme_credentials(text: str) -> Iterator[re.Match[str]]:
+    """Scheme words that start the text or follow `:`, `=` or a quote, so prose such as "the token abc-1234" is skipped.
+    Matches carry the credential in group `token` or `basic`, or name a Digest response in group `digest`."""
+    for match in AUTH_SCHEME_CREDENTIAL_RE.finditer(text):
+        if _starts_a_value(text, match.start()) and _is_auth_scheme_credential(match):
+            yield match
+
+
+def _starts_with_auth_scheme_credential(value: str) -> bool:
+    match = AUTH_SCHEME_CREDENTIAL_RE.match(value, len(value) - len(value.lstrip()))
+    return match is not None and _is_auth_scheme_credential(match)
+
+
+def is_hex_credential(value: str) -> bool:
+    return (
+        _HEX_CREDENTIAL_RE.fullmatch(value) is not None
+        and any(char.isdigit() for char in value)
+        and any(char.isalpha() for char in value)
+    )
+
+
+def has_credential_shape(value: str) -> bool:
+    return (
+        is_hex_credential(value)
+        or next(iter_jwt_runs(value), None) is not None
+        or _starts_with_auth_scheme_credential(value)
     )
 
 

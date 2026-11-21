@@ -2185,6 +2185,8 @@ class ScriptModel(Base):
     # The workflow run or task run id that this script is generated
     run_id = Column(String, nullable=True)
     version = Column(Integer, default=1, nullable=False)
+    # Set only when the platform pins one of its static modules; a main.py header naming any other module is ignored.
+    static_module = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
