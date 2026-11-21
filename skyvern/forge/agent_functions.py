@@ -58,6 +58,7 @@ from skyvern.forge.sdk.ember.config import (
 )
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
 from skyvern.forge.sdk.experimentation.drive_shared_drive_search import drive_shared_drive_search_enabled
+from skyvern.forge.sdk.integrations.catalog import integration_is_live
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
@@ -3130,7 +3131,7 @@ class AgentFunction:
         workflow_run_block_id: str,
         connection_id: str,
         hop_token: str | None = None,
-        credential_source: Literal["nango"] = "nango",
+        credential_source: Literal["nango", "native"] = "nango",
         dataset_id: str,
         query: str,
         max_rows: int = 1_000,
@@ -3138,7 +3139,9 @@ class AgentFunction:
         """Power BI reads require Cloud's persisted-run identity and audited execution facade."""
         raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
 
-    async def ensure_powerbi_queries_available(self, organization_id: str) -> None:
+    async def ensure_powerbi_queries_available(
+        self, organization_id: str, *, credential_sources: frozenset[str] = frozenset({"nango"})
+    ) -> None:
         raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
 
     async def get_google_workspace_credentials(
@@ -4225,3 +4228,7 @@ class AgentFunction:
             api_key=settings.MCP_POSTHOG_PROJECT_API_KEY,
             host=settings.MCP_POSTHOG_PROJECT_HOST,
         )
+
+    async def powerbi_native_connections_available(self, organization_id: str) -> bool:
+        """Whether this org may connect and query Power BI through its own Microsoft OAuth connection."""
+        return integration_is_live("powerbi")

@@ -23526,7 +23526,10 @@
           },
           "credential_source": {
             "type": "string",
-            "const": "nango",
+            "enum": [
+              "nango",
+              "native"
+            ],
             "title": "Credential Source",
             "default": "nango"
           },
@@ -23673,12 +23676,15 @@
             "description": "Power BI connection ID for this user.",
             "x-skyvern-connected-account": true,
             "x-skyvern-connected-account-when": {
-              "credential_source": "nango"
+              "credential_source": "native"
             }
           },
           "credential_source": {
             "type": "string",
-            "const": "nango",
+            "enum": [
+              "nango",
+              "native"
+            ],
             "title": "Credential Source",
             "default": "nango"
           },

@@ -2021,9 +2021,9 @@ class PowerBIQueryBlockYAML(BlockYAML):
     connection_id: str = Field(
         min_length=1,
         description="Power BI connection ID for this user.",
-        json_schema_extra=_connected_account_field(credential_source="nango"),
+        json_schema_extra=_connected_account_field(credential_source="native"),
     )
-    credential_source: Literal["nango"] = "nango"
+    credential_source: Literal["nango", "native"] = "nango"
     dataset_id: str = Field(min_length=1)
     query: str = Field(min_length=1, description="A single read-only DAX query.")
     max_rows: int = Field(default=1_000, ge=1, le=100_000, strict=True)

@@ -9,7 +9,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.db.repositories.microsoft_oauth import STATE_ACTIVE
-from skyvern.forge.sdk.integrations.catalog import integration_is_live
 from skyvern.forge.sdk.schemas.microsoft_oauth import (
     CreateMicrosoftOAuthAuthorizeRequest,
     CreateMicrosoftOAuthCallbackRequest,
@@ -128,7 +127,7 @@ async def microsoft_oauth_authorize(
     _request_authorization: None = Depends(require_request_actions(frozenset({"microsoft_oauth.authorize"}))),
 ) -> MicrosoftOAuthAuthorizeResponse:
     if request.scope_profile == microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ:
-        if not integration_is_live("powerbi"):
+        if not await app.AGENT_FUNCTION.powerbi_native_connections_available(current_org.organization_id):
             raise HTTPException(status_code=403, detail="Power BI connections are not currently available")
         current_user_id = _require_powerbi_user(current_org.organization_id, current_user_id)
     try:
@@ -183,7 +182,7 @@ async def microsoft_oauth_callback(
         )
     scope_profile = microsoft_oauth_service.scope_profile_from_scopes(context.scopes_requested)
     if scope_profile == microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ:
-        if not integration_is_live("powerbi"):
+        if not await app.AGENT_FUNCTION.powerbi_native_connections_available(current_org.organization_id):
             raise HTTPException(status_code=403, detail="Power BI connections are not currently available")
         current_user_id = _require_powerbi_user(current_org.organization_id, current_user_id)
         if microsoft_oauth_service.has_required_scopes(context.scopes_requested, ["Mail.Read"]):
