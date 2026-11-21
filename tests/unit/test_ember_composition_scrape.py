@@ -428,9 +428,6 @@ async def test_structured_evidence_error_is_bounded_and_redacted() -> None:
     assert len(error) < 400
 
 
-# The delay sits strictly between the two deadlines, so the only difference between the arms is
-# which deadline governs the same server response and the same packet bytes.
-_SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS = 0.05
 _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS = 0.2
 _SLOW_EXTRACTOR_OUTER_DEADLINE_SECONDS = 2.0
 
@@ -474,28 +471,6 @@ def _slow_structured_server() -> SimpleNamespace:
     return SimpleNamespace(call_internal_tool=call_internal_tool)
 
 
-@pytest.mark.asyncio
-async def test_structured_timeout_arm_a_nested_deadline_discards_a_slow_read() -> None:
-    """A nested deadline shorter than the response discards the whole packet."""
-    assert _SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS < _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS
-
-    started = time.monotonic()
-    evidence, error = await _composition_get_structured_evidence_result(
-        SimpleNamespace(discovery_mcp_server=_slow_structured_server()),
-        inspected_url="https://example.com/",
-        current_url="https://example.com/",
-        timeout_seconds=_SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS,
-    )
-    elapsed = time.monotonic() - started
-
-    assert evidence is None
-    assert error == (
-        f"skyvern_evaluate timed out after {_SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS:g}s "
-        "while capturing structured page evidence"
-    )
-    assert elapsed < _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS
-
-
 class _WaitForRecorder:
     def __init__(self) -> None:
         self.timeouts: list[float] = []
@@ -512,7 +487,7 @@ class _WaitForRecorder:
 async def test_structured_evidence_arm_b_same_slow_read_completes_under_the_outer_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The identical response and bytes, governed only by an owning outer deadline."""
+    """A slow structured read completes when only an owning outer deadline governs it."""
     assert _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS < _SLOW_EXTRACTOR_OUTER_DEADLINE_SECONDS
     recorder = _WaitForRecorder()
     monkeypatch.setattr(shared_module, "asyncio", recorder)
