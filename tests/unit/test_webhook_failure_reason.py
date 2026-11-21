@@ -319,7 +319,8 @@ async def test_task_http_failure_logs_do_not_copy_response_body(
     retries = [event for event in logs if event["event"] == "Retrying webhook delivery after transient failure"]
     assert len(failures) == 1
     assert failures[0]["resp_code"] == 503
-    assert failures[0]["resp_text"] == body
+    assert failures[0]["resp_text_length"] == len(body)
+    assert body not in str(failures[0])
     assert failures[0]["status_code"] == 503
     assert update.await_args.kwargs["webhook_failure_reason"] == (
         f"Webhook failed with status code 503, error message: {body}"

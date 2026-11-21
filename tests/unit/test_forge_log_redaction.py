@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import copy
 import enum
+import hashlib
 import io
 import json
 import logging
@@ -228,16 +229,58 @@ def test_redacts_bare_token_without_bearer_prefix() -> None:
     assert "foo=bar" in out["event"]
 
 
-def test_passes_through_when_no_token() -> None:
-    event = {"event": "GET /api/v1/heartbeat HTTP/1.1 200 OK"}
-    out = redact_bearer_tokens(None, "info", event)  # type: ignore[arg-type]
-    assert out == event
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"event": "GET /api/v1/heartbeat HTTP/1.1 200 OK"},
+        {"event": "no token here", "count": 42, "tags": ["a", "b"]},
+    ],
+)
+def test_passes_through_when_no_token(event: dict) -> None:
+    assert redact_bearer_tokens(None, "info", dict(event)) == event  # type: ignore[arg-type]
 
 
-def test_handles_non_string_values() -> None:
-    event = {"event": "no token here", "count": 42, "tags": ["a", "b"]}
-    out = redact_bearer_tokens(None, "info", event)  # type: ignore[arg-type]
-    assert out == event
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        ("url", "https://h.invalid/p?name=Jane%20Doe&dob=1990-01-01", "https://h.invalid/p?[query:name,dob]"),
+        ("current_url", "https://h.invalid/p#account=42", "https://h.invalid/p"),
+        ("webhook_callback_url", "https://user:pw@h.invalid/hook", "https://h.invalid/hook"),
+        ("href", "/form?ssn=123-45-6789&ssn=1&flag", "/form?[query:ssn]"),
+        (
+            "url",
+            "https://h.invalid/p?" + "&".join(f"k{i}=v" for i in range(25)),
+            "https://h.invalid/p?[query:" + ",".join(f"k{i}" for i in range(20)) + "]",
+        ),
+        (
+            "file_urls",
+            ["https://h.invalid/a?sig=s1", "https://h.invalid/b"],
+            ["https://h.invalid/a?[query:sig]", "https://h.invalid/b"],
+        ),
+        ("url", "https://h.invalid/plain/path", "https://h.invalid/plain/path"),
+        ("event", "visit https://h.invalid/p?name=Jane", "visit https://h.invalid/p?name=Jane"),
+        ("totp_url", "https://h.invalid/p?code=1", "https://h.invalid/p?code=1"),
+        (
+            "urls",
+            ["https://h.invalid/a?email=e", "https://h.invalid/b"],
+            ["https://h.invalid/a?[query:email]", "https://h.invalid/b"],
+        ),
+        ("cache_key_value", "jane@x.invalid", "sha256:" + hashlib.sha256(b"jane@x.invalid").hexdigest()[:12]),
+        (
+            "error",
+            "Page.goto: net::ERR_ABORTED at https://h.invalid/p?email=j%40x.invalid\nCall log: navigating",
+            "Page.goto: net::ERR_ABORTED at https://h.invalid/p?[query:email]\nCall log: navigating",
+        ),
+        (
+            "exception",
+            "ClientResponseError: 403, url='https://h.invalid/f?sig=s1&email=e'",
+            "ClientResponseError: 403, url='https://h.invalid/f?[query:sig,email]'",
+        ),
+    ],
+)
+def test_url_fields_keep_only_query_key_names(key: str, value: str | list[str], expected: str | list[str]) -> None:
+    out = forge_log.strip_url_query_strings(None, "info", {key: value})  # type: ignore[arg-type]
+    assert out[key] == expected
 
 
 def test_redacts_in_arbitrary_string_keys() -> None:
@@ -504,6 +547,7 @@ def test_registered_protocol_words_preserve_emitted_messages_and_severity(
     }
     expected_messages = ["Diagnostic emission", f"Diagnostic emission: {REDACTED_SECRET_PLACEHOLDER}"]
     emitted = re.sub(r"\x1b\[[0-9;]*m", "", registered_log_stream.getvalue())
+    stripped_url = "https://example.invalid/verify?[query:value]"
     record_groups = []
     if settings.JSON_LOGGING or route == "downstream_renamer":
         record_groups.append([json.loads(line) for line in emitted.splitlines()])
@@ -514,7 +558,8 @@ def test_registered_protocol_words_preserve_emitted_messages_and_severity(
         assert f"payload={masked_payload!r}" in emitted
         assert f"model={masked_payload!r}" in emitted
         assert f"user:{REDACTED_SECRET_PLACEHOLDER}={REDACTED_SECRET_PLACEHOLDER}" in emitted
-        assert f"url=https://example.invalid/verify?value={REDACTED_SECRET_PLACEHOLDER}" in emitted
+        assert f"url={stripped_url}" in emitted
+        assert "verify?value=" not in emitted
         assert f"ValueError: {REDACTED_SECRET_PLACEHOLDER}" in emitted
         assert f"Diagnostic emission: {protocol_word}" not in emitted
         assert f"ValueError: {protocol_word}" not in emitted
@@ -528,7 +573,7 @@ def test_registered_protocol_words_preserve_emitted_messages_and_severity(
             assert record["payload"] == masked_payload
             assert record["model"] == masked_payload
             assert record[f"user:{REDACTED_SECRET_PLACEHOLDER}"] == REDACTED_SECRET_PLACEHOLDER
-            assert record["url"] == f"https://example.invalid/verify?value={REDACTED_SECRET_PLACEHOLDER}"
+            assert record["url"] == stripped_url
         assert records[1]["exception"].endswith(f"ValueError: {REDACTED_SECRET_PLACEHOLDER}")
 
 
@@ -1587,7 +1632,8 @@ def test_setup_logger_pins_redactor_processor_order() -> None:
         assert names.index("redact_sensitive_event_fields") < names.index("redact_registered_secrets")
         privacy_boundaries = [index for index, name in enumerate(names) if name == "redact_private_log_event"]
         assert privacy_boundaries[0] == 0
-        assert privacy_boundaries[-1] == names.index("redact_registered_secrets") + 1
+        assert names.index("strip_url_query_strings") == names.index("redact_registered_secrets") + 1
+        assert privacy_boundaries[-1] == names.index("strip_url_query_strings") + 1
         assert privacy_boundaries[-1] + 1 == names.index("skyvern_logs_processor")
     finally:
         structlog.configure(**saved_config)

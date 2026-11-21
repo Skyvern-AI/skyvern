@@ -14,8 +14,9 @@ class _FakeAction:
 
 
 class _FakeResult:
-    def __init__(self, success: bool) -> None:
+    def __init__(self, success: bool, exception_type: str | None = None) -> None:
         self.success = success
+        self.exception_type = exception_type
 
 
 def test_compact_action_handles_missing_attrs_defensively() -> None:
@@ -34,9 +35,19 @@ def test_compact_action_result_summarizes_list() -> None:
 
 
 def test_compact_action_result_flags_partial_failure() -> None:
-    event = {"event": "Action failed", "action_result": [_FakeResult(True), _FakeResult(False)]}
+    results = [_FakeResult(True), _FakeResult(False, "TimeoutError")]
+    event = {
+        "event": "Action failed",
+        "action_result": results,
+        "action_results": results,
+        "actions_and_results": [(_FakeAction("act_1"), results)],
+    }
     result = compact_action_objects(None, "info", event)  # type: ignore[arg-type]
-    assert result["action_result"] == {"count": 2, "success": False}
+    summary = {"count": 2, "success": False, "exception_types": ["TimeoutError"]}
+    assert result["action_result"] == result["action_results"] == summary
+    assert result["actions_and_results"] == [
+        {"action": {"id": "act_1", "type": "click", "element_id": "AAA"}, **summary}
+    ]
 
 
 def test_compact_plural_actions_list() -> None:
