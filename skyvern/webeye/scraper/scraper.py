@@ -225,7 +225,11 @@ JS_FUNCTION_DEFS = load_js_script()
 
 def clean_element_before_hashing(element: dict) -> dict:
     def clean_nested(element: dict) -> dict:
-        element_cleaned = {key: value for key, value in element.items() if key not in {"id", "rect", "frame_index"}}
+        element_cleaned = {
+            key: value
+            for key, value in element.items()
+            if key not in {"id", "rect", "frame_index", "isContentEditable"}
+        }
         if "attributes" in element:
             attributes_cleaned = {key: value for key, value in element["attributes"].items() if key != SKYVERN_ID_ATTR}
             element_cleaned["attributes"] = attributes_cleaned
@@ -278,17 +282,25 @@ def _deepcopy_element_tree(element_tree: list[dict]) -> list[dict]:
 
 # These input types carry page-authored label or constant text in `value`, not user input.
 _INPUT_TYPES_WITH_PAGE_VALUE = frozenset({"button", "submit", "reset", "checkbox", "radio", "image"})
+_TEXT_ENTRY_INPUT_TYPES = frozenset({"text", "email", "search", "tel", "url", "password", "number"})
+# Roles whose value the user sets; widgets with these roles mirror it in the aria value attributes.
+_VALUE_ENTRY_ROLES = frozenset({"textbox", "combobox", "searchbox", "spinbutton", "slider"})
+# Of those, the roles whose text is the typed value; a combobox or slider shows an option label or a thumb instead.
+_TEXT_ENTRY_ROLES = frozenset({"textbox", "searchbox", "spinbutton"})
+# Attributes that mirror a control's current value (the OTP serializer in domUtils treats the same set).
+_VALUE_MIRROR_ATTRIBUTES = ("aria-valuenow", "aria-valuetext", "data-value", "defaultvalue")
 
 
-def _holds_input_value(element: dict) -> bool:
+def _holds_input_value(element: dict, attributes: dict, editable: bool) -> bool:
     tag = str(element.get("tagName", "")).lower()
     if tag == "textarea":
         return True
-    if tag != "input":
-        return False
-    attributes = element.get("attributes")
-    input_type = str(attributes.get("type") or "text").lower() if isinstance(attributes, dict) else "text"
-    return input_type not in _INPUT_TYPES_WITH_PAGE_VALUE
+    if tag == "input":
+        return str(attributes.get("type") or "text").lower() not in _INPUT_TYPES_WITH_PAGE_VALUE
+    if editable or str(attributes.get("role", "")).lower() in _VALUE_ENTRY_ROLES:
+        return True
+    # A custom element text field can reflect its typed value into `value`; other `value`s on custom tags are constants.
+    return "-" in tag and str(attributes.get("type", "")).lower() in _TEXT_ENTRY_INPUT_TYPES
 
 
 def _input_value_marker(value: Any) -> Any:
@@ -298,10 +310,8 @@ def _input_value_marker(value: Any) -> Any:
     return value
 
 
-def _walk_with_editability(
-    element_tree: list[dict], editable_ids: frozenset[str] | None
-) -> Iterator[tuple[dict, bool]]:
-    """Yield each element once with whether it sits inside a contenteditable region."""
+def _walk_with_editability(element_tree: list[dict]) -> Iterator[tuple[dict, bool]]:
+    """Yield each element once with whether the browser lets the user edit its text."""
     seen: set[int] = set()
     pending: list[tuple[Any, bool]] = [(element, False) for element in reversed(element_tree)]
     while pending:
@@ -311,11 +321,10 @@ def _walk_with_editability(
         seen.add(id(element))
         attributes = element.get("attributes")
         own = attributes.get("contenteditable") if isinstance(attributes, dict) else None
-        if own is not None:
+        if element.get("isContentEditable") is True:
+            editable = True
+        elif own is not None:
             editable = str(own).lower() != "false"
-        # The trimmed tree drops the contenteditable attribute, so its editable elements are matched by id.
-        elif editable_ids is not None and element.get("id"):
-            editable = element["id"] in editable_ids
         else:
             editable = parent_editable
         yield element, editable
@@ -324,28 +333,38 @@ def _walk_with_editability(
             pending.extend((child, editable) for child in reversed(children))
 
 
-def content_editable_element_ids(element_tree: list[dict]) -> frozenset[str]:
-    return frozenset(
-        str(element["id"])
-        for element, editable in _walk_with_editability(element_tree, None)
-        if editable and element.get("id")
-    )
-
-
-def redact_input_values_in_element_tree(
-    element_tree: list[dict], editable_ids: frozenset[str] | None = None
-) -> list[dict]:
-    """Return a deep copy of the tree with input, textarea and contenteditable values replaced by a length marker."""
+def _redact_input_values(element_tree: list[dict]) -> list[dict]:
     redacted = _deepcopy_element_tree(element_tree)
-    for element, editable in _walk_with_editability(redacted, editable_ids):
+    for element, editable in _walk_with_editability(redacted):
+        tag = str(element.get("tagName", "")).lower()
         attributes = element.get("attributes")
-        if isinstance(attributes, dict) and _holds_input_value(element) and "value" in attributes:
-            attributes["value"] = _input_value_marker(attributes["value"])
-        # A textarea's body text is its default value, which frameworks such as React keep in sync with the typed value.
-        is_textarea = str(element.get("tagName", "")).lower() == "textarea"
-        if (is_textarea or editable) and "text" in element:
+        if isinstance(attributes, dict):
+            if _holds_input_value(element, attributes, editable):
+                value = attributes.get("value")
+                for key in ("value", *_VALUE_MIRROR_ATTRIBUTES):
+                    if key in attributes:
+                        attributes[key] = _input_value_marker(attributes[key])
+                # The browser's validation message can quote a typed value; the `invalid` flag stays.
+                if isinstance(value, str) and value:
+                    attributes.pop("validationMessage", None)
+            # A custom element can forward an inner field's validation message without exposing its value.
+            if "-" in tag:
+                attributes.pop("validationMessage", None)
+            # An editor turns typed URLs into links.
+            if editable and tag == "a" and "href" in attributes:
+                attributes["href"] = _input_value_marker(attributes["href"])
+        # A textarea's body text is its default value, which UI frameworks keep in sync with the typed value.
+        role = str(attributes.get("role", "")).lower() if isinstance(attributes, dict) else ""
+        if (tag == "textarea" or editable or role in _TEXT_ENTRY_ROLES) and "text" in element:
             element["text"] = _input_value_marker(element["text"])
     return redacted
+
+
+def redact_input_values_in_element_trees(element_tree: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Return a redacted deep copy of the tree and its trimmed form, with typed values replaced by a length marker."""
+    redacted = _redact_input_values(element_tree)
+    # Trimming the redacted tree, as the scraper trims the live one, leaves no trimmed element unmasked.
+    return redacted, trim_element_tree(_deepcopy_element_tree(redacted))
 
 
 def hash_element(element: dict) -> str:
@@ -1522,6 +1541,9 @@ def trim_element(element: dict) -> dict:
 
         if "frame_index" in queue_ele:
             del queue_ele["frame_index"]
+
+        if "isContentEditable" in queue_ele:
+            del queue_ele["isContentEditable"]
 
         if "id" in queue_ele and not _should_keep_unique_id(queue_ele):
             del queue_ele["id"]

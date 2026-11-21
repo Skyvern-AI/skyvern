@@ -414,10 +414,9 @@ from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.native_downloads import NativeDownloadAttempt, NativeDownloads
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage, json_to_html
 from skyvern.webeye.scraper.scraper import (
-    content_editable_element_ids,
     page_is_dead_blank,
     page_is_http_survivor,
-    redact_input_values_in_element_tree,
+    redact_input_values_in_element_trees,
 )
 from skyvern.webeye.utils.document import get_main_document_loader_id
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, ScreenshotMode, SkyvernFrame, build_open_tabs_context
@@ -9130,10 +9129,8 @@ class ForgeAgent:
         # Called only for its last_used_element_tree side effect, which later readers depend on. The stored copies
         # are redacted; the live trees still feed the prompt and origin binding.
         scraped_page.build_element_tree(ElementTreeFormat.HTML)
-        editable_ids = content_editable_element_ids(scraped_page.element_tree)
-        stored_element_tree = redact_input_values_in_element_tree(scraped_page.element_tree)
-        stored_element_tree_trimmed = redact_input_values_in_element_tree(
-            scraped_page.element_tree_trimmed, editable_ids=editable_ids
+        stored_element_tree, stored_element_tree_trimmed = redact_input_values_in_element_trees(
+            scraped_page.element_tree
         )
         element_tree_in_prompt = "".join(json_to_html(element) for element in stored_element_tree_trimmed)
 
