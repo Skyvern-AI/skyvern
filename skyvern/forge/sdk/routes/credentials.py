@@ -1208,6 +1208,7 @@ async def test_login(
         title=f"Login Test - {data.username}",
         description="Auto-generated workflow to test login credentials",
         persist_browser_session=True,
+        mask_secrets=False,
         workflow_definition=workflow_definition_yaml,
         status=WorkflowStatus.auto_generated,
     )
@@ -1406,6 +1407,7 @@ async def test_credential(
         title=f"Credential Test - {credential.name}",
         description=f"Auto-generated workflow to test credential {credential_id}",
         persist_browser_session=data.save_browser_profile,
+        mask_secrets=False,
         workflow_definition=workflow_definition_yaml,
         status=WorkflowStatus.auto_generated,
     )
