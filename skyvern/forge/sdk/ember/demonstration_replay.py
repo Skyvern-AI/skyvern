@@ -45,6 +45,7 @@ from skyvern.forge.sdk.ember.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.ember.streaming_adapter import parse_tool_output
 from skyvern.forge.sdk.ember.tools.scouting import record_scouted_interaction_fact
 from skyvern.forge.sdk.schemas.ember import EmberSteerMessage
+from skyvern.forge.sdk.services.request_principal import get_request_principal, human_user_id
 from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 
 LOG = structlog.get_logger()
@@ -65,6 +66,9 @@ async def replay_demonstration(ctx: EmberContext, mcp_server: SkyvernOverlayMCPS
     if cache is None or not demonstration_id:
         return []
     record = await _claim_replay(cache, ctx, demonstration_id)
+    # The record knows who added to the demonstration besides its starter; the turn replaying it may not be the starter's.
+    replayer = human_user_id(get_request_principal(), ctx.organization_id)
+    ctx.steered_by_another = ctx.steered_by_another or record.steered_by_another or replayer != record.human_user_id
     replay_token = record.replay_token
     if replay_token is None:
         raise DemonstrationRejection(HTTPStatus.CONFLICT, "Demonstration replay lease is unavailable")

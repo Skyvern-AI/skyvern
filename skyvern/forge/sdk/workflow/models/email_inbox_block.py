@@ -43,7 +43,8 @@ LOG = structlog.get_logger()
 
 _CONNECTED_ACCOUNT_RUN_NOT_SUPPORTED_REASON = (
     "This Gmail account cannot be read in a run started with an API key, or in a webhook, job recipe or directory "
-    "submission run; use a natively connected Google account for those."
+    "submission run; use a natively connected Google account for those. For a scheduled run, open the schedule on "
+    "the Schedules page and save it."
 )
 _CONNECTED_ACCOUNT_UNAVAILABLE_REASON = (
     "The selected Gmail account is not available to this run. Choose an account you connected on the Integrations "

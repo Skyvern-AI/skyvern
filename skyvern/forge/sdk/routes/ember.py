@@ -5590,6 +5590,7 @@ async def ember_demonstration_control(
             cache,
             organization_id=organization.organization_id,
             request=control_request,
+            requester_user_id=human_user_id(get_request_principal(), organization.organization_id),
         )
     except DemonstrationRejection as rejection:
         raise HTTPException(status_code=rejection.status_code, detail=rejection.detail) from rejection
@@ -5670,6 +5671,7 @@ async def ember_demonstration_upload(
             cache,
             organization_id=organization.organization_id,
             request=EmberDemonstrationControlRequest(demonstration_id=demonstration_id, action="upload_file"),
+            requester_user_id=human_user_id(get_request_principal(), organization.organization_id),
             file_id=uploaded.file_id,
         )
     except DemonstrationRejection as rejection:

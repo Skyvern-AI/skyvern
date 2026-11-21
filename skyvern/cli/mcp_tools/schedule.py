@@ -2,19 +2,43 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Protocol
 
 import structlog
 from pydantic import Field
 
 from skyvern.client.core.api_error import ApiError
+from skyvern.client.types.workflow_schedule_response import WorkflowScheduleResponse
 
 from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
 from ._validation import validate_schedule_id, validate_workflow_id
 
 LOG = structlog.get_logger()
+
+
+class ScheduleWrites(Protocol):
+    """The schedule calls the write tools make, served in-process instead of over HTTP; failures raise ApiError."""
+
+    async def get(self, workflow_permanent_id: str, workflow_schedule_id: str) -> WorkflowScheduleResponse: ...
+    async def create(self, workflow_permanent_id: str, **body: Any) -> WorkflowScheduleResponse: ...
+    async def update(
+        self, workflow_permanent_id: str, workflow_schedule_id: str, **body: Any
+    ) -> WorkflowScheduleResponse: ...
+    async def enable(self, workflow_permanent_id: str, workflow_schedule_id: str) -> WorkflowScheduleResponse: ...
+    async def disable(self, workflow_permanent_id: str, workflow_schedule_id: str) -> WorkflowScheduleResponse: ...
+    async def cancel(self, workflow_permanent_id: str, workflow_schedule_id: str) -> WorkflowScheduleResponse: ...
+
+
+# A write made over HTTP authenticates with an API key, which marks the schedule key-made; an in-process caller
+# that already holds the signed-in request sets this so the schedule belongs to that person.
+schedule_writes_override: ContextVar[ScheduleWrites | None] = ContextVar("schedule_writes_override", default=None)
+
+
+def _schedule_writes() -> ScheduleWrites:
+    return schedule_writes_override.get() or get_skyvern().schedules
 
 
 def _serialize_schedule(s: Any) -> dict[str, Any]:
@@ -233,10 +257,10 @@ async def skyvern_schedule_create(
     if err := validate_workflow_id(workflow_permanent_id, "skyvern_schedule_create"):
         return err
 
-    skyvern = get_skyvern()
+    schedules = _schedule_writes()
     with Timer() as timer:
         try:
-            resp = await skyvern.schedules.create(
+            resp = await schedules.create(
                 workflow_permanent_id,
                 cron_expression=cron_expression,
                 interval_seconds=interval_seconds,
@@ -412,10 +436,8 @@ async def skyvern_schedule_update(
             "Pass at least one field to update, or set exact=true to do a full replace.",
         )
 
-    # Single SDK client for both the optional GET and the PUT — sharing one
-    # instance avoids any auth-context drift if get_skyvern() ever returns
-    # a fresh client per call.
-    skyvern = get_skyvern()
+    # One client for both the optional GET and the PUT, so both calls carry the same auth.
+    schedules = _schedule_writes()
 
     # One Timer covers the whole operation so timing_ms reports total wall
     # time including the partial-mode fetch (marked sdk_fetch) plus the PUT
@@ -448,7 +470,7 @@ async def skyvern_schedule_update(
             body_description = None if clear_description else description
         else:
             try:
-                existing_resp = await skyvern.schedules.get(workflow_permanent_id, workflow_schedule_id)
+                existing_resp = await schedules.get(workflow_permanent_id, workflow_schedule_id)
                 timer.mark("sdk_fetch")
             except ApiError as e:
                 if e.status_code == 404:
@@ -507,7 +529,7 @@ async def skyvern_schedule_update(
             )
 
         try:
-            resp = await skyvern.schedules.update(
+            resp = await schedules.update(
                 workflow_permanent_id,
                 workflow_schedule_id,
                 cron_expression=body_cron,
@@ -567,10 +589,10 @@ async def skyvern_schedule_enable(
     if err := validate_schedule_id(workflow_schedule_id, "skyvern_schedule_enable"):
         return err
 
-    skyvern = get_skyvern()
+    schedules = _schedule_writes()
     with Timer() as timer:
         try:
-            resp = await skyvern.schedules.enable(workflow_permanent_id, workflow_schedule_id)
+            resp = await schedules.enable(workflow_permanent_id, workflow_schedule_id)
             timer.mark("sdk")
         except ApiError as e:
             if e.status_code == 404:
@@ -596,10 +618,10 @@ async def skyvern_schedule_disable(
     if err := validate_schedule_id(workflow_schedule_id, "skyvern_schedule_disable"):
         return err
 
-    skyvern = get_skyvern()
+    schedules = _schedule_writes()
     with Timer() as timer:
         try:
-            resp = await skyvern.schedules.disable(workflow_permanent_id, workflow_schedule_id)
+            resp = await schedules.disable(workflow_permanent_id, workflow_schedule_id)
             timer.mark("sdk")
         except ApiError as e:
             if e.status_code == 404:
@@ -626,10 +648,10 @@ async def skyvern_schedule_cancel(
     if err := validate_schedule_id(workflow_schedule_id, "skyvern_schedule_cancel"):
         return err
 
-    skyvern = get_skyvern()
+    schedules = _schedule_writes()
     with Timer() as timer:
         try:
-            resp = await skyvern.schedules.cancel(workflow_permanent_id, workflow_schedule_id)
+            resp = await schedules.cancel(workflow_permanent_id, workflow_schedule_id)
             timer.mark("sdk")
         except ApiError as e:
             if e.status_code == 404:
