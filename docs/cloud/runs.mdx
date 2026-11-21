@@ -34,7 +34,7 @@ A **run** is one execution of an agent. Every run gets an ID starting with `wr_`
   </Step>
 </Steps>
 
-<img src="/images/cloud/cloud-run-agent-form.png" alt="Run form with Inputs, Settings (Webhook Callback URL, Proxy Location, Run With, AI Fallback), Advanced Settings, Copy API Command and Run agent" />
+<img src="/images/cloud/cloud-run-agent-form.png" alt="Run form with Inputs, Settings (Webhook Callback URL, Proxy Location), Advanced Settings, Copy API Command and Run agent" />
 
 The defaults work for most runs. The settings you are most likely to change:
 
@@ -42,8 +42,6 @@ The defaults work for most runs. The settings you are most likely to change:
 |---|---|
 | **Webhook Callback URL** | Skyvern posts the run's result to this URL when it finishes. **Test Webhook** sends a sample. |
 | **Proxy Location** | The country the browser's traffic comes from. Defaults to a US residential proxy. |
-| **Run With** | **Skyvern Agent** runs every step with AI. **Code** runs the agent's generated code (once it has been generated). |
-| **AI Fallback (cached scripts)** | When a code run fails, AI tries to fix the step and regenerate the code. On by default. |
 
 **Advanced Settings** holds browser options: **Browser Type**, **Browser Session ID** (run in an open session), **Reuse browser session**, **Browser Profile** (start with saved cookies and logins), **Browser Address** (connect to your own browser over CDP), **Extra HTTP Headers**, **CDP Connect Headers** and **Max Screenshot Scrolls**. [Browsers](/browsers) explains sessions and profiles.
 
@@ -73,14 +71,13 @@ Click **Stop** in the top bar, then **Stop run** to confirm. The run ends with s
 
 ## Read a run
 
-The **Run** pane has three views, plus more under **⋯**:
+The **Run** pane has three views:
 
 | View | What it shows |
 |---|---|
 | **Timeline** | Each block in order with its status, and the actions inside it. Click a block to see its details. |
-| **Inputs** | The input values and settings this run used, such as browser session, profile and **Run with** |
+| **Inputs** | The input values and settings this run used, such as browser session and profile |
 | **Outputs** | **Extracted information**, **Run outputs**, **Errors**, **Webhook failure reason** and **Downloaded files** |
-| **⋯** → **Code** | The code generated for this run |
 
 <img src="/images/cloud/cloud-run-timeline.png" alt="A completed run with the Browser pane on Screenshots and the Run pane Timeline showing the block and its action" />
 

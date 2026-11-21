@@ -386,9 +386,8 @@ Use `page.agent.*` when the run must start from a browser you prepared, for exam
 
 After an agent run succeeds, Skyvern can generate code from the actions it took. Later runs can execute that code directly instead of asking the model at each step, which makes them faster and cheaper.
 
-- In Studio, open the agent's **Start** block settings and set **Run With** to **Code**. **Skyvern Agent** always uses the model.
-- **AI Fallback (cached scripts)** is on by default: if the cached code fails, for example because the page changed, Skyvern falls back to the agent and regenerates the code.
-- From code, override the setting for one run with `run_with`:
+- Choose code for a run with `run_with="code"`. `"agent"` always uses the model. Studio has no setting for this, so set it from the API or SDK.
+- `ai_fallback` is on by default: if the cached code fails, for example because the page changed, Skyvern falls back to the agent and regenerates the code.
 
 <CodeGroup>
 ```python Python
