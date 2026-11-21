@@ -38,7 +38,7 @@ type BrokerCredentialSelectorBase = Readonly<{
 
 export type BrokerCredentialSelectorProps = BrokerCredentialSelectorBase &
   (
-    | Readonly<{ provider: "powerbi" }>
+    | Readonly<{ provider: "powerbi"; nodeId?: string }>
     | Readonly<{
         provider: "gmail";
         nodeId: string;
@@ -102,6 +102,7 @@ export type PermissionsState =
 export type PageSlots = {
   powerBIDatasetPicker?: React.ComponentType<
     Readonly<{
+      credentialSource?: "native" | "nango";
       connectionId: string;
       value: string;
       disabled: boolean;
