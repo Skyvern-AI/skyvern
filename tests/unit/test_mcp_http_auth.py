@@ -1083,6 +1083,7 @@ async def test_validate_mcp_oauth_token_passes_clock_skew_leeway_to_pyjwt(
             AGENT_FUNCTION=SimpleNamespace(
                 get_mcp_oauth_jwt_key=AsyncMock(return_value="jwk"),
                 resolve_mcp_oauth_member_api_key=AsyncMock(return_value=None),
+                ensure_api_key_issuance_allowed=AsyncMock(return_value=None),
             )
         ),
     )
