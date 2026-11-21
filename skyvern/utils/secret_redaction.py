@@ -176,7 +176,8 @@ _TRAILING_EXTENSION_RE = re.compile(r"\.[A-Za-z0-9]{1,5}\Z")
 # A quoted or `=`-delimited value, so the text scan applies the same whole-value hex rule as the parsed walk.
 _DELIMITED_HEX_VALUE_RE = re.compile(r'(?<=")[0-9A-Fa-f]{32,}(?=\\?")|(?<==)[0-9A-Fa-f]{32,}(?![A-Za-z0-9_.~%+-])')
 _MAX_BASE64_POST_DATA_CHARS = 16 * 1024 * 1024
-# Urlencoding encodes both, so raw whitespace or a quote means the text is not urlencoded.
+# Urlencoding encodes both, so raw whitespace or a quote means the text is not urlencoded; a trailing newline or space
+# is tolerated, since senders often append one.
 _NOT_URLENCODED_RE = re.compile(r'[\s"]')
 
 
@@ -797,8 +798,12 @@ def _scrubbed_body_text(mime_type: Any, text: str) -> str | None:
     mime = mime_type.lower() if isinstance(mime_type, str) else ""
     # Urlencoded text is read first: its scrub can start the text with the `[REDACTED_SECRET]` name, which would look
     # like JSON on the next pass.
-    if "application/x-www-form-urlencoded" in mime and not _NOT_URLENCODED_RE.search(text):
-        return _redact_named_urlencoded_values(text, _NORMALIZED_FORM_FIELD_NAMES, _NAMED_FORM_VALUE_SCRUB)
+    if "application/x-www-form-urlencoded" in mime:
+        # The trailing line break is scrubbed apart: kept on the last value, it defeats whole-value shape matching.
+        core = text.rstrip("\r\n")
+        if not _NOT_URLENCODED_RE.search(core):
+            scrubbed = _redact_named_urlencoded_values(core, _NORMALIZED_FORM_FIELD_NAMES, _NAMED_FORM_VALUE_SCRUB)
+            return scrubbed + text[len(core) :]
     if "json" in mime or _looks_like_json(text):
         return _scrub_json_text(text)
     return None
@@ -815,9 +820,12 @@ def _strict_base64_text(text: str) -> str | None:
 
 def _redact_post_data_text(post_data: dict[str, Any]) -> None:
     """Keeps a request body only when it is empty, JSON that parses, or plain urlencoded text, scrubbed; anything
-    else is withheld. The recorder stores no body text today, so this withholds nothing it writes."""
+    else is withheld."""
     text = post_data.get("text")
-    if text is None or text in ("", REDACTED_SECRET_PLACEHOLDER):
+    if text is None or text == "":
+        return
+    if text == REDACTED_SECRET_PLACEHOLDER:
+        post_data.pop("encoding", None)
         return
     if not isinstance(text, str):
         post_data.pop("encoding", None)
