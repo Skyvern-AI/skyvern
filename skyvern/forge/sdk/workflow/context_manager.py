@@ -3319,10 +3319,9 @@ class WorkflowContextManager:
         return settings.ENABLE_SECRET_ARTIFACT_REDACTION and self.mask_secrets_enabled_for_run(workflow_run_id)
 
     def artifact_redaction_enabled(self, workflow_run_id: str | None) -> bool:
-        """Whether persisted artifacts and browser diagnostics should be redacted.
+        """Whether a run gets the full secret scrub: LLM-bound text, failure text and stored artifacts.
 
-        Bare tasks have no workflow Mask Secrets setting, so only the global kill switch applies.
-        Workflow runs retain their per-run opt-in.
+        Bare tasks follow the global switch alone; workflow runs follow Mask Secrets.
         """
         if workflow_run_id is None:
             return settings.ENABLE_SECRET_ARTIFACT_REDACTION

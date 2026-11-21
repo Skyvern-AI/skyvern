@@ -26,7 +26,7 @@ from skyvern.forge.sdk.artifact.signing import (
     sign_artifact_url,
     verify_artifact_signature,
 )
-from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
+from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, artifact_filename_from_uri
 from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import generate_artifact_id
@@ -36,10 +36,12 @@ from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.utils.secret_redaction import (
+    MIN_UNANCHORED_SECRET_LENGTH,
     REDACTION_FAILED_STUB,
     redact_har_bytes,
     redact_multi_field_totp_artifact_bytes,
     redact_secrets_from_bytes,
+    redact_secrets_from_json_bytes,
 )
 
 if TYPE_CHECKING:
@@ -110,6 +112,13 @@ _REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
 )
 
 
+_JSON_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
+    artifact_type
+    for artifact_type in _REDACTABLE_TEXT_ARTIFACT_TYPES
+    if FILE_EXTENTSION_MAP.get(artifact_type) == "json"
+)
+
+
 # HARs take their own path through `_scrub_har`.
 _MULTI_FIELD_TOTP_TEXT_ARTIFACT_TYPES = _REDACTABLE_TEXT_ARTIFACT_TYPES | frozenset(
     {
@@ -151,6 +160,18 @@ def _warn_if_run_context_missing(artifact_type: ArtifactType, workflow_run_id: s
     )
 
 
+def _all_runs_artifact_secret_values(artifact_type: ArtifactType, workflow_run_id: str | None) -> set[str]:
+    # Shorter values match on word boundaries and would rewrite ordinary words such as a short username;
+    # browser diagnostics keep the runtime-code floor they already had.
+    values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
+        workflow_run_id, respect_artifact_redaction_flag=False
+    )
+    long_values = {value for value in values if len(value) >= MIN_UNANCHORED_SECRET_LENGTH}
+    if artifact_type in (ArtifactType.HAR, ArtifactType.BROWSER_CONSOLE_LOG):
+        long_values |= app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+    return long_values
+
+
 def _resolve_redaction_workflow_run_id(workflow_run_id: str | None) -> str | None:
     if workflow_run_id:
         return workflow_run_id
@@ -177,9 +198,16 @@ def _har_redaction_inputs(workflow_run_id: str | None) -> tuple[set[str], frozen
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
         else:
             _warn_if_run_context_missing(ArtifactType.HAR, resolved_workflow_run_id)
-            # Opted-out runs get the header, cookie and named-field scrub under the global switch,
-            # plus runtime-resolved secrets (e.g. verification codes).
-            secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            # Opted-out runs get the header, cookie and named-field scrub under the global switch, plus
+            # runtime-resolved secrets (e.g. verification codes) and, under the all-runs switch, long values.
+            if settings.ENABLE_SECRET_ARTIFACT_REDACTION and settings.ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS:
+                try:
+                    secret_values = _all_runs_artifact_secret_values(ArtifactType.HAR, resolved_workflow_run_id)
+                except Exception:
+                    LOG.warning("Secret lookup failed; storing HAR with the runtime-code scrub", exc_info=True)
+                    secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            else:
+                secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
             if (
                 not settings.ENABLE_SECRET_ARTIFACT_REDACTION
                 and not secret_values
@@ -221,11 +249,14 @@ def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workfl
         resolved_workflow_run_id = _resolve_redaction_workflow_run_id(workflow_run_id)
         if not app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(resolved_workflow_run_id):
             _warn_if_run_context_missing(artifact_type, resolved_workflow_run_id)
-            # Runtime-resolved secrets (e.g. verification codes) still redact from browser
-            # diagnostics under the global switch alone, matching the workflow-finalization floor.
-            if artifact_type != ArtifactType.BROWSER_CONSOLE_LOG:
+            if settings.ENABLE_SECRET_ARTIFACT_REDACTION and settings.ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS:
+                secret_values = _all_runs_artifact_secret_values(artifact_type, resolved_workflow_run_id)
+            elif artifact_type == ArtifactType.BROWSER_CONSOLE_LOG:
+                # Runtime-resolved secrets (e.g. verification codes) still redact from browser
+                # diagnostics under the global switch alone, matching the workflow-finalization floor.
+                secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            else:
                 return data
-            secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
             if not secret_values and not skyvern_context.multi_field_totp_masking_task_ids():
                 return data
         else:
@@ -239,6 +270,11 @@ def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workfl
     placeholder_ids = _placeholder_ids_for_run(resolved_workflow_run_id)
     if not secret_values and not skyvern_context.multi_field_totp_masking_task_ids():
         return data
+    # A JSON artifact's root can be a bare number or string (a scalar extraction result).
+    if secret_values and (artifact_type in _JSON_TEXT_ARTIFACT_TYPES or data.lstrip()[:1] in (b"{", b"[")):
+        scrubbed = redact_secrets_from_json_bytes(data, secret_values, placeholder_ids=placeholder_ids)
+        if scrubbed is not None:
+            return scrubbed
     return redact_secrets_from_bytes(data, secret_values, multi_field_totp=False, placeholder_ids=placeholder_ids)
 
 
