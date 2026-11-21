@@ -18,6 +18,7 @@ import { helpTooltips } from "../../helpContent";
 import { SftpPrivateKeyField } from "../components/SftpPrivateKeyField";
 import { type FileUploadNode, type FileUploadNodeData } from "./types";
 import { useUpdate } from "../../useUpdate";
+import { useGoogleDriveFolderHelp } from "../useGoogleDriveFolderHelp";
 
 function FileUploadEditor({ blockId }: { blockId: string }) {
   // Subscribe to this node's data slice. The sidebar mount lives outside the
@@ -37,6 +38,7 @@ function FileUploadEditorBody({
   blockId: string;
   data: FileUploadNodeData;
 }) {
+  const driveFolderHelp = useGoogleDriveFolderHelp();
   const {
     editable,
     storageType,
@@ -314,7 +316,7 @@ function FileUploadEditorBody({
               <Label className="text-sm text-muted-foreground">
                 Google Drive Folder ID (Optional)
               </Label>
-              <HelpTooltip content="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root." />
+              <HelpTooltip content={driveFolderHelp} />
             </div>
             <WorkflowBlockInputTextarea
               name="googleDriveFolderId"

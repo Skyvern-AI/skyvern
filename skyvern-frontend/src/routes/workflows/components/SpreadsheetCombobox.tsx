@@ -205,6 +205,8 @@ function SpreadsheetListPanel({
     () => listing.data?.pages.flatMap((p) => p.spreadsheets) ?? [],
     [listing.data],
   );
+  const searchIncomplete =
+    listing.data?.pages.some((p) => p.incomplete_search) ?? false;
 
   // Reset dedup so a new credential gets a fresh error window.
   useEffect(() => {
@@ -337,6 +339,12 @@ function SpreadsheetListPanel({
           </>
         )}
       </div>
+      {searchIncomplete ? (
+        <div className="border-t px-3 py-2 text-xs text-muted-foreground dark:text-slate-500">
+          Some shared drives could not be searched. If a spreadsheet is missing,
+          paste its URL.
+        </div>
+      ) : null}
     </>
   );
 }

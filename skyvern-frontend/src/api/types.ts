@@ -551,6 +551,7 @@ export interface GoogleSpreadsheetSummary {
 export interface PagedGoogleSpreadsheets {
   spreadsheets: GoogleSpreadsheetSummary[];
   next_page_token: string | null;
+  incomplete_search?: boolean;
 }
 
 export interface GoogleSheetTab {
