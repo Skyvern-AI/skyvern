@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -10,7 +11,7 @@ import pytest
 from skyvern.forge.agent import ForgeAgent, SpeculativePlan, StepPromptResult
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.schemas.runs import RunEngine
@@ -19,6 +20,7 @@ from skyvern.utils import stall_watch
 from skyvern.webeye.actions.actions import ClickAction, CompleteAction, ExtractAction
 from skyvern.webeye.actions.responses import ActionSuccess
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
+from skyvern.webeye.scraper.scraper import hash_element, trim_element_tree
 from tests.unit.helpers import (
     make_browser_state,
     make_organization,
@@ -869,48 +871,210 @@ async def test_agent_step_persists_artifacts_when_using_speculative_plan(
     agent._persist_scrape_artifacts.assert_awaited_once()
 
 
-def _typed_form_tree(trimmed: bool = False) -> list[dict]:
-    # Trimming drops the contenteditable attribute but keeps the ids of the editable elements.
-    editable = {} if trimmed else {"contenteditable": "true"}
-    return [
-        {
-            "tagName": "form",
-            "children": [
-                {"tagName": "input", "attributes": {"type": "email", "value": "jane@example.com"}},
-                {"tagName": "div", "children": [{"tagName": "textarea", "attributes": {"value": "note text"}}]},
-                {"tagName": "input", "attributes": {"value": "untyped"}},
-                {"tagName": "input", "attributes": {"type": "hidden", "value": "tok123"}},
-                {"tagName": "input", "attributes": {"type": "text", "value": ""}},
-                {"tagName": "input", "attributes": {"type": "password", "value": "******"}},
-                {"tagName": "input", "attributes": {"type": "checkbox", "value": "on", "checked": True}},
-                {"tagName": "input", "attributes": {"type": "SUBMIT", "value": "Send now"}},
-                {"tagName": "button", "attributes": {"value": "go"}, "text": "Go"},
-                {"tagName": "textarea", "attributes": {"value": "synced body"}, "text": "synced body"},
-                {"tagName": "textarea", "attributes": {"value": ""}, "text": ""},
-                {
-                    "tagName": "div",
-                    "id": "ce-1",
-                    "attributes": editable,
-                    "text": "typed in editor",
-                    "children": [{"tagName": "p", "id": "ce-2", "text": "second line"}],
+def _marker(typed: str) -> str:
+    return f"[REDACTED_INPUT len={len(typed)}]"
+
+
+def _form_rows() -> list[tuple[dict, dict]]:
+    """Each row is (live element, element as stored)."""
+    link = "https://docs.example/share?k=SECRETTOKEN42"
+    message = "Please include an '@'. 'BADMAILjane' is missing an '@'."
+    forwarded = "Please include an '@'. 'janedoe' is missing an '@'."
+    rows: list[tuple[dict, dict]] = [
+        (
+            {
+                "tagName": "input",
+                "attributes": {
+                    "type": "email",
+                    "value": "jane@example.com",
+                    "data-value": "jane@example.com",
+                    "defaultvalue": "jane@example.com",
                 },
-            ],
-        }
+            },
+            {
+                "tagName": "input",
+                "attributes": {
+                    "type": "email",
+                    "value": _marker("jane@example.com"),
+                    "data-value": _marker("jane@example.com"),
+                    "defaultvalue": _marker("jane@example.com"),
+                },
+            },
+        ),
+        (
+            {"tagName": "div", "children": [{"tagName": "textarea", "attributes": {"value": "note text"}}]},
+            {"tagName": "div", "children": [{"tagName": "textarea", "attributes": {"value": _marker("note text")}}]},
+        ),
+        ({"tagName": "input", "attributes": {"value": "untyped"}}, None),
+        ({"tagName": "input", "attributes": {"type": "hidden", "value": "tok123"}}, None),
+        ({"tagName": "input", "attributes": {"type": "text", "value": ""}}, "same"),
+        ({"tagName": "input", "attributes": {"type": "password", "value": "******"}}, "same"),
+        ({"tagName": "input", "attributes": {"type": "checkbox", "value": "on", "checked": True}}, "same"),
+        ({"tagName": "input", "attributes": {"type": "SUBMIT", "value": "Send now"}}, "same"),
+        ({"tagName": "button", "attributes": {"value": "go"}, "text": "Go"}, "same"),
+        ({"tagName": "button", "interactable": True, "attributes": {"name": "action", "value": "save"}}, "same"),
+        (
+            {"tagName": "textarea", "attributes": {"value": "synced body"}, "text": "synced body"},
+            {"tagName": "textarea", "attributes": {"value": _marker("synced body")}, "text": _marker("synced body")},
+        ),
+        ({"tagName": "textarea", "attributes": {"value": ""}, "text": ""}, "same"),
+        (
+            {
+                "tagName": "div",
+                "id": "ce-1",
+                "attributes": {"contenteditable": "true"},
+                "text": "typed in editor",
+                "children": [
+                    {"tagName": "p", "id": "ce-2", "text": "second line"},
+                    {"tagName": "a", "attributes": {"href": link}, "text": link},
+                ],
+            },
+            {
+                "tagName": "div",
+                "id": "ce-1",
+                "attributes": {"contenteditable": "true"},
+                "text": _marker("typed in editor"),
+                "children": [
+                    {"tagName": "p", "id": "ce-2", "text": _marker("second line")},
+                    {"tagName": "a", "attributes": {"href": _marker(link)}, "text": _marker(link)},
+                ],
+            },
+        ),
+        (
+            {"tagName": "a", "interactable": True, "attributes": {"href": "https://example.com/help"}, "text": "Help"},
+            "same",
+        ),
+        (
+            {
+                "tagName": "div",
+                "id": "dm-1",
+                "interactable": True,
+                "isContentEditable": True,
+                "text": "design mode text",
+            },
+            {
+                "tagName": "div",
+                "id": "dm-1",
+                "interactable": True,
+                "isContentEditable": True,
+                "text": _marker("design mode text"),
+            },
+        ),
+        (
+            {
+                "tagName": "div",
+                "interactable": True,
+                "isContentEditable": True,
+                "attributes": {"role": "spinbutton", "aria-valuenow": "1987", "aria-valuetext": "1987"},
+                "text": "1987",
+            },
+            {
+                "tagName": "div",
+                "interactable": True,
+                "isContentEditable": True,
+                "attributes": {
+                    "role": "spinbutton",
+                    "aria-valuenow": _marker("1987"),
+                    "aria-valuetext": _marker("1987"),
+                },
+                "text": _marker("1987"),
+            },
+        ),
+        (
+            {"tagName": "div", "interactable": True, "attributes": {"role": "slider", "aria-valuetext": "73 kg"}},
+            {
+                "tagName": "div",
+                "interactable": True,
+                "attributes": {"role": "slider", "aria-valuetext": _marker("73 kg")},
+            },
+        ),
+        (
+            {
+                "tagName": "input",
+                "attributes": {"type": "email", "value": "BADMAILjane", "invalid": True, "validationMessage": message},
+            },
+            {"tagName": "input", "attributes": {"type": "email", "value": _marker("BADMAILjane"), "invalid": True}},
+        ),
+        (
+            {
+                "tagName": "input",
+                "attributes": {
+                    "type": "text",
+                    "value": "",
+                    "invalid": True,
+                    "validationMessage": "Fill out this field.",
+                },
+            },
+            "same",
+        ),
+        (
+            {
+                "tagName": "x-input",
+                "interactable": True,
+                "attributes": {"type": "email", "invalid": True, "validationMessage": forwarded},
+            },
+            {"tagName": "x-input", "interactable": True, "attributes": {"type": "email", "invalid": True}},
+        ),
+        (
+            {"tagName": "x-field", "interactable": True, "attributes": {"role": "textbox", "value": "custom typed"}},
+            {
+                "tagName": "x-field",
+                "interactable": True,
+                "attributes": {"role": "textbox", "value": _marker("custom typed")},
+            },
+        ),
+        (
+            {"tagName": "x-entry", "attributes": {"type": "email", "value": "typed entry"}},
+            {"tagName": "x-entry", "attributes": {"type": "email", "value": _marker("typed entry")}},
+        ),
+        (
+            {
+                "tagName": "x-editor",
+                "isContentEditable": True,
+                "attributes": {"value": "draft42"},
+                "text": "draft body",
+            },
+            {
+                "tagName": "x-editor",
+                "isContentEditable": True,
+                "attributes": {"value": _marker("draft42")},
+                "text": _marker("draft body"),
+            },
+        ),
+        (
+            {"tagName": "div", "interactable": True, "attributes": {"role": "spinbutton"}, "text": "2001"},
+            {"tagName": "div", "interactable": True, "attributes": {"role": "spinbutton"}, "text": _marker("2001")},
+        ),
+        (
+            {"tagName": "div", "interactable": True, "attributes": {"role": "textbox"}, "text": "TBSECRET42"},
+            {"tagName": "div", "interactable": True, "attributes": {"role": "textbox"}, "text": _marker("TBSECRET42")},
+        ),
+        ({"tagName": "div", "interactable": True, "attributes": {"role": "combobox"}, "text": "Choose a plan"}, "same"),
+        ({"tagName": "x-option", "interactable": True, "attributes": {"value": "plan-annual"}}, "same"),
+        ({"tagName": "div", "attributes": {"type": "email", "value": "page constant"}}, "same"),
+        ({"tagName": "x-badge", "attributes": {"value": "page badge"}}, "same"),
     ]
+    resolved: list[tuple[dict, dict]] = []
+    for live, stored in rows:
+        if stored == "same":
+            stored = copy.deepcopy(live)
+        elif stored is None:
+            stored = copy.deepcopy(live)
+            stored["attributes"]["value"] = _marker(live["attributes"]["value"])
+        resolved.append((live, stored))
+    return resolved
 
 
-def _redacted_form_tree(trimmed: bool = False) -> list[dict]:
-    tree = _typed_form_tree(trimmed)
-    children = tree[0]["children"]
-    children[0]["attributes"]["value"] = "[REDACTED_INPUT len=16]"
-    children[1]["children"][0]["attributes"]["value"] = "[REDACTED_INPUT len=9]"
-    children[2]["attributes"]["value"] = "[REDACTED_INPUT len=7]"
-    children[3]["attributes"]["value"] = "[REDACTED_INPUT len=6]"
-    children[9]["attributes"]["value"] = "[REDACTED_INPUT len=11]"
-    children[9]["text"] = "[REDACTED_INPUT len=11]"
-    children[11]["text"] = "[REDACTED_INPUT len=15]"
-    children[11]["children"][0]["text"] = "[REDACTED_INPUT len=11]"
-    return tree
+def _typed_form_tree() -> list[dict]:
+    return [{"tagName": "form", "children": [live for live, _ in _form_rows()]}]
+
+
+def _redacted_form_tree() -> list[dict]:
+    return [{"tagName": "form", "children": [stored for _, stored in _form_rows()]}]
+
+
+def _trimmed(tree: list[dict]) -> list[dict]:
+    return trim_element_tree(copy.deepcopy(tree))
 
 
 @pytest.mark.asyncio
@@ -927,21 +1091,6 @@ async def test_persist_scrape_artifacts_stores_trees_without_input_values(
 
     async def _dummy_cleanup(*_args, **_kwargs) -> list[dict]:
         return []
-
-    scraped_page = ScrapedPage(
-        elements=[],
-        element_tree=_typed_form_tree(),
-        element_tree_trimmed=_typed_form_tree(trimmed=True),
-        _browser_state=browser_state,
-        _clean_up_func=_dummy_cleanup,
-        _scrape_exclude=None,
-    )
-    scraped_page.html = "<html></html>"
-    scraped_page.id_to_css_dict = {"node-1": "#node"}
-    scraped_page.id_to_frame_dict = {"node-1": "frame-1"}
-    scraped_page.last_used_element_tree_html = "<prompt variant>"
-    live_tree = scraped_page.element_tree
-    live_trimmed = scraped_page.element_tree_trimmed
 
     stored: dict[str, bytes] = {}
 
@@ -972,21 +1121,39 @@ async def test_persist_scrape_artifacts_stores_trees_without_input_values(
     monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_scrape_to_archive", record_archive)
     monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.create_artifact", record_create)
 
+    # The enriched tree keeps validation state in the trimmed tree, so its masking reaches IN_PROMPT.
     context = SkyvernContext(
         task_id=task.task_id,
         organization_id=task.organization_id,
         workflow_run_id=task.workflow_run_id,
         tz_info=ZoneInfo("UTC"),
+        enrich_tree_mode=EnrichTreeMode.ENRICHED_TREE,
     )
     with skyvern_context.scoped(context):
+        scraped_page = ScrapedPage(
+            elements=[],
+            element_tree=_typed_form_tree(),
+            element_tree_trimmed=_trimmed(_typed_form_tree()),
+            _browser_state=browser_state,
+            _clean_up_func=_dummy_cleanup,
+            _scrape_exclude=None,
+        )
+        scraped_page.html = "<html></html>"
+        scraped_page.id_to_css_dict = {"node-1": "#node"}
+        scraped_page.id_to_frame_dict = {"node-1": "frame-1"}
+        scraped_page.last_used_element_tree_html = "<prompt variant>"
+        live_tree = scraped_page.element_tree
+        live_trimmed = scraped_page.element_tree_trimmed
+
         await agent._persist_scrape_artifacts(
             task=task, step=step, scraped_page=scraped_page, context=context if use_archive else None
         )
 
+        expected_trimmed = _trimmed(_redacted_form_tree())
         expected_page = ScrapedPage(
             elements=[],
             element_tree=_redacted_form_tree(),
-            element_tree_trimmed=_redacted_form_tree(trimmed=True),
+            element_tree_trimmed=expected_trimmed,
             _browser_state=browser_state,
             _clean_up_func=_dummy_cleanup,
             _scrape_exclude=None,
@@ -995,18 +1162,19 @@ async def test_persist_scrape_artifacts_stores_trees_without_input_values(
         live_page = ScrapedPage(
             elements=[],
             element_tree=_typed_form_tree(),
-            element_tree_trimmed=_typed_form_tree(trimmed=True),
+            element_tree_trimmed=_trimmed(_typed_form_tree()),
             _browser_state=browser_state,
             _clean_up_func=_dummy_cleanup,
             _scrape_exclude=None,
         )
         expected_live_html = live_page.build_element_tree(ElementTreeFormat.HTML)
+        live_trimmed_again = _trimmed(_typed_form_tree())
 
     assert stored["html"] == b"<html></html>"
     assert json.loads(stored["id_css_map"]) == {"node-1": "#node"}
     assert json.loads(stored["id_frame_map"]) == {"node-1": "frame-1"}
     assert json.loads(stored["tree"]) == _redacted_form_tree()
-    assert json.loads(stored["trimmed"]) == _redacted_form_tree(trimmed=True)
+    assert json.loads(stored["trimmed"]) == expected_trimmed
     assert stored["in_prompt"].decode() == expected_in_prompt
     for blob in (stored["tree"], stored["trimmed"], stored["in_prompt"]):
         for typed in (
@@ -1017,19 +1185,45 @@ async def test_persist_scrape_artifacts_stores_trees_without_input_values(
             b"synced body",
             b"typed in editor",
             b"second line",
+            b"SECRETTOKEN42",
+            b"design mode text",
+            b"1987",
+            b"73 kg",
+            b"BADMAILjane",
+            b"janedoe",
+            b"custom typed",
+            b"typed entry",
+            b"draft42",
+            b"draft body",
+            b"2001",
+            b"TBSECRET42",
         ):
             assert typed not in blob
     in_prompt = stored["in_prompt"].decode()
-    assert 'value="Send now"' in in_prompt
-    assert 'value="go"' in in_prompt
-    assert ">Go</button>" in in_prompt
-    assert 'value="******"' in in_prompt
-    assert 'checked="true"' in in_prompt
+    for kept in (
+        'value="Send now"',
+        'value="go"',
+        ">Go</button>",
+        'value="save"',
+        'value="******"',
+        'checked="true"',
+        'invalid="true"',
+        "Fill out this field.",
+        'href="https://example.com/help"',
+        'value="plan-annual"',
+        'value="page constant"',
+        'value="page badge"',
+        ">Choose a plan</div>",
+    ):
+        assert kept in in_prompt
+    editable_node = {"tagName": "div", "isContentEditable": True, "text": "x"}
+    assert "isContentEditable" not in json.dumps(trim_element_tree([dict(editable_node)]))
+    assert hash_element(editable_node) == hash_element({"tagName": "div", "text": "x"})
 
     assert scraped_page.element_tree is live_tree
     assert scraped_page.element_tree_trimmed is live_trimmed
     assert live_tree == _typed_form_tree()
-    assert live_trimmed == _typed_form_tree(trimmed=True)
+    assert live_trimmed == live_trimmed_again
     assert scraped_page.last_used_element_tree_html == expected_live_html
     assert 'value="jane@example.com"' in expected_live_html
     assert scraped_page.last_used_element_tree is live_trimmed
