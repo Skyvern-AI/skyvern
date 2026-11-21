@@ -1755,8 +1755,17 @@ class UnresolvableHost(BlockedHost):
 
 
 class InvalidWorkflowParameter(SkyvernHTTPException):
-    def __init__(self, expected_parameter_type: str, value: str, workflow_permanent_id: str | None = None) -> None:
-        message = f"Invalid workflow parameter. Expected parameter type: {expected_parameter_type}. Value: {value}."
+    # The message reaches the response body, the request log and the run's failure reason, so it names the
+    # parameter and never the rejected value; the caller already has what it sent.
+    def __init__(
+        self,
+        expected_parameter_type: str,
+        parameter_key: str | None = None,
+        workflow_permanent_id: str | None = None,
+    ) -> None:
+        message = f"Invalid workflow parameter. Expected parameter type: {expected_parameter_type}."
+        if parameter_key:
+            message += f" Parameter: {parameter_key}."
         if workflow_permanent_id:
             message += f" Workflow permanent id: {workflow_permanent_id}"
         super().__init__(

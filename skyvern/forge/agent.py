@@ -6743,15 +6743,17 @@ class ForgeAgent:
                         LOG.info(
                             "Previous action succeeded, but we'll still continue.",
                             step_order=step.order,
-                            previous_action=previous_action,
-                            previous_result=previous_result,
+                            previous_action_id=previous_action.action_id,
+                            previous_action_type=previous_action.action_type,
+                            previous_result_success=True,
                         )
                     else:
                         LOG.warning(
                             "Previous action failed, so handle the next action.",
                             step_order=step.order,
-                            previous_action=previous_action,
-                            previous_result=previous_result,
+                            previous_action_id=previous_action.action_id,
+                            previous_action_type=previous_action.action_type,
+                            previous_result_success=False if previous_result else None,
                         )
 
                 element_id_to_last_action[action.element_id] = action_idx
@@ -6957,7 +6959,8 @@ class ForgeAgent:
                         step_retry=step.retry_index,
                         action_idx=action_idx,
                         action=action,
-                        next_action=action_node.next.action,
+                        next_action_id=action_node.next.action.action_id,
+                        next_action_type=action_node.next.action.action_type,
                         action_result=results,
                     )
                     continue
@@ -7605,7 +7608,7 @@ class ForgeAgent:
     ) -> list[Action]:
         LOG.info(
             "Anthropic CU call starts",
-            tool_results=llm_caller.current_tool_results,
+            tool_results_count=len(llm_caller.current_tool_results),
             message_length=len(llm_caller.message_history),
         )
         if llm_caller.current_tool_results:
@@ -10187,7 +10190,10 @@ class ForgeAgent:
                         if action_result.success:
                             LOG.info(
                                 "Extracted information for task",
-                                extracted_information=action_result.data,
+                                extracted_information_type=type(action_result.data).__name__,
+                                extracted_information_size=len(action_result.data)
+                                if isinstance(action_result.data, (dict, list, str))
+                                else None,
                             )
                             return action_result.data
                 # For CUA-style engines, the model returns its answer
@@ -10795,7 +10801,7 @@ class ForgeAgent:
                 "Sending task response to webhook callback url",
                 task_id=task.task_id,
                 webhook_callback_url=task.webhook_callback_url,
-                headers=signed_data.headers,
+                webhook_timestamp=signed_data.headers.get("x-skyvern-timestamp"),
             )
 
             try:
@@ -10839,7 +10845,7 @@ class ForgeAgent:
                     sampling=True,
                     task_id=task.task_id,
                     resp_code=resp.status_code,
-                    resp_text=resp.text,
+                    resp_text_length=len(resp.text),
                 )
                 await app.DATABASE.tasks.update_task(
                     task_id=task.task_id,
@@ -10852,7 +10858,7 @@ class ForgeAgent:
                     "Webhook failed",
                     task_id=task.task_id,
                     resp_code=resp.status_code,
-                    resp_text=resp.text,
+                    resp_text_length=len(resp.text),
                     status_code=resp.status_code,
                     error_reason=format_http_log_reason(resp.status_code),
                 )

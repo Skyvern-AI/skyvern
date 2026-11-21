@@ -21,8 +21,10 @@ from skyvern.forge import app
 from skyvern.forge.log_redaction import (
     REDACTED,
     SENSITIVE_HEADERS,
+    is_url_log_key,
     redact_sensitive_fields,
     strip_artifact_url_query,
+    strip_url_query,
 )
 from skyvern.forge.request_privacy import private_logging_scope, private_request_audit, private_request_path
 from skyvern.forge.sdk.forge_log import exception_log_fields
@@ -94,6 +96,60 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
     # after their routes go, because a POST that 404s still logs its body.
     re.compile(r"^POST /v1/(?:workflow/copilot|ember)/.+$"),
 )
+# Run routes carry the run's inputs and outputs, so their bodies are logged fail-closed: only ids, status, error
+# detail, timing and run settings keep their values, URLs keep only query names, and every other value is blanked.
+_RUN_PAYLOAD_ENDPOINT_PATTERNS = (
+    re.compile(r"^POST /(?:api/)?v1/run/(?:tasks|agents|workflows)(?:/.*)?$"),
+    re.compile(r"^POST /api/v[12]/tasks$"),
+    re.compile(r"^POST /(?:api/)?v1/workflows/[^/]+/run$"),
+    re.compile(r"^POST /(?:api/)?v1/workflows/runs/[^/]+/(?:retry|continue)$"),
+    re.compile(r"^POST /(?:api/)?v1/sdk/run_action$"),
+    re.compile(r"^POST /(?:api/)?v1/scripts/[^/]+/run$"),
+    re.compile(r"^POST /(?:api/)?v1/workflow_run_groups$"),
+    re.compile(r"^(?:POST|PUT) /(?:api/)?v1/workflows/[^/]+/schedules(?:/.*)?$"),
+    re.compile(r"^POST /(?:api/)?v1/webhook/trigger/[^/]+$"),
+    # Webhook replays return the run's delivered payload, and output summaries take and return run output.
+    re.compile(r"^POST /(?:api/)?v1/(?:runs|tasks)/[^/]+/retry_webhook$"),
+    re.compile(r"^POST /(?:api/)?v1/internal/(?:runs/[^/]+/)?test-webhook$"),
+    re.compile(r"^POST /(?:api/)?v1/prompts/summarize-output$"),
+)
+_RUN_PAYLOAD_KEPT_KEYS = frozenset(
+    {
+        "status",
+        "status_code",
+        "run_type",
+        "task_type",
+        "engine",
+        "run_with",
+        "browser_type",
+        "proxy_location",
+        "browser_seed_source",
+        "created_at",
+        "modified_at",
+        "queued_at",
+        "started_at",
+        "finished_at",
+        "next_attempt_at",
+        "attempt",
+        "step_count",
+        "latency_ms",
+        "max_steps",
+        "max_screenshot_scrolls",
+        "max_elapsed_time_minutes",
+        "download_timeout",
+        "cron_expression",
+        "timezone",
+        "error_code",
+        "detail",
+        "block_labels",
+    }
+)
+# Keys whose objects and lists are walked; their own scalar values are blanked like any other.
+_RUN_PAYLOAD_CONTAINER_KEYS = frozenset({"items", "run_request", "errors", "attempts", "script_run"})
+# A FastAPI validation error keeps `type`, `loc` and `msg`; the `input` and `ctx` it echoes are blanked.
+_VALIDATION_ERROR_KEPT_KEYS = frozenset({"type", "loc", "msg"})
+_RUN_PAYLOAD_ID_RE = re.compile(r"^[a-z]{1,5}_[0-9]+$")
+_RUN_PAYLOAD_ROOT = object()
 _STREAMING_REQUEST_ENDPOINT_PATTERNS = (
     re.compile(r"^POST /(?:api/)?v1/email/(?:inbound/[^/]+|sns-inbound)$"),
     # The internal Gmail send hop carries a whole encoded message; its route reads the body with its own bound.
@@ -289,6 +345,37 @@ def _is_sensitive_endpoint(request: Request) -> bool:
     )
 
 
+def _is_run_payload_endpoint(request: Request) -> bool:
+    # register_agent_route_aliases serves every /workflows route under /agents with the same handler, so the
+    # patterns are matched against the /workflows spelling of the path.
+    path = "/".join("workflows" if segment == "agents" else segment for segment in request.url.path.split("/"))
+    endpoint = f"{request.method.upper()} {path.rstrip('/')}"
+    return any(pattern.fullmatch(endpoint) for pattern in _RUN_PAYLOAD_ENDPOINT_PATTERNS)
+
+
+def _blank_run_payload_fields(key: object, value: typing.Any, parent: object = None) -> typing.Any:
+    if value is None or isinstance(value, bool):
+        return value
+    kept = key in _RUN_PAYLOAD_KEPT_KEYS or (parent == "detail" and key in _VALIDATION_ERROR_KEPT_KEYS)
+    walked = kept or key is _RUN_PAYLOAD_ROOT or key in _RUN_PAYLOAD_CONTAINER_KEYS
+    is_url = is_url_log_key(key)
+    is_id = isinstance(key, str) and key.endswith(("_id", "_ids"))
+    if isinstance(value, dict):
+        if not walked:
+            return REDACTED
+        return {item_key: _blank_run_payload_fields(item_key, item, key) for item_key, item in value.items()}
+    if isinstance(value, list):
+        if not (walked or is_url or is_id):
+            return REDACTED
+        return [_blank_run_payload_fields(key, item, parent) for item in value]
+    if isinstance(value, str):
+        if is_url:
+            return strip_url_query(value)
+        if is_id:
+            return value if _RUN_PAYLOAD_ID_RE.fullmatch(value) else REDACTED
+    return value if kept and isinstance(value, (str, int, float)) else REDACTED
+
+
 def _uses_streaming_request_body(request: Request) -> bool:
     endpoint = f"{request.method.upper()} {request.url.path.rstrip('/')}"
     return any(pattern.fullmatch(endpoint) for pattern in _STREAMING_REQUEST_ENDPOINT_PATTERNS)
@@ -305,19 +392,29 @@ def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> s
         text = body.decode("utf-8", errors="replace")
     except Exception:
         return _BINARY_PLACEHOLDER
-    text = _redact_loggable_body(text)
+    text = _redact_loggable_body(text, run_payload=_is_run_payload_endpoint(request))
     if len(text) > _MAX_BODY_LENGTH:
         return text[:_MAX_BODY_LENGTH] + "...[truncated]"
     return text
 
 
-def _redact_loggable_body(text: str) -> str:
+def _redact_loggable_body(text: str, *, run_payload: bool = False) -> str:
     try:
         parsed = json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        return strip_artifact_url_query(text)
-    redacted = redact_sensitive_fields(parsed)
-    return json.dumps(redacted) if redacted != parsed else text
+    except (ValueError, TypeError):
+        # ValueError also covers integers past the interpreter's digit limit, not only malformed JSON.
+        return REDACTED if run_payload else strip_artifact_url_query(text)
+    except RecursionError:
+        return REDACTED
+    try:
+        if run_payload:
+            # Always re-serialize: json.loads keeps only the last of duplicate keys, so the raw text can hold more.
+            return json.dumps(redact_sensitive_fields(_blank_run_payload_fields(_RUN_PAYLOAD_ROOT, parsed)))
+        redacted = redact_sensitive_fields(parsed)
+        return json.dumps(redacted) if redacted != parsed else text
+    except RecursionError:
+        # A body nested past the interpreter's limit must not turn the logged request into a 500.
+        return REDACTED
 
 
 def _is_loggable_content_type(content_type: str | None) -> bool:
@@ -335,7 +432,7 @@ def _sanitize_response_body(request: Request, body_str: str | None, content_type
         return ""
     if not _is_loggable_content_type(content_type):
         return _BINARY_PLACEHOLDER
-    text = _redact_loggable_body(body_str)
+    text = _redact_loggable_body(body_str, run_payload=_is_run_payload_endpoint(request))
     if len(text) > _MAX_BODY_LENGTH:
         return text[:_MAX_BODY_LENGTH] + "...[truncated]"
     return text

@@ -261,7 +261,7 @@ class WorkflowParameterType(StrEnum):
                     return value
                 lower_case = str(value).lower()
                 if lower_case not in ["true", "false", "1", "0"]:
-                    raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
+                    raise InvalidWorkflowParameter(expected_parameter_type=self)
                 return lower_case in ["true", "1"]
             elif self == WorkflowParameterType.JSON:
                 if isinstance(value, (dict, list)):
@@ -272,7 +272,7 @@ class WorkflowParameterType(StrEnum):
             elif self == WorkflowParameterType.CREDENTIAL_ID:
                 return value
         except Exception:
-            raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
+            raise InvalidWorkflowParameter(expected_parameter_type=self)
 
     def convert_default_value(self, value: Any) -> str | int | float | bool | dict | list | None:
         # A JSON default keeps its YAML shape: a string stays a string instead of being parsed.
