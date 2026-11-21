@@ -785,6 +785,49 @@ def _har_entry(
             ["digit-twin-secret", "gone-fallback"],
             ["kept-digit-run", "kept-fallback"],
         ),
+        (
+            _har_entry(post={"mimeType": "application/json", "encoding": "base64", "text": "[REDACTED_SECRET]"}),
+            ['"encoding"'],
+            ['"text": "[REDACTED_SECRET]"'],
+        ),
+        (
+            _har_entry(
+                post={"mimeType": "application/x-www-form-urlencoded", "text": "user=alice&password=nl-secret-1\r\n"}
+            ),
+            ["nl-secret-1"],
+            ["user=alice&password=[REDACTED_SECRET]"],
+        ),
+        (
+            _har_entry(
+                post={
+                    "mimeType": "application/x-www-form-urlencoded",
+                    "text": "user=alice&state=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4\n",
+                }
+            ),
+            ["a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4"],
+            ["user=alice&state=[REDACTED_SECRET]\\n"],
+        ),
+        (
+            _har_entry(
+                post={
+                    "mimeType": "application/x-www-form-urlencoded",
+                    "encoding": "base64",
+                    "text": base64.b64encode(b"state=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4\r\n").decode(),
+                }
+            ),
+            ["a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4"],
+            ["state=[REDACTED_SECRET]\r\n"],
+        ),
+        (
+            _har_entry(
+                post={
+                    "mimeType": "application/x-www-form-urlencoded",
+                    "text": "user=alice&state=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4 ",
+                }
+            ),
+            ["a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4"],
+            ['"text": "[REDACTED_SECRET]"'],
+        ),
     ],
     ids=[
         "jwt-custom-request-header",
@@ -834,6 +877,11 @@ def _har_entry(
         "bare-token-urlencoded-body-is-idempotent",
         "non-string-body-withheld",
         "long-digit-run-names",
+        "withheld-base64-body-drops-its-encoding",
+        "urlencoded-body-with-trailing-newline",
+        "hex-value-before-trailing-newline",
+        "base64-hex-value-before-trailing-crlf",
+        "urlencoded-body-with-trailing-space-withheld",
     ],
 )
 def test_redact_har_bytes_scrubs_credentials_by_name_and_shape(
@@ -848,9 +896,9 @@ def test_redact_har_bytes_scrubs_credentials_by_name_and_shape(
     if stored_post.get("encoding") == "base64":
         text += base64.b64decode(stored_post["text"]).decode()
     for token in gone:
-        assert token not in text
+        assert token not in text, token
     for fragment in kept:
-        assert fragment in text
+        assert fragment in text, fragment
     assert redact_har_bytes(once, set()) == once
     post = entry["request"].get("postData", {})
     body = post.get("text", "")
