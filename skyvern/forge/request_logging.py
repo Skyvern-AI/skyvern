@@ -38,8 +38,9 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
 LOG = structlog.get_logger()
 
 _SENSITIVE_ENDPOINTS = {
-    # The internal Power BI hop carries a run capability and customer query/result data.
+    # The internal Power BI hops carry a run capability and customer query/result data.
     "POST /api/v1/internal/powerbi/query",
+    "POST /api/v1/internal/powerbi/native-query",
     "POST /api/v1/internal/gmail/inbox",
     "POST /api/v1/internal/gmail/organize",
     "POST /api/v1/internal/gmail/send",

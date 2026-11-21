@@ -618,8 +618,10 @@ async def _google_accounts(organization_id: str) -> AccountsById:
     }
 
 
-async def _microsoft_accounts(organization_id: str, user_id: str | None = None) -> AccountsById:
-    entries = _entries_for_provider("microsoft")
+async def _microsoft_accounts(
+    organization_id: str, user_id: str | None = None, entries: Sequence[IntegrationEntry] | None = None
+) -> AccountsById:
+    entries = _entries_for_provider("microsoft") if entries is None else entries
     if not entries:
         return {}
     credentials = await microsoft_oauth_service.get_visible_credentials_for_org(organization_id, user_id=user_id)
@@ -707,6 +709,7 @@ def integration_entries(
     powerbi_available: bool = False,
     gmail_available: bool = False,
     hidden_ids: frozenset[str] = frozenset(),
+    powerbi_native_available: bool = False,
     unavailable: Mapping[str, IntegrationUnavailableReason] | None = None,
 ) -> list[IntegrationEntry]:
     added_triggers = app.AGENT_FUNCTION.get_cloud_integration_triggers()
@@ -747,6 +750,8 @@ def integration_entries(
             else entry
             for entry in entries
         ]
+    elif powerbi_native_available:
+        entries = [entry.model_copy(update={"status": "live"}) if entry.id == "powerbi" else entry for entry in entries]
     return sorted(entries, key=lambda entry: entry.position)
 
 
@@ -802,11 +807,16 @@ async def integration_entries_for_org(
         gmail_available = await app.AGENT_FUNCTION.nango_gmail_catalog_available(organization_id)
     except Exception:  # noqa: BLE001 - availability failures leave Gmail dark.
         gmail_available = False
+    try:
+        powerbi_native_available = await app.AGENT_FUNCTION.powerbi_native_connections_available(organization_id)
+    except Exception:  # noqa: BLE001 - availability failures leave native Power BI dark.
+        powerbi_native_available = False
     entries = integration_entries(
         email_forwarding_available=email_forwarding_available,
         powerbi_available=powerbi_available,
         gmail_available=gmail_available,
         hidden_ids=await app.AGENT_FUNCTION.hidden_integration_ids(organization_id),
+        powerbi_native_available=powerbi_native_available,
         unavailable=await _unavailable_reasons(organization_id) if include_unavailable else None,
     )
     # Neither the page nor Copilot's integration list has a use for an entry with nothing to connect yet;
@@ -819,15 +829,22 @@ def integration_is_live(integration_id: str) -> bool:
 
 
 async def integrations_for_org(organization_id: str, user_id: str | None = None) -> list[IntegrationEntry]:
-    microsoft_entry_ids = frozenset(entry.id for entry in _entries_for_provider("microsoft"))
-    microsoft_reader = read_account_source(
-        organization_id,
-        microsoft_entry_ids,
-        partial(_microsoft_accounts, user_id=user_id),
-    )
+    entries_read = asyncio.ensure_future(integration_entries_for_org(organization_id))
+
+    async def microsoft_reader() -> AccountsById:
+        # The org's own catalog: an entry this org has live, such as native Power BI, gets its Microsoft accounts.
+        microsoft_entries = [
+            entry for entry in await entries_read if entry.status == "live" and entry.oauth_provider == "microsoft"
+        ]
+        return await read_account_source(
+            organization_id,
+            frozenset(entry.id for entry in microsoft_entries),
+            partial(_microsoft_accounts, user_id=user_id, entries=microsoft_entries),
+        )
+
     reads = await asyncio.gather(
         *(read_account_source(organization_id, entry_ids, source) for entry_ids, source in _ACCOUNT_SOURCES),
-        microsoft_reader,
+        microsoft_reader(),
         app.AGENT_FUNCTION.get_cloud_integration_accounts(organization_id, user_id),
     )
     accounts: dict[str, list[IntegrationAccount]] = {}
@@ -838,5 +855,5 @@ async def integrations_for_org(organization_id: str, user_id: str | None = None)
                 accounts.setdefault(entry_id, []).extend(value)
             elif unavailable.get(entry_id) != "read_failed":
                 unavailable[entry_id] = value
-    entries = await integration_entries_for_org(organization_id)
+    entries = await entries_read
     return [with_accounts(entry, accounts.get(entry.id), unavailable.get(entry.id)) for entry in entries]

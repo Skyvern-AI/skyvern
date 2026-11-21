@@ -77,7 +77,7 @@ class PowerBIQueryBlock(Block):
     block_type: Literal[BlockType.POWERBI_QUERY] = BlockType.POWERBI_QUERY  # type: ignore
 
     connection_id: str
-    credential_source: Literal["nango"] = "nango"
+    credential_source: Literal["nango", "native"] = "nango"
     dataset_id: str
     query: str
     max_rows: int = Field(default=1_000, ge=1, le=100_000, strict=True)

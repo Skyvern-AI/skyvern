@@ -1546,7 +1546,9 @@ async def _validate_powerbi_workflow_save(
     workflow_permanent_id: str | None = None,
 ) -> None:
     try:
-        powerbi_live = await app.AGENT_FUNCTION.nango_powerbi_catalog_available(organization_id)
+        powerbi_live = await app.AGENT_FUNCTION.nango_powerbi_catalog_available(
+            organization_id
+        ) or await app.AGENT_FUNCTION.powerbi_native_connections_available(organization_id)
     except Exception:  # noqa: BLE001 - fail closed when checking nested Power BI workflow sources.
         powerbi_live = False
 
@@ -1564,6 +1566,7 @@ async def _validate_powerbi_workflow_save(
     root_key = workflow_permanent_id
     definitions: dict[str | None, WorkflowDefinition] = {root_key: workflow_definition}
     direct_connection_ids: list[str] = []
+    credential_sources: set[str] = set()
 
     async def collect_workflows(definition: WorkflowDefinition, depth: int = 0) -> None:
         blocks = get_all_blocks(definition.blocks)
@@ -1575,6 +1578,7 @@ async def _validate_powerbi_workflow_save(
                 error_code="unsafe_query_input_source",
             )
         direct_connection_ids.extend(block.connection_id for block in powerbi_blocks)
+        credential_sources.update(block.credential_source for block in powerbi_blocks)
         if not powerbi_live or depth >= WorkflowTriggerBlock.MAX_TRIGGER_DEPTH:
             return
         for block in blocks:
@@ -1607,7 +1611,9 @@ async def _validate_powerbi_workflow_save(
             error_code="invalid_powerbi_connection_id",
         )
     try:
-        await app.AGENT_FUNCTION.ensure_powerbi_queries_available(organization_id)
+        await app.AGENT_FUNCTION.ensure_powerbi_queries_available(
+            organization_id, credential_sources=frozenset(credential_sources)
+        )
     except NotImplementedError as exc:
         raise SkyvernHTTPException(
             "Power BI queries are not supported in this runtime.",
