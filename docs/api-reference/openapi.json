@@ -17558,6 +17558,11 @@
           "storage_type": {
             "$ref": "#/components/schemas/FileStorageType",
             "default": "s3"
+          },
+          "google_drive_save_as_sheet": {
+            "type": "boolean",
+            "title": "Google Drive Save As Sheet",
+            "default": false
           }
         },
         "type": "object",
@@ -17748,6 +17753,11 @@
               }
             ],
             "title": "Google Drive Folder Id"
+          },
+          "google_drive_save_as_sheet": {
+            "type": "boolean",
+            "title": "Google Drive Save As Sheet",
+            "default": false
           },
           "sftp_host": {
             "anyOf": [
