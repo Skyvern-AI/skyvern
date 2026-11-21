@@ -440,12 +440,19 @@ Additional fields in **Advanced Settings:**
 
 ### Code
 
-Execute custom Python code. Input parameters are available as global variables. Top-level variables in your code become the block's output.
+Execute custom Python code. The block's inputs are available as global variables. Top-level variables in your code become the block's output.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **Code** | code editor | Python code to execute |
-| **Input Parameters** | select | Parameters available as globals in the code |
+| **View** | toggle | **Plain** shows the Goal, the returned data schema and the steps. **Code** shows the steps, Inputs and the code. A new block opens in **Plain**. |
+| **Goal** | text | In **Plain**. What the block does, in plain language. **Generate** (**Regenerate** once the block has code) has Copilot write the code and steps from the Goal, and opens the Copilot pane. |
+| **Returned data schema** | read-only | In **Plain**, when the block has one. The fields of the block's output, shown as a list or as JSON. |
+| **Steps** | list | A plain-language outline of the code, rebuilt from the code on save. In **Code**, click a step to highlight its lines. |
+| **Inputs** | select | In **Code**. Inputs available as globals in the code |
+| **Code Input** | code editor | In **Code**. Python code to execute |
+| **Error Messages** | JSON | Error codes the code may raise, each with the condition it reports. Raise one with `raise ErrorCode("code", "reason")`. A code that isn't listed fails the block like any other exception. |
+
+After you edit the Goal, the block shows **Goal changed — not applied yet** in place of **Generate**. **Apply new Goal** has Copilot rebuild the code to match, and **Undo** restores the old Goal. When you edit the code of a block that has a Goal, it shows **Code changed — Goal may be out of date**, with **Update Goal** and **Keep Goal**.
 
 Code can import `asyncio`, `datetime`, `html`, `json` and `re`. Each one binds the
 sandbox's own version of the module, which carries part of the standard library and
@@ -486,10 +493,6 @@ reason are persisted, Skyvern masks exact registered-secret matches; registered
 secrets of at least five characters are also masked inside larger strings. Derived
 or transformed values may no longer match. Do not expose credentials through output
 or errors.
-
-<Frame>
-<img width="400" src="/images/cloud/code_block.png" alt="Code block configuration with Python code editor and Input Parameters field" />
-</Frame>
 
 ### Agent
 
