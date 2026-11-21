@@ -29,7 +29,7 @@ npm i -s @skyvern/client
 
 ## Reference
 
-A full reference for this library is available [here](https://www.skyvern.com/docs/api-reference/api-reference).
+A full reference for this library is available [here](https://www.skyvern.com/docs/api-reference).
 
 ## Usage
 
