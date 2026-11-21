@@ -226,6 +226,27 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
             },
             "Gmail: Send email with this account is not supported yet.",
         ),
+        (
+            {"integration_id": "google_drive", "action_id": "move_file", "inputs": {"file_id": "private-value"}},
+            "Input 'destination_folder_id' is required.",
+        ),
+        (
+            {
+                "integration_id": "google_drive",
+                "action_id": "move_file",
+                "connection_id": None,
+                "inputs": {"file_id": "private-value", "destination_folder_id": "private-value"},
+            },
+            "Google Drive: Move file needs a connected account.",
+        ),
+        (
+            {
+                "integration_id": "google_drive",
+                "action_id": "move_file",
+                "inputs": {"file_id": "private-value", "destination_folder_id": "private-value"},
+            },
+            "Google Drive folder actions are not available for this organization.",
+        ),
     ],
     ids=[
         "unknown-action",
@@ -239,6 +260,9 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
         "nango-account",
         "nango-no-account",
         "nango-gmail-account",
+        "drive-move-missing-destination",
+        "drive-move-no-account",
+        "drive-move-flag-off",
     ],
 )
 async def test_a_bad_action_or_input_fails_the_block_naming_it(values: dict[str, Any], reason: str) -> None:
