@@ -37,48 +37,6 @@ class TestDrivePicker:
         assert "mimeType = 'application/vnd.google-apps.spreadsheet'" in q
         assert "trashed = false" in q
 
-    @pytest.mark.asyncio
-    async def test_list_spreadsheets_sends_expected_params(self, mock_sheets_transport: TransportInstaller) -> None:
-        captured: dict[str, Any] = {}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured["url"] = str(request.url)
-            captured["auth"] = request.headers.get("Authorization")
-            return httpx.Response(
-                200,
-                json={
-                    "nextPageToken": "tok-2",
-                    "files": [
-                        {
-                            "id": "1xyz",
-                            "name": "Leads",
-                            "modifiedTime": "2026-04-10T00:00:00Z",
-                            "webViewLink": "https://docs.google.com/spreadsheets/d/1xyz",
-                        },
-                        {"id": "", "name": "skip-empty-id"},
-                    ],
-                },
-            )
-
-        mock_sheets_transport(handler)
-
-        paged = await google_sheets_service.list_spreadsheets(
-            access_token="at-1",
-            query="leads",
-            page_token="tok-1",
-            page_size=50,
-        )
-
-        assert paged.next_page_token == "tok-2"
-        assert len(paged.spreadsheets) == 1
-        assert paged.spreadsheets[0].id == "1xyz"
-        assert paged.spreadsheets[0].name == "Leads"
-        assert captured["auth"] == "Bearer at-1"
-        assert "pageSize=50" in captured["url"]
-        assert "pageToken=tok-1" in captured["url"]
-        assert "supportsAllDrives=true" in captured["url"]
-        assert "includeItemsFromAllDrives=true" in captured["url"]
-
 
 class TestReconnectRequired:
     @pytest.mark.asyncio

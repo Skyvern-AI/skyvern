@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import json
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
@@ -18,6 +19,7 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
+from skyvern.forge.sdk.experimentation.drive_shared_drive_search import DRIVE_SHARED_DRIVE_SEARCH_FLAG
 from skyvern.forge.sdk.routes import google_oauth as google_oauth_routes
 from skyvern.forge.sdk.schemas.google_oauth import (
     CreateGoogleOAuthAuthorizeRequest,
@@ -126,14 +128,16 @@ def test_google_drive_extract_folder_id_treats_blank_as_my_drive_root(value: str
     assert google_drive_service.extract_folder_id(value) is None
 
 
-def test_google_drive_extract_folder_id_rejects_non_folder_url() -> None:
-    with pytest.raises(ValueError, match="folder URL"):
-        google_drive_service.extract_folder_id("https://drive.google.com/file/d/file_123/view")
-
-
-def test_google_drive_extract_folder_id_rejects_non_google_folder_url() -> None:
-    with pytest.raises(ValueError, match=r"https://\*\.google\.com"):
-        google_drive_service.extract_folder_id("https://attacker.example.com/folders/folder_123")
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        ("https://drive.google.com/file/d/file_123/view", "folder URL"),
+        ("https://attacker.example.com/folders/folder_123", r"https://\*\.google\.com"),
+    ],
+)
+def test_google_drive_extract_folder_id_rejects_non_folder_or_non_google_url(value: str, error: str) -> None:
+    with pytest.raises(ValueError, match=error):
+        google_drive_service.extract_folder_id(value)
 
 
 @pytest.mark.parametrize("builder_name", ["build_multipart_upload_request", "build_resumable_initiate_request"])
@@ -791,6 +795,59 @@ async def test_google_drive_upload_does_not_retry_retryable_create_response(
     assert exc_info.value.status == 503
     assert calls == 1
     sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "reason", "expected_hint"),
+    [
+        (403, "insufficientFilePermissions", "role must be Contributor or higher"),
+        (403, "teamDriveMembershipRequired", "role must be Contributor or higher"),
+        (404, "notFound", "cannot see this Drive folder or file"),
+    ],
+)
+@pytest.mark.parametrize("organization_id", ["o_flag_on", "o_flag_off"])
+async def test_google_drive_upload_explains_shared_drive_access_errors_only_for_flagged_org(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    status: int,
+    reason: str,
+    expected_hint: str,
+    organization_id: str,
+) -> None:
+    source = tmp_path / "report.txt"
+    source.write_text("hello-drive")
+    raw_google_message = "File not found: folder_123."
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": {"message": raw_google_message, "errors": [{"reason": reason}]}})
+
+    async def flag_for_one_org(feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
+        return feature_name == DRIVE_SHARED_DRIVE_SEARCH_FLAG and distinct_id == "o_flag_on"
+
+    _install_google_drive_transport(monkeypatch, handler)
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", flag_for_one_org)
+    destination = FileUploadDestination(
+        storage_type=FileStorageType.GOOGLE_DRIVE,
+        customer_uri="https://drive.google.com/drive/folders/folder_123",
+        sdk_uri="https://drive.google.com/drive/folders/folder_123",
+        google_access_token="at-1",
+        google_drive_folder_id="folder_123",
+    )
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await AgentFunction().upload_file_to_customer_storage(
+            file_path=str(source), destination=destination, organization_id=organization_id
+        )
+
+    assert exc_info.value.status == status
+    assert exc_info.value.code == reason
+    if organization_id == "o_flag_on":
+        assert expected_hint in exc_info.value.message
+        assert reason in exc_info.value.message
+        assert "folder_123" not in "".join(traceback.format_exception(exc_info.value))
+    else:
+        assert exc_info.value.message == raw_google_message
 
 
 @pytest.mark.asyncio
