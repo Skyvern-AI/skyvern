@@ -1050,6 +1050,79 @@ def _form_rows() -> list[tuple[dict, dict]]:
             {"tagName": "div", "interactable": True, "attributes": {"role": "textbox"}, "text": _marker("TBSECRET42")},
         ),
         ({"tagName": "div", "interactable": True, "attributes": {"role": "combobox"}, "text": "Choose a plan"}, "same"),
+        (
+            {
+                "tagName": "x-input",
+                "interactable": True,
+                "attributes": {"value": "alice@example.com", "data-value": "alice@example.com"},
+                "children": [{"tagName": "input", "attributes": {"value": "alice@example.com"}}],
+            },
+            {
+                "tagName": "x-input",
+                "interactable": True,
+                "attributes": {"value": _marker("alice@example.com"), "data-value": _marker("alice@example.com")},
+                "children": [{"tagName": "input", "attributes": {"value": _marker("alice@example.com")}}],
+            },
+        ),
+        (
+            {
+                "tagName": "x-date",
+                "interactable": True,
+                "attributes": {"value": "1987-03-04"},
+                "children": [{"tagName": "input", "attributes": {"type": "date", "value": "1987-03-04"}}],
+            },
+            {
+                "tagName": "x-date",
+                "interactable": True,
+                "attributes": {"value": _marker("1987-03-04")},
+                "children": [{"tagName": "input", "attributes": {"type": "date", "value": _marker("1987-03-04")}}],
+            },
+        ),
+        (
+            {
+                "tagName": "x-pick",
+                "attributes": {"value": "pick-a"},
+                "children": [{"tagName": "input", "attributes": {"type": "hidden", "value": "pick-a"}}],
+            },
+            {
+                "tagName": "x-pick",
+                "attributes": {"value": "pick-a"},
+                "children": [{"tagName": "input", "attributes": {"type": "hidden", "value": _marker("pick-a")}}],
+            },
+        ),
+        (
+            {
+                "tagName": "x-choice",
+                "interactable": True,
+                "attributes": {"value": "choice-yes"},
+                "children": [{"tagName": "input", "attributes": {"type": "radio", "value": "choice-yes"}}],
+            },
+            "same",
+        ),
+        (
+            {
+                "tagName": "x-group",
+                "attributes": {"value": "group-a"},
+                "children": [
+                    {
+                        "tagName": "x-input",
+                        "attributes": {"value": "nested typed"},
+                        "children": [{"tagName": "input", "attributes": {"value": "nested typed"}}],
+                    }
+                ],
+            },
+            {
+                "tagName": "x-group",
+                "attributes": {"value": "group-a"},
+                "children": [
+                    {
+                        "tagName": "x-input",
+                        "attributes": {"value": _marker("nested typed")},
+                        "children": [{"tagName": "input", "attributes": {"value": _marker("nested typed")}}],
+                    }
+                ],
+            },
+        ),
         ({"tagName": "x-option", "interactable": True, "attributes": {"value": "plan-annual"}}, "same"),
         ({"tagName": "div", "attributes": {"type": "email", "value": "page constant"}}, "same"),
         ({"tagName": "x-badge", "attributes": {"value": "page badge"}}, "same"),
@@ -1197,6 +1270,9 @@ async def test_persist_scrape_artifacts_stores_trees_without_input_values(
             b"draft body",
             b"2001",
             b"TBSECRET42",
+            b"alice@example.com",
+            b"nested typed",
+            b"1987-03-04",
         ):
             assert typed not in blob
     in_prompt = stored["in_prompt"].decode()
@@ -1214,6 +1290,9 @@ async def test_persist_scrape_artifacts_stores_trees_without_input_values(
         'value="page constant"',
         'value="page badge"',
         ">Choose a plan</div>",
+        '<x-choice value="choice-yes">',
+        '<x-pick value="pick-a">',
+        '<x-group value="group-a">',
     ):
         assert kept in in_prompt
     editable_node = {"tagName": "div", "isContentEditable": True, "text": "x"}
