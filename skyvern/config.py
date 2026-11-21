@@ -1038,6 +1038,9 @@ class Settings(BaseSettings):
 
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_SECRET_ARTIFACT_REDACTION: bool = True
+    # On by default: runs without Mask Secrets still have known secret values of 8+ characters scrubbed from
+    # stored text artifacts. Set false to turn that tier off; Mask Secrets runs are not affected.
+    ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS: bool = True
     ENABLE_SECRET_VISUAL_MASKING: bool = True
     CODE_BLOCK_MODE: CodeBlockMode = CodeBlockMode.enabled
     DISABLE_CODE_BLOCK_EXECUTION: bool | None = None

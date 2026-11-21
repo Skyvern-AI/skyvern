@@ -32205,7 +32205,7 @@
               }
             ],
             "title": "Mask Secrets",
-            "description": "Mask secret values across this workflow's runs: hide them while they are typed (screenshots, recordings, live view) and redact them from stored artifacts, network logs, and LLM-bound text. A new workflow defaults to true; on PUT updates, omission keeps the stored value."
+            "description": "Mask secret values across this workflow's runs. A new workflow defaults to true; on PUT updates, omission keeps the stored value. With this off, stored text artifacts (page HTML, element trees, LLM prompts and responses, logs and network logs) are still scrubbed of known secret values of 8 or more characters. With it on, shorter secret values are scrubbed too, secrets are hidden while they are typed (screenshots, recordings, live view), and they are redacted from LLM-bound text and failure reasons."
           },
           "pin_saved_session_ip": {
             "type": "boolean",

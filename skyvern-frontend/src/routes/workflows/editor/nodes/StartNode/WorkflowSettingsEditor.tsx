@@ -89,7 +89,7 @@ const PREVENT_OVERLAPPING_RUNS_TOOLTIP =
   "Queues new runs of this agent until any in-progress run finishes. Does not affect block ordering inside a single run; blocks always execute in declared order. Use this when concurrent runs would collide on shared state, such as the same credentials, browser session, or downstream account.";
 
 const MASK_SECRETS_TOOLTIP =
-  "Mask secret values in this workflow's runs. Secrets are hidden while they are typed (screenshots, recordings, live browser view) and redacted from stored artifacts, network logs, and LLM prompts. Turning this on can make debugging harder because secret values are hidden.";
+  "Mask secret values in this workflow's runs. Even with this off, stored page HTML, LLM prompts and responses, logs and network logs are scrubbed of known secret values that are 8 or more characters long. Turning it on also scrubs shorter secret values, hides secrets while they are typed (screenshots, recordings, live browser view), and redacts them from text sent to the LLM and from failure reasons. Turning this on can make debugging harder because secret values are hidden.";
 
 const SEQUENTIAL_KEY_TOOLTIP =
   "Scope the run queue. Runs with the same key are queued together; runs with different keys can still execute in parallel. Templated against agent inputs, for example {{ account_id }} to serialize per account.";

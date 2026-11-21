@@ -930,7 +930,9 @@ def test_redact_har_bytes_scrubs_sensitive_names_in_a_truncated_har() -> None:
                             "params": [{"name": "cvv", "value": "987"}],
                         },
                     },
-                    "response": {"content": {"text": "welcome vault-secret-123 password=firstword suffixword"}},
+                    "response": {
+                        "content": {"text": "welcome vault-secret-123 password=firstword suffixword ref=7482913"}
+                    },
                 },
                 {"request": {"url": "https://example.test/next"}},
             ]
@@ -940,7 +942,7 @@ def test_redact_har_bytes_scrubs_sensitive_names_in_a_truncated_har() -> None:
     with pytest.raises(json.JSONDecodeError):
         json.loads(truncated)
 
-    result = redact_har_bytes(truncated, {"vault-secret-123", "firstword suffixword"})
+    result = redact_har_bytes(truncated, {"vault-secret-123", "firstword suffixword", "482913"})
 
     for leaked in (
         b"header-token-123",
@@ -958,6 +960,7 @@ def test_redact_har_bytes_scrubs_sensitive_names_in_a_truncated_har() -> None:
         b"987",
         b"vault-secret",
         b"suffixword",
+        b"482913",
     ):
         assert leaked not in result
     assert REDACTED_SECRET_PLACEHOLDER.encode() in result
@@ -1225,6 +1228,7 @@ def test_multi_box_artifact_retention_masks_representations_only_with_state(monk
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("multi_box", [False, True])
 def test_artifact_otp_floor_is_independent_of_credential_masking(monkeypatch, enabled: bool, multi_box: bool) -> None:
+    monkeypatch.setattr(artifact_manager.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", False)
     context = SkyvernContext(task_id="task")
     manager = SimpleNamespace(
         artifact_redaction_enabled=Mock(return_value=enabled),
@@ -1248,6 +1252,7 @@ def test_artifact_otp_floor_is_independent_of_credential_masking(monkeypatch, en
 @pytest.mark.parametrize("spelling", ["ＡＢＣＤＥＦ", "A\nB\nC\nD\nE\nF"])
 @pytest.mark.parametrize("artifact_type", [ArtifactType.HAR, ArtifactType.LLM_RESPONSE])
 def test_json_artifact_masks_decoded_code_spellings(monkeypatch, spelling: str, artifact_type: ArtifactType) -> None:
+    monkeypatch.setattr(artifact_manager.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", False)
     context = SkyvernContext(task_id="task")
     monkeypatch.setattr(
         artifact_manager,

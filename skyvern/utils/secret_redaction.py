@@ -282,15 +282,19 @@ def expand_secret_encodings(value: str) -> set[str]:
 
 @functools.lru_cache(maxsize=64)
 def _compiled_secret_pattern(
-    variants: frozenset[str], boundary_all_lengths: bool = False, match_inside_words: bool = False
+    variants: frozenset[str],
+    boundary_all_lengths: bool = False,
+    match_inside_words: bool = False,
+    digits_match_anywhere: bool = False,
 ) -> re.Pattern[str]:
     sorted_variants = sorted(variants, key=len, reverse=True)
-    pattern_parts = [
-        rf"(?<![A-Za-z0-9]){re.escape(variant)}(?![A-Za-z0-9])"
-        if not match_inside_words and (boundary_all_lengths or len(variant) < MIN_UNANCHORED_SECRET_LENGTH)
-        else re.escape(variant)
-        for variant in sorted_variants
-    ]
+    pattern_parts = []
+    for variant in sorted_variants:
+        anchored = not match_inside_words and (boundary_all_lengths or len(variant) < MIN_UNANCHORED_SECRET_LENGTH)
+        if anchored and not (digits_match_anywhere and variant.isascii() and variant.isdigit()):
+            pattern_parts.append(rf"(?<![A-Za-z0-9]){re.escape(variant)}(?![A-Za-z0-9])")
+        else:
+            pattern_parts.append(re.escape(variant))
     return re.compile("|".join(pattern_parts))
 
 
@@ -307,6 +311,7 @@ def redact_secrets_from_text(
     *,
     boundary_all_lengths: bool = False,
     match_inside_words: bool = False,
+    digits_match_anywhere: bool = False,
     placeholder_ids: Collection[str] = (),
 ) -> str:
     """Replace every registered secret variant found in ``text`` with a placeholder.
@@ -316,7 +321,8 @@ def redact_secrets_from_text(
     every secret length to token boundaries instead, for structured data where a short secret can
     legitimately be a substring of an unrelated longer value (e.g. "Sunshine1" inside "MySunshine1Co").
     ``match_inside_words=True`` scans every variant even inside words and placeholder-like tokens,
-    for rejecting values that must never carry a registered secret.
+    for rejecting values that must never carry a registered secret. ``digits_match_anywhere=True``
+    lets a short all-digit secret match next to other digits or letters too, for records such as HARs.
 
     ``placeholder_ids`` are the run's registered secret ids, exempted so a resolvable token survives
     the scrub (a credential field name such as ``placeholder_ab12_password`` would otherwise be
@@ -326,24 +332,48 @@ def redact_secrets_from_text(
     """
     if not text or not secret_values:
         return text
+    redact = _secret_text_redactor(
+        secret_values,
+        boundary_all_lengths=boundary_all_lengths,
+        match_inside_words=match_inside_words,
+        digits_match_anywhere=digits_match_anywhere,
+        placeholder_ids=placeholder_ids,
+    )
+    return redact(text) if redact else text
 
+
+def _secret_text_redactor(
+    secret_values: Collection[str],
+    *,
+    boundary_all_lengths: bool = False,
+    match_inside_words: bool = False,
+    digits_match_anywhere: bool = False,
+    placeholder_ids: Collection[str] = (),
+) -> Callable[[str], str] | None:
     variants = {
         variant for secret_value in secret_values for variant in expand_secret_encodings(secret_value) if variant
     }
     if not variants:
-        return text
-    pattern = _compiled_secret_pattern(frozenset(variants), boundary_all_lengths, match_inside_words)
+        return None
+    pattern = _compiled_secret_pattern(
+        frozenset(variants), boundary_all_lengths, match_inside_words, digits_match_anywhere
+    )
     exempt_ids = frozenset(token for token in placeholder_ids if token)
     if match_inside_words or not exempt_ids:
-        return pattern.sub(REDACTED_SECRET_PLACEHOLDER, text)
-    segments: list[str] = []
-    scanned = 0
-    for match in _compiled_placeholder_id_pattern(exempt_ids).finditer(text):
-        segments.append(pattern.sub(REDACTED_SECRET_PLACEHOLDER, text[scanned : match.start()]))
-        segments.append(match.group())
-        scanned = match.end()
-    segments.append(pattern.sub(REDACTED_SECRET_PLACEHOLDER, text[scanned:]))
-    return "".join(segments)
+        return lambda text: pattern.sub(REDACTED_SECRET_PLACEHOLDER, text)
+    exempt_pattern = _compiled_placeholder_id_pattern(exempt_ids)
+
+    def redact(text: str) -> str:
+        segments: list[str] = []
+        scanned = 0
+        for match in exempt_pattern.finditer(text):
+            segments.append(pattern.sub(REDACTED_SECRET_PLACEHOLDER, text[scanned : match.start()]))
+            segments.append(match.group())
+            scanned = match.end()
+        segments.append(pattern.sub(REDACTED_SECRET_PLACEHOLDER, text[scanned:]))
+        return "".join(segments)
+
+    return redact
 
 
 def redact_multi_field_totp_artifact_bytes(data: bytes, placeholder_ids: Collection[str] = ()) -> bytes:
@@ -390,12 +420,268 @@ def redact_secrets_from_bytes(
     secret_values: Collection[str],
     *,
     multi_field_totp: bool = True,
+    digits_match_anywhere: bool = False,
     placeholder_ids: Collection[str] = (),
 ) -> bytes:
     if multi_field_totp:
         data = redact_multi_field_totp_artifact_bytes(data, placeholder_ids)
     text = data.decode("utf-8", errors="replace")
-    return redact_secrets_from_text(text, secret_values, placeholder_ids=placeholder_ids).encode()
+    return redact_secrets_from_text(
+        text, secret_values, digits_match_anywhere=digits_match_anywhere, placeholder_ids=placeholder_ids
+    ).encode()
+
+
+_MAX_NESTED_JSON_TEXT_DEPTH = 4
+
+
+def redact_secrets_from_json_bytes(
+    data: bytes, secret_values: Collection[str], *, placeholder_ids: Collection[str] = ()
+) -> bytes | None:
+    """Scrub a JSON document value by value, or return None when ``data`` is not JSON; the caller then
+    scrubs the bytes as text.
+
+    A byte-level scrub turns a number-valued secret into a bare placeholder, which is not valid JSON, and
+    misses a secret inside JSON text carried in a string, where it is escaped twice.
+    """
+    redact = _secret_text_redactor(secret_values, placeholder_ids=placeholder_ids)
+    if redact is None:
+        return data
+    try:
+        text = data.decode("utf-8")
+        if not _json_text_could_hold_secret(text, secret_values):
+            return data
+    except ValueError:
+        return None
+    scrub = _JsonScrub(redact, _secret_documents(secret_values, redact))
+    try:
+        parsed, numbers_replaced = _load_json_for_redaction(text, redact)
+        walked = _redact_json_value(parsed, scrub, 0)
+        # allow_nan=False: a float past the double range parses as inf, which would be written as Infinity.
+        serialized = json.dumps(walked, ensure_ascii=False, allow_nan=False)
+        compact = json.dumps(walked, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except (json.JSONDecodeError, RecursionError):
+        return None
+    except ValueError:
+        # Duplicate keys, or a NaN or out-of-range float that cannot be written back: each string token is
+        # scrubbed in place, which keeps the nested layers covered and the source spelling intact.
+        try:
+            return _encode_json_text(redact(_redact_json_string_tokens(text, scrub, 0)))
+        except RecursionError:
+            return None
+    # A secret that spans keys and values is invisible to the walk, so the walked text is scanned too.
+    if redact(serialized) != serialized:
+        return _encode_json_text(redact(serialized))
+    if redact(compact) != compact:
+        return _encode_json_text(redact(compact))
+    if walked == parsed and not numbers_replaced:
+        return data
+    return _encode_json_text(serialized)
+
+
+# Printable ASCII that no JSON serializer escapes, at any nesting depth, unless it writes the character
+# as a `\u00XX` escape (`/`, `'`, `<`, `>` and `&` have escaping serializers, so they are left out).
+_JSON_ESCAPE_STABLE_RUN = re.compile(r"[ !#-%(-.0-;=?-\[\]-~]+")
+_JSON_PRINTABLE_ASCII_ESCAPE = re.compile(r"\\u00[2-7][0-9a-fA-F]")
+
+
+def _json_text_could_hold_secret(text: str, secret_values: Collection[str]) -> bool:
+    # A decoded match implies that each of a variant's escape-stable runs appears literally, so a miss
+    # rules the secret out at every escaping depth. Word boundaries are ignored on purpose.
+    screen = _json_secret_screen(frozenset(secret_values))
+    if screen is None or _JSON_PRINTABLE_ASCII_ESCAPE.search(text) is not None:
+        return True
+    if screen.pattern is not None and screen.pattern.search(text) is not None:
+        return True
+    return any(all(run in text for run in runs) for runs in screen.documents)
+
+
+@dataclasses.dataclass(frozen=True)
+class _JsonSecretScreen:
+    # One alternation over each plain secret variant's longest run, scanned once.
+    pattern: re.Pattern[str] | None
+    # A document-valued secret's text leads with a key such as `username`, which ordinary artifacts hold,
+    # so all of its runs are required, longest first.
+    documents: tuple[tuple[str, ...], ...]
+
+
+@functools.lru_cache(maxsize=64)
+def _json_secret_screen(secret_values: frozenset[str]) -> _JsonSecretScreen | None:
+    anchors: set[str] = set()
+    documents: set[tuple[str, ...]] = set()
+    for value in secret_values:
+        document = _parse_secret_document(value)
+        for variant in expand_secret_encodings(value):
+            runs = _JSON_ESCAPE_STABLE_RUN.findall(variant)
+            if not runs:
+                # Nothing in it survives escaping unchanged (non-ASCII or quote-only), so always parse.
+                return None
+            if document is None:
+                anchors.add(max(runs, key=len))
+            else:
+                documents.add(_screen_runs(runs))
+        if document is not None:
+            # A document matched by value appears with each key and string leaf as a JSON string, at any
+            # depth and in any formatting, so every run of those strings does too.
+            runs = [run for text in _document_strings(document) for run in _JSON_ESCAPE_STABLE_RUN.findall(text)]
+            if not runs:
+                # Only numbers, booleans and nulls, whose spelling can differ, so always parse.
+                return None
+            documents.add(_screen_runs(runs))
+    pattern = (
+        re.compile("|".join(re.escape(anchor) for anchor in sorted(anchors, key=len, reverse=True)))
+        if anchors
+        else None
+    )
+    return _JsonSecretScreen(pattern, tuple(documents))
+
+
+def _screen_runs(runs: list[str]) -> tuple[str, ...]:
+    return tuple(sorted(set(runs), key=len, reverse=True))
+
+
+def _parse_secret_document(value: str) -> dict[str, Any] | list[Any] | None:
+    if value.lstrip()[:1] not in ("{", "["):
+        return None
+    try:
+        document = json.loads(value)
+    except (ValueError, RecursionError):
+        return None
+    return document if isinstance(document, dict | list) and document else None
+
+
+def _document_strings(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield key
+            yield from _document_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _document_strings(item)
+
+
+def _secret_documents(secret_values: Collection[str], redact: Callable[[str], str]) -> list[Any]:
+    # A registered value can be a whole JSON document (a stored secret string); in a parsed artifact it is
+    # structure, not text, so it is matched by value. It is parsed like the artifact, so a registered number
+    # inside it compares as the same placeholder.
+    documents = []
+    for value in secret_values:
+        if _parse_secret_document(value) is None:
+            continue
+        try:
+            documents.append(_load_json_for_redaction(value, redact)[0])
+        except (ValueError, RecursionError):
+            # The redaction parse rejects duplicate keys; a plain parse keeps the last copy.
+            documents.append(json.loads(value))
+    return documents
+
+
+@dataclasses.dataclass(frozen=True)
+class _JsonScrub:
+    redact: Callable[[str], str]
+    documents: list[Any]
+
+
+def _load_json_for_redaction(
+    text: str | bytes, redact: Callable[[str], str], *, reject_duplicate_keys: bool = True
+) -> tuple[Any, bool]:
+    # Numbers are checked on their source digits, which a parsed float may round away. Duplicate keys
+    # raise, because the parse would drop an earlier copy that may hold the secret.
+    numbers_replaced = False
+
+    def number(raw: str, convert: Callable[[str], Any]) -> Any:
+        nonlocal numbers_replaced
+        if redact(raw) != raw:
+            numbers_replaced = True
+            return REDACTED_SECRET_PLACEHOLDER
+        value = convert(raw)
+        # The dump re-spells the number (1.2345678e7 is written as 12345678.0), so that spelling is checked too.
+        spelled = json.dumps(value)
+        if redact(spelled) != spelled:
+            numbers_replaced = True
+            return REDACTED_SECRET_PLACEHOLDER
+        return value
+
+    def unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            raise ValueError("duplicate JSON key")
+        return result
+
+    parsed = json.loads(
+        text,
+        object_pairs_hook=unique_keys if reject_duplicate_keys else None,
+        parse_int=lambda raw: number(raw, int),
+        parse_float=lambda raw: number(raw, float),
+    )
+    return parsed, numbers_replaced
+
+
+def _redact_json_value(value: Any, scrub: _JsonScrub, depth: int) -> Any:
+    if isinstance(value, str):
+        return _redact_json_string(value, scrub, depth)
+    if isinstance(value, dict | list) and scrub.documents and value in scrub.documents:
+        return REDACTED_SECRET_PLACEHOLDER
+    if isinstance(value, dict):
+        return {
+            _redact_json_string(key, scrub, depth): _redact_json_value(item, scrub, depth)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json_value(item, scrub, depth) for item in value]
+    return value
+
+
+def _redact_json_string(value: str, scrub: _JsonScrub, depth: int) -> str:
+    redacted_text = scrub.redact(value)
+    # A whole-string match wins: the registered secret can itself be a JSON document.
+    if redacted_text == REDACTED_SECRET_PLACEHOLDER:
+        return redacted_text
+    if (
+        depth < _MAX_NESTED_JSON_TEXT_DEPTH
+        and value.lstrip()[:1] in ("{", "[")
+        and ("\\" in value or redacted_text != value or scrub.documents)
+    ):
+        try:
+            nested, numbers_replaced = _load_json_for_redaction(value, scrub.redact)
+        except (json.JSONDecodeError, RecursionError):
+            nested, numbers_replaced = None, False
+        except ValueError:
+            # Duplicate keys: the parse would drop a copy, so the string tokens are scrubbed in place.
+            return scrub.redact(_redact_json_string_tokens(value, scrub, depth + 1))
+        if isinstance(nested, dict | list):
+            walked = _redact_json_value(nested, scrub, depth + 1)
+            if walked != nested or numbers_replaced:
+                # A match the decoded walk cannot see (one spanning keys and values) is scrubbed as text.
+                return scrub.redact(json.dumps(walked, ensure_ascii=False))
+    return redacted_text
+
+
+def _encode_json_text(text: str) -> bytes:
+    # A lone surrogate from a split emoji cannot be encoded; written as an escape it stays valid JSON.
+    return text.encode("utf-8", "backslashreplace")
+
+
+_JSON_TOKEN = re.compile(r'"(?:[^"\\\x00-\x1f]|\\.)*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
+
+
+def _redact_json_string_tokens(text: str, scrub: _JsonScrub, depth: int) -> str:
+    # Keeps the source spelling of everything but a changed string or number, so text that cannot
+    # round-trip through a parse still gets each string's nested JSON layers decoded and scrubbed.
+    def replace(match: re.Match[str]) -> str:
+        token = match.group()
+        if token[0] != '"':
+            # As in the parse, a matched number becomes the placeholder string so the text still parses.
+            return json.dumps(REDACTED_SECRET_PLACEHOLDER) if scrub.redact(token) != token else token
+        try:
+            value = json.loads(token)
+        except ValueError:
+            return token
+        redacted = _redact_json_string(value, scrub, depth)
+        return token if redacted == value else json.dumps(redacted, ensure_ascii=False)
+
+    return _JSON_TOKEN.sub(replace, text)
 
 
 def redact_har_bytes(
@@ -407,14 +693,23 @@ def redact_har_bytes(
 ) -> bytes:
     if not har_data.strip():
         return har_data
+    number_redact = _secret_text_redactor(secret_values, digits_match_anywhere=True)
     try:
-        har = json.loads(har_data)
+        if number_redact is None:
+            har, numbers_replaced = json.loads(har_data), False
+        else:
+            # A number holding a secret becomes the placeholder string, so the stored HAR still parses.
+            har, numbers_replaced = _load_json_for_redaction(har_data, number_redact, reject_duplicate_keys=False)
     except Exception:
         # A HAR cut short (a killed browser or worker) still holds header and cookie values.
         LOG.warning("HAR is not valid JSON; storing it with a pattern scrub", artifact_type="har")
         # Exact values go first: the name scrub stops at a space or quote and would split a registered value.
         scrubbed = redact_secrets_from_bytes(
-            har_data, secret_values, multi_field_totp=multi_field_totp, placeholder_ids=placeholder_ids
+            har_data,
+            secret_values,
+            multi_field_totp=multi_field_totp,
+            digits_match_anywhere=True,
+            placeholder_ids=placeholder_ids,
         )
         return _pattern_scrub_har_text(scrubbed.decode()).encode()
 
@@ -482,7 +777,9 @@ def redact_har_bytes(
                 text = skyvern_context.mask_multi_field_totp_artifact_text(
                     text, replacement=REDACTED_SECRET_PLACEHOLDER
                 )
-            return redact_secrets_from_text(text, combined_secrets, placeholder_ids=placeholder_ids)
+            return redact_secrets_from_text(
+                text, combined_secrets, digits_match_anywhere=True, placeholder_ids=placeholder_ids
+            )
 
         def mask_value(value: Any) -> Any:
             if isinstance(value, str):
@@ -500,15 +797,36 @@ def redact_har_bytes(
 
         redacted_serialized_har = json.dumps(mask_value(har))
     else:
-        serialized = json.dumps(har).encode()
+        string_redact = _secret_text_redactor(
+            secret_values, digits_match_anywhere=True, placeholder_ids=placeholder_ids
+        )
+        # The serialized pass below is for a secret spanning keys and values. An all-digit secret cannot span
+        # them, and in the serialized text it could match inside an escape such as \u5482, so it is left out.
+        span_values = [value for value in secret_values if not (value.isascii() and value.isdigit())]
+        try:
+            walked = _redact_json_strings(har, string_redact) if string_redact else har
+        except RecursionError:
+            # Too deep for the walk: the serialized pass takes every secret on the word boundary, as it did before.
+            walked, span_values = har, list(secret_values)
+        serialized = json.dumps(walked).encode()
         if multi_field_totp:
             serialized = redact_multi_field_totp_artifact_bytes(serialized, placeholder_ids)
         redacted_serialized_har = redact_secrets_from_text(
-            serialized.decode(), secret_values, placeholder_ids=placeholder_ids
+            serialized.decode(), span_values, placeholder_ids=placeholder_ids
         )
-    if redacted_serialized_har == original_serialized_har:
+    if redacted_serialized_har == original_serialized_har and not numbers_replaced:
         return har_data
     return redacted_serialized_har.encode()
+
+
+def _redact_json_strings(value: Any, redact: Callable[[str], str]) -> Any:
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {redact(key): _redact_json_strings(item, redact) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_json_strings(item, redact) for item in value]
+    return value
 
 
 def redact_console_log_bytes(
@@ -570,6 +888,7 @@ def _pattern_scrub_urlencoded(text: str, pattern: _NamedValueScrub) -> str:
             text.encode(),
             state.secret_values,
             multi_field_totp=state.multi_field_totp,
+            digits_match_anywhere=True,
             placeholder_ids=state.placeholder_ids,
         ).decode()
     return pattern.scrub(text)
@@ -894,6 +1213,7 @@ def _redact_base64_text(
             encoded_text.encode(),
             secret_values,
             multi_field_totp=multi_field_totp,
+            digits_match_anywhere=True,
             placeholder_ids=placeholder_ids,
         ).decode()
         if redacted_text != encoded_text:
@@ -904,6 +1224,10 @@ def _redact_base64_text(
     except UnicodeDecodeError:
         return
     redacted_text = redact_secrets_from_bytes(
-        decoded_text.encode(), secret_values, multi_field_totp=multi_field_totp, placeholder_ids=placeholder_ids
+        decoded_text.encode(),
+        secret_values,
+        multi_field_totp=multi_field_totp,
+        digits_match_anywhere=True,
+        placeholder_ids=placeholder_ids,
     ).decode()
     container["text"] = base64.b64encode(redacted_text.encode()).decode()

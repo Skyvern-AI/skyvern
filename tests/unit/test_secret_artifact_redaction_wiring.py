@@ -26,12 +26,14 @@ def _har_bytes(secret: str = SECRET) -> bytes:
                 "entries": [
                     {
                         "request": {
-                            "url": f"https://example.test/path?token={secret}",
+                            "url": f"https://example.test/path?token={secret}&q={secret}",
                             "headers": [
                                 {"name": "Authorization", "value": f"Bearer {secret}"},
                                 {"name": "X-Safe", "value": "safe"},
                             ],
                             "cookies": [{"name": "session", "value": secret}],
+                            # No name rule reaches these, so only a value scrub removes the secret.
+                            "postData": {"mimeType": "text/plain", "text": f"code {secret}"},
                         },
                         "response": {"headers": [], "cookies": []},
                     }
@@ -258,35 +260,52 @@ def test_model_hidden_values_is_per_task_not_process_global() -> None:
     assert SkyvernContext().model_hidden_values == set()
 
 
-def test_task_artifact_gate_floors_runtime_secret_for_har_and_console(monkeypatch: pytest.MonkeyPatch) -> None:
+_SHORT_RUNTIME_CODE = "482913"
+
+
+def _ungated_secret_lookup_only(
+    _workflow_run_id: str | None, *, respect_artifact_redaction_flag: bool = True
+) -> set[str]:
+    if respect_artifact_redaction_flag:
+        raise AssertionError("gated set must not be consulted")
+    # The real ungated lookup includes the task's runtime codes.
+    return {_SHORT_RUNTIME_CODE}
+
+
+@pytest.mark.parametrize("scrub_all_runs", [False, True])
+def test_task_artifact_gate_floors_runtime_secret_for_har_and_console(
+    monkeypatch: pytest.MonkeyPatch, scrub_all_runs: bool
+) -> None:
     # Task-level HAR/console persistence goes through _maybe_redact_artifact_data; a mask-off
-    # workflow must still have runtime-resolved secrets floored there (llm surfaces stay gated).
+    # workflow must still have runtime-resolved secrets floored there.
     from skyvern.forge.sdk.artifact import manager as artifact_manager_module
 
     fake_app = SimpleNamespace(
         WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
             artifact_redaction_enabled=Mock(return_value=False),
-            get_secret_values_for_run=Mock(side_effect=AssertionError("gated set must not be consulted")),
-            runtime_secret_values_for_artifacts=Mock(return_value={RUNTIME_SECRET}),
+            get_secret_values_for_run=_ungated_secret_lookup_only,
+            runtime_secret_values_for_artifacts=Mock(return_value={_SHORT_RUNTIME_CODE}),
         )
     )
     monkeypatch.setattr(artifact_manager_module, "app", fake_app)
+    monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", scrub_all_runs)
     skyvern_context.set(SkyvernContext(workflow_run_id=WORKFLOW_RUN_ID))
     try:
         har_out = artifact_manager_module._maybe_redact_artifact_data(
-            ArtifactType.HAR, _har_bytes(RUNTIME_SECRET), WORKFLOW_RUN_ID
+            ArtifactType.HAR, _har_bytes(_SHORT_RUNTIME_CODE), WORKFLOW_RUN_ID
         )
         console_out = artifact_manager_module._maybe_redact_artifact_data(
-            ArtifactType.BROWSER_CONSOLE_LOG, f"code={RUNTIME_SECRET}".encode(), WORKFLOW_RUN_ID
+            ArtifactType.BROWSER_CONSOLE_LOG, f"code={_SHORT_RUNTIME_CODE}".encode(), WORKFLOW_RUN_ID
         )
         llm_out = artifact_manager_module._maybe_redact_artifact_data(
-            ArtifactType.LLM_REQUEST, f"code={RUNTIME_SECRET}".encode(), WORKFLOW_RUN_ID
+            ArtifactType.LLM_REQUEST, f"code={_SHORT_RUNTIME_CODE}".encode(), WORKFLOW_RUN_ID
         )
     finally:
         skyvern_context.reset()
-    assert RUNTIME_SECRET.encode() not in har_out
-    assert RUNTIME_SECRET.encode() not in console_out
-    assert llm_out == f"code={RUNTIME_SECRET}".encode()
+    assert _SHORT_RUNTIME_CODE.encode() not in har_out
+    assert _SHORT_RUNTIME_CODE.encode() not in console_out
+    # The short runtime code stays on browser diagnostics only, so a V3-only code scrub is not widened.
+    assert llm_out == f"code={_SHORT_RUNTIME_CODE}".encode()
 
 
 @pytest.mark.parametrize(
@@ -305,6 +324,7 @@ def test_task_artifact_gate_untouched_when_no_runtime_secrets(
         )
     )
     monkeypatch.setattr(artifact_manager_module, "app", fake_app)
+    monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", False)
     payload = _har_bytes(SECRET) if artifact_type == ArtifactType.HAR else f"console {SECRET}".encode()
     out = artifact_manager_module._maybe_redact_artifact_data(artifact_type, payload, WORKFLOW_RUN_ID)
     assert out == payload
