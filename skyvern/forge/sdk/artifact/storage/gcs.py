@@ -274,26 +274,32 @@ class GcsStorage(BaseStorage, StreamingArtifactStorage):
         return await self.async_client.download_file(path, log_exception=False)
 
     async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
-        # Zip the directory to a temp file
-        temp_zip_file = create_named_temporary_file()
-        zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
         browser_session_uri = (
             f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
         )
         storage_class = await self._get_storage_class_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
-        LOG.debug(
-            "Storing browser session",
-            organization_id=organization_id,
-            workflow_permanent_id=workflow_permanent_id,
-            zip_file_path=zip_file_path,
-            browser_session_uri=browser_session_uri,
-            storage_class=storage_class,
-            tags=tags,
-        )
-        await self.async_client.upload_file_from_path(
-            browser_session_uri, zip_file_path, storage_class=storage_class, tags=tags
-        )
+        # make_archive writes base_name + ".zip", a separate file the NamedTemporaryFile cleanup never
+        # removes, so name it up front and remove it even when archiving or upload fails.
+        with create_named_temporary_file() as temp_zip_file:
+            zip_file_path = f"{temp_zip_file.name}.zip"
+            try:
+                shutil.make_archive(temp_zip_file.name, "zip", directory)
+                LOG.debug(
+                    "Storing browser session",
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    zip_file_path=zip_file_path,
+                    browser_session_uri=browser_session_uri,
+                    storage_class=storage_class,
+                    tags=tags,
+                )
+                await self.async_client.upload_file_from_path(
+                    browser_session_uri, zip_file_path, storage_class=storage_class, tags=tags
+                )
+            finally:
+                if os.path.exists(zip_file_path):
+                    os.remove(zip_file_path)
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
         browser_session_uri = (

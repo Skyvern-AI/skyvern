@@ -37,6 +37,7 @@ import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { SftpPrivateKeyField } from "../components/SftpPrivateKeyField";
 import { type FileDownloadNode, type FileDownloadNodeData } from "./types";
+import { useGoogleDriveFolderHelp } from "../useGoogleDriveFolderHelp";
 import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
 import {
   blockUrlErrorId,
@@ -96,6 +97,7 @@ function FileDownloadEditorBody({
   blockId: string;
   data: FileDownloadNodeData;
 }) {
+  const driveFolderHelp = useGoogleDriveFolderHelp();
   const {
     editable,
     label,
@@ -574,7 +576,7 @@ function FileDownloadEditorBody({
             </DestinationField>
             <DestinationField
               label="Google Drive Folder ID (Optional)"
-              help="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root."
+              help={driveFolderHelp}
             >
               <WorkflowBlockInputTextarea
                 name="googleDriveFolderId"

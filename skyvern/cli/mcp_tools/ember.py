@@ -37,6 +37,7 @@ from ._ember_http import (
     get_history,
     list_all_chats,
     list_chats,
+    list_saved_logins,
     post_action,
     post_chat,
     recovery_token,
@@ -60,6 +61,8 @@ MAX_ATTACHED_FILE_BYTES = 30 * 1024 * 1024
 _MAX_ENTRIES = 15
 _MAX_ENTRY_CHARS = 300
 _MAX_REPLY_CHARS = 2000
+_MAX_USER_MESSAGE_CHARS = 500
+_MAX_SAVED_LOGINS = 25
 _HIDDEN_ACTIVITY_TOOLS = frozenset({"get_run_results", "get_browser_screenshot"})
 _STOPPED_TERMINAL_REASONS = frozenset({"cancel", "user_cancelled"})
 _INTERRUPTED_TERMINAL_REASON = "interrupted"
@@ -283,7 +286,11 @@ def _question_action(item: dict[str, Any], expires_at: str | None, studio: str |
                 ],
                 "total_accounts": len(rows),
                 "common_inputs": review.get("common_inputs") or {},
-                "preselected_note": _PRESELECTED_NOTE,
+                **(
+                    {"preselected_note": _PRESELECTED_NOTE}
+                    if any(not row.get("preselected", True) for row in rows)
+                    else {}
+                ),
                 "cost": review.get("cost"),
                 "warnings": _group_review_warnings(review),
             },
@@ -439,7 +446,11 @@ def _claimed_deletion(item: dict[str, Any]) -> bool:
 
 
 def _user_actions(
-    history: dict[str, Any], last_ai: dict[str, Any] | None, *, turn_ended: bool, links: dict[str, str | None]
+    history: dict[str, Any],
+    last_ai: dict[str, Any] | None,
+    *,
+    turn_ended: bool,
+    links: dict[str, str | None],
 ) -> list[dict[str, Any]]:
     in_flight = history.get("in_flight_turn") or {}
     actions = [
@@ -795,6 +806,44 @@ def _fit(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _offer_saved_logins(result: dict[str, Any], saved_logins: list[dict[str, str | None]], *, fit: bool) -> None:
+    # A decision re-reads the card without this list, so it only gets the room left once the card itself fits.
+    for action in result["user_actions"]:
+        facts = action.get("facts")
+        if action.get("kind") != "login_needed" or facts is None:
+            continue
+        for count in range(min(len(saved_logins), _MAX_SAVED_LOGINS), -1, -1):
+            facts["saved_logins"] = saved_logins[:count]
+            facts["saved_logins_more"] = len(saved_logins) > count
+            if not fit or len(json.dumps(result, default=str)) <= SUMMARY_LIMIT_CHARS:
+                break
+        else:
+            del facts["saved_logins"], facts["saved_logins_more"]
+
+
+def _offer_last_user_message(result: dict[str, Any], message: str | None, *, fit: bool) -> None:
+    # The latest message is context, so like the saved-login list it only gets the room left once the rest fits.
+    for limit in (_MAX_USER_MESSAGE_CHARS, 200, 40, 0):
+        result["last_user_message"] = _clip(message, limit)
+        if not fit or len(json.dumps(result, default=str)) <= SUMMARY_LIMIT_CHARS:
+            return
+    # Left off like the list, so a message with no room never reads as no message.
+    del result["last_user_message"]
+
+
+def _last_user_message(history: dict[str, Any], rows: list[dict[str, Any]]) -> str | None:
+    # Ember reads a steer the user sends into a running turn after that turn's opening message.
+    steers = (history.get("in_flight_turn") or {}).get("steer_messages") or []
+    for row in reversed(rows):
+        if steers:
+            break
+        if row.get("sender") == "user":
+            return row.get("content")
+        steers = (row.get("narrative_payload") or {}).get("steerMessages") or []
+    texts = [item.get("text") for item in steers if isinstance(item, dict)]
+    return texts[-1] if texts else None
+
+
 def map_turn_state(
     history: dict[str, Any],
     *,
@@ -802,6 +851,7 @@ def map_turn_state(
     since: str | None = None,
     login_resolved: bool = False,
     fit: bool = True,
+    saved_logins: list[dict[str, str | None]] | None = None,
 ) -> dict[str, Any]:
     """Turn one chat-history response into the turn state every Ember tool returns."""
     rows = _rows(history)
@@ -857,7 +907,13 @@ def map_turn_state(
         "links": links,
         "next": _next(state, waiting_on, user_actions, proposal, progress["cursor"]),
     }
-    return _fit(result) if fit else result
+    if fit:
+        result = _fit(result)
+    # The Studio or another client can start or steer a turn, so the latest message says what Ember was asked.
+    _offer_last_user_message(result, _last_user_message(history, rows), fit=fit)
+    if saved_logins is not None:
+        _offer_saved_logins(result, saved_logins, fit=fit)
+    return result
 
 
 def _too_large_refusal(history: dict[str, Any], item_id: str) -> str | None:
@@ -928,8 +984,15 @@ def _poll_timeout(deadline: float) -> float:
 async def _turn_state_with_links(
     history: dict[str, Any], *, since: str | None, deadline: float, login_resolved: bool = False
 ) -> dict[str, Any]:
-    state = map_turn_state(history, now=datetime.now(UTC), since=since, login_resolved=login_resolved)
     timeout = _poll_timeout(deadline)
+    saved_logins = (
+        await list_saved_logins(_MAX_SAVED_LOGINS + 1, timeout=timeout)
+        if history.get("pending_credential_requests")
+        else None
+    )
+    state = map_turn_state(
+        history, now=datetime.now(UTC), since=since, login_resolved=login_resolved, saved_logins=saved_logins
+    )
     if browser_session_id := _live_browser_session_id(history):
         session = await get_browser_session(browser_session_id, timeout=timeout)
         state["progress"]["live_browser_url"] = (session or {}).get("app_url")
@@ -1155,7 +1218,12 @@ async def _find_live_chat(
 async def skyvern_ember_send(
     message: Annotated[
         str | None,
-        Field(description="What to ask Ember. Required, except with action='test_end_to_end'."),
+        Field(
+            description=(
+                "The user's request. Ember reads it as the user's own chat message, as if typed in the Studio, and "
+                "asks the user about anything it leaves open. Required, except with action='test_end_to_end'."
+            )
+        ),
     ] = None,
     workflow_id: Annotated[
         str | None, Field(description="The workflow's wpid_ id. Leave out to create a blank workflow.")
@@ -1301,7 +1369,7 @@ async def skyvern_ember_send(
                     target_chat_id = chat_id_of(chats[0])
                 if live is not None:
                     live_chat_id, live_history = live
-                    live_state = map_turn_state(live_history, now=datetime.now(UTC))
+                    live_state = await _turn_state_with_links(live_history, since=None, deadline=call_deadline)
                     if if_turn_running != "steer" or new_chat or live_chat_id != target_chat_id:
                         return _error(
                             action_name,
@@ -1546,8 +1614,9 @@ async def skyvern_ember_check(
     ] = "summary",
 ) -> dict[str, Any]:
     """See what Ember (the new name for Skyvern's Workflow Copilot; the app may still say Copilot) is doing or did
-    in a chat: progress, questions and approvals waiting on the user, the final reply, and the proposal awaiting
-    review. Use it for "what is Ember/Copilot doing" and to keep watching a turn that skyvern_ember_send started.
+    in a chat: the latest user message, progress, questions and approvals waiting on the user, the final reply, and
+    the proposal awaiting review. Use it for "what is Ember/Copilot doing" and to keep watching a turn that
+    skyvern_ember_send started.
 
     With wait_seconds it polls until the turn pauses for the user or ends, and returns at once when nothing is
     running. Pass since=progress.cursor from the last result to get only new progress lines. Like the Studio's own
@@ -1676,7 +1745,7 @@ async def skyvern_ember_stop(
                     ErrorCode.TURN_CONTROL_DENIED,
                     "Only the person who started this Ember turn, or an Admin, can stop it.",
                     timer,
-                    data=map_turn_state(history, now=datetime.now(UTC)),
+                    data=await _turn_state_with_links(history, since=None, deadline=deadline),
                 )
             deletion_in_progress = any(_claimed_deletion(item) for item in pending_questions)
             await cancel(chat_id=ember_chat_id, cancel_token=token, timeout=READ_TIMEOUT_SECONDS)
@@ -1766,10 +1835,10 @@ def _login_card(history: dict[str, Any], item_id: str) -> dict[str, Any] | None:
     return next((card for card in cards if isinstance(card, dict) and _login_item_id(card) == item_id), None)
 
 
-def _expired(
-    action: str, item_id: str, history: dict[str, Any], timer: Timer, *, next_text: str | None = None
+async def _expired(
+    action: str, item_id: str, history: dict[str, Any], timer: Timer, *, deadline: float, next_text: str | None = None
 ) -> dict[str, Any]:
-    state = map_turn_state(history, now=datetime.now(UTC))
+    state = await _turn_state_with_links(history, since=None, deadline=deadline)
     if next_text is not None:
         state["next"] = next_text
     return _error(
@@ -1896,7 +1965,7 @@ async def skyvern_ember_answer(
             history = await get_history(chat_id=ember_chat_id, timeout=READ_TIMEOUT_SECONDS)
             item = _pending_question(history, str(item_id))
             if item is None:
-                return _expired(action_name, str(item_id), history, timer)
+                return await _expired(action_name, str(item_id), history, timer, deadline=deadline)
             kind = _question_action(item, None, None)["kind"]
             if kind != "question":
                 return _error(
@@ -2138,7 +2207,7 @@ async def _decide_login(
     card = _login_card(history, item_id)
     if card is None:
         expired_next = _expired_pick_next(credential_id) if credential_id is not None else None
-        return _expired(action, item_id, history, timer, next_text=expired_next)
+        return await _expired(action, item_id, history, timer, deadline=deadline, next_text=expired_next)
     allowed = _login_decisions(card)
     if decision not in allowed:
         return _not_allowed(action, item_id, decision, allowed, timer)
@@ -2251,7 +2320,7 @@ async def _decide_proposal(
             ErrorCode.PROPOSAL_CHANGED,
             f"The proposal is now {proposal['proposal_id']}, not {item_id}. Nothing was saved.",
             timer,
-            data=map_turn_state(history, now=datetime.now(UTC)),
+            data=await _turn_state_with_links(history, since=None, deadline=deadline),
         )
     shown = map_turn_state(history, now=datetime.now(UTC))["proposal"]
     if shown is None or shown["proposal_id"] != item_id:
@@ -2293,7 +2362,13 @@ async def skyvern_ember_decide(
     ] = None,
     credential_ids: Annotated[
         list[str] | None,
-        Field(description="approve: the ones the user chose. use_saved_login: exactly one saved credential id."),
+        Field(
+            description=(
+                "approve: the ones the user chose. use_saved_login: exactly one saved credential id, such as one in "
+                "the card's saved_logins or its named_credential_id; a login the user wants that isn't listed can also "
+                "be picked in the Studio at the card's link."
+            )
+        ),
     ] = None,
     site_answer: Annotated[
         Literal["add", "no"] | None,
@@ -2362,9 +2437,9 @@ async def skyvern_ember_decide(
                 proposal = _proposal(history, rows)
                 if proposal is not None and proposal["proposal_id"] == item_id:
                     return _not_allowed(action_name, item_id, decision, list(_PROPOSAL_DECISIONS), timer)
-                return _expired(action_name, item_id, history, timer)
+                return await _expired(action_name, item_id, history, timer, deadline=deadline)
             if not _is_proposal_id(item_id):
-                return _expired(action_name, item_id, history, timer)
+                return await _expired(action_name, item_id, history, timer, deadline=deadline)
             return await _decide_proposal(
                 action_name, ember_chat_id, history, item_id, decision, auto_accept, deadline, timer
             )

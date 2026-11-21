@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from skyvern.forge import app
 from skyvern.forge.sdk.integrations.catalog import all_integration_entries, entry_action
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
+from skyvern.forge.sdk.schemas.ember_turn_outcome import ConnectedAccountChoice
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, microsoft_oauth_service
@@ -238,7 +238,6 @@ async def org_connections(organization_id: str, user_id: str | None = None) -> l
 
 # A run Copilot starts offers its agent steps only the accounts the chat approved, recorded here at dispatch.
 _RUN_ACCOUNTS_TTL_SECONDS = 3 * 24 * 60 * 60
-COPILOT_RUN_CREATOR = "copilot"
 
 
 def _run_accounts_key(organization_id: str, workflow_run_id: str) -> str:

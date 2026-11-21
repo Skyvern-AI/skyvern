@@ -137,6 +137,7 @@ class Settings(BaseSettings):
     VIDEO_COMPRESSION_TIMEOUT_SECONDS: float = 300.0
     VIDEO_FINAL_SYNC_TIMEOUT_SECONDS: float = 750.0
     HAR_PATH: str | None = "./har"
+    BROWSER_HAR_RECORDING_ENABLED: bool = True
     LOG_PATH: str = "./log"
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
@@ -1109,8 +1110,13 @@ class Settings(BaseSettings):
     """
 
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
+    ENCRYPTOR_AES_SCOPED_SECRET_KEY: str | None = None
+    ENCRYPTOR_AES_WRITE_SCOPED: bool = False
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
+    ENCRYPTOR_AES_SECRET_KEY_V2: str | None = None
+    ENCRYPTOR_AES_SALT_V2: str | None = None
+    ENCRYPTOR_AES_WRITE_VERSION: Literal["v1"] = "v1"
     ENABLE_ENCRYPTION: bool = False
 
     # Google OAuth settings (used by the Google Sheets connector)

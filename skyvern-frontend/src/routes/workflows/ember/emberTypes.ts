@@ -158,6 +158,14 @@ export interface CredentialDeleteReview {
   outcomes?: { credential_id: string; outcome: CredentialDeleteOutcomeKind }[];
 }
 
+export interface SkillWriteReview {
+  action: "save" | "delete";
+  name: string;
+  live_version: number | null;
+  skill_md?: string | null;
+  decision?: AccountGroupDecision | null;
+}
+
 export interface QuestionResponse {
   answers?: QuestionAnswer[];
   text?: string | null;
@@ -177,6 +185,7 @@ export interface QuestionInteraction {
   account_group_review?: AccountGroupReview;
   account_group_cancel?: AccountGroupCancelReview;
   credential_delete_review?: CredentialDeleteReview;
+  skill_write_review?: SkillWriteReview;
 }
 
 export interface EmberQuestionRequired {
@@ -260,6 +269,7 @@ export interface EmberChatRequest {
   code_block?: boolean | null;
   /** Internal capability: send only when the document editor is active. */
   doc_editor_enabled?: boolean;
+  editor_settings_digest?: string | null;
   cancel_token?: string;
   idempotency_key?: string | null;
   target_block_label?: string | null;
@@ -280,6 +290,7 @@ export interface EmberChatRequest {
   supports_single_run_card?: boolean;
   supports_input_group_card?: boolean;
   supports_credential_delete_card?: boolean;
+  supports_skill_write_card?: boolean;
   supports_connection_card?: boolean;
   supports_demonstration_offer?: boolean;
 }

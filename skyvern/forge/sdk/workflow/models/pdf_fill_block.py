@@ -1067,6 +1067,12 @@ class PdfFillBlock(Block):
         browser_session_id: str | None = None,
         **kwargs: Any,
     ) -> BlockResult:
+        await app.AGENT_FUNCTION.validate_block_execution(
+            block=self,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         block_context = skyvern_context.current()
         if block_context and organization_id:

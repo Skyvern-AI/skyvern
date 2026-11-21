@@ -92,25 +92,54 @@ vi.mock("./tagging/TagPickerCommand", () => ({
 
 import { WorkflowRowActions } from "./WorkflowRowActions";
 import type { WorkflowApiResponse } from "../types/workflowTypes";
+import type { PermissionsState } from "@/store/PageSlots";
+import { PermissionsStateTestProvider } from "@/testUtils/permissions";
 
-function buildWorkflow(): WorkflowApiResponse {
+function buildWorkflow(originalCreatedBy?: string | null): WorkflowApiResponse {
   return {
     workflow_permanent_id: "wpid_1",
     title: "Scrape leads",
     is_template: false,
     folder_id: null,
+    original_created_by: originalCreatedBy,
   } as unknown as WorkflowApiResponse;
+}
+
+function deletePermissions(grants: {
+  any: boolean;
+  own: boolean;
+}): PermissionsState {
+  return {
+    status: "ready",
+    data: {
+      organization_id: "org_test",
+      user_id: "user_self",
+      auth_kind: "bearer",
+      org_role: "org:member",
+      role: "member",
+      capabilities: [
+        { capability: "workflow.delete", allowed: grants.any, reason: "role" },
+        {
+          capability: "workflow.delete.own",
+          allowed: grants.own,
+          reason: "role",
+        },
+      ],
+    },
+  };
 }
 
 function renderMenu(props?: {
   selectedCount?: number;
   onDeleted?: (id: string) => void;
   currentTags?: Array<{ key: string | null; value: string }>;
+  originalCreatedBy?: string | null;
+  permissions?: PermissionsState;
 }) {
-  return render(
+  const menu = (
     <MemoryRouter>
       <WorkflowRowActions
-        workflow={buildWorkflow()}
+        workflow={buildWorkflow(props?.originalCreatedBy)}
         tagKeys={[]}
         labelSuggestions={[]}
         valueSuggestionsByKey={new Map()}
@@ -122,8 +151,21 @@ function renderMenu(props?: {
       >
         {() => <div>row</div>}
       </WorkflowRowActions>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+  return render(
+    props?.permissions ? (
+      <PermissionsStateTestProvider permissions={props.permissions}>
+        {menu}
+      </PermissionsStateTestProvider>
+    ) : (
+      menu
+    ),
+  );
+}
+
+function deleteItem(): HTMLButtonElement {
+  return screen.getByRole("button", { name: /^delete$/i }) as HTMLButtonElement;
 }
 
 afterEach(() => {
@@ -171,5 +213,59 @@ describe("WorkflowRowActions single-row delete", () => {
       },
       expect.any(Object),
     );
+  });
+});
+
+describe("WorkflowRowActions delete permission", () => {
+  // The detail GET returns a null creator for an agent no user created (an API key).
+  it.each([
+    ["user_other", true, "You can only delete agents you created."],
+    [null, true, "You can only delete agents you created."],
+    ["user_self", false, "Your role cannot delete agents."],
+  ])(
+    "disables Delete with a reason (creator %s, own grant %s)",
+    (originalCreatedBy, own, reason) => {
+      renderMenu({
+        originalCreatedBy,
+        permissions: deletePermissions({ any: false, own }),
+      });
+
+      // The item stays focusable so keyboard and screen-reader users reach the reason.
+      expect(deleteItem().getAttribute("aria-disabled")).toBe("true");
+      const reasonId = deleteItem().getAttribute("aria-describedby");
+      expect(reasonId && document.getElementById(reasonId)?.textContent).toBe(
+        reason,
+      );
+      fireEvent.click(deleteItem());
+      expect(screen.queryByRole("dialog")).toBeNull();
+    },
+  );
+
+  it("keeps Delete enabled for a Builder's own agent", () => {
+    renderMenu({
+      originalCreatedBy: "user_self",
+      permissions: deletePermissions({ any: false, own: true }),
+    });
+
+    expect(deleteItem().getAttribute("aria-disabled")).toBeNull();
+  });
+
+  it("keeps Delete enabled for any agent with workflow.delete", () => {
+    renderMenu({
+      originalCreatedBy: "user_other",
+      permissions: deletePermissions({ any: true, own: false }),
+    });
+
+    expect(deleteItem().getAttribute("aria-disabled")).toBeNull();
+  });
+
+  it.each<[string, PermissionsState | undefined]>([
+    ["no permission state (OSS)", undefined],
+    ["a failed permissions read", { status: "error" }],
+    ["permissions still loading", { status: "loading" }],
+  ])("keeps Delete enabled with %s", (_label, permissions) => {
+    renderMenu({ originalCreatedBy: "user_other", permissions });
+
+    expect(deleteItem().getAttribute("aria-disabled")).toBeNull();
   });
 });

@@ -44,7 +44,7 @@ from skyvern.forge.sdk.services.credentials import (
     parse_totp_config,
     wait_for_fresh_totp_window,
 )
-from skyvern.services.otp_email import EmailOTPVerificationContext
+from skyvern.services.otp_email import EmailOTPVerificationContext, GmailOTPSource, OutlookOTPSource
 from skyvern.utils.url_validators import (
     BLOCKED_HOST_ALLOWLIST_HINT,
     SAFE_REDIRECT_STATUS_CODES,
@@ -75,6 +75,106 @@ class RawOTPVerificationContext:
     # False until the stored-code queries return once, so a wait that times out first can say the
     # store went unchecked instead of claiming it was empty.
     store_queried: bool = False
+
+
+_OTP_NOUN_BY_TYPE = {
+    OTPType.TOTP: "code",
+    OTPType.MAGIC_LINK: "sign-in link",
+}
+
+
+def otp_sources_checked(
+    totp_identifier: str,
+    expected_otp_type: OTPType,
+    email_context: EmailOTPVerificationContext,
+    raw_context: RawOTPVerificationContext,
+    *,
+    webhook_checked: bool = False,
+) -> str:
+    """Counts only: addresses, credential ids, identifiers and codes must never reach this text."""
+    # Leading facts come first because every downstream cap slices a prefix.
+    lead_facts = ["verification webhook returned no code"] if webhook_checked else []
+    inbox_facts: list[str] = []
+    # An identifier without an "@" never reaches the inbox search, so no mailbox fact holds for it.
+    inboxes_apply = "@" in totp_identifier
+    connected_everywhere_empty = inboxes_apply
+    if inboxes_apply:
+        gmail = email_context.per_source.get(GmailOTPSource.name)
+        needs_reconnect = gmail.needs_reconnect_count if gmail is not None else 0
+        if needs_reconnect:
+            connected_everywhere_empty = False
+            lead_facts.append(
+                "1 Gmail inbox connected to this organization needs reconnecting in Integrations, "
+                "and codes sent to it cannot be read until it is reconnected"
+                if needs_reconnect == 1
+                else f"{needs_reconnect} Gmail inboxes connected to this organization need reconnecting in "
+                "Integrations, and codes sent to them cannot be read until they are reconnected"
+            )
+        for label, source_name in (
+            ("Gmail", GmailOTPSource.name),
+            ("Outlook", OutlookOTPSource.name),
+        ):
+            source = email_context.per_source.get(source_name)
+            if source is None:
+                inbox_facts.append(f"{label} inboxes not checked")
+                connected_everywhere_empty = False
+            elif source.credential_ids is None:
+                inbox_facts.append(f"{label} inbox list never loaded")
+                connected_everywhere_empty = False
+            elif not source.credential_ids:
+                if source.credential_list_refresh_failed:
+                    inbox_facts.append(f"{label} inbox list not refreshed")
+                    connected_everywhere_empty = False
+                elif not source.needs_reconnect_count:
+                    inbox_facts.append(f"no {label} inbox connected")
+            else:
+                connected_everywhere_empty = False
+                connected = set(source.credential_ids)
+                inboxes = len(connected)
+                # Counted here rather than pruned on refresh: the message sets also drive dedupe,
+                # and forgetting a key would re-parse a message the caller already paid for.
+                messages = sum(1 for credential_id, _ in source.seen_message_keys if credential_id in connected)
+                unreadable = sum(1 for credential_id, _ in source.unreadable_message_keys if credential_id in connected)
+                capped = source.messages_evicted
+                shown = f"{messages}+" if capped else str(messages)
+                if messages and unreadable:
+                    reached = messages + unreadable
+                    # One count carries both: an appended clause would not survive the shortest
+                    # consumer, and a bare checked count hides the candidates the parser refused.
+                    read_fact = f"{shown} of {reached}{'+' if capped else ''} messages read"
+                elif messages:
+                    read_fact = f"{shown} message{'s' if messages != 1 else ''} checked"
+                elif source.failed_credential_ids:
+                    read_fact = "search failed"
+                elif unreadable:
+                    read_fact = f"{unreadable} message{'s' if unreadable != 1 else ''} could not be read"
+                else:
+                    read_fact = "no messages read"
+                plural = "es" if inboxes != 1 else ""
+                # Coverage shares the clause with the read fact, which on its own would hide an inbox
+                # that failed or was still in flight whenever a sibling inbox answered.
+                searched = len(source.completed_credential_ids & connected)
+                coverage = (
+                    f"{searched} of {inboxes} {label} inbox{plural} searched"
+                    if searched < inboxes
+                    else f"{inboxes} {label} inbox{plural} connected"
+                )
+                inbox_facts.append(f"{coverage}, {read_fact}")
+    rows = len(raw_context.seen_row_ids)
+    noun = _OTP_NOUN_BY_TYPE.get(expected_otp_type, "OTP")
+    store_empty = raw_context.store_queried and not rows
+    if not lead_facts and connected_everywhere_empty and store_empty:
+        return f"No Gmail or Outlook inbox is connected and no {noun} has been stored."
+    if not lead_facts and not raw_context.store_queried and all(fact.endswith("not checked") for fact in inbox_facts):
+        return "No delivery source was checked before the wait ended."
+    if not raw_context.store_queried:
+        row_fact = f"stored {noun}s not checked"
+    elif rows:
+        # "found", not "checked": the reparse budget stops the scan before every row is parsed.
+        row_fact = f"{rows} stored OTP message{'s' if rows != 1 else ''} found"
+    else:
+        row_fact = f"no {noun} has been stored"
+    return f"Sources checked: {'; '.join([*lead_facts, *inbox_facts, row_fact])}."
 
 
 @dataclass(frozen=True)
@@ -935,6 +1035,9 @@ async def resolve_otp_value(
     *,
     min_remaining_seconds: int = 0,
     surface_magic_link: MagicLinkSurfacing | None = None,
+    email_context: EmailOTPVerificationContext | None = None,
+    raw_context: RawOTPVerificationContext | None = None,
+    webhook_context: WebhookOTPVerificationContext | None = None,
 ) -> OTPValue | None:
     """Resolve the OTP value to use for a verification step.
 
@@ -995,6 +1098,9 @@ async def resolve_otp_value(
             poll_started_at=poll_started_at,
             multi_field_expected_digits=multi_field_expected_digits,
             surface_magic_link=surface_magic_link,
+            email_context=email_context,
+            raw_context=raw_context,
+            webhook_context=webhook_context,
         )
 
     _warn_if_scope_suppresses_legacy_credential(task, expected_otp_type, allowed_credential_parameter_keys)

@@ -8,7 +8,7 @@ from skyvern.forge import agent_functions
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.services import otp_service
-from skyvern.services.otp_email import EmailOTPCandidate, EmailOTPVerificationContext
+from skyvern.services.otp_email import EmailOTPCandidate, EmailOTPSourceContext, EmailOTPVerificationContext
 
 
 class StubSource:
@@ -23,7 +23,7 @@ class StubSource:
         self.name, self.credentials, self.candidates = name, credentials or [], candidates or []
         self.events, self.list_error = events if events is not None else [], list_error
 
-    async def list_credential_ids(self, organization_id: str) -> list[str]:
+    async def list_credential_ids(self, organization_id: str, context: EmailOTPSourceContext) -> list[str]:
         self.events.append(f"list:{self.name}")
         if self.list_error:
             raise self.list_error

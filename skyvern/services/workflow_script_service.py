@@ -105,7 +105,7 @@ _CACHED_DECORATOR_RE = re.compile(
 )
 
 
-def _validate_main_py(source: str) -> bytes:
+def _validate_main_py(source: str, *, base_main_py: str | None = None) -> bytes:
     content = base64.b64encode(source.encode("utf-8")).decode("utf-8")
     file = ScriptFileCreate(
         path="main.py",
@@ -113,7 +113,16 @@ def _validate_main_py(source: str) -> bytes:
         encoding=FileEncoding.BASE64,
         mime_type="text/x-python",
     )
-    return script_service.validate_uploaded_script_files([file])[file.path]
+    # A patch may keep the static-module header its base revision already has, but never add or change one.
+    header = source.split("\n", 1)[0]
+    keeps_base_header = (
+        base_main_py is not None
+        and header.startswith(script_service.STATIC_MODULE_MARKER)
+        and header == base_main_py.split("\n", 1)[0]
+    )
+    return script_service.validate_uploaded_script_files([file], allow_static_module_marker=keeps_base_header)[
+        file.path
+    ]
 
 
 def _cached_label_from_decorator(decorator: ast.expr) -> str | None:
@@ -2122,7 +2131,7 @@ async def create_script_version_from_review(
                         )
                         return new_script
 
-            patched_bytes = _validate_main_py(patched_main)
+            patched_bytes = _validate_main_py(patched_main, base_main_py=main_py_content)
             patched_hash = hashlib.sha256(patched_bytes).hexdigest()
 
             main_artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(

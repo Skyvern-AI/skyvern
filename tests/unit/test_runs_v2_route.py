@@ -29,6 +29,7 @@ from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow import retry_policy
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -141,27 +142,31 @@ async def test_get_runs_enriches_retry_state_preserving_tasks_and_order(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "run_types", [(RunType.workflow_run,), (RunType.task_v1,), (RunType.workflow_run, RunType.task_v1)]
+)
+async def test_get_runs_v2_serializes_mapping_rows_from_database(
+    monkeypatch: pytest.MonkeyPatch, run_types: tuple[RunType, ...]
+) -> None:
+    rows = [
+        {
+            "task_run_id": f"tr_{run_type.value}",
+            "run_id": "wr_123" if run_type == RunType.workflow_run else "tsk_123",
+            "task_run_type": run_type.value,
+            "status": "completed",
+            "title": "Run",
+            "started_at": None,
+            "finished_at": None,
+            "created_at": "2026-04-01T00:00:00Z",
+            "workflow_permanent_id": "wpid_123" if run_type == RunType.workflow_run else None,
+            "workflow_deleted": False,
+            "script_run": False,
+            "trigger_type": "mcp" if run_type == RunType.workflow_run else None,
+        }
+        for run_type in run_types
+    ]
     mock_workflow_runs = SimpleNamespace(
-        get_all_runs_v2=AsyncMock(
-            return_value=[
-                {
-                    "task_run_id": "tr_123",
-                    "run_id": "wr_123",
-                    "task_run_type": "workflow_run",
-                    "status": "completed",
-                    "title": "Workflow run",
-                    "started_at": None,
-                    "finished_at": None,
-                    "created_at": "2026-04-01T00:00:00Z",
-                    "workflow_permanent_id": "wpid_123",
-                    "workflow_deleted": False,
-                    "script_run": False,
-                    "trigger_type": "mcp",
-                    "searchable_text": "Workflow run",
-                }
-            ]
-        )
+        get_all_runs_v2=AsyncMock(return_value=[dict(row, searchable_text="Run") for row in rows])
     )
     mock_database = SimpleNamespace(
         workflow_runs=mock_workflow_runs,
@@ -174,7 +179,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
         page=2,
         page_size=5,
         search_key="abc",
-        run_type=[RunType.workflow_run, RunType.task_v1],
+        run_type=list(run_types),
         failure_category=None,
     )
 
@@ -184,11 +189,93 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
         page_size=5,
         status=None,
         search_key="abc",
-        run_type=["workflow_run", "task_v1"],
+        run_type=[run_type.value for run_type in run_types],
         workflow_permanent_ids=None,
         run_tags=None,
         failure_category=None,
     )
+    assert orjson.loads(response.body) == [
+        {
+            **row,
+            "created_by": None,
+            "attempt": 1,
+            "retry_pending": False,
+            "next_attempt_at": None,
+        }
+        for row in rows
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("finished_seconds_ago", "decision", "prepared", "pending"),
+    [
+        (30, None, False, True),
+        (600, None, False, True),
+        (601, None, False, False),
+        (601, "retry", False, True),
+        (30, "retry", True, False),
+        (30, "revoked", False, False),
+    ],
+)
+async def test_get_runs_v2_applies_retry_decision_grace_window(
+    monkeypatch: pytest.MonkeyPatch,
+    finished_seconds_ago: int,
+    decision: str | None,
+    prepared: bool,
+    pending: bool,
+) -> None:
+    now = datetime(2026, 4, 1, tzinfo=UTC).replace(tzinfo=None)
+    next_attempt_at = now + timedelta(minutes=5) if decision else None
+    monkeypatch.setattr(retry_policy, "naive_utc_now", lambda: now)
+    mock_workflow_runs = SimpleNamespace(
+        get_all_runs_v2=AsyncMock(
+            return_value=[
+                {
+                    "task_run_id": "tr_123",
+                    "run_id": "wr_123",
+                    "task_run_type": "workflow_run",
+                    "status": "completed",
+                    "title": "Workflow run",
+                    "started_at": None,
+                    # The task_runs mirror can lag the canonical workflow_runs row. Retry grace
+                    # must use the latter so list and detail agree during that window.
+                    "finished_at": None,
+                    "workflow_run_finished_at": now - timedelta(seconds=finished_seconds_ago),
+                    "created_at": "2026-04-01T00:00:00Z",
+                    "workflow_permanent_id": "wpid_123",
+                    "workflow_deleted": False,
+                    "script_run": False,
+                    "trigger_type": "mcp",
+                    "searchable_text": "Workflow run",
+                }
+            ]
+        )
+    )
+    summary = WorkflowRunAttemptSummary(
+        workflow_run_id="wr_123",
+        attempt_number=2,
+        retry_decision=decision,
+        next_attempt_prepared_at=now if prepared else None,
+        next_attempt_at=next_attempt_at,
+    )
+    attempts = make_workflow_run_attempts_fake()
+    attempts.get_latest_attempt_summaries_for_runs.return_value = {"wr_123": summary}
+    mock_database = SimpleNamespace(
+        workflow_runs=mock_workflow_runs,
+        workflow_run_attempts=attempts,
+    )
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    response = await agent_protocol.get_runs_v2(
+        current_org=SimpleNamespace(organization_id="org_123"),
+        page=1,
+        page_size=5,
+        search_key=None,
+        run_type=[RunType.workflow_run],
+        failure_category=None,
+    )
+
     assert orjson.loads(response.body) == [
         {
             "task_run_id": "tr_123",
@@ -204,63 +291,11 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
             "script_run": False,
             "trigger_type": "mcp",
             "created_by": None,
-            "attempt": 1,
-            "retry_pending": False,
-            "next_attempt_at": None,
+            "attempt": 2,
+            "retry_pending": pending,
+            "next_attempt_at": next_attempt_at.isoformat() if pending and next_attempt_at else None,
         }
     ]
-
-
-@pytest.mark.asyncio
-async def test_get_runs_v2_applies_retry_decision_grace_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    mock_workflow_runs = SimpleNamespace(
-        get_all_runs_v2=AsyncMock(
-            return_value=[
-                {
-                    "task_run_id": "tr_123",
-                    "run_id": "wr_123",
-                    "task_run_type": "workflow_run",
-                    "status": "completed",
-                    "title": "Workflow run",
-                    "started_at": None,
-                    # The task_runs mirror can lag the canonical workflow_runs row. Retry grace
-                    # must use the latter so list and detail agree during that window.
-                    "finished_at": None,
-                    "workflow_run_finished_at": datetime.now(UTC) - timedelta(seconds=30),
-                    "created_at": "2026-04-01T00:00:00Z",
-                    "workflow_permanent_id": "wpid_123",
-                    "workflow_deleted": False,
-                    "script_run": False,
-                    "trigger_type": "mcp",
-                    "searchable_text": "Workflow run",
-                }
-            ]
-        )
-    )
-    mock_attempt = SimpleNamespace(
-        attempt_number=1,
-        retry_decision=None,
-        next_attempt_prepared_at=None,
-        next_attempt_at=None,
-    )
-    mock_database = SimpleNamespace(
-        workflow_runs=mock_workflow_runs,
-        workflow_run_attempts=SimpleNamespace(
-            get_latest_attempts_for_runs=AsyncMock(return_value={"wr_123": mock_attempt})
-        ),
-    )
-    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
-
-    response = await agent_protocol.get_runs_v2(
-        current_org=SimpleNamespace(organization_id="org_123"),
-        page=1,
-        page_size=5,
-        search_key=None,
-        run_type=[RunType.workflow_run],
-        failure_category=None,
-    )
-
-    assert orjson.loads(response.body)[0]["retry_pending"] is True
 
 
 @pytest.mark.asyncio

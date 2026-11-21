@@ -43,12 +43,13 @@ describe("Power BI query block validation", () => {
     ]);
   });
 
-  it("requires explicit migration from a saved native connection", () => {
+  it("accepts a native connection and requires a connection source", () => {
     expect(
       validatePowerBIQueryNode(queryNode({ credentialSource: "native" })),
-    ).toContain(
-      "Query sales: Select a verified Power BI connection; native connections are no longer supported.",
-    );
+    ).toEqual([]);
+    expect(
+      validatePowerBIQueryNode(queryNode({ credentialSource: undefined })),
+    ).toContain("Query sales: Select a Power BI connection.");
   });
 
   it.each([0, -1, 1.5, POWERBI_QUERY_MAX_ROWS + 1, Number.NaN])(

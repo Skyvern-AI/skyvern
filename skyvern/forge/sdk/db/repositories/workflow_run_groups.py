@@ -31,7 +31,7 @@ from skyvern.forge.sdk.services.request_principal import (
     scoped_api_key_actor_id,
     trigger_owner_id,
 )
-from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR
+from skyvern.forge.sdk.workflow.models.workflow import EMBER_TEST_WORKFLOW_CREATOR
 from skyvern.schemas.workflow_run_groups import (
     DEFAULT_MAX_CONCURRENCY,
     IN_FLIGHT_ITEM_STATES,
@@ -145,7 +145,7 @@ class WorkflowRunGroupsRepository(BaseRepository):
                     .where(
                         or_(
                             WorkflowModel.created_by.is_(None),
-                            WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR,
+                            WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR,
                         )
                     )
                     .order_by(WorkflowModel.version.desc())

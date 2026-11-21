@@ -412,7 +412,12 @@ async def _build_task_payload(
         raise WebhookReplayError(f"Run {run_id} has not reached a terminal state (status={task.status}).")
     latest_step = await app.DATABASE.tasks.get_latest_step(run_id, organization_id=organization_id)
     task_response = await app.agent.build_task_response(task=task, last_step=latest_step)
-    run_response = await run_service.get_run_response(run_id=run_id, organization_id=organization_id)
+    run_response = await run_service.get_run_response(
+        run_id=run_id,
+        organization_id=organization_id,
+        need_browser_log=False,
+        need_final_screenshot=False,
+    )
     responses = [task_response]
     if isinstance(run_response, TaskRunResponse):
         if not run_response.status.is_final():

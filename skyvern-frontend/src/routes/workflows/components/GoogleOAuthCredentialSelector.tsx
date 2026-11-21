@@ -19,6 +19,7 @@ import {
 } from "@/hooks/useGoogleOAuthCredentials";
 import { useOAuthCredentialAutoFill } from "@/routes/workflows/editor/hooks/useOAuthCredentialAutoFill";
 import { PlusIcon } from "@radix-ui/react-icons";
+import { stripBidiIsolates } from "@/util/bidiText";
 import {
   GOOGLE_GMAIL_REQUIRED_SCOPES,
   GOOGLE_GMAIL_SEND_REQUIRED_SCOPES,
@@ -336,6 +337,7 @@ function GoogleOAuthCredentialSelector({
                   key={account.id}
                   value={`${ADDITIONAL_PREFIX}${account.id}`}
                   disabled={account.disabled}
+                  textValue={stripBidiIsolates(account.label)}
                 >
                   {account.label}
                 </SelectItem>

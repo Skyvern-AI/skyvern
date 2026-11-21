@@ -1966,7 +1966,7 @@ class SkyvernPage(Page):
                         field_label=label[:50],
                         field_type=field_type,
                         field_index=idx,
-                        value=str(value)[:50],
+                        value_length=len(str(value)),
                         options_count=len(field.get("options", [])),
                         option_labels=[(o.get("label") or "?")[:30] for o in field.get("options", [])],
                     )
@@ -2069,7 +2069,7 @@ class SkyvernPage(Page):
                         "fill_from_mapping: custom widget detected",
                         field_label=label,
                         widget_type=field_type,
-                        value=str(value)[:50],
+                        value_length=len(str(value)),
                     )
                     if _budget_available():
                         filled = await app.AGENT_FUNCTION.fill_custom_widget(

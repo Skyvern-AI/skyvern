@@ -203,6 +203,7 @@ export type BlockYAMLBase = WorkflowBlockDocFields & {
 
 export type TaskBlockYAML = BlockYAMLBase & {
   block_type: "task";
+  complete_verification?: boolean;
   url: string | null;
   title?: string;
   navigation_goal: string | null;
@@ -269,6 +270,8 @@ export type DataExportBlockYAML = BlockYAMLBase & {
 
 export type ActionBlockYAML = BlockYAMLBase & {
   block_type: "action";
+  selector?: string | null;
+  ai_fallback?: "fallback" | "proactive";
   url: string | null;
   title?: string;
   navigation_goal: string | null;
@@ -286,6 +289,8 @@ export type ActionBlockYAML = BlockYAMLBase & {
 
 export type NavigationBlockYAML = BlockYAMLBase & {
   block_type: "navigation";
+  complete_verification?: boolean;
+  complete_criterion_is_untrusted?: boolean;
   url: string | null;
   title?: string;
   navigation_goal: string | null;
@@ -326,6 +331,8 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
 
 export type LoginBlockYAML = BlockYAMLBase & {
   block_type: "login";
+  complete_verification?: boolean;
+  skip_saved_profile?: boolean;
   url: string | null;
   title?: string;
   navigation_goal: string | null;
@@ -451,6 +458,7 @@ export type FileUploadBlockYAML = BlockYAMLBase & {
   azure_blob_container_name?: string | null;
   google_credential_id?: string | null;
   google_drive_folder_id?: string | null;
+  google_drive_save_as_sheet?: boolean;
   sftp_host?: string | null;
   sftp_port?: number | null;
   sftp_username?: string | null;

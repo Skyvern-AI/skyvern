@@ -8,13 +8,13 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
-from skyvern.forge.sdk.copilot.code_block_preflight import (
+from skyvern.forge.sdk.ember.code_block_preflight import (
     CodeBlockPreflightDiagnostic,
     author_time_code_block_diagnostics,
     preflight_code_block,
     scanner_advisory_diagnostics,
 )
-from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
+from skyvern.forge.sdk.ember.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.workflow.code_block_security import (
     CodeBlockSecurityError,
     author_time_code_security_errors,

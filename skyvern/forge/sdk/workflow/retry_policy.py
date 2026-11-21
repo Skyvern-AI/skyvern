@@ -15,6 +15,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.models import WorkflowRunAttemptModel
+from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunAttemptSummary
 from skyvern.forge.sdk.db.repositories.workflow_runs import PrepareNextAttemptResult
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.emails import GMAIL_ORGANIZE_UNCERTAIN_ERROR_CODE
@@ -204,7 +205,7 @@ def _attempt_from_record(record: AttemptRecord) -> WorkflowRunAttempt:
 def is_retry_pending(
     status: WorkflowRunStatus | RunStatus,
     finished_at: datetime | None,
-    latest_attempt: AttemptRecord,
+    latest_attempt: AttemptRecord | WorkflowRunAttemptSummary,
 ) -> bool:
     """Return the retry-pending state shared by detail and list responses."""
     if not status.is_final():

@@ -21,6 +21,10 @@ Times are UTC on 2026-11-14.
 | `site_question.json` | wcc_596972050801660396 | 560eaeef24684c5f94b46ab7bf7205e7 | 17:16:39 | Login card on a fixture origin no saved login covers, then `skyvern_ember_decide use_saved_login` with a login saved for a different site; the card carries `site_question` with `vault_sourced=false` (Skyvern-held sites). |
 | `created_trigger_webhook.json` | wcc_596979390906312646 | bec7a90cc6a64ab488c69402372bb584 | 17:45:51 | Turn started through stdio `skyvern_ember_send` with a member-bound key for an org member whose role may create triggers, asking for an untested draft plus a signed webhook trigger; Ember created `etr_596979605654677482`, turned off. |
 
+`saved_logins.json` is the `GET /v1/credentials?page=1&page_size=1000&credential_type=password` response from a local
+stack on 2026-11-19 at 04:19:59 UTC, the list the Studio login card's picker shows; the route returns no secrets.
+Its `created_by` user ids are set to null.
+
 `finished_tested_proposal_saved_workflow.json` is the `GET /api/v1/workflows/wpid_596722129431361928` response for that
 chat's workflow (version 1, last modified 01:06:37, before the proposal), so the judged eval can show a proposal diff.
 

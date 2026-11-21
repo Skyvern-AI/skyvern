@@ -245,7 +245,7 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
     async def clean_up_workflow(**_kwargs: object) -> None:
         finalization_order.append("cleanup")
 
-    monkeypatch.setattr(service_module, "publish_copilot_runtime_secret_values", publish_runtime_secrets)
+    monkeypatch.setattr(service_module, "publish_ember_runtime_secret_values", publish_runtime_secrets)
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow_by_workflow_run_id", AsyncMock(return_value=workflow))

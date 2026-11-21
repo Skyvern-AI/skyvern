@@ -493,6 +493,12 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             });
             void queryClient.invalidateQueries({ queryKey: ["workflows"] });
             void queryClient.invalidateQueries({
+              queryKey: [
+                "workflowVersions",
+                base.workflow.workflow_permanent_id,
+              ],
+            });
+            void queryClient.invalidateQueries({
               queryKey: ["block-scripts", base.workflow.workflow_permanent_id],
             });
           }

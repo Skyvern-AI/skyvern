@@ -8,14 +8,14 @@ import pytest
 
 from skyvern.forge.sdk.api.llm.model_usage import (
     ModelUsageEvent,
-    _emit_direct_copilot_model_usage,
+    _emit_direct_ember_model_usage,
     _emit_model_usage,
-    is_workflow_copilot_prompt_name,
+    is_ember_prompt_name,
     normalize_gen_ai_provider,
 )
-from skyvern.forge.sdk.copilot.cost_telemetry import (
-    copilot_cost_scope,
-    current_copilot_cost,
+from skyvern.forge.sdk.ember.cost_telemetry import (
+    current_ember_cost,
+    ember_cost_scope,
     exclude_workflow_block_cost,
 )
 
@@ -38,16 +38,16 @@ class CapturingLogger:
         "workflow-copilot-future-call",
     ],
 )
-def test_workflow_copilot_prompt_namespace_accepts_exact_and_prefixed_names(prompt_name: str) -> None:
-    assert is_workflow_copilot_prompt_name(prompt_name)
+def test_ember_prompt_namespace_accepts_exact_and_prefixed_names(prompt_name: str) -> None:
+    assert is_ember_prompt_name(prompt_name)
 
 
 @pytest.mark.parametrize(
     "prompt_name",
     [None, "", "workflow", "workflow-copilotish", "other-workflow-copilot", "check-user-goal"],
 )
-def test_workflow_copilot_prompt_namespace_rejects_unrelated_names(prompt_name: str | None) -> None:
-    assert not is_workflow_copilot_prompt_name(prompt_name)
+def test_ember_prompt_namespace_rejects_unrelated_names(prompt_name: str | None) -> None:
+    assert not is_ember_prompt_name(prompt_name)
 
 
 def test_direct_event_preserves_zeroes_and_omits_unavailable_optional_fields() -> None:
@@ -64,7 +64,7 @@ def test_direct_event_preserves_zeroes_and_omits_unavailable_optional_fields() -
         prompt_name="workflow-copilot-narration",
     )
 
-    assert _emit_direct_copilot_model_usage(event, logger=logger)
+    assert _emit_direct_ember_model_usage(event, logger=logger)
 
     assert logger.events == [
         (
@@ -98,7 +98,7 @@ def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
         prompt_name="workflow-copilot-raw-secret-safety",
     )
 
-    _emit_direct_copilot_model_usage(event, logger=logger)
+    _emit_direct_ember_model_usage(event, logger=logger)
 
     fields = logger.events[0][1]
     assert set(fields) == {
@@ -137,11 +137,11 @@ def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
 
 def test_cost_ledger_records_actor_and_safety_cost_without_filling_unknowns() -> None:
     logger = CapturingLogger()
-    with copilot_cost_scope():
+    with ember_cost_scope():
         _emit_model_usage(
             ModelUsageEvent(request_model="model", cost=0.03, cost_source="litellm_estimate"), logger=logger
         )
-        _emit_direct_copilot_model_usage(
+        _emit_direct_ember_model_usage(
             ModelUsageEvent(
                 request_model="model",
                 prompt_name="workflow-copilot-raw-secret-safety",
@@ -151,7 +151,7 @@ def test_cost_ledger_records_actor_and_safety_cost_without_filling_unknowns() ->
             logger=logger,
         )
         _emit_model_usage(ModelUsageEvent(request_model="model"), logger=logger)
-        snapshot = current_copilot_cost()
+        snapshot = current_ember_cost()
         assert snapshot is not None
         assert snapshot["known_cost_usd"] == pytest.approx(0.03)
         assert snapshot["status"] == "partial"
@@ -160,7 +160,7 @@ def test_cost_ledger_records_actor_and_safety_cost_without_filling_unknowns() ->
         assert snapshot["unknown_call_count"] == 1
         assert snapshot["pricing_sources"] == ["litellm_estimate", "provider_reported"]
         assert "workflow_replay" in snapshot["excluded"]
-    assert current_copilot_cost() is None
+    assert current_ember_cost() is None
 
 
 @pytest.mark.asyncio
@@ -175,21 +175,21 @@ async def test_cost_ledger_isolates_concurrent_turns_and_closes_inherited_backgr
         _emit_model_usage(
             ModelUsageEvent(request_model="model", cost=10.0, cost_source="litellm_estimate"), logger=logger
         )
-        assert current_copilot_cost() is None
+        assert current_ember_cost() is None
 
     async def turn(amount: float) -> dict[str, object] | None:
-        with copilot_cost_scope():
+        with ember_cost_scope():
             _emit_model_usage(
                 ModelUsageEvent(request_model="model", cost=amount, cost_source="litellm_estimate"),
                 logger=logger,
             )
             await asyncio.sleep(0)
-            return current_copilot_cost()
+            return current_ember_cost()
 
     left, right = await asyncio.gather(turn(0.1), turn(0.2))
     assert left is not None and left["known_cost_usd"] == pytest.approx(0.1)
     assert right is not None and right["known_cost_usd"] == pytest.approx(0.2)
-    with copilot_cost_scope() as ledger:
+    with ember_cost_scope() as ledger:
         task = asyncio.create_task(record_later())
         await background_ready.wait()
     background_release.set()
@@ -198,16 +198,16 @@ async def test_cost_ledger_isolates_concurrent_turns_and_closes_inherited_backgr
 
 
 @pytest.mark.asyncio
-async def test_workflow_block_tasks_cannot_contribute_to_the_parent_copilot_cost() -> None:
+async def test_workflow_block_tasks_cannot_contribute_to_the_parent_ember_cost() -> None:
     logger = CapturingLogger()
 
     async def execute_block() -> None:
         await asyncio.sleep(0)
-        assert current_copilot_cost() is None
+        assert current_ember_cost() is None
         _emit_model_usage(
             ModelUsageEvent(request_model="model", cost=100.0, cost_source="litellm_estimate"), logger=logger
         )
-        _emit_direct_copilot_model_usage(
+        _emit_direct_ember_model_usage(
             ModelUsageEvent(
                 request_model="model",
                 prompt_name="workflow-copilot-raw-secret-safety",
@@ -217,10 +217,10 @@ async def test_workflow_block_tasks_cannot_contribute_to_the_parent_copilot_cost
             logger=logger,
         )
 
-    with copilot_cost_scope() as ledger:
+    with ember_cost_scope() as ledger:
         with exclude_workflow_block_cost():
             task = asyncio.create_task(execute_block())
-        _emit_direct_copilot_model_usage(
+        _emit_direct_ember_model_usage(
             ModelUsageEvent(
                 request_model="model",
                 prompt_name="workflow-copilot-raw-secret-safety",
@@ -237,7 +237,7 @@ async def test_workflow_block_tasks_cannot_contribute_to_the_parent_copilot_cost
 
 @pytest.mark.parametrize("cost", [None, -1.0, float("nan"), float("inf"), True])
 def test_cost_ledger_preserves_invalid_cost_as_unknown(cost: float | None) -> None:
-    with copilot_cost_scope() as ledger:
+    with ember_cost_scope() as ledger:
         ledger.record(ModelUsageEvent(request_model="model", cost=cost, cost_source="litellm_estimate"))
         assert ledger.snapshot()["known_cost_usd"] is None
         assert ledger.snapshot()["unknown_call_count"] == 1
@@ -277,7 +277,7 @@ def test_unrelated_direct_event_does_not_log() -> None:
         prompt_name="extract-actions",
     )
 
-    assert not _emit_direct_copilot_model_usage(event, logger=logger)
+    assert not _emit_direct_ember_model_usage(event, logger=logger)
     assert logger.events == []
 
 

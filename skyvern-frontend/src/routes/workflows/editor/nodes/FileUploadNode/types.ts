@@ -17,6 +17,7 @@ export type FileUploadNodeData = NodeBaseData & {
   azureBlobContainerName: string | null;
   googleCredentialId: string | null;
   googleDriveFolderId: string | null;
+  googleDriveSaveAsSheet: boolean;
   sftpHost: string | null;
   sftpPort: string | null;
   sftpUsername: string | null;
@@ -46,6 +47,7 @@ export const fileUploadNodeDefaultData: FileUploadNodeData = {
   azureBlobContainerName: null,
   googleCredentialId: null,
   googleDriveFolderId: null,
+  googleDriveSaveAsSheet: false,
   sftpHost: null,
   sftpPort: null,
   sftpUsername: null,

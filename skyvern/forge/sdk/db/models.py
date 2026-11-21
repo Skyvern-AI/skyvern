@@ -44,6 +44,9 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_parameter_id,
     generate_debug_session_id,
     generate_email_config_id,
+    generate_ember_chat_id,
+    generate_ember_chat_message_id,
+    generate_ember_completion_criteria_set_id,
     generate_folder_id,
     generate_forwarding_address_id,
     generate_gmail_send_dispatch_id,
@@ -78,9 +81,6 @@ from skyvern.forge.sdk.db.id import (
     generate_thought_id,
     generate_totp_code_id,
     generate_uploaded_file_id,
-    generate_workflow_copilot_chat_id,
-    generate_workflow_copilot_chat_message_id,
-    generate_workflow_copilot_completion_criteria_set_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
@@ -1081,7 +1081,7 @@ class WorkflowRunModel(Base):
     # mid-run flag edit strand the run on a cluster with no runner. NULL means the run predates
     # the pin, and the gates resolve the flag as before.
     secure_runner_pinned = Column(Boolean, nullable=True)
-    copilot_session_id = Column(String, nullable=True)
+    ember_session_id = Column("copilot_session_id", String, nullable=True)
     created_by = Column(String, nullable=True)
     # The actor that authorized the start when it is not created_by: the person Copilot started the run for, or the
     # org's synthetic user for an API key. Run start and its Trigger children are judged as them.
@@ -2185,6 +2185,8 @@ class ScriptModel(Base):
     # The workflow run or task run id that this script is generated
     run_id = Column(String, nullable=True)
     version = Column(Integer, default=1, nullable=False)
+    # Set only when the platform pins one of its static modules; a main.py header naming any other module is ignored.
+    static_module = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -2293,11 +2295,11 @@ class ScriptBlockModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
-class WorkflowCopilotChatModel(Base):
+class EmberChatModel(Base):
     __tablename__ = "workflow_copilot_chats"
     __table_args__ = (Index("wcc_org_created_at_index", "organization_id", "created_at"),)
 
-    workflow_copilot_chat_id = Column(String, primary_key=True, default=generate_workflow_copilot_chat_id)
+    ember_chat_id = Column("workflow_copilot_chat_id", String, primary_key=True, default=generate_ember_chat_id)
     organization_id = Column(String, nullable=False)
     workflow_permanent_id = Column(String, nullable=False, index=True)
     proposed_workflow = Column(JSON, nullable=True)
@@ -2316,14 +2318,14 @@ class WorkflowCopilotChatModel(Base):
     )
 
 
-class WorkflowCopilotChatMessageModel(Base):
+class EmberChatMessageModel(Base):
     __tablename__ = "workflow_copilot_chat_messages"
     __table_args__ = (Index("wccm_org_chat_index", "organization_id", "workflow_copilot_chat_id"),)
 
-    workflow_copilot_chat_message_id = Column(
-        String, primary_key=True, default=generate_workflow_copilot_chat_message_id
+    ember_chat_message_id = Column(
+        "workflow_copilot_chat_message_id", String, primary_key=True, default=generate_ember_chat_message_id
     )
-    workflow_copilot_chat_id = Column(String, nullable=False, index=True)
+    ember_chat_id = Column("workflow_copilot_chat_id", String, nullable=False, index=True)
     organization_id = Column(String, nullable=False)
     sender = Column(String, nullable=False)
     content = Column(UnicodeText, nullable=False)
@@ -2345,15 +2347,13 @@ class WorkflowCopilotChatMessageModel(Base):
     )
 
 
-class WorkflowCopilotCompletionCriteriaSetModel(Base):
+class EmberCompletionCriteriaSetModel(Base):
     __tablename__ = "workflow_copilot_completion_criteria_sets"
     __table_args__ = (Index("wcccs_org_chat_index", "organization_id", "workflow_copilot_chat_id"),)
 
-    completion_criteria_set_id = Column(
-        String, primary_key=True, default=generate_workflow_copilot_completion_criteria_set_id
-    )
+    completion_criteria_set_id = Column(String, primary_key=True, default=generate_ember_completion_criteria_set_id)
     organization_id = Column(String, nullable=False)
-    workflow_copilot_chat_id = Column(String, nullable=False)
+    ember_chat_id = Column("workflow_copilot_chat_id", String, nullable=False)
     goal_epoch = Column(Integer, nullable=False)
     status = Column(String, nullable=False, default="active")
     criteria = Column(JSON, nullable=False)

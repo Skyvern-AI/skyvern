@@ -674,7 +674,12 @@ async def refresh_and_rotate(
     if not credential_secrets.encrypted_refresh_token:
         raise ValueError("Microsoft OAuth credential is missing its stored refresh token")
     _require_gcm_encryption()
-    token_data = await refresh_access_token(credential_secrets.refresh_token, credential_secrets.scopes)
+    try:
+        token_data = await refresh_access_token(credential_secrets.refresh_token, credential_secrets.scopes)
+    except MicrosoftOAuthError as exc:
+        if exc.error_code == "invalid_grant":
+            await _mark_credential_expired(organization_id, credential_id, credential_secrets.encrypted_refresh_token)
+        raise
     access_token = token_data.get("access_token")
     if not isinstance(access_token, str) or not access_token:
         raise MissingAccessTokenError("Microsoft token response did not include access_token")
@@ -735,6 +740,40 @@ async def refresh_and_rotate(
             "Failed to persist Microsoft credential refresh; reconnect the Microsoft account"
         ) from exc
     return access_token
+
+
+async def _mark_credential_expired(
+    organization_id: str, credential_id: str, expected_encrypted_refresh_token: str
+) -> None:
+    """Best-effort: the caller still raises the refresh failure if this cannot persist."""
+    try:
+        flipped = await app.DATABASE.microsoft_oauth.mark_needs_reconnect(
+            organization_id=organization_id,
+            credential_id=credential_id,
+            expected_encrypted_refresh_token=expected_encrypted_refresh_token,
+            now=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to mark Microsoft OAuth credential as needing reconnect",
+            credential_id=credential_id,
+            exc_info=True,
+        )
+        return
+    if flipped:
+        LOG.info(
+            "Marked Microsoft OAuth credential as needing reconnect",
+            credential_id=credential_id,
+            organization_id=organization_id,
+        )
+
+
+async def get_visible_credentials_for_org(
+    organization_id: str,
+    user_id: str | None = None,
+) -> list[MicrosoftOAuthCredentialBase]:
+    """Active and needs-reconnect credentials, for listing in the UI."""
+    return await app.DATABASE.microsoft_oauth.list_visible_for_org(organization_id=organization_id, user_id=user_id)
 
 
 async def get_credentials_for_org(

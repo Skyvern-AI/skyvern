@@ -40,6 +40,7 @@ from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.analytics import get_oss_version
 from skyvern.config import settings
+from skyvern.constants import EMBER_RUN_CREATOR
 from skyvern.exceptions import (
     DisabledBlockExecutionError,
     MissingBrowserAddressError,
@@ -182,7 +183,7 @@ from skyvern.forge.sdk.services.request_principal import (
     get_request_principal,
     reject_non_admin_api_key_secret_access,
 )
-from skyvern.forge.sdk.services.route_authorization import require_request_actions
+from skyvern.forge.sdk.services.route_authorization import EMBER_READ_ACTION, require_request_actions
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key_from_digest
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -926,7 +927,10 @@ async def get_run(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Task run not found {run_id}",
         )
-    run_response = run_response.model_copy(deep=True)
+    # Coalesced callers share the source response, so isolate the one field the redactor writes.
+    run_request = run_response.run_request
+    isolated_run_request = run_request.model_copy() if run_request is not None else None
+    run_response = run_response.model_copy(update={"run_request": isolated_run_request})
     await _redact_browser_session_addresses([run_response], current_org.organization_id)
     return run_response
 
@@ -1108,6 +1112,13 @@ async def create_workflow_legacy(
 
 IDEMPOTENCY_KEY_MAX_BYTES = 255
 IDEMPOTENCY_KEY_CONTRACT = f"Idempotency-Key must contain 1 to {IDEMPOTENCY_KEY_MAX_BYTES} visible ASCII bytes."
+IDEMPOTENCY_KEY_HEADER_DESCRIPTION = (
+    "Makes the create safe to retry: a repeat request with the same key returns the agent the first request "
+    f"created instead of creating another. Must contain 1 to {IDEMPOTENCY_KEY_MAX_BYTES} visible ASCII bytes. "
+    "When this header is sent, the returned `workflow_permanent_id` is derived from the key: `wpid_` followed by "
+    "64 hexadecimal characters, instead of the usual `wpid_` followed by digits. The ID is permanent and works "
+    "like any other agent ID. Omit the header to get the usual format."
+)
 MAX_WORKFLOW_VALIDATION_DRAFT_BYTES = 100_000
 
 
@@ -1212,7 +1223,7 @@ async def validate_saved_workflow_trailing_slash(
 def validate_idempotency_key(
     value: Annotated[
         str | None,
-        Header(alias="Idempotency-Key", description=IDEMPOTENCY_KEY_CONTRACT),
+        Header(alias="Idempotency-Key", description=IDEMPOTENCY_KEY_HEADER_DESCRIPTION),
     ] = None,
 ) -> str | None:
     # Visible ASCII encodes one byte per character, so the character count is the byte count.
@@ -3516,7 +3527,7 @@ async def _require_write_in_every_folder() -> None:
     await app.AGENT_FUNCTION.enforce_folder_access_everywhere(get_request_principal(), "workflow.update")
 
 
-_COPILOT_CHAT_LOG_PATH = re.compile(rf"/logs/{LogEntityType.WORKFLOW_COPILOT_CHAT}/([^/]+)/")
+_EMBER_CHAT_LOG_PATH = re.compile(rf"/logs/{LogEntityType.EMBER_CHAT}/([^/]+)/")
 _DESCENDANT_CHECKED_ARTIFACT_TYPES = frozenset(
     {
         ArtifactType.DOWNLOAD,
@@ -3677,8 +3688,8 @@ async def _authorize_artifact_read(
             await _enforce_folder_access("script.read", {"script_id": script_id})
         return
     # Copilot screenshots and audio name their chat only in the log path create_log_artifact writes.
-    if chat_match := _COPILOT_CHAT_LOG_PATH.search(artifact.uri or ""):
-        await _enforce_folder_access("workflow_copilot.read", {"workflow_copilot_chat_id": chat_match.group(1)})
+    if chat_match := _EMBER_CHAT_LOG_PATH.search(artifact.uri or ""):
+        await _enforce_folder_access(EMBER_READ_ACTION, {"workflow_copilot_chat_id": chat_match.group(1)})
 
 
 async def _authorize_artifact_list(artifacts: list[Artifact], *, check_folder: bool = True) -> None:
@@ -5591,7 +5602,7 @@ async def get_runs_v2(
         ) from exc
     items = [TaskRunListItem.model_validate(row) for row in rows]
     workflow_run_ids = [row["run_id"] for row in rows if row["task_run_type"] == RunType.workflow_run.value]
-    latest_attempts = await app.DATABASE.workflow_run_attempts.get_latest_attempts_for_runs(workflow_run_ids)
+    latest_attempts = await app.DATABASE.workflow_run_attempts.get_latest_attempt_summaries_for_runs(workflow_run_ids)
     response_items = []
     for row, item in zip(rows, items, strict=True):
         response_item = item.model_dump(mode="json")
@@ -6866,16 +6877,40 @@ async def get_workflow(
         version=version,
     )
     if not template:
-        workflow.copilot_authored = "copilot" in (
-            workflow.created_by,
-            workflow.edited_by,
-        ) or await app.DATABASE.workflows.is_workflow_copilot_authored(
-            workflow_permanent_id=workflow_permanent_id,
-            organization_id=current_org.organization_id,
+
+        async def _is_copilot_authored() -> bool:
+            if EMBER_RUN_CREATOR in (workflow.created_by, workflow.edited_by):
+                return True
+            return await app.DATABASE.workflows.is_ember_authored(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=current_org.organization_id,
+            )
+
+        async def _original_creators() -> dict[str, str | None] | None:
+            try:
+                # Same creator lookup the delete ownership check uses.
+                return await app.DATABASE.workflows.get_workflow_original_creators(
+                    {workflow_permanent_id}, current_org.organization_id
+                )
+            except Exception:
+                LOG.warning(
+                    "Agent creator lookup failed; returning the agent without its creator",
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=current_org.organization_id,
+                    exc_info=True,
+                )
+                return None
+
+        copilot_authored, default_engine, original_creators = await asyncio.gather(
+            _is_copilot_authored(),
+            effective_default_engine(workflow_permanent_id, current_org.organization_id),
+            _original_creators(),
         )
-        workflow.set_effective_default_engine(
-            await effective_default_engine(workflow_permanent_id, current_org.organization_id)
-        )
+        workflow.copilot_authored = copilot_authored
+        workflow.set_effective_default_engine(default_engine)
+        # On a failed lookup the field stays omitted, so the UI leaves Delete to the server's check.
+        if original_creators is not None:
+            workflow.set_original_created_by(original_creators.get(workflow_permanent_id))
     await _redact_inaccessible_workflow_credential_ids([workflow])
     return mask_workflow_for_api(workflow)
 

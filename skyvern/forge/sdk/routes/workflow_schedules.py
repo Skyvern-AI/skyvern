@@ -53,7 +53,7 @@ _AUDITED_SCHEDULE_FIELDS = {
 }
 
 
-def _require_schedules_enabled() -> None:
+def require_schedules_enabled() -> None:
     if not app.AGENT_FUNCTION.workflow_schedules_enabled:
         raise HTTPException(
             status_code=501,
@@ -292,7 +292,7 @@ async def list_organization_schedules(
     ),
     search: str | None = Query(default=None, description="Search by workflow title or schedule name"),
     organization: Organization = Depends(org_auth_service.get_current_org),
-    _: None = Depends(_require_schedules_enabled),
+    _: None = Depends(require_schedules_enabled),
 ) -> OrganizationScheduleListResponse:
     enabled_filter: bool | None = None
     if status == "active":
@@ -333,7 +333,7 @@ async def create_workflow_schedule(
     workflow_permanent_id: str,
     body: WorkflowScheduleUpsertRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
-    _: None = Depends(_require_schedules_enabled),
+    _: None = Depends(require_schedules_enabled),
 ) -> WorkflowScheduleResponse:
     _validate_request(body)
     first_fire_at = _resolve_first_fire_at(body, existing=None)
@@ -489,7 +489,7 @@ async def create_workflow_schedule(
 async def list_workflow_schedules(
     workflow_permanent_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
-    _: None = Depends(_require_schedules_enabled),
+    _: None = Depends(require_schedules_enabled),
 ) -> WorkflowScheduleListResponse:
     await _ensure_workflow_exists(workflow_permanent_id, organization.organization_id)
     schedules = await app.DATABASE.schedules.get_workflow_schedules(
@@ -515,7 +515,7 @@ async def get_workflow_schedule(
     workflow_permanent_id: str,
     workflow_schedule_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
-    _: None = Depends(_require_schedules_enabled),
+    _: None = Depends(require_schedules_enabled),
 ) -> WorkflowScheduleResponse:
     await _ensure_workflow_exists(workflow_permanent_id, organization.organization_id)
     schedule = await _get_schedule_or_404(
@@ -548,7 +548,7 @@ async def update_workflow_schedule(
     workflow_schedule_id: str,
     body: WorkflowScheduleUpsertRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
-    _: None = Depends(_require_schedules_enabled),
+    _: None = Depends(require_schedules_enabled),
 ) -> WorkflowScheduleResponse:
     workflow = await _ensure_workflow_exists(workflow_permanent_id, organization.organization_id)
     existing = await _get_schedule_or_404(
@@ -585,7 +585,7 @@ async def update_workflow_schedule(
         existing.workflow_schedule_id
     )
     if backend_schedule_id is None:
-        # The route-level _require_schedules_enabled dependency guarantees we only
+        # The route-level require_schedules_enabled dependency guarantees we only
         # reach this point when schedules are enabled, so a None here means a
         # misconfigured AgentFunction override (build returned None even though
         # workflow_schedules_enabled is True). Bail out so the DB doesn't drift.
@@ -733,7 +733,7 @@ async def cancel_workflow_schedule(
     workflow_permanent_id: str,
     workflow_schedule_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
-    _: None = Depends(_require_schedules_enabled),
+    _: None = Depends(require_schedules_enabled),
 ) -> WorkflowScheduleResponse:
     await _ensure_workflow_exists(workflow_permanent_id, organization.organization_id)
     existing = await _get_schedule_or_404(workflow_schedule_id, organization.organization_id)
@@ -795,7 +795,7 @@ async def enable_workflow_schedule(
     workflow_permanent_id: str,
     workflow_schedule_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
-    _: None = Depends(_require_schedules_enabled),
+    _: None = Depends(require_schedules_enabled),
 ) -> WorkflowScheduleResponse:
     return await _set_schedule_enabled(
         workflow_permanent_id=workflow_permanent_id,
@@ -821,7 +821,7 @@ async def disable_workflow_schedule(
     workflow_permanent_id: str,
     workflow_schedule_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
-    _: None = Depends(_require_schedules_enabled),
+    _: None = Depends(require_schedules_enabled),
 ) -> WorkflowScheduleResponse:
     return await _set_schedule_enabled(
         workflow_permanent_id=workflow_permanent_id,
@@ -846,7 +846,7 @@ async def delete_workflow_schedule_route(
     workflow_permanent_id: str,
     workflow_schedule_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
-    _: None = Depends(_require_schedules_enabled),
+    _: None = Depends(require_schedules_enabled),
 ) -> DeleteScheduleResponse:
     await _ensure_workflow_exists(workflow_permanent_id, organization.organization_id)
     existing = await _get_schedule_or_404(

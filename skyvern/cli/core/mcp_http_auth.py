@@ -331,6 +331,7 @@ async def _resolve_oauth_subject_to_org(
             api_key=api_key, validation=validation, api_key_token_id=api_key_token_id, user_id=subject
         )
 
+    await app.AGENT_FUNCTION.ensure_api_key_issuance_allowed(org_id)
     api_token = await get_auth_token(org_id, OrganizationAuthTokenType.api)
     if not api_token:
         from skyvern.forge.sdk.services import org_auth_token_service  # noqa: PLC0415
@@ -805,6 +806,10 @@ class MCPAPIKeyMiddleware:
             await response(scope, receive, send)
             return
         except HTTPException as e:
+            if e.status_code == 402:
+                response = JSONResponse({"error": {"code": "PAYMENT_REQUIRED", "message": e.detail}}, status_code=402)
+                await response(scope, receive, send)
+                return
             if e.status_code == 503:
                 oauth_service_error = e
             elif e.status_code not in {401, 403}:

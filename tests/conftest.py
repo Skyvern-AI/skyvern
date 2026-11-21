@@ -301,7 +301,7 @@ def ai_fallback_on_in_an_ordinary_run(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def copilot_workflow_toggle_off() -> SimpleNamespace:
+def ember_workflow_toggle_off() -> SimpleNamespace:
     return SimpleNamespace(
         ai_fallback=True,
         enable_self_healing=False,

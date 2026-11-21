@@ -147,6 +147,11 @@ class ProviderDownloadRecovery:
         finally:
             self._local_seen = _completed_names(self._download_dir)
 
+    def download_began(self) -> bool:
+        """Whether the run's monitor reports a download the browser began since the last read. A read still owed from
+        an earlier download is not one: it would end every later wait before its own download began."""
+        return self._monitor is not None and self._monitor.browser_download_event_count != self._events_seen
+
     def _settle_read(self) -> None:
         # A file landed locally, so every event admitted so far is accounted for; a later probe must not
         # read one of them as new and publish the provider's copy of the same download beside it.

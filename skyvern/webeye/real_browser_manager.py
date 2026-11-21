@@ -2224,6 +2224,8 @@ class RealBrowserManager(BrowserManager):
         workflow_id: str = "",
         workflow_run_id: str = "",
     ) -> bytes:
+        if not settings.BROWSER_HAR_RECORDING_ENABLED:
+            return b""
         if browser_state:
             path = browser_state.browser_artifacts.har_path
             if path and os.path.exists(path=path):

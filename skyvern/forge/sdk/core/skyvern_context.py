@@ -779,7 +779,7 @@ class SkyvernContext:
     # Set only by the in-process copilot block-test path, on that run's own context. A dispatched
     # run's context is rebuilt on the worker and never carries it, so runner selection can tell the
     # two apart instead of inferring it from a process-wide capability.
-    copilot_inline_execution: bool = False
+    ember_inline_execution: bool = False
     # The CodeBlock arm the rollout assigned this run to ("secure_runner" / "legacy_in_process"),
     # stamped only on an authoritative flag/pin verdict so log lines can be grouped by arm for an
     # unbiased secure-vs-legacy comparison. Left None when no genuine assignment was made (no browser
@@ -835,7 +835,7 @@ class SkyvernContext:
     runtime_secret_values: set[str] = field(default_factory=builtins.set)
     # Copilot credential values this request filled or scrubbed with. Its log lines and span exceptions
     # scrub them at any length, while other sessions' values reach its log lines only above a length floor.
-    copilot_scrub_values: set[str] = field(default_factory=builtins.set, repr=False)
+    ember_scrub_values: set[str] = field(default_factory=builtins.set, repr=False)
     # Subset of runtime_secret_values that must also never reach the model's own view of tool
     # output (e.g. a magic sign-in link), as opposed to values the model needs to read (e.g. a TOTP
     # code) that are only scrubbed from artifacts/logs.
