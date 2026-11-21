@@ -5,6 +5,7 @@ from typing import Any, ClassVar, Literal
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+from skyvern.forge.sdk.integrations.action_runners import ACTION_RUNNERS, ActionRunFailed, ActionRunner
 from skyvern.forge.sdk.integrations.catalog import (
     IntegrationAction,
     IntegrationEntry,
@@ -12,6 +13,7 @@ from skyvern.forge.sdk.integrations.catalog import (
     entry_action,
 )
 from skyvern.forge.sdk.integrations.connected_accounts import connected_account_fields
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import Block, render_failure_reason
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.emails import is_connected_gmail_id
@@ -84,6 +86,79 @@ class IntegrationActionBlock(Block):
         found = entry_action(all_integration_entries(), self.integration_id, self.action_id)
         kind, _, block_type = found[1].runs_via.partition(":") if found else ("", "", "")
         return BlockType(block_type) if kind == "block" else None
+
+    def action_runner(self) -> tuple[IntegrationEntry, IntegrationAction, ActionRunner] | None:
+        """The catalog action and our own runner for a ``runner:`` action, or None for any other action."""
+        found = entry_action(all_integration_entries(), self.integration_id, self.action_id)
+        kind, _, name = found[1].runs_via.partition(":") if found else ("", "", "")
+        if found is None or kind != "runner" or name not in ACTION_RUNNERS:
+            return None
+        return found[0], found[1], ACTION_RUNNERS[name]
+
+    async def _run_with_runner(
+        self,
+        entry: IntegrationEntry,
+        action: IntegrationAction,
+        runner: ActionRunner,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str,
+    ) -> BlockResult:
+        try:
+            validate_action_inputs(action, self.inputs)
+        except IntegrationActionError as e:
+            return await self._failure(str(e), workflow_run_block_id, organization_id)
+        connection_id = self.connection_id and (
+            workflow_run_context.get_original_secret_value_or_none(self.connection_id) or self.connection_id
+        )
+        if not connection_id:
+            return await self._failure(
+                f"{entry.name}: {action.name} needs a connected account.", workflow_run_block_id, organization_id
+            )
+        inputs = dict(self.inputs)
+        # Values an agent wrote are text, never templates.
+        if "inputs" not in self._prerendered_fields:
+            try:
+                inputs = {
+                    name: self.format_block_parameter_template_from_workflow_run_context(value, workflow_run_context)
+                    if _templated(value)
+                    else value
+                    for name, value in inputs.items()
+                }
+            except Exception as e:
+                return await self._template_format_failure_result(
+                    e,
+                    render_failure_reason(
+                        "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                    ),
+                    workflow_run_context,
+                    workflow_run_id,
+                    workflow_run_block_id,
+                    organization_id,
+                )
+        try:
+            output = await runner(organization_id, connection_id, action.id, inputs)
+        except ActionRunFailed as e:
+            if e.output is not None:
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, e.output)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=e.reason,
+                output_parameter_value=e.output,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=output,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
     def inner_block(self) -> Block:
         """The existing block this action runs as, under this block's label and output."""
@@ -179,6 +254,15 @@ class IntegrationActionBlock(Block):
                     workflow_run_block_id,
                     effective_org_id,
                 )
+        if runner := rendered.action_runner():
+            ran: Block = rendered
+            try:
+                return await rendered._run_with_runner(
+                    *runner, workflow_run_context, workflow_run_id, workflow_run_block_id, effective_org_id
+                )
+            finally:
+                # The runner recorded on the rendered copy; the outer wrapper reads this block's flag.
+                self._output_recorded_this_execution = ran._output_recorded_this_execution
         try:
             inner = rendered.inner_block()
         except IntegrationActionError as e:
