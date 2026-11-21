@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.exceptions import FailedToReloadPage, NoTOTPVerificationCodeFound, ScrapingFailedBlankPage
 from skyvern.forge import app
@@ -29,6 +30,7 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     ExtractAction,
+    InputTextAction,
     ReloadPageAction,
     TerminateAction,
     WaitAction,
@@ -347,18 +349,23 @@ async def test_failed_action_with_continue_flag_executes_remaining(monkeypatch: 
 async def test_failed_action_skip_remaining_controls_duplicate_element_retry(
     monkeypatch: pytest.MonkeyPatch, skip: bool, expected_calls: int
 ) -> None:
-    first, duplicate = _click("node-1"), _click("node-1")
+    first = _click("node-1")
+    duplicate = InputTextAction(**first.model_dump(exclude={"action_type", "text"}), text="typed-sample")
     failure = ActionFailure(Exception("unverified click"))
     failure.skip_remaining_actions = skip
     action_handler = AsyncMock(return_value=[failure])
     rig = make_agent_step_rig(monkeypatch, parsed_actions=[first, duplicate], action_handler=action_handler)
 
-    step, output = await rig.run()
+    with capture_logs() as logs:
+        step, output = await rig.run()
 
     assert step.status == StepStatus.failed
     assert action_handler.await_count == expected_calls
     assert output.actions_and_results is not None
     assert [action for action, _ in output.actions_and_results] == ([first] if skip else [first, duplicate])
+    duplicate_warnings = [log for log in logs if str(log["event"]).startswith("Action failed, but have duplicated")]
+    assert len(duplicate_warnings) == expected_calls - 1
+    assert all("typed-sample" not in str(log) for log in duplicate_warnings)
 
 
 @pytest.mark.asyncio

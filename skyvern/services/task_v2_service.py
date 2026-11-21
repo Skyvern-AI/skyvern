@@ -3363,7 +3363,7 @@ async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> 
                 "Task v2 webhook sent successfully",
                 task_v2_id=task_v2.observer_cruise_id,
                 resp_code=resp.status_code,
-                resp_text=resp.text,
+                resp_text_length=len(resp.text),
             )
             await app.DATABASE.observer.update_task_v2(
                 task_v2_id=task_v2.observer_cruise_id,
@@ -3376,7 +3376,7 @@ async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> 
                 "Task v2 webhook failed",
                 task_v2_id=task_v2.observer_cruise_id,
                 resp_code=resp.status_code,
-                resp_text=resp.text,
+                resp_text_length=len(resp.text),
                 status_code=resp.status_code,
                 error_reason=format_http_log_reason(resp.status_code),
             )

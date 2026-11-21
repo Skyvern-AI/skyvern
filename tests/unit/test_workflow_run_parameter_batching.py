@@ -1801,7 +1801,7 @@ async def test_run_submission_carries_user_agent_platform_through_real_prepare_a
         pytest.param(
             "run",
             {"email": "a@example.com", "count": "three"},
-            "Invalid workflow parameter. Expected parameter type: integer. Value: three.",
+            "Invalid workflow parameter. Expected parameter type: integer. Parameter: count.",
             id="invalid-parameter-value",
         ),
         pytest.param(
@@ -1813,7 +1813,7 @@ async def test_run_submission_carries_user_agent_platform_through_real_prepare_a
         pytest.param(
             "run",
             {"login": "cred_live", "email": "a@example.com", "vault_item": "not-a-uuid"},
-            "Invalid workflow parameter. Expected parameter type: Bitwarden item ID (UUID). Value: not-a-uuid.",
+            "Invalid workflow parameter. Expected parameter type: Bitwarden item ID (UUID). Parameter: vault_login.",
             id="invalid-bitwarden-item-id",
         ),
         pytest.param(
@@ -1838,6 +1838,7 @@ async def test_run_submission_refuses_unusable_parameters_without_writing_a_run(
 
         assert refused.status_code == 400
         assert refused.json()["detail"].startswith(detail.format(wpid=lab.workflow_permanent_id))
+        assert not {"three", "not-a-uuid"} & set(refused.json()["detail"].rstrip(".").split())
         assert await lab.run_rows() == []
         lab.execute_workflow.assert_not_awaited()
 

@@ -3030,7 +3030,7 @@ class BaseTaskBlock(Block):
             if task_url_parameter_value:
                 LOG.info(
                     "Task URL is parameterized, using parameter value",
-                    task_url_parameter_value=task_url_parameter_value,
+                    task_parameter_url=task_url_parameter_value,
                     task_url_parameter_key=self.url,
                 )
                 self.url = task_url_parameter_value
@@ -12359,7 +12359,7 @@ class DownloadToS3Block(Block):
             if task_url_parameter_value:
                 LOG.info(
                     "DownloadToS3Block Task URL is parameterized, using parameter value",
-                    task_url_parameter_value=task_url_parameter_value,
+                    task_parameter_url=task_url_parameter_value,
                     task_url_parameter_key=self.url,
                 )
                 self.url = task_url_parameter_value
@@ -16333,7 +16333,7 @@ class FileParserBlock(Block):
                 else:
                     LOG.info(
                         "FileParserBlock File URL is parameterized, using parameter value",
-                        file_url_parameter_value=file_url_parameter_value,
+                        file_parameter_url=file_url_parameter_value,
                         file_url_parameter_key=self.file_url,
                     )
                     self.file_url = file_url_parameter_value
@@ -16648,7 +16648,7 @@ class PDFParserBlock(Block):
             if file_url_parameter_value:
                 LOG.info(
                     "PDFParserBlock File URL is parameterized, using parameter value",
-                    file_url_parameter_value=file_url_parameter_value,
+                    file_parameter_url=file_url_parameter_value,
                     file_url_parameter_key=self.file_url,
                 )
                 self.file_url = file_url_parameter_value

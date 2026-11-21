@@ -139,16 +139,15 @@ async def test_normal_select_shadow_disagreement_emits_rich_fields(
     event = logs[0]
     assert event["match_found"] is True
     assert event["match_agrees_with_llm"] is False
-    assert event["target_value"] == "Years"
+    assert event["target_value_length"] == len("Years")
     assert event["matched_index"] == 0
-    assert event["matched_label"] == "Years"
-    assert event["matched_value"] == "years"
+    assert event["matched_label_length"] == len("Years")
+    assert event["matched_value_length"] == len("years")
     assert event["llm_index"] == 1
-    assert event["llm_value"] == "months"
-    assert event["normalized_target_value"] == "years"
-    assert event["normalized_matched_label"] == "years"
-    assert event["normalized_matched_value"] == "years"
-    assert event["normalized_llm_value"] == "months"
+    assert event["llm_value_length"] == len("months")
+    assert event["llm_value_equals_matched_label_normalized"] is False
+    assert event["llm_value_equals_matched_value_normalized"] is False
+    assert not {"Years", "years", "months"} & {value for value in event.values() if isinstance(value, str)}
     assert "matched_element_id" not in event
     assert "llm_element_id" not in event
 
@@ -170,22 +169,20 @@ async def test_normal_select_agreement_stays_lean(
     for lean_only in (
         "target_value",
         "matched_index",
-        "matched_label",
-        "matched_value",
+        "matched_label_length",
+        "matched_value_length",
         "matched_element_id",
         "llm_index",
-        "llm_value",
+        "llm_value_length",
         "llm_element_id",
-        "normalized_target_value",
-        "normalized_matched_label",
-        "normalized_matched_value",
-        "normalized_llm_value",
+        "llm_value_equals_matched_label_normalized",
+        "llm_value_equals_matched_value_normalized",
     ):
         assert lean_only not in event
 
 
 @pytest.mark.asyncio
-async def test_normal_select_disagreement_truncates_free_text_fields(
+async def test_normal_select_disagreement_logs_option_lengths_not_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     long_target = "  " + "A’   B " * 40
@@ -203,20 +200,12 @@ async def test_normal_select_disagreement_truncates_free_text_fields(
 
     assert len(logs) == 1
     event = logs[0]
-    bound = handler.SELECT_SHADOW_MATCH_FIELD_MAX_CHARS
     assert event["match_agrees_with_llm"] is False
-    for field in ("target_value", "matched_label", "matched_value", "llm_value"):
-        value = event[field]
-        assert isinstance(value, str)
-        assert len(value) == bound + 1
-        assert value.endswith("…")
-    for field, raw_value in (
-        ("normalized_target_value", long_target),
-        ("normalized_matched_label", long_target),
-        ("normalized_matched_value", long_option),
-        ("normalized_llm_value", long_llm_value),
-    ):
-        assert event[field] == handler._truncate_select_shadow_field(handler._normalize_select_shadow_text(raw_value))
+    assert event["target_value_length"] == len(long_target)
+    assert isinstance(event["matched_label_length"], int)
+    assert isinstance(event["matched_value_length"], int)
+    assert event["llm_value_length"] == len(long_llm_value)
+    assert not any(isinstance(value, str) and ("’" in value) for value in event.values())
 
 
 @pytest.mark.asyncio
@@ -287,7 +276,7 @@ async def test_non_string_llm_values_are_coerced_not_dropped(
     assert len(logs) == 1
     event = logs[0]
     assert event["match_agrees_with_llm"] is False
-    assert event["llm_value"] == "2024"
+    assert event["llm_value_length"] == len("2024")
 
 
 def test_select_shadow_agreement_coerces_malformed_llm_fields() -> None:
@@ -479,8 +468,8 @@ async def test_auto_completion_call_path_forwards_committed_value_to_shadow_matc
     assert event["prompt_name"] == "auto-completion-choose-option"
     assert event["match_agrees_with_llm"] is expected_agrees
     if not expected_agrees:
-        assert event["normalized_matched_label"] == "committed value"
-        assert event["normalized_llm_value"] == "different value"
+        assert event["matched_label_length"] == len("committed value")
+        assert event["llm_value_equals_matched_label_normalized"] is False
 
 
 @pytest.mark.asyncio

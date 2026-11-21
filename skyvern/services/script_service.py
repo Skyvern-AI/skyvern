@@ -591,7 +591,11 @@ async def execute_script(
     if workflow_run_id and not parameters:
         parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
         parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
-        LOG.info("Script run Parameters is using workflow run parameters", parameters=parameters)
+        LOG.info(
+            "Script run Parameters is using workflow run parameters",
+            parameter_keys=sorted(parameters),
+            parameter_count=len(parameters),
+        )
 
     script_path = os.path.join(settings.TEMP_PATH, script.script_id, script.script_revision_id, "main.py")
     if script_path not in written_paths:

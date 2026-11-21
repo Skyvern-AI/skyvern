@@ -4854,7 +4854,7 @@ class WorkflowService:
             if not isinstance(candidate, str) or not is_uuid(candidate):
                 raise InvalidWorkflowParameter(
                     expected_parameter_type="Bitwarden item ID (UUID)",
-                    value=str(candidate),
+                    parameter_key=parameter.key,
                     workflow_permanent_id=workflow.workflow_permanent_id,
                 )
 
@@ -16318,8 +16318,13 @@ class WorkflowService:
     @staticmethod
     def _serialize_workflow_run_parameter_value(workflow_parameter: WorkflowParameter, value: Any) -> Any:
         value = json.dumps(value) if isinstance(value, (dict, list)) else value
-        # InvalidWorkflowParameter will be raised if the validation fails
-        workflow_parameter.workflow_parameter_type.convert_value(value)
+        try:
+            workflow_parameter.workflow_parameter_type.convert_value(value)
+        except InvalidWorkflowParameter:
+            raise InvalidWorkflowParameter(
+                expected_parameter_type=workflow_parameter.workflow_parameter_type,
+                parameter_key=workflow_parameter.key,
+            ) from None
         return value
 
     async def get_workflow_run_parameter_tuples(
@@ -18050,7 +18055,7 @@ class WorkflowService:
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
-            headers=signed_data.headers,
+            webhook_timestamp=signed_data.headers.get("x-skyvern-timestamp"),
         )
         return PreparedWorkflowWebhook(
             workflow_id=workflow_id,
@@ -18191,7 +18196,7 @@ class WorkflowService:
             workflow_id=webhook.workflow_id,
             workflow_run_id=webhook.workflow_run_id,
             webhook_callback_url=webhook.webhook_callback_url,
-            headers=webhook.headers,
+            webhook_timestamp=webhook.headers.get("x-skyvern-timestamp"),
         )
         try:
             resp = await deliver_webhook_with_retries(
@@ -18241,7 +18246,7 @@ class WorkflowService:
                 workflow_id=webhook.workflow_id,
                 workflow_run_id=webhook.workflow_run_id,
                 resp_code=resp.status_code,
-                resp_text=resp.text,
+                resp_text_length=len(resp.text),
             )
             try:
                 await record_delivery("", delivered_projection)
@@ -18262,7 +18267,7 @@ class WorkflowService:
                 workflow_id=webhook.workflow_id,
                 workflow_run_id=webhook.workflow_run_id,
                 resp_code=resp.status_code,
-                resp_text=resp.text,
+                resp_text_length=len(resp.text),
                 status_code=resp.status_code,
                 error_reason=format_http_log_reason(resp.status_code),
             )

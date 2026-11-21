@@ -78,7 +78,7 @@ def _make_fill_element(readbacks: list[str]) -> MagicMock:
 
 def test_tel_target_log_fields_never_include_phone_value() -> None:
     assert _input_target_log_fields(is_tel=True, text=NANP_DIGITS) == {"target_digit_count": 10}
-    assert _input_target_log_fields(is_tel=False, text="query") == {"target_value": "query"}
+    assert _input_target_log_fields(is_tel=False, text="query") == {"target_value_length": 5}
 
 
 @pytest.mark.asyncio
