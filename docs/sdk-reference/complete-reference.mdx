@@ -455,7 +455,7 @@ get_workflows(page?, page_size?, only_saved_tasks?, only_workflows?, only_templa
 get_workflow_versions(workflow_permanent_id, template?) → list[Workflow]       # Every saved version of an agent
 update_workflow(workflow_id, json_definition?, yaml_definition?) → Workflow    # Save a new version
 delete_workflow(workflow_id)                                                   # Permanent ID (wpid_...). Deletes all versions.
-get_workflow_runs(page?, page_size?, status?, search_key?, error_code?) → list[WorkflowRun]   # Runs across all agents
+get_workflow_runs(page?, page_size?, status?, search_key?, error_code?, created_at_start?, created_at_end?) → list[WorkflowRun]   # Runs across all agents
 get_workflow_runs_by_id(workflow_id, page?, page_size?, status?, search_key?, error_code?, created_at_start?, created_at_end?) → list[WorkflowRun]   # Runs of one agent
 ```
 
