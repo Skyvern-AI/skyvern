@@ -486,6 +486,7 @@ export type FileUploadBlock = WorkflowBlockBase & {
   azure_blob_container_name: string | null;
   google_credential_id: string | null;
   google_drive_folder_id: string | null;
+  google_drive_save_as_sheet?: boolean;
   sftp_host: string | null;
   sftp_port: number | null;
   sftp_username: string | null;

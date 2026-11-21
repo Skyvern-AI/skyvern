@@ -1411,6 +1411,7 @@ function convertToNode(
           azureBlobContainerName: block.azure_blob_container_name ?? "",
           googleCredentialId: block.google_credential_id ?? "",
           googleDriveFolderId: block.google_drive_folder_id ?? "",
+          googleDriveSaveAsSheet: block.google_drive_save_as_sheet ?? false,
           sftpHost: block.sftp_host ?? "",
           sftpPort: block.sftp_port != null ? String(block.sftp_port) : "",
           sftpUsername: block.sftp_username ?? "",
@@ -4080,6 +4081,7 @@ function getWorkflowBlock(
         azure_blob_container_name: node.data.azureBlobContainerName ?? "",
         google_credential_id: node.data.googleCredentialId ?? "",
         google_drive_folder_id: node.data.googleDriveFolderId ?? "",
+        google_drive_save_as_sheet: node.data.googleDriveSaveAsSheet ?? false,
         sftp_host: node.data.sftpHost ?? "",
         sftp_port:
           node.data.sftpPort && Number.isFinite(Number(node.data.sftpPort))
@@ -5860,6 +5862,7 @@ function convertBlocksToBlockYAML(
           azure_blob_container_name: block.azure_blob_container_name ?? "",
           google_credential_id: block.google_credential_id ?? "",
           google_drive_folder_id: block.google_drive_folder_id ?? "",
+          google_drive_save_as_sheet: block.google_drive_save_as_sheet ?? false,
           sftp_host: block.sftp_host ?? "",
           sftp_port: block.sftp_port ?? null,
           sftp_username: block.sftp_username ?? "",
