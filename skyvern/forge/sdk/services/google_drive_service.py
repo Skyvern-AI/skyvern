@@ -32,6 +32,14 @@ DRIVE_RESUMABLE_CHUNK_BYTES = 8 * 1024 * 1024
 DRIVE_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 GOOGLE_WORKSPACE_MIME_PREFIX = "application/vnd.google-apps."
 GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
+GOOGLE_SHEET_MIME_TYPE = "application/vnd.google-apps.spreadsheet"
+# Keyed by suffix, not guess_type(): Python's built-in mime table has no .xlsx entry, so hosts without
+# /etc/mime.types would otherwise send XLSX as application/octet-stream and skip the conversion.
+SHEET_CONVERTIBLE_MEDIA_TYPES = {
+    ".csv": "text/csv",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 _DRIVE_FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _DEFAULT_BACKOFF_SECONDS = 1.0
@@ -294,8 +302,27 @@ def _multipart_body(
     )
 
 
-def _upload_metadata(*, file_name: str, folder_id: str | None) -> dict[str, Any]:
-    metadata: dict[str, Any] = {"name": file_name}
+def _converts_to_sheet(file_path: str, save_as_sheet: bool) -> bool:
+    return save_as_sheet and Path(file_path).suffix.lower() in SHEET_CONVERTIBLE_MEDIA_TYPES
+
+
+def upload_content_type(file_path: str, save_as_sheet: bool = False) -> str:
+    if _converts_to_sheet(file_path, save_as_sheet):
+        return SHEET_CONVERTIBLE_MEDIA_TYPES[Path(file_path).suffix.lower()]
+    return guess_type(file_path)[0] or "application/octet-stream"
+
+
+def _upload_metadata(
+    *,
+    file_path: str,
+    folder_id: str | None,
+    save_as_sheet: bool,
+) -> dict[str, Any]:
+    path = Path(file_path)
+    metadata: dict[str, Any] = {"name": path.name}
+    if _converts_to_sheet(file_path, save_as_sheet):
+        # Drive converts the media to this type on create; the media part keeps its source content type.
+        metadata = {"name": path.stem, "mimeType": GOOGLE_SHEET_MIME_TYPE}
     # Drive puts the file in the account's My Drive root when ``parents`` is omitted.
     if folder_id:
         metadata["parents"] = [folder_id]
@@ -307,6 +334,7 @@ def build_multipart_upload_request(
     access_token: str,
     file_path: str,
     folder_id: str | None,
+    save_as_sheet: bool = False,
 ) -> GoogleDriveMultipartUploadRequest:
     """Build a bounded Google Drive multipart upload request body.
 
@@ -315,9 +343,8 @@ def build_multipart_upload_request(
     before invoking this helper.
     """
     _assert_multipart_upload_size(file_path)
-    file_name = Path(file_path).name
-    content_type = guess_type(file_path)[0] or "application/octet-stream"
-    metadata = _upload_metadata(file_name=file_name, folder_id=folder_id)
+    content_type = upload_content_type(file_path, save_as_sheet)
+    metadata = _upload_metadata(file_path=file_path, folder_id=folder_id, save_as_sheet=save_as_sheet)
     boundary = f"skyvern-{uuid.uuid4().hex}"
     content = _multipart_body(
         metadata=metadata,
@@ -347,11 +374,12 @@ def build_resumable_initiate_request(
     access_token: str,
     file_path: str,
     folder_id: str | None,
+    save_as_sheet: bool = False,
 ) -> GoogleDriveResumableInitiateRequest:
     path = Path(file_path)
     file_size = path.stat().st_size
-    content_type = guess_type(file_path)[0] or "application/octet-stream"
-    metadata = _upload_metadata(file_name=path.name, folder_id=folder_id)
+    content_type = upload_content_type(file_path, save_as_sheet)
+    metadata = _upload_metadata(file_path=file_path, folder_id=folder_id, save_as_sheet=save_as_sheet)
     query = urlencode({"uploadType": "resumable", "fields": "id,name,webViewLink", "supportsAllDrives": "true"})
     return GoogleDriveResumableInitiateRequest(
         target_url=f"{DRIVE_UPLOAD_API_BASE}/files?{query}",
@@ -433,8 +461,9 @@ async def run_chunked_resumable_upload(
     total: int,
     send: Callable[[bytes, dict[str, str]], Awaitable[ResumableChunkResponse]],
     max_attempts: int,
+    save_as_sheet: bool = False,
 ) -> UploadedDriveFile:
-    content_type = guess_type(file_path)[0] or "application/octet-stream"
+    content_type = upload_content_type(file_path, save_as_sheet)
     offset = 0
     attempts = 0
     probe_first = False  # after a chunk transport failure, learn Drive's committed offset before re-sending
@@ -574,11 +603,13 @@ async def _upload_file_resumable(
     access_token: str,
     file_path: str,
     folder_id: str | None,
+    save_as_sheet: bool = False,
 ) -> UploadedDriveFile:
     initiate_request = build_resumable_initiate_request(
         access_token=access_token,
         file_path=file_path,
         folder_id=folder_id,
+        save_as_sheet=save_as_sheet,
     )
 
     async with httpx.AsyncClient(timeout=settings.GOOGLE_DRIVE_API_TIMEOUT_SECONDS) as client:
@@ -619,6 +650,7 @@ async def _upload_file_resumable(
             total=Path(file_path).stat().st_size,
             send=send,
             max_attempts=max(1, settings.GOOGLE_DRIVE_API_MAX_RETRIES),
+            save_as_sheet=save_as_sheet,
         )
 
 
@@ -827,18 +859,21 @@ async def upload_file(
     access_token: str,
     file_path: str,
     folder_id: str | None,
+    save_as_sheet: bool = False,
 ) -> UploadedDriveFile:
     if should_use_resumable_upload(file_path):
         return await _upload_file_resumable(
             access_token=access_token,
             file_path=file_path,
             folder_id=folder_id,
+            save_as_sheet=save_as_sheet,
         )
 
     request = build_multipart_upload_request(
         access_token=access_token,
         file_path=file_path,
         folder_id=folder_id,
+        save_as_sheet=save_as_sheet,
     )
 
     async with httpx.AsyncClient(timeout=settings.GOOGLE_DRIVE_API_TIMEOUT_SECONDS) as client:
