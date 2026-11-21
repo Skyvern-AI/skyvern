@@ -100,6 +100,7 @@ class SpreadsheetSummary:
 class PagedSpreadsheets:
     spreadsheets: list[SpreadsheetSummary] = field(default_factory=list)
     next_page_token: str | None = None
+    incomplete_search: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +184,7 @@ async def list_spreadsheets(
     query: str | None = None,
     page_token: str | None = None,
     page_size: int = 25,
+    search_all_drives: bool = False,
 ) -> PagedSpreadsheets:
     """List spreadsheets via Drive v3 files.list, filtered to Google Sheets MIME."""
     params: dict[str, Any] = {
@@ -197,6 +199,10 @@ async def list_spreadsheets(
         "supportsAllDrives": "true",
         "includeItemsFromAllDrives": "true",
     }
+    if search_all_drives:
+        # The default corpora=user only returns shared-drive files the user has already opened.
+        params["corpora"] = "allDrives"
+        params["fields"] = "nextPageToken,incompleteSearch,files(id,name,modifiedTime,webViewLink)"
     if page_token:
         params["pageToken"] = page_token
 
@@ -221,6 +227,7 @@ async def list_spreadsheets(
             if item.get("id")
         ],
         next_page_token=payload.get("nextPageToken"),
+        incomplete_search=search_all_drives and payload.get("incompleteSearch") is True,
     )
 
 

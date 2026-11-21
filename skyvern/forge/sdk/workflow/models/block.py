@@ -220,6 +220,7 @@ from skyvern.forge.sdk.executor.run_liveness import (
     run_lease_tasks_enabled,
 )
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
+from skyvern.forge.sdk.experimentation.drive_shared_drive_search import drive_shared_drive_search_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     run_honors_chosen_engine,
@@ -17604,6 +17605,11 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                 file_id=file_id,
             )
             return None
+        except google_drive_service.GoogleDriveAPIError as exc:
+            explained = google_drive_service.explain_access_error(exc, operation="download")
+            if explained and await drive_shared_drive_search_enabled(org_id):
+                raise explained from None
+            raise
 
         downloaded_files = await self._register_authenticated_download(
             organization_id=org_id,
