@@ -208,6 +208,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 from skyvern.forge.sdk.workflow.retry_policy import is_retry_pending
 from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_for_api
 from skyvern.forge.sdk.workflow.service import (
+    NEW_WORKFLOW_MASK_SECRETS,
     TimelineDownloads,
     block_image_ids,
     cap_action_payloads,
@@ -1554,6 +1555,7 @@ async def import_workflow_from_pdf(
         workflow_definition={"parameters": [], "blocks": []},
         organization_id=current_org.organization_id,
         status=WorkflowStatus.importing,
+        mask_secrets=NEW_WORKFLOW_MASK_SECRETS,
         folder_id=folder_id,
         created_by=user_id,
         edited_by=user_id,

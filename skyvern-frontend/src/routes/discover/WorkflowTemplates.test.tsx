@@ -68,6 +68,7 @@ describe("WorkflowTemplates", () => {
       expect.objectContaining({
         title: "Invoice Downloading (copy)",
         folder_id: "fld_1",
+        mask_secrets: true,
         _via: "template",
       }),
     );

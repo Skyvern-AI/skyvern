@@ -514,6 +514,7 @@ describe("DiscoverPage redesigned blank agent", () => {
       expect.objectContaining({
         _via: "blank",
         title: "New Agent",
+        mask_secrets: true,
         workflow_definition: expect.objectContaining({
           blocks: [],
           parameters: [],

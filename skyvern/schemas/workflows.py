@@ -2258,7 +2258,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     mask_secrets: bool | None = Field(
         default=None,
         title="Mask Secrets",
-        description="Mask secret values across this workflow's runs: hide them while they are typed (screenshots, recordings, live view) and redact them from stored artifacts, network logs, and LLM-bound text.",
+        description="Mask secret values across this workflow's runs: hide them while they are typed (screenshots, recordings, live view) and redact them from stored artifacts, network logs, and LLM-bound text. A new workflow defaults to true; on PUT updates, omission keeps the stored value.",
     )
     pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None

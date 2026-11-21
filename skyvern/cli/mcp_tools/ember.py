@@ -125,7 +125,7 @@ _STUDIO_BLANK_WORKFLOW: dict[str, Any] = {
     "description": "",
     "ai_fallback": True,
     "code_version": 2,
-    "mask_secrets": False,
+    "mask_secrets": True,
     "run_with": "agent",
     "workflow_definition": {"version": 2, "blocks": [], "parameters": []},
 }

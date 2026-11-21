@@ -506,6 +506,7 @@ LOG = structlog.get_logger()
 
 DEFAULT_FIRST_BLOCK_LABEL = "block_1"
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
+NEW_WORKFLOW_MASK_SECRETS = True
 MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH = 120
 MANAGED_BROWSER_PROFILE_KEY_MAX_LENGTH = 40
 DETECTED_PLATFORM_RUN_TAG_KEY = "skyvern.platform"
@@ -12671,6 +12672,7 @@ class WorkflowService:
             run_with=run_with,
             ai_fallback=ai_fallback,
             generate_script_on_terminal=generate_script,
+            mask_secrets=NEW_WORKFLOW_MASK_SECRETS,
             created_by=actor_user_id,
             edited_by=actor_user_id,
             build_source=build_source,
@@ -18944,7 +18946,7 @@ class WorkflowService:
             totp_identifier=request.totp_identifier,
             persist_browser_session=request.persist_browser_session,
             reuse_browser_session=request.reuse_browser_session,
-            mask_secrets=request.mask_secrets if request.mask_secrets is not None else False,
+            mask_secrets=request.mask_secrets if request.mask_secrets is not None else NEW_WORKFLOW_MASK_SECRETS,
             pin_saved_session_ip=request.pin_saved_session_ip,
             browser_profile_id=request.browser_profile_id,
             browser_profile_key=request.browser_profile_key,
@@ -19564,6 +19566,7 @@ class WorkflowService:
             extra_http_headers=extra_http_headers,
             cdp_connect_headers=cdp_connect_headers,
             run_with=run_with,
+            mask_secrets=False,
         )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,
