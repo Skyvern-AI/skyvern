@@ -57,6 +57,7 @@ from skyvern.forge.sdk.ember.config import (
     authoring_capability_for_request,
 )
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
+from skyvern.forge.sdk.experimentation.drive_shared_drive_search import drive_shared_drive_search_enabled
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
@@ -3746,11 +3747,17 @@ class AgentFunction:
         if destination.storage_type == FileStorageType.GOOGLE_DRIVE:
             if not destination.google_access_token:
                 raise ValueError("Google Drive destination is missing required fields")
-            uploaded_file = await google_drive_service.upload_file(
-                access_token=destination.google_access_token,
-                file_path=file_path,
-                folder_id=destination.google_drive_folder_id,
-            )
+            try:
+                uploaded_file = await google_drive_service.upload_file(
+                    access_token=destination.google_access_token,
+                    file_path=file_path,
+                    folder_id=destination.google_drive_folder_id,
+                )
+            except google_drive_service.GoogleDriveAPIError as exc:
+                explained = google_drive_service.explain_access_error(exc, operation="upload")
+                if explained and await drive_shared_drive_search_enabled(organization_id):
+                    raise explained from None
+                raise
             return uploaded_file.web_view_link or f"https://drive.google.com/file/d/{uploaded_file.id}/view"
 
         if destination.storage_type == FileStorageType.SFTP:

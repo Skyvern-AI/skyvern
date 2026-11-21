@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from mimetypes import guess_type
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import aiofiles
@@ -36,6 +36,7 @@ _DRIVE_FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _DEFAULT_BACKOFF_SECONDS = 1.0
 _RATE_LIMIT_403_REASONS = frozenset({"ratelimitexceeded", "userratelimitexceeded"})
+_FILE_PERMISSION_403_REASONS = frozenset({"insufficientFilePermissions", "teamDriveMembershipRequired"})
 _sleep = asyncio.sleep
 
 
@@ -200,6 +201,40 @@ def _raise_for_error(response: httpx.Response) -> None:
     if status == 403 and code in {"insufficientPermissions", "insufficientScopes"}:
         code = "reconnect_required"
     raise GoogleDriveAPIError(status=status, code=code, message=message)
+
+
+def error_from_response_body(status: int, body: str | None) -> GoogleDriveAPIError:
+    try:
+        _raise_for_error(httpx.Response(status, content=(body or "").encode()))
+    except GoogleDriveAPIError as exc:
+        return exc
+    return GoogleDriveAPIError(status=status, code=None, message="Google Drive API error")
+
+
+def explain_access_error(
+    exc: GoogleDriveAPIError, *, operation: Literal["upload", "download"]
+) -> GoogleDriveAPIError | None:
+    """Clearer text for a Drive permission or visibility error, or None when ``exc`` is neither."""
+    # Google's own message is dropped on purpose: for notFound it echoes the file or folder ID.
+    # Callers raise the result `from None` so the original error stays out of logged tracebacks too.
+    if exc.status == 403 and exc.code in _FILE_PERMISSION_403_REASONS and operation == "upload":
+        hint = (
+            "The connected Google account cannot add or change files in this Drive folder or file. "
+            "On a shared drive, its role must be Contributor or higher."
+        )
+    elif exc.status == 403 and exc.code in _FILE_PERMISSION_403_REASONS:
+        hint = (
+            "The connected Google account cannot download this Drive file. Check that it can view the file "
+            "(on a shared drive, that it is a member) and that the owner has not turned off downloading."
+        )
+    elif exc.status == 404 and exc.code == "notFound":
+        hint = (
+            "The connected Google account cannot see this Drive folder or file. Check the URL, and that "
+            "the account has access to it or is a member of its shared drive."
+        )
+    else:
+        return None
+    return GoogleDriveAPIError(status=exc.status, code=exc.code, message=f"{hint} (Google Drive reason: {exc.code})")
 
 
 def extract_folder_id(value: str | None) -> str | None:

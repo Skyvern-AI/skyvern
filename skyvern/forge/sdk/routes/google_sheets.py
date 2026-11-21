@@ -4,6 +4,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.exc import SQLAlchemyError
 
+from skyvern.forge.sdk.experimentation.drive_shared_drive_search import drive_shared_drive_search_enabled
 from skyvern.forge.sdk.schemas.google_sheets import (
     CreateGoogleSheetTabRequest,
     CreateGoogleSheetTabResponse,
@@ -101,7 +102,8 @@ def _translate_api_error(exc: google_sheets_service.GoogleSheetsAPIError) -> HTT
     return HTTPException(status_code=502, detail=exc.message)
 
 
-@google_sheets_router.get("/spreadsheets")
+# exclude_unset keeps incomplete_search out of the body unless the shared-drive search set it.
+@google_sheets_router.get("/spreadsheets", response_model_exclude_unset=True)
 async def list_spreadsheets(
     credential_id: Annotated[str, Query(description="Stored Google OAuth credential id")],
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
@@ -110,16 +112,18 @@ async def list_spreadsheets(
     page_size: Annotated[int, Query(ge=1, le=100)] = 25,
 ) -> ListGoogleSpreadsheetsResponse:
     access_token = await _mint_access_token(current_org.organization_id, credential_id)
+    search_all_drives = await drive_shared_drive_search_enabled(current_org.organization_id)
     try:
         paged = await google_sheets_service.list_spreadsheets(
             access_token=access_token,
             query=q,
             page_token=page_token,
             page_size=page_size,
+            search_all_drives=search_all_drives,
         )
     except google_sheets_service.GoogleSheetsAPIError as exc:
         raise _translate_api_error(exc)
-    return ListGoogleSpreadsheetsResponse(
+    response = ListGoogleSpreadsheetsResponse(
         spreadsheets=[
             GoogleSpreadsheetSummary(
                 id=s.id,
@@ -131,6 +135,9 @@ async def list_spreadsheets(
         ],
         next_page_token=paged.next_page_token,
     )
+    if search_all_drives:
+        response.incomplete_search = paged.incomplete_search
+    return response
 
 
 @google_sheets_router.get("/spreadsheets/{spreadsheet_id}")
