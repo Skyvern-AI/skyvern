@@ -59,7 +59,7 @@ from skyvern.forge.sdk.ember.workflow_credential_utils import (
 )
 from skyvern.forge.sdk.ember.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.integrations.account_fit import connection_fit
-from skyvern.forge.sdk.integrations.catalog import SKYVERN_INTEGRATIONS
+from skyvern.forge.sdk.integrations.catalog import SKYVERN_INTEGRATIONS, runner_action
 from skyvern.forge.sdk.integrations.connected_accounts import (
     IncompleteConnectionRead,
     OrgConnection,
@@ -85,6 +85,7 @@ from skyvern.forge.sdk.workflow.models.block import WorkflowTriggerBlock
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.schemas.agent_step_tool_names import current_tool_names
 from skyvern.schemas.google_sheets import extract_sheet_gid, extract_spreadsheet_id, is_plain_cell_range
+from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import _iter_yaml_blocks, _workflow_definition_as_dict
@@ -673,6 +674,11 @@ def _block_can_use(written: Mapping[str, Any], connection: OrgConnection) -> boo
     block = as_run_block(written)
     if block.get("credential_source") == "nango":
         return connection.provider == "nango"
+    # An action that runs as our own code is judged by itself, since no block type stands for it.
+    if written.get("block_type") == BlockType.INTEGRATION_ACTION.value and (
+        found := runner_action(str(written.get("integration_id")), str(written.get("action_id")))
+    ):
+        return found[0].oauth_provider == connection.provider and connection_fit(connection, found[1]) != "no"
     # The catalog actions this block runs: same block type, and every input the action pins (e.g. email_client).
     actions = [
         (entry, action)

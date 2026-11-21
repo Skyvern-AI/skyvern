@@ -1,5 +1,7 @@
 import asyncio
 import json
+import socket
+import threading
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, timedelta
 from pathlib import Path
@@ -376,7 +378,7 @@ async def test_a_discovery_answer_that_breaks_policy_starts_no_driver(reply: byt
 
 
 @pytest.mark.asyncio
-async def test_a_trickling_discovery_reply_is_cut_off_at_the_deadline() -> None:
+async def test_a_trickling_discovery_reply_is_cut_off_at_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     handlers: list[asyncio.Task[Any]] = []
 
     async def trickle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -397,7 +399,11 @@ async def test_a_trickling_discovery_reply_is_cut_off_at_the_deadline() -> None:
     started = loop.time()
     try:
         with pytest.raises(CdpDiscoveryError, match="TimeoutError"):
-            await resolve_websocket_url(f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}", timeout_ms=1_000)
+            await resolve_websocket_url(
+                f"http://discovery.example.test:{server.sockets[0].getsockname()[1]}",
+                timeout_ms=1_000,
+                resolved_ips=("127.0.0.1",),
+            )
     finally:
         server.close()
         for handler in handlers:
@@ -405,6 +411,105 @@ async def test_a_trickling_discovery_reply_is_cut_off_at_the_deadline() -> None:
         await asyncio.gather(*handlers, return_exceptions=True)
 
     assert loop.time() - started < 3
+
+    requests: list[bytes] = []
+    healthy_server = await _serve_discovery(
+        _json_reply({"webSocketDebuggerUrl": "ws://localhost/devtools/browser/fallback"}), requests
+    )
+    port = healthy_server.sockets[0].getsockname()[1]
+    release_stalled_address = threading.Event()
+    attempted_addresses: list[str] = []
+    create_connection = socket.create_connection
+
+    def connect_candidate(
+        address: tuple[str, int],
+        timeout: float | None = None,
+        source_address: tuple[str, int] | None = None,
+    ) -> socket.socket:
+        attempted_addresses.append(address[0])
+        if address[0] == "192.0.2.1":
+            release_stalled_address.wait((timeout or 0) + 0.25)
+            raise TimeoutError("synthetic stalled address")
+        return create_connection(address, timeout=timeout, source_address=source_address)
+
+    monkeypatch.setattr("skyvern.webeye.cdp_discovery.socket.create_connection", connect_candidate)
+    try:
+        websocket_url = await resolve_websocket_url(
+            f"http://discovery.example.test:{port}",
+            timeout_ms=1_000,
+            resolved_ips=("192.0.2.1", "127.0.0.1"),
+        )
+    finally:
+        release_stalled_address.set()
+        healthy_server.close()
+        await healthy_server.wait_closed()
+
+    assert attempted_addresses == ["192.0.2.1", "127.0.0.1"]
+    assert websocket_url == f"ws://discovery.example.test:{port}/devtools/browser/fallback"
+    assert len(requests) == 1
+
+    proxy_requests: list[bytes] = []
+    proxied_requests: list[bytes] = []
+
+    async def proxied_discovery(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        proxied_requests.append(await reader.readuntil(b"\r\n\r\n"))
+        if len(proxied_requests) == 1:
+            writer.write(_json_reply({"webSocketDebuggerUrl": "ws://localhost/devtools/browser/proxied"}))
+            writer.close()
+            return
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n" + b"x" * (64 * 1024 + 1))
+        await writer.drain()
+        await asyncio.sleep(3)
+        writer.close()
+
+    proxied_server = await asyncio.start_server(proxied_discovery, "127.0.0.1", 0)
+    proxied_port = proxied_server.sockets[0].getsockname()[1]
+
+    async def proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        proxy_requests.append(await reader.readuntil(b"\r\n\r\n"))
+        upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", proxied_port)
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await writer.drain()
+
+        async def forward(source: asyncio.StreamReader, sink: asyncio.StreamWriter) -> None:
+            try:
+                while chunk := await source.read(65536):
+                    sink.write(chunk)
+                    await sink.drain()
+            except ConnectionError:
+                pass
+            finally:
+                sink.close()
+
+        await asyncio.gather(forward(reader, upstream_writer), forward(upstream_reader, writer))
+
+    proxy_server = await asyncio.start_server(proxy, "127.0.0.1", 0)
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy_server.sockets[0].getsockname()[1]}")
+    monkeypatch.setenv("no_proxy", "")
+    try:
+        proxied_websocket_url = await resolve_websocket_url(
+            f"http://proxy-only.example.test:{proxied_port}",
+            timeout_ms=2_000,
+            resolved_ips=("192.0.2.1",),
+        )
+        oversized_started = loop.time()
+        with pytest.raises(CdpDiscoveryError, match="ValueError"):
+            await resolve_websocket_url(
+                f"http://proxy-only.example.test:{proxied_port}",
+                timeout_ms=2_000,
+                resolved_ips=("192.0.2.1",),
+            )
+        oversized_elapsed = loop.time() - oversized_started
+    finally:
+        proxy_server.close()
+        proxied_server.close()
+        await proxy_server.wait_closed()
+        await proxied_server.wait_closed()
+
+    assert proxy_requests[0].startswith(f"CONNECT 192.0.2.1:{proxied_port} HTTP/1.1\r\n".encode())
+    assert proxied_websocket_url == f"ws://proxy-only.example.test:{proxied_port}/devtools/browser/proxied"
+    assert oversized_elapsed < 1
+    assert len(proxied_requests) == 2
 
 
 @pytest.mark.asyncio

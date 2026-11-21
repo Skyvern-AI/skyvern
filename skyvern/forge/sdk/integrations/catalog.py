@@ -14,6 +14,7 @@ from pydantic.alias_generators import to_camel
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.experimentation.drive_folder_actions import drive_folder_actions_enabled
 from skyvern.forge.sdk.schemas.google_oauth import GOOGLE_GMAIL_SEND_SCOPE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, microsoft_oauth_service
@@ -77,7 +78,8 @@ class IntegrationAction(BaseModel):
     # Provider scope strings, compared against IntegrationAccount.scopes_granted.
     needs: list[str] = Field(default_factory=list)
     acts: bool = False
-    # Always "block:<BlockType value>", the existing block that runs the action; there is no "nango:" or other kind.
+    # "block:<BlockType value>", the existing block that runs the action, or "runner:<name>", our own code in
+    # action_runners.ACTION_RUNNERS that only the integration_action block calls. There is no "nango:" kind.
     runs_via: str
     agent_step: Literal["tool", "saved_block_only"] = "tool"
 
@@ -271,6 +273,62 @@ def listed_oauth_accounts(integrations: Sequence[Any]) -> list[dict[str, Any]]:
     return rows
 
 
+_DRIVE_FOLDER_HELP = "A folder ID or link, a shared drive's ID for its top level, or root for My Drive."
+# Every text input of these actions is required: a move names both ends, and nothing defaults to a folder.
+_DRIVE_TEXT_INPUTS: dict[str, dict[str, str]] = {
+    "google_drive_folder_id": {"title": "Folder", "description": _DRIVE_FOLDER_HELP},
+    "parent_folder_id": {"title": "Parent folder", "description": _DRIVE_FOLDER_HELP},
+    "folder_name": {"title": "Folder name", "description": "Name of the new folder."},
+    "file_id": {"title": "File or folder to move", "description": "The file's or folder's ID or Drive link."},
+    "destination_folder_id": {"title": "Destination folder", "description": _DRIVE_FOLDER_HELP},
+}
+
+
+def _drive_folder_action(
+    action_id: str, name: str, description: str, fields: tuple[str, ...], *, acts: bool, **extra: dict[str, Any]
+) -> IntegrationAction:
+    properties: dict[str, Any] = {
+        field: {"type": "string", **_DRIVE_TEXT_INPUTS[field], "pattern": r"\S"} for field in fields
+    }
+    return IntegrationAction(
+        id=action_id,
+        name=name,
+        description=description,
+        inputs={"type": "object", "properties": properties | extra, "required": list(fields)},
+        needs=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+        acts=acts,
+        runs_via="runner:google_drive_folder",
+        agent_step="saved_block_only",
+    )
+
+
+_GOOGLE_DRIVE_ENTRY_ID = "google_drive"
+# Offered only to an organization with DRIVE_FOLDER_ACTIONS on, so they are kept out of SKYVERN_INTEGRATIONS.
+DRIVE_FOLDER_ACTIONS: tuple[IntegrationAction, ...] = (
+    _drive_folder_action(
+        "list_folder",
+        "List folder",
+        "List the files and folders directly inside a Google Drive folder, including one in a shared drive.",
+        ("google_drive_folder_id",),
+        acts=False,
+        max_results={"type": "integer", "minimum": 1, "maximum": 1000, "default": 100, "title": "Max results"},
+    ),
+    _drive_folder_action(
+        "create_folder",
+        "Create subfolder",
+        "Create a folder inside a Google Drive folder, including one in a shared drive.",
+        ("parent_folder_id", "folder_name"),
+        acts=True,
+    ),
+    _drive_folder_action(
+        "move_file",
+        "Move file",
+        "Move a file or folder into another Google Drive folder, within or between My Drive and shared drives.",
+        ("file_id", "destination_folder_id"),
+        acts=True,
+    ),
+)
+
 _GOOGLE_GMAIL_ENTRY_ID = "gmail"
 
 SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
@@ -428,7 +486,7 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         position=4,
     ),
     IntegrationEntry(
-        id="google_drive",
+        id=_GOOGLE_DRIVE_ENTRY_ID,
         name="Google Drive",
         category="Workspace",
         description="Upload workflow files to Google Drive folders.",
@@ -711,6 +769,7 @@ def integration_entries(
     hidden_ids: frozenset[str] = frozenset(),
     powerbi_native_available: bool = False,
     unavailable: Mapping[str, IntegrationUnavailableReason] | None = None,
+    drive_folder_actions_available: bool = False,
 ) -> list[IntegrationEntry]:
     added_triggers = app.AGENT_FUNCTION.get_cloud_integration_triggers()
     entries = [
@@ -752,12 +811,29 @@ def integration_entries(
         ]
     elif powerbi_native_available:
         entries = [entry.model_copy(update={"status": "live"}) if entry.id == "powerbi" else entry for entry in entries]
+    if drive_folder_actions_available:
+        entries = [
+            entry.model_copy(update={"actions": [*entry.actions, *DRIVE_FOLDER_ACTIONS]})
+            if entry.id == _GOOGLE_DRIVE_ENTRY_ID
+            else entry
+            for entry in entries
+        ]
     return sorted(entries, key=lambda entry: entry.position)
+
+
+def runner_action(integration_id: str, action_id: str) -> tuple[IntegrationEntry, IntegrationAction] | None:
+    """A built-in action that runs as our own code (``runner:``), with its entry; None for any other action."""
+    for entry in SKYVERN_INTEGRATIONS:
+        extra = DRIVE_FOLDER_ACTIONS if entry.id == _GOOGLE_DRIVE_ENTRY_ID else ()
+        for action in (*entry.actions, *extra):
+            if entry.id == integration_id and action.id == action_id and action.runs_via.startswith("runner:"):
+                return entry, action
+    return None
 
 
 def all_integration_entries() -> list[IntegrationEntry]:
     """Every entry with every backend it can have, for lookups that must not depend on an org's availability gates."""
-    return integration_entries(powerbi_available=True, gmail_available=True)
+    return integration_entries(powerbi_available=True, gmail_available=True, drive_folder_actions_available=True)
 
 
 async def _unavailable_reasons(organization_id: str) -> dict[str, IntegrationUnavailableReason]:
@@ -773,8 +849,9 @@ async def _unavailable_reasons(organization_id: str) -> dict[str, IntegrationUna
 
 
 async def integration_entries_for_org(
-    organization_id: str, *, include_unavailable: bool = False
+    organization_id: str, *, include_unavailable: bool = False, drive_folder_actions: bool | None = None
 ) -> list[IntegrationEntry]:
+    """With ``drive_folder_actions`` unset, the Drive folder actions follow the org's DRIVE_FOLDER_ACTIONS flag."""
     try:
         email_forwarding_available = await app.AGENT_FUNCTION.ensure_email_forwarding_available(
             organization_id, fresh=False
@@ -818,6 +895,11 @@ async def integration_entries_for_org(
         hidden_ids=await app.AGENT_FUNCTION.hidden_integration_ids(organization_id),
         powerbi_native_available=powerbi_native_available,
         unavailable=await _unavailable_reasons(organization_id) if include_unavailable else None,
+        drive_folder_actions_available=(
+            await drive_folder_actions_enabled(organization_id)
+            if drive_folder_actions is None
+            else drive_folder_actions
+        ),
     )
     # Neither the page nor Copilot's integration list has a use for an entry with nothing to connect yet;
     # Copilot reads every trigger through its trigger tools.

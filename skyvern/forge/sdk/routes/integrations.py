@@ -14,7 +14,11 @@ from skyvern.forge.sdk.services import org_auth_service
 async def list_integrations(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
 ) -> list[dict[str, Any]]:
-    entries = await integration_entries_for_org(current_org.organization_id, include_unavailable=True)
+    # The page reads no org flags, so it always lists the Drive folder actions; the frontend shows them only when the
+    # org's DRIVE_FOLDER_ACTIONS flag is on, and a saved one refuses to run while it is off.
+    entries = await integration_entries_for_org(
+        current_org.organization_id, include_unavailable=True, drive_folder_actions=True
+    )
     # Every entry the gates allow, so a hidden or gated app is never offered again as a request.
     known = [*entries, *integration_entries(powerbi_available=True, gmail_available=True)]
     entries += await app.AGENT_FUNCTION.more_integration_entries(known)
