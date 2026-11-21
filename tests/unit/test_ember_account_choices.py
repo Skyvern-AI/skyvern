@@ -2279,8 +2279,37 @@ async def test_an_account_id_the_user_wrote_is_admitted_without_a_listing(monkey
         ({"block_type": "file_download", "download_target": "google_drive"}, True),
         ({"block_type": "send_email", "credential_id": "goac_stale"}, False),
         ({"block_type": "send_email", "transport": "gmail", "credential_id": "goac_stale"}, True),
+        (
+            {
+                "block_type": "powerbi_query",
+                "credential_source": "native",
+                "connection_id": "goac_stale",
+                "dataset_id": "11111111-1111-4111-8111-111111111111",
+                "query": "EVALUATE 'Sales'",
+            },
+            True,
+        ),
+        (
+            {
+                "block_type": "powerbi_query",
+                "credential_source": "nango",
+                "connection_id": "goac_stale",
+                "dataset_id": "11111111-1111-4111-8111-111111111111",
+                "query": "EVALUATE 'Sales'",
+            },
+            False,
+        ),
     ],
-    ids=["s3_upload", "drive_upload", "website_download", "drive_download", "smtp_send", "gmail_send"],
+    ids=[
+        "s3_upload",
+        "drive_upload",
+        "website_download",
+        "drive_download",
+        "smtp_send",
+        "gmail_send",
+        "powerbi_native",
+        "powerbi_connected",
+    ],
 )
 async def test_a_leftover_account_id_is_gated_only_where_the_block_reads_it(
     monkeypatch: pytest.MonkeyPatch, block: dict[str, str], gated: bool
