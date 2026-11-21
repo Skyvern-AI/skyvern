@@ -1966,8 +1966,9 @@ async def _load_user_script_module(
     stored body would resurrect the same staleness, and the marker-only pin
     check would never supersede it. Only a markerless pin (a generated script)
     executes its stored body. A marker is honoured only when it names
-    ``trusted_static_module``, the module the platform would pin for this run;
-    any other marker script goes through the in-process gate like a tenant script.
+    ``trusted_static_module``: the module recorded when the platform pinned this
+    revision, provided this run would still be pinned to it. Any other marker
+    script goes through the in-process gate.
     """
     if trusted_static_module is not None and _static_module_from_header(script_path) == trusted_static_module:
         loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
@@ -9493,11 +9494,19 @@ class WorkflowService:
 
                         spec = importlib.util.spec_from_file_location("user_script", script_path)
                         if spec and spec.loader:
-                            trusted_static_module = (
-                                await app.AGENT_FUNCTION.static_script_module_for_run(workflow, workflow_run)
-                                if _script_has_static_module_marker(script_path)
-                                else None
-                            )
+                            trusted_static_module: str | None = None
+                            if _script_has_static_module_marker(script_path):
+                                # The revision must record a platform pin, and this run must still be one
+                                # the platform would pin to that same module.
+                                recorded_static_module = await app.DATABASE.scripts.get_script_static_module(
+                                    script_revision_id=script.script_revision_id,
+                                    organization_id=organization_id,
+                                )
+                                if recorded_static_module is not None and (
+                                    recorded_static_module
+                                    == await app.AGENT_FUNCTION.static_script_module_for_run(workflow, workflow_run)
+                                ):
+                                    trusted_static_module = recorded_static_module
                             loaded_script_module = await _load_user_script_module(
                                 script_path,
                                 spec,

@@ -7,8 +7,9 @@ from enum import StrEnum
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, delete, distinct, exists, func, not_, or_, select, update
+from sqlalchemy import and_, case, delete, distinct, exists, func, not_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -102,6 +103,28 @@ class WorkflowScriptUpsertResult:
     previous_workflow_script: WorkflowScript | None = None
 
 
+async def _lock_script_revisions(session: AsyncSession, organization_id: str, script_id: str) -> None:
+    # Serializes adding revisions to one script, so a conditional publish sees every revision committed before it.
+    # Advisory rather than row locks: the revision being added has no row to lock until it is inserted.
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name not in {"postgresql", "postgres"}:
+        return
+    lock_key = f"script_revisions:{organization_id}:{script_id}"
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(lock_key))))
+
+
+async def _lock_workflow_script_mappings(
+    session: AsyncSession, organization_id: str, workflow_permanent_id: str
+) -> None:
+    # Serializes every writer that creates or bulk soft-deletes a workflow's script mappings, so a check-then-insert
+    # (such as publishing a static pin) cannot interleave with a cache clear or a concurrent deploy.
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name not in {"postgresql", "postgres"}:
+        return
+    lock_key = f"workflow_script_mappings:{organization_id}:{workflow_permanent_id}"
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(lock_key))))
+
+
 class ScriptsRepository(BaseRepository):
     """Database operations for scripts, script files, script blocks, workflow scripts, and fallback episodes."""
 
@@ -112,11 +135,15 @@ class ScriptsRepository(BaseRepository):
         run_id: str | None = None,
         script_id: str | None = None,
         version: int | None = None,
+        static_module: str | None = None,
     ) -> Script:
         async with self.Session() as session:
+            if script_id:
+                await _lock_script_revisions(session, organization_id, script_id)
             script = ScriptModel(
                 organization_id=organization_id,
                 run_id=run_id,
+                static_module=static_module,
             )
             if script_id:
                 script.script_id = script_id
@@ -126,6 +153,16 @@ class ScriptsRepository(BaseRepository):
             await session.commit()
             await session.refresh(script)
             return convert_to_script(script)
+
+    @db_operation("get_script_static_module")
+    async def get_script_static_module(self, script_revision_id: str, organization_id: str) -> str | None:
+        async with self.Session() as session:
+            return await session.scalar(
+                select(ScriptModel.static_module).where(
+                    ScriptModel.script_revision_id == script_revision_id,
+                    ScriptModel.organization_id == organization_id,
+                )
+            )
 
     @db_operation("get_scripts")
     async def get_scripts(
@@ -832,6 +869,7 @@ class ScriptsRepository(BaseRepository):
     ) -> None:
         """Create a workflow->script cache mapping entry."""
         async with self.Session() as session:
+            await _lock_workflow_script_mappings(session, organization_id, workflow_permanent_id)
             record = WorkflowScriptModel(
                 organization_id=organization_id,
                 script_id=script_id,
@@ -855,6 +893,14 @@ class ScriptsRepository(BaseRepository):
         status: ScriptStatus,
     ) -> None:
         async with self.Session() as session:
+            workflow_permanent_id = await session.scalar(
+                select(WorkflowScriptModel.workflow_permanent_id).where(
+                    WorkflowScriptModel.workflow_script_id == workflow_script_id,
+                    WorkflowScriptModel.organization_id == organization_id,
+                )
+            )
+            if workflow_permanent_id is not None:
+                await _lock_workflow_script_mappings(session, organization_id, workflow_permanent_id)
             await session.execute(
                 update(WorkflowScriptModel)
                 .where(
@@ -883,6 +929,7 @@ class ScriptsRepository(BaseRepository):
     ) -> WorkflowScriptUpsertResult:
         """Create/update an active workflow-script mapping with sticky-pin semantics."""
         async with self.Session() as session:
+            await _lock_workflow_script_mappings(session, organization_id, workflow_permanent_id)
             now = naive_utc_now()
             status_value = status.value if isinstance(status, ScriptStatus) else status
             existing_rows = (
@@ -950,6 +997,151 @@ class ScriptsRepository(BaseRepository):
                 workflow_script=WorkflowScript.model_validate(existing),
                 previous_workflow_script=previous_workflow_script,
             )
+
+    @db_operation("publish_script_revision_if_latest")
+    async def publish_script_revision_if_latest(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+        target_script_id: str,
+        expected_latest_revision_id: str,
+        staged_script_revision_id: str,
+        cache_key: str = "",
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+        observed_is_pinned: bool = False,
+    ) -> Script | None:
+        """Move a fully built revision of an unmapped staging script onto ``target_script_id`` as its next version.
+
+        Publishes only while ``expected_latest_revision_id`` is still the target's latest revision; otherwise returns
+        None and soft-deletes the staged revision so it is not listed. A mapping is never moved: while the cache-key
+        mapping still names ``target_script_id`` it records ``workflow_id``/``workflow_run_id``, and it is pinned only
+        if its pin state is still ``observed_is_pinned``, so a pin change made since that read is kept. When the only
+        active mapping naming the target is pending, that row is promoted to a published pinned mapping.
+        """
+        async with self.Session() as session:
+            await _lock_script_revisions(session, organization_id, target_script_id)
+            latest_revision_id = await session.scalar(
+                select(ScriptModel.script_revision_id)
+                .where(
+                    ScriptModel.script_id == target_script_id,
+                    ScriptModel.organization_id == organization_id,
+                    ScriptModel.deleted_at.is_(None),
+                )
+                .order_by(ScriptModel.version.desc())
+                .limit(1)
+            )
+            staged = (
+                await session.scalars(
+                    select(ScriptModel).where(
+                        ScriptModel.script_revision_id == staged_script_revision_id,
+                        ScriptModel.organization_id == organization_id,
+                        ScriptModel.deleted_at.is_(None),
+                    )
+                )
+            ).first()
+            if latest_revision_id != expected_latest_revision_id or staged is None:
+                if staged is not None:
+                    staged.deleted_at = naive_utc_now()
+                await session.commit()
+                return None
+            highest_version = await session.scalar(
+                select(func.max(ScriptModel.version)).where(
+                    ScriptModel.script_id == target_script_id,
+                    ScriptModel.organization_id == organization_id,
+                )
+            )
+            staged.script_id = target_script_id
+            staged.version = (highest_version or 0) + 1
+            for child_model in (ScriptFileModel, ScriptBlockModel):
+                await session.execute(
+                    update(child_model)
+                    .where(
+                        child_model.script_revision_id == staged_script_revision_id,
+                        child_model.organization_id == organization_id,
+                    )
+                    .values(script_id=target_script_id)
+                )
+            await _lock_workflow_script_mappings(session, organization_id, workflow_permanent_id)
+            now = naive_utc_now()
+            active_mapping = (
+                WorkflowScriptModel.organization_id == organization_id,
+                WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                WorkflowScriptModel.cache_key_value == cache_key_value,
+                WorkflowScriptModel.deleted_at.is_(None),
+            )
+            await session.execute(
+                update(WorkflowScriptModel)
+                .where(
+                    *active_mapping,
+                    WorkflowScriptModel.script_id == target_script_id,
+                    WorkflowScriptModel.status == ScriptStatus.published.value,
+                )
+                .values(
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    is_pinned=case(
+                        (WorkflowScriptModel.is_pinned.is_(observed_is_pinned), True),
+                        else_=WorkflowScriptModel.is_pinned,
+                    ),
+                    pinned_at=case(
+                        (
+                            WorkflowScriptModel.is_pinned.is_(observed_is_pinned),
+                            func.coalesce(WorkflowScriptModel.pinned_at, now),
+                        ),
+                        else_=WorkflowScriptModel.pinned_at,
+                    ),
+                    modified_at=now,
+                )
+            )
+            has_published_mapping = await session.scalar(
+                select(exists().where(*active_mapping, WorkflowScriptModel.status == ScriptStatus.published.value))
+            )
+            if not has_published_mapping:
+                # Promote the pending row itself rather than adding a second one, and keep its workflow_run_id: the
+                # generation run that created it finds it by that ID, so its later promotion is a no-op instead of a
+                # duplicate published mapping.
+                pending_target_mapping = (
+                    await session.scalars(
+                        select(WorkflowScriptModel)
+                        .where(
+                            *active_mapping,
+                            WorkflowScriptModel.script_id == target_script_id,
+                            WorkflowScriptModel.status == ScriptStatus.pending.value,
+                        )
+                        .order_by(WorkflowScriptModel.created_at.desc())
+                        .limit(1)
+                    )
+                ).first()
+                if pending_target_mapping is not None:
+                    pending_target_mapping.status = ScriptStatus.published.value
+                    pending_target_mapping.workflow_id = workflow_id
+                    pending_target_mapping.is_pinned = True
+                    pending_target_mapping.pinned_at = pending_target_mapping.pinned_at or now
+                    pending_target_mapping.modified_at = now
+            await session.commit()
+            await session.refresh(staged)
+            return convert_to_script(staged)
+
+    @db_operation("discard_staged_script_revision")
+    async def discard_staged_script_revision(
+        self, *, organization_id: str, staging_script_id: str, script_revision_id: str
+    ) -> None:
+        """Soft-delete a staged revision that was never published; a published revision has left the staging script."""
+        async with self.Session() as session:
+            await session.execute(
+                update(ScriptModel)
+                .where(
+                    ScriptModel.script_revision_id == script_revision_id,
+                    ScriptModel.script_id == staging_script_id,
+                    ScriptModel.organization_id == organization_id,
+                    ScriptModel.deleted_at.is_(None),
+                )
+                .values(deleted_at=naive_utc_now())
+            )
+            await session.commit()
 
     @db_operation("get_workflow_script")
     async def get_workflow_script(
@@ -1133,6 +1325,7 @@ class ScriptsRepository(BaseRepository):
         Returns True if any records were deleted, False otherwise.
         """
         async with self.Session() as session:
+            await _lock_workflow_script_mappings(session, organization_id, workflow_permanent_id)
             stmt = (
                 update(WorkflowScriptModel)
                 .where(
@@ -1233,6 +1426,7 @@ class ScriptsRepository(BaseRepository):
         Returns True if any records were deleted, False otherwise.
         """
         async with self.Session() as session:
+            await _lock_workflow_script_mappings(session, organization_id, workflow_permanent_id)
             stmt = (
                 update(WorkflowScriptModel)
                 .where(
