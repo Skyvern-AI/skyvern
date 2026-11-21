@@ -412,8 +412,13 @@ from skyvern.webeye.cdp_download_interceptor import (
 )
 from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.native_downloads import NativeDownloadAttempt, NativeDownloads
-from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
-from skyvern.webeye.scraper.scraper import page_is_dead_blank, page_is_http_survivor
+from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage, json_to_html
+from skyvern.webeye.scraper.scraper import (
+    content_editable_element_ids,
+    page_is_dead_blank,
+    page_is_http_survivor,
+    redact_input_values_in_element_tree,
+)
 from skyvern.webeye.utils.document import get_main_document_loader_id
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, ScreenshotMode, SkyvernFrame, build_open_tabs_context
 
@@ -9119,8 +9124,15 @@ class ForgeAgent:
         _artifacts_span.set_attribute("element_count", len(scraped_page.elements))
         _artifacts_span.set_attribute("html_bytes", len(scraped_page.html) if scraped_page.html else 0)
 
-        element_tree_format = ElementTreeFormat.HTML
-        element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
+        # Called only for its last_used_element_tree side effect, which later readers depend on. The stored copies
+        # are redacted; the live trees still feed the prompt and origin binding.
+        scraped_page.build_element_tree(ElementTreeFormat.HTML)
+        editable_ids = content_editable_element_ids(scraped_page.element_tree)
+        stored_element_tree = redact_input_values_in_element_tree(scraped_page.element_tree)
+        stored_element_tree_trimmed = redact_input_values_in_element_tree(
+            scraped_page.element_tree_trimmed, editable_ids=editable_ids
+        )
+        element_tree_in_prompt = "".join(json_to_html(element) for element in stored_element_tree_trimmed)
 
         if context:
             attempt = context.multi_field_totp.get(task.task_id)
@@ -9131,8 +9143,8 @@ class ForgeAgent:
                 html=scraped_page.html.encode("utf-8"),
                 id_css_map=json.dumps(scraped_page.id_to_css_dict, indent=2).encode("utf-8"),
                 id_frame_map=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode("utf-8"),
-                element_tree=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
-                element_tree_trimmed=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
+                element_tree=json.dumps(stored_element_tree, indent=2).encode("utf-8"),
+                element_tree_trimmed=json.dumps(stored_element_tree_trimmed, indent=2).encode("utf-8"),
                 element_tree_in_prompt=element_tree_in_prompt.encode("utf-8"),
             )
         else:
@@ -9161,12 +9173,12 @@ class ForgeAgent:
                 app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
                     artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
-                    data=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
+                    data=json.dumps(stored_element_tree, indent=2).encode("utf-8"),
                 ),
                 app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
                     artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
-                    data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
+                    data=json.dumps(stored_element_tree_trimmed, indent=2).encode("utf-8"),
                 ),
                 app.ARTIFACT_MANAGER.create_artifact(
                     step=step,

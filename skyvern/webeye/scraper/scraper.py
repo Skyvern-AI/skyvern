@@ -4,6 +4,7 @@ import inspect
 import json
 import secrets
 from collections import defaultdict
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -273,6 +274,78 @@ def _deepcopy_element_tree(element_tree: list[dict]) -> list[dict]:
         return copy.deepcopy(value, memo)
 
     return copy_value(element_tree)
+
+
+# These input types carry page-authored label or constant text in `value`, not user input.
+_INPUT_TYPES_WITH_PAGE_VALUE = frozenset({"button", "submit", "reset", "checkbox", "radio", "image"})
+
+
+def _holds_input_value(element: dict) -> bool:
+    tag = str(element.get("tagName", "")).lower()
+    if tag == "textarea":
+        return True
+    if tag != "input":
+        return False
+    attributes = element.get("attributes")
+    input_type = str(attributes.get("type") or "text").lower() if isinstance(attributes, dict) else "text"
+    return input_type not in _INPUT_TYPES_WITH_PAGE_VALUE
+
+
+def _input_value_marker(value: Any) -> Any:
+    # An empty value stays empty, and password or OTP values are already masked as "*" * len by domUtils.
+    if isinstance(value, str) and value and value.strip("*"):
+        return f"[REDACTED_INPUT len={len(value)}]"
+    return value
+
+
+def _walk_with_editability(
+    element_tree: list[dict], editable_ids: frozenset[str] | None
+) -> Iterator[tuple[dict, bool]]:
+    """Yield each element once with whether it sits inside a contenteditable region."""
+    seen: set[int] = set()
+    pending: list[tuple[Any, bool]] = [(element, False) for element in reversed(element_tree)]
+    while pending:
+        element, parent_editable = pending.pop()
+        if not isinstance(element, dict) or id(element) in seen:
+            continue
+        seen.add(id(element))
+        attributes = element.get("attributes")
+        own = attributes.get("contenteditable") if isinstance(attributes, dict) else None
+        if own is not None:
+            editable = str(own).lower() != "false"
+        # The trimmed tree drops the contenteditable attribute, so its editable elements are matched by id.
+        elif editable_ids is not None and element.get("id"):
+            editable = element["id"] in editable_ids
+        else:
+            editable = parent_editable
+        yield element, editable
+        children = element.get("children")
+        if isinstance(children, list):
+            pending.extend((child, editable) for child in reversed(children))
+
+
+def content_editable_element_ids(element_tree: list[dict]) -> frozenset[str]:
+    return frozenset(
+        str(element["id"])
+        for element, editable in _walk_with_editability(element_tree, None)
+        if editable and element.get("id")
+    )
+
+
+def redact_input_values_in_element_tree(
+    element_tree: list[dict], editable_ids: frozenset[str] | None = None
+) -> list[dict]:
+    """Return a deep copy of the tree with input, textarea and contenteditable values replaced by a length marker."""
+    redacted = _deepcopy_element_tree(element_tree)
+    for element, editable in _walk_with_editability(redacted, editable_ids):
+        attributes = element.get("attributes")
+        if isinstance(attributes, dict) and _holds_input_value(element) and "value" in attributes:
+            attributes["value"] = _input_value_marker(attributes["value"])
+        # A textarea's body text is its default value, which frameworks such as React keep in sync with the typed value.
+        is_textarea = str(element.get("tagName", "")).lower() == "textarea"
+        if (is_textarea or editable) and "text" in element:
+            element["text"] = _input_value_marker(element["text"])
+    return redacted
 
 
 def hash_element(element: dict) -> str:
