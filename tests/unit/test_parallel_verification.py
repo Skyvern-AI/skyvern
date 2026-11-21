@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -7,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from skyvern.forge.agent import ForgeAgent, SpeculativePlan, StepPromptResult
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -16,7 +18,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.utils import stall_watch
 from skyvern.webeye.actions.actions import ClickAction, CompleteAction, ExtractAction
 from skyvern.webeye.actions.responses import ActionSuccess
-from skyvern.webeye.scraper.scraped_page import ScrapedPage
+from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from tests.unit.helpers import (
     make_browser_state,
     make_organization,
@@ -867,18 +869,60 @@ async def test_agent_step_persists_artifacts_when_using_speculative_plan(
     agent._persist_scrape_artifacts.assert_awaited_once()
 
 
-def _make_scrape_test_fixtures(now, monkeypatch):
-    """Shared setup for _persist_scrape_artifacts tests."""
+def _typed_form_tree(trimmed: bool = False) -> list[dict]:
+    # Trimming drops the contenteditable attribute but keeps the ids of the editable elements.
+    editable = {} if trimmed else {"contenteditable": "true"}
+    return [
+        {
+            "tagName": "form",
+            "children": [
+                {"tagName": "input", "attributes": {"type": "email", "value": "jane@example.com"}},
+                {"tagName": "div", "children": [{"tagName": "textarea", "attributes": {"value": "note text"}}]},
+                {"tagName": "input", "attributes": {"value": "untyped"}},
+                {"tagName": "input", "attributes": {"type": "hidden", "value": "tok123"}},
+                {"tagName": "input", "attributes": {"type": "text", "value": ""}},
+                {"tagName": "input", "attributes": {"type": "password", "value": "******"}},
+                {"tagName": "input", "attributes": {"type": "checkbox", "value": "on", "checked": True}},
+                {"tagName": "input", "attributes": {"type": "SUBMIT", "value": "Send now"}},
+                {"tagName": "button", "attributes": {"value": "go"}, "text": "Go"},
+                {"tagName": "textarea", "attributes": {"value": "synced body"}, "text": "synced body"},
+                {"tagName": "textarea", "attributes": {"value": ""}, "text": ""},
+                {
+                    "tagName": "div",
+                    "id": "ce-1",
+                    "attributes": editable,
+                    "text": "typed in editor",
+                    "children": [{"tagName": "p", "id": "ce-2", "text": "second line"}],
+                },
+            ],
+        }
+    ]
+
+
+def _redacted_form_tree(trimmed: bool = False) -> list[dict]:
+    tree = _typed_form_tree(trimmed)
+    children = tree[0]["children"]
+    children[0]["attributes"]["value"] = "[REDACTED_INPUT len=16]"
+    children[1]["children"][0]["attributes"]["value"] = "[REDACTED_INPUT len=9]"
+    children[2]["attributes"]["value"] = "[REDACTED_INPUT len=7]"
+    children[3]["attributes"]["value"] = "[REDACTED_INPUT len=6]"
+    children[9]["attributes"]["value"] = "[REDACTED_INPUT len=11]"
+    children[9]["text"] = "[REDACTED_INPUT len=11]"
+    children[11]["text"] = "[REDACTED_INPUT len=15]"
+    children[11]["children"][0]["text"] = "[REDACTED_INPUT len=11]"
+    return tree
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_archive", [True, False])
+async def test_persist_scrape_artifacts_stores_trees_without_input_values(
+    monkeypatch: pytest.MonkeyPatch, use_archive: bool
+) -> None:
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
     organization = make_organization(now)
     task = make_task(now, organization)
-    step = make_step(
-        now,
-        task,
-        step_id="step-artifacts",
-        status=StepStatus.created,
-        order=0,
-        output=None,
-    )
+    step = make_step(now, task, step_id="step-artifacts", status=StepStatus.created, order=0, output=None)
     browser_state, _, _ = make_browser_state()
 
     async def _dummy_cleanup(*_args, **_kwargs) -> list[dict]:
@@ -886,8 +930,8 @@ def _make_scrape_test_fixtures(now, monkeypatch):
 
     scraped_page = ScrapedPage(
         elements=[],
-        element_tree=[{"tagName": "div"}],
-        element_tree_trimmed=[{"tagName": "div"}],
+        element_tree=_typed_form_tree(),
+        element_tree_trimmed=_typed_form_tree(trimmed=True),
         _browser_state=browser_state,
         _clean_up_func=_dummy_cleanup,
         _scrape_exclude=None,
@@ -895,45 +939,100 @@ def _make_scrape_test_fixtures(now, monkeypatch):
     scraped_page.html = "<html></html>"
     scraped_page.id_to_css_dict = {"node-1": "#node"}
     scraped_page.id_to_frame_dict = {"node-1": "frame-1"}
-    scraped_page.element_tree = [{"tagName": "div"}]
-    scraped_page.element_tree_trimmed = [{"tagName": "div"}]
+    scraped_page.last_used_element_tree_html = "<prompt variant>"
+    live_tree = scraped_page.element_tree
+    live_trimmed = scraped_page.element_tree_trimmed
 
-    economy_tree_mock = MagicMock(return_value="<economy>")
-    full_tree_mock = MagicMock(return_value="<full>")
-    monkeypatch.setattr(ScrapedPage, "build_economy_elements_tree", lambda self, *a, **kw: economy_tree_mock())
-    monkeypatch.setattr(ScrapedPage, "build_element_tree", lambda self, *a, **kw: full_tree_mock())
+    stored: dict[str, bytes] = {}
 
-    return task, step, scraped_page, economy_tree_mock, full_tree_mock
+    def record_archive(**kwargs: Any) -> None:
+        stored.update(
+            tree=kwargs["element_tree"],
+            trimmed=kwargs["element_tree_trimmed"],
+            in_prompt=kwargs["element_tree_in_prompt"],
+            html=kwargs["html"],
+            id_css_map=kwargs["id_css_map"],
+            id_frame_map=kwargs["id_frame_map"],
+        )
 
+    by_type = {
+        ArtifactType.VISIBLE_ELEMENTS_TREE: "tree",
+        ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED: "trimmed",
+        ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT: "in_prompt",
+        ArtifactType.HTML_SCRAPE: "html",
+        ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP: "id_css_map",
+        ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP: "id_frame_map",
+    }
 
-@pytest.mark.asyncio
-async def test_persist_scrape_artifacts_uses_archive(monkeypatch: pytest.MonkeyPatch) -> None:
-    """All six scrape fields are collected in one archive call."""
-    agent = ForgeAgent()
-    now = datetime.now(UTC)
-    task, step, scraped_page, economy_tree_mock, full_tree_mock = _make_scrape_test_fixtures(now, monkeypatch)
+    async def record_create(*, step: Step, artifact_type: ArtifactType, data: bytes, **_kwargs: Any) -> str:
+        if artifact_type in by_type:
+            stored[by_type[artifact_type]] = data
+        return "artifact-id"
 
-    accumulate_mock = MagicMock()
-    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_scrape_to_archive", accumulate_mock)
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_scrape_to_archive", record_archive)
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.create_artifact", record_create)
 
     context = SkyvernContext(
         task_id=task.task_id,
-        step_id=None,
         organization_id=task.organization_id,
         workflow_run_id=task.workflow_run_id,
         tz_info=ZoneInfo("UTC"),
     )
+    with skyvern_context.scoped(context):
+        await agent._persist_scrape_artifacts(
+            task=task, step=step, scraped_page=scraped_page, context=context if use_archive else None
+        )
 
-    await agent._persist_scrape_artifacts(task=task, step=step, scraped_page=scraped_page, context=context)
+        expected_page = ScrapedPage(
+            elements=[],
+            element_tree=_redacted_form_tree(),
+            element_tree_trimmed=_redacted_form_tree(trimmed=True),
+            _browser_state=browser_state,
+            _clean_up_func=_dummy_cleanup,
+            _scrape_exclude=None,
+        )
+        expected_in_prompt = expected_page.build_element_tree(ElementTreeFormat.HTML)
+        live_page = ScrapedPage(
+            elements=[],
+            element_tree=_typed_form_tree(),
+            element_tree_trimmed=_typed_form_tree(trimmed=True),
+            _browser_state=browser_state,
+            _clean_up_func=_dummy_cleanup,
+            _scrape_exclude=None,
+        )
+        expected_live_html = live_page.build_element_tree(ElementTreeFormat.HTML)
 
-    accumulate_mock.assert_called_once()
-    call_kwargs = accumulate_mock.call_args.kwargs
-    assert call_kwargs["html"] == b"<html></html>"
-    assert "node-1" in call_kwargs["id_css_map"].decode()
-    assert "node-1" in call_kwargs["id_frame_map"].decode()
-    assert call_kwargs["element_tree_in_prompt"] == b"<full>"
-    full_tree_mock.assert_called_once()
-    economy_tree_mock.assert_not_called()
+    assert stored["html"] == b"<html></html>"
+    assert json.loads(stored["id_css_map"]) == {"node-1": "#node"}
+    assert json.loads(stored["id_frame_map"]) == {"node-1": "frame-1"}
+    assert json.loads(stored["tree"]) == _redacted_form_tree()
+    assert json.loads(stored["trimmed"]) == _redacted_form_tree(trimmed=True)
+    assert stored["in_prompt"].decode() == expected_in_prompt
+    for blob in (stored["tree"], stored["trimmed"], stored["in_prompt"]):
+        for typed in (
+            b"jane@example.com",
+            b"note text",
+            b"untyped",
+            b"tok123",
+            b"synced body",
+            b"typed in editor",
+            b"second line",
+        ):
+            assert typed not in blob
+    in_prompt = stored["in_prompt"].decode()
+    assert 'value="Send now"' in in_prompt
+    assert 'value="go"' in in_prompt
+    assert ">Go</button>" in in_prompt
+    assert 'value="******"' in in_prompt
+    assert 'checked="true"' in in_prompt
+
+    assert scraped_page.element_tree is live_tree
+    assert scraped_page.element_tree_trimmed is live_trimmed
+    assert live_tree == _typed_form_tree()
+    assert live_trimmed == _typed_form_tree(trimmed=True)
+    assert scraped_page.last_used_element_tree_html == expected_live_html
+    assert 'value="jane@example.com"' in expected_live_html
+    assert scraped_page.last_used_element_tree is live_trimmed
 
 
 @pytest.mark.asyncio
