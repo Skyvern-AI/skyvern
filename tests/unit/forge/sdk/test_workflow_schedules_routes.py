@@ -69,7 +69,7 @@ def test_oss_agent_function_enables_workflow_schedules() -> None:
 
 
 def test_require_schedules_enabled_allows_oss() -> None:
-    assert workflow_schedule_routes._require_schedules_enabled() is None
+    assert workflow_schedule_routes.require_schedules_enabled() is None
 
 
 def test_oss_build_workflow_schedule_id_returns_local_backend_id() -> None:

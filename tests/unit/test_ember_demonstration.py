@@ -49,6 +49,7 @@ from skyvern.forge.sdk.ember.tools import mcp_hooks as mcp_hooks_module
 from skyvern.forge.sdk.routes import ember as ember_routes
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.ember import EmberDemonstrationControlRequest
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.services import uploaded_file_service
 from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from tests.unit.ember_test_helpers import make_ember_ctx, stamping_browser_manager, stop_activity_renewer
@@ -546,9 +547,17 @@ async def test_demonstrated_drag_replays_through_the_drag_tool_into_a_drag_to_bl
 
 
 @pytest.mark.asyncio
-async def test_replay_reports_nested_frame_chain_as_a_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("replayer", "added_by_another", "steered"),
+    [("u_A", False, False), ("u_B", False, True), ("u_A", True, True)],
+)
+async def test_replay_reports_nested_frame_chain_as_a_gap(
+    monkeypatch: pytest.MonkeyPatch, replayer: str, added_by_another: bool, steered: bool
+) -> None:
     cache = _SharedCache()
     monkeypatch.setattr(app, "CACHE", cache)
+    principal = RequestPrincipal(organization_id="org-1", auth_kind=AuthKind.ui_session, user_id=replayer)
+    monkeypatch.setattr(replay_module, "get_request_principal", lambda: principal)
     monkeypatch.setattr(replay_module, "resolve_raw_secret_safety_handler", AsyncMock(return_value=None))
     events = [
         {
@@ -576,6 +585,8 @@ async def test_replay_reports_nested_frame_chain_as_a_gap(monkeypatch: pytest.Mo
             owner=None,
             owner_seen_at=None,
             final_url="https://example.test/",
+            human_user_id="u_A",
+            steered_by_another=added_by_another,
         )
     )
     for seq, event in enumerate(events, 1):
@@ -588,6 +599,9 @@ async def test_replay_reports_nested_frame_chain_as_a_gap(monkeypatch: pytest.Mo
 
     call_tool.assert_awaited_once_with("click", {"selector": "#outside"})
     assert any("nested frame" in str(item.get("content")) for item in history)
+    # Someone else clicking Done, or someone else having added to the recording, puts another person's instructions in
+    # the replaying turn.
+    assert ctx.steered_by_another is steered
 
 
 @pytest.mark.asyncio
@@ -1119,6 +1133,7 @@ async def test_client_upload_control_cannot_name_a_file() -> None:
             owner="owner-1",
             owner_seen_at=datetime.now(UTC),
             final_url=None,
+            human_user_id="u_starter",
         )
     )
     cache.store[demonstration_controls_key("org-1", "demo-1")] = "[]"
@@ -1126,16 +1141,27 @@ async def test_client_upload_control_cannot_name_a_file() -> None:
         {"demonstration_id": "demo-1", "action": "upload_file", "file_id": "file-from-elsewhere"}
     )
 
-    await append_demonstration_control(cache, organization_id="org-1", request=crafted)  # type: ignore[arg-type]
+    await append_demonstration_control(
+        cache,  # type: ignore[arg-type]
+        organization_id="org-1",
+        request=crafted,
+        requester_user_id="u_starter",
+    )
+    record = await load_demonstration_record(cache, "org-1", "demo-1")  # type: ignore[arg-type]
+    assert record is not None and record.steered_by_another is False
     await append_demonstration_control(
         cache,  # type: ignore[arg-type]
         organization_id="org-1",
         request=EmberDemonstrationControlRequest(demonstration_id="demo-1", action="upload_file"),
         file_id="file-stored-for-demo",
+        requester_user_id="u_other",
     )
 
     controls = json.loads(cache.store[demonstration_controls_key("org-1", "demo-1")])
     assert [control.get("file_id") for control in controls] == [None, "file-stored-for-demo"]
+    # Another member's upload makes the replayed turn not only the starter's, so its schedules stay off the starter.
+    record = await load_demonstration_record(cache, "org-1", "demo-1")  # type: ignore[arg-type]
+    assert record is not None and record.steered_by_another is True
 
 
 @pytest.mark.asyncio
@@ -1750,7 +1776,11 @@ async def test_resumed_recording_clears_prior_stop_reason_before_replay(monkeypa
         workflow_permanent_id="wfp-1",
         browser_session_id="pbs-1",
         demonstration_id="demo-1",
+        human_user_id="u_other",
     )
+    # A resume by someone other than the starter adds their actions, so the replayed turn is not only the starter's.
+    resumed = await load_demonstration_record(cache, "org-1", "demo-1")  # type: ignore[arg-type]
+    assert resumed is not None and resumed.steered_by_another is True
     await append_demonstration_control(
         cache,  # type: ignore[arg-type]
         organization_id="org-1",
