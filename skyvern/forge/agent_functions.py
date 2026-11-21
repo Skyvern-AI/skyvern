@@ -2414,6 +2414,10 @@ class AgentFunction:
     ) -> tuple[str, str] | None:
         return None
 
+    async def ensure_api_key_issuance_allowed(self, organization_id: str) -> None:
+        """Raise HTTPException when the organization may not be handed an API key."""
+        return None
+
     async def resolve_member_api_key_user_id(self, organization_id: str, token_id: str) -> str | None:
         return None
 
