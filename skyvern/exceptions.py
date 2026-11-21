@@ -2166,7 +2166,9 @@ class BrowserProfileNotFound(SkyvernHTTPException):
 
 class APIKeyNotFound(SkyvernHTTPException):
     def __init__(self, organization_id: str) -> None:
-        super().__init__(f"No valid API key token found for organization {organization_id}")
+        super().__init__(
+            f"No valid API key token found for organization {organization_id}. Create one in Settings > API Keys."
+        )
 
 
 class ElementOutOfCurrentViewport(SkyvernException):
