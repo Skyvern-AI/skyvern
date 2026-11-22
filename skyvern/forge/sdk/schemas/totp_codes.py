@@ -30,6 +30,16 @@ class TOTPCodeBase(BaseModel):
         description="The workflow run id that the TOTP code is for. It can be the workflow run id of the workflow run that the TOTP code is for.",
         examples=["wr_123456"],
     )
+    otp_request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^otpr_[A-Za-z0-9_-]+$",
+        description=(
+            "Explicit request marker for strict run-bound delivery. Omit this field to retain legacy behavior."
+        ),
+        examples=["otpr_example"],
+    )
     source: str | None = Field(
         default=None,
         description="An optional field. The source of the TOTP code. e.g. email, sms, etc.",
@@ -85,6 +95,10 @@ class TOTPCode(TOTPCodeCreate):
     created_at: datetime = Field(..., description="The timestamp when the TOTP code was created.")
     modified_at: datetime = Field(..., description="The timestamp when the TOTP code was modified.")
     otp_type: OTPType | None = Field(None, description="The type of the OTP code.")
+    claimed_by_task_id: str | None = None
+    claimed_by_workflow_run_id: str | None = None
+    claimed_at: datetime | None = None
+    rejected_at: datetime | None = None
 
 
 class RawTOTPCode(BaseModel):
@@ -97,6 +111,7 @@ class RawTOTPCode(BaseModel):
     task_id: str | None
     workflow_id: str | None
     workflow_run_id: str | None
+    otp_request_id: str | None = None
     source: str | None
     created_at: datetime
     expired_at: datetime | None

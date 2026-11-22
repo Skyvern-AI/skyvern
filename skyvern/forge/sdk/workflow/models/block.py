@@ -6404,6 +6404,7 @@ async def _poll_code_block_otp(
                 workflow_id=workflow_run.workflow_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
+                otp_request_id=workflow_run.otp_request_id,
                 totp_identifier=totp_identifier,
                 created_after=created_after,
                 expected_otp_type=expected_otp_type,
@@ -21360,6 +21361,21 @@ class WorkflowTriggerBlock(Block):
                 organization_id,
             )
 
+        ambient_context = skyvern_context.current()
+        if ambient_context is not None and ambient_context.otp_request_id is not None:
+            unsupported_strict_child_modes = []
+            if self.wait_for_completion:
+                unsupported_strict_child_modes.append("synchronous child")
+            if self.browser_session_id:
+                unsupported_strict_child_modes.append("supplied browser session")
+            if self.use_parent_browser_session:
+                unsupported_strict_child_modes.append("parent browser reuse")
+            if unsupported_strict_child_modes:
+                return await _fail(
+                    "Strict OTP child workflows require asynchronous dispatch to a fresh local worker-owned browser; "
+                    "unsupported modes: " + ", ".join(unsupported_strict_child_modes)
+                )
+
         resolved_workflow_permanent_id = self.workflow_permanent_id
         resolved_payload = self.payload
 
@@ -21492,6 +21508,7 @@ class WorkflowTriggerBlock(Block):
                 skyvern_context.SkyvernContext(
                     run_id=parent_context.run_id if parent_context else None,
                     root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
+                    otp_request_id=parent_context.otp_request_id if parent_context else None,
                     requested_by=parent_context.requested_by if parent_context else None,
                     copilot_session_id=parent_context.copilot_session_id if parent_context else None,
                     trigger_type=inherited_trigger_type,
@@ -21644,6 +21661,7 @@ class WorkflowTriggerBlock(Block):
                         root_workflow_run_id=async_parent_context.root_workflow_run_id
                         if async_parent_context
                         else None,
+                        otp_request_id=async_parent_context.otp_request_id if async_parent_context else None,
                         requested_by=async_parent_context.requested_by if async_parent_context else None,
                         copilot_session_id=async_parent_context.copilot_session_id if async_parent_context else None,
                         trigger_type=async_inherited_trigger_type,

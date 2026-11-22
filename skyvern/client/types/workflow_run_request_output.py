@@ -79,6 +79,11 @@ class WorkflowRunRequestOutput(UniversalBaseModel):
     Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
     """
 
+    otp_request_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Explicit request marker for strict run-bound OTP delivery.
+    """
+
     browser_session_id: typing.Optional[str] = pydantic.Field(default=None)
     """
     ID of a Skyvern browser session to reuse, having it continue from the current screen state

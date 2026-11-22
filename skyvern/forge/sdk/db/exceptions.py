@@ -32,6 +32,15 @@ class NotFoundError(Exception):
     pass
 
 
+class OTPRequestAlreadyBoundError(Exception):
+    """A strict OTP request marker already has a durable original owner."""
+
+    def __init__(self, *, owner_type: str, owner_id: str) -> None:
+        super().__init__("OTP request marker is already bound")
+        self.owner_type = owner_type
+        self.owner_id = owner_id
+
+
 class CredentialSitesChangedError(Exception):
     """The login's saved sites no longer match the ones the edit was made from."""
 
