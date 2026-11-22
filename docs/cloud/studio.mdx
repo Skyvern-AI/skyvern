@@ -41,7 +41,7 @@ The right side of the top bar holds the agent's controls:
 | Save (disk icon) | Saves your hand edits. A dot on the icon means unsaved changes. It is disabled, and its tooltip says why, while Copilot is working on a request or applying changes and while YAML edits are being applied. When Copilot pauses saving so you don't overwrite a newer change (for example, the agent changed after Copilot proposed its changes), Save stays clickable and opens **Save is paused**, which explains why and offers **Reload and discard my edits**. |
 | **Schedule** (calendar icon) | Lists this agent's schedules and adds new ones. See [Runs and schedules](/cloud/runs#schedule-an-agent). |
 | **Triggers** (lightning icon) | Starts this agent from a signed HTTP request. See [Event triggers](/developers/event-triggers). |
-| **More actions** (⋯) | **Code**, **Version history**, **Save as Template**, **Take a tour** |
+| **More actions** (⋯) | **Version history**, **Save as Template**, **Take a tour** |
 | **Inputs** | The values the agent takes on each run. See [Inputs](#inputs). |
 | **Run** | Opens the run form. Shows **Stop** while a run is in progress and **Re-run** after one ends. See [Runs and schedules](/cloud/runs). |
 
@@ -114,7 +114,7 @@ The library holds browser blocks (such as **Browser Task**, **Extraction** and *
 
 Click a block to open its settings in the block config sidebar. Every block has a **Label**. The label also names the block's output, which later blocks read as `{{ <label>_output }}`.
 
-Click **Start** at the top of the flow to open **Agent Settings**, the settings that apply to the whole agent. They include **Webhook Callback URL**, **Proxy Location**, **Run With**, **Prevent Overlapping Runs** and **Max Run Time (minutes)**. The run form can override some of them per run.
+Click **Start** at the top of the flow to open **Agent Settings**, the settings that apply to the whole agent. They include **Webhook Callback URL**, **Proxy Location**, **Prevent Overlapping Runs** and **Max Run Time (minutes)**. The run form can override some of them per run.
 
 <img src="/images/cloud/cloud-studio-block-config.png" alt="A Browser Task block with URL, Prompt, the Engine selector and Advanced Settings" />
 
