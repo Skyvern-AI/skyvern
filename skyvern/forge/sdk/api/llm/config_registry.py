@@ -1471,7 +1471,8 @@ if settings.ENABLE_VOLCENGINE:
 
 if settings.ENABLE_NACE:
     # A decision model answered through nace_decision_llm_caller, never through litellm; see
-    # LLMCaller._call_nace_decision. Screenshots only go to models that read images (drex-max).
+    # LLMCaller._call_nace_decision. Screenshots go only to image-capable models (Drex Max v1.1, its
+    # aliases and retired ids, and drex-max-finance; drex-v2.0 is text only).
     _nace_config = LLMConfig(
         settings.NACE_MODEL,
         ["NACE_API_KEY"],

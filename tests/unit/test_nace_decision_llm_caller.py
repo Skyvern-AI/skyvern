@@ -523,7 +523,7 @@ async def test_client_sends_the_system_one_body_and_bearer_token(monkeypatch: py
     assert seen["client"] == "skyvern/9.8.7+test"  # the pip version, never "development"
     assert re.fullmatch(r"skyvern/[A-Za-z0-9 ._@+-]+", seen["client"]) and len(seen["client"]) <= 64
     assert seen["body"] == {
-        "model": "drex-max",
+        "model": "drex-max-v1.1",
         "state": "state",
         "questions": questions,
         "images": [PNG_DATA_URL],
@@ -659,7 +659,7 @@ async def test_call_nace_decision_returns_a_chat_shaped_model_response() -> None
         return httpx.Response(
             200,
             json={
-                "model": "drex-max",
+                "model": "drex-max-v1.1",
                 "answers": {
                     "classification": _choice(
                         "LOGIN",
@@ -690,7 +690,7 @@ async def test_call_nace_decision_returns_a_chat_shaped_model_response() -> None
 
     assert isinstance(response, ModelResponse)
     assert response.id == "req_abc"
-    assert response.model == "drex-max"
+    assert response.model == "drex-max-v1.1"
     assert response.usage.prompt_tokens == 307
     assert response.usage.completion_tokens == 311
     parsed = parse_api_response(
@@ -966,10 +966,15 @@ async def test_without_a_system_prompt_the_state_is_the_prompt(
 @pytest.mark.parametrize(
     ("model", "images", "usd_per_million"),
     [
-        ("drex-max", True, 0.03),
         ("drex-max-v1.1", True, 0.03),
-        ("drex-v2.0", False, 0.06),
-        ("drex-latest", False, 0.06),
+        ("drex-max-finance", True, 0.03),
+        ("drex-latest", True, 0.03),
+        ("nacedm-latest", True, 0.03),
+        ("drex-max", True, 0.03),
+        ("drex-v1.0", True, 0.03),
+        ("drex-v1.1", True, 0.03),
+        ("drex-v1.5", True, 0.03),
+        ("drex-v2.0", False, 0.03),
     ],
 )
 def test_capabilities_and_price_by_model(model: str, images: bool, usd_per_million: float) -> None:
@@ -981,15 +986,23 @@ def test_an_unpriced_model_has_no_cost() -> None:
     assert nace_decision_cost_usd(1_000, "drex-unknown") is None
 
 
+def test_unlisted_drex_max_id_sends_no_images_and_has_no_price() -> None:
+    assert nace_model_supports_images("drex-max-preview") is False
+    assert nace_decision_cost_usd(1_000_000, "drex-max-preview") is None
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("served", "usd_per_million"), [("drex-max", 0.03), ("drex-v2.0", 0.06)])
-async def test_call_stats_price_by_the_served_model(
-    nace_registered: Any,
-    served: str,
-    usd_per_million: float,
-) -> None:
+async def test_call_stats_price_by_the_served_model(nace_registered: Any) -> None:
+    """Bill the served model. The configured id is unpriced, so a config-rate bug reports no cost."""
+    LLMConfigRegistry._configs[NACE_DECISION_LLM_KEY] = LLMConfig(
+        "drex-max-preview",
+        [],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        temperature=None,
+    )
     response = ModelResponse(
-        model=served,
+        model="drex-max-v1.1",
         choices=[
             {
                 "index": 0,
@@ -1003,7 +1016,7 @@ async def test_call_stats_price_by_the_served_model(
     stats = await LLMCaller(NACE_DECISION_LLM_KEY).get_call_stats(response)
 
     assert stats.llm_cost_available is True
-    assert stats.llm_cost == pytest.approx(usd_per_million)
+    assert stats.llm_cost == pytest.approx(0.03)
 
 
 @pytest.mark.asyncio
@@ -1028,7 +1041,7 @@ async def test_call_stats_without_a_known_price_report_the_cost_as_unavailable(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["drex-v2.0", "drex-latest"])
+@pytest.mark.parametrize("model", ["drex-v2.0"])
 async def test_text_only_models_are_never_sent_images(model: str) -> None:
     seen: dict[str, Any] = {}
 
@@ -1054,7 +1067,36 @@ async def test_text_only_models_are_never_sent_images(model: str) -> None:
 
     assert seen["body"]["model"] == model
     assert "images" not in seen["body"]
-    assert response.model == "drex-v2.0"  # the served id, not the alias
+    assert response.model == "drex-v2.0"
+
+
+@pytest.mark.asyncio
+async def test_drex_latest_sends_images() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"model": "drex-max-v1.1", "answers": {"user_goal_achieved": _noul(0.9)}},
+        )
+
+    client = NaceDecisionClient(api_key="k", model="drex-latest", transport=httpx.MockTransport(handler))
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "goal"},
+                {"type": "image_url", "image_url": {"url": PNG_DATA_URL}},
+            ],
+        },
+    ]
+
+    response = await call_nace_decision(client, messages, prompt_name="check-user-goal")
+
+    assert seen["body"]["model"] == "drex-latest"
+    assert seen["body"]["images"] == [PNG_DATA_URL]
+    assert response.model == "drex-max-v1.1"  # the pinned version, not the alias
 
 
 _REGISTRY_PROBE = """
@@ -1094,7 +1136,15 @@ def test_missing_key_outside_local_records_an_issue_instead_of_failing_import() 
 
 @pytest.mark.parametrize(
     ("model", "vision"),
-    [("drex-max", True), ("drex-max-v1.1", True), ("drex-v2.0", False), ("drex-latest", False)],
+    [
+        ("drex-max", True),
+        ("drex-max-v1.1", True),
+        ("drex-max-finance", True),
+        ("drex-latest", True),
+        ("nacedm-latest", True),
+        ("drex-v1.5", True),
+        ("drex-v2.0", False),
+    ],
 )
 def test_registered_config_supports_vision_only_for_image_models(model: str, vision: bool) -> None:
     probe = _probe_registry(

@@ -12,8 +12,8 @@ Opt-in only. ``ENABLE_NACE=true`` registers the ``NACE_DREX_MAX`` LLM key, ``for
 ``DECISION_LLM_API_HANDLER`` from it, and only the prompts in ``NACE_DECISION_PROMPT_NAMES`` are
 routed through it (``get_decision_llm_api_handler`` in ``api_handler_factory``). Any other prompt
 sent to the key is rejected before a request is made. Routing stays inside ``LLMCaller``
-(``_call_nace_decision``), so artifact persistence, token accounting and error classification are
-the base class's, as for UI-TARS and Yutori Navigator.
+(``_call_nace_decision``), so artifact persistence and token accounting are the base class's, as for
+UI-TARS. HTTP errors are classified in this module.
 """
 
 from __future__ import annotations
@@ -46,7 +46,8 @@ LOG = structlog.get_logger()
 
 NACE_DECISION_LLM_KEY = "NACE_DREX_MAX"
 NACE_DEFAULT_API_BASE = "https://console.nace.ai"
-NACE_DEFAULT_MODEL = "drex-max"
+# Drex Max v1.1. drex-max is retired and only forwarded to this id.
+NACE_DEFAULT_MODEL = "drex-max-v1.1"
 NACE_SYSTEMONE_PATH = "/v1/systemone"
 # https://console.nace.ai/docs/drex/guides/drex-max: 8 images per request (Drex resizes each to at
 # most 1,638,400 px), 255 options per choice question, 512 questions per request.
@@ -57,16 +58,34 @@ NACE_MAX_BODY_BYTES = 4_194_304
 NACE_MAX_IMAGE_PIXELS = 1_638_400
 # Drex waits up to 55 s server-side, so the client must wait longer than that.
 NACE_MIN_TIMEOUT_SECONDS = 60.0
-# https://console.nace.ai/docs/drex/reference/models: models bill input tokens only (output is
-# free), per million input tokens. drex-latest is an alias of drex-v2.0. Only drex-max and
-# drex-max-v1.1 read images; drex-v2.0 and drex-latest are text only and answer 422 to an image.
+# https://console.nace.ai/docs/drex/reference/models: input tokens only (output is free), $0.03 per
+# million. drex-latest (and legacy nacedm-latest) point at Drex Max v1.1. drex-max, drex-v1.0,
+# drex-v1.1 and drex-v1.5 are retired and forwarded to drex-max-v1.1 at this price. drex-v2.0 is
+# text only and answers 422 to an image, so this caller never sends it images. Any other id,
+# including an unlisted drex-max-* name, has no price and is not sent images.
 _NACE_USD_PER_MILLION_INPUT_TOKENS: dict[str, float] = {
-    "drex-max": 0.03,
     "drex-max-v1.1": 0.03,
-    "drex-v2.0": 0.06,
-    "drex-latest": 0.06,
+    "drex-max-finance": 0.03,
+    "drex-v2.0": 0.03,
+    "drex-latest": 0.03,
+    "nacedm-latest": 0.03,
+    "drex-max": 0.03,
+    "drex-v1.0": 0.03,
+    "drex-v1.1": 0.03,
+    "drex-v1.5": 0.03,
 }
-_NACE_IMAGE_MODELS = frozenset({"drex-max", "drex-max-v1.1"})
+_NACE_IMAGE_MODELS = frozenset(
+    {
+        "drex-max-v1.1",
+        "drex-max-finance",
+        "drex-latest",
+        "nacedm-latest",
+        "drex-max",
+        "drex-v1.0",
+        "drex-v1.1",
+        "drex-v1.5",
+    }
+)
 NACE_USD_PER_INPUT_TOKEN = _NACE_USD_PER_MILLION_INPUT_TOKENS[NACE_DEFAULT_MODEL] / 1_000_000
 
 CHECK_USER_GOAL_PROMPT_NAME = "check-user-goal"
@@ -118,18 +137,16 @@ class NaceDecisionAPIError(Exception):
 def nace_model_supports_images(model: str | None) -> bool:
     """Whether ``model`` accepts screenshots.
 
-    True for drex-max and its versions; drex-v2.0 and drex-latest are text only.
+    True only for the listed ids: Drex Max v1.1, drex-max-finance, the drex-latest and nacedm-latest
+    aliases, and retired ids that forward to v1.1. drex-v2.0 and any unlisted id, including other
+    drex-max-* names, are text only.
     """
-    model = model or ""
-    return model in _NACE_IMAGE_MODELS or model.startswith("drex-max-")
+    return (model or "") in _NACE_IMAGE_MODELS
 
 
 def nace_decision_price_per_input_token(model: str | None) -> float | None:
-    """USD per input token for a Nace model id, or None when the model is not in the price list."""
-    model = model or ""
-    price = _NACE_USD_PER_MILLION_INPUT_TOKENS.get(model)
-    if price is None and model.startswith("drex-max-"):
-        price = _NACE_USD_PER_MILLION_INPUT_TOKENS[NACE_DEFAULT_MODEL]
+    """USD per input token for a listed Nace model id, or None when the id is not priced."""
+    price = _NACE_USD_PER_MILLION_INPUT_TOKENS.get(model or "")
     return None if price is None else price / 1_000_000
 
 
