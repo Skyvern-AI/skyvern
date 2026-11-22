@@ -100,6 +100,9 @@ class ParserResult:
 def _detect_encoding(file_path: Path) -> str:
     with file_path.open("rb") as file:
         raw_data = file.read(65_536)
+    # charset-normalizer reports a UTF-8 BOM as "utf_8", which keeps the BOM in the first header.
+    if raw_data.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
     best_match = from_bytes(raw_data).best()
     if best_match and best_match.encoding:
         return best_match.encoding
@@ -127,6 +130,9 @@ def _sniff_csv_delimiter(file_path: Path) -> tuple[str, str]:
         raise ParserFailure("File is empty")
     try:
         delimiter = csv.Sniffer().sniff(sample).delimiter
+        # The sniffer can pick a letter or digit as the delimiter of a one-column file ("email" -> "m").
+        if delimiter.isalnum():
+            raise csv.Error("Could not determine delimiter")
     except csv.Error:
         delimiter = "\t" if file_path.name.lower().endswith(".tsv") else ","
     return delimiter, encoding

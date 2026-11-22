@@ -15276,6 +15276,9 @@ class FileParserBlock(Block):
         facts["sampled_rows"] = len(rows) - 1
         try:
             delimiter = csv.Sniffer().sniff("".join(rows)).delimiter
+            # Same guard as _sniff_csv_delimiter, so the logged shape matches what the parser reads.
+            if delimiter.isalnum():
+                raise csv.Error("Could not determine delimiter")
             facts["delimiter_sniffed"] = True
         except csv.Error:
             # Same fallback the CSV parser applies when the sniffer gives up (see _sniff_csv_delimiter).
@@ -15341,6 +15344,10 @@ class FileParserBlock(Block):
         with open(file_path, "rb") as f:
             raw_data = f.read(sample_size)
 
+        # charset-normalizer reports a UTF-8 BOM as "utf_8", which keeps the BOM in the first header.
+        if raw_data.startswith(codecs.BOM_UTF8):
+            return "utf-8-sig"
+
         result = from_bytes(raw_data)
         best_match = result.best()
         if best_match and best_match.encoding:
@@ -15388,6 +15395,9 @@ class FileParserBlock(Block):
 
         try:
             delimiter = csv.Sniffer().sniff(sample).delimiter
+            # The sniffer can pick a letter or digit as the delimiter of a one-column file ("email" -> "m").
+            if delimiter.isalnum():
+                raise csv.Error("Could not determine delimiter")
         except csv.Error:
             delimiter = "\t" if file_path.lower().endswith(".tsv") else ","
         return delimiter, encoding
