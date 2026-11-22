@@ -1834,6 +1834,7 @@ class _FakeWorkflowRun:
     def __init__(self) -> None:
         self.workflow_id = "w"
         self.workflow_permanent_id = "wpid"
+        self.otp_request_id = "otpr_code_block"
         # Naive, like workflow_runs.started_at (Column(DateTime)). An aware value here would let a
         # local-clock anchor pass the call-time assertion below in every timezone.
         self.started_at = datetime(2026, 6, 14, 0, 0, 0)
@@ -2032,6 +2033,7 @@ class TestCodeBlockOtpIdentifierFetch:
         assert captured["totp_identifier"] == "otp@example.com"
         assert captured["created_after"] == fake_run.started_at
         assert captured["organization_id"] == _ORG_ID
+        assert captured["otp_request_id"] == "otpr_code_block"
         # The budget is the in-block setting, never the legacy 15-minute window.
         assert "timeout" not in captured
 

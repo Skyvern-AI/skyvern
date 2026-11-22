@@ -625,11 +625,27 @@ async def test_skyvern_launch_local_browser_windows_bypasses_managed_profiles_be
     assert browser.local_user_data_dir_owned is True
 
 
-def test_run_workflow_sends_run_metadata() -> None:
+@pytest.mark.asyncio
+async def test_run_workflow_sends_run_metadata_and_explicit_otp_marker_uses_guarded_route() -> None:
     captured_bodies: list[dict[str, object]] = []
+    captured_paths: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured_bodies.append(json.loads(request.content))
+        captured_paths.append(request.url.path)
+        if request.url.path.endswith("/credentials/totp"):
+            now = datetime.now(UTC).isoformat()
+            return httpx.Response(
+                status_code=200,
+                json={
+                    **captured_bodies[-1],
+                    "totp_code_id": "otp_sdk_test",
+                    "code": "synthetic-code",
+                    "organization_id": "o_sdk_test",
+                    "created_at": now,
+                    "modified_at": now,
+                },
+            )
         return httpx.Response(
             status_code=200,
             json={
@@ -650,13 +666,69 @@ def test_run_workflow_sends_run_metadata() -> None:
         agent_id="wpid_123",
         run_metadata={"customer": "acme", "tier": "enterprise"},
     )
+    task_response = client.run_task(prompt="Check sign-in", otp_request_id="otpr_sdk_test")
+    delivered = client.send_totp_code(
+        totp_identifier="otp@example.test",
+        content="synthetic-code",
+        workflow_run_id="wr_123",
+        otp_request_id="otpr_sdk_test",
+    )
+    async_http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async_client = AsyncSkyvern(
+        base_url="https://api.example.test",
+        api_key="test-key",
+        httpx_client=async_http_client,
+    )
+    try:
+        async_task_response = await async_client.run_task(
+            prompt="Check async sign-in", otp_request_id="otpr_async_task"
+        )
+        async_workflow_response = await async_client.run_workflow(
+            agent_id="wpid_123", otp_request_id="otpr_async_workflow"
+        )
+        async_delivered = await async_client.send_totp_code(
+            totp_identifier="otp@example.test",
+            content="synthetic-code",
+            workflow_run_id="wr_123",
+            otp_request_id="otpr_async_workflow",
+        )
+    finally:
+        await async_http_client.aclose()
 
     assert response.run_id == "wr_123"
+    assert task_response.run_id == "wr_123"
+    assert delivered.totp_code_id == "otp_sdk_test"
+    assert async_task_response.run_id == "wr_123"
+    assert async_workflow_response.run_id == "wr_123"
+    assert async_delivered.totp_code_id == "otp_sdk_test"
+    assert captured_paths == [
+        "/v1/run/agents",
+        "/v1/otp-bound/run/tasks",
+        "/v1/otp-bound/credentials/totp",
+        "/v1/otp-bound/run/tasks",
+        "/v1/otp-bound/run/agents",
+        "/v1/otp-bound/credentials/totp",
+    ]
     assert captured_bodies == [
         {
             "agent_id": "wpid_123",
             "run_metadata": {"customer": "acme", "tier": "enterprise"},
-        }
+        },
+        {"prompt": "Check sign-in", "otp_request_id": "otpr_sdk_test"},
+        {
+            "totp_identifier": "otp@example.test",
+            "workflow_run_id": "wr_123",
+            "otp_request_id": "otpr_sdk_test",
+            "content": "synthetic-code",
+        },
+        {"prompt": "Check async sign-in", "otp_request_id": "otpr_async_task"},
+        {"agent_id": "wpid_123", "otp_request_id": "otpr_async_workflow"},
+        {
+            "totp_identifier": "otp@example.test",
+            "workflow_run_id": "wr_123",
+            "otp_request_id": "otpr_async_workflow",
+            "content": "synthetic-code",
+        },
     ]
 
 
@@ -736,12 +808,22 @@ def test_retry_workflow_run_uses_retry_route() -> None:
         max_steps_override=12,
         user_agent="skyvern-ui",
     )
+    strict_response = client.retry_workflow_run(
+        "wr_original",
+        otp_request_id="otpr_retry_sync",
+        max_steps_override=12,
+        user_agent="skyvern-ui",
+    )
 
     assert response.run_id == "wr_retry"
+    assert strict_response.run_id == "wr_retry"
     assert captured_requests[0].method == "POST"
     assert captured_requests[0].url.path == "/v1/agents/runs/wr_original/retry"
     assert captured_requests[0].headers["x-max-steps-override"] == "12"
     assert captured_requests[0].headers["x-user-agent"] == "skyvern-ui"
+    assert captured_requests[1].method == "POST"
+    assert captured_requests[1].url.path == "/v1/otp-bound/workflows/runs/wr_original/retry"
+    assert captured_requests[1].read() == b'{"otp_request_id":"otpr_retry_sync"}'
 
 
 @pytest.mark.asyncio
@@ -763,12 +845,22 @@ async def test_async_retry_workflow_run_uses_retry_route() -> None:
             max_steps_override=8,
             user_agent="skyvern-ui",
         )
+        strict_response = await client.retry_workflow_run(
+            "wr_original",
+            otp_request_id="otpr_retry_async",
+            max_steps_override=8,
+            user_agent="skyvern-ui",
+        )
 
     assert response.run_id == "wr_retry"
+    assert strict_response.run_id == "wr_retry"
     assert captured_requests[0].method == "POST"
     assert captured_requests[0].url.path == "/v1/agents/runs/wr_original/retry"
     assert captured_requests[0].headers["x-max-steps-override"] == "8"
     assert captured_requests[0].headers["x-user-agent"] == "skyvern-ui"
+    assert captured_requests[1].method == "POST"
+    assert captured_requests[1].url.path == "/v1/otp-bound/workflows/runs/wr_original/retry"
+    assert captured_requests[1].content == b'{"otp_request_id":"otpr_retry_async"}'
 
 
 def test_get_workflow_runs_by_id_uses_workflow_scoped_route() -> None:

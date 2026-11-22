@@ -693,6 +693,8 @@ class TestSanitizeResponseBody:
         [
             ("POST", "/v1/credentials/totp"),
             ("POST", "/v1/credentials/totp/"),
+            ("POST", "/v1/otp-bound/credentials/totp"),
+            ("POST", "/v1/otp-bound/credentials/totp/"),
             ("POST", "/api/v1/totp"),
             ("POST", "/api/v1/totp/"),
             ("GET", "/v1/credentials/totp"),
@@ -840,6 +842,8 @@ class TestSanitizeBody:
         [
             ("POST", "/v1/credentials/totp"),
             ("POST", "/v1/credentials/totp/"),
+            ("POST", "/v1/otp-bound/credentials/totp"),
+            ("POST", "/v1/otp-bound/credentials/totp/"),
             ("POST", "/api/v1/totp"),
             ("POST", "/api/v1/totp/"),
             ("GET", "/v1/credentials/totp"),
