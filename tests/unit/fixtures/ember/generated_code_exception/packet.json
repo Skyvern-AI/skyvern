@@ -1,6 +1,6 @@
 {
   "schema": "generated-code-exception-packet-v1",
-  "provenance": "runner response produced by tests/browser_e2e/test_workflow_copilot_generated_code_exception_repair.py against a live Chromium page",
+  "provenance": "runner response produced by tests/browser_e2e/test_ember_generated_code_exception_repair.py against a live Chromium page",
   "runner_exception_class": "builtins.NameError",
   "runner_failing_line": 2,
   "workflow_yaml": "workflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: price_the_trip\n    code: |\n      fare = float(await page.locator(\"#fare\").inner_text())\n      total = fare * passenger_count\n      return {\"total\": f\"{total:.2f}\"}\n",
