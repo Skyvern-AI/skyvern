@@ -22,6 +22,7 @@ from skyvern.forge.sdk.ember.config import (
 from skyvern.forge.sdk.ember.runtime import AgentContext
 from skyvern.forge.sdk.ember.tracing_setup import ember_span
 from skyvern.forge.sdk.ember.workflow_yaml import dump_workflow_yaml
+from skyvern.forge.sdk.integrations.connected_accounts import as_run_block
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
 from skyvern.forge.sdk.workflow.code_block_security import DENIED_PAGE_MEMBERS
 from skyvern.forge.sdk.workflow.models.block import resolve_conditional_merge_edges
@@ -450,6 +451,15 @@ def _ember_banned_block_alternatives(ctx: AgentContext | None) -> str:
     )
 
 
+def _wrapped_agent_type(block: Mapping[str, object], block_type: str | None) -> str | None:
+    """The browser-agent block type an `integration_action` runs; its wrapper carries no engine, so the engine pin
+    and the code-only ban would never see it."""
+    if block_type != "integration_action":
+        return None
+    run_type = str(as_run_block({**block, "block_type": block_type}).get("block_type"))
+    return run_type if run_type in _AGENT_FAMILY_BLOCK_TYPES else None
+
+
 def _block_authoring_violations(
     block: Mapping[str, object],
     capability: AuthoringCapability,
@@ -465,7 +475,19 @@ def _block_authoring_violations(
     label = raw_label if isinstance(raw_label, str) else "(unlabeled)"
     violations: list[AuthoringPolicyViolation] = []
 
-    if block_type in _banned_block_types_for_capability(capability):
+    banned = _banned_block_types_for_capability(capability)
+    if (run_type := _wrapped_agent_type(block, block_type)) is not None:
+        violations.append(
+            AuthoringPolicyViolation(
+                label=label,
+                block_type=block_type,
+                code=AuthoringViolationCode.BLOCK_TYPE_UNAVAILABLE,
+                guidance=_render_block_policy_detail(run_type, _EMBER_BLOCK_TYPE_POLICIES[run_type])
+                if run_type in banned and run_type in _EMBER_BLOCK_TYPE_POLICIES
+                else f"This integration action runs a `{run_type}` block; write a `{run_type}` block instead.",
+            )
+        )
+    elif block_type in _banned_block_types_for_capability(capability):
         violations.append(
             AuthoringPolicyViolation(
                 label=label,
@@ -687,6 +709,7 @@ def _validator_relevant_fingerprint(block: Mapping[str, object]) -> tuple[object
         )
     return (
         block_type,
+        _wrapped_agent_type(block, block_type),
         block.get("engine"),
         bool(block.get("engine_pinned")),
         block.get("complete_on_download"),
@@ -729,7 +752,8 @@ def _rewrites_a_banned_block(
     if not isinstance(raw_type, str):
         return False
     block_type = normalize_ember_block_type_alias(raw_type.strip().lower())
-    if block_type not in _banned_block_types_for_capability(capability):
+    banned = _banned_block_types_for_capability(capability)
+    if block_type not in banned and _wrapped_agent_type(block, block_type) not in banned:
         return False
     return _states_new_content(block, prior_block)
 

@@ -168,6 +168,7 @@ from skyvern.forge.sdk.api.files import (
     get_run_temp_dir,
     is_remote_url,
     is_uploaded_file_id,
+    list_downloading_files_in_directory,
     observe_download_dir,
     parse_uri_to_path,
     resolve_local_or_download_file,
@@ -381,7 +382,12 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_encrypted_secret,
     is_full_template_reference,
 )
-from skyvern.forge.taskv3.goal_composition import CodeExecutedCall, CodeProgressRecord, CodeTypedValue
+from skyvern.forge.taskv3.goal_composition import (
+    CodeExecutedCall,
+    CodeProgressRecord,
+    CodeTypedValue,
+    StartUrlDownload,
+)
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
@@ -3138,6 +3144,8 @@ class BaseTaskBlock(Block):
                 raise Exception(f"Organization is missing organization_id={workflow_run.organization_id}")
 
             browser_state: BrowserState | None = None
+            navigation: bool | StartUrlDownload = False
+            close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
             holds_start_url = await self._holds_start_url(task)
             if is_first_task:
                 # the first task block will create the browser state and do the navigation
@@ -3167,14 +3175,23 @@ class BaseTaskBlock(Block):
                         if _needs_navigation:
                             if holds_start_url:
                                 _hold_for_start_url(browser_state)
-                            await browser_state.navigate_to_url(
-                                page=working_page, url=self.url, wait_until=_navigate_wait_until
+                            navigation = await app.agent.navigate_to_block_url(
+                                task=task,
+                                step=step,
+                                task_block=self,
+                                browser_state=browser_state,
+                                page=working_page,
+                                url=self.url,
+                                wait_until=_navigate_wait_until,
+                                browser_session_id=browser_session_id,
+                                close_browser_on_completion=close_browser_on_completion,
+                                hand_to_agent=holds_start_url,
                             )
 
                     # When a browser profile is loaded, wait for the page to fully settle
                     # so that cookie-based authentication can redirect or restore the session
                     # BEFORE the agent starts interacting with the page.
-                    if workflow_run.browser_profile_id:
+                    if workflow_run.browser_profile_id and navigation is not True:
                         applied_profile_id = browser_state.browser_artifacts.applied_browser_profile_id
                         if applied_profile_id != workflow_run.browser_profile_id and not browser_session_id:
                             LOG.warning(
@@ -3261,8 +3278,8 @@ class BaseTaskBlock(Block):
                     raise missing_url_exc
 
                 try:
-                    # add screenshot artifact for the first task
-                    screenshot = await browser_state.take_fullpage_screenshot()
+                    # add screenshot artifact for the first task; a completed download may have closed the browser
+                    screenshot = None if navigation is True else await browser_state.take_fullpage_screenshot()
                     if screenshot:
                         await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                             workflow_run_block=workflow_run_block,
@@ -3312,8 +3329,17 @@ class BaseTaskBlock(Block):
                         # pages with slow subresources can still resolve via domcontentloaded.
                         if holds_start_url:
                             _hold_for_start_url(browser_state)
-                        await browser_state.navigate_to_url(
-                            page=working_page, url=self.url, wait_until=_navigate_wait_until
+                        navigation = await app.agent.navigate_to_block_url(
+                            task=task,
+                            step=step,
+                            task_block=self,
+                            browser_state=browser_state,
+                            page=working_page,
+                            url=self.url,
+                            wait_until=_navigate_wait_until,
+                            browser_session_id=browser_session_id,
+                            close_browser_on_completion=close_browser_on_completion,
+                            hand_to_agent=holds_start_url,
                         )
                     except Exception as e:
                         await self._handle_task_failure_with_error_detection(
@@ -3333,17 +3359,18 @@ class BaseTaskBlock(Block):
                 current_context.task_id = task.task_id
                 previous_complete_criterion_is_untrusted = current_context.complete_criterion_is_untrusted
                 current_context.complete_criterion_is_untrusted = self.complete_criterion_is_untrusted
-                close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
-                await app.agent.execute_step(
-                    organization=organization,
-                    task=task,
-                    step=step,
-                    task_block=self,
-                    browser_session_id=browser_session_id,
-                    close_browser_on_completion=close_browser_on_completion,
-                    complete_verification=self.complete_verification,
-                    engine=self.resolve_engine(workflow_run.workflow_run_id),
-                )
+                if navigation is not True:
+                    await app.agent.execute_step(
+                        organization=organization,
+                        task=task,
+                        step=step,
+                        task_block=self,
+                        browser_session_id=browser_session_id,
+                        close_browser_on_completion=close_browser_on_completion,
+                        complete_verification=self.complete_verification,
+                        engine=self.resolve_engine(workflow_run.workflow_run_id),
+                        start_url_download=navigation if isinstance(navigation, StartUrlDownload) else None,
+                    )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception
                 await self._handle_task_failure_with_error_detection(
@@ -6404,6 +6431,7 @@ async def _poll_code_block_otp(
                 workflow_id=workflow_run.workflow_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
+                otp_request_id=workflow_run.otp_request_id,
                 totp_identifier=totp_identifier,
                 created_after=created_after,
                 expected_otp_type=expected_otp_type,
@@ -13214,6 +13242,9 @@ class FileDestinationBlock(Block):
                 if os.path.isdir(os.path.join(download_files_path, file)):
                     LOG.warning("FileUploadBlock Skipping directory", file=file)
                     continue
+                if file.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                    LOG.info("FileUploadBlock Skipping unfinished download", file=file)
+                    continue
                 files_to_upload.append(os.path.join(download_files_path, file))
             if unique_pdfs:
                 files_to_upload = unique_pdf_paths(files_to_upload, stop)
@@ -13619,10 +13650,14 @@ class FileUploadBlock(FileDestinationBlock):
                         context=context,
                     ),
                 )
+                unfinished_downloads = list_downloading_files_in_directory(
+                    Path(download_files_path), attempt_started_at=attempt_started_at
+                )
                 if (
                     registered_downloaded_files == []
                     and alternate_files == []
                     and browser_session_downloaded_files == []
+                    and not unfinished_downloads
                 ):
                     LOG.info(
                         "FileUploadBlock empty scan has no registered downloads; treating as no-op",
@@ -13656,6 +13691,7 @@ class FileUploadBlock(FileDestinationBlock):
                         f"registered_download_count={registered_download_count}; "
                         f"alternate_file_count={alternate_file_count}; "
                         f"browser_session_download_count={browser_session_download_count}; "
+                        f"unfinished_download_count={len(unfinished_downloads)}; "
                         f"nothing was sent to {self.storage_type}."
                     ),
                     output_parameter_value=None,
@@ -15344,7 +15380,7 @@ class FileParserBlock(Block):
         with open(file_path, "rb") as f:
             raw_data = f.read(sample_size)
 
-        # charset-normalizer reports a UTF-8 BOM as "utf_8", which keeps the BOM in the first header.
+        # charset-normalizer reports a UTF-8 BOM file as utf_8, which leaves the BOM in the first header.
         if raw_data.startswith(codecs.BOM_UTF8):
             return "utf-8-sig"
 
@@ -21370,6 +21406,21 @@ class WorkflowTriggerBlock(Block):
                 organization_id,
             )
 
+        ambient_context = skyvern_context.current()
+        if ambient_context is not None and ambient_context.otp_request_id is not None:
+            unsupported_strict_child_modes = []
+            if self.wait_for_completion:
+                unsupported_strict_child_modes.append("synchronous child")
+            if self.browser_session_id:
+                unsupported_strict_child_modes.append("supplied browser session")
+            if self.use_parent_browser_session:
+                unsupported_strict_child_modes.append("parent browser reuse")
+            if unsupported_strict_child_modes:
+                return await _fail(
+                    "Strict OTP child workflows require asynchronous dispatch to a fresh local worker-owned browser; "
+                    "unsupported modes: " + ", ".join(unsupported_strict_child_modes)
+                )
+
         resolved_workflow_permanent_id = self.workflow_permanent_id
         resolved_payload = self.payload
 
@@ -21502,6 +21553,7 @@ class WorkflowTriggerBlock(Block):
                 skyvern_context.SkyvernContext(
                     run_id=parent_context.run_id if parent_context else None,
                     root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
+                    otp_request_id=parent_context.otp_request_id if parent_context else None,
                     requested_by=parent_context.requested_by if parent_context else None,
                     copilot_session_id=parent_context.copilot_session_id if parent_context else None,
                     trigger_type=inherited_trigger_type,
@@ -21654,6 +21706,7 @@ class WorkflowTriggerBlock(Block):
                         root_workflow_run_id=async_parent_context.root_workflow_run_id
                         if async_parent_context
                         else None,
+                        otp_request_id=async_parent_context.otp_request_id if async_parent_context else None,
                         requested_by=async_parent_context.requested_by if async_parent_context else None,
                         copilot_session_id=async_parent_context.copilot_session_id if async_parent_context else None,
                         trigger_type=async_inherited_trigger_type,

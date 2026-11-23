@@ -56,6 +56,8 @@ export interface WorkflowRunRequestOutput {
      * Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
      */
     totp_identifier?: string;
+    /** Explicit request marker for strict run-bound OTP delivery. */
+    otp_request_id?: string;
     /** ID of a Skyvern browser session to reuse, having it continue from the current screen state */
     browser_session_id?: string;
     /** ID of a browser profile to reuse for this workflow run */

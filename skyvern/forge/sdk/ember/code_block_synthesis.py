@@ -283,7 +283,7 @@ def credential_scout_gap(
 
 
 _ENTRY_TARGET_TOOLS = frozenset(
-    {"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file", "press_key", "drag"}
+    {"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file", "press_key", "drag", "hover"}
 )
 _DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset(
     {"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file"}
@@ -1730,13 +1730,16 @@ def _entry_target_locator(
             continue
         if tool_name == "press_key" and not interaction.get("selector"):
             continue
+        if tool_name == "hover" and strict_selectors:
+            continue
         locator = _locator_expr(interaction, [], strict_selectors=strict_selectors)
         if not locator:
             continue
         if not first_locator:
             first_locator = locator
             first_index = index
-        if prefer_durable and is_durable_fallback_entry_target(interaction):
+        # A hover's trigger is visible before anything it reveals, so a field behind it cannot be the anchor.
+        if prefer_durable and (tool_name == "hover" or is_durable_fallback_entry_target(interaction)):
             return locator, index
         if not prefer_durable:
             return locator, index

@@ -1,10 +1,19 @@
 import abc
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from fastapi import BackgroundTasks, Request
 
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
+
+
+@dataclass(frozen=True)
+class CredentialProfileCreation:
+    credential_id: str
+    expected_browser_profile_id: str | None
+    expected_credential_modified_at: datetime | None = None
 
 
 class AsyncExecutor(abc.ABC):

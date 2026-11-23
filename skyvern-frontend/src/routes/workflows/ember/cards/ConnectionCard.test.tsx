@@ -363,7 +363,7 @@ describe("ConnectionCard", () => {
       connections: [{ connection_id: "nc_existing", name: "nc_existing" }],
       start: vi.fn(),
     };
-    render(
+    const { unmount } = render(
       <PageSlotsProvider
         value={{
           connectedGmailFlow: ({
@@ -387,6 +387,46 @@ describe("ConnectionCard", () => {
     );
 
     expect(screen.getByText("nc_existing")).toBeTruthy();
+    unmount();
+
+    // A Connected-Gmail-only step never falls back to native sign-in, even when its flow cannot connect.
+    const blocked: ConnectedGmailFlow = {
+      ...flow,
+      canConnect: false,
+      connections: [],
+    };
+    render(
+      <PageSlotsProvider
+        value={{
+          connectedGmailFlow: ({
+            children,
+          }: {
+            children: (value: ConnectedGmailFlow) => React.ReactNode;
+          }) => <>{children(blocked)}</>,
+        }}
+      >
+        <ConnectionCard
+          card={{
+            integrationId: "gmail",
+            integrationName: "Gmail",
+            provider: "google",
+            scopeProfile: "gmail",
+            requiredScopes: [GMAIL],
+            reconnectConnectionId: null,
+            connectedGmailOnly: true,
+          }}
+        />
+      </PageSlotsProvider>,
+    );
+
+    expect(screen.queryByRole("button", { name: "Connect" })).toBeNull();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Unavailable",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
   });
   it("says a user's one Connected Gmail account is already connected instead of offering Connect", () => {
     const flow: ConnectedGmailFlow = {

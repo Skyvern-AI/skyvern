@@ -111,6 +111,7 @@ from skyvern.schemas.workflows import BlockType
 from skyvern.services.otp_service import iter_totp_from_navigation_inputs
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.token_counter import approx_count_tokens, count_tokens
+from skyvern.webeye.cdp_download_interceptor import DownloadTally
 from skyvern.webeye.native_downloads import NativeDownloadAttempt
 
 LOG = structlog.get_logger()
@@ -334,6 +335,8 @@ async def run_task_v3_agent_loop(
     download_until: DownloadUntil | None = None,
     download_settle: DownloadSettle | None = None,
     unsaved_downloads: UnsavedDownloads | None = None,
+    hold_completed_on_landed_file: bool = False,
+    download_tally_before: DownloadTally | None = None,
     native_download_attempt: NativeDownloadAttempt | None = None,
     completion_gate: CompletionGate | None = None,
     staged_downloads: set[str] | None = None,
@@ -497,6 +500,7 @@ async def run_task_v3_agent_loop(
             refs,
             native_download_attempt=native_download_attempt,
             report_failures=download_settle is not None,
+            tally_before=download_tally_before,
         )
     )
     download_facts = failure_watch.facts if failure_watch is not None and download_settle is not None else None
@@ -755,6 +759,7 @@ async def run_task_v3_agent_loop(
         justify_stops=justify_on,
         file_landed_hold=file_landed_hold,
         unsaved_downloads=unsaved_downloads,
+        hold_completed_on_landed_file=hold_completed_on_landed_file,
     )
     # An extraction block cannot enter input, so a yes has nothing to act on there and offering the tool cost a turn.
     context_texts = (

@@ -23,8 +23,24 @@ from skyvern.utils.token_counter import count_tokens
 if TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.tasks import Task
     from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock
+    from skyvern.webeye.cdp_download_interceptor import DownloadTally
 
 DOWNLOAD_BLOCK_FACT = "No file has landed in this block yet."
+
+
+START_URL_DOWNLOAD_FACT = (
+    "Opening this block's start URL started a file download instead of loading a page; that download belongs "
+    "to this block."
+)
+
+
+@dataclass(frozen=True)
+class StartUrlDownload:
+    """A block's start URL that began a file download; the download listing and tally are from before it."""
+
+    baseline: list[str]
+    tally_before: DownloadTally | None = None
+
 
 PAGE_FIELD_NOUNS = {
     "navigation_goal": "goal",
@@ -253,11 +269,16 @@ def compose_goal(navigation_goal: str, directives: GoalDirectives) -> str:
     return goal
 
 
+def _download_block_fact(start_url_download: StartUrlDownload | None) -> str:
+    return DOWNLOAD_BLOCK_FACT if start_url_download is None else START_URL_DOWNLOAD_FACT
+
+
 def render_block_context(
     task: Task,
     task_block: BaseTaskBlock | None,
     *,
     page_free_validation: bool = False,
+    start_url_download: StartUrlDownload | None = None,
 ) -> str:
     """The block-kind framing (mid-flow / page-free validation / validation / action); ``""`` for a bare task."""
     pieces: list[str] = []
@@ -277,7 +298,11 @@ def render_block_context(
                 else ""
             )
             # The download settle's predicate: on these blocks finish records the files that landed.
-            + (f" {DOWNLOAD_BLOCK_FACT}" if task_block.complete_on_download and task.workflow_run_id else "")
+            + (
+                f" {_download_block_fact(start_url_download)}"
+                if task_block.complete_on_download and task.workflow_run_id
+                else ""
+            )
             + " If the criterion is genuinely satisfied, finish with status=completed "
             "immediately without acting. Stay "
             "within this block's goal: never sign out, navigate away from the current flow, or undo "

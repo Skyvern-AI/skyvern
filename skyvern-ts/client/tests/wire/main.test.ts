@@ -156,11 +156,11 @@ describe("SkyvernClient", () => {
     test("run_task (2)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { prompt: "prompt" };
+        const rawRequestBody = { prompt: "prompt", otp_request_id: "otpr_sdk_test" };
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .post("/v1/run/tasks")
+            .post("/v1/otp-bound/run/tasks")
             .jsonBody(rawRequestBody)
             .respondWith()
             .statusCode(400)
@@ -170,6 +170,7 @@ describe("SkyvernClient", () => {
         await expect(async () => {
             return await client.runTask({
                 prompt: "prompt",
+                otp_request_id: "otpr_sdk_test",
             });
         }).rejects.toThrow(Skyvern.BadRequestError);
     });
@@ -349,11 +350,11 @@ describe("SkyvernClient", () => {
     test("run_workflow (2)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { agent_id: "agent_id" };
+        const rawRequestBody = { agent_id: "agent_id", otp_request_id: "otpr_sdk_test" };
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .post("/v1/run/agents")
+            .post("/v1/otp-bound/run/agents")
             .jsonBody(rawRequestBody)
             .respondWith()
             .statusCode(400)
@@ -363,6 +364,7 @@ describe("SkyvernClient", () => {
         await expect(async () => {
             return await client.runWorkflow({
                 agent_id: "agent_id",
+                otp_request_id: "otpr_sdk_test",
             });
         }).rejects.toThrow(Skyvern.BadRequestError);
     });
@@ -4222,6 +4224,10 @@ describe("SkyvernClient", () => {
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             otp_type: "totp",
+            claimed_by_task_id: "claimed_task_id",
+            claimed_by_workflow_run_id: "claimed_workflow_run_id",
+            claimed_at: "2024-01-15T09:31:00Z",
+            rejected_at: "2024-01-15T09:32:00Z",
         };
         server
             .mockEndpoint()
@@ -4251,17 +4257,30 @@ describe("SkyvernClient", () => {
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             otp_type: "totp",
+            claimed_by_task_id: "claimed_task_id",
+            claimed_by_workflow_run_id: "claimed_workflow_run_id",
+            claimed_at: "2024-01-15T09:31:00Z",
+            rejected_at: "2024-01-15T09:32:00Z",
         });
+        expect(response.claimed_by_task_id).toBe("claimed_task_id");
+        expect(response.claimed_by_workflow_run_id).toBe("claimed_workflow_run_id");
+        expect(response.claimed_at).toBe("2024-01-15T09:31:00Z");
+        expect(response.rejected_at).toBe("2024-01-15T09:32:00Z");
     });
 
     test("send_totp_code (2)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { totp_identifier: "totp_identifier", content: "content" };
+        const rawRequestBody = {
+            totp_identifier: "totp_identifier",
+            workflow_run_id: "workflow_run_id",
+            otp_request_id: "otpr_sdk_test",
+            content: "content",
+        };
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .post("/v1/credentials/totp")
+            .post("/v1/otp-bound/credentials/totp")
             .jsonBody(rawRequestBody)
             .respondWith()
             .statusCode(422)
@@ -4271,6 +4290,8 @@ describe("SkyvernClient", () => {
         await expect(async () => {
             return await client.sendTotpCode({
                 totp_identifier: "totp_identifier",
+                workflow_run_id: "workflow_run_id",
+                otp_request_id: "otpr_sdk_test",
                 content: "content",
             });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
@@ -6127,9 +6148,10 @@ describe("SkyvernClient", () => {
         };
         server
             .mockEndpoint()
-            .post("/v1/agents/runs/wr_123/retry")
+            .post("/v1/otp-bound/workflows/runs/wr_123/retry")
             .header("x-max-steps-override", "1")
             .header("x-user-agent", "x-user-agent")
+            .jsonBody({ otp_request_id: "otpr_retry_typescript" })
             .respondWith()
             .statusCode(200)
             .jsonBody(rawResponseBody)
@@ -6138,6 +6160,7 @@ describe("SkyvernClient", () => {
         const response = await client.retryWorkflowRun("wr_123", {
             "x-max-steps-override": 1,
             "x-user-agent": "x-user-agent",
+            otp_request_id: "otpr_retry_typescript",
         });
         expect(response).toEqual({
             run_id: "tsk_123",

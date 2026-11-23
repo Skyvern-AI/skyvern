@@ -355,7 +355,12 @@ class _ChildBodyStarted(BaseException):
 
 
 def _nested_rows(
-    monkeypatch: pytest.MonkeyPatch, *, on_child_created=None, on_child_running=None, on_session_begun=None
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    strict: bool = False,
+    on_child_created=None,
+    on_child_running=None,
+    on_session_begun=None,
 ) -> SimpleNamespace:
     """Parent run plus the rows a nested task v2 creates, with conditional writes that honor their control kwargs."""
     from datetime import UTC, datetime
@@ -373,6 +378,8 @@ def _nested_rows(
         extra_http_headers=None,
         cdp_connect_headers=None,
         failure_reason=None,
+        otp_request_id="otpr_nested" if strict else None,
+        started_at=datetime.now(UTC),
     )
     organization = SimpleNamespace(
         organization_id="org_1",
@@ -409,7 +416,9 @@ def _nested_rows(
         rows.started.append(workflow_run_id)
         if on_child_running is not None:
             on_child_running(rows)
-        return await update_run_if_not_final(workflow_run_id, WorkflowRunStatus.running) or rows.runs[workflow_run_id]
+        run = await update_run_if_not_final(workflow_run_id, WorkflowRunStatus.running) or rows.runs[workflow_run_id]
+        run.started_at = run.started_at or datetime.now(UTC)
+        return run
 
     async def update_task(
         task_v2_id: str, status: TaskV2Status | None = None, keep_final_status: bool = False, **_: object
@@ -433,12 +442,14 @@ def _nested_rows(
         rows.runs["wr_child"] = SimpleNamespace(
             workflow_run_id="wr_child",
             workflow_id="wf_child",
-            status=WorkflowRunStatus.created,
+            status=WorkflowRunStatus.running if strict else WorkflowRunStatus.created,
             parent_workflow_run_id=parent_workflow_run_id,
             browser_profile_id=None,
             browser_address=None,
             failure_reason=None,
             terminal_bookkeeping_done=False,
+            otp_request_id="otpr_nested" if strict else None,
+            started_at=None,
         )
         rows.tasks["tsk_child"] = SimpleNamespace(
             observer_cruise_id="tsk_child",
@@ -454,6 +465,7 @@ def _nested_rows(
             output=None,
             summary=None,
             failure_category=None,
+            otp_request_id="otpr_nested" if strict else None,
         )
         if on_child_created is not None:
             on_child_created(rows)
@@ -642,11 +654,14 @@ async def test_child_finished_elsewhere_before_queueing_is_not_queued_again(monk
 
 
 @pytest.mark.asyncio
-async def test_child_of_a_live_parent_reaches_its_browser(monkeypatch: pytest.MonkeyPatch) -> None:
-    rows = _nested_rows(monkeypatch)
+@pytest.mark.parametrize("strict", [False, True])
+async def test_child_of_a_live_parent_reaches_its_browser(monkeypatch: pytest.MonkeyPatch, strict: bool) -> None:
+    rows = _nested_rows(monkeypatch, strict=strict)
 
     with pytest.raises(_ChildBodyStarted):
         await _execute_nested_block()
 
     assert [run.workflow_run_id for run in rows.browser_requests] == ["wr_child"]
     assert rows.runs["wr_parent"].status == WorkflowRunStatus.running
+    assert rows.runs["wr_child"].otp_request_id == ("otpr_nested" if strict else None)
+    assert rows.tasks["tsk_child"].otp_request_id == ("otpr_nested" if strict else None)

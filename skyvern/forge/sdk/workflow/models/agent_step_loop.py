@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -107,7 +108,8 @@ from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, IntegrationActionBlockYAML
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.secret_redaction import redact_secrets_from_text
-from skyvern.webeye.actions.actions import UploadFileAction
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action, GotoUrlAction, UploadFileAction, reasoning_is_turn_scoped
 
 if TYPE_CHECKING:
     from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
@@ -121,6 +123,7 @@ _MAX_TRAIL_BYTES = 512 * 1024
 _TRAIL_WRITE_SECONDS = 2
 _MASK = "*****"
 _Fact = str | list[dict[str, str]]
+_OPAQUE_TOKEN = re.compile(rf"{_TOKEN_PREFIX}[0-9a-f]{{8}}")
 
 _INSTRUCTIONS = (
     "You are one step of an unattended workflow run; nobody can answer questions. "
@@ -1225,10 +1228,9 @@ async def _run_child_block(
             report, child_block_id = await _execute_child(child, written, state)
             if page_url is not None:
                 facts["page_url_at_start"] = page_url
-            if "files" in tool.fields:
-                attempts = await _upload_attempts(state, child_block_id, written.get("files") or [])
-                if attempts is not None:
-                    facts["upload_attempts"] = attempts
+            if tool.nested_agent:
+                files = (written.get("files") or []) if "files" in tool.fields else None
+                facts.update(await _child_action_facts(state, child_block_id, files))
             # Ahead of output, so the window that cuts a long output keeps them.
             report = {"status": report["status"], **facts, **report}
             if (
@@ -1273,7 +1275,7 @@ async def _execute_child(child: Block, written: dict[str, Any], state: _RunState
 
 
 def _url_fact(url: str) -> str:
-    if url == "about:blank" or url.startswith(_TOKEN_PREFIX):
+    if url == "about:blank" or _OPAQUE_TOKEN.fullmatch(url):
         return url
     return sanitize_handoff_url(url) or "unparseable url"
 
@@ -1288,40 +1290,61 @@ async def _page_url_at_start(state: _RunState) -> str | None:
         return None
 
 
-async def _upload_attempts(
-    state: _RunState, workflow_run_block_id: str | None, files: list[str]
-) -> list[dict[str, str]] | None:
+async def _child_action_facts(
+    state: _RunState, workflow_run_block_id: str | None, files: list[str] | None
+) -> dict[str, _Fact]:
     try:
         if workflow_run_block_id is None:
-            return None
+            return {}
         run_block = await app.DATABASE.observer.get_workflow_run_block(
             workflow_run_block_id, organization_id=state.organization_id
         )
         if run_block.task_id is None:
-            return None
+            return {}
         actions = await app.DATABASE.tasks.get_task_actions_hydrated(
             run_block.task_id, organization_id=state.organization_id
         )
-        handed = {key: state.run_context.values.get(key) for key in files}
-        attempts = []
-        for action in actions:
-            if not isinstance(action, UploadFileAction):
-                continue
-            # Task V3 stores the file argument as its model wrote it, so a handed signed URL is its opaque_url_ token.
-            parameter = next(
-                (
-                    key
-                    for key, value in handed.items()
-                    if mask_opaque_urls({key: value}).resolve(action.file_url) in string_leaves(value)
-                ),
-                None,
-            )
-            named = {"parameter": parameter} if parameter else {"source": _url_fact(action.file_url)}
-            attempts.append({**named, "status": action.status.value})
-        return attempts
+        facts: dict[str, _Fact] = {} if files is None else {"upload_attempts": _upload_attempts(state, actions, files)}
+        return facts | _recorded_actions(actions)
     except Exception:
-        LOG.warning("Could not read a nested agent's uploads", label=state.label, exc_info=True)
-        return None
+        LOG.warning("Could not read a nested agent's actions", label=state.label, exc_info=True)
+        return {}
+
+
+def _upload_attempts(state: _RunState, actions: list[Action], files: list[str]) -> list[dict[str, str]]:
+    handed = {key: state.run_context.values.get(key) for key in files}
+    attempts = []
+    for action in actions:
+        if not isinstance(action, UploadFileAction):
+            continue
+        # Task V3 stores the file argument as its model wrote it, so a handed signed URL is its opaque_url_ token.
+        parameter = next(
+            (
+                key
+                for key, value in handed.items()
+                if mask_opaque_urls({key: value}).resolve(action.file_url) in string_leaves(value)
+            ),
+            None,
+        )
+        named = {"parameter": parameter} if parameter else {"source": _url_fact(action.file_url)}
+        attempts.append({**named, "status": action.status.value})
+    return attempts
+
+
+def _recorded_actions(actions: list[Action]) -> dict[str, _Fact]:
+    # Only Task V3 rows carry an LLM-free target label in intention; a navigation's intention holds its raw URL.
+    if not all(reasoning_is_turn_scoped(action.description) for action in actions):
+        return {}
+    entries = []
+    for action in actions:
+        if action.action_type == ActionType.GOTO_URL:
+            entry = {"action": "navigate"}
+            if isinstance(action, GotoUrlAction):
+                entry["url"] = _url_fact(action.url)
+        else:
+            entry = {"action": action.intention or action.action_type.value}
+        entries.append({**entry, "status": action.status.value})
+    return {"recorded_actions": entries}
 
 
 def _credential_keys(parameters: list[PARAMETER_TYPE]) -> list[str]:

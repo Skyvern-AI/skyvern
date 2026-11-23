@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import structlog
@@ -16,6 +17,8 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import (
 )
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core.hashing import generate_url_hash
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.exceptions import OTPRequestAlreadyBoundError
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration, TaskGenerationBase
@@ -23,13 +26,28 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, Tas
 from skyvern.forge.sdk.services import request_principal
 from skyvern.schemas.runs import RunEngine, RunStatus, RunType
 from skyvern.services import uploaded_file_service
+from skyvern.services.strict_otp_terminalization import fail_unclaimed_strict_task
 from skyvern.utils.url_validators import validate_fetch_url
 
 LOG = structlog.get_logger()
 
+_STRICT_OTP_ADMISSION_FAILURE_REASON = "Strict OTP task setup failed after admission."
+
 
 class InvalidTaskV1ModelError(ValueError):
     pass
+
+
+async def _await_admission_cleanup_deferring_cancellation(cleanup: Callable[[], Awaitable[None]]) -> None:
+    cleanup_task = asyncio.ensure_future(cleanup())
+    while True:
+        try:
+            await asyncio.shield(cleanup_task)
+            return
+        except asyncio.CancelledError:
+            if cleanup_task.done():
+                await cleanup_task
+                return
 
 
 async def _validate_task_v1_model_for_org(organization: Organization, model: dict[str, Any] | None) -> None:
@@ -141,55 +159,103 @@ async def run_task(
     if task.url:
         task.url = await asyncio.to_thread(validate_fetch_url, task.url)
 
-    created_task = await app.agent.create_task(task, organization.organization_id)
-    engine = await app.AGENT_FUNCTION.resolve_run_engine(
-        requested_engine=engine,
-        task=task,
-        organization=organization,
-        task_id=created_task.task_id,
-        ab_eligible=ab_routing_eligible,
-    )
-    url_hash = generate_url_hash(task.url)
-    run_type = RunType.task_v1
-    if engine == RunEngine.openai_cua:
-        run_type = RunType.openai_cua
-    elif engine == RunEngine.anthropic_cua:
-        run_type = RunType.anthropic_cua
-    elif engine == RunEngine.ui_tars:
-        run_type = RunType.ui_tars
-    elif engine == RunEngine.skyvern_v3:
-        run_type = RunType.task_v3
-    await app.DATABASE.tasks.create_task_run(
-        task_run_type=run_type,
-        organization_id=organization.organization_id,
-        run_id=created_task.task_id,
-        title=task.title,
-        url=task.url,
-        url_hash=url_hash,
-        status=RunStatus.queued,
-    )
-    if x_max_steps_override:
-        LOG.info(
-            "Overriding max steps per run",
-            max_steps_override=x_max_steps_override,
-            organization_id=organization.organization_id,
+    try:
+        created_task = await app.agent.create_task(task, organization.organization_id)
+    except OTPRequestAlreadyBoundError as exc:
+        raise HTTPException(status_code=409, detail="otp_request_id is already bound to another run") from exc
+    try:
+        engine = await app.AGENT_FUNCTION.resolve_run_engine(
+            requested_engine=engine,
+            task=task,
+            organization=organization,
             task_id=created_task.task_id,
+            ab_eligible=ab_routing_eligible,
         )
-    # Bound before dispatch so the run cannot reach teardown with nothing attached to delete.
-    await uploaded_file_service.attach_files_to_run(
-        file_ids=file_ids or [],
-        organization_id=organization.organization_id,
-        run_id=created_task.task_id,
-    )
-    await AsyncExecutorFactory.get_executor().execute_task(
-        request=request,
-        background_tasks=background_tasks,
-        task_id=created_task.task_id,
-        organization_id=organization.organization_id,
-        max_steps_override=x_max_steps_override,
-        browser_session_id=task.browser_session_id,
-        api_key=x_api_key,
-    )
+        url_hash = generate_url_hash(task.url)
+        run_type = RunType.task_v1
+        if engine == RunEngine.openai_cua:
+            run_type = RunType.openai_cua
+        elif engine == RunEngine.anthropic_cua:
+            run_type = RunType.anthropic_cua
+        elif engine == RunEngine.ui_tars:
+            run_type = RunType.ui_tars
+        elif engine == RunEngine.skyvern_v3:
+            run_type = RunType.task_v3
+        await app.DATABASE.tasks.create_task_run(
+            task_run_type=run_type,
+            organization_id=organization.organization_id,
+            run_id=created_task.task_id,
+            title=task.title,
+            url=task.url,
+            url_hash=url_hash,
+            status=RunStatus.queued,
+        )
+        if x_max_steps_override:
+            LOG.info(
+                "Overriding max steps per run",
+                max_steps_override=x_max_steps_override,
+                organization_id=organization.organization_id,
+                task_id=created_task.task_id,
+            )
+        # Bound before dispatch so the run cannot reach teardown with nothing attached to delete.
+        await uploaded_file_service.attach_files_to_run(
+            file_ids=file_ids or [],
+            organization_id=organization.organization_id,
+            run_id=created_task.task_id,
+        )
+    except (Exception, asyncio.CancelledError):
+        if created_task.otp_request_id is not None:
+            try:
+
+                async def finalize_admission_failure() -> None:
+                    failed_task, finish_claimed = await app.DATABASE.tasks.update_task_and_claim_finish(
+                        created_task.task_id,
+                        organization_id=organization.organization_id,
+                        status=TaskStatus.failed,
+                        failure_reason=_STRICT_OTP_ADMISSION_FAILURE_REASON,
+                        keep_final_status=True,
+                    )
+                    if finish_claimed:
+                        await app.DATABASE.tasks.sync_task_run_status(
+                            organization_id=organization.organization_id,
+                            run_id=created_task.task_id,
+                            status=RunStatus.failed,
+                            started_at=failed_task.started_at,
+                            finished_at=failed_task.finished_at,
+                        )
+                        signing_key = x_api_key
+                        if signing_key is None:
+                            api_key = await app.DATABASE.organizations.get_valid_org_auth_token(
+                                organization.organization_id,
+                                OrganizationAuthTokenType.api.value,
+                            )
+                            signing_key = api_key.token if api_key is not None else None
+                        await app.agent.execute_task_webhook(task=failed_task, api_key=signing_key)
+
+                await _await_admission_cleanup_deferring_cancellation(finalize_admission_failure)
+            except (Exception, asyncio.CancelledError):
+                LOG.warning(
+                    "Failed to finalize strict OTP task after admission error",
+                    organization_id=organization.organization_id,
+                    task_id=created_task.task_id,
+                    exc_info=True,
+                )
+        raise
+    try:
+        await AsyncExecutorFactory.get_executor().execute_task(
+            request=request,
+            background_tasks=background_tasks,
+            task_id=created_task.task_id,
+            organization_id=organization.organization_id,
+            max_steps_override=x_max_steps_override,
+            browser_session_id=task.browser_session_id,
+            api_key=x_api_key,
+        )
+    except (Exception, asyncio.CancelledError):
+        # The executor may already have claimed the task, so only an unclaimed one is failed here.
+        if created_task.otp_request_id is not None:
+            await fail_unclaimed_strict_task(task_id=created_task.task_id, organization_id=organization.organization_id)
+        raise
     # Return the resolved engine so callers report the run_type that actually executes (the A/B
     # hook may reroute a default request to v3), not the pre-routing request engine.
     return created_task, engine

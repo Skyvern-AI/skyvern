@@ -80,6 +80,7 @@ from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models import agent_step_loop, agent_step_tools
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.block import (
+    BaseTaskBlock,
     ConditionalBlock,
     DownloadToS3Block,
     ExtractionBlock,
@@ -110,7 +111,14 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import script_service
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
-from skyvern.webeye.actions.actions import ActionStatus, UploadFileAction
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import (
+    TASK_V3_ACTION_DESCRIPTION_PREFIX,
+    Action,
+    ActionStatus,
+    GotoUrlAction,
+    UploadFileAction,
+)
 from tests.unit.conftest import make_block_output_parameter
 from tests.unit.ember_test_helpers import (
     RecordingSkills,
@@ -1503,7 +1511,7 @@ def _token(url: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_a_nested_agent_result_gives_page_url_at_start_and_each_upload_attempt(
+async def test_a_nested_agent_result_gives_page_url_at_start_each_upload_attempt_and_its_recorded_actions(
     monkeypatch: pytest.MonkeyPatch, database: AgentDB
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
@@ -1511,72 +1519,70 @@ async def test_a_nested_agent_result_gives_page_url_at_start_and_each_upload_att
     context.parameters |= {"fax_file": _file_parameter("fax_file"), "notes_file": _file_parameter("notes_file")}
     context.values |= {"fax_file": FAX_URL, "notes_file": NOTES_URL}
     working_page = SimpleNamespace(url="about:blank")
-    # The fourth call's page read and upload read both fail.
+    # The fourth call's page read and action read both fail; the taskless child makes no action read.
     browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(side_effect=[working_page] * 3 + [RuntimeError("page closed")]),
+        get_working_page=AsyncMock(side_effect=[working_page] * 3 + [RuntimeError("page closed")] + [working_page] * 7),
         take_fullpage_screenshot=AsyncMock(return_value=None),
     )
     monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *_, **__: browser_state)
     read_actions = database.tasks.get_task_actions_hydrated
-    action_reads = [read_actions] * 3 + [AsyncMock(side_effect=RuntimeError("database unavailable"))]
+    action_reads = (
+        [read_actions] * 3 + [AsyncMock(side_effect=RuntimeError("database unavailable"))] + [read_actions] * 6
+    )
     monkeypatch.setattr(
         database.tasks, "get_task_actions_hydrated", lambda *args, **kwargs: action_reads.pop(0)(*args, **kwargs)
     )
-    # Each child: the upload rows its nested agent records, its status, its output, and the page it leaves.
-    children = [
+
+    def uploads(*rows: tuple[str, ActionStatus]) -> list[Action]:
+        return [UploadFileAction(element_id="file", file_url=url, status=status) for url, status in rows]
+
+    long_rows = [_clicked(f"Filler {n}") for n in range(32)] + [
+        Action(action_type=ActionType.GOTO_URL, status=ActionStatus.failed, description=f"{V3}navigate"),
+        GotoUrlAction(url="opaque_url_deadbeef?x=s", status=ActionStatus.completed, description=f"{V3}navigate"),
+        _clicked(f"{SECRET} {'x' * 250}"),
+    ]
+    item_a = {"item": "Physical item A", "price": "48.00"}
+    # Each child: its action rows (None gives it no task), its status, its output, and the page it leaves.
+    children: list[tuple[list[Action] | None, BlockStatus, dict[str, Any] | None, str]] = [
         (
-            [(_token(FAX_URL), ActionStatus.completed), (NOTES_URL, ActionStatus.completed)],
+            uploads((_token(FAX_URL), ActionStatus.completed), (NOTES_URL, ActionStatus.completed)),
             BlockStatus.completed,
             None,
             "https://agent:pw@example.com/upload?session_id=sK8pL2nQ5vR9xT3mW6yZ1aBc#done",
         ),
         (
-            [
+            uploads(
                 (_token(DECOY_URL), ActionStatus.completed),
                 (MALFORMED_URL, ActionStatus.failed),
                 ("https://example.com/other.pdf?token=abc123", ActionStatus.failed),
-            ],
+            ),
             BlockStatus.completed,
             {"downloaded_file_urls": [DOWNLOADED_URL]},
             MALFORMED_URL,
         ),
-        ([(_token(DOWNLOADED_URL), ActionStatus.completed)], BlockStatus.timed_out, None, FORM_URL),
-        ([(_token(FAX_URL), ActionStatus.completed)], BlockStatus.completed, None, FORM_URL),
+        (uploads((_token(DOWNLOADED_URL), ActionStatus.completed)), BlockStatus.timed_out, None, FORM_URL),
+        (uploads((_token(FAX_URL), ActionStatus.completed)), BlockStatus.completed, None, FORM_URL),
+        (_shopped("Physical item A"), BlockStatus.completed, item_a, FORM_URL),
+        (_shopped("Physical item B"), BlockStatus.completed, item_a, FORM_URL),
+        (long_rows, BlockStatus.completed, item_a, FORM_URL),
+        ([], BlockStatus.completed, item_a, FORM_URL),
+        (
+            [_clicked("Physical item A"), _clicked("Physical item B", description=None)],
+            BlockStatus.completed,
+            item_a,
+            FORM_URL,
+        ),
+        (None, BlockStatus.completed, item_a, FORM_URL),
+        (_shopped("Physical item D"), BlockStatus.completed, item_a, FORM_URL),
     ]
 
     async def nested_agent(
-        block: TaskBlock, workflow_run_id: str, workflow_run_block_id: str, **_: object
+        block: BaseTaskBlock, workflow_run_id: str, workflow_run_block_id: str, **_: object
     ) -> BlockResult:
         rows, status, output, page_after = children.pop(0)
-        task = await database.tasks.create_task(
-            url=block.url or "",
-            title=None,
-            navigation_goal=None,
-            data_extraction_goal=None,
-            navigation_payload=None,
-            organization_id=ORG,
-            workflow_run_id=RUN,
-        )
-        await database.observer.update_workflow_run_block(
-            workflow_run_block_id=workflow_run_block_id, organization_id=ORG, task_id=task.task_id
-        )
-        step = await database.tasks.create_step(
-            task_id=task.task_id, order=0, retry_index=0, organization_id=ORG, status=StepStatus.running
-        )
-        for order, (file_url, row_status) in enumerate(rows):
-            await database.workflow_params.create_action(
-                UploadFileAction(
-                    element_id="file",
-                    file_url=file_url,
-                    status=row_status,
-                    organization_id=ORG,
-                    workflow_run_id=RUN,
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                    step_order=0,
-                    action_order=order,
-                )
-            )
+        if rows is not None:
+            await _child_task(database, workflow_run_block_id, rows)
+            await _child_task(database, None, [_clicked("Physical item C")])
         if output is not None:
             await block.record_output_parameter_value(context, RUN, output)
         working_page.url = page_after
@@ -1588,7 +1594,9 @@ async def test_a_nested_agent_result_gives_page_url_at_start_and_each_upload_att
             workflow_run_block_id=workflow_run_block_id,
         )
 
-    monkeypatch.setattr(TaskBlock, "execute", nested_agent)
+    monkeypatch.setattr(BaseTaskBlock, "execute", nested_agent)
+    upload_calls = ("upload", "read", "again", "broken")
+    action_calls = ("a", "b", "long", "none", "legacy", "taskless")
     model = _ScriptedModel(
         [
             [
@@ -1603,17 +1611,31 @@ async def test_a_nested_agent_result_gives_page_url_at_start_and_each_upload_att
                 )
             ],
             [scripted_call("browser_task", {**UPLOAD, "url": FORM_URL, "files": ["fax_file"]}, call_id="broken")],
+            *(
+                [scripted_call("browser_task", {"navigation_goal": "Buy one item"}, call_id=call)]
+                for call in action_calls
+            ),
+            [
+                scripted_call(
+                    "run_block",
+                    {"block_type": "file_download", "arguments": {"url": FORM_URL, "navigation_goal": "Get it"}},
+                    call_id="download",
+                )
+            ],
+            [scripted_call("read_run_data", {"name": "agent_task_5"}, call_id="reread_a")],
+            [scripted_call("read_run_data", {"name": "agent_task_7"}, call_id="reread_long")],
             VALID_FINISH,
         ]
     )
 
-    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["browser_task"])
+    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["browser_task", "file_download"])
 
+    calls = (*upload_calls, *action_calls, "download")
+    texts = {call: tool_outputs_for(model.inputs[-1][1], call)[0] for call in (*calls, "reread_a", "reread_long")}
+    reports = {call: json.loads(text) for call, text in texts.items()}
     facts = [
-        {key: report[key] for key in ("page_url_at_start", "upload_attempts") if key in report}
-        for report in (
-            json.loads(tool_outputs_for(model.inputs[-1][1], call)[0]) for call in ("upload", "read", "again", "broken")
-        )
+        {key: reports[call][key] for key in ("page_url_at_start", "upload_attempts") if key in reports[call]}
+        for call in upload_calls
     ]
     assert facts == [
         {
@@ -1637,17 +1659,101 @@ async def test_a_nested_agent_result_gives_page_url_at_start_and_each_upload_att
         },
         {},
     ]
+    a, b = reports["a"], reports["b"]
+    assert {**a, "recorded_actions": None} == {**b, "recorded_actions": None}
+    assert a["recorded_actions"] == [
+        {"action": "navigate", "url": "https://shop.example.com/items", "status": "completed"},
+        {"action": 'Clicked the "Physical item A" link', "status": "completed"},
+        {"action": "complete", "status": "completed"},
+    ]
+    assert b["recorded_actions"][1] == {"action": 'Clicked the "Physical item B" link', "status": "completed"}
+    assert reports["download"]["recorded_actions"][1] == {
+        "action": 'Clicked the "Physical item D" link',
+        "status": "completed",
+    }
+    assert texts["reread_a"] == texts["a"]
+    assert texts["reread_long"] == texts["long"]
+    long_actions = reports["long"]["recorded_actions"]
+    assert len(long_actions) == 35
+    assert long_actions[0]["action"] == 'Clicked the "Filler 0" link'
+    assert long_actions[-3:] == [
+        {"action": "navigate", "status": "failed"},
+        {"action": "navigate", "url": "unparseable url", "status": "completed"},
+        {"action": f'Clicked the "***** {"x" * 250}" link', "status": "completed"},
+    ]
+    assert reports["none"]["recorded_actions"] == []
+    assert [call for call in calls if "recorded_actions" in reports[call]] == ["a", "b", "long", "none", "download"]
     assert children == []
     assert result.status == BlockStatus.completed
     assert isinstance(result.output_parameter_value, dict)
-    tool_calls = result.output_parameter_value["tool_calls"][:4]
-    assert [call["status"] for call in tool_calls] == ["completed", "completed", "timed_out", "completed"]
-    assert [{key: call[key] for key in facts[0] if key in call} for call in tool_calls] == facts
+    tool_calls = result.output_parameter_value["tool_calls"]
+    assert [call["status"] for call in tool_calls[:4]] == ["completed", "completed", "timed_out", "completed"]
+    assert [{key: call[key] for key in facts[0] if key in call} for call in tool_calls[:4]] == facts
+    assert [call.get("recorded_actions") for call in tool_calls[4:6]] == [a["recorded_actions"], b["recorded_actions"]]
     block_output = json.dumps(result.output_parameter_value)
-    assert not [
-        url
-        for url in (FAX_URL, DECOY_URL, DOWNLOADED_URL, "agent:pw", "9f8e7d6c5b4a3210", "sK8pL2nQ5vR9", "abc123")
-        if url in block_output
+    url_leaks = (FAX_URL, DECOY_URL, DOWNLOADED_URL, "agent:pw", "9f8e7d6c5b4a3210", "sK8pL2nQ5vR9", "abc123")
+    assert not [leak for leak in url_leaks if leak in block_output]
+    every_text = json.dumps(texts) + block_output
+    assert not [leak for leak in (SECRET, "Physical item C", "Physical item Z", "sK8pL2") if leak in every_text]
+
+
+SHOP_URL = "https://shop.example.com/items?session=sK8pL2nQ5vR9xT3mW6yZ1aBc#top"
+V3 = TASK_V3_ACTION_DESCRIPTION_PREFIX
+
+
+async def _child_task(database: AgentDB, workflow_run_block_id: str | None, rows: list[Action]) -> None:
+    task = await database.tasks.create_task(
+        url="",
+        title=None,
+        navigation_goal=None,
+        data_extraction_goal=None,
+        navigation_payload=None,
+        organization_id=ORG,
+        workflow_run_id=RUN,
+    )
+    if workflow_run_block_id is not None:
+        await database.observer.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id, organization_id=ORG, task_id=task.task_id
+        )
+    step = await database.tasks.create_step(
+        task_id=task.task_id, order=0, retry_index=0, organization_id=ORG, status=StepStatus.running
+    )
+    for order, row in enumerate(rows):
+        await database.workflow_params.create_action(
+            row.model_copy(
+                update={
+                    "organization_id": ORG,
+                    "workflow_run_id": RUN,
+                    "task_id": task.task_id,
+                    "step_id": step.step_id,
+                    "step_order": 0,
+                    "action_order": order,
+                }
+            )
+        )
+
+
+def _clicked(target: str, description: str | None = f"{V3}click e12") -> Action:
+    return Action(
+        action_type=ActionType.CLICK,
+        status=ActionStatus.completed,
+        element_id="e12",
+        description=description,
+        intention=f'Clicked the "{target}" link',
+        reasoning="Turn reasoning that names Physical item Z.",
+    )
+
+
+def _shopped(item: str) -> list[Action]:
+    return [
+        GotoUrlAction(
+            url=SHOP_URL,
+            status=ActionStatus.completed,
+            description=f"{V3}navigate",
+            intention=f"Navigated to {SHOP_URL}",
+        ),
+        _clicked(item),
+        Action(action_type=ActionType.COMPLETE, status=ActionStatus.completed, description=f"{V3}finish completed"),
     ]
 
 

@@ -544,6 +544,8 @@ export interface ConnectionCard {
   scopeProfile: string | null;
   requiredScopes: string[];
   reconnectConnectionId: string | null;
+  // The step runs only on a Connected Gmail account, so a Google sign-in account is neither offered nor connected.
+  connectedGmailOnly?: boolean;
 }
 
 export function connectionCardKey(card: ConnectionCard): string {
@@ -881,6 +883,7 @@ export function parseConnectionCards(value: unknown): ConnectionCard[] {
         row.reconnectConnectionId.length > 0
           ? row.reconnectConnectionId
           : null,
+      ...(row.connectedGmailOnly === true ? { connectedGmailOnly: true } : {}),
     };
     const key = connectionCardKey(card);
     if (seen.has(key)) continue;
@@ -930,6 +933,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   select_option: "Selecting option",
   press_key: "Interacting with page",
   drag: "Interacting with page",
+  hover: "Interacting with page",
   navigate_browser: "Opening page",
   wait_for_either_state: "Waiting for the page",
   skyvern_frame_list: "Finding embedded pages",

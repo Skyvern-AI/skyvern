@@ -109,6 +109,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import is_temp_working_dir, resolve_run_download_id
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_artifacts, artifact_filename_from_uri
+from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import (
     ResponseComparison,
     response_deadline,
@@ -281,7 +282,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     takes_default_engine,
     v3_ab_ineligibility_reason,
 )
-from skyvern.forge.sdk.workflow.models.integration_action_block import IntegrationActionBlock
+from skyvern.forge.sdk.workflow.models.integration_action_block import IntegrationActionBlock, runnable_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     AzureVaultCredentialParameter,
@@ -448,6 +449,7 @@ from skyvern.services.script_reviewer import (
 )
 from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.postrun import v3_review_post_run
+from skyvern.services.strict_otp_terminalization import fail_unclaimed_strict_workflow_run_on_error
 from skyvern.services.webhook_delivery import (
     FinalWebhookFinalizer,
     PreparedWorkflowWebhook,
@@ -485,9 +487,10 @@ from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, InputTextAction, VerificationCodeAction
 from skyvern.webeye.actions.responses import ActionResult
+from skyvern.webeye.browser_artifacts import BrowserArtifacts, CredentialProfileFinalizer
 from skyvern.webeye.browser_manager import SupersededRunClaim
 from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss
-from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
+from skyvern.webeye.persistent_session_errors import BrowserProfilePreflightError, BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.persistent_sessions_manager import BROWSER_RETIREMENT_DENIED_NOTE
 from skyvern.webeye.profile_cookie_merge import cookie_delta, seed_cookie_values, union_cookies_into_profile_dir
 from skyvern.webeye.real_browser_manager import (
@@ -1571,7 +1574,7 @@ async def _validate_powerbi_workflow_save(
 
     async def collect_workflows(definition: WorkflowDefinition, depth: int = 0) -> None:
         blocks = get_all_blocks(definition.blocks)
-        powerbi_blocks = [block for block in blocks if isinstance(block, PowerBIQueryBlock)]
+        powerbi_blocks = [block for block in runnable_blocks(blocks) if isinstance(block, PowerBIQueryBlock)]
         if depth == 0 and any(not block.has_valid_input_shape() for block in powerbi_blocks):
             raise SkyvernHTTPException(
                 "Power BI query must be literal and dataset_id must be a UUID or one workflow input reference.",
@@ -1714,6 +1717,21 @@ class WorkflowBrowserCleanupResult:
     child_workflow_run_ids: list[str]
     close_browser_on_completion: bool
     browser_session_write_back_attempted: bool = False
+
+
+def _owned_credential_capture(
+    cleanup: WorkflowBrowserCleanupResult, browser_session_id: str | None
+) -> BrowserArtifacts | None:
+    if browser_session_id or not cleanup.close_browser_on_completion or cleanup.browser_state is None:
+        return None
+    artifacts = cleanup.browser_state.browser_artifacts
+    if (
+        artifacts._credential_profile_writer
+        and artifacts.browser_session_dir
+        and is_temp_working_dir(artifacts.browser_session_dir)
+    ):
+        return artifacts
+    return None
 
 
 @dataclass
@@ -4309,7 +4327,10 @@ class WorkflowService:
             does not convert.
         :return: The created workflow run.
         """
-        async with app.DATABASE.workflow_runs.Session() as outer_session:
+        async with (
+            fail_unclaimed_strict_workflow_run_on_error() as strict_run,
+            app.DATABASE.workflow_runs.Session() as outer_session,
+        ):
             if workflow is None:
                 workflow = await self.resolve_workflow_for_run(
                     workflow_permanent_id=workflow_permanent_id,
@@ -4328,6 +4349,13 @@ class WorkflowService:
             if reject_empty_workflow and not workflow.workflow_definition.blocks:
                 raise WorkflowHasNoBlocks(workflow_permanent_id=workflow_permanent_id)
             workflow_id = workflow.workflow_id
+            if parent_workflow_run_id is not None and workflow_request.otp_request_id is None:
+                parent_workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    parent_workflow_run_id,
+                    organization_id=organization.organization_id,
+                )
+                if parent_workflow_run is not None:
+                    workflow_request.otp_request_id = parent_workflow_run.otp_request_id
             if workflow_request.proxy_location is None and workflow.proxy_location is not None:
                 workflow_request.proxy_location = workflow.proxy_location
             if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
@@ -4379,6 +4407,40 @@ class WorkflowService:
                     workflow_request.browser_session_id or workflow_request.browser_address
                 ):
                     workflow_request.browser_type = read_browser_type(workflow)
+
+            # Strict OTP runs are admitted only onto the fresh local worker-owned browser lane. Resolve inherited
+            # marker and browser policy first so internal children and workflow defaults cannot persist a guarded
+            # owner that will deterministically fail after dispatch.
+            unsupported_strict_resources: list[str] = []
+            if workflow_request.otp_request_id is not None:
+                strict_starts_fresh = resolve_start_fresh(
+                    workflow_request.start_fresh_browser,
+                    explicit_request_browser_profile_id,
+                )
+                if strict_starts_fresh and explicit_request_browser_profile_id is None:
+                    # The workflow-level profile was copied only for legacy seed selection. Fresh mode outranks
+                    # that default and persists no profile, matching _resolve_run_seed's fresh source/sink policy.
+                    workflow_request.browser_profile_id = None
+                unsupported_strict_resources.extend(
+                    field
+                    for field in ("browser_session_id", "browser_profile_id", "browser_address", "browser_type")
+                    if getattr(workflow_request, field) is not None
+                )
+                if should_acquire_reused_session(
+                    browser_session_id=workflow_request.browser_session_id,
+                    start_fresh_browser=workflow_request.start_fresh_browser,
+                    run_override=workflow_request.reuse_browser_session,
+                    workflow_default=workflow.reuse_browser_session,
+                ):
+                    unsupported_strict_resources.append("reuse_browser_session")
+                if workflow.persist_browser_session and not strict_starts_fresh:
+                    unsupported_strict_resources.append("persist_browser_session")
+            if unsupported_strict_resources:
+                raise SkyvernHTTPException(
+                    "Strict OTP runs require a fresh local worker-owned browser; unsupported resource fields: "
+                    + ", ".join(unsupported_strict_resources),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
 
             # Force ai_fallback=True for adaptive caching (code_version >= 2) runs.
             # Adaptive caching requires AI fallback to self-heal when cached scripts break.
@@ -4437,6 +4499,19 @@ class WorkflowService:
                     )
                     raise
 
+            # Older cloud API processes do not know about otp_request_id, but they already refuse
+            # retrying any run whose tri-state code_gen value is non-null. Persist False on strict
+            # roots as a rollout sentinel so those processes stop before reconstructing an unmarked
+            # retry; current processes recognize this exact shape as an ordinary strict root.
+            effective_code_gen = code_gen
+            if (
+                workflow_request.otp_request_id is not None
+                and parent_workflow_run_id is None
+                and debug_session_id is None
+                and code_gen is None
+            ):
+                effective_code_gen = False
+
             # Create the workflow run and set skyvern context
             workflow_run = await self.create_workflow_run(
                 workflow_request=workflow_request,
@@ -4451,7 +4526,7 @@ class WorkflowService:
                 if workflow_request.max_elapsed_time_minutes is not None
                 else workflow.max_elapsed_time_minutes,
                 debug_session_id=debug_session_id,
-                code_gen=code_gen,
+                code_gen=effective_code_gen,
                 workflow_run_id=workflow_run_id,
                 trigger_type=resolved_trigger_type,
                 workflow_schedule_id=workflow_schedule_id,
@@ -4464,6 +4539,8 @@ class WorkflowService:
                 block_scoped=block_scoped,
                 created_by=created_by,
             )
+            if workflow_run.otp_request_id is not None:
+                strict_run.workflow_run_id = workflow_run.workflow_run_id
             try:
                 await self._apply_initial_run_metadata_tags(
                     workflow_run=workflow_run,
@@ -4492,7 +4569,7 @@ class WorkflowService:
                 max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
                 ai_fallback=workflow_request.ai_fallback,
                 run_with=workflow_request.run_with,
-                code_gen=code_gen,
+                code_gen=effective_code_gen,
             )
             if parent_workflow_run_id is None and retried_from_workflow_run_id is None:
                 try:
@@ -4528,6 +4605,7 @@ class WorkflowService:
                     request_id=request_id,
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
+                    otp_request_id=workflow_run.otp_request_id,
                     root_workflow_run_id=root_workflow_run_id,
                     requested_by=resolved_requested_by,
                     run_id=current_run_id,
@@ -6043,6 +6121,9 @@ class WorkflowService:
         human_interaction_blocks = [block for block in blocks if block.block_type == BlockType.HUMAN_INTERACTION]
 
         if human_interaction_blocks:
+            context = skyvern_context.current()
+            if context is not None and context.otp_request_id is not None:
+                raise SkyvernException("Strict OTP workflow cannot provision a human interaction browser session")
             timeouts = [getattr(block, "timeout_seconds", 60 * 60) for block in human_interaction_blocks]
             timeout_seconds = sum(timeouts) + 60 * 60
 
@@ -7428,6 +7509,7 @@ class WorkflowService:
         initialize_attempt: Callable[[str | None], Awaitable[str | None]] | None = None,
         on_execution_authority: Callable[[int, datetime | None], None] | None = None,
         on_finalization_denied: Callable[[], None] | None = None,
+        credential_profile_finalizer: CredentialProfileFinalizer | None = None,
     ) -> WorkflowRun:
         """Run a workflow and keep the caller's concurrency slot through retry finalization.
 
@@ -7494,6 +7576,8 @@ class WorkflowService:
                     "on_execution_authority": report_authority,
                     "on_finalization_denied": deny_finalization,
                 }
+            if credential_profile_finalizer is not None:
+                dispatch_kwargs["credential_profile_finalizer"] = credential_profile_finalizer
             return await self.execute_workflow(
                 workflow_run_id=workflow_run_id,
                 api_key=api_key,
@@ -7590,6 +7674,11 @@ class WorkflowService:
                         if not workflow_run.status.is_final():
                             return workflow_run
                     else:
+                        capture_kwargs: dict[str, Any] = (
+                            {"credential_profile_finalizer": credential_profile_finalizer}
+                            if credential_profile_finalizer is not None
+                            else {}
+                        )
                         workflow_run = await self.execute_workflow(
                             workflow_run_id=workflow_run_id,
                             api_key=api_key,
@@ -7604,6 +7693,7 @@ class WorkflowService:
                             dispatch_claim_started_at=dispatch_claim_started_at,
                             on_execution_authority=report_authority,
                             on_finalization_denied=deny_finalization,
+                            **capture_kwargs,
                         )
                 except asyncio.CancelledError as error:
                     if BROWSER_RETIREMENT_DENIED_NOTE in getattr(error, "__notes__", ()):
@@ -7814,6 +7904,7 @@ class WorkflowService:
         *,
         on_execution_authority: Callable[[int, datetime | None], None] | None = None,
         on_finalization_denied: Callable[[], None] | None = None,
+        credential_profile_finalizer: CredentialProfileFinalizer | None = None,
     ) -> WorkflowRun:
         if on_execution_authority is not None:
             on_execution_authority(attempt_number, dispatch_claim_started_at)
@@ -7836,6 +7927,7 @@ class WorkflowService:
                     attempt_number=attempt_number,
                     dispatch_claim_started_at=dispatch_claim_started_at,
                     on_finalization_denied=on_finalization_denied,
+                    credential_profile_finalizer=credential_profile_finalizer,
                 )
             except BaseException as error:
                 if isinstance(error, WorkflowAttemptDispatchSuperseded) or BROWSER_RETIREMENT_DENIED_NOTE in getattr(
@@ -7959,6 +8051,7 @@ class WorkflowService:
         dispatch_claim_started_at: datetime | None = None,
         *,
         on_finalization_denied: Callable[[], None] | None = None,
+        credential_profile_finalizer: CredentialProfileFinalizer | None = None,
     ) -> WorkflowRun:
         """Execute a workflow.
 
@@ -9118,6 +9211,13 @@ class WorkflowService:
                             if current_workflow_run.status.is_final():
                                 browser_persistence_status = current_workflow_run.status
                                 break
+                            if credential_profile_finalizer is not None and _owned_credential_capture(
+                                browser_cleanup_result,
+                                browser_session_id or owned_browser_session_id or workflow_run.browser_session_id,
+                            ):
+                                # The untyped fallback can see the session as soon as completion is durable.
+                                # Let final cleanup save this known capture before exposing that session.
+                                break
                             async with asyncio.timeout(BROWSER_SESSION_WRITE_BACK_TIMEOUT):
                                 await self._persist_workflow_browser_session_if_needed(
                                     workflow=workflow,
@@ -9125,6 +9225,7 @@ class WorkflowService:
                                     browser_state=browser_cleanup_result.browser_state,
                                     close_browser_on_completion=browser_cleanup_result.close_browser_on_completion,
                                     workflow_run_status=browser_persistence_status,
+                                    first_credential_save=credential_profile_finalizer is not None,
                                 )
                             # Only suppress clean_up_workflow's write-back once this one has
                             # actually persisted.
@@ -9292,6 +9393,7 @@ class WorkflowService:
                 stream_tombstone=stream_tombstone,
                 final_diagnostic_owner=final_diagnostic_owner,
                 before_finally=before_finally,
+                credential_profile_finalizer=credential_profile_finalizer,
             )
 
         return workflow_run
@@ -13562,6 +13664,7 @@ class WorkflowService:
         error_code: str | None = None,
         created_at_start: datetime | None = None,
         created_at_end: datetime | None = None,
+        project_status_for_reads: bool = False,
     ) -> list[WorkflowRun]:
         workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs(
             organization_id=organization_id,
@@ -13573,6 +13676,7 @@ class WorkflowService:
             error_code=error_code,
             created_at_start=created_at_start,
             created_at_end=created_at_end,
+            project_status_for_reads=project_status_for_reads,
         )
         return await self._attach_latest_attempt_views(workflow_runs)
 
@@ -13602,10 +13706,12 @@ class WorkflowService:
         self,
         organization_id: str,
         status: list[WorkflowRunStatus] | None = None,
+        project_status_for_reads: bool = False,
     ) -> int:
         return await app.DATABASE.workflow_runs.get_workflow_runs_count(
             organization_id=organization_id,
             status=status,
+            project_status_for_reads=project_status_for_reads,
         )
 
     async def get_workflow_runs_for_workflow_permanent_id(
@@ -13621,6 +13727,7 @@ class WorkflowService:
         created_at_start: datetime | None = None,
         created_at_end: datetime | None = None,
         run_tags: Sequence[tuple[str | None, str | None]] | None = None,
+        project_status_for_reads: bool = False,
     ) -> list[WorkflowRun]:
         workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
@@ -13634,6 +13741,7 @@ class WorkflowService:
             created_at_start=created_at_start,
             created_at_end=created_at_end,
             run_tags=run_tags,
+            project_status_for_reads=project_status_for_reads,
         )
         return await self._attach_latest_attempt_views(workflow_runs)
 
@@ -13783,6 +13891,7 @@ class WorkflowService:
                     webhook_callback_url=workflow_request.webhook_callback_url,
                     totp_verification_url=workflow_request.totp_verification_url,
                     totp_identifier=workflow_request.totp_identifier,
+                    otp_request_id=workflow_request.otp_request_id,
                     parent_workflow_run_id=parent_workflow_run_id,
                     max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
                     max_elapsed_time_minutes=max_elapsed_time_minutes,
@@ -13853,6 +13962,7 @@ class WorkflowService:
             webhook_callback_url=workflow_request.webhook_callback_url,
             totp_verification_url=workflow_request.totp_verification_url,
             totp_identifier=workflow_request.totp_identifier,
+            otp_request_id=workflow_request.otp_request_id,
             parent_workflow_run_id=parent_workflow_run_id,
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
             max_elapsed_time_minutes=max_elapsed_time_minutes,
@@ -13954,7 +14064,11 @@ class WorkflowService:
                         created_for_workflow_run_id=workflow_run.workflow_run_id,
                         workflow_permanent_id=workflow_permanent_id,
                     )
-            except (WorkflowAttemptDispatchSuperseded, BrowserSessionCreditAdmissionRefusal):
+            except (
+                WorkflowAttemptDispatchSuperseded,
+                BrowserSessionCreditAdmissionRefusal,
+                BrowserProfilePreflightError,
+            ):
                 raise
             except Exception as error:
                 if BROWSER_RETIREMENT_DENIED_NOTE in getattr(
@@ -15091,6 +15205,7 @@ class WorkflowService:
         only_from: Sequence[WorkflowRunStatus] | None = None,
         worker_container_restarted: bool = False,
         require_latest_attempt_number: int | None = None,
+        require_job_id_unset: bool = False,
         _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun | None:
         """:meth:`_update_workflow_run_status` for writers that must lose a race against the
@@ -15107,6 +15222,7 @@ class WorkflowService:
             failure_category=failure_category,
             only_from=only_from,
             require_latest_attempt_number=require_latest_attempt_number,
+            require_job_id_unset=require_job_id_unset,
             **_internal_cancel_proof(workflow_run_id, execution),
         )
         if workflow_run is None:
@@ -15845,6 +15961,7 @@ class WorkflowService:
         only_from: Sequence[WorkflowRunStatus] | None = None,
         worker_container_restarted: bool = False,
         require_latest_attempt_number: int | None = None,
+        require_job_id_unset: bool = False,
         _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun | None:
         """Conditional failure finalize that no-ops when the run has already reached a terminal
@@ -15866,6 +15983,7 @@ class WorkflowService:
             failure_category=failure_category,
             only_from=only_from,
             require_latest_attempt_number=require_latest_attempt_number,
+            require_job_id_unset=require_job_id_unset,
             worker_container_restarted=worker_container_restarted,
             _on_terminal_write=_on_terminal_write,
         )
@@ -16366,7 +16484,9 @@ class WorkflowService:
         output_parameters_by_id = {
             output_parameter.output_parameter_id: output_parameter for output_parameter in output_parameters
         }
-        if workflow is not None:
+        if workflow is not None and any(
+            row.output_parameter_id not in output_parameters_by_id for row in workflow_run_output_parameters
+        ):
             for parameter in workflow.workflow_definition.parameters:
                 if isinstance(parameter, OutputParameter):
                     output_parameters_by_id.setdefault(parameter.output_parameter_id, parameter)
@@ -17122,7 +17242,7 @@ class WorkflowService:
         response = WorkflowRunResponseBase(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
-            status=workflow_run.status,
+            status=workflow_run.status_for_reads,
             attempt=attempt_view.attempt,
             retry_pending=attempt_view.retry_pending,
             next_attempt_at=attempt_view.next_attempt_at,
@@ -17251,6 +17371,8 @@ class WorkflowService:
         browser_state: BrowserState | None,
         close_browser_on_completion: bool,
         workflow_run_status: WorkflowRunStatus | None = None,
+        *,
+        first_credential_save: bool = False,
     ) -> None:
         effective_workflow_run_status = workflow_run_status or workflow_run.status
 
@@ -17288,6 +17410,7 @@ class WorkflowService:
                 browser_state=browser_state,
                 close_browser_on_completion=close_browser_on_completion,
                 effective_workflow_run_status=effective_workflow_run_status,
+                first_credential_save=first_credential_save,
             )
             await self._materialize_own_profile_pick_if_needed(
                 workflow=workflow,
@@ -17328,7 +17451,11 @@ class WorkflowService:
                     browser_state.browser_context,
                     browser_state.browser_artifacts.browser_session_dir,
                 )
-            await app.STORAGE.store_browser_profile(
+            storage = app.STORAGE
+            store_profile = storage.store_browser_profile
+            if first_credential_save and isinstance(storage, S3Storage):
+                store_profile = partial(storage.store_browser_profile, strict_traversal=True)
+            await store_profile(
                 workflow_run.organization_id,
                 profile_id=browser_profile.browser_profile_id,
                 directory=browser_state.browser_artifacts.browser_session_dir,
@@ -17359,7 +17486,12 @@ class WorkflowService:
                     browser_state.browser_context,
                     browser_state.browser_artifacts.browser_session_dir,
                 )
-            await app.STORAGE.store_browser_session(
+            storage = app.STORAGE
+            store_session = storage.store_browser_session
+            if first_credential_save and isinstance(storage, S3Storage):
+                # This archive can become a new credential profile. Reject incomplete source captures.
+                store_session = partial(storage.store_browser_session, strict_traversal=True)
+            await store_session(
                 workflow_run.organization_id,
                 browser_session_storage_key,
                 browser_state.browser_artifacts.browser_session_dir,
@@ -17377,6 +17509,7 @@ class WorkflowService:
         browser_state: BrowserState | None,
         close_browser_on_completion: bool,
         effective_workflow_run_status: WorkflowRunStatus,
+        first_credential_save: bool = False,
     ) -> None:
         """Engine-era workflow write-back: whole-dir persist the run's RESOLVED sink profile
         (workflow_run.browser_sink_profile_id — the picked plain profile with save on, or the workflow's
@@ -17480,7 +17613,11 @@ class WorkflowService:
                 browser_profile_id=sink_profile_id,
                 exc_info=True,
             )
-        await app.STORAGE.store_browser_profile(
+        storage = app.STORAGE
+        store_profile = storage.store_browser_profile
+        if first_credential_save and isinstance(storage, S3Storage):
+            store_profile = partial(storage.store_browser_profile, strict_traversal=True)
+        await store_profile(
             workflow_run.organization_id,
             profile_id=sink_profile_id,
             directory=browser_state.browser_artifacts.browser_session_dir,
@@ -17630,6 +17767,7 @@ class WorkflowService:
         # The snapshot this run's own terminal write returned; without one the optional diagnostic is skipped.
         final_diagnostic_owner: WorkflowRun | None = None,
         before_finally: FailureBeforeFinally | None = None,
+        credential_profile_finalizer: CredentialProfileFinalizer | None = None,
     ) -> None:
         # Direct cleanup callers can enter with a terminal row. When browser cleanup is still
         # pending, install the tombstone before the first awaited terminal hook. A pre-finalization
@@ -17747,8 +17885,26 @@ class WorkflowService:
         child_workflow_run_ids = browser_cleanup_result.child_workflow_run_ids
         close_browser_on_completion = browser_cleanup_result.close_browser_on_completion
         har_evidence = HarEvidence.unavailable(HarEvidenceAvailability.not_collected)
+        capture_cancellation: asyncio.CancelledError | None = None
         try:
             if browser_state:
+                if (
+                    credential_profile_finalizer is not None
+                    and final_diagnostic_owner is not None
+                    and final_diagnostic_owner.status == WorkflowRunStatus.completed
+                    and workflow_run.status == WorkflowRunStatus.completed
+                    and (
+                        capture := _owned_credential_capture(
+                            browser_cleanup_result,
+                            browser_session_id or owned_browser_session_id or workflow_run.browser_session_id,
+                        )
+                    )
+                    is not None
+                ):
+                    try:
+                        await credential_profile_finalizer(capture)
+                    except asyncio.CancelledError as exc:
+                        capture_cancellation = exc
                 await self.persist_video_data(
                     browser_state, workflow, workflow_run, close_browser_on_completion=close_browser_on_completion
                 )
@@ -17767,13 +17923,23 @@ class WorkflowService:
                     not browser_cleanup_result.browser_session_write_back_attempted
                     and not skip_browser_session_write_back
                 ):
-                    await self._persist_workflow_browser_session_if_needed(
-                        workflow=workflow,
-                        workflow_run=workflow_run,
-                        browser_state=browser_state,
-                        close_browser_on_completion=close_browser_on_completion,
-                        workflow_run_status=browser_persistence_status,
-                    )
+                    try:
+                        await self._persist_workflow_browser_session_if_needed(
+                            workflow=workflow,
+                            workflow_run=workflow_run,
+                            browser_state=browser_state,
+                            close_browser_on_completion=close_browser_on_completion,
+                            workflow_run_status=browser_persistence_status,
+                            first_credential_save=credential_profile_finalizer is not None,
+                        )
+                    except (OSError, ValueError):
+                        if credential_profile_finalizer is None or not isinstance(app.STORAGE, S3Storage):
+                            raise
+                        LOG.warning(
+                            "Credential first-save fallback archive could not be persisted",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            exc_info=True,
+                        )
 
             # The retry decision above already read this run; the webhook below re-reads it from the database.
             try:
@@ -17900,6 +18066,8 @@ class WorkflowService:
                     browser_session_id=owned_browser_session_id,
                     child_workflow_run_ids=child_workflow_run_ids,
                 )
+            if capture_cancellation is not None:
+                raise capture_cancellation
         if caller_cancelled:
             raise asyncio.CancelledError
 

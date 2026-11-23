@@ -18,6 +18,8 @@ export interface TotpCodeCreate {
     workflow_id?: string;
     /** The workflow run id that the TOTP code is for. It can be the workflow run id of the workflow run that the TOTP code is for. */
     workflow_run_id?: string;
+    /** Explicit request marker for strict run-bound OTP delivery. When present, only the exact bound run may claim this code. */
+    otp_request_id?: string;
     /** An optional field. The source of the TOTP code. e.g. email, sms, etc. */
     source?: string;
     /** The content of the TOTP code. It can be the email content that contains the TOTP code, or the sms message that contains the TOTP code. Skyvern will automatically extract the TOTP code from the content. */

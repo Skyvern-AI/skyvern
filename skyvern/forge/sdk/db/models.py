@@ -22,7 +22,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncAttrs
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, deferred
+from sqlalchemy.sql.functions import FunctionElement
 
 from skyvern.forge.sdk.db._soft_delete import SoftDeleteMixin
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
@@ -140,6 +142,7 @@ class TaskModel(Base):
     webhook_failure_reason = Column(String, nullable=True)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
+    otp_request_id = Column(String, nullable=True)
     title = Column(String)
     task_type = Column(String, default=TaskType.general)
     url = Column(String)
@@ -1029,6 +1032,7 @@ class WorkflowRunModel(Base):
     webhook_delivery_finalized_at = Column(DateTime, nullable=True)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
+    otp_request_id = Column(String, nullable=True)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     max_elapsed_time_minutes = Column(Integer, nullable=True)
     browser_runtime = Column(String, nullable=True)
@@ -1474,11 +1478,61 @@ class AISuggestionModel(Base):
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
+class _StrictOTPCodeIndexKey(FunctionElement):
+    inherit_cache = True
+    name = "strict_otp_code_index_key"
+
+
+@compiles(_StrictOTPCodeIndexKey, "postgresql")
+def _compile_strict_otp_code_index_key_postgresql(element: FunctionElement, compiler: object, **kw: object) -> str:
+    code = next(iter(element.clauses))
+    return f"skyvern_sha256_text_utf8({compiler.process(code, **kw)})"  # type: ignore[attr-defined]
+
+
+@compiles(_StrictOTPCodeIndexKey)
+def _compile_strict_otp_code_index_key_default(element: FunctionElement, compiler: object, **kw: object) -> str:
+    return compiler.process(next(iter(element.clauses)), **kw)  # type: ignore[attr-defined,no-any-return]
+
+
 class TOTPCodeModel(Base):
     __tablename__ = "totp_codes"
     __table_args__ = (
         Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),
         Index("ix_totp_codes_otp_type", "organization_id", "otp_type"),
+        Index(
+            "ix_totp_codes_strict_claim",
+            "organization_id",
+            "otp_request_id",
+            "totp_identifier",
+            "created_at",
+            postgresql_where=text("otp_request_id IS NOT NULL AND claimed_at IS NULL"),
+            sqlite_where=text("otp_request_id IS NOT NULL AND claimed_at IS NULL"),
+        ),
+        Index(
+            "uq_totp_codes_strict_code",
+            "organization_id",
+            "otp_request_id",
+            "totp_identifier",
+            _StrictOTPCodeIndexKey(sqlalchemy.column("code")),
+            unique=True,
+            postgresql_where=text("otp_request_id IS NOT NULL AND code IS NOT NULL"),
+            sqlite_where=text("otp_request_id IS NOT NULL AND code IS NOT NULL"),
+        ),
+        Index(
+            "uq_totp_codes_strict_webhook_code",
+            "organization_id",
+            "otp_request_id",
+            _StrictOTPCodeIndexKey(sqlalchemy.column("code")),
+            unique=True,
+            postgresql_where=text(
+                "otp_request_id IS NOT NULL AND totp_identifier IS NULL "
+                "AND source = 'verification_url' AND code IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "otp_request_id IS NOT NULL AND totp_identifier IS NULL "
+                "AND source = 'verification_url' AND code IS NOT NULL"
+            ),
+        ),
         Index(
             "uq_totp_codes_org_external_message_id",
             "organization_id",
@@ -1490,11 +1544,19 @@ class TOTPCodeModel(Base):
     )
 
     totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
-    totp_identifier = Column(String, nullable=False, index=True)
+    # External pushed deliveries always carry an identifier. Strict verification-URL
+    # responses use the explicit request marker as their source scope and therefore do
+    # not fabricate an email/phone identifier.
+    totp_identifier = Column(String, nullable=True, index=True)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     task_id = Column(String, ForeignKey("tasks.task_id"))
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"))
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
+    otp_request_id = Column(String, nullable=True)
+    claimed_by_task_id = Column(String, nullable=True)
+    claimed_by_workflow_run_id = Column(String, nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
+    rejected_at = Column(DateTime, nullable=True)
     content = Column(String, nullable=False)
     code = Column(String)
     source = Column(String)
@@ -1504,6 +1566,88 @@ class TOTPCodeModel(Base):
     expired_at = Column(DateTime, index=True)
     otp_type = Column(String, server_default=sqlalchemy.text("'totp'"))
     parse_status = Column(String, nullable=False, server_default=sqlalchemy.text("'parsed'"))
+
+
+class OTPRequestBindingModel(Base):
+    """Durable original owner and strict browser lifecycle receipt for one marker."""
+
+    __tablename__ = "otp_request_bindings"
+    __table_args__ = (
+        CheckConstraint(
+            "(owner_type = 'task' AND owner_task_id IS NOT NULL AND owner_workflow_run_id IS NULL) OR "
+            "(owner_type = 'workflow_run' AND owner_task_id IS NULL AND owner_workflow_run_id IS NOT NULL)",
+            name="ck_otp_request_bindings_single_owner",
+        ),
+    )
+
+    organization_id = Column(
+        String,
+        ForeignKey("organizations.organization_id"),
+        primary_key=True,
+        nullable=False,
+    )
+    otp_request_id = Column(String, primary_key=True, nullable=False)
+    owner_type = Column(String, nullable=False)
+    owner_task_id = Column(String, ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=True)
+    owner_workflow_run_id = Column(
+        String,
+        ForeignKey("workflow_runs.workflow_run_id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    owner_store = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class OTPRequestAcquisitionModel(Base):
+    """One immutable strict browser acquisition attempt beneath an OTP binding."""
+
+    __tablename__ = "otp_request_acquisitions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "otp_request_id"],
+            ["otp_request_bindings.organization_id", "otp_request_bindings.otp_request_id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "otp_request_id",
+            "execution_owner_type",
+            "execution_owner_id",
+            "execution_attempt",
+            name="uq_otp_request_acquisitions_attempt",
+        ),
+    )
+
+    acquisition_id = Column(String, primary_key=True)
+    organization_id = Column(String, nullable=False)
+    otp_request_id = Column(String, nullable=False)
+    execution_owner_type = Column(String, nullable=False)
+    execution_owner_id = Column(String, nullable=False)
+    execution_attempt = Column(String, nullable=False)
+    browser_type = Column(String, nullable=True)
+    browser_engine = Column(String, nullable=True)
+    worker_pid = Column(Integer, nullable=False)
+    worker_process_started_at = Column(String, nullable=False)
+    pod_uid = Column(String, nullable=True)
+    container_identity = Column(String, nullable=True)
+    lifecycle_state = Column(String, nullable=False, default="sealed", server_default="sealed")
+    acquisition_sealed_at = Column(DateTime, nullable=False)
+    stop_started_at = Column(DateTime, nullable=True)
+    stop_confirmed_at = Column(DateTime, nullable=True)
+    failure_reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
 
 
 class OrganizationEmailConfigModel(Base):
@@ -1745,6 +1889,7 @@ class TaskV2Model(Base):
     webhook_failure_reason = Column(String, nullable=True)
     totp_verification_url = Column(String, nullable=True)
     totp_identifier = Column(String, nullable=True)
+    otp_request_id = Column(String, nullable=True)
     proxy_location = Column(String, nullable=True)
     extracted_information_schema = Column(JSON, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)

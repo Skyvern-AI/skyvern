@@ -839,6 +839,9 @@ class DemonstrationRecorder:
         return "event_limit" if self.tap.event_limit_reached else None
 
     async def _record_tap_event(self, event: TapEvent) -> None:
+        # A page can focus a field on its own in a tab the user is not in; that is not a tab switch.
+        if event.payload.get("unprompted") and event.page is not self.event_page:
+            return
         if event.page is not self.event_page:
             if self.event_page is not None:
                 await self._record_tab_switch(event.page, _tab_event_url(event))
@@ -888,7 +891,13 @@ class DemonstrationRecorder:
         if kind == "freeform_drag" or (kind == "drag" and not event.is_main_frame):
             await self._record_gap_event(event, frame, "freeform_drag", label="Drag not recorded")
             return
-        if event_kind not in {"click", "type", "select", "key", "navigate", "secret", "drag"}:
+        if kind == "reveal_check_skipped":
+            await self._record_gap_event(event, frame, "reveal_check_skipped", label="Reveal check skipped")
+            return
+        if kind == "reveal_gap":
+            await self._record_gap_event(event, frame, "reveal_unattributed", label="Reveal not attributed")
+            return
+        if event_kind not in {"click", "type", "select", "key", "navigate", "secret", "drag", "hover"}:
             await self._record_gap_event(event, frame, f"unsupported_event:{kind or 'unknown'}")
             return
         source_url = str(payload.get("url") or "") if event.is_main_frame else str(event.page.url or "")
@@ -957,6 +966,7 @@ class DemonstrationRecorder:
                         "key": "press_key",
                         "navigate": "navigate_browser",
                         "drag": "drag",
+                        "hover": "hover",
                     }[event_kind],
                 }
             )
@@ -1425,6 +1435,8 @@ def _event_label(event: dict[str, Any]) -> str:
         source = _target_label(event.get("packet"), max_name=20)
         target = _target_label(event.get("target_packet"), max_name=20)
         return f"Drag {source} to {target}"[:60]
+    if kind == "hover":
+        return f"Hover {_target_label(event.get('packet'))}"[:60]
     if kind == "type":
         value = event.get("value")
         text = redact_raw_secrets_for_prompt(value) if isinstance(value, str) else ""

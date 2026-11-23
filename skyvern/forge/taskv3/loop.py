@@ -820,6 +820,12 @@ _JUSTIFY_HOLD_SKIP = "queued after a finish that was held; read the hold above, 
 FILE_LANDED_HOLD_MESSAGE = (
     "verdict held once: these files landed in this block:\n{landed}\nFinish again; that verdict will stand."
 )
+# A failed save the unsaved-download hold counts: every reason but a limit refusal, as unsaved_downloads_since does.
+_UNSAVED_DOWNLOAD_FACT_RE = re.compile(r"Browser download not saved \((?![a-z_]*_limit\))")
+UNSEEN_DOWNLOAD_FACTS_HOLD_MESSAGE = (
+    "verdict held once: no file has landed in this block, and these download results were not shown to you yet:\n"
+    "{facts}\nFinish again; that verdict will stand."
+)
 UNSAVED_DOWNLOAD_HOLD_MESSAGE = (
     "verdict held once: no new file has landed in this block, and downloads the browser did not save were recorded "
     "during this block ({unsaved}). If the goal needs the file, retry it; otherwise finish again; that verdict stands."
@@ -3071,6 +3077,7 @@ def make_finish_tool(
     justify_stops: bool = False,
     file_landed_hold: bool = False,
     unsaved_downloads: UnsavedDownloads | None = None,
+    hold_completed_on_landed_file: bool = False,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -3134,6 +3141,8 @@ def make_finish_tool(
     `file_landed_hold` settles `download_settle` before a failed or terminated verdict and, when a file landed in the
     block, hands that verdict back once per run naming the landed files, ahead of the justification hold. With
     `unsaved_downloads` it also hands a completed verdict with no file landed back once per run, naming them.
+    `hold_completed_on_landed_file` holds a completed verdict the same way, for a block whose start URL was a file
+    the model never saw land.
     """
     error_code_mapping = _offered_error_codes(error_code_mapping)
     deferrals = 0
@@ -3157,6 +3166,7 @@ def make_finish_tool(
     # Spent by the first verdict the justification hold could apply to, held or not.
     justify_spent = False
     file_landed_held = False
+    unseen_facts_checked = False
     unsaved_held = False
     held_reason_key: str | None = None
 
@@ -3447,7 +3457,7 @@ def make_finish_tool(
         nonlocal deferrals, stale_holds, failure_deferrals, reask_asked, premise_checks
         nonlocal submission_hold_turn, submission_hold_message
         nonlocal retry_offered, retry_would_offer, retry_granted_on
-        nonlocal justify_spent, held_reason_key, file_landed_held, unsaved_held
+        nonlocal justify_spent, held_reason_key, file_landed_held, unsaved_held, unseen_facts_checked
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -3725,16 +3735,25 @@ def make_finish_tool(
             except Exception:
                 return False
 
-        if file_landed_hold and download_settle is not None and status != "completed":
+        if (
+            file_landed_hold
+            and download_settle is not None
+            and (status != "completed" or (hold_completed_on_landed_file and not file_landed_held))
+        ):
             started = time.monotonic()
             try:
                 landed = await download_settle(frozenset(staged_downloads or ()))
             except Exception:
-                LOG.warning("taskv3 download settle failed on a non-completed finish", exc_info=True)
+                LOG.warning("taskv3 download settle failed on a held finish", exc_info=True)
                 landed = None
             if await _canceled_during_settle():
                 return ToolResult.error("the run was canceled while the verdict was being checked.")
-            hand_back = not file_landed_held and bool(landed) and _verdict_turn_left()
+            # A completed verdict on a start URL's file is never final unseen; with no turn left the budget ends the run.
+            hand_back = (
+                not file_landed_held
+                and bool(landed)
+                and (_verdict_turn_left() or (hold_completed_on_landed_file and status == "completed"))
+            )
             LOG.info(
                 "taskv3 finish on a download block",
                 status=status,
@@ -3754,6 +3773,32 @@ def make_finish_tool(
                 return ToolResult.error(
                     FILE_LANDED_HOLD_MESSAGE.format(landed=shown), {"stop_batch": _JUSTIFY_HOLD_SKIP}
                 )
+            if (
+                hold_completed_on_landed_file
+                and status == "completed"
+                and not landed
+                and not unseen_facts_checked
+                and download_facts is not None
+            ):
+                # Once per run: a first-call finish never received the download facts a wrapped tool would have shown.
+                unseen_facts_checked = True
+                if download_facts.attach is not None:
+                    await download_facts.attach()
+                held = download_facts.held_candidates() if download_facts.held_candidates is not None else {}
+                candidate_lines = set(held.values())
+                drained = download_facts.deliver()
+                unseen = [line for line in drained if line not in candidate_lines]
+                # A held candidate this call drained stays undelivered: the candidate offer below asks about it once.
+                download_facts.delivered -= candidate_lines.intersection(drained)
+                if unseen:
+                    justify_spent = True
+                    # The unsaved-download hold would hold again for a failed save this one just showed.
+                    if any(_UNSAVED_DOWNLOAD_FACT_RE.match(line) for line in unseen):
+                        unsaved_held = True
+                    return ToolResult.error(
+                        UNSEEN_DOWNLOAD_FACTS_HOLD_MESSAGE.format(facts="\n".join(unseen)),
+                        {"stop_batch": _JUSTIFY_HOLD_SKIP},
+                    )
         if justify_stops and activity is not None and status in ("failed", "terminated"):
             reason = str(args.get("reason") or "")
             if not justify_spent and status == "terminated":

@@ -186,6 +186,7 @@ class TestResolveOtpValuePlaceholderFallthrough:
         credential-backed TOTP instead of being returned as an inline verification code."""
         task = SimpleNamespace(
             task_id="tsk_test",
+            otp_request_id=None,
             workflow_run_id="wr_test",
             organization_id="o_test",
             totp_verification_url="https://example.com/webhook",
@@ -233,6 +234,7 @@ class TestResolveOtpValuePlaceholderFallthrough:
 
         task = SimpleNamespace(
             task_id="tsk_test",
+            otp_request_id=None,
             url="https://example.com/login",
             workflow_run_id="wr_test",
             organization_id="o_test",
@@ -272,6 +274,7 @@ class TestResolveOtpValuePlaceholderFallthrough:
 
         task = SimpleNamespace(
             task_id="tsk_test",
+            otp_request_id=None,
             url="https://example.com/login",
             workflow_run_id="wr_test",
             organization_id="o_test",
@@ -298,6 +301,7 @@ class TestResolveOtpValueExpectedOtpTypeGating:
     def _task() -> SimpleNamespace:
         return SimpleNamespace(
             task_id="tsk_test",
+            otp_request_id=None,
             url="https://example.com/login",
             workflow_run_id=None,
             organization_id="o_test",
@@ -1666,6 +1670,7 @@ class TestPollOtpValueRetry:
         assert mock_fetch.call_count == 3
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("otp_request_id", [None, "otpr_test"])
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_email", new_callable=AsyncMock)
@@ -1676,6 +1681,7 @@ class TestPollOtpValueRetry:
         mock_email: AsyncMock,
         mock_db: AsyncMock,
         mock_sleep: AsyncMock,
+        otp_request_id: str | None,
     ) -> None:
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
         mock_email.return_value = None
@@ -1688,18 +1694,24 @@ class TestPollOtpValueRetry:
             workflow_id="w_test",
             workflow_run_id="wr_test",
             workflow_permanent_id="wpid_test",
+            otp_request_id=otp_request_id,
             totp_identifier="otp@example.test",
             expected_otp_type=OTPType.MAGIC_LINK,
         )
 
         assert result == otp
-        mock_email.assert_awaited_once()
+        if otp_request_id is None:
+            mock_email.assert_awaited_once()
+        else:
+            mock_email.assert_not_awaited()
         mock_db.assert_awaited_once()
-        assert mock_email.await_args is not None
         assert mock_db.await_args is not None
-        assert mock_email.await_args.kwargs["workflow_id"] == "w_test"
-        assert mock_email.await_args.kwargs["expected_otp_type"] == OTPType.MAGIC_LINK
+        assert mock_db.await_args.kwargs["otp_request_id"] == otp_request_id
         assert mock_db.await_args.kwargs["workflow_id"] == "w_test"
+        if otp_request_id is None:
+            assert mock_email.await_args is not None
+            assert mock_email.await_args.kwargs["workflow_id"] == "w_test"
+            assert mock_email.await_args.kwargs["expected_otp_type"] == OTPType.MAGIC_LINK
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
@@ -1708,6 +1720,7 @@ class TestPollOtpValueRetry:
     @patch("skyvern.services.otp_service._get_otp_value_from_email", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service.app")
     @patch("skyvern.services.otp_service.settings")
+    @pytest.mark.parametrize("otp_request_id", [None, "otpr_test"])
     async def test_prefers_url_before_email_and_db_when_url_has_code(
         self,
         mock_settings: MagicMock,
@@ -1716,10 +1729,18 @@ class TestPollOtpValueRetry:
         mock_url: AsyncMock,
         mock_db: AsyncMock,
         mock_sleep: AsyncMock,
+        otp_request_id: str | None,
     ) -> None:
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
         mock_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        claimed_webhooks: list[dict[str, object]] = []
+
+        async def claim_strict_webhook_otp_code(**kwargs: object) -> bool:
+            claimed_webhooks.append(kwargs)
+            return True
+
+        mock_app.DATABASE.otp.claim_strict_webhook_otp_code = claim_strict_webhook_otp_code
         otp = OTPValue(value="123456", type=OTPType.TOTP)
         mock_url.return_value = otp
         mock_email.return_value = OTPValue(value="654321", type=OTPType.TOTP)
@@ -1729,6 +1750,7 @@ class TestPollOtpValueRetry:
             task_id="tsk_test",
             workflow_run_id="wr_test",
             workflow_permanent_id="wpid_test",
+            otp_request_id=otp_request_id,
             totp_identifier="otp@example.com",
             totp_verification_url="https://example.com/mfa",
         )
@@ -1737,6 +1759,21 @@ class TestPollOtpValueRetry:
         mock_url.assert_awaited_once()
         mock_email.assert_not_awaited()
         mock_db.assert_not_awaited()
+        assert claimed_webhooks == (
+            []
+            if otp_request_id is None
+            else [
+                {
+                    "organization_id": "o_test",
+                    "otp_request_id": "otpr_test",
+                    "content": "123456",
+                    "code": "123456",
+                    "otp_type": OTPType.TOTP,
+                    "task_id": "tsk_test",
+                    "workflow_run_id": "wr_test",
+                }
+            ]
+        )
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
@@ -2630,24 +2667,54 @@ class TestPostTotpVerificationUrlSeam:
 
 
 @pytest.mark.asyncio
-async def test_get_otp_value_from_db_forwards_created_after(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("otp_request_id", [None, "otpr_test"])
+async def test_get_otp_value_from_db_forwards_created_after(
+    monkeypatch: pytest.MonkeyPatch, otp_request_id: str | None
+) -> None:
     """_get_otp_value_from_db forwards created_after so the DB query can disqualify pre-run codes."""
     started_at = datetime(2026, 6, 8, 20, 3, 0)
-    get_otp_codes = AsyncMock(return_value=[])
+    calls: list[dict[str, object]] = []
+
+    async def read_or_claim(**kwargs: object) -> list[object] | SimpleNamespace:
+        calls.append(kwargs)
+        if otp_request_id is None:
+            return []
+        return SimpleNamespace(
+            totp_code_id="otp_marked",
+            code="111111",
+            otp_type=OTPType.TOTP,
+            source=None,
+        )
+
     with patch("skyvern.services.otp_service.app") as mock_app:
-        mock_app.DATABASE.otp.get_otp_codes = get_otp_codes
+        mock_app.DATABASE.otp.get_otp_codes = read_or_claim
+        mock_app.DATABASE.otp.claim_otp_code = read_or_claim
+        mock_app.DATABASE.otp.reject_claimed_otp_code = AsyncMock(return_value=True)
         result = await _get_otp_value_from_db(
             "o_test",
             "otp@example.com",
+            task_id="tsk_test",
             workflow_run_id="wr_test",
+            otp_request_id=otp_request_id,
             created_after=started_at,
+            rejected_code_hash=hashlib.sha256(b"111111").hexdigest() if otp_request_id else None,
         )
 
     assert result is None
-    get_otp_codes.assert_awaited_once()
-    assert get_otp_codes.await_args.kwargs["created_after"] == started_at
-    assert get_otp_codes.await_args.kwargs["workflow_run_id"] == "wr_test"
-    assert get_otp_codes.await_args.kwargs["include_unscoped_workflow_run"] is True
+    assert len(calls) == 1
+    assert calls[0]["created_after"] == started_at
+    assert calls[0]["workflow_run_id"] == "wr_test"
+    if otp_request_id is None:
+        assert calls[0]["include_unscoped_workflow_run"] is True
+    else:
+        assert calls[0]["task_id"] == "tsk_test"
+        assert calls[0]["otp_request_id"] == "otpr_test"
+        mock_app.DATABASE.otp.reject_claimed_otp_code.assert_awaited_once_with(
+            totp_code_id="otp_marked",
+            organization_id="o_test",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+        )
 
 
 @pytest.mark.asyncio
@@ -3485,6 +3552,7 @@ class TestScopeSuppressionRegressionSentinel:
     def _task(self, totp_verification_url: str | None = None) -> SimpleNamespace:
         return SimpleNamespace(
             task_id="tsk_test",
+            otp_request_id=None,
             url="https://example.com/login",
             workflow_run_id="wr_test",
             organization_id="o_test",
@@ -3567,6 +3635,7 @@ async def test_retry_resolution_forwards_cutoff_and_ignores_inline_rejected_hash
     cutoff = datetime(2026, 1, 1)
     task = SimpleNamespace(
         task_id="task-test",
+        otp_request_id=None,
         url="https://example.test/login",
         organization_id="org-test",
         workflow_run_id=None,

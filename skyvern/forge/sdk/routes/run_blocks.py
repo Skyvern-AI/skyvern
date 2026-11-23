@@ -120,7 +120,7 @@ async def _run_workflow_and_build_response(
     response = WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
         run_type=RunType.workflow_run,
-        status=str(workflow_run.status),
+        status=str(workflow_run.status_for_reads),
         failure_reason=workflow_run.failure_reason,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,

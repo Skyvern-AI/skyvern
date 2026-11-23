@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import io
 import os
@@ -1348,17 +1349,54 @@ async def test_retrieve_browser_profile_extracts_sub_buffer_size_archive(
 
 _EXTENSION_ID = "a" * 32
 _RULESET_BYTES = 4096
+_COOKIES_MEMBER = "Default/Network/Cookies"
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("confirm_creation", [False, True])
+@pytest.mark.parametrize(
+    ("member", "dangling", "fault", "strict_error"),
+    [
+        pytest.param(_COOKIES_MEMBER, False, None, None, id="readable"),
+        pytest.param(_COOKIES_MEMBER, False, "listing", errno.EACCES, id="listing"),
+        pytest.param(_COOKIES_MEMBER, False, errno.EACCES, errno.EACCES, id="stat-permission"),
+        pytest.param(_COOKIES_MEMBER, False, errno.EIO, errno.EIO, id="stat-io"),
+        pytest.param(_COOKIES_MEMBER, False, errno.ENOENT, errno.ENOENT, id="missing-cookies"),
+        pytest.param("SingletonLock", True, None, None, id="root-lock"),
+        pytest.param("SingletonCookie", True, None, None, id="root-cookie"),
+        pytest.param("SingletonSocket", True, None, None, id="root-socket"),
+        pytest.param("RunningChromeVersion", True, None, None, id="root-running-version"),
+        pytest.param("Default/Network/SingletonLock", True, None, None, id="nested-lock"),
+        pytest.param("UnrecognizedLink", True, None, None, id="unrecognized-link"),
+        pytest.param("SingletonLock", False, None, None, id="regular-lock"),
+        pytest.param("SingletonLock", False, errno.ENOENT, errno.ENOENT, id="regular-lock-enoent"),
+        pytest.param("SingletonLock", True, errno.EACCES, errno.EACCES, id="root-link-permission"),
+        pytest.param("SingletonLock", True, errno.EIO, errno.EIO, id="root-link-io"),
+    ],
+)
 async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_the_archive(
-    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    s3_storage: S3Storage,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    confirm_creation: bool,
+    member: str,
+    dangling: bool,
+    fault: str | int | None,
+    strict_error: int | None,
 ) -> None:
     # Each run loads its extensions from a new path, so Chrome indexes a fresh DNR ruleset under a new extension
     # id and never prunes the old ones; archiving them grew one profile to 2.7 GiB extracted.
     profile = tmp_path / "profile"
-    (profile / "Default" / "Network").mkdir(parents=True)
-    (profile / "Default" / "Network" / "Cookies").write_bytes(b"cookies")
+    network = profile / "Default" / "Network"
+    network.mkdir(parents=True)
+    cookies = network / "Cookies"
+    cookies.write_bytes(b"cookies")
+    entry = profile / member
+    if dangling:
+        entry.symlink_to("nonexistent-runtime-target")
+    elif entry != cookies:
+        entry.write_bytes(b"regular file")
+    (profile / "Local State").write_bytes(b"state")
     settings_dir = profile / "Default" / "Local Extension Settings" / _EXTENSION_ID
     settings_dir.mkdir(parents=True)
     (settings_dir / "000003.log").write_bytes(b"settings")
@@ -1366,20 +1404,55 @@ async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_t
     rules_dir.mkdir(parents=True)
     (rules_dir / "ruleset.bin").write_bytes(b"r" * _RULESET_BYTES)
     monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
+    if fault == "listing":
+        scandir = os.scandir
 
-    archived: list[str] = []
+        def scan_directory(path: str) -> os.ScandirIterator[str]:
+            if path == str(network):
+                raise PermissionError(errno.EACCES, "synthetic unreadable profile directory", path)
+            return scandir(path)
+
+        monkeypatch.setattr(os, "scandir", scan_directory)
+    elif isinstance(fault, int):
+        real_stat = os.stat
+
+        def stat_entry(path: str, *, dir_fd: int | None = None, follow_symlinks: bool = True) -> os.stat_result:
+            if path == str(entry):
+                if fault == errno.ENOENT and entry == cookies:
+                    cookies.unlink(missing_ok=True)
+                else:
+                    raise OSError(fault, "synthetic profile stat fault", path)
+            return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(os, "stat", stat_entry)
+
+    uploads: list[str] = []
+    archived: dict[str, bytes] = {}
 
     async def capture_upload(uri: str, path: str, **kwargs: object) -> None:
+        uploads.append(uri)
+        if confirm_creation and not kwargs.get("raise_exception"):
+            return
         with zipfile.ZipFile(path) as archive:
-            archived.extend(archive.namelist())
+            archived.update({name: archive.read(name) for name in archive.namelist()})
 
     s3_storage.async_client = MagicMock()
     s3_storage.async_client.upload_file_from_path = AsyncMock(side_effect=capture_upload)
 
-    with capture_logs() as events:
-        await s3_storage.store_browser_profile("o", "bp", str(profile))
+    if confirm_creation and strict_error is not None:
+        with pytest.raises(OSError) as error:
+            await s3_storage.store_browser_profile("o", "bp", str(profile), confirm_creation=True)
+        assert error.value.errno == strict_error
+        assert not uploads
+        assert not list((tmp_path / "temp").glob("*.zip"))
+        return
 
-    assert "Default/Network/Cookies" in archived
+    with capture_logs() as events:
+        await s3_storage.store_browser_profile("o", "bp", str(profile), confirm_creation=confirm_creation)
+
+    assert "Local State" in archived
+    assert (member in archived) is (not dangling and fault is None)
+    assert archived.get(_COOKIES_MEMBER) == (None if member == _COOKIES_MEMBER and fault is not None else b"cookies")
     assert f"Default/Local Extension Settings/{_EXTENSION_ID}/000003.log" in archived
     assert not [name for name in archived if "DNR Extension Rules" in name]
     # The run's live profile directory is left alone: Chrome may still be using it mid-run.

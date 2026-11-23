@@ -100,7 +100,7 @@ class ParserResult:
 def _detect_encoding(file_path: Path) -> str:
     with file_path.open("rb") as file:
         raw_data = file.read(65_536)
-    # charset-normalizer reports a UTF-8 BOM as "utf_8", which keeps the BOM in the first header.
+    # charset-normalizer reports a UTF-8 BOM file as utf_8, which leaves the BOM in the first header.
     if raw_data.startswith(codecs.BOM_UTF8):
         return "utf-8-sig"
     best_match = from_bytes(raw_data).best()

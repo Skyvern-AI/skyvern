@@ -256,6 +256,7 @@ Retry a workflow run using the original run parameters.
 await skyvern.retry_workflow_run(
     workflow_run_id: str,
     *,
+    otp_request_id: str | None = None,
     max_steps_override: int | None = None,
     user_agent: str | None = None,
 ) -> WorkflowRunResponse
@@ -272,6 +273,12 @@ skyvern.retryWorkflowRun(workflowRunId: string, request?: RetryWorkflowRunReques
 The id of the workflow run to retry.
 
 TypeScript: `workflowRunId`
+</ParamField>
+
+<ParamField path={"otp_request_id"} type={"str | None"}>
+A fresh explicit marker for a strict OTP-bound retry. Omission preserves legacy retry behavior.
+
+Default: `None` · Python only
 </ParamField>
 
 <ParamField path={"max_steps_override"} type={"int | None"}>

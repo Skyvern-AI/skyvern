@@ -82,6 +82,7 @@ from skyvern.exceptions import (
     MissingBrowserStatePage,
     MissingExtractActionsResponse,
     MultiFieldTotpGroupGone,
+    NavigationStartedDownload,
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
     ScrapingFailed,
@@ -89,6 +90,7 @@ from skyvern.exceptions import (
     ScreenshotTargetClosed,
     SkyvernException,
     SkyvernPageAnalysisTimeout,
+    StartUrlDownloadFailed,
     StepTerminationError,
     StepUnableToExecuteError,
     TaskAlreadyCanceled,
@@ -233,7 +235,7 @@ from skyvern.forge.taskv3.goal_check import (
     GOAL_CHECK_PROMPT_NAME,
     GoalJudge,
 )
-from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
+from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, StartUrlDownload
 from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
     DEFAULT_MAX_SETTLE_DEFERRALS,
@@ -403,6 +405,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     begin_replay_candidate_hold,
     consume_unsolicited_download_error_for_context,
     download_filename_from_suffix,
+    download_limits,
     download_tally_for_context,
     has_download_interceptor_for_context,
     record_download_artifact_outcome_for_context,
@@ -449,6 +452,19 @@ PARALLEL_VERIFICATION_TIMEOUT_SECONDS = 15 * 60
 # minutes, but a code the page never accepted is better re-polled than submitted indefinitely, and
 # two steps' worth is enough to cover a code field that renders one step after the gate fires.
 UNCONSUMED_OTP_CODE_TTL_SECONDS = 120.0
+
+_DOWNLOAD_FAILURE_SENTENCES = {
+    "file_size_limit": "the file is larger than the {limit:,} byte limit",
+    "run_size_limit": "the run's downloads would exceed the {limit:,} byte limit",
+    "file_count_limit": "the run already saved its limit of {limit} files",
+}
+
+
+def _describe_download_failure(reason: str) -> str:
+    sentence = _DOWNLOAD_FAILURE_SENTENCES.get(reason)
+    limit = download_limits().get(reason)
+    return sentence.format(limit=limit) if sentence and limit is not None else "the browser could not save it"
+
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
@@ -1201,6 +1217,7 @@ async def _fetch_reissued_external_otp(
             workflow_id=workflow_run.workflow_id if workflow_run else None,
             workflow_run_id=task.workflow_run_id,
             workflow_permanent_id=workflow_run.workflow_permanent_id if workflow_run else None,
+            otp_request_id=task.otp_request_id,
             totp_verification_url=task.totp_verification_url,
             totp_identifier=task.totp_identifier,
             created_after=requested_at,
@@ -3077,6 +3094,7 @@ class ForgeAgent:
             webhook_callback_url=webhook_callback_url,
             totp_verification_url=totp_verification_url,
             totp_identifier=task_request.totp_identifier,
+            otp_request_id=task_request.otp_request_id,
             navigation_goal=task_request.navigation_goal,
             complete_criterion=task_request.complete_criterion,
             terminate_criterion=task_request.terminate_criterion,
@@ -3112,6 +3130,28 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
+    async def _task_run_stopped(self, task: Task) -> bool:
+        try:
+            refreshed = await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id)
+        except Exception:
+            LOG.warning("Cancel poll failed to read task", task_id=task.task_id, exc_info=True)
+            refreshed = None
+        if refreshed and refreshed.status in (TaskStatus.canceled, TaskStatus.timed_out):
+            return True
+        # A workflow task also stops when its parent run is canceled or reaped to timed_out, not
+        # just the task row. Fail open on a lookup error: a DB blip must not fail a healthy run.
+        if task.workflow_run_id:
+            try:
+                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    workflow_run_id=task.workflow_run_id, organization_id=task.organization_id
+                )
+            except Exception:
+                LOG.warning("Cancel poll failed to read workflow run", task_id=task.task_id, exc_info=True)
+                return False
+            if workflow_run and workflow_run.status in (WorkflowRunStatus.canceled, WorkflowRunStatus.timed_out):
+                return True
+        return False
+
     @_holding_replay_candidates
     async def _execute_task_v3(
         self,
@@ -3129,6 +3169,7 @@ class ForgeAgent:
         recovery_release_parameter_keys: list[str] | None = None,
         recovery_enforce_vault_sites: bool = True,
         recovery_code_progress: CodeProgressRecord | None = None,
+        start_url_download: StartUrlDownload | None = None,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
 
@@ -3292,7 +3333,9 @@ class ForgeAgent:
                 page_free_validation = bool(router_result.effective_without_page_information)
             except Exception:
                 LOG.warning("task_v3 validation evidence router failed; staying page-aware", task_id=task.task_id)
-        framing = render_block_context(task, task_block, page_free_validation=page_free_validation)
+        framing = render_block_context(
+            task, task_block, page_free_validation=page_free_validation, start_url_download=start_url_download
+        )
         # Surface the customer's completion/termination criteria (trusted task config, like the navigation
         # goal). Withhold a complete_criterion flagged untrusted (LLM-derived from page content) so it can't be
         # injected into the goal raw — unreachable on v3 today, but keeps the boundary if a future change ever
@@ -3397,24 +3440,7 @@ class ForgeAgent:
             return app.WORKFLOW_CONTEXT_MANAGER.login_identifier_secret_ids_for_run(task.workflow_run_id)
 
         async def _should_cancel() -> bool:
-            refreshed = await app.DATABASE.tasks.get_task(
-                task_id=task.task_id, organization_id=organization.organization_id
-            )
-            if refreshed and refreshed.status in (TaskStatus.canceled, TaskStatus.timed_out):
-                return True
-            # A workflow task also stops when its parent run is canceled or reaped to timed_out, not
-            # just the task row. Fail open on a lookup error: a DB blip must not fail a healthy run.
-            if task.workflow_run_id:
-                try:
-                    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
-                        workflow_run_id=task.workflow_run_id, organization_id=organization.organization_id
-                    )
-                except Exception:
-                    LOG.warning("task_v3 cancel poll failed to read workflow run", task_id=task.task_id, exc_info=True)
-                    return False
-                if workflow_run and workflow_run.status in (WorkflowRunStatus.canceled, WorkflowRunStatus.timed_out):
-                    return True
-            return False
+            return await self._task_run_stopped(task)
 
         input_dispatch.start_login_pace(_should_cancel)
 
@@ -3437,15 +3463,19 @@ class ForgeAgent:
             workflow_download_directory = get_path_for_workflow_download_directory(
                 resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
             )
-            download_baseline_files = list_files_in_directory(
-                workflow_download_directory, attempt_started_at=attempt_started_at
-            )
-            if task.browser_session_id:
-                browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
-                    organization_id=organization.organization_id,
-                    browser_session_id=task.browser_session_id,
+            if start_url_download is not None:
+                # Taken before the start URL's own download, so that file counts as this block's.
+                download_baseline_files = start_url_download.baseline
+            else:
+                download_baseline_files = list_files_in_directory(
+                    workflow_download_directory, attempt_started_at=attempt_started_at
                 )
-                download_baseline_files = download_baseline_files + browser_session_downloaded_files
+                if task.browser_session_id:
+                    browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
+                        organization_id=organization.organization_id,
+                        browser_session_id=task.browser_session_id,
+                    )
+                    download_baseline_files = download_baseline_files + browser_session_downloaded_files
 
         # Passed to the loop below as well, so a download wait caps itself at what's left
         # of the same deadline the loop enforces.
@@ -3456,7 +3486,11 @@ class ForgeAgent:
         download_wait_exhausted: set[str] = set()
 
         download_finalized = False
-        capture_tally_before = download_tally_for_context(browser_state.browser_context)
+        capture_tally_before = (
+            start_url_download.tally_before
+            if start_url_download is not None and start_url_download.tally_before is not None
+            else download_tally_for_context(browser_state.browser_context)
+        )
         # Files settle already recorded, as the finalizer left them, so a later settle records only files new since.
         recorded_files: list[str] = []
         download_completion_reason: str | None = None
@@ -3488,11 +3522,12 @@ class ForgeAgent:
                 deadline=time.monotonic() + min(PROVIDER_BASELINE_TIMEOUT_SECONDS, loop_deadline_at - time.monotonic()),
             )
             # A file that landed while the provider baseline was awaited predates this block's first action,
-            # whether or not the baseline read succeeded.
-            download_baseline_files = [
-                *(download_baseline_files or []),
-                *list_files_in_directory(workflow_download_directory, attempt_started_at=attempt_started_at),
-            ]
+            # whether or not the baseline read succeeded; a start URL's own download is this block's.
+            if start_url_download is None:
+                download_baseline_files = [
+                    *(download_baseline_files or []),
+                    *list_files_in_directory(workflow_download_directory, attempt_started_at=attempt_started_at),
+                ]
 
         def _provider_wait_seconds(block: BaseTaskBlock) -> float:
             return min(block.download_timeout or PROVIDER_DOWNLOAD_WAIT_SECONDS, loop_deadline_at - time.monotonic())
@@ -4418,6 +4453,8 @@ class ForgeAgent:
                 download_settle=download_settle,
                 unsaved_downloads=unsaved_downloads,
                 native_download_attempt=native_download_attempt,
+                hold_completed_on_landed_file=start_url_download is not None,
+                download_tally_before=start_url_download.tally_before if start_url_download is not None else None,
                 completion_gate=_completion_gate,
                 settle_reload_signal=lambda accept: app.AGENT_FUNCTION.settle_page_reload_signal(
                     task=task, raise_signal=False, accept=accept
@@ -4972,6 +5009,7 @@ class ForgeAgent:
         llm_caller: LLMCaller | None = None,
         download_baseline_files: list[str] | None = None,
         pre_resolved_browser_state: BrowserState | None = None,
+        start_url_download: StartUrlDownload | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         # set the step_id and task_id in the context
         context = skyvern_context.ensure_context()
@@ -5210,6 +5248,7 @@ class ForgeAgent:
                         recovery_release_parameter_keys=recovery_release_parameter_keys,
                         recovery_enforce_vault_sites=recovery_enforce_vault_sites,
                         recovery_code_progress=recovery_code_progress,
+                        start_url_download=start_url_download,
                     )
                 finally:
                     # The block's turn steps share its ZIP: one storage PUT per block rather than one per turn.
@@ -8654,6 +8693,138 @@ class ForgeAgent:
         scraped_page._support_empty_page = support_empty_page
         return scraped_page
 
+    async def navigate_to_block_url(
+        self,
+        task: Task,
+        step: Step,
+        task_block: BaseTaskBlock,
+        browser_state: BrowserState,
+        page: Page,
+        url: str,
+        *,
+        wait_until: Literal["load", "domcontentloaded", "commit"],
+        browser_session_id: str | None,
+        close_browser_on_completion: bool,
+        hand_to_agent: bool,
+    ) -> bool | StartUrlDownload:
+        """Open a task block's start URL. When the URL is a file, returns True once its download completed the
+        task, or, with `hand_to_agent`, the started download for the Task V3 agent to wait on and judge."""
+        if not (task_block.complete_on_download and task.workflow_run_id):
+            await browser_state.navigate_to_url(page=page, url=url, wait_until=wait_until)
+            return False
+
+        context = skyvern_context.current()
+        download_id = resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
+        attempt_started_at = await get_download_retry_started_at(task.organization_id, download_id)
+        # Taken before the navigation: once the download starts, its own partial file would hide it from the diff.
+        list_files_before = list_files_in_directory(
+            get_path_for_workflow_download_directory(download_id), attempt_started_at=attempt_started_at
+        )
+        if task.browser_session_id:
+            list_files_before += await app.STORAGE.list_downloaded_files_in_browser_session(
+                organization_id=task.organization_id, browser_session_id=task.browser_session_id
+            )
+            list_files_before += await app.STORAGE.list_downloading_files_in_browser_session(
+                organization_id=task.organization_id, browser_session_id=task.browser_session_id
+            )
+        # An earlier download still in flight must not be credited to this navigation once it settles.
+        list_files_before += [
+            normalize_download_identity(path) for path in list_files_before if path.endswith(BROWSER_DOWNLOADING_SUFFIX)
+        ]
+        tally_before = download_tally_for_context(browser_state.browser_context)
+        if hand_to_agent:
+            try:
+                await browser_state.navigate_to_url(page=page, url=url, wait_until=wait_until)
+                return False
+            except NavigationStartedDownload:
+                # The loop waits for the file, offers a held candidate, and reports a failed save from these baselines.
+                LOG.info("Start URL started a download; the agent waits on it", task_id=task.task_id)
+                return StartUrlDownload(baseline=list_files_before, tally_before=tally_before)
+        download_failures: list[str] = []
+
+        async def _download_failed_or_run_stopped() -> bool:
+            tally = download_tally_for_context(browser_state.browser_context)
+            if tally is not None and tally_before is not None and tally.generation == tally_before.generation:
+                download_failures[:] = [
+                    reason
+                    for reason, count in tally.unsolicited_failures.items()
+                    if count > tally_before.unsolicited_failures.get(reason, 0)
+                ]
+            # Failure counts are per browser context: another download failing must not end this one's wait.
+            if download_failures and not (tally is not None and tally.pending):
+                return True
+            return await self._task_run_stopped(task)
+
+        try:
+            await browser_state.navigate_to_url(page=page, url=url, wait_until=wait_until)
+            return False
+        except NavigationStartedDownload as navigation_error:
+            landed = await self._observe_claimed_download_within_grace(
+                task,
+                task_block,
+                remaining=task_block.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
+                list_files_before=list_files_before,
+                attempt_started_at=attempt_started_at,
+                should_stop=_download_failed_or_run_stopped,
+            )
+            if not landed:
+                if await self._task_run_stopped(task):
+                    # Leave a canceled or timed-out run to execute_step, which records it as such.
+                    return False
+                if download_failures:
+                    reasons = "; ".join(
+                        _describe_download_failure(reason) for reason in dict.fromkeys(download_failures)
+                    )
+                    raise StartUrlDownloadFailed(
+                        url=navigation_error.url,
+                        error_message=f"The start URL began a file download that was not saved: {reasons}",
+                    ) from None
+                raise navigation_error
+            try:
+                await app.AGENT_FUNCTION.validate_step_execution(task, step)
+            except Exception:
+                # Leave the refusal to execute_step, which runs the same check and fails the step properly.
+                return False
+            if await self._task_run_stopped(task):
+                return False
+            recorded_downloads: list[str] = []
+            rejected_downloads: list[str] = []
+            new_files = await self._finalize_downloaded_files_for_task(
+                task,
+                organization_id=task.organization_id,
+                download_suffix=task_block.download_suffix,
+                list_files_before=list_files_before,
+                randomize_if_missing=True,
+                attempt_started_at=attempt_started_at,
+                recorded_into=recorded_downloads,
+                rejected_into=rejected_downloads,
+            )
+            if not (new_files or rejected_downloads):
+                raise navigation_error
+
+        LOG.info(
+            "Task marked as completed due to download from its start URL", task_id=task.task_id, new_files=new_files
+        )
+        last_step = await self.update_step(
+            step, status=StepStatus.completed, is_last=True, output=AgentStepOutput(action_results=[])
+        )
+        try:
+            await app.AGENT_FUNCTION.post_step_execution(task, last_step)
+        except Exception:
+            LOG.warning("Post-step hook failed after a start URL download", task_id=task.task_id, exc_info=True)
+        await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
+        await self.clean_up_task(
+            task=task,
+            last_step=last_step,
+            close_browser_on_completion=close_browser_on_completion,
+            browser_session_id=browser_session_id,
+            download_completion_pending=True,
+            completion_extracted_information=task.extracted_information,
+            download_rejections=rejected_downloads,
+            download_completion_files=recorded_downloads,
+        )
+        return True
+
     async def _observe_claimed_download_within_grace(
         self,
         task: Task,
@@ -8664,6 +8835,7 @@ class ForgeAgent:
         attempt_started_at: datetime | None,
         observe_session: bool = True,
         allow_new_file_credit: bool = True,
+        should_stop: Callable[[], Awaitable[bool]] | None = None,
     ) -> bool:
         """Read-only bounded observation of real download file state for a claimed dead-blank page.
 
@@ -8744,7 +8916,7 @@ class ForgeAgent:
             if allow_new_file_credit and await _new_final_file_present():
                 return True
             now = time.monotonic()
-            if now >= deadline:
+            if now >= deadline or (should_stop is not None and await should_stop()):
                 return False
             if task_block is not None and await _in_flight_present():
                 # An in-flight download (local .crdownload or a browser-session partial) exists: reuse the
@@ -8767,6 +8939,7 @@ class ForgeAgent:
                                 task.organization_id,
                                 timeout_cap=budget,
                                 attempt_started_at=attempt_started_at,
+                                should_cancel=should_stop,
                             ),
                             timeout=budget,
                         )
@@ -11659,6 +11832,7 @@ class ForgeAgent:
                         workflow_run_id=task.workflow_run_id,
                         workflow_id=workflow_run.workflow_id if workflow_run else None,
                         workflow_permanent_id=workflow_run.workflow_permanent_id if workflow_run else None,
+                        otp_request_id=task.otp_request_id,
                         totp_verification_url=task.totp_verification_url,
                         totp_identifier=task.totp_identifier,
                         expected_otp_type=OTPType.TOTP,
@@ -13143,6 +13317,7 @@ class ForgeAgent:
             organization_id=task.organization_id,
             task_id=task.task_id,
             workflow_run_id=task.workflow_run_id,
+            otp_request_id=task.otp_request_id,
             totp_verification_url=task.totp_verification_url,
             totp_identifier=task.totp_identifier,
             expected_otp_type=OTPType.MAGIC_LINK,

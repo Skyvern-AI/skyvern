@@ -2448,7 +2448,7 @@ def test_upload_scan_sends_each_pdf_content_once_and_leaves_the_files(tmp_path: 
         for name, data in [("cut", CUT_OFF), ("header", HEADER_ONLY), ("report", NOT_PDF), ("empty", b"")]
         for i in range(2)
     ]
-    in_progress = _write(tmp_path / "invoice.pdf.crdownload", INVOICE, 0)
+    _write(tmp_path / "invoice.pdf.crdownload", INVOICE, 0)
     text = [_write(tmp_path / f"notes{i}.txt", b"same notes", 6 + i) for i in range(2)]
     link = tmp_path / "invoice-link.pdf"
     link.symlink_to(first)
@@ -2457,7 +2457,7 @@ def test_upload_scan_sends_each_pdf_content_once_and_leaves_the_files(tmp_path: 
         download_files_path=str(tmp_path), max_file_count=300
     )
 
-    assert sorted(files) == sorted(str(p) for p in [first, statement, *kept_pairs, in_progress, *text, link])
+    assert sorted(files) == sorted(str(p) for p in [first, statement, *kept_pairs, *text, link])
     assert late.read_bytes() == INVOICE
 
 

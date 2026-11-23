@@ -287,10 +287,12 @@ async def test_a_microsoft_read_failure_still_verifies_google_choices(monkeypatc
         "    - block_type: integration_action\n      label: upload\n      integration_id: google_drive\n"
         "      action_id: upload_files\n      connection_id: goac_staged\n"
         "      inputs:\n        google_drive_folder_id: folder\n",
+        "    - block_type: file_download\n      label: upload\n      download_target: google_drive\n"
+        "      google_credential_id: goac_staged\n      navigation_goal: Download the report\n",
     ],
-    ids=["file_upload", "integration_action"],
+    ids=["file_upload", "integration_action", "file_download"],
 )
-async def test_recovery_choices_for_a_drive_upload_offer_the_staged_account_then_only_drive_accounts(
+async def test_recovery_choices_for_a_drive_block_offer_the_staged_account_then_only_drive_accounts(
     monkeypatch: pytest.MonkeyPatch, upload_block: str
 ) -> None:
     drive = ["https://www.googleapis.com/auth/drive"]

@@ -1069,7 +1069,7 @@ def hydrate_prior_carried_trajectory(ctx: AgentContext) -> bool:
     return True
 
 
-_ACT_OBSERVE_TOOLS = frozenset({"click"})
+_ACT_OBSERVE_TOOLS = frozenset({"click", "hover"})
 
 
 def _scout_act_observe_capture_outcome(parsed: dict[str, Any] | None, *, started: float, timeout_seconds: float) -> str:

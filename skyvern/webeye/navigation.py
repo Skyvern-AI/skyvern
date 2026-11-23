@@ -22,6 +22,7 @@ from skyvern.exceptions import (
     BlockedNavigationDestination,
     FailedToNavigateToUrl,
     InvalidUrl,
+    NavigationStartedDownload,
     UnreachableNavigationHost,
     UnresolvableNavigationHost,
 )
@@ -317,6 +318,7 @@ async def navigate_with_retry(
     sleep: SleepFunc | None = None,
     log_url: str | None = None,
     stop_retrying: Callable[[], bool] | None = None,
+    download_started: Callable[[], bool] | None = None,
 ) -> int | None:
     # Returns the final navigation response's HTTP status when one is available (None when the
     # navigation produced no response object). Additive: every caller today ignores the return; the
@@ -391,6 +393,12 @@ async def navigate_with_retry(
             # Playwright names the destination in its own message, so the raw text carries the
             # secret even though the url field is redacted. Match on the raw text, report the safe one.
             safe_error_str = error_str.replace(url, display_url) if log_url is not None else error_str
+
+            # A slow attachment the interceptor is still streaming times out the goto rather than reporting the download.
+            if "Download is starting" in error_str or (download_started is not None and download_started()):
+                raise NavigationStartedDownload(url=display_url, error_message=safe_error_str) from (
+                    None if redacting else error
+                )
 
             if is_skip_inner_retry_error(error_str):
                 # The host is the one part of a secret URL that redaction keeps, so naming it is

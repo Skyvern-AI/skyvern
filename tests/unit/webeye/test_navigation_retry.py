@@ -14,6 +14,7 @@ from skyvern.exceptions import (
     BlockedHost,
     BlockedNavigationDestination,
     FailedToNavigateToUrl,
+    NavigationStartedDownload,
     UnresolvableHost,
     UnresolvableNavigationHost,
 )
@@ -82,26 +83,29 @@ def _redirect_response(*urls: str) -> _FakeResponse:
 
 
 @pytest.mark.parametrize(
-    "error_message",
+    ("error_message", "expected_error"),
     [
-        pytest.param("net::ERR_NAME_NOT_RESOLVED", id="dns-not-resolved"),
-        pytest.param("net::ERR_NAME_RESOLUTION_FAILED", id="dns-resolution-failed"),
-        pytest.param("net::ERR_INVALID_URL", id="invalid-url"),
-        pytest.param("net::ERR_CERT_AUTHORITY_INVALID", id="cert-authority-invalid"),
-        pytest.param("net::ERR_CERT_DATE_INVALID", id="cert-date-invalid"),
-        pytest.param("net::ERR_SSL_PROTOCOL_ERROR", id="ssl-protocol-error"),
-        pytest.param("net::ERR_SOCKS_CONNECTION_FAILED", id="socks-connection-failed"),
-        pytest.param("net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE", id="socks-host-unreachable"),
+        pytest.param("net::ERR_NAME_NOT_RESOLVED", FailedToNavigateToUrl, id="dns-not-resolved"),
+        pytest.param("net::ERR_NAME_RESOLUTION_FAILED", FailedToNavigateToUrl, id="dns-resolution-failed"),
+        pytest.param("net::ERR_INVALID_URL", FailedToNavigateToUrl, id="invalid-url"),
+        pytest.param("net::ERR_CERT_AUTHORITY_INVALID", FailedToNavigateToUrl, id="cert-authority-invalid"),
+        pytest.param("net::ERR_CERT_DATE_INVALID", FailedToNavigateToUrl, id="cert-date-invalid"),
+        pytest.param("net::ERR_SSL_PROTOCOL_ERROR", FailedToNavigateToUrl, id="ssl-protocol-error"),
+        pytest.param("net::ERR_SOCKS_CONNECTION_FAILED", FailedToNavigateToUrl, id="socks-connection-failed"),
+        pytest.param("net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE", FailedToNavigateToUrl, id="socks-host-unreachable"),
+        pytest.param("Page.goto: Download is starting", NavigationStartedDownload, id="url-is-a-file-download"),
     ],
 )
 @pytest.mark.asyncio
-async def test_skip_inner_retry_error_fails_immediately(error_message: str) -> None:
+async def test_skip_inner_retry_error_fails_immediately(
+    error_message: str, expected_error: type[FailedToNavigateToUrl]
+) -> None:
     page = AsyncMock()
     page.goto = AsyncMock(side_effect=Exception(error_message))
     settle = AsyncMock()
     sleep = AsyncMock()
 
-    with pytest.raises(FailedToNavigateToUrl):
+    with pytest.raises(expected_error):
         await navigate_with_retry(
             navigate=lambda strategy: page.goto("http://example.invalid", timeout=30000, wait_until=strategy),
             url="http://example.invalid",

@@ -759,13 +759,14 @@ def test_read_google_sheet_description_states_facts_without_steering() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("integration_id", "connection_id", "provider", "reconnect_id"),
+    ("integration_id", "connection_id", "provider", "reconnect_id", "action_id"),
     [
-        ("outlook", None, "microsoft", None),
-        ("outlook", "msoac_1", "microsoft", None),
-        ("outlook", "msoac_send_only", "microsoft", None),
-        ("google_sheets", "goac_sheets_expired", "google", "goac_sheets_expired"),
-        ("google_sheets", "goac_gmail_only", "google", "goac_gmail_only"),
+        ("outlook", None, "microsoft", None, None),
+        ("outlook", "msoac_1", "microsoft", None, None),
+        ("outlook", "msoac_send_only", "microsoft", None, None),
+        ("google_sheets", "goac_sheets_expired", "google", "goac_sheets_expired", None),
+        ("google_sheets", "goac_gmail_only", "google", "goac_gmail_only", None),
+        ("gmail", "goac_gmail_only", "google", None, "mark_email_read"),
     ],
     ids=[
         "outlook_new",
@@ -773,11 +774,28 @@ def test_read_google_sheet_description_states_facts_without_steering() -> None:
         "outlook_scope_gap_new",
         "google_reconnect",
         "google_scope_gap_reconnect",
+        "gmail_organize_never_reconnects_google_sign_in",
     ],
 )
 async def test_request_connection_builds_one_card_from_the_list_entry_without_touching_the_workflow(
-    org: _OrgState, integration_id: str, connection_id: str | None, provider: str, reconnect_id: str | None
+    org: _OrgState,
+    monkeypatch: pytest.MonkeyPatch,
+    integration_id: str,
+    connection_id: str | None,
+    provider: str,
+    reconnect_id: str | None,
+    action_id: str | None,
 ) -> None:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "nango_gmail_catalog_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_cloud_integration_accounts",
+        AsyncMock(
+            return_value={
+                "gmail": [catalog.IntegrationAccount(connection_id="ngc_connected", provider="nango", state="active")]
+            }
+        ),
+    )
     org.google = [
         _google(
             id="goac_sheets_expired",
@@ -798,8 +816,8 @@ async def test_request_connection_builds_one_card_from_the_list_entry_without_to
     ]
     ctx = make_ember_ctx(organization_id=ORGANIZATION_ID, workflow_yaml="title: untouched\n")
 
-    result = await _request_connection(integration_id, connection_id, ctx)
-    await _request_connection(integration_id, connection_id, ctx)
+    result = await _request_connection(integration_id, connection_id, ctx, action_id)
+    await _request_connection(integration_id, connection_id, ctx, action_id)
 
     entry = next(entry for entry in catalog.SKYVERN_INTEGRATIONS if entry.id == integration_id)
     assert result["data"]["status"] == "offered"
@@ -812,12 +830,28 @@ async def test_request_connection_builds_one_card_from_the_list_entry_without_to
             "scopeProfile": entry.oauth_scope_profile,
             "requiredScopes": list(entry.capability_scopes or entry.required_scopes or []),
             "reconnectConnectionId": reconnect_id,
+            **({"connectedGmailOnly": True} if action_id else {}),
         }
     ]
     assert ctx.workflow_yaml == "title: untouched\n"
     serialized = json.dumps(result)
     for name in TOKEN_FIELD_NAMES:
         assert f'"{name}"' not in serialized
+    if action_id:
+        assert "required_scopes" not in result["data"]
+        assert [account["connection_id"] for account in result["data"]["accounts"]] == ["ngc_connected"]
+        plain = await _request_connection(integration_id, None, make_ember_ctx(organization_id=ORGANIZATION_ID))
+        assert any(account["provider"] == "google" for account in plain["data"]["accounts"])
+        # A later plain call for the entry replaces the card but keeps it Connected-Gmail-only.
+        await _request_connection(integration_id, None, ctx)
+        assert ctx.connection_cards[0].get("connectedGmailOnly") is True
+        # Without Connected Gmail no card can connect an account that runs the action, so the earlier card is dropped,
+        # even on a plain call that only inherits the restriction.
+        monkeypatch.setattr(app.AGENT_FUNCTION, "nango_gmail_catalog_available", AsyncMock(return_value=False))
+        refused = await _request_connection(integration_id, None, ctx)
+        assert refused["data"]["status"] == "not_offered"
+        assert refused["data"]["earlier_card_withdrawn"] is True
+        assert ctx.connection_cards == []
 
 
 @pytest.mark.asyncio

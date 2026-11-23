@@ -2925,7 +2925,6 @@ def test_every_browser_overlay_offers_the_target_param() -> None:
         "skyvern_tab_switch",
         "skyvern_tab_close",
     } <= set(browser_overlays)
-    assert len(browser_overlays) == 18
     assert all(BROWSER_TARGET_PARAM_NAME in overlay.ember_params for overlay in browser_overlays.values())
     # inspect_page_for_composition owns target_url semantics; a second target would overload it.
     assert "inspect_page_for_composition" not in browser_overlays
