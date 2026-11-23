@@ -7334,6 +7334,19 @@
                       }
                     ],
                     "title": "2Fa Identifier"
+                  },
+                  "credential_id": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^cred_[A-Za-z0-9_-]{1,64}$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Credential Id",
+                    "description": "ID of a password credential saved in your organization, such as one an earlier Apply call saved with persist_credentials. Use it in place of username, password, and persist_credentials. The job_url must be on a website saved on the credential (its tested_url or one of its extra_site_urls). Before the run types the credential's password, or a one-time code made from it, it checks that the receiving page is on one of those websites. Change a credential's saved websites in the Skyvern app's credential editor."
                   }
                 },
                 "additionalProperties": false,
@@ -7470,6 +7483,19 @@
                       }
                     ],
                     "title": "2Fa Identifier"
+                  },
+                  "credential_id": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^cred_[A-Za-z0-9_-]{1,64}$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Credential Id",
+                    "description": "ID of a password credential saved in your organization, such as one an earlier Apply call saved with persist_credentials. Use it in place of username, password, and persist_credentials. The job_url must be on a website saved on the credential (its tested_url or one of its extra_site_urls). Before the run types the credential's password, or a one-time code made from it, it checks that the receiving page is on one of those websites. Change a credential's saved websites in the Skyvern app's credential editor."
                   }
                 },
                 "additionalProperties": false,
@@ -7520,6 +7546,9 @@
           },
           "502": {
             "description": "Credential service failed"
+          },
+          "503": {
+            "description": "Saved credential check is temporarily unavailable"
           }
         },
         "security": [
