@@ -774,6 +774,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
 
         assert result.success is True
         assert sent["data"] == {"order": "sku-2590"}
+        assert sent["use_controlled_egress"] is True
 
     @pytest.mark.asyncio
     async def test_execute_sends_a_request_that_merely_contains_the_username_text(
@@ -939,6 +940,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
 
         monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
         monkeypatch.setattr(block_module, "download_file", fake_download_file)
+        monkeypatch.setattr(block_module, "aiohttp_request", AsyncMock(return_value=(200, {}, {})))
         monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
 
         await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
@@ -969,6 +971,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
 
         monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
         monkeypatch.setattr(block_module, "download_file", fake_download_file)
+        monkeypatch.setattr(block_module, "aiohttp_request", AsyncMock(return_value=(200, {}, {})))
         monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
 
         result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
@@ -998,6 +1001,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
 
         monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
         monkeypatch.setattr(block_module, "download_file", fake_download_file)
+        monkeypatch.setattr(block_module, "aiohttp_request", AsyncMock(return_value=(200, {}, {})))
         monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
 
         await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
@@ -1077,6 +1081,16 @@ class TestHttpRequestBlockCredentialSiteConfinement:
         monkeypatch.setattr(aiohttp_helper, "validate_and_pin_fetch_url", unpinned_fetch)
         monkeypatch.setattr(aiohttp_helper, "validate_and_pin_redirect_url", unpinned_redirect)
         monkeypatch.setattr(aiohttp_helper, "ssrf_guarded_tcp_connector", lambda *_a, **_k: aiohttp.TCPConnector())
+        monkeypatch.setattr(
+            aiohttp_helper.SSRFGuardedResolver,
+            "pinned_ips_for_url",
+            lambda _self, _url: ("127.0.0.1",),
+        )
+        monkeypatch.setattr(
+            aiohttp_helper.app.AGENT_FUNCTION,
+            "relay_http_request_hop",
+            AsyncMock(return_value=None),
+        )
         context = _context_with_credential(f"http://127.0.0.1:{port}/login")
         monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
         monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())

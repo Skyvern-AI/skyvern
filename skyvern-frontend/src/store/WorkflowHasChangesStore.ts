@@ -493,6 +493,12 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             });
             void queryClient.invalidateQueries({ queryKey: ["workflows"] });
             void queryClient.invalidateQueries({
+              queryKey: [
+                "workflowVersions",
+                base.workflow.workflow_permanent_id,
+              ],
+            });
+            void queryClient.invalidateQueries({
               queryKey: ["block-scripts", base.workflow.workflow_permanent_id],
             });
           }
@@ -687,7 +693,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   return saveWorkflowMutation;
 };
 
-function hydrateWorkflowEditor(workflow: WorkflowApiResponse): boolean {
+export function hydrateWorkflowEditor(workflow: WorkflowApiResponse): boolean {
   const owner = useWorkflowYamlEditorStore.getState().editorOwner;
   const hydrate = useWorkflowHasChangesStore.getState().hydrateSavedSettings;
   if (

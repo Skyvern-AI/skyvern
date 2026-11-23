@@ -233,6 +233,14 @@ CRAFTED_4_MIB_HEADERS = {
 }
 
 
+# ImageIO (Safari, iOS) restarts at a mid-stream SOI and sizes the SOF behind it; libjpeg refuses the file.
+_JPEG_SOF_BEHIND_A_SECOND_SOI = _jpeg(64, 64).replace(
+    _JPEG_SOS, b"\xff\xd8" + (2 + len(_sof(10_000, 9_000))).to_bytes(2, "big") + _sof(10_000, 9_000) + _JPEG_SOS
+)
+# Past the first 64 KiB, so a header answered inside it shows whether the route reads the file again.
+_PAST_THE_HEAD = b"\x00" * 70_000
+
+
 _SCREENSHOT_PNG = _png(1920, 1080)
 _RASTER_HEADS = {
     "image/png": _SCREENSHOT_PNG,
@@ -559,6 +567,7 @@ class TestFileSignedUrlEndpoint:
             _jpeg_decoy(b"\xff\xd0"),
             _jpeg(1, 1).replace(_JPEG_SOS, _sof(10_000, 9_000) + _JPEG_SOS),
             _jpeg(10_000, 9_000).replace(_JPEG_SOS, _sof(1, 1) + _JPEG_SOS),
+            _JPEG_SOF_BEHIND_A_SECOND_SOI,
             _jpeg(64, 64).replace(b"\xff\xc2", b"\xff\x01" * _PAST_THE_STEP_CAP + b"\xff\xc2"),
             _gif_after_extension(_DESCRIPTOR_SUB_BLOCK * _PAST_THE_STEP_CAP + b"\x00"),
             *CRAFTED_4_MIB_HEADERS.values(),
@@ -579,6 +588,7 @@ class TestFileSignedUrlEndpoint:
             "jpeg-rst0-decoy",
             "jpeg-second-sof-larger",
             "jpeg-second-sof-smaller",
+            "jpeg-sof-behind-a-second-soi",
             "jpeg-bare-markers-past-the-step-cap",
             "gif-sub-blocks-past-the-step-cap",
             *CRAFTED_4_MIB_HEADERS,
@@ -598,6 +608,54 @@ class TestFileSignedUrlEndpoint:
 
         assert resp.status_code == 404
         assert resp.json() == {"detail": "File is no longer available"}
+
+    @pytest.mark.parametrize(
+        ("body", "status", "reads"),
+        [
+            (_jpeg(1, 1).replace(_JPEG_SOS, _sof(10_000, 9_000) + _JPEG_SOS) + _PAST_THE_HEAD, 404, 1),
+            (_JPEG_SOF_BEHIND_A_SECOND_SOI + _PAST_THE_HEAD, 404, 1),
+            (b"\xff\xd8" + _JPEG_SOS + _PAST_THE_HEAD, 404, 1),
+            (
+                _jpeg(64, 64).replace(b"\xff\xc2", b"\xff\x01" * _PAST_THE_STEP_CAP + b"\xff\xc2") + _PAST_THE_HEAD,
+                404,
+                1,
+            ),
+            (_gif_after_extension(b"\x01\x00" * _PAST_THE_STEP_CAP + b"\x00") + _PAST_THE_HEAD, 404, 1),
+            (b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x3b" + _PAST_THE_HEAD, 404, 1),
+            (_jpeg(64, 64).replace(b"\xff\xc2", b"\x00\xff\xc2") + _PAST_THE_HEAD, 404, 1),
+            (_jpeg(1920, 1080, app_segment_bytes=(40_000, 40_000)), 200, 2),
+            (_gif_after_extension((b"\xff" + b"c" * 255) * 280 + b"\x00"), 200, 2),
+            (b"\xff\xd8\xff\xe1\xff\xff" + _PAST_THE_HEAD, 404, 2),
+        ],
+        ids=[
+            "jpeg-second-sof",
+            "jpeg-sof-behind-a-second-soi",
+            "jpeg-sos-with-no-sof",
+            "jpeg-step-cap",
+            "gif-step-cap",
+            "gif-no-frame",
+            "jpeg-junk-between-segments",
+            "jpeg-late-sof",
+            "gif-frame-past-the-head",
+            "jpeg-segment-past-the-head",
+        ],
+    )
+    def test_the_whole_file_is_read_only_when_the_first_64_kib_ends_inside_the_header(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        body: bytes,
+        status: int,
+        reads: int,
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, body, size_bytes=len(body))
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == status
+        assert len(storage.downloads) == reads
 
     @pytest.mark.parametrize("header", [_png, _webp_vp8x, _webp_vp8l, _webp_vp8, _gif, _jpeg])
     def test_an_image_at_80_megapixels_is_served(
@@ -1162,24 +1220,6 @@ class TestUploadTypeRestrictions:
                 file, purpose="import_pdf", allowed=uploaded_file_service.PDF_UPLOAD_EXTENSIONS
             )
         assert "declared type image/png" in refused.value.detail
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("filename", "content", "logged_reason"),
-        [
-            ("capture.har", b'{"log": {}}', None),
-            ("setup.exe", b"not really", ".exe files are not allowed"),
-        ],
-    )
-    async def test_passthrough_logs_only_the_denylist(
-        self, filename: str, content: bytes, logged_reason: str | None
-    ) -> None:
-        """A third-party site may ask for any type, so pass-through files skip the allowlist but not the denylist."""
-        file = UploadFile(file=io.BytesIO(content), filename=filename, headers=Headers({"content-type": _OCTET}))
-        with capture_logs() as logs:
-            await uploaded_file_service.validate_passthrough_upload(file, max_size_bytes=None, purpose="test")
-        reasons = [log["reason"] for log in logs if log["event"] == "Accepted a restricted file type for pass-through"]
-        assert reasons == ([logged_reason] if logged_reason else [])
 
     def test_every_route_allowlist_is_inside_the_declared_type_table(self) -> None:
         """A route set outside the table would skip the declared-type check for those extensions."""

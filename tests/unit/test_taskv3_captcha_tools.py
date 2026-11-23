@@ -15,11 +15,16 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.taskv3 import captcha_tools, input_dispatch
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
 from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus
-from tests.unit.conftest import OcrRecordingAgentFunction, ScopeRecordingAgentFunction
+from skyvern.webeye.utils.challenge_signature import SolverExtensionCheck
+from tests.unit.conftest import (
+    OcrRecordingAgentFunction,
+    ScopeRecordingAgentFunction,
+)
 
 _SOLVED = ChallengeOutcome(ChallengeStatus.SOLVED, arm="dom_checkbox")
 _ABSENT = ChallengeOutcome(ChallengeStatus.ABSENT, page_state="clear")
-_UNSOLVED = ChallengeOutcome(ChallengeStatus.UNSOLVED)
+_UNSOLVED = ChallengeOutcome(ChallengeStatus.UNSOLVED, attempts=("dom_checkbox:not_solved",))
+_INCOMPLETE = ChallengeOutcome(ChallengeStatus.ABSENT, page_state="clear", unread=("presence_probe",))
 
 
 def _task(**overrides: Any) -> SimpleNamespace:
@@ -73,6 +78,66 @@ async def test_solve_captcha_solved_returns_ok(monkeypatch: pytest.MonkeyPatch) 
     result = await tools[0].handler({})
     assert result.status == "ok"
     assert "solved" in result.content.lower()
+    assert captcha_tools._RECAPTCHA_RESPONSE_LIFETIME not in result.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stalled_lookup", ["count", "token"])
+async def test_solved_captcha_returns_when_response_probe_stalls(
+    monkeypatch: pytest.MonkeyPatch, stalled_lookup: str
+) -> None:
+    async def never_returns(*args: Any) -> bool:
+        await asyncio.Event().wait()
+        return False
+
+    monkeypatch.setattr(captcha_tools, "_RECAPTCHA_RESPONSE_PROBE_TIMEOUT_SECONDS", 0.01, raising=False)
+    monkeypatch.setattr(captcha_tools, "solve_challenge", AsyncMock(return_value=_SOLVED))
+    monkeypatch.setattr(
+        captcha_tools,
+        "_recaptcha_token_populated",
+        never_returns if stalled_lookup == "token" else AsyncMock(return_value=True),
+    )
+    count = never_returns if stalled_lookup == "count" else AsyncMock(return_value=0)
+    page = SimpleNamespace(locator=lambda selector: SimpleNamespace(count=count))
+    tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(page), organization_id="o_1")
+    with capture_logs() as logs:
+        async with asyncio.timeout(0.5):
+            result = await tools[0].handler({})
+
+    assert (result.status, result.ok_class) == ("ok", "solved")
+    assert captcha_tools._RECAPTCHA_RESPONSE_LIFETIME not in result.content
+    [outcome] = [line for line in logs if line["event"] == "taskv3 captcha solve outcome"]
+    assert outcome["recaptcha_response_present"] is None
+
+
+@pytest.mark.asyncio
+async def test_response_probe_propagates_cancellation() -> None:
+    started = asyncio.Event()
+
+    async def count() -> int:
+        started.set()
+        await asyncio.Event().wait()
+        return 0
+
+    page = SimpleNamespace(locator=lambda selector: SimpleNamespace(count=count))
+    async with asyncio.timeout(0.5):
+        probe = asyncio.create_task(captcha_tools._recaptcha_response_present(page))
+        await started.wait()
+        probe.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await probe
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hcaptcha", "response", "expected"), [(False, True, True), (False, False, False), (True, True, None)]
+)
+async def test_response_probe_preserves_ordinary_results(
+    monkeypatch: pytest.MonkeyPatch, hcaptcha: bool, response: bool, expected: bool | None
+) -> None:
+    monkeypatch.setattr(captcha_tools, "_recaptcha_token_populated", AsyncMock(return_value=response))
+    page = SimpleNamespace(locator=lambda selector: SimpleNamespace(count=AsyncMock(return_value=int(hcaptcha))))
+    assert await captcha_tools._recaptcha_response_present(page) is expected
 
 
 @pytest.mark.asyncio
@@ -111,6 +176,8 @@ async def test_every_ok_branch_names_a_distinct_outcome_class(monkeypatch: pytes
     solved = await handler({})
     ladder.return_value = _ABSENT
     absent = await handler({})
+    ladder.return_value = _INCOMPLETE
+    incomplete = await handler({})
     # Exhaust the cap on real failures, then the next call is the short-circuit branch.
     ladder.return_value = _UNSOLVED
     for _ in range(captcha_tools._MAX_SOLVE_ATTEMPTS):
@@ -119,10 +186,11 @@ async def test_every_ok_branch_names_a_distinct_outcome_class(monkeypatch: pytes
 
     assert (solved.status, solved.ok_class) == ("ok", "solved")
     assert (absent.status, absent.ok_class) == ("ok", "absent")
+    assert (incomplete.status, incomplete.ok_class) == ("ok", "check_incomplete")
     assert (declined.status, declined.ok_class) == ("ok", "attempts_exhausted")
     # Distinctness is the property that matters: two branches sharing a value would reintroduce the
     # conflation while every per-branch assertion above still passed.
-    assert len({solved.ok_class, absent.ok_class, declined.ok_class}) == 3
+    assert len({solved.ok_class, absent.ok_class, incomplete.ok_class, declined.ok_class}) == 4
 
 
 def test_every_ok_construction_in_the_module_names_an_ok_class() -> None:
@@ -267,15 +335,39 @@ async def test_solve_captcha_success_resets_failure_streak(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_solve_captcha_absent_does_not_consume_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A page with no captcha returns absent(ok); repeated absent no-ops must never trip the failure cap.
-    ladder = AsyncMock(return_value=_ABSENT)
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        _ABSENT,
+        _INCOMPLETE,
+        ChallengeOutcome(ChallengeStatus.UNSOLVED, "captcha", page_state="challenged"),
+        ChallengeOutcome(ChallengeStatus.UNSOLVED, "captcha", attempts=("extension:found_none",)),
+        ChallengeOutcome(ChallengeStatus.UNSOLVED, "captcha", attempts=("extension:raised",)),
+        ChallengeOutcome(
+            ChallengeStatus.UNSOLVED, "captcha", attempts=("extension:found_none", "recaptcha_service:skipped")
+        ),
+    ],
+    ids=[
+        "absent",
+        "check_incomplete",
+        "no_solver_started",
+        "extension_found_none",
+        "extension_raised",
+        "token_not_requested",
+    ],
+)
+async def test_a_call_in_which_no_solver_acted_does_not_consume_the_cap(
+    monkeypatch: pytest.MonkeyPatch, outcome: ChallengeOutcome
+) -> None:
+    # A call in which no solver acted on a challenge is a no-op; repeated no-ops must never trip the failure cap.
+    ladder = AsyncMock(return_value=outcome)
     monkeypatch.setattr(captcha_tools, "solve_challenge", ladder)
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
     handler = tools[0].handler
     for _ in range(captcha_tools._MAX_SOLVE_ATTEMPTS + 3):
         result = await handler({})
-        assert result.status == "ok"
+        assert result.ok_class != "attempts_exhausted"
+        assert "a token for the reCAPTCHA" not in result.content
     assert ladder.await_count == captcha_tools._MAX_SOLVE_ATTEMPTS + 3  # every call reached the ladder
 
 
@@ -325,19 +417,42 @@ class _MarkerOnlyPage:
         await asyncio.sleep(0)
 
 
+class _SwitchableExtensionAgentFunction(ScopeRecordingAgentFunction):
+    def __init__(self) -> None:
+        super().__init__(record_arms=False)
+        self.check: SolverExtensionCheck | None = None
+
+    async def solver_extension_check(self, page: object) -> SolverExtensionCheck | None:
+        return self.check
+
+
 @pytest.mark.asyncio
 async def test_capped_solve_never_enters_lifecycle_scope(monkeypatch: pytest.MonkeyPatch) -> None:
     # Each real solve opens the shared lifecycle scope once; once the failure cap trips, the tool
     # fast-fails BEFORE the ladder, so the vendor lifecycle is never entered again.
-    agent_function = ScopeRecordingAgentFunction(record_arms=False)
+    agent_function = _SwitchableExtensionAgentFunction()
     monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(_MarkerOnlyPage()), organization_id="o_1")
     handler = tools[0].handler
 
+    # The presence check found the marker but no solver applied: the text claims only that nothing a solver could
+    # act on was found, and the no-op call spends no cap.
+    for _ in range(captcha_tools._MAX_SOLVE_ATTEMPTS + 1):
+        result = await handler({})
+        assert result.status == "error"
+        assert "its probes found no captcha checkbox or widget to act on." in result.content
+        assert "Not finished" not in result.content
+    # An extension check that did not finish is reported as unfinished, never as "found none", and spends no cap.
+    agent_function.check = SolverExtensionCheck(found=False, solved=False, unfinished=True)
+    for _ in range(captcha_tools._MAX_SOLVE_ATTEMPTS + 1):
+        result = await handler({})
+        assert "a check for a checkbox or widget a solver acts on ran out of time or failed" in result.content
+        assert "found none" not in result.content
+    agent_function.check = SolverExtensionCheck(found=True, solved=False, label="Cloudflare")
     for _ in range(captcha_tools._MAX_SOLVE_ATTEMPTS):
         result = await handler({})
         assert result.status == "error"
-    assert agent_function.events == ["enter", "exit"] * captcha_tools._MAX_SOLVE_ATTEMPTS
+    assert agent_function.events == ["enter", "exit"] * (3 * captcha_tools._MAX_SOLVE_ATTEMPTS + 2)
 
     events_at_cap = list(agent_function.events)
     result = await handler({})
@@ -412,11 +527,10 @@ class _FramesOnlyPage:
         (ChallengeOutcome(ChallengeStatus.UNSUPPORTED, "arkose", page_state="challenged"), "challenge_unsupported"),
     ],
 )
-async def test_an_unsolved_solve_names_its_class_and_logs_the_receipt_without_changing_the_result(
+async def test_an_unsolved_solve_names_its_class_logs_the_receipt_and_reports_what_it_did(
     monkeypatch: pytest.MonkeyPatch, outcome: ChallengeOutcome, error_class: str
 ) -> None:
-    # Every unsolved shape used to reach telemetry as "other". The result the model reads is the one it got before,
-    # and the receipt joins the tool-call record through tool_call_seq.
+    # The model reads the solve's own facts, and the receipt joins the tool-call record through tool_call_seq.
     monkeypatch.setattr(captcha_tools, "solve_challenge", AsyncMock(return_value=outcome))
     monkeypatch.setattr(captcha_tools, "current_tool_call_seq", lambda: 7)
     page = _FramesOnlyPage("https://app.example/login", ["https://challenge.example/captcha/frame"])
@@ -426,7 +540,8 @@ async def test_an_unsolved_solve_names_its_class_and_logs_the_receipt_without_ch
         result = await tools[0].handler({})
 
     assert (result.status, result.error_class) == ("error", error_class)
-    assert result.content.startswith("a captcha challenge is present but could not be solved this attempt")
+    assert result.content == outcome.facts("solve_captcha")
+    assert "is present" not in result.content and "report the captcha as blocking" not in result.content
     [line] = [e for e in logs if e["event"] == "taskv3 captcha solve outcome"]
     assert {key.removeprefix("solve_"): line[key] for key in line if key.startswith("solve_")} == outcome.receipt()
     assert (line["vendor_frame_present"], line["tool_call_seq"]) == (True, 7)

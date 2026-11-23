@@ -51,6 +51,21 @@ def _hold_memory_then_wait(megabytes: int) -> int:
     return len(held)
 
 
+def _write_pid_then_wait(path: str) -> None:
+    Path(path).write_text(str(os.getpid()))
+    time.sleep(60)
+
+
+def _run_nested_wait(path: str) -> None:
+    run_in_capped_subprocess(
+        _write_pid_then_wait,
+        path,
+        memory_limit_bytes=256 * MIB,
+        max_result_bytes=MIB,
+        timeout_seconds=60,
+    )
+
+
 def _raise_a_long_error() -> None:
     raise ValueError("x" * 100_000)
 
@@ -513,11 +528,41 @@ def test_a_child_is_killed_when_the_call_cannot_finish_starting_it(monkeypatch: 
     assert processes[0].poll() is not None
 
 
-def test_a_child_that_does_not_exit_after_its_result_is_killed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_child_that_does_not_exit_after_its_result_is_killed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(capped_subprocess, "_EXIT_GRACE_SECONDS", 0.2)
     process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
 
     assert capped_subprocess._wait_for_exit(process) == -signal.SIGKILL
+
+    pid_file = tmp_path / "nested.pid"
+    cancel_event = threading.Event()
+    failures: list[CappedSubprocessError] = []
+
+    def run_nested() -> None:
+        try:
+            run_in_capped_subprocess(
+                _run_nested_wait,
+                str(pid_file),
+                memory_limit_bytes=256 * MIB,
+                max_result_bytes=MIB,
+                timeout_seconds=60,
+                cancel_event=cancel_event,
+            )
+        except CappedSubprocessError as exc:
+            failures.append(exc)
+
+    started = time.monotonic()
+    worker = threading.Thread(target=run_nested)
+    worker.start()
+    while not pid_file.exists() and time.monotonic() - started < 3:
+        time.sleep(0.01)
+    nested_pid = int(pid_file.read_text())
+    cancel_event.set()
+    worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert failures[0].kind == "cancelled"
+    assert not psutil.pid_exists(nested_pid)
+    assert time.monotonic() - started < 3
 
 
 @pytest.mark.skipif(not MEMORY_CAP_ENFORCED, reason="only Linux enforces RLIMIT_AS; elsewhere the child is uncapped")

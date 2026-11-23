@@ -30,6 +30,7 @@ async def create_debug_browser_session(
             organization_id=organization_id,
             timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
             proxy_location=proxy_location,
+            workflow_permanent_id=workflow_permanent_id,
             wait_for_startup=settings.ENV != "local",
             needs_live_view=True,
             created_by=user_id,

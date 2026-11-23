@@ -492,7 +492,7 @@ type StoredAccept = Pick<EmberAcceptSnapshot, "chatId" | "acceptAttempt"> & {
   alwaysAccept: boolean;
 };
 export const PENDING_ACCEPT_KEY_PREFIX = "ember-pending-accept:";
-// Still the key this bundle writes, so a tab rolled back to an older bundle finds the marker.
+// Read when the Ember key is absent: older bundles wrote this key.
 export const LEGACY_PENDING_ACCEPT_KEY_PREFIX = "copilot-pending-accept:";
 
 export function readStoredAccept(
@@ -522,7 +522,7 @@ export function storePendingAccept(
 ): boolean {
   try {
     sessionStorage.setItem(
-      `${LEGACY_PENDING_ACCEPT_KEY_PREFIX}${workflowPermanentId}`,
+      `${PENDING_ACCEPT_KEY_PREFIX}${workflowPermanentId}`,
       JSON.stringify(value),
     );
     return true;

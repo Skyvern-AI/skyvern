@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 import aiofiles
 import structlog
@@ -86,6 +87,7 @@ class BrowserArtifacts(BaseModel):
     har_path: str | None = None
     traces_dir: str | None = None
     browser_session_dir: str | None = None
+    _credential_profile_writer: Literal["chrome", "msedge", "stealth-chromium"] | None = PrivateAttr(default=None)
     browser_console_log_path: str | None = None
     # Set by remote-CDP creators so RealBrowserManager attaches a CDP frame
     # publisher. Local Playwright contexts leave it False. Type must stay
@@ -277,3 +279,6 @@ class BrowserArtifacts(BaseModel):
                 timeout=timeout,
             )
             return await self._read_console_log_file()
+
+
+CredentialProfileFinalizer = Callable[[BrowserArtifacts | None], Coroutine[Any, Any, None]]

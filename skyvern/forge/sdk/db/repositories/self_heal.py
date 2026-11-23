@@ -29,7 +29,7 @@ def _recent_terminal_runs_select(
             WorkflowRunModel.workflow_permanent_id == workflow_permanent_id,
             WorkflowRunModel.status.in_(_TERMINAL_WORKFLOW_RUN_STATUSES),
             WorkflowRunModel.parent_workflow_run_id.is_(None),
-            WorkflowRunModel.copilot_session_id.is_(None),
+            WorkflowRunModel.ember_session_id.is_(None),
             WorkflowRunModel.debug_session_id.is_(None),
         )
         .order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc())

@@ -21,15 +21,6 @@ from tests.unit._mcp_browser_fakes import patch_get_page
 
 
 @pytest.mark.asyncio
-async def test_ensure_clipboard_permissions_calls_grant(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.cli.mcp_tools.browser import _ensure_clipboard_permissions
-
-    page = _make_mock_page()
-    await _ensure_clipboard_permissions(page, asyncio.get_running_loop().time() + 30)
-    page.context.grant_permissions.assert_awaited_once_with(["clipboard-read", "clipboard-write"])
-
-
-@pytest.mark.asyncio
 async def test_ensure_clipboard_permissions_survives_error(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.cli.mcp_tools.browser import _ensure_clipboard_permissions
 

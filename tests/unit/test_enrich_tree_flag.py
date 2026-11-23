@@ -8,8 +8,8 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     _llm_screenshots_enabled_metric,
     _llm_screenshots_for_call,
 )
-from skyvern.forge.sdk.copilot.video_attachment import VIDEO_PERCEPTION_PROMPT_NAME, VIDEO_SECRET_SAFETY_PROMPT_NAME
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext, parse_enrich_tree_mode
+from skyvern.forge.sdk.ember.video_attachment import VIDEO_PERCEPTION_PROMPT_NAME, VIDEO_SECRET_SAFETY_PROMPT_NAME
 from skyvern.schemas.llm import LLMConfig
 
 

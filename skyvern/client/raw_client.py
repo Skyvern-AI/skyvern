@@ -102,6 +102,7 @@ class RawSkyvern:
         webhook_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
@@ -234,7 +235,7 @@ class RawSkyvern:
             Successfully run task
         """
         _response = self._client_wrapper.httpx_client.request(
-            "v1/run/tasks",
+            "v1/otp-bound/run/tasks" if otp_request_id is not OMIT and otp_request_id is not None else "v1/run/tasks",
             method="POST",
             json={
                 "prompt": prompt,
@@ -254,6 +255,7 @@ class RawSkyvern:
                 "webhook_url": webhook_url,
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
+                "otp_request_id": otp_request_id,
                 "browser_session_id": browser_session_id,
                 "model": model,
                 "extra_http_headers": extra_http_headers,
@@ -322,6 +324,7 @@ class RawSkyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         max_elapsed_time_minutes: typing.Optional[int] = OMIT,
@@ -440,7 +443,7 @@ class RawSkyvern:
             Successfully ran agent
         """
         _response = self._client_wrapper.httpx_client.request(
-            "v1/run/agents",
+            "v1/otp-bound/run/agents" if otp_request_id is not OMIT and otp_request_id is not None else "v1/run/agents",
             method="POST",
             params={
                 "template": template,
@@ -455,6 +458,7 @@ class RawSkyvern:
                 "webhook_url": webhook_url,
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
+                "otp_request_id": otp_request_id,
                 "browser_session_id": browser_session_id,
                 "browser_profile_id": browser_profile_id,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
@@ -3691,6 +3695,7 @@ class RawSkyvern:
         task_id: typing.Optional[str] = OMIT,
         workflow_id: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         source: typing.Optional[str] = OMIT,
         expired_at: typing.Optional[dt.datetime] = OMIT,
         type: typing.Optional[OtpType] = OMIT,
@@ -3716,6 +3721,9 @@ class RawSkyvern:
         workflow_run_id : typing.Optional[str]
             The workflow run id that the TOTP code is for. It can be the workflow run id of the workflow run that the TOTP code is for.
 
+        otp_request_id : typing.Optional[str]
+            Explicit request marker for strict run-bound OTP delivery. When present, the guarded delivery endpoint is used.
+
         source : typing.Optional[str]
             An optional field. The source of the TOTP code. e.g. email, sms, etc.
 
@@ -3734,13 +3742,16 @@ class RawSkyvern:
             Successful Response
         """
         _response = self._client_wrapper.httpx_client.request(
-            "v1/credentials/totp",
+            "v1/otp-bound/credentials/totp"
+            if otp_request_id is not OMIT and otp_request_id is not None
+            else "v1/credentials/totp",
             method="POST",
             json={
                 "totp_identifier": totp_identifier,
                 "task_id": task_id,
                 "workflow_id": workflow_id,
                 "workflow_run_id": workflow_run_id,
+                "otp_request_id": otp_request_id,
                 "source": source,
                 "content": content,
                 "expired_at": expired_at,
@@ -5383,6 +5394,7 @@ class RawSkyvern:
         self,
         workflow_run_id: str,
         *,
+        otp_request_id: typing.Optional[str] = None,
         max_steps_override: typing.Optional[int] = None,
         user_agent: typing.Optional[str] = None,
         request_options: typing.Optional[RequestOptions] = None,
@@ -5394,6 +5406,9 @@ class RawSkyvern:
         ----------
         workflow_run_id : str
             The id of the workflow run to retry.
+
+        otp_request_id : typing.Optional[str]
+            A fresh explicit marker for a strict OTP-bound retry. Omission preserves legacy retry behavior.
 
         max_steps_override : typing.Optional[int]
 
@@ -5408,8 +5423,13 @@ class RawSkyvern:
             Successfully retried workflow run
         """
         _response = self._client_wrapper.httpx_client.request(
-            f"v1/agents/runs/{jsonable_encoder(workflow_run_id)}/retry",
+            (
+                f"v1/otp-bound/workflows/runs/{jsonable_encoder(workflow_run_id)}/retry"
+                if otp_request_id is not None
+                else f"v1/agents/runs/{jsonable_encoder(workflow_run_id)}/retry"
+            ),
             method="POST",
+            json={"otp_request_id": otp_request_id} if otp_request_id is not None else None,
             headers={
                 "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
                 "x-user-agent": str(user_agent) if user_agent is not None else None,
@@ -5472,6 +5492,8 @@ class RawSkyvern:
         status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
         search_key: typing.Optional[str] = None,
         error_code: typing.Optional[str] = None,
+        created_at_start: typing.Optional[dt.datetime] = None,
+        created_at_end: typing.Optional[dt.datetime] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[typing.List[WorkflowRun]]:
         """
@@ -5521,6 +5543,12 @@ class RawSkyvern:
         error_code : typing.Optional[str]
             Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
+        created_at_start : typing.Optional[dt.datetime]
+            Only include runs created at or after this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Supplying it replaces the 30-day default window of a free-text search_key.
+
+        created_at_end : typing.Optional[dt.datetime]
+            Only include runs created strictly before this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Without created_at_start, a free-text search_key covers the 30 days before this time.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -5538,6 +5566,8 @@ class RawSkyvern:
                 "status": status,
                 "search_key": search_key,
                 "error_code": error_code,
+                "created_at_start": serialize_datetime(created_at_start) if created_at_start is not None else None,
+                "created_at_end": serialize_datetime(created_at_end) if created_at_end is not None else None,
             },
             request_options=request_options,
         )
@@ -5804,6 +5834,7 @@ class AsyncRawSkyvern:
         webhook_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
@@ -5936,7 +5967,7 @@ class AsyncRawSkyvern:
             Successfully run task
         """
         _response = await self._client_wrapper.httpx_client.request(
-            "v1/run/tasks",
+            "v1/otp-bound/run/tasks" if otp_request_id is not OMIT and otp_request_id is not None else "v1/run/tasks",
             method="POST",
             json={
                 "prompt": prompt,
@@ -5956,6 +5987,7 @@ class AsyncRawSkyvern:
                 "webhook_url": webhook_url,
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
+                "otp_request_id": otp_request_id,
                 "browser_session_id": browser_session_id,
                 "model": model,
                 "extra_http_headers": extra_http_headers,
@@ -6024,6 +6056,7 @@ class AsyncRawSkyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         max_elapsed_time_minutes: typing.Optional[int] = OMIT,
@@ -6142,7 +6175,7 @@ class AsyncRawSkyvern:
             Successfully ran agent
         """
         _response = await self._client_wrapper.httpx_client.request(
-            "v1/run/agents",
+            "v1/otp-bound/run/agents" if otp_request_id is not OMIT and otp_request_id is not None else "v1/run/agents",
             method="POST",
             params={
                 "template": template,
@@ -6157,6 +6190,7 @@ class AsyncRawSkyvern:
                 "webhook_url": webhook_url,
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
+                "otp_request_id": otp_request_id,
                 "browser_session_id": browser_session_id,
                 "browser_profile_id": browser_profile_id,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
@@ -9393,6 +9427,7 @@ class AsyncRawSkyvern:
         task_id: typing.Optional[str] = OMIT,
         workflow_id: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         source: typing.Optional[str] = OMIT,
         expired_at: typing.Optional[dt.datetime] = OMIT,
         type: typing.Optional[OtpType] = OMIT,
@@ -9418,6 +9453,9 @@ class AsyncRawSkyvern:
         workflow_run_id : typing.Optional[str]
             The workflow run id that the TOTP code is for. It can be the workflow run id of the workflow run that the TOTP code is for.
 
+        otp_request_id : typing.Optional[str]
+            Explicit request marker for strict run-bound OTP delivery. When present, the guarded delivery endpoint is used.
+
         source : typing.Optional[str]
             An optional field. The source of the TOTP code. e.g. email, sms, etc.
 
@@ -9436,13 +9474,16 @@ class AsyncRawSkyvern:
             Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
-            "v1/credentials/totp",
+            "v1/otp-bound/credentials/totp"
+            if otp_request_id is not OMIT and otp_request_id is not None
+            else "v1/credentials/totp",
             method="POST",
             json={
                 "totp_identifier": totp_identifier,
                 "task_id": task_id,
                 "workflow_id": workflow_id,
                 "workflow_run_id": workflow_run_id,
+                "otp_request_id": otp_request_id,
                 "source": source,
                 "content": content,
                 "expired_at": expired_at,
@@ -11085,6 +11126,7 @@ class AsyncRawSkyvern:
         self,
         workflow_run_id: str,
         *,
+        otp_request_id: typing.Optional[str] = None,
         max_steps_override: typing.Optional[int] = None,
         user_agent: typing.Optional[str] = None,
         request_options: typing.Optional[RequestOptions] = None,
@@ -11096,6 +11138,9 @@ class AsyncRawSkyvern:
         ----------
         workflow_run_id : str
             The id of the workflow run to retry.
+
+        otp_request_id : typing.Optional[str]
+            A fresh explicit marker for a strict OTP-bound retry. Omission preserves legacy retry behavior.
 
         max_steps_override : typing.Optional[int]
 
@@ -11110,8 +11155,13 @@ class AsyncRawSkyvern:
             Successfully retried workflow run
         """
         _response = await self._client_wrapper.httpx_client.request(
-            f"v1/agents/runs/{jsonable_encoder(workflow_run_id)}/retry",
+            (
+                f"v1/otp-bound/workflows/runs/{jsonable_encoder(workflow_run_id)}/retry"
+                if otp_request_id is not None
+                else f"v1/agents/runs/{jsonable_encoder(workflow_run_id)}/retry"
+            ),
             method="POST",
+            json={"otp_request_id": otp_request_id} if otp_request_id is not None else None,
             headers={
                 "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
                 "x-user-agent": str(user_agent) if user_agent is not None else None,
@@ -11174,6 +11224,8 @@ class AsyncRawSkyvern:
         status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
         search_key: typing.Optional[str] = None,
         error_code: typing.Optional[str] = None,
+        created_at_start: typing.Optional[dt.datetime] = None,
+        created_at_end: typing.Optional[dt.datetime] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[typing.List[WorkflowRun]]:
         """
@@ -11223,6 +11275,12 @@ class AsyncRawSkyvern:
         error_code : typing.Optional[str]
             Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
+        created_at_start : typing.Optional[dt.datetime]
+            Only include runs created at or after this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Supplying it replaces the 30-day default window of a free-text search_key.
+
+        created_at_end : typing.Optional[dt.datetime]
+            Only include runs created strictly before this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Without created_at_start, a free-text search_key covers the 30 days before this time.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -11240,6 +11298,8 @@ class AsyncRawSkyvern:
                 "status": status,
                 "search_key": search_key,
                 "error_code": error_code,
+                "created_at_start": serialize_datetime(created_at_start) if created_at_start is not None else None,
+                "created_at_end": serialize_datetime(created_at_end) if created_at_end is not None else None,
             },
             request_options=request_options,
         )

@@ -254,6 +254,7 @@ async def test_run_task_v2_copies_parent_loop_state_into_child_context(monkeypat
         workflow_id="wf_child",
         workflow_run_id="wr_child",
         error_code_mapping=None,
+        otp_request_id=None,
     )
     captured_contexts: list[SkyvernContext] = []
 
@@ -298,7 +299,12 @@ async def test_run_task_v2_copies_parent_loop_state_into_child_context(monkeypat
 @pytest.mark.asyncio
 async def test_run_task_v2_browser_creation_reports_request_to_ready_latency(monkeypatch: pytest.MonkeyPatch) -> None:
     skyvern_context.set(SkyvernContext(organization_id="org_parent", workflow_run_id="wr_parent", run_id="wr_parent"))
-    task_v2 = SimpleNamespace(observer_cruise_id="tsk_v2_child", workflow_id=None, workflow_run_id=None)
+    task_v2 = SimpleNamespace(
+        observer_cruise_id="tsk_v2_child",
+        workflow_id=None,
+        workflow_run_id=None,
+        otp_request_id=None,
+    )
     manager = RealBrowserManager()
     selection = BrowserEngineSelection(
         name="playwright",

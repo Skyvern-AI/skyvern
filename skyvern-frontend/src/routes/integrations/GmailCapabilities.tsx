@@ -6,6 +6,8 @@ import {
   UpdateIcon,
 } from "@radix-ui/react-icons";
 import type { GoogleOAuthCredential } from "@/api/types";
+import { AdminOnlyTooltip } from "@/components/AdminOnlyTooltip";
+import { adminOnlyReason } from "@/components/adminOnlyReason";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import {
@@ -37,6 +39,8 @@ type PillsProps = {
   needsReconnect?: boolean;
   pendingAction?: GmailCapability | "reconnect" | null;
   disabled?: boolean;
+  // Disabled because the user lacks the permission, which the pills then explain.
+  adminOnly?: boolean;
   disabledCapabilities?: Partial<Record<GmailCapability, boolean>>;
   onEnable: (capability: GmailCapability) => void;
   onReconnect?: () => void;
@@ -47,33 +51,39 @@ function GmailCapabilityPills({
   needsReconnect = false,
   pendingAction = null,
   disabled = false,
+  adminOnly = false,
   disabledCapabilities,
   onEnable,
   onReconnect,
 }: PillsProps) {
   const name = credential.credential_name;
-  const isBusy = disabled || pendingAction !== null;
+  const isBusy = disabled || adminOnly || pendingAction !== null;
 
   if (needsReconnect) {
     return (
-      <button
-        type="button"
-        aria-label={`Reconnect ${name}`}
-        disabled={isBusy}
-        onClick={onReconnect}
-        className={cn(
-          PILL,
-          PILL_BUTTON,
-          "border-amber-500/30 bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 dark:text-amber-500",
-        )}
+      <AdminOnlyTooltip
+        allowed={!adminOnly}
+        reason={adminOnlyReason("reconnect an account")}
       >
-        {pendingAction === "reconnect" ? (
-          <ReloadIcon className="size-3 animate-spin" />
-        ) : (
-          <UpdateIcon className="size-3" />
-        )}
-        Reconnect
-      </button>
+        <button
+          type="button"
+          aria-label={`Reconnect ${name}`}
+          disabled={isBusy}
+          onClick={onReconnect}
+          className={cn(
+            PILL,
+            PILL_BUTTON,
+            "border-amber-500/30 bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 dark:text-amber-500",
+          )}
+        >
+          {pendingAction === "reconnect" ? (
+            <ReloadIcon className="size-3 animate-spin" />
+          ) : (
+            <UpdateIcon className="size-3" />
+          )}
+          Reconnect
+        </button>
+      </AdminOnlyTooltip>
     );
   }
 
@@ -98,32 +108,37 @@ function GmailCapabilityPills({
         // The server refuses to add sending to a connection with no recorded account.
         const needsReconnectFirst = id === "send" && !credential.email_address;
         return (
-          <button
+          <AdminOnlyTooltip
             key={id}
-            type="button"
-            aria-label={`Enable ${label.toLowerCase()} for ${name}`}
-            title={
-              needsReconnectFirst
-                ? "Reconnect this account before enabling sending."
-                : undefined
-            }
-            disabled={
-              isBusy || needsReconnectFirst || disabledCapabilities?.[id]
-            }
-            onClick={() => onEnable(id)}
-            className={cn(
-              PILL,
-              PILL_BUTTON,
-              "border-dashed border-neutral-400 bg-transparent text-neutral-700 hover:border-neutral-600 hover:bg-neutral-100 dark:border-slate-600 dark:text-slate-300 dark:hover:border-slate-400 dark:hover:bg-slate-800/60 dark:hover:text-slate-100",
-            )}
+            allowed={!adminOnly}
+            reason={adminOnlyReason("add permissions to an account")}
           >
-            {pendingAction === id ? (
-              <ReloadIcon className="size-3 animate-spin" />
-            ) : (
-              <PlusIcon className="size-3" />
-            )}
-            {label}
-          </button>
+            <button
+              type="button"
+              aria-label={`Enable ${label.toLowerCase()} for ${name}`}
+              title={
+                needsReconnectFirst
+                  ? "Reconnect this account before enabling sending."
+                  : undefined
+              }
+              disabled={
+                isBusy || needsReconnectFirst || disabledCapabilities?.[id]
+              }
+              onClick={() => onEnable(id)}
+              className={cn(
+                PILL,
+                PILL_BUTTON,
+                "border-dashed border-neutral-400 bg-transparent text-neutral-700 hover:border-neutral-600 hover:bg-neutral-100 dark:border-slate-600 dark:text-slate-300 dark:hover:border-slate-400 dark:hover:bg-slate-800/60 dark:hover:text-slate-100",
+              )}
+            >
+              {pendingAction === id ? (
+                <ReloadIcon className="size-3 animate-spin" />
+              ) : (
+                <PlusIcon className="size-3" />
+              )}
+              {label}
+            </button>
+          </AdminOnlyTooltip>
         );
       })}
     </>

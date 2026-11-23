@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
-from skyvern.cli.core import copilot_sessions, session_manager
+from skyvern.cli.core import ember_sessions, session_manager
 from skyvern.cli.core.browser_ops import NavigateResult
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import SessionState
@@ -1025,28 +1025,6 @@ async def test_tab_wait_for_new_arrives_async(monkeypatch: pytest.MonkeyPatch) -
 
 
 class TestMultiPageInspectionHooks:
-    def test_hooks_registered_on_all_pages(self) -> None:
-        from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
-
-        page_a = MagicMock()
-        page_a.is_closed.return_value = False
-        page_a.on = MagicMock()
-
-        page_b = MagicMock()
-        page_b.is_closed.return_value = False
-        page_b.on = MagicMock()
-
-        state = _make_session_state()
-
-        ensure_hooks_on_all_pages(state, [page_a, page_b])
-
-        # Both pages should have hooks
-        assert id(page_a) in state._hooked_page_ids
-        assert id(page_b) in state._hooked_page_ids
-        # 6 events per page: console, response, requestfailed, close, dialog, pageerror
-        assert page_a.on.call_count == 6
-        assert page_b.on.call_count == 6
-
     def test_hooks_idempotent(self) -> None:
         from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
 
@@ -1183,12 +1161,12 @@ class TestTabStatePersistenceGuards:
         assert result["error"]["code"] == "ACTION_FAILED"
 
     @pytest.mark.asyncio
-    async def test_tab_switch_allows_registered_copilot_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_tab_switch_allows_registered_ember_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page_a = _make_mock_page("https://a.com", "A")
         page_b = _make_mock_page("https://b.com", "B")
         owned = SessionState(browser=_make_mock_browser(page_a, page_b), organization_id="org_tabs")
         session_manager.set_stateless_http_mode(True)
-        copilot_sessions.register_copilot_session("pbs_tabs", owned, organization_id="org_tabs")
+        ember_sessions.register_ember_session("pbs_tabs", owned, organization_id="org_tabs")
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_tabs")
 
         async def _resolve_browser_installing_registered(
@@ -1201,7 +1179,7 @@ class TestTabStatePersistenceGuards:
         try:
             result = await mcp_tabs.skyvern_tab_switch(tab_id=str(id(page_b)))
         finally:
-            copilot_sessions.unregister_copilot_session("pbs_tabs", organization_id="org_tabs")
+            ember_sessions.unregister_ember_session("pbs_tabs", organization_id="org_tabs")
 
         assert result["ok"] is True
         assert owned.tab_state_persists is True

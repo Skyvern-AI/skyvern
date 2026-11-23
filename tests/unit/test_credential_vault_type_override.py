@@ -1,13 +1,18 @@
 """Tests for per-credential vault_type override in CreateCredentialRequest and vault service routing."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from skyvern.config import Settings
+from skyvern.config import Settings, settings
+from skyvern.forge import app
+from skyvern.forge.forge_app import ForgeApp
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.routes import credentials as credentials_routes
 from skyvern.forge.sdk.routes.credentials import _delete_temporary_test_login_credential
 from skyvern.forge.sdk.schemas.credentials import (
@@ -19,8 +24,11 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredentialResponse,
     SecretCredential,
     SecretCredentialResponse,
+    TotpType,
 )
+from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential import custom_credential_vault_service as custom_vault_module
+from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
 from skyvern.forge.sdk.services.credential.credential_creation_service import (
     get_credential_vault_service as _get_credential_vault_service,
 )
@@ -29,6 +37,8 @@ from skyvern.forge.sdk.services.credential.custom_credential_vault_service impor
     CONFIGURATION_INVALID_MESSAGE,
     CustomCredentialVaultService,
 )
+from skyvern.forge.sdk.services.credential.skyvern_credential_vault_service import SkyvernCredentialVaultService
+from skyvern.forge.sdk.settings_manager import SettingsManager
 
 
 class TestLocalCredentialVaultSettings:
@@ -552,87 +562,125 @@ class TestTemporaryTestLoginCredentialCleanup:
     """Verify temporary login-test credentials are deleted through the owning vault service."""
 
     @pytest.mark.asyncio
-    async def test_deletes_temporary_skyvern_credential_through_vault_service(self) -> None:
-        credential = SimpleNamespace(
-            credential_id="cred_temp",
-            organization_id="org_test",
-            name="_test_login_example",
-            vault_type=CredentialVaultType.SKYVERN,
+    @pytest.mark.parametrize(
+        ("temporary_marker", "profile_id", "should_delete"),
+        [
+            pytest.param(True, None, True, id="temporary"),
+            pytest.param(False, None, False, id="permanent"),
+            pytest.param(None, None, False, id="unknown-marker"),
+            pytest.param(True, "bp_linked", False, id="linked"),
+        ],
+    )
+    async def test_deletes_temporary_skyvern_credential_through_vault_service(
+        self,
+        temporary_marker: bool | None,
+        profile_id: str | None,
+        should_delete: bool,
+        sqlite_engine: AsyncEngine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db = AgentDB(str(sqlite_engine.url), db_engine=sqlite_engine)
+        credential = await db.credentials.create_credential(
+            "org_test",
+            "_test_login_example",
+            CredentialVaultType.SKYVERN,
+            "synthetic-test-login",
+            CredentialType.PASSWORD,
+            "synthetic@example.invalid",
+            TotpType.NONE,
+            None,
+            None,
         )
-        mock_repository = MagicMock()
-        mock_repository.get_credential = AsyncMock(return_value=credential)
-        mock_service = MagicMock(spec=CredentialVaultService)
-        mock_service.delete_credential = AsyncMock()
-        mock_settings = MagicMock()
-        mock_settings.is_local_credential_vault_enabled.return_value = True
+        await db.credentials.update_credential(
+            credential.credential_id,
+            credential.organization_id,
+            is_test_login_temporary=temporary_marker,
+            browser_profile_id=profile_id,
+        )
+        item_path = tmp_path / f"{credential.item_id}.bin"
+        item_path.touch()
+        monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
+        monkeypatch.setattr(SettingsManager.get_settings(), "ENABLE_LOCAL_CREDENTIAL_VAULT", True)
+        monkeypatch.setattr(app, "DATABASE", db)
+        monkeypatch.setattr(
+            ForgeApp, "SKYVERN_CREDENTIAL_VAULT_SERVICE", SkyvernCredentialVaultService(), raising=False
+        )
 
-        with (
-            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
-            patch("skyvern.forge.sdk.services.credential.credential_creation_service.app") as mock_creation_app,
-            patch(
-                "skyvern.forge.sdk.services.credential.credential_creation_service.SettingsManager.get_settings",
-                return_value=mock_settings,
-            ),
-        ):
-            mock_app.DATABASE.credentials = mock_repository
-            mock_creation_app.SKYVERN_CREDENTIAL_VAULT_SERVICE = mock_service
+        await _delete_temporary_test_login_credential(
+            credential_id=credential.credential_id,
+            organization_id=credential.organization_id,
+            reason="test",
+        )
 
-            await _delete_temporary_test_login_credential(
-                credential_id="cred_temp",
-                organization_id="org_test",
-                reason="test",
-            )
-
-        mock_service.delete_credential.assert_awaited_once_with(credential)
+        saved = await db.credentials.get_credential(credential.credential_id, credential.organization_id)
+        assert (saved is None) is should_delete
+        assert item_path.exists() is not should_delete
 
     @pytest.mark.asyncio
-    async def test_defaults_missing_vault_type_to_bitwarden_for_legacy_credentials(self) -> None:
-        credential = SimpleNamespace(
-            credential_id="cred_temp",
-            organization_id="org_test",
-            name="_test_login_example",
-            vault_type=None,
+    async def test_deletes_temporary_bitwarden_credential_through_vault_service(
+        self, sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db = AgentDB(str(sqlite_engine.url), db_engine=sqlite_engine)
+        credential = await db.credentials.create_credential(
+            "org_test",
+            "_test_login_example",
+            None,
+            "synthetic-test-login",
+            CredentialType.PASSWORD,
+            "synthetic@example.invalid",
+            TotpType.NONE,
+            None,
+            None,
         )
-        mock_repository = MagicMock()
-        mock_repository.get_credential = AsyncMock(return_value=credential)
-        mock_service = MagicMock(spec=CredentialVaultService)
-        mock_service.delete_credential = AsyncMock()
+        await db.credentials.create_organization_bitwarden_collection(credential.organization_id, "test-collection")
+        await db.credentials.update_credential(
+            credential.credential_id, credential.organization_id, is_test_login_temporary=True
+        )
+        vault_items = {credential.item_id}
 
-        with (
-            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
-            patch("skyvern.forge.sdk.services.credential.credential_creation_service.app") as mock_creation_app,
-        ):
-            mock_app.DATABASE.credentials = mock_repository
-            mock_creation_app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = mock_service
+        async def delete_item(item_id: str) -> None:
+            vault_items.remove(item_id)
 
-            await _delete_temporary_test_login_credential(
-                credential_id="cred_temp",
-                organization_id="org_test",
-                reason="test",
-            )
+        monkeypatch.setattr(SettingsManager.get_settings(), "CREDENTIAL_VAULT_TYPE", CredentialVaultType.SKYVERN)
+        monkeypatch.setattr(app, "DATABASE", db)
+        monkeypatch.setattr(
+            ForgeApp, "BITWARDEN_CREDENTIAL_VAULT_SERVICE", BitwardenCredentialVaultService(), raising=False
+        )
+        monkeypatch.setattr(BitwardenService, "delete_credential_item", delete_item)
 
-        mock_service.delete_credential.assert_awaited_once_with(credential)
+        await _delete_temporary_test_login_credential(
+            credential_id=credential.credential_id,
+            organization_id=credential.organization_id,
+            reason="test",
+        )
+
+        assert await db.credentials.get_credential(credential.credential_id, credential.organization_id) is None
+        assert not vault_items
 
     @pytest.mark.asyncio
-    async def test_ignores_non_temporary_credentials(self) -> None:
-        credential = SimpleNamespace(
-            credential_id="cred_regular",
-            organization_id="org_test",
-            name="regular credential",
-            vault_type=CredentialVaultType.SKYVERN,
+    async def test_ignores_non_temporary_credentials(
+        self, sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db = AgentDB(str(sqlite_engine.url), db_engine=sqlite_engine)
+        credential = await db.credentials.create_credential(
+            "org_test",
+            "regular credential",
+            CredentialVaultType.SKYVERN,
+            "synthetic-regular",
+            CredentialType.PASSWORD,
+            "synthetic@example.invalid",
+            TotpType.NONE,
+            None,
+            None,
         )
-        mock_repository = MagicMock()
-        mock_repository.get_credential = AsyncMock(return_value=credential)
-        mock_service = MagicMock(spec=CredentialVaultService)
-        mock_service.delete_credential = AsyncMock()
-
-        with patch("skyvern.forge.sdk.routes.credentials.app") as mock_app:
-            mock_app.DATABASE.credentials = mock_repository
-
-            await _delete_temporary_test_login_credential(
-                credential_id="cred_regular",
-                organization_id="org_test",
-                reason="test",
-            )
-
-        mock_service.delete_credential.assert_not_awaited()
+        await db.credentials.update_credential(
+            credential.credential_id, credential.organization_id, is_test_login_temporary=True
+        )
+        monkeypatch.setattr(app, "DATABASE", db)
+        await _delete_temporary_test_login_credential(
+            credential_id=credential.credential_id,
+            organization_id=credential.organization_id,
+            reason="test",
+        )
+        assert await db.credentials.get_credential(credential.credential_id, credential.organization_id) is not None

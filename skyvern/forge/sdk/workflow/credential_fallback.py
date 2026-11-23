@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import (
-    FAILURE_CLASSIFIER_V2_REASON_CODE,
+    CLASSIFIER_LABEL_REASON_CODES,
     classify_from_failure_reason,
 )
 from skyvern.forge.sdk.core import skyvern_context
@@ -75,7 +75,7 @@ def _failure_category_names(workflow_run: WorkflowRun) -> set[str]:
     categories: list[dict[str, Any]] | None = [
         entry
         for entry in without_final_har_user_match(workflow_run.failure_category) or []
-        if not (isinstance(entry, dict) and entry.get("reason_code") == FAILURE_CLASSIFIER_V2_REASON_CODE)
+        if not (isinstance(entry, dict) and entry.get("reason_code") in CLASSIFIER_LABEL_REASON_CODES)
     ]
     if not categories:
         categories = classify_from_failure_reason(workflow_run.failure_reason)
@@ -186,6 +186,13 @@ async def _maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, orga
     # runs before the flag check and DB reads so the success path stays cheap. _trigger_matches
     # below still applies the finer per-parameter trigger (credential_failures vs any_failure).
     if workflow_run.status not in RETRYABLE_STATUSES:
+        return None
+
+    # Credential fallback is a new top-level run, not a child execution of this owner. Reusing the
+    # marker would collide with the original binding, while dropping it would silently downgrade a
+    # strict operation to legacy matching. Strict runs therefore fail closed; unmarked runs retain
+    # the existing automatic fallback behavior (including vault-backed credential selection).
+    if workflow_run.otp_request_id is not None:
         return None
 
     if await app.AGENT_FUNCTION.get_workflow_run_retry_refusal(workflow_run) is not None:

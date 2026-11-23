@@ -381,7 +381,6 @@ _MULTI_FIELD_TOTP_OPERATION_TIMEOUT_SECONDS = _MULTI_FIELD_TOTP_OPERATION_TIMEOU
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
-COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
 COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG = "COLLAPSE_AUTOCOMPLETE_FANOUT"
 COLLAPSE_XP_ASSIGNMENT_FLAG = "COLLAPSE_XP_ASSIGNMENT"
 # Nested dispatch replaces contexts, so run-stickiness is process-local and keyed by run ID.
@@ -851,10 +850,14 @@ def _truncate_select_shadow_field(text: str | None) -> str | None:
     return text[:SELECT_SHADOW_MATCH_FIELD_MAX_CHARS] + "…"
 
 
-def _normalized_select_shadow_field(text: str | None) -> str | None:
-    if text is None:
+def _select_shadow_length(text: str | None) -> int | None:
+    return None if text is None else len(text)
+
+
+def _select_shadow_equal(left: str | None, right: str | None) -> bool | None:
+    if left is None or right is None:
         return None
-    return _truncate_select_shadow_field(_normalize_select_shadow_text(text))
+    return _normalize_select_shadow_text(left) == _normalize_select_shadow_text(right)
 
 
 def _collapse_select_shadow_field(text: str | None) -> str | None:
@@ -951,18 +954,18 @@ async def _verify_autocomplete_option_identity(
             LOG.info(
                 "Autocomplete option index differed from deterministic candidate; accepting label match",
                 expected_index=matched_index,
-                expected_label=matched_label,
+                expected_label_length=len(str(matched_label or "")),
                 actual_index=actual_index,
-                actual_label=actual_label,
+                actual_label_length=len(str(actual_label or "")),
             )
         return True
 
     LOG.info(
         "Autocomplete option identity did not match deterministic candidate",
         expected_index=matched_index,
-        expected_label=matched_label,
+        expected_label_length=len(str(matched_label or "")),
         actual_index=actual_index,
-        actual_label=actual_label,
+        actual_label_length=len(str(actual_label or "")),
     )
     return False
 
@@ -983,8 +986,8 @@ async def _verify_autocomplete_input_readback(
     LOG.info(
         "Autocomplete read-back did not match deterministic option",
         expected_index=matched_index,
-        expected_label=matched_label,
-        actual_value=actual_value,
+        expected_label_length=len(str(matched_label or "")),
+        actual_value_length=len(str(actual_value or "")),
     )
     return False
 
@@ -1270,18 +1273,20 @@ def _log_select_shadow_match(
         if matched_index is not None and result.agrees is not True:
             matched_candidate = candidates[matched_index] if matched_index < len(candidates) else {}
             disagreement_fields = {
-                "target_value": _truncate_select_shadow_field(target_value),
+                "target_value_length": len(str(target_value or "")),
                 "matched_index": matched_index,
-                "matched_label": _truncate_select_shadow_field(matched_candidate.get("label")),
-                "matched_value": _truncate_select_shadow_field(matched_candidate.get("value")),
+                "matched_label_length": _select_shadow_length(matched_candidate.get("label")),
+                "matched_value_length": _select_shadow_length(matched_candidate.get("value")),
                 "matched_element_id": matched_candidate.get("element_id"),
                 "llm_index": result.llm_index,
-                "llm_value": _truncate_select_shadow_field(result.llm_value),
+                "llm_value_length": _select_shadow_length(result.llm_value),
                 "llm_element_id": result.llm_element_id,
-                "normalized_target_value": _normalized_select_shadow_field(target_value),
-                "normalized_matched_label": _normalized_select_shadow_field(matched_candidate.get("label")),
-                "normalized_matched_value": _normalized_select_shadow_field(matched_candidate.get("value")),
-                "normalized_llm_value": _normalized_select_shadow_field(result.llm_value),
+                "llm_value_equals_matched_label_normalized": _select_shadow_equal(
+                    result.llm_value, matched_candidate.get("label")
+                ),
+                "llm_value_equals_matched_value_normalized": _select_shadow_equal(
+                    result.llm_value, matched_candidate.get("value")
+                ),
             }
             disagreement_fields = {key: value for key, value in disagreement_fields.items() if value is not None}
         LOG.info(
@@ -2909,7 +2914,7 @@ def _phone_digits(value: str | None) -> str:
 def _input_target_log_fields(*, is_tel: bool, text: str) -> dict[str, str | int]:
     if is_tel:
         return {"target_digit_count": len(_phone_digits(text))}
-    return {"target_value": text}
+    return {"target_value_length": len(text)}
 
 
 def _browser_error_log_fields(exc: Exception, *, is_tel: bool) -> dict[str, str]:
@@ -3172,7 +3177,7 @@ async def _resolve_collapse_xp_assignment(
 
 async def _resolve_collapse_gate(
     task: Task,
-    family_flag: str,
+    family_flag: str | None,
     log_label: str,
     *,
     consult_assignment: bool = True,
@@ -3194,7 +3199,7 @@ async def _resolve_collapse_gate(
             "workflow_permanent_id": workflow_permanent_id or "",
             "script_mode": "true" if script_mode_run else "false",
         }
-        family_enabled = bool(
+        family_enabled = family_flag is None or bool(
             await experimentation_provider.is_feature_enabled_cached(
                 family_flag,
                 organization_id,
@@ -3236,14 +3241,6 @@ async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
         consult_assignment=False,
     )
     return gate.family_enabled
-
-
-async def _is_collapse_custom_select_fanout_enabled(task: Task) -> bool:
-    return await _is_collapse_fanout_enabled(
-        task,
-        COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
-        "collapse-custom-select-fanout",
-    )
 
 
 async def _is_collapse_autocomplete_fanout_enabled(task: Task) -> bool:
@@ -4589,8 +4586,8 @@ async def _normal_select_readback_contradicts(
         LOG.info(
             "Failed to read normal select option after deterministic selection; keeping select_option success",
             expected_index=matched_index,
-            expected_label=matched_label,
-            expected_value=matched_value,
+            expected_label_length=len(str(matched_label or "")),
+            expected_value_length=len(str(matched_value or "")),
             exc_info=True,
         )
         return False
@@ -4599,8 +4596,8 @@ async def _normal_select_readback_contradicts(
         LOG.info(
             "Normal select read-back returned unexpected payload; keeping select_option success",
             expected_index=matched_index,
-            expected_label=matched_label,
-            expected_value=matched_value,
+            expected_label_length=len(str(matched_label or "")),
+            expected_value_length=len(str(matched_value or "")),
             actual_selection=selection,
         )
         return False
@@ -4624,11 +4621,13 @@ async def _normal_select_readback_contradicts(
     LOG.info(
         "Normal select read-back did not match deterministic option",
         expected_index=matched_index,
-        expected_label=expected_label,
-        expected_value=expected_value,
+        expected_label_length=len(str(expected_label or "")),
+        expected_value_length=len(str(expected_value or "")),
         actual_index=actual_index,
-        actual_label=actual_label,
-        actual_value=actual_value,
+        actual_label_length=len(str(actual_label or "")),
+        actual_value_length=len(str(actual_value or "")),
+        labels_equal_normalized=" ".join(str(actual_label or "").split()).casefold()
+        == str(expected_label or "").casefold(),
     )
     return True
 
@@ -8155,7 +8154,7 @@ async def _build_after_click_verify_prompt(
     # SKY-9718 Layer 1: sequential-click after-dropdown verifier path. Keep
     # Skyvern IDs (default html_need_skyvern_attrs=True) because
     # `new_elements_ids` is threaded and the LLM compares those IDs to what's
-    # rendered. Gate lean on the PostHog flag.
+    # rendered.
     _ctx = skyvern_context.current()
     lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
     slim_output = await get_slim_output_template_value("check-user-goal")
@@ -10472,7 +10471,7 @@ async def _handle_input_text_action(
             except Exception:
                 LOG.warning(
                     "Failed to check the date format, using the original text to fill in the date input",
-                    text=text,
+                    text_length=len(str(text)),
                     action=action,
                     exc_info=True,
                 )
@@ -11549,7 +11548,7 @@ async def handle_select_option_action(
         ):
             LOG.info(
                 "Optional custom-select found no matching option; recording an optional miss and skipping the step",
-                target_value=action.option.label or action.option.value,
+                target_value_length=len(str(action.option.label or action.option.value or "")),
             )
             results.append(ActionAbort())
             return results
@@ -11586,7 +11585,7 @@ async def handle_select_option_action(
     LOG.info(
         "Try to select by value in custom select",
         element_id=skyvern_element.get_id(),
-        value=suggested_value,
+        value_length=len(str(suggested_value)) if suggested_value is not None else None,
     )
     try:
         await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
@@ -13302,7 +13301,7 @@ async def choose_auto_completion_dropdown(
                                 "Autocomplete deterministic option identity failed, resetting input before LLM fallback",
                                 element_id=matched_element_id,
                                 matched_index=matched_index,
-                                matched_label=matched_label,
+                                matched_label_length=len(str(matched_label or "")),
                             )
                             (
                                 incremental_scraped,
@@ -13328,9 +13327,9 @@ async def choose_auto_completion_dropdown(
                             LOG.info(
                                 "Autocomplete deterministic fast path: exact/stem option found, skipping LLM",
                                 element_id=matched_element_id,
-                                input_value=text,
+                                input_value_length=len(str(text)),
                                 matched_index=matched_index,
-                                matched_label=matched_label,
+                                matched_label_length=len(str(matched_label or "")),
                             )
                             try:
                                 await matched_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
@@ -13347,14 +13346,14 @@ async def choose_auto_completion_dropdown(
                                     "Autocomplete deterministic read-back failed, resetting input before LLM fallback",
                                     element_id=matched_element_id,
                                     matched_index=matched_index,
-                                    matched_label=matched_label,
+                                    matched_label_length=len(str(matched_label or "")),
                                 )
                             except Exception:
                                 LOG.info(
                                     "Autocomplete deterministic fast-path click/read-back failed, falling through to LLM",
                                     element_id=matched_element_id,
                                     matched_index=matched_index,
-                                    matched_label=matched_label,
+                                    matched_label_length=len(str(matched_label or "")),
                                     exc_info=True,
                                 )
                             (
@@ -13385,7 +13384,7 @@ async def choose_auto_completion_dropdown(
                             "Autocomplete deterministic option detached before click, resetting input before LLM fallback",
                             element_id=matched_element_id,
                             matched_index=matched_index,
-                            matched_label=matched_label,
+                            matched_label_length=len(str(matched_label or "")),
                         )
                         (
                             incremental_scraped,
@@ -13423,7 +13422,7 @@ async def choose_auto_completion_dropdown(
                         LOG.info(
                             "Location auto-completion fast path: single option found, skipping LLM",
                             element_id=fast_path_element_id,
-                            input_value=text,
+                            input_value_length=len(str(text)),
                         )
                         try:
                             await fast_path_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
@@ -13501,7 +13500,7 @@ async def choose_auto_completion_dropdown(
         if json_response.get("direct_searching", False):
             LOG.info(
                 "Decided to directly search with the current value",
-                value=text,
+                value_length=len(str(text)),
             )
             await skyvern_element.press_key("Enter")
             clear_input = False
@@ -13571,7 +13570,7 @@ async def choose_auto_completion_dropdown(
             "Failed to choose the auto completion dropdown",
             sampling=True,
             exc_info=True,
-            input_value=text,
+            input_value_length=len(str(text)),
         )
         result.action_result = ActionFailure(exception=e)
         return result
@@ -13664,7 +13663,7 @@ async def input_or_auto_complete_input(
         LOG.info(
             "Try the potential value for auto completion",
             sampling=True,
-            input_value=current_value,
+            input_value_length=len(str(current_value)),
         )
         is_location = input_or_select_context.is_location_input or False
         attempt_started_at = monotonic()
@@ -13716,7 +13715,7 @@ async def input_or_auto_complete_input(
                 element_id=skyvern_element.get_id(),
                 elapsed_seconds=round(_elapsed_seconds(), 1),
                 budget_seconds=retry_budget_seconds,
-                attempts=attempt_timings,
+                attempt_seconds=[attempt["seconds"] for attempt in attempt_timings],
             )
         else:
             prompt = prompt_engine.load_prompt(
@@ -13731,7 +13730,7 @@ async def input_or_auto_complete_input(
 
             LOG.info(
                 "Ask LLM to give potential values based on the current value",
-                current_value=current_value,
+                current_value_length=len(str(current_value)),
                 potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
             )
             if collapse_autocomplete_fanout_enabled and action is not None:
@@ -13746,7 +13745,7 @@ async def input_or_auto_complete_input(
             if not value:
                 LOG.info(
                     "Empty potential value, skip this attempt",
-                    value=each_value,
+                    value_index=value_index,
                 )
                 continue
             if _retry_budget_exhausted():
@@ -13755,14 +13754,14 @@ async def input_or_auto_complete_input(
                     element_id=skyvern_element.get_id(),
                     elapsed_seconds=round(_elapsed_seconds(), 1),
                     budget_seconds=retry_budget_seconds,
-                    attempts=attempt_timings,
+                    attempt_seconds=[attempt["seconds"] for attempt in attempt_timings],
                     skipped_value_count=len(values) - value_index,
                 )
                 break
             LOG.info(
                 "Try the potential value for auto completion",
                 sampling=True,
-                input_value=value,
+                input_value_length=len(str(value)),
             )
             attempt_started_at = monotonic()
             result = await choose_auto_completion_dropdown(
@@ -13792,7 +13791,7 @@ async def input_or_auto_complete_input(
         if current_attemp < MAX_AUTO_COMPLETE_ATTEMP:
             LOG.info(
                 "Ask LLM to tweak the current value based on tried input values",
-                current_value=current_value,
+                current_value_length=len(str(current_value)),
                 current_attemp=current_attemp,
             )
             cleaned_new_elements = remove_duplicated_HTML_element(whole_new_elements)
@@ -13816,8 +13815,8 @@ async def input_or_auto_complete_input(
             LOG.info(
                 "Ask LLM tweaked the current value with a new value",
                 field_information=input_or_select_context.field,
-                current_value=current_value,
-                new_value=new_current_value,
+                current_value_length=len(str(current_value)),
+                new_value_length=len(str(new_current_value)),
             )
             current_value = new_current_value
 
@@ -13826,7 +13825,7 @@ async def input_or_auto_complete_input(
             LOG.info(
                 "Auto completion attempts exhausted, trying discover-all-options fallback",
                 element_id=skyvern_element.get_id(),
-                original_text=text,
+                original_text_length=len(str(text or "")),
             )
             fallback_result = await discover_and_select_from_full_dropdown(
                 context=input_or_select_context,
@@ -13845,7 +13844,7 @@ async def input_or_auto_complete_input(
             "Auto completion didn't finish, this might leave the input value to be empty.",
             sampling=True,
             **llm_response_log_metadata(input_or_select_context.model_dump()),
-            attempts=attempt_timings,
+            attempt_seconds=[attempt["seconds"] for attempt in attempt_timings],
             total_seconds=round(_elapsed_seconds(), 1),
         )
         return None
@@ -13977,7 +13976,7 @@ async def discover_and_select_from_full_dropdown(
         LOG.info(
             "Discover fallback: asking LLM to pick from actual options",
             element_id=skyvern_element.get_id(),
-            original_text=original_text,
+            original_text_length=len(str(original_text)),
         )
         json_response = await get_org_aware_secondary_llm_api_handler(default=app.AUTO_COMPLETION_LLM_API_HANDLER)(
             prompt=prompt, step=step, prompt_name="auto-completion-choose-option"
@@ -14000,7 +13999,7 @@ async def discover_and_select_from_full_dropdown(
             "Discover fallback: found suitable option, typing discovered value to trigger auto-completion",
             element_id=element_id,
             relevance_float=relevance_float,
-            discovered_value=discovered_value,
+            discovered_value_length=len(str(discovered_value)),
         )
 
         if not discovered_value:
@@ -14023,14 +14022,14 @@ async def discover_and_select_from_full_dropdown(
             await skyvern_element.press_key("Enter")
             LOG.info(
                 "Discover fallback: selected option via keyboard",
-                discovered_value=discovered_value,
+                discovered_value_length=len(str(discovered_value)),
             )
             return ActionSuccess()
         except Exception:
             LOG.info(
                 "Discover fallback: keyboard selection failed",
                 exc_info=True,
-                discovered_value=discovered_value,
+                discovered_value_length=len(str(discovered_value)),
             )
             return None
 
@@ -14038,7 +14037,7 @@ async def discover_and_select_from_full_dropdown(
         LOG.warning(
             "Discover fallback failed",
             exc_info=True,
-            original_text=original_text,
+            original_text_length=len(str(original_text)),
         )
         return None
     finally:
@@ -14824,7 +14823,7 @@ async def _custom_select_scope_confirms_committed(
         LOG.info(
             "Failed to read custom-select committed label",
             matched_element_id=matched_element_id,
-            matched_label=matched_label,
+            matched_label_length=len(str(matched_label or "")),
             exc_info=True,
         )
         return False, "none"
@@ -14972,9 +14971,9 @@ async def _resolve_custom_select_readback_scope_element(
     except Exception:
         LOG.info(
             "Failed to resolve custom-select read-back scope element; continuing with matched-element read-back",
-            target_value=target_value,
+            target_value_length=len(str(target_value or "")),
             matched_element_id=matched_element_id,
-            matched_label=matched_label,
+            matched_label_length=len(str(matched_label or "")),
             exc_info=True,
         )
         return None
@@ -15116,8 +15115,8 @@ async def _select_deterministic_custom_option(
     script_mode_run = bool(context and context.script_mode)
     gate = await _resolve_collapse_gate(
         task,
-        COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
-        "collapse-custom-select-fanout",
+        family_flag=None,
+        log_label="collapse-custom-select-fanout",
     )
     if gate.gate_error and not post_failed_click_commit_recovery:
         emit(CustomSelectFamilyOutcome.llm_fallback_gate_error)
@@ -15237,7 +15236,7 @@ async def _select_deterministic_custom_option(
             if pre_click_anchor_value is None:
                 LOG.info(
                     "Anchor value unreadable before deterministic click; falling back to LLM path",
-                    target_value=target_value,
+                    target_value_length=len(target_value) if target_value is not None else None,
                     matched_element_id=element_id,
                 )
                 emit(CustomSelectFamilyOutcome.llm_fallback_pre_click_error)
@@ -15262,18 +15261,18 @@ async def _select_deterministic_custom_option(
         if not click_attempted or isinstance(exc, InteractWithDisabledElement):
             LOG.info(
                 "Deterministic custom-select failed; falling back to LLM path",
-                target_value=target_value,
+                target_value_length=len(target_value) if target_value is not None else None,
                 matched_element_id=element_id,
-                matched_label=matched_label,
+                matched_label_length=len(str(matched_label or "")),
                 exc_info=True,
             )
             emit(CustomSelectFamilyOutcome.llm_fallback_pre_click_error)
             return None
         LOG.info(
             "Deterministic custom-select failed after click; returning failure to avoid replaying over mutated widget",
-            target_value=target_value,
+            target_value_length=len(target_value) if target_value is not None else None,
             matched_element_id=element_id,
-            matched_label=matched_label,
+            matched_label_length=len(str(matched_label or "")),
             exc_info=True,
         )
         emit(CustomSelectFamilyOutcome.terminal_post_click_exception)
@@ -15295,16 +15294,16 @@ async def _select_deterministic_custom_option(
                 emit(CustomSelectFamilyOutcome.llm_fallback_reset_verified)
             LOG.info(
                 "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
-                target_value=target_value,
+                target_value_length=len(target_value) if target_value is not None else None,
                 matched_element_id=element_id,
-                matched_label=matched_label,
+                matched_label_length=len(str(matched_label or "")),
             )
             return None
         LOG.info(
             "Deterministic custom-select combobox reset failed; returning failure to avoid replaying over mutated widget",
-            target_value=target_value,
+            target_value_length=len(target_value) if target_value is not None else None,
             matched_element_id=element_id,
-            matched_label=matched_label,
+            matched_label_length=len(str(matched_label or "")),
         )
         emit(CustomSelectFamilyOutcome.terminal_unverified_reset)
         return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
@@ -15312,18 +15311,18 @@ async def _select_deterministic_custom_option(
     if not matched_option_is_choice_input:
         LOG.info(
             "Deterministic custom-select read-back inconclusive on non-choice-input option; returning terminal failure",
-            target_value=target_value,
+            target_value_length=len(target_value) if target_value is not None else None,
             matched_element_id=element_id,
-            matched_label=matched_label,
+            matched_label_length=len(str(matched_label or "")),
         )
         emit(CustomSelectFamilyOutcome.terminal_unverified_click)
         return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
 
     LOG.info(
         "Deterministic custom-select read-back failed after click; returning failure to avoid replaying over mutated widget",
-        target_value=target_value,
+        target_value_length=len(target_value) if target_value is not None else None,
         matched_element_id=element_id,
-        matched_label=matched_label,
+        matched_label_length=len(str(matched_label or "")),
     )
     emit(CustomSelectFamilyOutcome.terminal_unverified_toggle)
     return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
@@ -16229,7 +16228,7 @@ async def select_from_dropdown(
         # but only one option is clickable on the page
         LOG.debug(
             "Searching option with the same value in incremental elements",
-            value=value,
+            value_length=len(str(value)),
             elements=incremental_scraped.element_tree,
         )
         locator = await incremental_scraped.select_one_element_by_value(value=value)
@@ -16242,7 +16241,7 @@ async def select_from_dropdown(
         try:
             LOG.info(
                 "Find an alternative option with the same value. Try to select the option.",
-                value=value,
+                value_length=len(str(value)),
             )
             await EventStrategyFactory.move_to_element(page, locator)
             await locator.click(timeout=timeout)
@@ -16730,9 +16729,9 @@ async def normal_select(
             LOG.info(
                 "Deterministic normal-select failed; falling back to LLM path",
                 action=action,
-                target_value=target_value,
+                target_value_length=len(str(target_value or "")),
                 matched_index=resolution.matched_index,
-                matched_label=resolution.matched_label,
+                matched_label_length=len(str(resolution.matched_label or "")),
             )
 
     if collapse_select_fanout_enabled:

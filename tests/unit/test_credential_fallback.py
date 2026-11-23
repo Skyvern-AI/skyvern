@@ -78,6 +78,7 @@ def _workflow_run(
     workflow_schedule_id: str | None = None,
     copilot_session_id: str | None = None,
     start_fresh_browser: bool | None = None,
+    otp_request_id: str | None = None,
 ) -> WorkflowRun:
     now = datetime.now(timezone.utc)
     return WorkflowRun(
@@ -100,6 +101,7 @@ def _workflow_run(
         workflow_schedule_id=workflow_schedule_id,
         copilot_session_id=copilot_session_id,
         start_fresh_browser=start_fresh_browser,
+        otp_request_id=otp_request_id,
         trigger_type=WorkflowRunTriggerType.api,
         created_at=now,
         modified_at=now,
@@ -420,6 +422,19 @@ async def test_any_failure_fallback_is_not_started_after_the_run_lost_its_browse
 
     assert result is None
     run_workflow_mock.assert_not_awaited()
+
+    strict_run = _workflow_run(
+        workflow_run_id="wr_strict",
+        failure_category=[{"category": "AUTH_FAILURE"}],
+        otp_request_id="otpr_strict",
+    )
+    strict_result, strict_run_workflow_mock, _ = await _run_fallback_retry(
+        workflow_run=strict_run,
+        parameters=[login],
+    )
+
+    assert strict_result is None
+    assert "context_at_call" not in strict_run_workflow_mock.captured
 
 
 _RENDER_TEXT = (
@@ -856,7 +871,7 @@ async def test_completed_run_bails_before_flag_check_and_db_reads() -> None:
 
 
 @pytest.mark.asyncio
-async def test_copilot_scoped_run_does_not_retry() -> None:
+async def test_ember_scoped_run_does_not_retry() -> None:
     workflow_run = _workflow_run(
         failure_category=[{"category": "AUTH_FAILURE"}],
         copilot_session_id="cs_1",

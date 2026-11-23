@@ -1,21 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import socket
 import traceback
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+import websockets
 from playwright._impl._errors import Error as PWError
 from playwright._impl._errors import TimeoutError as PWTimeoutError
+from websockets.exceptions import InvalidMessage, InvalidStatus
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost
 from skyvern.webeye import browser_acquisition_sample as sample_mod
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserCdpAcquisitionError, BrowserCdpConnectionError
-from skyvern.webeye.cdp_retry import _resolve_retry_budget, connect_over_cdp_with_retry, is_cdp_connection_error
+from skyvern.webeye.cdp_retry import (
+    _connect_over_relay,
+    _is_retryable_pinned_connect_error,
+    _PinnedCdpRelay,
+    _resolve_retry_budget,
+    connect_over_cdp_with_retry,
+    is_cdp_connection_error,
+)
 
 
 class _FakeEngineError(Exception):
@@ -81,22 +92,261 @@ class TestRetryBehavior:
     @pytest.mark.asyncio
     async def test_transient_resolution_failure_is_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _set_budget(monkeypatch, attempts=3, backoff=[1, 2])
-        pw = _make_playwright(["browser"])
-        resolver = MagicMock(
-            side_effect=[
-                OSError("synthetic resolver failure"),
-                [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))],
-            ]
-        )
-        monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolver)
+        resolutions: list[tuple[str, int | None, int]] = []
+        resolution_results: list[OSError | list[tuple[int, int, int, str, tuple[str, int]]]] = [
+            OSError("synthetic resolver failure"),
+            [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.4.4", 0)),
+            ],
+            [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.0.0.1", 0)),
+            ],
+            [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("9.9.9.9", 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("149.112.112.112", 0)),
+            ],
+        ]
+        discoveries: list[tuple[str, float, tuple[str, ...] | None, dict[str, str] | None]] = []
+        pinned_dials: list[tuple[str, dict[str, Any]]] = []
+        dials: list[tuple[str, dict[str, str] | None]] = []
+        dial_timeouts: list[float | None] = []
+        sleeps: list[float] = []
 
-        with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock) as mock_sleep:
-            result = await connect_over_cdp_with_retry(pw, "wss://cdp.example.test")
+        def resolver(host: str, port: int | None, *, type: int) -> list[tuple[int, int, int, str, tuple[str, int]]]:
+            resolutions.append((host, port, type))
+            result = resolution_results.pop(0)
+            if isinstance(result, OSError):
+                raise result
+            return result
+
+        async def resolve_websocket_url(
+            endpoint_url: str,
+            *,
+            timeout_ms: float,
+            resolved_ips: tuple[str, ...] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> str:
+            discoveries.append((endpoint_url, timeout_ms, resolved_ips, headers))
+            suffix = len(discoveries)
+            return f"wss://socket-{suffix}.example.test/devtools/browser/fake-{suffix}"
+
+        async def connect_over_cdp(
+            address: str, *, headers: dict[str, str] | None = None, timeout: float | None = None
+        ) -> str:
+            dials.append((address, headers))
+            dial_timeouts.append(timeout)
+            if len(dials) == 1:
+                raise PWTimeoutError("synthetic candidate timeout")
+            return "browser"
+
+        async def open_pinned(uri: str, **kwargs: Any) -> Any:
+            pinned_dials.append((uri, kwargs))
+            return object()
+
+        async def connect_over_relay(
+            playwright: Any,
+            upstream: Any,
+            *,
+            timeout_ms: float,
+        ) -> str:
+            return await playwright.chromium.connect_over_cdp("ws://127.0.0.1/relay", timeout=timeout_ms)
+
+        async def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        pw = MagicMock()
+        pw.chromium.connect_over_cdp = connect_over_cdp
+        monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolver)
+        monkeypatch.setattr("skyvern.webeye.cdp_retry.resolve_websocket_url", resolve_websocket_url, raising=False)
+        monkeypatch.setattr("skyvern.webeye.cdp_retry.open_first_pinned_websocket", open_pinned)
+        monkeypatch.setattr("skyvern.webeye.cdp_retry._connect_over_relay", connect_over_relay)
+        monkeypatch.setattr("skyvern.webeye.cdp_retry._sleep", sleep)
+
+        result = await connect_over_cdp_with_retry(
+            pw,
+            "https://cdp.example.test",
+            headers={"Host": "localhost", "X-Test": "value"},
+        )
 
         assert result == "browser"
-        assert resolver.call_count == 2
-        pw.chromium.connect_over_cdp.assert_awaited_once()
-        mock_sleep.assert_awaited_once_with(1)
+        assert resolutions == [
+            ("cdp.example.test", None, socket.SOCK_STREAM),
+            ("cdp.example.test", None, socket.SOCK_STREAM),
+            ("socket-1.example.test", None, socket.SOCK_STREAM),
+            ("socket-2.example.test", None, socket.SOCK_STREAM),
+        ]
+        assert [
+            (endpoint, resolved_ips, connect_headers) for endpoint, _, resolved_ips, connect_headers in discoveries
+        ] == [
+            (
+                "https://cdp.example.test",
+                ("8.8.8.8", "8.8.4.4"),
+                {"Host": "localhost", "X-Test": "value"},
+            ),
+            (
+                "https://cdp.example.test",
+                ("8.8.8.8", "8.8.4.4"),
+                {"Host": "localhost", "X-Test": "value"},
+            ),
+        ]
+        assert all(30_000 < timeout_ms <= 180_000 for _, timeout_ms, _, _ in discoveries)
+        assert [(uri, kwargs["connect_hosts"]) for uri, kwargs in pinned_dials] == [
+            ("wss://socket-1.example.test/devtools/browser/fake-1", ("1.1.1.1", "1.0.0.1")),
+            ("wss://socket-2.example.test/devtools/browser/fake-2", ("149.112.112.112", "9.9.9.9")),
+        ]
+        assert all(
+            kwargs["server_hostname"] == f"socket-{index}.example.test"
+            for index, (_, kwargs) in enumerate(pinned_dials, 1)
+        )
+        assert all(kwargs["headers"] == {"Host": "localhost", "X-Test": "value"} for _, kwargs in pinned_dials)
+        assert dials == [("ws://127.0.0.1/relay", None)] * 2
+        assert all(timeout is not None and 30_000 < timeout <= 180_000 for timeout in dial_timeouts)
+        assert sleeps == [1, 2]
+
+        direct_resolutions = [
+            [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.4.4", 0)),
+            ]
+        ]
+        direct_dials: list[tuple[str, dict[str, str] | None, float | None]] = []
+
+        def direct_resolver(
+            host: str, port: int | None, *, type: int
+        ) -> list[tuple[int, int, int, str, tuple[str, int]]]:
+            assert (host, port, type) == ("direct.example.test", None, socket.SOCK_STREAM)
+            return direct_resolutions.pop(0)
+
+        async def direct_websocket_url(
+            endpoint_url: str,
+            *,
+            timeout_ms: float,
+            resolved_ips: tuple[str, ...] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> str:
+            return endpoint_url
+
+        async def direct_connect(
+            address: str, *, headers: dict[str, str] | None = None, timeout: float | None = None
+        ) -> str:
+            direct_dials.append((address, headers, timeout))
+            if len(direct_dials) < 2:
+                raise PWTimeoutError("synthetic candidate timeout")
+            return "direct-browser"
+
+        _set_budget(monkeypatch, attempts=2, backoff=[0])
+        monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", direct_resolver)
+        monkeypatch.setattr("skyvern.webeye.cdp_retry.resolve_websocket_url", direct_websocket_url)
+        pw.chromium.connect_over_cdp = direct_connect
+
+        direct_result = await connect_over_cdp_with_retry(pw, "wss://direct.example.test/devtools/browser/fake")
+
+        assert direct_result == "direct-browser"
+        assert [(address, headers) for address, headers, _ in direct_dials] == [
+            ("ws://127.0.0.1/relay", None),
+            ("ws://127.0.0.1/relay", None),
+        ]
+        assert [(uri, kwargs["connect_hosts"]) for uri, kwargs in pinned_dials[-2:]] == [
+            ("wss://direct.example.test/devtools/browser/fake", ("8.8.8.8", "8.8.4.4")),
+            ("wss://direct.example.test/devtools/browser/fake", ("8.8.4.4", "8.8.8.8")),
+        ]
+        assert all(timeout is not None and 30_000 < timeout <= 180_000 for _, _, timeout in direct_dials)
+
+        address_connects = 0
+
+        async def address_open(*args: Any, **kwargs: Any) -> Any:
+            nonlocal address_connects
+            address_connects += 1
+            if address_connects == 1:
+                raise OSError(errno.ENETUNREACH, "synthetic unreachable address")
+            return object()
+
+        _set_budget(monkeypatch, attempts=2, backoff=[0])
+        monkeypatch.setattr(
+            "skyvern.webeye.cdp_retry._validate_browser_address_host",
+            AsyncMock(return_value=("192.0.2.1", "192.0.2.2")),
+        )
+        monkeypatch.setattr("skyvern.webeye.cdp_retry.open_first_pinned_websocket", address_open)
+        pw.chromium.connect_over_cdp = AsyncMock(return_value="address-browser")
+
+        address_result = await connect_over_cdp_with_retry(
+            pw,
+            "wss://address-error.example.test/devtools/browser/fake",
+        )
+
+        assert address_result == "address-browser"
+        assert address_connects == 2
+        assert not _is_retryable_pinned_connect_error(OSError(errno.EADDRNOTAVAIL, "synthetic local failure"))
+        assert not _is_retryable_pinned_connect_error(OSError(errno.EAFNOSUPPORT, "synthetic local failure"))
+
+        handshake_connects = 0
+
+        async def handshake_open(*args: Any, **kwargs: Any) -> Any:
+            nonlocal handshake_connects
+            handshake_connects += 1
+            if handshake_connects == 1:
+                try:
+                    raise EOFError("synthetic handshake EOF")
+                except EOFError as cause:
+                    raise InvalidMessage("synthetic invalid handshake") from cause
+            return object()
+
+        monkeypatch.setattr("skyvern.webeye.cdp_retry.open_first_pinned_websocket", handshake_open)
+        pw.chromium.connect_over_cdp = AsyncMock(return_value="handshake-browser")
+
+        handshake_result = await connect_over_cdp_with_retry(
+            pw,
+            "wss://handshake-error.example.test/devtools/browser/fake",
+            selection=_fake_selection(),
+        )
+
+        assert handshake_result == "handshake-browser"
+        assert handshake_connects == 2
+
+        async def echo(connection: websockets.ServerConnection) -> None:
+            async for message in connection:
+                await connection.send(message)
+
+        async with websockets.serve(echo, "127.0.0.1", 0) as upstream_server:
+            upstream_port = upstream_server.sockets[0].getsockname()[1]
+            upstream = await websockets.connect(f"ws://127.0.0.1:{upstream_port}")
+            relay = _PinnedCdpRelay(upstream)
+            relay_url = await relay.start()
+            relay_parts = urlsplit(relay_url)
+            wrong_path = urlunsplit((relay_parts.scheme, relay_parts.netloc, "/wrong", "", ""))
+
+            assert relay_parts.path not in ("", "/")
+            with pytest.raises(InvalidStatus):
+                await websockets.connect(wrong_path)
+            with pytest.raises(InvalidStatus):
+                await websockets.connect(relay_url, origin="http://attacker.example")
+
+            accepted = await websockets.connect(relay_url)
+            await accepted.send("relay-ready")
+            assert await accepted.recv() == "relay-ready"
+            with pytest.raises(InvalidStatus):
+                await websockets.connect(relay_url)
+
+            await accepted.close()
+            await relay.close()
+
+        class StartupFailureUpstream:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        async def fail_relay_start(*args: Any, **kwargs: Any) -> None:
+            raise OSError("synthetic relay bind failure")
+
+        startup_failure_upstream = StartupFailureUpstream()
+        monkeypatch.setattr("skyvern.webeye.cdp_retry.websockets.serve", fail_relay_start)
+        with pytest.raises(OSError, match="synthetic relay bind failure"):
+            await _connect_over_relay(MagicMock(), cast(Any, startup_failure_upstream), timeout_ms=1_000)
+        assert startup_failure_upstream.closed
 
     @pytest.mark.asyncio
     async def test_blocked_host_fails_closed_without_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -186,6 +436,55 @@ class TestRetryBehavior:
             with pytest.raises(PWError):
                 await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224", validate_browser_address=False)
         assert pw.chromium.connect_over_cdp.call_count == 3
+
+        late_attach: asyncio.Task[None] | None = None
+        late_attached = False
+
+        async def upstream(connection: websockets.ServerConnection) -> None:
+            await connection.wait_closed()
+
+        async with websockets.serve(upstream, "127.0.0.1", 0) as upstream_server:
+            upstream_port = upstream_server.sockets[0].getsockname()[1]
+
+            async def delayed_attach(address: str) -> None:
+                nonlocal late_attached
+                await asyncio.sleep(0.1)
+                try:
+                    connection = await websockets.connect(address)
+                except OSError:
+                    return
+                late_attached = True
+                await connection.close()
+
+            async def ignores_cancellation(
+                address: str, *, headers: dict[str, str] | None = None, timeout: float | None = None
+            ) -> str:
+                nonlocal late_attach
+                assert address.startswith("ws://127.0.0.1:")
+                assert timeout is not None and 0 < timeout < 50
+                late_attach = asyncio.create_task(delayed_attach(address))
+                await asyncio.Event().wait()
+                return "unreachable"
+
+            pw.chromium.connect_over_cdp = ignores_cancellation
+            monkeypatch.setattr(
+                "skyvern.webeye.cdp_retry._validate_browser_address_host",
+                AsyncMock(return_value=("127.0.0.1",)),
+            )
+            monkeypatch.setattr(
+                "skyvern.webeye.cdp_retry.DEFAULT_PLAYWRIGHT_LAUNCH_TIMEOUT_IN_MILLISECONDS",
+                50,
+            )
+            with pytest.raises(TimeoutError):
+                await connect_over_cdp_with_retry(
+                    pw,
+                    f"ws://late.example.test:{upstream_port}/devtools/browser/fake",
+                    retry=False,
+                )
+            assert late_attach is not None
+            await late_attach
+
+        assert not late_attached
 
     @pytest.mark.asyncio
     async def test_native_non_retryable_connect_failure_is_an_acquisition_fact(self):
@@ -316,7 +615,7 @@ class TestRetryBehavior:
 
         with patch("skyvern.webeye.cdp_retry._sleep", side_effect=track_sleep):
             with pytest.raises(PWError):
-                await connect_over_cdp_with_retry(pw, "http://127.0.0.1:9222")
+                await connect_over_cdp_with_retry(pw, "http://127.0.0.1:9222", validate_browser_address=False)
         assert sleep_values == [1, 2, 2, 2]
 
 
@@ -381,7 +680,11 @@ class TestRetryBudget:
         # Port binds on the 5th attempt (after 4 refusals while the browser cold-starts).
         pw = _make_playwright([refused, refused, refused, refused, "browser"])
         with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock) as mock_sleep:
-            result = await connect_over_cdp_with_retry(pw, "http://127.0.0.1:9222")
+            result = await connect_over_cdp_with_retry(
+                pw,
+                "http://127.0.0.1:9222",
+                validate_browser_address=False,
+            )
         assert result == "browser"
         assert pw.chromium.connect_over_cdp.call_count == 5
         assert [call.args[0] for call in mock_sleep.call_args_list] == [1, 2, 3, 4]

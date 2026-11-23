@@ -35,7 +35,6 @@ from skyvern.forge.antibot_evidence import run_prompt_evidence_str
 from skyvern.forge.failure_classifier import (
     HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
     bounded_failure_categories,
-    classify_from_failure_reason,
     with_root_user_errors,
 )
 from skyvern.forge.prompts import prompt_engine
@@ -141,6 +140,7 @@ from skyvern.services.webhook_delivery import (
     format_no_response_failure_reason,
     status_code_from_exception,
 )
+from skyvern.utils.deferred_cleanup import finish_cleanup_deferring_cancellation
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.url_validators import validate_fetch_url
@@ -403,7 +403,9 @@ async def _handle_task_v2_termination(
         output=output,
     )
 
-    resolved_failure_category = failure_category or classify_from_failure_reason(termination_reason)
+    resolved_failure_category = failure_category or app.AGENT_FUNCTION.classify_failure(
+        termination_reason, status=TaskV2Status.terminated
+    )
     LOG.info(
         "Task failure classified",
         task_v2_id=task_v2_id,
@@ -433,6 +435,7 @@ async def initialize_task_v2(
     proxy_location: ProxyLocationInput = None,
     totp_identifier: str | None = None,
     totp_verification_url: str | None = None,
+    otp_request_id: str | None = None,
     webhook_callback_url: str | None = None,
     publish_workflow: bool = False,
     parent_workflow_run_id: str | None = None,
@@ -471,12 +474,27 @@ async def initialize_task_v2(
         if unusable is not None:
             raise unusable
 
+    # TaskV2Block creates its task row before the backing workflow row exists. Resolve the immutable parent marker
+    # first so the task never enters the database unmarked and cannot replace the strict context with None.
+    if parent_workflow_run_id is not None:
+        parent_workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+            parent_workflow_run_id,
+            organization_id=organization.organization_id,
+        )
+        if parent_workflow_run is None:
+            raise ValueError(f"Parent workflow run not found: {parent_workflow_run_id}")
+        if otp_request_id is None:
+            otp_request_id = parent_workflow_run.otp_request_id
+        elif otp_request_id != parent_workflow_run.otp_request_id:
+            raise ValueError("Task-v2 OTP request marker does not match its parent workflow run")
+
     task_v2 = await app.DATABASE.observer.create_task_v2(
         prompt=user_prompt,
         url=user_url if user_url else None,
         organization_id=organization.organization_id,
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
+        otp_request_id=otp_request_id,
         webhook_callback_url=webhook_callback_url,
         proxy_location=proxy_location,
         extracted_information_schema=extracted_information_schema,
@@ -514,6 +532,7 @@ async def initialize_task_v2(
             request_id=None,
             workflow_request=WorkflowRequestBody(
                 max_screenshot_scrolls=max_screenshot_scrolling_times,
+                otp_request_id=otp_request_id,
                 browser_session_id=browser_session_id,
                 browser_profile_id=browser_profile_id,
                 start_fresh_browser=start_fresh_browser,
@@ -539,6 +558,18 @@ async def initialize_task_v2(
             failure_reason="Skyvern failed to setup the workflow run",
             organization_id=organization.organization_id,
         )
+        raise
+    except asyncio.CancelledError:
+        # setup_workflow_run fails its own strict run; the Task V2 row has no other owner to fail it.
+        if otp_request_id is not None:
+            await finish_cleanup_deferring_cancellation(
+                lambda: mark_task_v2_as_failed(
+                    task_v2_id=task_v2.observer_cruise_id,
+                    failure_reason="Skyvern failed to setup the workflow run",
+                    organization_id=organization.organization_id,
+                ),
+                task_v2_id=task_v2.observer_cruise_id,
+            )
         raise
 
     # update observer cruise
@@ -569,6 +600,18 @@ async def initialize_task_v2(
             failure_reason="Skyvern failed to update the task 2.0 after initializing the workflow run",
             organization_id=organization.organization_id,
         )
+        raise
+    except asyncio.CancelledError:
+        if otp_request_id is not None:
+            await finish_cleanup_deferring_cancellation(
+                lambda: mark_task_v2_as_failed(
+                    task_v2_id=task_v2.observer_cruise_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    failure_reason="Skyvern failed to update the task 2.0 after initializing the workflow run",
+                    organization_id=organization.organization_id,
+                ),
+                task_v2_id=task_v2.observer_cruise_id,
+            )
         raise
 
     return task_v2
@@ -716,6 +759,7 @@ async def run_task_v2(
         root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
         task_v2_id=task_v2_id,
         run_id=current_run_id,
+        otp_request_id=task_v2.otp_request_id,
         request_id=request_id,
         browser_session_id=browser_session_id,
         loop_internal_state=copy.deepcopy(parent_context.loop_internal_state) if parent_context else None,
@@ -988,7 +1032,15 @@ async def run_task_v2_helper(
     else:
         LOG.info("Workflow run found", workflow_run_id=workflow_run_id)
 
-    if workflow_run.status != WorkflowRunStatus.queued:
+    # Marked backing rows stay outside the legacy created/queued repair scan until their strict worker begins. Admit
+    # only the untouched reservation owned by this same TaskV2; an already-started running row remains a duplicate.
+    strict_dispatch_reservation = (
+        workflow_run.status == WorkflowRunStatus.running
+        and workflow_run.started_at is None
+        and task_v2.otp_request_id is not None
+        and workflow_run.otp_request_id == task_v2.otp_request_id
+    )
+    if workflow_run.status != WorkflowRunStatus.queued and not strict_dispatch_reservation:
         LOG.warning("Duplicate workflow run execution", workflow_run_id=workflow_run_id, status=workflow_run.status)
         return None, None, task_v2
 
@@ -1701,8 +1753,8 @@ async def run_task_v2_helper(
                 f' "x-max-steps-override" header with your desired number'
                 f" of steps in the API request."
             )
-            failure_category = llm_failure_categories or classify_from_failure_reason(
-                full_failure_reason, fallback_to_unknown=True
+            failure_category = llm_failure_categories or app.AGENT_FUNCTION.classify_failure(
+                full_failure_reason, fallback_to_unknown=True, status=TaskV2Status.failed
             )
             LOG.info(
                 "Task failure classified",
@@ -1734,8 +1786,8 @@ async def run_task_v2_helper(
     else:
         # Loop completed without early exit - task exceeded max iterations
         max_iterations_failure_reason = f"Task exceeded maximum of {max_iterations} planning iterations. Consider simplifying the task or breaking it into smaller steps."
-        max_iterations_failure_category = classify_from_failure_reason(
-            max_iterations_failure_reason, fallback_to_unknown=True
+        max_iterations_failure_category = app.AGENT_FUNCTION.classify_failure(
+            max_iterations_failure_reason, fallback_to_unknown=True, status=TaskV2Status.failed
         )
         LOG.info(
             "Task v2 failed - exceeded maximum iterations",
@@ -3270,6 +3322,7 @@ async def build_task_v2_run_response(task_v2: TaskV2, cap_output_values: bool = 
         app_url=app_url,
         run_request=TaskRunRequest(
             engine=RunEngine.skyvern_v2,
+            otp_request_id=task_v2.otp_request_id,
             prompt=task_v2.prompt or "",
             url=task_v2.url,
             webhook_url=task_v2.webhook_callback_url,
@@ -3362,7 +3415,7 @@ async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> 
                 "Task v2 webhook sent successfully",
                 task_v2_id=task_v2.observer_cruise_id,
                 resp_code=resp.status_code,
-                resp_text=resp.text,
+                resp_text_length=len(resp.text),
             )
             await app.DATABASE.observer.update_task_v2(
                 task_v2_id=task_v2.observer_cruise_id,
@@ -3375,7 +3428,7 @@ async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> 
                 "Task v2 webhook failed",
                 task_v2_id=task_v2.observer_cruise_id,
                 resp_code=resp.status_code,
-                resp_text=resp.text,
+                resp_text_length=len(resp.text),
                 status_code=resp.status_code,
                 error_reason=format_http_log_reason(resp.status_code),
             )

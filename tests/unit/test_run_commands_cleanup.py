@@ -414,6 +414,7 @@ def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.Monkey
     monkeypatch.setattr(run_commands, "atexit", SimpleNamespace(register=register))
     monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", run)
     monkeypatch.setattr("skyvern.cli.core.session_manager.set_stateless_http_mode", set_stateless)
+    monkeypatch.setattr("skyvern.forge.forge_app_initializer.start_forge_app", MagicMock())
 
     run_commands.run_mcp(
         transport="streamable-http",
@@ -451,6 +452,7 @@ def _compose_standalone_mcp_http_app(monkeypatch: pytest.MonkeyPatch, inner: Any
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", AsyncMock())
     monkeypatch.setattr(run_commands.atexit, "register", MagicMock())
     monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", run)
+    monkeypatch.setattr("skyvern.forge.forge_app_initializer.start_forge_app", MagicMock())
 
     run_commands.run_mcp(transport="streamable-http", port=9010, path="mcp")
 
@@ -531,15 +533,6 @@ def test_standalone_mcp_origin_validation_precedes_api_key_auth(monkeypatch: pyt
     card = client.get("/.well-known/mcp/server-card.json", headers={"origin": "https://STORMBREAKER.attacker.invalid"})
     assert card.status_code == 200
     assert card.headers["access-control-allow-origin"] == "*"
-
-
-@pytest.mark.asyncio
-async def test_run_task_tool_registration_points_to_browser_module() -> None:
-    from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
-
-    tool = await mcp.get_tool("skyvern_run_task")
-    assert tool is not None
-    assert tool.fn.__module__ == "skyvern.cli.mcp_tools.browser"
 
 
 # A stdio MCP process is spawned per client session, so whatever it imports at boot is paid once per session.

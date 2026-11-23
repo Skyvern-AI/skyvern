@@ -30,6 +30,7 @@ async def test_run_block_response_includes_resolved_browser_session(
         workflow_permanent_id="wpid_123",
         browser_session_id=resolved_browser_session_id,
         status=WorkflowRunStatus.created,
+        status_for_reads=WorkflowRunStatus.created,
         failure_reason=None,
         created_at=datetime(2026, 8, 16, tzinfo=UTC),
         modified_at=datetime(2026, 8, 16, tzinfo=UTC),

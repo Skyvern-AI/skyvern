@@ -1,7 +1,7 @@
 ---
 title: Block Types and Configuration
 subtitle: Reference for every block available in the agent editor
-description: Reference guide for every agent block type in the Skyvern Cloud UI, including Browser Task, Extraction, Login, Loop, While Loop, Conditional, Code, HTTP Request, and more.
+description: Reference guide for every agent block type in the Skyvern Cloud UI, including Browser Task, Extraction, Login, Loop, Conditional, Code, HTTP Request, Google Sheets, PDF Fill, Agent Trigger, and more.
 slug: reference/blocks
 keywords:
   - navigation block
@@ -15,8 +15,14 @@ keywords:
   - login block
   - validation block
   - file download block
+  - cloud storage block
   - conditional block
   - terminate block
+  - agent trigger block
+  - Google Sheets block
+  - Power BI block
+  - PDF fill block
+  - split PDF block
 ---
 
 Agents are built from blocks. Each block performs one specific operation: navigating a page, extracting data, making an API call, or branching logic. This page covers every block type available in the Cloud UI [Studio editor](/cloud/studio), grouped by category.
@@ -32,9 +38,9 @@ If you're writing automations in code instead, the equivalent operations are Pag
 | Category | Blocks |
 |----------|--------|
 | [Browser Automation](#browser-automation) | Browser Task, Browser Action, Extraction, Login, Go to URL, Print Page |
-| [Data and Extraction](#data-and-extraction) | Web Search, Text Prompt, File Parser |
-| [Control Flow](#control-flow) | Loop, While Loop, Conditional, AI Validation, Code, Agent, Wait, Terminate |
-| [Files](#files) | File Download, Cloud Storage Upload |
+| [Data and Extraction](#data-and-extraction) | Web Search, Text Prompt, File Parser, Google Sheets Read, Google Sheets Write, Power BI Query |
+| [Control Flow](#control-flow) | Loop, Conditional, AI Validation, Code, Agent, Agent Trigger, Wait, Terminate |
+| [Files](#files) | File Download, Cloud Storage, PDF Fill, Split PDF |
 | [Communication](#communication) | Send Email, HTTP Request, Human Interaction, Email Inbox |
 
 ---
@@ -135,6 +141,14 @@ Extract structured data from the current page using AI.
 |-------|------|-------------|
 | **Data Extraction Goal** | text | What data to extract |
 | **Data Schema** | JSON | [JSON Schema](https://json-schema.org/) defining the output format. Enable the checkbox to reveal the editor. Click **Generate with AI** to auto-suggest a schema from your extraction goal. |
+
+Turn on **Export as Parquet** in the **Export** section to also write the extracted data to a downloadable Parquet file, without a separate Data Export block. It adds these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Data Schema** | JSON | Schema of the exported records. Starts from the extraction's Data Schema when it can be derived. |
+| **Filename (optional)** | text | Name of the Parquet file. Leave it empty to use the block's label. Inside a loop, each iteration's file ends in its number, such as `-0001`. |
+| **Records (optional)** | text | What to export. Defaults to this block's extracted data; use `{{ parameter_name }}` to export something else. |
 
 *Plus [common browser fields](#common-fields).*
 
@@ -284,12 +298,65 @@ Very large files can exceed the parser's time budget and fail the block. When a 
 | Field | Type | Description |
 |-------|------|-------------|
 | **File URL** | text | URL or parameter reference to the file |
+| **File Type** | select | **Auto detect**, **CSV**, **Excel**, **PDF**, **Image**, **DOCX** or **ZIP**. Auto detect reads the type from the URL's extension when it can. |
+| **Worksheet** | text | Excel only: the exact name of the worksheet to read. Leave it empty to read the first worksheet. The run fails if the workbook has no worksheet with that name. |
 | **Data Schema** | JSON | Schema for the extracted output. Enable the checkbox to reveal the editor. |
 | **Model** | selector | Which LLM model to use |
+
+Additional fields in **Advanced Settings:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Force OCR** | switch | PDF only: ignore the PDF's text layer and read the pages with vision OCR. Skyvern already does this when the text layer is empty or scrambled; turn it on when the text layer is unreadable in another way. OCR is slower, costs more, and reads at most the first 50 pages. |
 
 <Frame>
 <img width="400" src="/images/cloud/file_parse_block.png" alt="File Parser block configuration with File URL, Data Schema, and Model fields" />
 </Frame>
+
+### Google Sheets Read
+
+Read cells from a Google Sheet. Connect a Google account with Google Sheets access on [Integrations](/cloud/integrations#google-and-microsoft-accounts) first.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Google Account** | selector | The connected account used to open the spreadsheet |
+| **Spreadsheet** | selector | Search your spreadsheets or paste a spreadsheet URL |
+| **Sheet Name** | text | The tab to read, e.g. `Sheet1` |
+| **Range** | text | Optional. An A1 range such as `A1:D10`, or a named range. Leave it empty to read all rows. |
+| **Has Header Row** | switch | Use the first row as column names (default: on) |
+
+The output holds `values`, a list of rows with one list of cell values each. With **Has Header Row** on, `rows` holds one object per remaining row, keyed by the header; with it off, `rows` is `null`. The output also includes `spreadsheet_id`, `range`, `sheet_title`, `cells` and `merges`.
+
+### Google Sheets Write
+
+Write rows to a Google Sheet, through the same Google Sheets connection as Google Sheets Read.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Google Account** | selector | The connected account used to open the spreadsheet |
+| **Spreadsheet** | selector | Search your spreadsheets or paste a spreadsheet URL |
+| **Write Mode** | select | `Append rows` (default) adds rows below the existing data. `Update range` overwrites the cells in **Range**. |
+| **Sheet Name** | text | The tab to write to |
+| **Range** | text | With `Update range`, the cells to overwrite in A1 notation (e.g. `A2:D5`) or a named range; the data must match its shape. With `Append rows`, an optional start column such as `D:D`. |
+| **Values** | text | A JSON array, or a reference that resolves to one, such as an earlier block's output. A list of lists writes each inner list left to right as one row. |
+| **Column Mapping** | mapping | Required when **Values** holds objects. Maps each field to a column letter (`A`, `B`) or to a header name. |
+
+Turn on **Create sheet if missing** in **Advanced Settings** to create the tab before writing. You need it when the sheet name changes per iteration, such as `sheet_{{ current_index }}`.
+
+The output includes `rows_written`, `updated_range`, `write_mode` and `spreadsheet_id`.
+
+### Power BI Query
+
+Run a read-only DAX query against a Power BI dataset. Power BI is available on Enterprise plans.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Power BI account** | selector | A connected Power BI account with access to read the dataset |
+| **Dataset / semantic model** | selector | The dataset to query. Click **Use a workflow parameter** to pass its ID as an input instead. |
+| **DAX query** | text | A read-only query, e.g. `EVALUATE 'Table'` |
+| **Maximum rows** | number | From 1 to 100,000 (default: 1000). A result with more rows than this fails the query instead of returning part of it. |
+
+The DAX query must be literal text. The dataset can be literal text or a single input parameter reference, such as `{{ dataset_id }}`. The block runs only when the person who connected the Power BI account starts the run from the agent editor; other runs fail. The output is a list of row objects.
 
 ---
 
@@ -297,35 +364,41 @@ Very large files can exceed the parser's time budget and fail the block. When a 
 
 ### Loop
 
-Repeat a sequence of blocks for each item in a list. Child blocks are placed inside the loop on the canvas.
+Repeat a sequence of blocks. Child blocks are placed inside the loop on the canvas. The block has two tabs: **For each** runs the blocks once per item in a list, and **While** runs them as long as a condition stays true.
+
+**For each** fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **Loop Value** | text | The list to iterate over. Use a parameter reference (e.g., `{{ my_list }}`) or a natural language description (e.g., "Extract links of the top 5 posts") which triggers automatic extraction. |
-| **Continue if Empty** | boolean | Mark the loop as complete if the list is empty |
+| **Loop Value** | text | The list to iterate over. Use a parameter reference (e.g., `{{ my_list }}`) or a natural language description (e.g., "Extract links of the top 5 posts"), which adds an extraction step that builds the list. |
+| **Data Schema** | JSON | Shape of the extracted items. Applies only when **Loop Value** is a natural language description. |
+| **Continue if Empty** | boolean | Complete the loop successfully and continue the agent if the list is empty |
+| **Continue Workflow if Loop Fails** | boolean | Let the rest of the agent run when the loop ends in failure |
+| **Skip Iterations that Fail** | boolean | When an iteration fails, skip its remaining blocks and start the next iteration |
+
+**While** fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Loop Condition** | expression | Jinja expression or natural language, checked before each iteration. Defaults to `{{ true }}`. |
+| **Continue Workflow if Loop Fails** | boolean | Let the rest of the agent run when the loop ends in failure |
+| **Skip Iterations that Fail** | boolean | When an iteration fails, skip its remaining blocks and start the next iteration |
+
+If the condition is false at the first check, the child blocks never run and the loop succeeds with an empty output. Either kind of loop stops at 1000 iterations and fails with `Reached max_loop_iterations limit of 1000`.
 
 Inside loop blocks, use these [reserved variables](/cloud/studio#values-every-agent-has):
-- `{{ current_value }}`: the current item
+- `{{ current_value }}`: the current item. `{{ current_item }}` holds the same value.
 - `{{ current_index }}`: the iteration number (0-based)
+
+A **While** loop sets only `{{ current_index }}`.
 
 <Frame>
 <img width="400" src="/images/cloud/block-loop-config.png" alt="Loop block configuration" />
 </Frame>
 
-Use Loop when the item list is already known before the loop starts, such as rows extracted from a table, files uploaded by a user, or URLs passed as agent parameters.
+Use **For each** when the item list is already known before the loop starts, such as rows extracted from a table, files uploaded by a user, or URLs passed as agent parameters.
 
-### While Loop
-
-Repeat a sequence of blocks while a condition remains true. Child blocks are placed inside the loop on the canvas.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| **Condition** | expression | Jinja2 template or natural-language prompt evaluated before each iteration |
-
-Inside while-loop blocks, use these [reserved variables](/cloud/studio#values-every-agent-has):
-- `{{ current_index }}`: the iteration number (0-based)
-
-Use While Loop for flows where the number of iterations is discovered during the run, such as pagination, polling, or retrying until a recoverable page state clears. For pagination, a common pattern is to extract a `has_next_page` boolean inside the loop, click Next, and let the next condition check decide whether to continue.
+Use **While** when the number of iterations is discovered during the run, such as pagination, polling, or retrying until a recoverable page state clears. For pagination, a common pattern is to extract a `has_next_page` boolean inside the loop, click Next, and let the next condition check decide whether to continue.
 
 ### Conditional
 
@@ -367,12 +440,19 @@ Additional fields in **Advanced Settings:**
 
 ### Code
 
-Execute custom Python code. Input parameters are available as global variables. Top-level variables in your code become the block's output.
+Execute custom Python code. The block's inputs are available as global variables. Top-level variables in your code become the block's output.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **Code** | code editor | Python code to execute |
-| **Input Parameters** | select | Parameters available as globals in the code |
+| **View** | toggle | **Plain** shows the Goal, the returned data schema and the steps. **Code** shows the steps, Inputs and the code. A new block opens in **Plain**. |
+| **Goal** | text | In **Plain**. What the block does, in plain language. **Generate** (**Regenerate** once the block has code) has Copilot write the code and steps from the Goal, and opens the Copilot pane. |
+| **Returned data schema** | read-only | In **Plain**, when the block has one. The fields of the block's output, shown as a list or as JSON. |
+| **Steps** | list | A plain-language outline of the code, rebuilt from the code on save. In **Code**, click a step to highlight its lines. |
+| **Inputs** | select | In **Code**. Inputs available as globals in the code |
+| **Code Input** | code editor | In **Code**. Python code to execute |
+| **Error Messages** | JSON | Error codes the code may raise, each with the condition it reports. Raise one with `raise ErrorCode("code", "reason")`. A code that isn't listed fails the block like any other exception. |
+
+After you edit the Goal, the block shows **Goal changed — not applied yet** in place of **Generate**. **Apply new Goal** has Copilot rebuild the code to match, and **Undo** restores the old Goal. When you edit the code of a block that has a Goal, it shows **Code changed — Goal may be out of date**, with **Update Goal** and **Keep Goal**.
 
 Code can import `asyncio`, `datetime`, `html`, `json` and `re`. Each one binds the
 sandbox's own version of the module, which carries part of the standard library and
@@ -414,10 +494,6 @@ secrets of at least five characters are also masked inside larger strings. Deriv
 or transformed values may no longer match. Do not expose credentials through output
 or errors.
 
-<Frame>
-<img width="400" src="/images/cloud/code_block.png" alt="Code block configuration with Python code editor and Input Parameters field" />
-</Frame>
-
 ### Agent
 
 The Agent block lets a model choose which tools to call until it can return the fields in its Data Schema.
@@ -434,17 +510,34 @@ The Agent block is available to selected organizations. Contact support to enabl
 | **Max Turns** | number | Turns the model may take, from 1 to 200. Defaults to 25. When the turns run out, the model gets one more turn in which it can only return its answer; the block fails if that turn does not produce a valid answer |
 | **Tools** | multi-select | The tools the model may call |
 
-The model can always read this run's data (`read_run_data`) and return its answer (`finish`). Without a Tools list it has no other tools. A new Agent block starts with these checked: **Browser Task**, **Download**, **File Download**, **Web Search**, **Go to URL**, **Click**, **Input Text** and **Extract Data**. The Tools checklist in the editor lists every optional tool, and checking one offers it to the model, except Login, which also needs a credential in Inputs.
+The model can always read this run's data (`read_run_data`) and return its answer (`finish`). Without a Tools list it has no other tools. A new Agent block starts with these checked: **Browser Task**, **Code**, **Download**, **File Download**, **Login**, **Web Search**, **Go to URL**, **Click**, **Input Text** and **Extract Data**. The Tools checklist in the editor lists every optional tool, and checking one offers it to the model, except Login, which also needs a credential in Inputs.
 
 A tool named after a block, such as **Browser Task** or **HTTP Request**, runs that block as an ordinary block and is billed as usual. **Go to URL**, **Click**, **Input Text** and **Extract Data** act on the run's current page. **Browser Task**, **File Download** and **Login** each start a separate browser agent that uses your organization's default step limit.
 
-To sign in, check **Login** in Tools and add a credential to Inputs. Login is not checked by default. Skyvern masks the run's registered secrets in the tool results the model reads and in the recorded tool calls. The answer is saved as the model returns it, so do not ask the model to return a secret.
+To sign in, check **Login** in Tools and add a credential to Inputs. Login is checked by default; it is offered to the model only when Inputs has a credential. Skyvern masks the run's registered secrets in the tool results the model reads and in the recorded tool calls. The answer is saved as the model returns it, so do not ask the model to return a secret.
 
 [Copilot](/cloud/studio#build-with-copilot) can add an Agent block to your agent and choose its Tools.
 
 <Frame>
 <img width="400" src="/images/cloud/agent_block.png" alt="Agent block configuration with Prompt, Data Schema, Inputs, Max Turns and Tools fields" />
 </Frame>
+
+### Agent Trigger
+
+Start another agent from this one.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Target Agent** | selector | The agent to start. The current agent is not listed. |
+| **Payload** | fields | One field per input of the target agent. Values support [parameter references](/cloud/studio#inputs). |
+| **Browser Session** | select | `Continue in the same session` (default) shares tabs, cookies and login state with the triggered agent. `Create a new browser` gives it a fresh browser. Click **Use dynamic value** to enter a browser session ID instead, such as `{{ browser_session_id }}`. |
+| **Wait for Completion** | switch | Wait for the triggered agent to finish before the next block runs (default: on) |
+
+With **Wait for Completion** on, the block succeeds only when the triggered run completes. Its output holds `workflow_run_id`, `workflow_permanent_id`, `status`, `failure_reason` and `outputs`, which holds the triggered agent's block outputs by name.
+
+With it off, the triggered agent starts in the background and the next block runs at once. The output holds `workflow_run_id`, `workflow_permanent_id` and `status: "queued"`. `Continue in the same session` is unavailable, because this agent may close its browser before the triggered one finishes.
+
+Agents can trigger each other at most 10 levels deep.
 
 ### Wait
 
@@ -482,18 +575,22 @@ error_code: PRECHECK_UNREACHABLE
 
 ### File Download
 
-Navigate the browser to download a file.
+Navigate the browser to download a file. The block can keep the file in Skyvern or send it to cloud storage, and it can read the file from an SFTP server instead of a website.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **URL** | text | Starting URL (optional) |
-| **Download Goal** | text | Instructions for finding and downloading the file |
-| **Download Timeout (sec)** | number | Seconds to wait for the download to complete |
+| **URL** | text | Starting URL (optional). Not needed when the block reads from SFTP. |
+| **Download Goal** | text | Instructions for finding and downloading the file. Hidden when the block reads from SFTP. |
+| **Download Timeout (sec)** | number | Seconds to wait for the download to complete. Defaults to 120 when empty. Hidden when the block reads from SFTP. |
+| **Download Target** | select | **Website** keeps the downloaded files in Skyvern. **AWS S3**, **Azure Blob Storage**, **Google Drive** and **SFTP** send them to that storage, with the same fields as the [Cloud Storage](#cloud-storage) block. |
+| **Files to Send (Optional)** | text | Shown when the target is not **Website**. Describes which downloaded files to send, such as only the PDF files whose names contain "invoice". Leave it empty to send all of them. |
+| **Google Drive Source Account (Optional)** | selector | Shown when the URL is a Google Drive link and the target is AWS S3, Azure Blob Storage or SFTP. For a private Drive link, the file is fetched through this connected account instead of the browser. |
 
 Additional fields in **Advanced Settings:**
 
 | Field | Type | Description |
 |-------|------|-------------|
+| **SFTP Source Path** | text | Under **Read from SFTP (Optional)**: the path of a file to read from an SFTP server instead of browsing for it. It replaces the URL, Download Goal and Download Timeout, and shows the SFTP connection fields, where **Host Key** is then required. When the target is also SFTP, one connection serves both. |
 | **File Name** | text | Custom filename for the download. Replaces the site's filename, keeping the extension. Reference `{{ original_filename }}` to keep the site's name instead — `{{ fund }}_{{ original_filename }}` prefixes it, which separates documents that several pages name identically. |
 
 *Plus [common browser fields](#common-fields).*
@@ -502,23 +599,27 @@ Additional fields in **Advanced Settings:**
 <img width="400" src="/images/cloud/download_block.png" alt="File Download block configuration with URL, Download Goal, and Download Timeout fields" />
 </Frame>
 
-### Cloud Storage Upload
+### Cloud Storage
 
-Upload downloaded files to S3 or Azure Blob Storage.
+Upload files that earlier blocks downloaded to Amazon S3, Azure Blob Storage, Google Drive or an SFTP server.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **Storage Type** | select | `Amazon S3` or `Azure Blob Storage` |
-| **Folder Path** | text | Upload path/prefix (optional) |
+| **Storage Type** | select | `Amazon S3` (default), `Azure Blob Storage`, `Google Drive` or `SFTP` |
+| **Prompt** | text | Optional. Describes which downloaded files to upload, such as only the PDF files whose names contain "invoice". Leave it empty to upload every downloaded file. |
+
+The other fields depend on the storage type. For S3 and Azure, **Folder Path** starts as `{{ workflow_run_id }}`, so each run uploads to its own folder.
 
 <Accordion title="S3 fields">
 
 | Field | Description |
 |-------|-------------|
-| **S3 Bucket** | Bucket name |
 | **AWS Access Key ID** | AWS credential |
 | **AWS Secret Access Key** | AWS credential |
+| **S3 Bucket** | Bucket name |
 | **Region Name** | AWS region |
+| **(Optional) Endpoint URL** | An `https://` endpoint for S3-compatible storage, such as MinIO. Leave it empty to use AWS S3. |
+| **(Optional) Folder Path** | Upload path/prefix |
 
 </Accordion>
 
@@ -529,12 +630,66 @@ Upload downloaded files to S3 or Azure Blob Storage.
 | **Storage Account Name** | Storage account name |
 | **Storage Account Key** | Storage account key |
 | **Blob Container Name** | Container name |
+| **(Optional) Folder Path** | Upload path/prefix |
+
+</Accordion>
+
+<Accordion title="Google Drive fields">
+
+| Field | Description |
+|-------|-------------|
+| **Google Account** | A Google account connected with Google Drive access on [Integrations](/cloud/integrations#google-and-microsoft-accounts) |
+| **Google Drive Folder ID (Optional)** | ID of the folder to upload to |
+
+</Accordion>
+
+<Accordion title="SFTP fields">
+
+| Field | Description |
+|-------|-------------|
+| **SFTP Host** | The server to upload to |
+| **Port** | A number; template values are not supported. Defaults to 22 when blank. |
+| **Username** | SFTP username |
+| **Password** | Leave it blank when you use a private key. Reference a secret parameter instead of typing the password. |
+| **Private Key** | Key for key-based authentication |
+| **Private Key Passphrase (Optional)** | Passphrase for the private key |
+| **(Optional) Remote Directory** | Directory to upload to |
+| **(Optional) Host Key** | The server's host key, such as `ssh-ed25519 AAAA...`. When blank, the host key is not verified and the connection can be intercepted. |
 
 </Accordion>
 
 <Frame>
-<img width="400" src="/images/cloud/cloud_block.png" alt="Cloud Storage Upload block configuration with Storage Type and Folder Path fields" />
+<img width="400" src="/images/cloud/cloud_block.png" alt="Cloud Storage block configuration with Storage Type and Folder Path fields" />
 </Frame>
+
+### PDF Fill
+
+Fill in a PDF form from a prompt and a JSON payload, and save the filled PDF as a file of the run.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **File URL** | text | The source PDF: a URL, an S3 URI, or a file path from an earlier block's output |
+| **Prompt** | text | How to fill the PDF fields. Supports [parameter references](/cloud/studio#inputs). |
+| **Payload** | JSON | The data to fill in (default: `{}`). Supports [parameter references](/cloud/studio#inputs). |
+| **Model** | selector | Which LLM model maps the payload to the fields |
+
+The block works best on fillable PDFs with form fields. A scanned or flat PDF is filled best-effort by placing text on the page, and fails if it has more than 25 pages. `fill_mode` in the output is `acroform` for a fillable form and `flat_overlay` for a flat one.
+
+The output also includes `fields`, `skipped_fields`, `file_path`, `file_name`, `artifact_url` and `downloaded_files`.
+
+### Split PDF
+
+Split one PDF into several PDFs, following a prompt that says where each document starts and ends.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **File URL** | text | The source PDF: a URL, an S3 URI, or a file path from an earlier block's output |
+| **Prompt** | text | How to split the PDF, e.g. "Split the PDF into one file per document." Supports [parameter references](/cloud/studio#inputs). |
+| **Model** | selector | Which LLM model plans the split |
+
+The block reads at most 1000 pages. A longer PDF fails with a message to split the source PDF into smaller files first.
+
+The output holds `documents`, one entry per new PDF with its `name`, `folder`, `page_range`, `page_count`, `file_path`, `file_name` and `artifact_url`. It also includes `document_count`, `skipped`, `source_page_count` and `downloaded_files`.
 
 ---
 
@@ -572,15 +727,15 @@ Fields in **Advanced Settings** (SMTP only):
 
 ### HTTP Request
 
-Make an API call to an external service. Click **Import cURL** in the block header to populate fields from a cURL command.
+Make an API call to an external service. Click **Import cURL**, above the **Method** field, to populate fields from a cURL command.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | **Method** | select | GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS |
 | **URL** | text | Request URL. Supports parameter references. |
 | **Headers** | JSON | HTTP headers. Use **Quick Headers** to add common headers. |
-| **Body** | JSON | Request body (POST/PUT/PATCH only) |
-| **Files** | JSON | File uploads (POST/PUT/PATCH only) |
+| **Body** | JSON | Request body. Hidden for GET, HEAD and DELETE. |
+| **Files** | JSON | File uploads. Hidden for GET, HEAD and DELETE. |
 
 Additional fields in **Advanced Settings:**
 
@@ -591,6 +746,7 @@ Additional fields in **Advanced Settings:**
 | **Continue on Failure** | boolean | Continue agent if the request fails |
 | **Save Response as File** | boolean | Save the response body as a downloadable file |
 | **Download Filename** | text | Filename for the saved response (shown when Save Response as File is enabled) |
+| **Secret Response Paths** | text | One dot-path per line into the JSON response body, such as `data.ssn`. Matching values are stored as secrets: hidden from outputs, logs and the AI, and usable in later blocks like credentials. A path that does not resolve to a non-empty string fails the block, and the response body is left out of its output. You cannot combine it with **Save Response as File**: the editor lets you turn on both, but saving the agent fails. |
 
 <Frame>
 <img width="400" src="/images/cloud/http_block.png" alt="HTTP Request block configuration with Method, URL, Headers, and Body fields" />

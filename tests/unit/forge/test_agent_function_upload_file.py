@@ -191,6 +191,7 @@ async def test_google_drive_direct_path_calls_drive_service(small_file: Path) ->
         access_token="at-1",
         file_path=str(small_file),
         folder_id="folder_123",
+        save_as_sheet=False,
     )
 
 

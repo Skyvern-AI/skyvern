@@ -28,6 +28,7 @@ import {
   yamlKey,
 } from "./docSettingsChips";
 import type { ParametersState } from "../types";
+import { reviewFieldValue } from "../panels/workflowReviewDiff";
 
 // Typed as a record so a new block type fails tsc here until it is listed.
 const BLOCK_TYPES: Record<WorkflowBlockNode["type"], true> = {
@@ -65,6 +66,7 @@ const BLOCK_TYPES: Record<WorkflowBlockNode["type"], true> = {
   googleSheetsWrite: true,
   agentStep: true,
   powerBIQuery: true,
+  integrationAction: true,
 };
 
 describe("docCustomSettings", () => {
@@ -243,7 +245,7 @@ describe("docCustomSettings", () => {
     },
   );
 
-  test("a Gmail step with a cleared field lists that field and its transport", () => {
+  test("a Gmail step with a cleared field lists that field and its transport; a step on a connected account names its source by the product's term and hides its connection id", () => {
     expect(
       docCustomSettings(
         newStep("sendEmail", { transport: "gmail", bodyFormat: "" }),
@@ -252,6 +254,46 @@ describe("docCustomSettings", () => {
       ["transport", "gmail"],
       ["body_format", "Not set"],
     ]);
+    const connected = { credentialSource: "nango", connectionId: "conn-raw-1" };
+    const steps = [
+      newStep("emailInbox", connected),
+      newStep("sendEmail", { transport: "gmail", ...connected }),
+      newStep("powerBIQuery", connected),
+      newStep("powerBIQuery", { credentialSource: "native" }),
+    ];
+    const rows = steps.map((step) =>
+      (docCustomSettings(step) ?? [])
+        .filter((row) =>
+          ["credential_source", "connection_id"].includes(row.key),
+        )
+        .map((row) => [row.label, row.value]),
+    );
+    expect(rows).toEqual([
+      [
+        ["Credential source", "Connected Gmail"],
+        ["Connection ID", "•••••••• (hidden)"],
+      ],
+      [
+        ["Credential source", "Connected Gmail"],
+        ["Connection ID", "•••••••• (hidden)"],
+      ],
+      [["Connection ID", "•••••••• (hidden)"]],
+      [["Credential source", "Native Power BI connection"]],
+    ]);
+    expect(
+      JSON.stringify(steps.map((step) => docCustomSettings(step))),
+    ).not.toMatch(/nango|conn-raw-1/i);
+    expect(
+      reviewFieldValue("credential_source", "native", {
+        block_type: "email_inbox",
+        email_client: "outlook",
+      }),
+    ).toBe("Microsoft Account");
+    expect(
+      reviewFieldValue("connection_id", "conn-typed-1", {
+        block_type: "integration_action",
+      }),
+    ).toBe("conn-typed-1");
   });
 
   test.each([

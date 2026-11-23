@@ -22,6 +22,7 @@ export interface FileUploadBlockYaml {
     azure_folder_path?: string;
     google_credential_id?: string;
     google_drive_folder_id?: string;
+    google_drive_save_as_sheet?: boolean;
     sftp_host?: string;
     sftp_port?: number;
     sftp_username?: string;

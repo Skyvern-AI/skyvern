@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import litellm  # type: ignore[import-not-found]
 import pytest  # type: ignore[import-not-found]
@@ -38,9 +38,11 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
-from skyvern.forge.sdk.copilot.cost_telemetry import copilot_cost_scope
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.ember.cost_telemetry import ember_cost_scope
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
 from tests.unit.helpers import FakeLLMResponse
 
@@ -123,6 +125,7 @@ class HandlerOutcome:
     update_thought_calls: list[dict[str, Any]] = field(default_factory=list)
     block_cost_calls: list[dict[str, Any]] = field(default_factory=list)
     usage_events: list[dict[str, Any]] = field(default_factory=list)
+    llm_artifacts: list[tuple[ArtifactType, bytes]] = field(default_factory=list)
     metrics_events: list[dict[str, Any]] = field(default_factory=list)
     span: ReadableSpan | None = None
 
@@ -182,6 +185,36 @@ def _make_thought() -> MagicMock:
     return thought
 
 
+class _RecordingArtifactManager:
+    def __init__(self, outcome: HandlerOutcome) -> None:
+        self._outcome = outcome
+
+    async def prepare_llm_artifact(self, data: bytes, artifact_type: ArtifactType, **_: Any) -> None:
+        self._outcome.llm_artifacts.append((artifact_type, data))
+
+    async def bulk_create_artifacts(self, requests: list[Any]) -> list[str]:
+        return []
+
+    def accumulate_llm_call_to_archive(self, **kwargs: Any) -> None:
+        for key, artifact_type in (
+            ("prompt", ArtifactType.LLM_PROMPT),
+            ("request", ArtifactType.LLM_REQUEST),
+            ("response", ArtifactType.LLM_RESPONSE),
+            ("parsed_response", ArtifactType.LLM_RESPONSE_PARSED),
+            ("rendered_response", ArtifactType.LLM_RESPONSE_RENDERED),
+        ):
+            if kwargs.get(key) is not None:
+                self._outcome.llm_artifacts.append((artifact_type, kwargs[key]))
+
+    def accumulate_screenshot_to_step_archive(self, **_: Any) -> list[str]:
+        return []
+
+
+class _FailingSecretLookupContextManager(WorkflowContextManager):
+    def get_secret_values_for_run(self, *_: Any, **__: Any) -> set[str]:
+        raise RuntimeError("secret store unavailable")
+
+
 def _stub_common(mp: pytest.MonkeyPatch, outcome: HandlerOutcome, context: SkyvernContext | None) -> None:
     mp.setattr(api_handler_factory.skyvern_context, "current", lambda: context)
 
@@ -193,7 +226,7 @@ def _stub_common(mp: pytest.MonkeyPatch, outcome: HandlerOutcome, context: Skyve
     mp.setattr(api_handler_factory.litellm, "completion_cost", lambda completion_response: LLM_COST)
 
     def capture_info(_event: str, **fields: Any) -> None:
-        if fields.get("log_code") == "copilot_model_usage":
+        if fields.get("log_code") == "model_usage":
             outcome.usage_events.append(fields)
         if _event == "LLM API handler duration metrics":
             outcome.metrics_events.append(fields)
@@ -203,10 +236,7 @@ def _stub_common(mp: pytest.MonkeyPatch, outcome: HandlerOutcome, context: Skyve
     mp.setattr(api_handler_factory, "LOG", structlog.get_logger())
     mp.setattr(api_handler_factory.LOG, "info", capture_info)
 
-    artifact_manager = MagicMock()
-    artifact_manager.prepare_llm_artifact = AsyncMock(return_value=None)
-    artifact_manager.bulk_create_artifacts = AsyncMock()
-    mp.setattr(api_handler_factory.app, "ARTIFACT_MANAGER", artifact_manager)
+    mp.setattr(api_handler_factory.app, "ARTIFACT_MANAGER", _RecordingArtifactManager(outcome))
 
     async def fake_update_step(**kwargs: Any) -> MagicMock:
         outcome.update_step_calls.append(kwargs)
@@ -427,7 +457,13 @@ async def _run_router(
 
 
 @pytest.mark.asyncio
-async def test_happy_path_parses_and_records_identically(span_exporter: InMemorySpanExporter) -> None:
+@pytest.mark.parametrize("secret_lookup_fails", [False, True])
+async def test_happy_path_parses_and_records_identically(
+    span_exporter: InMemorySpanExporter, monkeypatch: pytest.MonkeyPatch, secret_lookup_fails: bool
+) -> None:
+    if secret_lookup_fails:
+        monkeypatch.setattr(api_handler_factory.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+        monkeypatch.setattr(api_handler_factory.app, "WORKFLOW_CONTEXT_MANAGER", _FailingSecretLookupContextManager())
     response = ParityResponse("gpt-4", cache_creation_tokens=404)
     direct = await _run_direct(span_exporter, responses=[response], step=_make_step(), parameters={})
     router = await _run_router(span_exporter, responses=[response], step=_make_step(), parameters={})
@@ -450,6 +486,22 @@ async def test_happy_path_parses_and_records_identically(span_exporter: InMemory
     # Compare shared completion args by VALUE (not just key set) so the gate catches
     # value drift (temperature, token limits, retry settings) during the SKY-11686 dedup.
     assert {k: v for k, v in direct_call.items() if k != "timeout"} == router_call
+
+    # A failed secret lookup means the call's text could not be scrubbed, so none of it is stored.
+    expected_artifact_types = (
+        []
+        if secret_lookup_fails
+        else [
+            ArtifactType.LLM_PROMPT,
+            ArtifactType.LLM_REQUEST,
+            ArtifactType.LLM_RESPONSE,
+            ArtifactType.LLM_RESPONSE_PARSED,
+        ]
+    )
+    for outcome in (direct, router):
+        assert sorted(artifact_type for artifact_type, _ in outcome.llm_artifacts) == sorted(expected_artifact_types)
+    if not secret_lookup_fails:
+        assert PROMPT.encode() in dict(direct.llm_artifacts)[ArtifactType.LLM_PROMPT]
 
     expected_step_update = {
         "task_id": "tsk_parity",
@@ -560,7 +612,7 @@ async def test_recording_correlation_survives_response_parse_failure(
 
 
 @pytest.mark.asyncio
-async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
+async def test_ember_model_usage_is_emitted_once_by_router_and_single_handler(
     span_exporter: InMemorySpanExporter,
 ) -> None:
     def response() -> ParityResponse:
@@ -573,7 +625,7 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
             provider="openai",
         )
 
-    with copilot_cost_scope() as ledger:
+    with ember_cost_scope() as ledger:
         direct = await _run_direct(
             span_exporter,
             responses=[response()],
@@ -590,7 +642,7 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
         )
 
     expected = {
-        "log_code": "copilot_model_usage",
+        "log_code": "model_usage",
         "gen_ai.operation.name": "chat",
         "gen_ai.request.model": "gpt-4",
         "gen_ai.response.model": "openai/gpt-4.1",
@@ -600,7 +652,8 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
         "gen_ai.usage.cache_read.input_tokens": 0,
         "gen_ai.usage.cache_creation.input_tokens": 0,
         "operation.cost": LLM_COST,
-        "copilot.prompt_name": "workflow-copilot-narration",
+        "gen_ai.agent.name": "ember",
+        "llm.prompt_name": "workflow-copilot-narration",
     }
     assert direct.error is None and router.error is None
     assert direct.usage_events == router.usage_events == [expected]
@@ -610,7 +663,7 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
 
 
 @pytest.mark.asyncio
-async def test_unrelated_prompt_does_not_emit_copilot_model_usage(span_exporter: InMemorySpanExporter) -> None:
+async def test_unrelated_prompt_does_not_emit_ember_model_usage(span_exporter: InMemorySpanExporter) -> None:
     direct = await _run_direct(span_exporter, responses=[ParityResponse("gpt-4")], parameters={})
     router = await _run_router(span_exporter, responses=[ParityResponse("gpt-4")], parameters={})
 
@@ -618,7 +671,7 @@ async def test_unrelated_prompt_does_not_emit_copilot_model_usage(span_exporter:
 
 
 @pytest.mark.asyncio
-async def test_copilot_model_usage_survives_response_parse_failure(
+async def test_ember_model_usage_survives_response_parse_failure(
     span_exporter: InMemorySpanExporter,
 ) -> None:
     direct = await _run_direct(
@@ -968,7 +1021,7 @@ async def test_truncated_response_direct_raises_output_truncated(span_exporter: 
 
 
 @pytest.mark.asyncio
-async def test_copilot_model_usage_router_emits_for_each_truncation_attempt(
+async def test_ember_model_usage_router_emits_for_each_truncation_attempt(
     span_exporter: InMemorySpanExporter,
 ) -> None:
     truncated = ParityResponse("gpt-4", content=None, finish_reason="length")

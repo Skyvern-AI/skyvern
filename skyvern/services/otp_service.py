@@ -44,7 +44,7 @@ from skyvern.forge.sdk.services.credentials import (
     parse_totp_config,
     wait_for_fresh_totp_window,
 )
-from skyvern.services.otp_email import EmailOTPVerificationContext
+from skyvern.services.otp_email import EmailOTPVerificationContext, GmailOTPSource, OutlookOTPSource
 from skyvern.utils.url_validators import (
     BLOCKED_HOST_ALLOWLIST_HINT,
     SAFE_REDIRECT_STATUS_CODES,
@@ -75,6 +75,106 @@ class RawOTPVerificationContext:
     # False until the stored-code queries return once, so a wait that times out first can say the
     # store went unchecked instead of claiming it was empty.
     store_queried: bool = False
+
+
+_OTP_NOUN_BY_TYPE = {
+    OTPType.TOTP: "code",
+    OTPType.MAGIC_LINK: "sign-in link",
+}
+
+
+def otp_sources_checked(
+    totp_identifier: str,
+    expected_otp_type: OTPType,
+    email_context: EmailOTPVerificationContext,
+    raw_context: RawOTPVerificationContext,
+    *,
+    webhook_checked: bool = False,
+) -> str:
+    """Counts only: addresses, credential ids, identifiers and codes must never reach this text."""
+    # Leading facts come first because every downstream cap slices a prefix.
+    lead_facts = ["verification webhook returned no code"] if webhook_checked else []
+    inbox_facts: list[str] = []
+    # An identifier without an "@" never reaches the inbox search, so no mailbox fact holds for it.
+    inboxes_apply = "@" in totp_identifier
+    connected_everywhere_empty = inboxes_apply
+    if inboxes_apply:
+        gmail = email_context.per_source.get(GmailOTPSource.name)
+        needs_reconnect = gmail.needs_reconnect_count if gmail is not None else 0
+        if needs_reconnect:
+            connected_everywhere_empty = False
+            lead_facts.append(
+                "1 Gmail inbox connected to this organization needs reconnecting in Integrations, "
+                "and codes sent to it cannot be read until it is reconnected"
+                if needs_reconnect == 1
+                else f"{needs_reconnect} Gmail inboxes connected to this organization need reconnecting in "
+                "Integrations, and codes sent to them cannot be read until they are reconnected"
+            )
+        for label, source_name in (
+            ("Gmail", GmailOTPSource.name),
+            ("Outlook", OutlookOTPSource.name),
+        ):
+            source = email_context.per_source.get(source_name)
+            if source is None:
+                inbox_facts.append(f"{label} inboxes not checked")
+                connected_everywhere_empty = False
+            elif source.credential_ids is None:
+                inbox_facts.append(f"{label} inbox list never loaded")
+                connected_everywhere_empty = False
+            elif not source.credential_ids:
+                if source.credential_list_refresh_failed:
+                    inbox_facts.append(f"{label} inbox list not refreshed")
+                    connected_everywhere_empty = False
+                elif not source.needs_reconnect_count:
+                    inbox_facts.append(f"no {label} inbox connected")
+            else:
+                connected_everywhere_empty = False
+                connected = set(source.credential_ids)
+                inboxes = len(connected)
+                # Counted here rather than pruned on refresh: the message sets also drive dedupe,
+                # and forgetting a key would re-parse a message the caller already paid for.
+                messages = sum(1 for credential_id, _ in source.seen_message_keys if credential_id in connected)
+                unreadable = sum(1 for credential_id, _ in source.unreadable_message_keys if credential_id in connected)
+                capped = source.messages_evicted
+                shown = f"{messages}+" if capped else str(messages)
+                if messages and unreadable:
+                    reached = messages + unreadable
+                    # One count carries both: an appended clause would not survive the shortest
+                    # consumer, and a bare checked count hides the candidates the parser refused.
+                    read_fact = f"{shown} of {reached}{'+' if capped else ''} messages read"
+                elif messages:
+                    read_fact = f"{shown} message{'s' if messages != 1 else ''} checked"
+                elif source.failed_credential_ids:
+                    read_fact = "search failed"
+                elif unreadable:
+                    read_fact = f"{unreadable} message{'s' if unreadable != 1 else ''} could not be read"
+                else:
+                    read_fact = "no messages read"
+                plural = "es" if inboxes != 1 else ""
+                # Coverage shares the clause with the read fact, which on its own would hide an inbox
+                # that failed or was still in flight whenever a sibling inbox answered.
+                searched = len(source.completed_credential_ids & connected)
+                coverage = (
+                    f"{searched} of {inboxes} {label} inbox{plural} searched"
+                    if searched < inboxes
+                    else f"{inboxes} {label} inbox{plural} connected"
+                )
+                inbox_facts.append(f"{coverage}, {read_fact}")
+    rows = len(raw_context.seen_row_ids)
+    noun = _OTP_NOUN_BY_TYPE.get(expected_otp_type, "OTP")
+    store_empty = raw_context.store_queried and not rows
+    if not lead_facts and connected_everywhere_empty and store_empty:
+        return f"No Gmail or Outlook inbox is connected and no {noun} has been stored."
+    if not lead_facts and not raw_context.store_queried and all(fact.endswith("not checked") for fact in inbox_facts):
+        return "No delivery source was checked before the wait ended."
+    if not raw_context.store_queried:
+        row_fact = f"stored {noun}s not checked"
+    elif rows:
+        # "found", not "checked": the reparse budget stops the scan before every row is parsed.
+        row_fact = f"{rows} stored OTP message{'s' if rows != 1 else ''} found"
+    else:
+        row_fact = f"no {noun} has been stored"
+    return f"Sources checked: {'; '.join([*lead_facts, *inbox_facts, row_fact])}."
 
 
 @dataclass(frozen=True)
@@ -935,6 +1035,9 @@ async def resolve_otp_value(
     *,
     min_remaining_seconds: int = 0,
     surface_magic_link: MagicLinkSurfacing | None = None,
+    email_context: EmailOTPVerificationContext | None = None,
+    raw_context: RawOTPVerificationContext | None = None,
+    webhook_context: WebhookOTPVerificationContext | None = None,
 ) -> OTPValue | None:
     """Resolve the OTP value to use for a verification step.
 
@@ -985,6 +1088,7 @@ async def resolve_otp_value(
             workflow_id=workflow_id,
             workflow_run_id=task.workflow_run_id,
             workflow_permanent_id=workflow_permanent_id,
+            otp_request_id=task.otp_request_id,
             totp_verification_url=task.totp_verification_url,
             totp_identifier=task.totp_identifier,
             created_after=created_after or run_started_at,
@@ -995,6 +1099,9 @@ async def resolve_otp_value(
             poll_started_at=poll_started_at,
             multi_field_expected_digits=multi_field_expected_digits,
             surface_magic_link=surface_magic_link,
+            email_context=email_context,
+            raw_context=raw_context,
+            webhook_context=webhook_context,
         )
 
     _warn_if_scope_suppresses_legacy_credential(task, expected_otp_type, allowed_credential_parameter_keys)
@@ -1007,6 +1114,7 @@ async def poll_otp_value(
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
     workflow_permanent_id: str | None = None,
+    otp_request_id: str | None = None,
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
     created_after: datetime | None = None,
@@ -1062,6 +1170,7 @@ async def poll_otp_value(
     raw_otp_context = raw_context if raw_context is not None else RawOTPVerificationContext()
     webhook_otp_context = webhook_context if webhook_context is not None else WebhookOTPVerificationContext()
     sleep_seconds = min(10.0, timeout.total_seconds())
+    source = "not_polled"
     while True:
         await asyncio.sleep(sleep_seconds)
         now = datetime.utcnow()
@@ -1072,6 +1181,7 @@ async def poll_otp_value(
                     "Polling otp value timed out while webhook was still failing",
                     consecutive_failures=consecutive_failures,
                     last_error_reason=last_error_reason,
+                    otp_poll_source=source,
                 )
                 raise FailedToGetTOTPVerificationCode(
                     task_id=task_id,
@@ -1090,11 +1200,12 @@ async def poll_otp_value(
                     "Polling otp value timed out; totp_verification_url never returned the documented response",
                     webhook_diagnostics=webhook_diagnostics,
                     expected_response_shape=TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE,
+                    otp_poll_source=source,
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
                 )
             else:
-                LOG.warning("Polling otp value timed out")
+                LOG.warning("Polling otp value timed out", otp_poll_source=source)
             raise NoTOTPVerificationCodeFound(
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
@@ -1115,6 +1226,7 @@ async def poll_otp_value(
                 if not org_token:
                     LOG.error("Failed to get organization token when trying to get otp value")
                     return None
+                source = "verification_url"
                 otp_value = await _get_otp_value_from_url(
                     organization_id,
                     totp_verification_url,
@@ -1122,13 +1234,36 @@ async def poll_otp_value(
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
                     workflow_permanent_id=workflow_permanent_id,
+                    otp_request_id=otp_request_id,
                     context=webhook_otp_context,
                     expected_otp_type=expected_otp_type,
                 )
+                if otp_request_id is not None and otp_value is not None:
+                    # A strict webhook response is not consumable until this exact
+                    # original owner wins the durable insert-and-claim race. Filter a
+                    # code the caller already rejected before recording the response,
+                    # so a later distinct resend can still win for this marker.
+                    otp_value = _exclude_rejected_otp(
+                        otp_value,
+                        rejected_code_hash,
+                        multi_field_expected_digits,
+                        task_id=task_id,
+                    )
+                    if otp_value is not None and not await app.DATABASE.otp.claim_strict_webhook_otp_code(
+                        organization_id=organization_id,
+                        otp_request_id=otp_request_id,
+                        content=otp_value.value,
+                        code=otp_value.value,
+                        otp_type=otp_value.get_otp_type(),
+                        task_id=task_id,
+                        workflow_run_id=workflow_run_id,
+                    ):
+                        otp_value = None
             otp_value = _exclude_rejected_otp(
                 otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task_id
             )
-            if otp_value is None and totp_identifier:
+            if otp_value is None and totp_identifier and otp_request_id is None:
+                source = "connected_email"
                 otp_value = await _get_otp_value_from_email(
                     organization_id=organization_id,
                     totp_identifier=totp_identifier,
@@ -1144,12 +1279,14 @@ async def poll_otp_value(
             if otp_value is None and totp_identifier:
                 # Preserve the historical DB behavior: callers that omit
                 # created_after may still read codes inserted before this poll began.
+                source = "stored_code"
                 otp_value = await _get_otp_value_from_db(
                     organization_id,
                     totp_identifier,
                     task_id=task_id,
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run_id,
+                    otp_request_id=otp_request_id,
                     created_after=db_created_after,
                     expected_otp_type=expected_otp_type,
                     raw_context=raw_otp_context,
@@ -1175,6 +1312,7 @@ async def poll_otp_value(
         if otp_value:
             LOG.info(
                 "Got otp value",
+                otp_poll_source=source,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -1191,6 +1329,7 @@ async def _get_otp_value_from_url(
     task_id: str | None = None,
     workflow_run_id: str | None = None,
     workflow_permanent_id: str | None = None,
+    otp_request_id: str | None = None,
     context: WebhookOTPVerificationContext | None = None,
     expected_otp_type: OTPType | None = None,
 ) -> OTPValue | None:
@@ -1201,6 +1340,8 @@ async def _get_otp_value_from_url(
         request_data["workflow_run_id"] = workflow_run_id
     if workflow_permanent_id:
         request_data["workflow_permanent_id"] = workflow_permanent_id
+    if otp_request_id:
+        request_data["otp_request_id"] = otp_request_id
     signed_data = generate_skyvern_webhook_signature(
         payload=request_data,
         api_key=api_key,
@@ -1265,6 +1406,15 @@ async def _get_otp_value_from_url(
             content_type=content_type,
             response_json_type=type(response_body).__name__,
             expected_response_shape=TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE,
+        )
+        return None
+
+    if otp_request_id is not None and response_body.get("otp_request_id") != otp_request_id:
+        LOG.warning(
+            "TOTP webhook response did not echo the strict request marker",
+            http_status=status_code,
+            content_type=content_type,
+            response_keys=list(response_body.keys()),
         )
         return None
 
@@ -1365,6 +1515,7 @@ async def _get_otp_value_from_db(
     task_id: str | None = None,
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
+    otp_request_id: str | None = None,
     created_after: datetime | None = None,
     expected_otp_type: OTPType | None = None,
     raw_context: RawOTPVerificationContext | None = None,
@@ -1374,6 +1525,46 @@ async def _get_otp_value_from_db(
     *,
     surface_magic_link: MagicLinkSurfacing | None = None,
 ) -> OTPValue | None:
+    context = raw_context or RawOTPVerificationContext()
+    if otp_request_id is not None:
+        claimed = await app.DATABASE.otp.claim_otp_code(
+            organization_id=organization_id,
+            totp_identifier=totp_identifier,
+            otp_request_id=otp_request_id,
+            task_id=task_id,
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id,
+            otp_type=expected_otp_type,
+            created_after=created_after,
+        )
+        context.store_queried = True
+        if claimed is None:
+            return None
+        context.seen_row_ids.add(claimed.totp_code_id)
+        claimed_value = _exclude_rejected_otp(
+            OTPValue(value=claimed.code, type=claimed.otp_type),
+            rejected_code_hash,
+            multi_field_expected_digits,
+            task_id=task_id,
+        )
+        if claimed_value is None:
+            await app.DATABASE.otp.reject_claimed_otp_code(
+                totp_code_id=claimed.totp_code_id,
+                organization_id=organization_id,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+            )
+            return None
+        if not _forwarded_magic_link_matches_task_site(claimed_value, claimed.source, task_url):
+            await app.DATABASE.otp.reject_claimed_otp_code(
+                totp_code_id=claimed.totp_code_id,
+                organization_id=organization_id,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+            )
+            return None
+        return claimed_value
+
     # Email/SMS deliveries can arrive through /v1/credentials/totp without run
     # scope, so include both exact run matches and unscoped rows in SQL.
     totp_codes = await app.DATABASE.otp.get_otp_codes(
@@ -1383,7 +1574,6 @@ async def _get_otp_value_from_db(
         include_unscoped_workflow_run=workflow_run_id is not None,
         created_after=created_after,
     )
-    context = raw_context or RawOTPVerificationContext()
     raw_rows: list[RawTOTPCode] = []
     if expected_otp_type is not None:
         raw_rows = await app.DATABASE.otp.get_raw_otp_codes(

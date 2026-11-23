@@ -36,7 +36,7 @@ from skyvern.client.errors import InternalServerError, UnprocessableEntityError
 from skyvern.config import settings
 from skyvern.constants import TEXT_PRESS_MAX_LENGTH
 from skyvern.exceptions import SkyvernPageAnalysisTimeout, StaleFrameSelectionError
-from skyvern.forge.sdk.copilot.tools import mcp_hooks
+from skyvern.forge.sdk.ember.tools import mcp_hooks
 from skyvern.forge.sdk.forge_log import codeblock_parameter_log_redaction
 from skyvern.library.ai_locator import AILocator
 from skyvern.webeye import action_deadline

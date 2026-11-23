@@ -1,0 +1,373 @@
+{
+ "pending_credential_requests": [],
+ "question_interactions": [],
+ "pending_question_cancel_token": null,
+ "workflow_copilot_chat_id": "wcc_596869687476203422",
+ "request_turn_id": null,
+ "request_browser_allocations": null,
+ "in_flight_turn": null,
+ "chat_history": [
+  {
+   "workflow_copilot_chat_message_id": "wccm_596870138447767658",
+   "sender": "user",
+   "content": "Add a third output with the text of every link on the page, and test it end to end.",
+   "turn_id": "17f238cae8394e2694f60affabb6c276",
+   "feedback": null,
+   "audio_artifact_id": null,
+   "attached_files": [],
+   "turn_outcome": null,
+   "narrative_payload": null,
+   "created_at": "2026-11-14T10:40:58.339506",
+   "modified_at": "2026-11-14T10:40:59.901025",
+   "ember_chat_message_id": "wccm_596870138447767658"
+  },
+  {
+   "workflow_copilot_chat_message_id": "wccm_596870211462211744",
+   "sender": "ai",
+   "content": "Stopped. Before the stop, I changed extract_main_heading. Test run wr_596870185692407926 recorded extract_main_heading completed. The tested draft from this turn was preserved for review. Accept it to save, or discard.",
+   "turn_id": "17f238cae8394e2694f60affabb6c276",
+   "feedback": null,
+   "audio_artifact_id": null,
+   "attached_files": [],
+   "turn_outcome": {
+    "response_kind": "recover",
+    "reason_code": "",
+    "output_policy_reasons": [],
+    "actuation_obligation_key": "",
+    "normalized_reply_signature": "e4a6a0577479b2b4",
+    "tool_calls": [
+     "edit_block"
+    ],
+    "terminal_reason": "cancel",
+    "budget_expired": false,
+    "budget_expiry_source": null,
+    "budget_expiry_report_produced": null,
+    "budget_expiry_staged_draft_id": null,
+    "drain_fingerprint": null,
+    "cancel_source": "api",
+    "blocked_signatures": [],
+    "copilot_runtime": "agent",
+    "copilot_effective_mode": null,
+    "copilot_code_available": true,
+    "copilot_last_code_build_failed": false,
+    "copilot_pending_capability": null,
+    "copilot_turn_id": "17f238cae8394e2694f60affabb6c276",
+    "user_message_id": "wccm_596870138447767658",
+    "request_cancel_token": "b144df5f-852b-4b7f-8bb7-3dd9445881be",
+    "request_browser_allocations": null,
+    "interrupted_row_final": false,
+    "idempotency_digest": null,
+    "connected_account_choices": null,
+    "output_files": null
+   },
+   "narrative_payload": {
+    "turnId": "17f238cae8394e2694f60affabb6c276",
+    "turnIndex": 2,
+    "designStarted": true,
+    "designEnded": true,
+    "draft": {
+     "blockCount": 1,
+     "blockLabels": [
+      "extract_main_heading"
+     ],
+     "summary": null
+    },
+    "blocks": [
+     {
+      "label": "extract_main_heading",
+      "workflowRunBlockId": "wrb_596870185692407936",
+      "blockType": "code",
+      "state": "completed",
+      "lastSeenIteration": 1,
+      "activity": [],
+      "startedAt": "2026-11-14T10:41:09.425032",
+      "endedAt": "2026-11-14T10:41:09.720071",
+      "workflowRunId": "wr_596870185692407926",
+      "outcome": "not_evaluated",
+      "outcomeRole": "recorded"
+     }
+    ],
+    "terminal": "error",
+    "terminalMessage": "Stopped. Before the stop, I changed extract_main_heading. Test run wr_596870185692407926 recorded extract_main_heading completed. The tested draft from this turn was preserved for review. Accept it to save, or discard.",
+    "narrativeSummary": "Stopped. Before the stop, I changed extract_main_heading. Test run wr_596870185692407926 recorded extract_main_heading completed. The tested draft from this turn was preserved for review. Accept it to save, or discard.",
+    "priorBlockCount": 1,
+    "designActivity": [
+     {
+      "kind": "tool_call",
+      "text": "Editing block \"Extract Main Heading\"\u2026",
+      "iteration": 0,
+      "toolName": "edit_block",
+      "displayLabel": "Editing block \"Extract Main Heading\"",
+      "id": "tc-toolu_01DKsoQK9otjjCKi4hJY3GtE",
+      "timestamp": "2026-11-14T10:41:04.499712+00:00",
+      "reason": "Add the links output to the block's output schema.",
+      "activityStartedAt": "2026-11-14T10:41:04.499712+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_result",
+      "text": "Editing block \"Extract Main Heading\"",
+      "iteration": 0,
+      "toolName": "edit_block",
+      "displayLabel": "Editing block \"Extract Main Heading\"",
+      "success": true,
+      "id": "tr-toolu_01DKsoQK9otjjCKi4hJY3GtE",
+      "timestamp": "2026-11-14T10:41:04.642785+00:00",
+      "reason": "Add the links output to the block's output schema.",
+      "activityStartedAt": "2026-11-14T10:41:04.499712+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_call",
+      "text": "Editing and testing block \"Extract Main Heading\"\u2026",
+      "iteration": 1,
+      "toolName": "edit_block_and_run",
+      "displayLabel": "Editing and testing block \"Extract Main Heading\"",
+      "id": "tc-toolu_01TgiiMR2iXESgVLDLmD48ca",
+      "timestamp": "2026-11-14T10:41:07.852546+00:00",
+      "reason": "Add the links output and test the block end to end.",
+      "activityStartedAt": "2026-11-14T10:41:07.852546+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     }
+    ],
+    "startedAt": "2026-11-14T10:40:59.904183+00:00",
+    "endedAt": "2026-11-14T10:41:14.886179+00:00",
+    "testedBlockFingerprints": {
+     "extract_main_heading": [
+      "10cb5ac671b714aa37930edb9375b1e51d7e817bb1e7dc66ebcdbc2d14caa983",
+      "5570454f5a427948c1fb4e26df6d2993e68efe11d40fda1d34940dca6c0e53b9",
+      "673ca551810aaad69345e81e5c7f4b9480db5a4ca5f28de74f7898fbbbc6325f",
+      "6d10d3803a3e21bf7193483c1fa80ebd0617f64cc8644e41e7b54d7fee4a154b"
+     ]
+    },
+    "review": {
+     "blocks": [
+      {
+       "label": "extract_main_heading",
+       "blockType": "code",
+       "change": "added",
+       "neverTested": false,
+       "coverage": "current_source"
+      }
+     ],
+     "duplicateWrites": [],
+     "inputs": []
+    },
+    "responseType": "REPLY",
+    "proposalDisposition": "review_tested",
+    "responseKind": "recover",
+    "turnFacts": {
+     "factsAvailable": true,
+     "evaluationState": "not_evaluated",
+     "runId": "wr_596870185692407926",
+     "runCompleted": true,
+     "terminalCause": null,
+     "blocksRunThisTurn": 1,
+     "recordedFailure": null,
+     "ranCleanOnCurrentSource": true,
+     "authoredBlockCount": 1,
+     "matchingSourceBlockCount": 1,
+     "editedBlockLabels": [
+      "extract_main_heading"
+     ]
+    },
+    "cancelled": true
+   },
+   "created_at": "2026-11-14T10:41:15.186868",
+   "modified_at": "2026-11-14T10:41:15.186869",
+   "ember_chat_message_id": "wccm_596870211462211744"
+  }
+ ],
+ "workflow_permanent_id": "wpid_596869687476203418",
+ "app_url": "http://localhost:8080",
+ "accepted_turn_ids": [],
+ "proposed_workflow": {
+  "workflow_id": "w_596869687476203416",
+  "organization_id": "o_596691277976876550",
+  "title": "Extract main heading from example.com",
+  "workflow_permanent_id": "wpid_596869687476203418",
+  "version": 1,
+  "is_saved_task": false,
+  "is_template": false,
+  "description": "",
+  "workflow_definition": {
+   "version": 1,
+   "parameters": [
+    {
+     "parameter_type": "output",
+     "key": "extract_main_heading_output",
+     "description": "Output parameter for block extract_main_heading",
+     "output_parameter_id": "op_596870177102473326",
+     "workflow_id": "w_596869687476203416",
+     "created_at": "2026-11-14T10:41:07.935621",
+     "modified_at": "2026-11-14T10:41:07.935623",
+     "deleted_at": null
+    }
+   ],
+   "blocks": [
+    {
+     "label": "extract_main_heading",
+     "next_block_label": null,
+     "block_type": "code",
+     "output_parameter": {
+      "parameter_type": "output",
+      "key": "extract_main_heading_output",
+      "description": "Output parameter for block extract_main_heading",
+      "output_parameter_id": "op_596870177102473326",
+      "workflow_id": "w_596869687476203416",
+      "created_at": "2026-11-14T10:41:07.935621",
+      "modified_at": "2026-11-14T10:41:07.935623",
+      "deleted_at": null
+     },
+     "continue_on_failure": false,
+     "model": null,
+     "disable_cache": false,
+     "ignore_workflow_system_prompt": false,
+     "next_loop_on_failure": false,
+     "code": "await page.goto(\"https://example.com\")\nawait page.wait_for_selector(\"p\")\nh1 = page.locator(\"h1\")\nif await h1.count() > 0:\n    heading = (await h1.first.inner_text()).strip()\n    source = \"h1\"\nelse:\n    heading = (await page.locator(\"p\").first.inner_text()).strip()\n    source = \"first paragraph (page has no h1)\"\npage_title = await page.title()\nfirst_paragraph = (await page.locator(\"p\").first.inner_text()).strip()\nlink_texts = await page.locator(\"a\").all_inner_texts()\nlinks = [t.strip() for t in link_texts if t.strip()]\nreturn {\"heading\": heading, \"source\": source, \"title\": page_title, \"paragraph\": first_paragraph, \"links\": links}",
+     "parameters": [],
+     "error_code_mapping": null,
+     "prompt": "The Example Domain page is open, showing its main heading text at the top as 'This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.' and the browser tab title 'Example Domain'. Opens https://example.com, waits for the page body text to render, then reads the first h1 if one exists, otherwise the first English paragraph (the most prominent text at the top of the page), and the page title.",
+     "steps": [
+      {
+       "description": "Open https://example.com",
+       "action_type": "goto_url",
+       "line_start": 1,
+       "line_end": 1
+      },
+      {
+       "description": "Extract heading",
+       "action_type": "extract",
+       "line_start": 5,
+       "line_end": 8
+      },
+      {
+       "description": "Extract first paragraph",
+       "action_type": "extract",
+       "line_start": 11,
+       "line_end": 11
+      },
+      {
+       "description": "Extract link texts",
+       "action_type": "extract",
+       "line_start": 12,
+       "line_end": 12
+      }
+     ],
+     "data_schema": {
+      "type": "object",
+      "properties": {
+       "heading": {
+        "type": "string"
+       },
+       "source": {
+        "type": "string"
+       },
+       "title": {
+        "type": "string"
+       },
+       "paragraph": {
+        "type": "string"
+       },
+       "links": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "heading",
+       "paragraph",
+       "links"
+      ]
+     },
+     "user_owned_goal": null,
+     "goal_needs_regeneration": null,
+     "code_edited_by_hand": null
+    }
+   ],
+   "finally_block_label": null,
+   "error_code_mapping": null,
+   "retry_policy": null,
+   "workflow_system_prompt": null,
+   "completion_contract": null
+  },
+  "persist_browser_session": false,
+  "reuse_browser_session": false,
+  "mask_secrets": false,
+  "pin_saved_session_ip": false,
+  "browser_profile_id": null,
+  "browser_profile_key": null,
+  "model": null,
+  "status": "published",
+  "max_screenshot_scrolls": null,
+  "max_elapsed_time_minutes": null,
+  "run_with": "agent",
+  "browser_type": null,
+  "ai_fallback": true,
+  "cache_key": "default",
+  "adaptive_caching": false,
+  "enable_self_healing": false,
+  "code_version": 2,
+  "generate_script_on_terminal": false,
+  "run_sequentially": false,
+  "sequential_key": null,
+  "folder_id": null,
+  "import_error": null,
+  "created_by": null,
+  "edited_by": null,
+  "build_source": null,
+  "copilot_authored": false,
+  "original_created_by": null,
+  "original_created_at": null,
+  "created_at": "2026-11-14T10:41:07.941418Z",
+  "modified_at": "2026-11-14T10:41:07.941418Z",
+  "deleted_at": null,
+  "agent_id": "wpid_596869687476203418",
+  "_copilot_yaml": "title: Extract main heading from example.com\nworkflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: extract_main_heading\n    prompt: The Example Domain page is open, showing its main heading text at the\n      top as 'This domain is for use in documentation examples without needing permission.\n      This is not a service; avoid relying on it for testing and monitoring purposes.'\n      and the browser tab title 'Example Domain'. Opens https://example.com, waits\n      for the page body text to render, then reads the first h1 if one exists, otherwise\n      the first English paragraph (the most prominent text at the top of the page),\n      and the page title.\n    code: \"await page.goto(\\\"https://example.com\\\")\\nawait page.wait_for_selector(\\\"\\\n      p\\\")\\nh1 = page.locator(\\\"h1\\\")\\nif await h1.count() > 0:\\n    heading = (await\\\n      \\ h1.first.inner_text()).strip()\\n    source = \\\"h1\\\"\\nelse:\\n    heading =\\\n      \\ (await page.locator(\\\"p\\\").first.inner_text()).strip()\\n    source = \\\"first\\\n      \\ paragraph (page has no h1)\\\"\\npage_title = await page.title()\\nfirst_paragraph\\\n      \\ = (await page.locator(\\\"p\\\").first.inner_text()).strip()\\nlink_texts = await\\\n      \\ page.locator(\\\"a\\\").all_inner_texts()\\nlinks = [t.strip() for t in link_texts\\\n      \\ if t.strip()]\\nreturn {\\\"heading\\\": heading, \\\"source\\\": source, \\\"title\\\"\\\n      : page_title, \\\"paragraph\\\": first_paragraph, \\\"links\\\": links}\"\n    data_schema:\n      type: object\n      properties:\n        heading:\n          type: string\n        source:\n          type: string\n        title:\n          type: string\n        paragraph:\n          type: string\n        links:\n          type: array\n          items:\n            type: string\n      required:\n      - heading\n      - paragraph\n      - links\n    steps:\n    - description: Open https://example.com\n      action_type: goto_url\n      line_start: 1\n      line_end: 1\n    - description: Extract heading\n      action_type: extract\n      line_start: 5\n      line_end: 8\n    - description: Extract first paragraph\n      action_type: extract\n      line_start: 11\n      line_end: 11\n    - description: Extract link texts\n      action_type: extract\n      line_start: 12\n      line_end: 12\n",
+  "_copilot_tested_block_fingerprints": {
+   "extract_main_heading": [
+    "10cb5ac671b714aa37930edb9375b1e51d7e817bb1e7dc66ebcdbc2d14caa983",
+    "5570454f5a427948c1fb4e26df6d2993e68efe11d40fda1d34940dca6c0e53b9",
+    "673ca551810aaad69345e81e5c7f4b9480db5a4ca5f28de74f7898fbbbc6325f",
+    "6d10d3803a3e21bf7193483c1fa80ebd0617f64cc8644e41e7b54d7fee4a154b"
+   ]
+  },
+  "_copilot_proposal": {
+   "owner_turn_id": "17f238cae8394e2694f60affabb6c276",
+   "revision": 3,
+   "canonical_fingerprint": "6556da2556e7ea2f88c1a3fafd6ac5cdba12d369e81e9bec4b411c77f6a219c2",
+   "canonical_title": "Extract main heading from example.com",
+   "disposition": "review_tested",
+   "workflow_run_id": null,
+   "claimed_at": null
+  },
+  "proxy_location": null,
+  "webhook_callback_url": null,
+  "totp_verification_url": null,
+  "totp_identifier": null,
+  "extra_http_headers": null,
+  "cdp_connect_headers": null
+ },
+ "proposed_workflow_metadata": {
+  "owner_turn_id": "17f238cae8394e2694f60affabb6c276",
+  "revision": 3,
+  "canonical_fingerprint": "6556da2556e7ea2f88c1a3fafd6ac5cdba12d369e81e9bec4b411c77f6a219c2",
+  "canonical_title": "Extract main heading from example.com",
+  "disposition": "review_tested",
+  "workflow_run_id": null,
+  "claimed_at": null
+ },
+ "proposed_claim_expires_in_seconds": null,
+ "proposed_workflow_run": null,
+ "auto_accept": false,
+ "work_plan": [],
+ "ember_chat_id": "wcc_596869687476203422"
+}

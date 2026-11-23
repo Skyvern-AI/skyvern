@@ -76,7 +76,7 @@ The **Run** pane has three views:
 | View | What it shows |
 |---|---|
 | **Timeline** | Each block in order with its status, and the actions inside it. Click a block to see its details. |
-| **Inputs** | The input values and settings this run used, such as browser session and profile |
+| **Inputs** | The input values and settings this run used, such as the webhook URL, proxy, browser session and browser profile |
 | **Outputs** | **Extracted information**, **Run outputs**, **Errors**, **Webhook failure reason** and **Downloaded files** |
 
 <img src="/images/cloud/cloud-run-timeline.png" alt="A completed run with the Browser pane on Screenshots and the Run pane Timeline showing the block and its action" />
@@ -113,7 +113,6 @@ A block that never ran because an earlier branch or condition skipped it shows `
 | Screenshots | **Browser** pane → **Screenshots** |
 | Extracted data (JSON) | **Run** pane → **Outputs** → **Extracted information** or **Run outputs** |
 | Files the agent downloaded | **Run** pane → **Outputs** → **Downloaded files**. Click a file to download it. |
-| Generated code | **Run** pane → **⋯** → **Code** |
 
 To pull artifacts from code, call `GET /v1/runs/{run_id}/artifacts`. Each artifact comes with a `signed_url` you can download from. Filter with `artifact_type`, for example `recording` or `screenshot_final`:
 
@@ -132,7 +131,7 @@ Click **Runs** in the sidebar to open **Run History**, every run in your organiz
 
 - **Search** by run ID, input value or credential ("Search by run ID, input, credential...").
 - **Filter** by agent, by run type (**Task**, **Workflow**, **Agent (CUA)**) and by status.
-- Columns are **Run ID**, **Detail**, **Status**, **Created At** and **Duration** (some organizations also see **Created By**). Runs started by a schedule carry a badge next to the ID, and runs that used generated code show a lightning icon.
+- Columns are **Run ID**, **Detail**, **Status**, **Created At** and **Duration** (some organizations also see **Created By**). Runs started by a schedule carry a badge next to the ID.
 - Click a run to open it in Studio.
 
 To see only one agent's runs while you work on it, open the **Past Runs** list from the Studio top bar.

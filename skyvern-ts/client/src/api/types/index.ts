@@ -57,6 +57,7 @@ export * from "./CustomLlmResponse.js";
 export * from "./DeleteScheduleResponse.js";
 export * from "./DownloadToS3Block.js";
 export * from "./DownloadToS3BlockYaml.js";
+export * from "./EmailOrganizeAction.js";
 export * from "./EmailInboxBlock.js";
 export * from "./EmailInboxBlockParametersItem.js";
 export * from "./EmailInboxBlockYaml.js";

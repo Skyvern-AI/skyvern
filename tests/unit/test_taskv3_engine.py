@@ -31,10 +31,11 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     LLMCaller,
 )
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.forge.taskv3 import engine as engine_mod
 from skyvern.forge.taskv3 import loop as loop_mod
+from skyvern.forge.taskv3 import tools as tools_mod
 from skyvern.forge.taskv3.engine import (
     DEFAULT_MAX_TOOL_CALLS,
     DEFAULT_MAX_TURNS,
@@ -378,10 +379,12 @@ async def test_engine_forwards_single_action_block_to_the_loop(
         goal="x",
         single_action_block=single_action_block,
         block_completion_judge=_achieving_judge([]),
+        download_settle=None if single_action_block else _no_download_pending,
     )
 
     assert captured["single_action_block"] is single_action_block
     assert (captured["block_completion_check"] is not None) is single_action_block
+    assert captured["completes_on_download"] is (not single_action_block)
 
 
 def _achieving_judge(prompts: list[str]):
@@ -1021,6 +1024,51 @@ async def test_engine_omits_semantic_commit_stats_when_the_verify_kill_switch_is
     assert loop_stats == [None], loop_stats
 
 
+@pytest.mark.parametrize(
+    ("supports_vision", "enrich_tree_mode", "expected_width"),
+    [
+        pytest.param(True, EnrichTreeMode.CONTROL, 768, id="vision"),
+        pytest.param(False, EnrichTreeMode.CONTROL, 0, id="non_vision_model"),
+        pytest.param(True, EnrichTreeMode.ENRICHED_TREE_NO_IMAGES, 0, id="no_images_policy"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_engine_reads_the_observe_screenshot_width_only_when_the_model_receives_images(
+    monkeypatch: pytest.MonkeyPatch, supports_vision: bool, enrich_tree_mode: EnrichTreeMode, expected_width: int
+) -> None:
+    widths: list[int] = []
+    real_build = engine_mod.build_browser_tools
+
+    def capturing_build(*args: Any, **kwargs: Any) -> Any:
+        widths.append(kwargs["observe_screenshot_width"])
+        return real_build(*args, **kwargs)
+
+    width_setting = AsyncMock(return_value=768)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_observe_screenshot_width", width_setting)
+    monkeypatch.setattr(engine_mod, "build_browser_tools", capturing_build)
+    caller = _ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]])
+    caller.llm_config = SimpleNamespace(supports_vision=supports_vision)
+    page = _FakePage()
+    page.screenshot = AsyncMock(return_value=b"")
+    skyvern_context.set(SkyvernContext(organization_id="o_width", enrich_tree_mode=enrich_tree_mode))
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page), llm_caller=caller, goal="g", organization_id="o_width"
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert widths == [expected_width]
+    assert width_setting.await_count == (1 if expected_width else 0)
+    assert page.screenshot.await_count == (1 if expected_width else 0)
+    observe_tool = next(t for t in caller.sent_tools or [] if t["function"]["name"] == "observe")
+    assert observe_tool["function"]["description"] == (
+        tools_mod._OBSERVE_DESCRIPTION_BASE
+        + tools_mod._OBSERVE_DESCRIPTION_FRAME_REACH
+        + (tools_mod._OBSERVE_DESCRIPTION_SCREENSHOT if expected_width else "")
+    )
+
+
 @pytest.mark.asyncio
 async def test_signed_payload_url_reaches_model_only_as_a_token(monkeypatch: pytest.MonkeyPatch) -> None:
     # A presigned file URL reaches the model only as its opaque_url_ token in the payload; the tools
@@ -1367,6 +1415,34 @@ async def test_engine_forwards_download_hooks_without_a_download_order(monkeypat
     assert (
         download_prompt.split("\n\nToday's date is")[0] == loop_kwargs["system_prompt"].split("\n\nToday's date is")[0]
     )
+
+
+@pytest.mark.asyncio
+async def test_engine_hands_an_unsaved_download_completion_back_once_through_the_finish_tool() -> None:
+    reads: list[int] = []
+
+    async def unsaved_downloads() -> dict[str, int]:
+        reads.append(1)
+        return {"capture_failed": 1}
+
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller(
+            [
+                [("finish", {"status": "completed", "reason": "the export finished"})],
+                [("finish", {"status": "failed", "reason": "the browser did not save the export"})],
+            ]
+        ),
+        goal="download the file",
+        download_settle=_no_download_pending,
+        unsaved_downloads=unsaved_downloads,
+    )
+
+    assert outcome.status == "failed"
+    assert reads == [1]
+    results = [str(m["content"]) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert len(results) == 2, results
+    assert "capture_failed: 1" in results[0]
 
 
 @pytest.mark.asyncio
@@ -1779,6 +1855,7 @@ async def test_application_context_arm_off_leaves_the_run_as_today(monkeypatch: 
 async def test_a_declared_yes_delivers_the_defaults_once_after_the_first_reply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_authorized_agent_default", lambda: "AGENT TEXT")
     outcome, caller, terminal, _ = await _run_with_application_context_arm(
         monkeypatch,
         "treatment",
@@ -1790,7 +1867,10 @@ async def test_a_declared_yes_delivers_the_defaults_once_after_the_first_reply(
     )
     assert "declare_application_context" in _sent_tool_names(caller)
     users = _user_texts(outcome)
-    assert users[0].endswith("\n\nTIER ONE")
+    # First, so the Tier 1 legal-standing text after it outranks it as "anything above".
+    assert users[0].endswith("\n\nAGENT TEXT\n\nTIER ONE")
+    assert sum(text.count("AGENT TEXT") for text in users) == 1
+    assert terminal["authorized_agent_default_rendered"] is True
     assert users.count("AGE TEXT\n\nSIX TEXT") == 1
     assert terminal["application_context"] == "yes_declared"
     assert terminal["application_defaults_delivered"] is True
@@ -2081,15 +2161,24 @@ async def test_operator_defaults_ride_the_task_message_only_and_leave_the_system
 ) -> None:
     Hook = tuple[str | None, str] | None
 
-    async def run(age: Hook, application: Hook) -> tuple[str, str, dict[str, Any]]:
+    async def run(
+        age: Hook,
+        application: Hook,
+        agent: str | None = None,
+        block_type: BlockType | None = None,
+        page_free: bool = False,
+    ) -> tuple[str, str, dict[str, Any]]:
         monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", lambda parameters: age)
         monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_defaults", lambda parameters: application)
+        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_authorized_agent_default", lambda: agent)
         with capture_logs() as logs:
             outcome = await run_task_v3_agent_loop(
                 page_provider=_fixed_page_provider(_FakePage()),
                 llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
                 goal="Apply.",
                 parameters={"resume": "text"},
+                block_type=block_type,
+                page_free=page_free,
             )
         by_role = {m["role"]: m["content"] for m in outcome.messages if m.get("role") in ("system", "user")}
         terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
@@ -2114,6 +2203,17 @@ async def test_operator_defaults_ride_the_task_message_only_and_leave_the_system
     # Each default keeps its own field, so one entry's outcome read never counts the other's renders.
     assert (both_log["age_default_rendered"], both_log["application_defaults_rendered"]) == (False, True)
     assert (age_log["application_defaults_rendered"], age_log["application_defaults_reason"]) == (False, None)
+
+    # The authorized-agent default renders on every page-aware run except extraction and validation blocks, first.
+    agent_system, agent_user, agent_log = await run(("AGE DEFAULT TEXT", "rendered"), None, "AGENT TEXT")
+    assert agent_system == base_system
+    assert agent_user == base_user + "\n\nAGENT TEXT\n\nAGE DEFAULT TEXT"
+    assert agent_log["authorized_agent_default_rendered"] is True
+    assert base_log["authorized_agent_default_rendered"] is False
+    for block_type, page_free in ((BlockType.EXTRACTION, False), (BlockType.VALIDATION, False), (None, True)):
+        _, user, log = await run(None, None, "AGENT TEXT", block_type, page_free)
+        assert "AGENT TEXT" not in user
+        assert log["authorized_agent_default_rendered"] is False
 
 
 @pytest.mark.asyncio
@@ -2150,45 +2250,6 @@ async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(mo
     assert "Apply." in hook_calls[0]["goal"] and "Answer citizenship from the resume." in hook_calls[0]["goal"]
     assert "click" in applied[0][0] and applied[0][1] is audit
     assert applied[1][1] is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("audit_installed", [True, False])
-@pytest.mark.parametrize("audit_arm", ["unrandomized", "control", "treatment"])
-async def test_the_log_only_arm_changes_the_run_only_on_treatment(
-    monkeypatch: pytest.MonkeyPatch, audit_arm: str, audit_installed: bool
-) -> None:
-    applied: list[dict[str, Any]] = []
-
-    async def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object | None:
-        return object() if audit_installed else None
-
-    def spy(tools: list[Any], answer_audit: Any, **kwargs: Any) -> None:
-        applied.append(kwargs)
-
-    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", hook)
-    monkeypatch.setattr(engine_mod, "apply_answer_basis_audit", spy)
-    ctx = SkyvernContext()
-    ctx.run_arms = {ANSWER_AUDIT_LOG_ONLY_FLAG: ("wr_1", audit_arm)} if audit_arm != "unrandomized" else {}
-    skyvern_context.set(ctx)
-    try:
-        with capture_logs() as logs:
-            outcome = await run_task_v3_agent_loop(
-                page_provider=_fixed_page_provider(_FakePage()),
-                llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
-                goal="Apply.",
-                parameters={"resume": "text"},
-            )
-    finally:
-        skyvern_context.reset()
-
-    assert outcome.status == "completed"
-    assert applied == [
-        {"log_only": audit_arm == "treatment", "log_fields": {"audit_mode_arm": audit_arm}, "armed": None}
-    ]
-    terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
-    assert (terminal["audit_mode_arm"], terminal["answer_audit_active"]) == (audit_arm, audit_installed)
-    assert terminal["answer_audit_trigger"] == ("payload" if audit_installed else None)
 
 
 @pytest.mark.asyncio

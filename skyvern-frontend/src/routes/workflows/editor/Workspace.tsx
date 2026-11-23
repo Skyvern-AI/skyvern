@@ -1,3 +1,4 @@
+import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import {
   TEMPLATE_VIA,
   buildTemplateGuidanceMessage,
@@ -184,6 +185,7 @@ import {
   layout,
   startNode,
   getWorkflowBlocks,
+  keepUneditedBlockFields,
   getWorkflowErrors,
   upgradeWorkflowDefinitionToVersionTwo,
   withGoalUndoRecordsFrom,
@@ -267,6 +269,9 @@ import {
 } from "./workflowVersionFromSaveData";
 import "./workspace-styles.css";
 
+// The chat pane's crash-report `pane` value in PostHog and Datadog, kept so those series stay continuous.
+const EMBER_PANE_CRASH_LABEL = "copilot";
+
 function readEmberAttachedFiles(
   value: unknown,
 ): Array<EmberAttachedFile> | undefined {
@@ -348,6 +353,7 @@ export type AddNodeProps = {
   select?: boolean;
   // A step that leaves the graph in the same pass that adds this one.
   replacing?: string;
+  integrationAction?: { integrationId: string; actionId: string };
 };
 
 // eslint-disable-next-line react-refresh/only-export-components -- Exercise the production apply callback without mounting the entire workspace.
@@ -439,7 +445,7 @@ function Workspace({
   const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
   const { paneWidths: studioPaneWidths, entryId: studioEntryId } =
     useStudioPaneDefaults();
-  const studioEmberOpen = studioPanes.includes("copilot");
+  const studioEmberOpen = studioPanes.includes("ember");
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -515,7 +521,7 @@ function Workspace({
         emberPaneOpen: studioEmberOpen,
       })
     ) {
-      openStudioPane("copilot", { state: location.state });
+      openStudioPane("ember", { state: location.state });
     }
   });
   const headlessTurnDrainEnabled = ["1", "true"].includes(
@@ -601,6 +607,7 @@ function Workspace({
     [postHog],
   );
   const { getNodes, getEdges } = useReactFlow();
+  const activeOrgId = useActiveOrgId();
   const {
     nodes,
     edges,
@@ -746,7 +753,7 @@ function Workspace({
   // Opening an already-open studio pane still restores a maximized pane, which would otherwise hide Ember.
   const openEmber = useCallback(() => {
     if (!embedded) setIsEmberOpen(true);
-    else openStudioPane("copilot", { state: location.state });
+    else openStudioPane("ember", { state: location.state });
   }, [embedded, openStudioPane, location.state]);
   const [emberMessageCount, setEmberMessageCount] = useState(0);
   const emberButtonRef = useRef<HTMLButtonElement>(null);
@@ -1630,6 +1637,7 @@ function Workspace({
     label,
     select = true,
     replacing,
+    integrationAction,
   }: AddNodeProps): string | undefined {
     if (refuseMutationDuringYamlCommit()) return;
     const newNodes: Array<AppNode> = [];
@@ -1666,6 +1674,9 @@ function Workspace({
     );
     // Track the new label
     usedLabelsRef.current.add(newLabel);
+    if (integrationAction && node.type === "integrationAction") {
+      node.data = { ...node.data, ...integrationAction };
+    }
 
     if (branch && "data" in node) {
       node.data = {
@@ -1811,6 +1822,12 @@ function Workspace({
       workflow_permanent_id: workflow.workflow_permanent_id,
       block_type: blockTypeFromNode(node) ?? nodeType,
       position: previousNodeIndex + 1,
+      ...(integrationAction && node.type === "integrationAction"
+        ? {
+            integration_id: integrationAction.integrationId,
+            integration_action: integrationAction.actionId,
+          }
+        : {}),
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
     if (select) useWorkflowPanelStore.getState().setSelectedBlockId(id);
@@ -2077,7 +2094,7 @@ function Workspace({
       if (!isWorkflowYamlDirty(yamlStore)) {
         let savedWorkflow: WorkflowVersion | undefined;
         if (persist) {
-          const errors = getWorkflowErrors(nodes);
+          const errors = getWorkflowErrors(nodes, activeOrgId);
           if (errors.length > 0) {
             toast({
               title: "Can not save workflow because of errors:",
@@ -2166,7 +2183,7 @@ function Workspace({
       const client = await getClient(credentialGetter, "sans-api-v1");
       if (!isYamlCommitOwnerCurrent(owner)) return false;
       const response = await client.post<WorkflowYAMLConversionResponse>(
-        "/workflow/copilot/convert-yaml-to-blocks",
+        "/workflow/convert-yaml-to-blocks",
         {
           workflow_definition_yaml: definitionYaml,
           workflow_id: saveData.workflow.workflow_id,
@@ -2179,7 +2196,13 @@ function Workspace({
         true,
         workflowEffectiveDefaultEngine(saveData.workflow, queryClient),
       );
-      const repairedBlocks = getWorkflowBlocks(repairedNodes, repairedEdges);
+      const repairedBlocks = keepUneditedBlockFields(
+        getWorkflowBlocks(repairedNodes, repairedEdges),
+        {
+          ...saveData.workflow,
+          workflow_definition: response.data.workflow_definition,
+        },
+      );
       settings.finallyBlockLabel = resolveFinallyBlockLabel(
         settings.finallyBlockLabel,
         settingsPatch,
@@ -2200,7 +2223,7 @@ function Workspace({
       // carries live metadata explicitly so a hydrate cannot replay stale values.
       version.description = mergedSaveData.description;
       if (persist) {
-        const repairedErrors = getWorkflowErrors(repairedNodes);
+        const repairedErrors = getWorkflowErrors(repairedNodes, activeOrgId);
         if (repairedErrors.length > 0) {
           toast({
             title: "Can not save workflow because of errors:",
@@ -2342,12 +2365,34 @@ function Workspace({
       workflowEffectiveDefaultEngine(selectedVersion, queryClient),
     );
 
+    // Studio Save ignores a clean editor, so mark the restore as an edit; the
+    // Save dialog diffs it against the existing baseline (or the pre-restore
+    // draft if none). contentDirty too, or the Doc clears it as "back to saved"
+    // before the remount recomputes it. Reselecting the loaded version on a
+    // clean editor changes nothing, so it stays clean.
+    if (
+      selectedVersion.version !== workflow.version ||
+      useWorkflowHasChangesStore.getState().hasChanges
+    ) {
+      useWorkflowSnapshotStore.getState().markUserEdit();
+      useWorkflowSnapshotStore.setState({ contentDirty: true });
+      workflowChangesStore.setHasChanges(true);
+    }
+
     const collapsedSet = useNodeCollapseStore.getState().collapsed;
     const wpid = workflowPermanentId ?? "__global__";
     setNodes(
       replayPersistedCollapseVisibility(elements.nodes, wpid, collapsedSet),
     );
     setEdges(elements.edges);
+    setParameterBaselines((current) => ({
+      ...current,
+      [selectedVersion.workflow_permanent_id]:
+        selectedVersion.workflow_definition.parameters,
+    }));
+    useWorkflowParametersStore
+      .getState()
+      .setParameters(getInitialParameters(selectedVersion));
     const titleStore = useWorkflowTitleStore.getState();
     titleStore.clearEmberMetadata(selectedVersion.workflow_permanent_id);
     titleStore.trackEmberMetadata(
@@ -3106,7 +3151,7 @@ function Workspace({
 
       <DemonstrateFromBlockStatus />
       {withStudioPaneBoundary(
-        "copilot",
+        EMBER_PANE_CRASH_LABEL,
         <EmberChat
           templateGuidance={templateGuidance}
           onTemplateGuidanceShown={handleTemplateGuidanceShown}

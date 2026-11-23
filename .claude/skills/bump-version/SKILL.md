@@ -1,165 +1,50 @@
 ---
 name: bump-version
-description: Bump Skyvern OSS version, build Python and TypeScript SDKs with Fern, and create release PR. Use when releasing a new version or when the user asks to bump version.
+description: Release a new version of Skyvern. The version bump is made in the cloud repo and arrives here through the sync; this repo's only step is the skyvern-ui package. Use when the user asks to bump the version.
 argument-hint: [version]
 disable-model-invocation: true
 ---
 
 # Bump Version Skill
 
-Automate the complete OSS version bump and release workflow for Skyvern.
+A release is a version change on `main` of this repo. These workflows publish it:
 
-## What this does
+| Workflow | Fires on a change to | Does |
+|----------|----------------------|------|
+| `sdk-release.yml` | `pyproject.toml` | Publishes `skyvern` and `skyvern-ui` to PyPI. Fails if the two versions differ. |
+| `ts-sdk-release.yml` | `skyvern-ts/client/package.json` | Publishes `@skyvern/client` to npm. |
+| `auto-release.yml` | `pyproject.toml` | Creates the GitHub release, then builds and pushes the Docker images tagged `v<version>` and `latest`. |
 
+## Do not bump the version here
 
-1. Validates and updates version in `pyproject.toml`
-2. Builds Python SDK with Fern
-3. Builds TypeScript SDK with Fern
-4. Creates commit with all changes
-5. Optionally runs SDK tests
-6. Pushes branch and creates PR
+`pyproject.toml`, `uv.lock`, `skyvern/` and `skyvern-ts/` are copied into this repo by a sync from the
+cloud repo (`Skyvern-AI/skyvern-cloud`). Each sync overwrites this repo's copies. A version bumped here
+first is put back by the next sync that touches one of those files:
 
-## Version argument
+- 1.0.58 was bumped here on 2026-11-15 and a sync turned it back to 1.0.57 seven hours later.
+- 1.0.57 was turned back to 1.0.56 28 minutes after its release, and restored a day later.
 
-The version can be provided as an argument or you'll be prompted:
+Each flip is a version change on `main`, so `auto-release.yml` runs again: it rewrites the notes of an
+existing GitHub release and rebuilds its Docker tags from whatever `main` holds at that moment.
 
-- If `$ARGUMENTS` is provided, use it as the new version
-- If not provided, ask user for the new version number
-- Validate it follows semver format: `MAJOR.MINOR.PATCH` (e.g., `1.0.14`, `1.1.0`, `2.0.0`)
+Maintainers run the `bump-version` skill in the cloud repo. It covers both repos, in order.
 
-**Semver guidance:**
-- PATCH: Bug fixes, backwards compatible (e.g., 1.0.13 → 1.0.14)
-- MINOR: New features, backwards compatible (e.g., 1.0.13 → 1.1.0)
-- MAJOR: Breaking changes (e.g., 1.0.13 → 2.0.0)
+## The one step in this repo
 
-## Step-by-step process
+`packages/skyvern-ui/pyproject.toml` exists only here, so it is bumped here, and first.
 
-### 1. Get and validate version
+1. The version is `$ARGUMENTS`. If it is empty, ask. It must match `^\d+\.\d+\.\d+$`.
+2. Create a branch named `bump-skyvern-ui-{version}`.
+3. Set `version` on line 3 of `packages/skyvern-ui/pyproject.toml` to the new version. Change no other file.
+4. Commit, push and open a PR titled `Bump skyvern-ui to {version}`.
+5. Tell the user: merge this PR before the cloud repo's bump. `sdk-release.yml` refuses to build when
+   `skyvern-ui` and `skyvern` differ, and it runs when the cloud bump arrives.
 
-- Read current version from `pyproject.toml` line 3
-- Determine new version from `$ARGUMENTS` or prompt user
-- Validate semver format using regex: `^\d+\.\d+\.\d+$`
-- Confirm with user: "Bumping version from {current} to {new}. Continue?"
+Nothing is published when this PR merges: no release workflow watches this file.
 
-### 2. Create feature branch
+## Rules
 
-```bash
-git checkout -b bump-version-$ARGUMENTS
-```
-
-Branch naming: `bump-version-{version}` (e.g., `bump-version-1.0.14`)
-
-### 3. Update pyproject.toml
-
-Update line 3 in `pyproject.toml`:
-
-```toml
-version = "{new_version}"
-```
-
-Use the Edit tool to make this single-line change.
-
-### 4. Build Python SDK
-
-```bash
-bash scripts/fern_build_python_sdk.sh
-```
-
-- Wait for completion
-- Check output for errors
-- Fern reads version from `pyproject.toml`
-
-### 5. Build TypeScript SDK
-
-```bash
-bash scripts/fern_build_ts_sdk.sh
-```
-
-- Wait for completion
-- Check output for errors
-- Verify `skyvern-ts/client/package.json` version matches new version
-
-### 6. Review changes
-
-```bash
-git status
-git diff --stat
-```
-
-Show user:
-- Number of files changed
-- Which files were modified
-- Summary of changes
-
-### 7. Commit changes
-
-```bash
-git add .
-git commit -m "Bump version to {version}
-
-- Update version in pyproject.toml
-- Regenerate Python SDK with Fern
-- Regenerate TypeScript SDK with Fern
-
-Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"
-```
-
-### 8. Verify SDKs (optional)
-
-Ask user: "Would you like to run SDK tests to verify nothing broke?"
-
-If yes:
-- Python SDK tests: `pytest tests/sdk/python_sdk/`
-- Note that TypeScript tests require manual Chrome setup (see `tests/sdk/README.md`)
-- Display test results
-- If tests fail, STOP and report errors - do not proceed to push
-
-If no:
-- Skip to push step
-
-### 9. Push and create PR
-
-Ask user: "Ready to push and create PR?"
-
-If yes:
-
-```bash
-git push -u origin bump-version-{version}
-
-gh pr create --title "Bump version to {version}" --body "## Summary
-Bump Skyvern OSS version to {version}
-
-## Changes
-- Updated version in \`pyproject.toml\`
-- Regenerated Python SDK with Fern
-- Regenerated TypeScript SDK with Fern
-
-## Deployment
-After merge, GitHub will automatically:
-- Deploy Python package to PyPI (version change in \`pyproject.toml\`)
-- Deploy TypeScript package to NPM (version change in \`package.json\`)
-
-## Testing
-- [ ] Python SDK tests passed locally
-- [ ] TypeScript SDK tests passed locally (if applicable)
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)"
-```
-
-Display the PR URL to the user.
-
-## Important notes
-
-- **Single PR**: All changes (version bump, SDK generation, commit) happen in one PR
-- **Fern sync**: Fern reads version from `pyproject.toml` and syncs to `package.json`
-- **Testing**: SDK tests require `.env` with `SKYVERN_API_KEY`
-- **Deployment**: Automatic on PR merge via GitHub Actions
-- **No force push**: Never use `--force` when pushing
-
-## Error handling
-
-If any step fails:
-1. Display the error message clearly
-2. Explain what went wrong
-3. Ask user how to proceed (fix, skip, or abort)
-4. Do not continue to next steps if critical operations fail
+- Never change the version in `pyproject.toml`, `uv.lock`, `skyvern-ts/client/package.json`,
+  `skyvern-ts/client/package-lock.json` or `skyvern/client/` in this repo.
+- Never push to `main` and never force-push.
+- If a step fails, stop, show the error and ask how to proceed.

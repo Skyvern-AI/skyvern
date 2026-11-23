@@ -1,3 +1,4 @@
+import { usePageSlots } from "@/store/PageSlots";
 import {
   WorkflowFindingsBoundary,
   WorkflowFindingsButton,
@@ -119,6 +120,7 @@ const FOLDERS_PAGE_SIZE = 100;
 const FOLDER_ID_PREFIX = "fld_";
 
 function WorkflowsFlat() {
+  const { agentStartsBadge: AgentStartsBadge } = usePageSlots();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -1056,6 +1058,13 @@ function WorkflowsFlat() {
                                       title={workflow.title}
                                       surface="list"
                                     />
+                                    {AgentStartsBadge ? (
+                                      <AgentStartsBadge
+                                        workflowPermanentId={
+                                          workflow.workflow_permanent_id
+                                        }
+                                      />
+                                    ) : null}
                                   </div>
                                   {taggingEnabled &&
                                   workflowTags &&

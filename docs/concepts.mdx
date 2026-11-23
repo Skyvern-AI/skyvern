@@ -108,7 +108,7 @@ Go next: [build your first agent with Copilot](/cloud/quickstart).
 
 ## Studio
 
-**Studio** is where you open and edit an agent in the app. It has four panes: **Copilot**, **Editor** (the blocks, as a flow you can edit directly), **Browser** (the live browser while a block runs) and **Run** (the timeline, inputs and outputs of a run). The top bar holds **Inputs**, **Run**, **Schedule** and **Triggers**.
+**Studio** is where you open and edit an agent in the app. Its panes are **Copilot**, **Editor** (the blocks, as a flow you can edit directly), **Browser** (the live browser while a block runs), **Run** (the timeline, inputs and outputs of a run) and, in Skyvern Cloud, **Triggers** (the agent's [event triggers](/developers/event-triggers)). The top bar holds **Inputs**, **Run** and **Schedule**.
 
 Go next: [Build in Studio](/cloud/studio).
 
@@ -122,7 +122,7 @@ Go next: [Browsers](/browsers).
 
 ## Credentials
 
-A **credential** is a login, a credit card or a secret that Skyvern stores encrypted and fills into the page at run time. The LLM sees a placeholder and decides where the value goes; Skyvern types the real value. To also hide typed values in an agent's screenshots and logs, turn on **Mask Secrets** in the agent's settings. A password credential can also carry its 2FA method: an authenticator key, a code sent by email or text, or a passkey.
+A **credential** is a login, a credit card or a secret that Skyvern stores encrypted and fills into the page at run time. The LLM sees a placeholder and decides where the value goes; Skyvern types the real value. Stored page HTML, LLM prompts and responses, logs and network logs are scrubbed of known secret values of 8 or more characters even with **Mask Secrets** off. **Mask Secrets** in the agent's settings also scrubs shorter values and hides typed values in an agent's screenshots and recordings; new agents start with it on. A password credential can also carry its 2FA method: an authenticator key, a code sent by email or text, or a passkey.
 
 You can store credentials in Skyvern or keep them in a vault you already use, such as Bitwarden, 1Password or Azure Key Vault.
 

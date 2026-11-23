@@ -48,6 +48,7 @@ def _task(**overrides: Any) -> SimpleNamespace:
         "url": "https://example.com/login",
         "organization_id": "o_1",
         "workflow_run_id": None,
+        "otp_request_id": None,
         "totp_verification_url": None,
         "totp_identifier": None,
         "navigation_payload": None,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable, Collection, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -15,30 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import defer, load_only
 
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot.ask_user import (
-    QUESTION_CLIENT_GRACE,
-    AccountGroupDecision,
-    CredentialDeleteOutcome,
-    QuestionInteraction,
-    QuestionResponse,
-    claim_credential_deletion,
-    credential_deletion_lease_expired,
-    fail_unrecorded_credential_deletion,
-    finish_credential_deletion,
-    question_wait_is_live,
-    resolve_question_response,
-)
-from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criterion_authority_projection
-from skyvern.forge.sdk.copilot.context import ProposalDisposition, TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
-from skyvern.forge.sdk.db._sentinels import _UNSET
+from skyvern.forge.sdk.db._sentinels import _UNSET, _Unset
 from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory, read_with_disconnect_recovery
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.exceptions import (
-    CopilotProposalConflictError,
     DatabaseConnectionUnavailableError,
-    DuplicateCopilotTurnError,
+    DuplicateEmberTurnError,
+    EmberProposalConflictError,
+    EmberTurnRunningError,
     NotFoundError,
 )
 from skyvern.forge.sdk.db.id import generate_credential_parameter_id
@@ -52,51 +38,68 @@ from skyvern.forge.sdk.db.models import (
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
     CredentialParameterModel,
+    EmberChatMessageModel,
+    EmberChatModel,
+    EmberCompletionCriteriaSetModel,
     OnePasswordCredentialParameterModel,
     OutputParameterModel,
     TaskGenerationModel,
-    WorkflowCopilotChatMessageModel,
-    WorkflowCopilotChatModel,
-    WorkflowCopilotCompletionCriteriaSetModel,
     WorkflowModel,
     WorkflowParameterModel,
 )
 from skyvern.forge.sdk.db.repositories.workflow_runs import _folder_access_filter
 from skyvern.forge.sdk.db.utils import (
     convert_to_aws_secret_parameter,
+    convert_to_ember_chat_message,
     convert_to_output_parameter,
-    convert_to_workflow_copilot_chat_message,
     convert_to_workflow_parameter,
     escape_like_term,
     hydrate_action,
-    summarize_copilot_chat_title,
+    summarize_ember_chat_title,
 )
+from skyvern.forge.sdk.ember.ask_user import (
+    QUESTION_CLIENT_GRACE,
+    AccountGroupDecision,
+    CredentialDeleteOutcome,
+    QuestionInteraction,
+    QuestionResponse,
+    claim_credential_deletion,
+    credential_deletion_lease_expired,
+    fail_unrecorded_credential_deletion,
+    finish_credential_deletion,
+    question_wait_is_live,
+    resolve_question_response,
+)
+from skyvern.forge.sdk.ember.completion_criteria_store import criteria_from_json, criterion_authority_projection
+from skyvern.forge.sdk.ember.context import ProposalDisposition, TurnNarrativePayload
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
-    CopilotBrowserAllocation,
-    CopilotRequestBrowserAllocations,
+from skyvern.forge.sdk.schemas.ember import (
+    EMBER_PROPOSAL_INTERNAL_KEY_PREFIX,
+    EMBER_PROPOSAL_METADATA_KEY,
+    EMBER_PROPOSAL_YAML_KEY,
+    MAX_STEER_MESSAGES_PER_TURN,
+    EmberAcceptedTestedRun,
+    EmberAttachedFile,
+    EmberCandidateDisposition,
+    EmberChat,
+    EmberChatMessage,
+    EmberChatSender,
+    EmberChatSummary,
+    EmberCompletionCriteriaSet,
+    EmberMessageFeedbackRating,
+    EmberPendingTurn,
+    EmberProposalMetadata,
+    EmberSteerMessage,
+    EmberVideoEvidenceArtifact,
+    NonAdoptableCriteriaSet,
+    ember_proposal_metadata,
+)
+from skyvern.forge.sdk.schemas.ember_turn_outcome import (
+    EmberBrowserAllocation,
+    EmberRequestBrowserAllocations,
     TurnOutcome,
 )
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
-from skyvern.forge.sdk.schemas.workflow_copilot import (
-    COPILOT_PROPOSAL_METADATA_KEY,
-    MAX_STEER_MESSAGES_PER_TURN,
-    CopilotAcceptedTestedRun,
-    CopilotAttachedFile,
-    CopilotCandidateDisposition,
-    CopilotPendingTurn,
-    CopilotProposalMetadata,
-    CopilotSteerMessage,
-    CopilotVideoEvidenceArtifact,
-    NonAdoptableCriteriaSet,
-    WorkflowCopilotChat,
-    WorkflowCopilotChatMessage,
-    WorkflowCopilotChatSender,
-    WorkflowCopilotChatSummary,
-    WorkflowCopilotCompletionCriteriaSet,
-    WorkflowCopilotMessageFeedbackRating,
-    copilot_proposal_metadata,
-)
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -112,7 +115,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR
+from skyvern.forge.sdk.workflow.models.workflow import EMBER_TEST_WORKFLOW_CREATOR
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -122,8 +125,11 @@ PENDING_TURN_RETENTION = timedelta(days=30)
 _SQLITE_FINALISING_TURNS: set[str] = set()
 
 
+EMBER_TURN_FINALISATION_LOCK_PREFIX = "copilot_turn_finalisation"
+
+
 def _turn_finalisation_lock_key(workflow_copilot_chat_id: str, turn_id: str) -> str:
-    return f"copilot_turn_finalisation:{workflow_copilot_chat_id}:{turn_id}"
+    return f"{EMBER_TURN_FINALISATION_LOCK_PREFIX}:{workflow_copilot_chat_id}:{turn_id}"
 
 
 async def _turn_finalisation_held(session: AsyncSession, key: str) -> bool:
@@ -171,13 +177,13 @@ def _floor_rekeyed_association_is_coherent(item: Mapping[str, object]) -> bool:
 
 
 def _decode_completion_criteria_set(
-    row: WorkflowCopilotCompletionCriteriaSetModel,
-) -> WorkflowCopilotCompletionCriteriaSet | NonAdoptableCriteriaSet:
+    row: EmberCompletionCriteriaSetModel,
+) -> EmberCompletionCriteriaSet | NonAdoptableCriteriaSet:
     """A current or v1 row adopts only when every recorded criterion decodes without loss."""
     raw_criteria = row.criteria
     try:
         if isinstance(raw_criteria, list):
-            current = WorkflowCopilotCompletionCriteriaSet.model_validate(row)
+            current = EmberCompletionCriteriaSet.model_validate(row)
             inner = current.criteria
             is_v1_envelope = False
         elif (
@@ -218,10 +224,10 @@ def _decode_completion_criteria_set(
         if current is not None:
             return current
         if is_v1_envelope:
-            return WorkflowCopilotCompletionCriteriaSet(
+            return EmberCompletionCriteriaSet(
                 completion_criteria_set_id=row.completion_criteria_set_id,
                 organization_id=row.organization_id,
-                workflow_copilot_chat_id=row.workflow_copilot_chat_id,
+                workflow_copilot_chat_id=row.ember_chat_id,
                 goal_epoch=row.goal_epoch,
                 status=row.status,
                 criteria=inner,
@@ -260,6 +266,21 @@ def _parse_pending_turn_timestamp(value: object) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+async def _ended_ember_turn_ids(
+    session: AsyncSession, organization_id: str, chat_ids: Collection[str], turn_ids: Collection[str]
+) -> set[str]:
+    # A turn whose outcome is saved has ended even if clearing its pending entry failed, as chat-history reads it.
+    outcome_turn_id = EmberChatMessageModel.turn_outcome["copilot_turn_id"].as_string()
+    return set(
+        await session.scalars(
+            select(outcome_turn_id)
+            .where(EmberChatMessageModel.organization_id == organization_id)
+            .where(EmberChatMessageModel.ember_chat_id.in_(list(chat_ids)))
+            .where(outcome_turn_id.in_(list(turn_ids)))
+        )
+    )
+
+
 def _prune_pending_turns(pending_turns: object) -> dict[str, Any]:
     """Drop markers too old to still be worth reconciling, so the column cannot grow without bound."""
     if not isinstance(pending_turns, dict):
@@ -296,7 +317,7 @@ def _prune_pending_turns(pending_turns: object) -> dict[str, Any]:
     return kept
 
 
-def _dump_attached_files(attached_files: list[CopilotAttachedFile] | None) -> list[dict[str, Any]] | None:
+def _dump_attached_files(attached_files: list[EmberAttachedFile] | None) -> list[dict[str, Any]] | None:
     # ``available`` is resolved fresh on every read, so persisting it would age into a lie.
     if not attached_files:
         return None
@@ -789,36 +810,36 @@ class WorkflowParametersRepository(BaseRepository):
             return AISuggestion.model_validate(new_ai_suggestion)
 
     @db_operation("create_workflow_copilot_chat")
-    async def create_workflow_copilot_chat(
+    async def create_ember_chat(
         self,
         organization_id: str,
         workflow_permanent_id: str,
-    ) -> WorkflowCopilotChat:
+    ) -> EmberChat:
         async with self.Session() as session:
-            new_chat = WorkflowCopilotChatModel(
+            new_chat = EmberChatModel(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_permanent_id,
             )
             session.add(new_chat)
             await session.commit()
             await session.refresh(new_chat)
-            return WorkflowCopilotChat.model_validate(new_chat)
+            return EmberChat.model_validate(new_chat)
 
     @db_operation("update_workflow_copilot_chat")
-    async def update_workflow_copilot_chat(
+    async def update_ember_chat(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
         proposed_workflow: dict | None | object = _UNSET,
         auto_accept: bool | None = None,
         work_plan: list[str] | None | object = _UNSET,
-    ) -> WorkflowCopilotChat | None:
+    ) -> EmberChat | None:
         async with self.Session() as session:
             chat = (
                 await session.scalars(
-                    select(WorkflowCopilotChatModel)
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatModel)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
                     .with_for_update()
                 )
             ).first()
@@ -828,10 +849,10 @@ class WorkflowParametersRepository(BaseRepository):
             if proposed_workflow is not _UNSET:
                 # Callers here read the chat before they write it. An owned candidate published in
                 # between owns the row, and only its own compare-and-set may replace it.
-                if copilot_proposal_metadata(chat.proposed_workflow) is not None and (
-                    copilot_proposal_metadata(proposed_workflow) is None
+                if ember_proposal_metadata(chat.proposed_workflow) is not None and (
+                    ember_proposal_metadata(proposed_workflow) is None
                 ):
-                    raise CopilotProposalConflictError(
+                    raise EmberProposalConflictError(
                         "Copilot proposal is owned by a newer candidate", reason="token_changed"
                     )
                 chat.proposed_workflow = proposed_workflow
@@ -842,16 +863,16 @@ class WorkflowParametersRepository(BaseRepository):
 
             await session.commit()
             await session.refresh(chat)
-            return WorkflowCopilotChat.model_validate(chat)
+            return EmberChat.model_validate(chat)
 
-    async def _locked_copilot_chat(
+    async def _locked_ember_chat(
         self, session: AsyncSession, organization_id: str, workflow_copilot_chat_id: str
-    ) -> WorkflowCopilotChatModel:
+    ) -> EmberChatModel:
         chat = (
             await session.scalars(
-                select(WorkflowCopilotChatModel)
-                .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                select(EmberChatModel)
+                .where(EmberChatModel.organization_id == organization_id)
+                .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
                 .with_for_update()
             )
         ).first()
@@ -862,20 +883,20 @@ class WorkflowParametersRepository(BaseRepository):
     @staticmethod
     def _require_candidate_token(
         proposal: object, expected_owner_turn_id: str | None, expected_revision: int | None
-    ) -> CopilotProposalMetadata | None:
-        current = copilot_proposal_metadata(proposal)
+    ) -> EmberProposalMetadata | None:
+        current = ember_proposal_metadata(proposal)
         if current is None:
-            if isinstance(proposal, Mapping) and COPILOT_PROPOSAL_METADATA_KEY in proposal:
-                raise CopilotProposalConflictError("Copilot proposal metadata is invalid", reason="metadata_invalid")
+            if isinstance(proposal, Mapping) and EMBER_PROPOSAL_METADATA_KEY in proposal:
+                raise EmberProposalConflictError("Copilot proposal metadata is invalid", reason="metadata_invalid")
             if expected_owner_turn_id is not None or expected_revision is not None:
-                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
+                raise EmberProposalConflictError("Copilot proposal changed", reason="candidate_missing")
             return None
         if current.owner_turn_id != expected_owner_turn_id or current.revision != expected_revision:
-            raise CopilotProposalConflictError("Copilot proposal changed", reason="token_changed")
+            raise EmberProposalConflictError("Copilot proposal changed", reason="token_changed")
         return current
 
-    @db_operation("publish_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
-    async def publish_workflow_copilot_candidate(
+    @db_operation("publish_workflow_copilot_candidate", expected_errors=(EmberProposalConflictError,))
+    async def publish_ember_candidate(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -887,16 +908,16 @@ class WorkflowParametersRepository(BaseRepository):
         disposition: ProposalDisposition,
         expected_owner_turn_id: str | None,
         expected_revision: int | None,
-    ) -> WorkflowCopilotChat:
+    ) -> EmberChat:
         async with self.Session() as session:
-            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            chat = await self._locked_ember_chat(session, organization_id, workflow_copilot_chat_id)
             current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
             if current is not None and current.claim_is_live(datetime.now(timezone.utc)):
                 # The accept between its claim and its canonical write is committing bytes it has
                 # already read; replacing them underneath it would make it write a stale workflow.
-                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
+                raise EmberProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
             revision = current.revision + 1 if current is not None and current.owner_turn_id == owner_turn_id else 1
-            metadata = CopilotProposalMetadata(
+            metadata = EmberProposalMetadata(
                 owner_turn_id=owner_turn_id,
                 revision=revision,
                 canonical_fingerprint=canonical_fingerprint,
@@ -905,14 +926,14 @@ class WorkflowParametersRepository(BaseRepository):
             )
             chat.proposed_workflow = {
                 **proposal,
-                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+                EMBER_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
             }
             await session.commit()
             await session.refresh(chat)
-            return WorkflowCopilotChat.model_validate(chat)
+            return EmberChat.model_validate(chat)
 
-    @db_operation("enrich_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
-    async def enrich_workflow_copilot_candidate(
+    @db_operation("enrich_workflow_copilot_candidate", expected_errors=(EmberProposalConflictError,))
+    async def enrich_ember_candidate(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -921,33 +942,37 @@ class WorkflowParametersRepository(BaseRepository):
         expected_owner_turn_id: str,
         expected_revision: int,
         disposition: ProposalDisposition,
-    ) -> WorkflowCopilotChat:
+    ) -> EmberChat:
         async with self.Session() as session:
-            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            chat = await self._locked_ember_chat(session, organization_id, workflow_copilot_chat_id)
             current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
             if current is None or not isinstance(chat.proposed_workflow, dict):
-                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
+                raise EmberProposalConflictError("Copilot proposal changed", reason="candidate_missing")
             if current.claim_is_live(datetime.now(timezone.utc)):
-                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
-            if chat.proposed_workflow.get("_copilot_yaml") != proposal.get("_copilot_yaml"):
-                raise CopilotProposalConflictError("Copilot proposal bytes changed", reason="bytes_changed")
+                raise EmberProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
+            if chat.proposed_workflow.get(EMBER_PROPOSAL_YAML_KEY) != proposal.get(EMBER_PROPOSAL_YAML_KEY):
+                raise EmberProposalConflictError("Copilot proposal bytes changed", reason="bytes_changed")
             current_workflow = {
-                key: value for key, value in chat.proposed_workflow.items() if not key.startswith("_copilot_")
+                key: value
+                for key, value in chat.proposed_workflow.items()
+                if not key.startswith(EMBER_PROPOSAL_INTERNAL_KEY_PREFIX)
             }
-            proposed_workflow = {key: value for key, value in proposal.items() if not key.startswith("_copilot_")}
+            proposed_workflow = {
+                key: value for key, value in proposal.items() if not key.startswith(EMBER_PROPOSAL_INTERNAL_KEY_PREFIX)
+            }
             if current_workflow != proposed_workflow:
-                raise CopilotProposalConflictError("Copilot proposal content changed", reason="content_changed")
+                raise EmberProposalConflictError("Copilot proposal content changed", reason="content_changed")
             metadata = current.model_copy(update={"disposition": disposition})
             chat.proposed_workflow = {
                 **proposal,
-                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+                EMBER_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
             }
             await session.commit()
             await session.refresh(chat)
-            return WorkflowCopilotChat.model_validate(chat)
+            return EmberChat.model_validate(chat)
 
-    @db_operation("bind_workflow_copilot_candidate_run", expected_errors=(CopilotProposalConflictError,))
-    async def bind_workflow_copilot_candidate_run(
+    @db_operation("bind_workflow_copilot_candidate_run", expected_errors=(EmberProposalConflictError,))
+    async def bind_ember_candidate_run(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -956,16 +981,19 @@ class WorkflowParametersRepository(BaseRepository):
         expected_revision: int,
         expected_workflow_yaml: str,
         workflow_run_id: str,
-    ) -> WorkflowCopilotChat:
+        expected_workflow_run_id: str | None | _Unset = _UNSET,
+    ) -> EmberChat:
         async with self.Session() as session:
-            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            chat = await self._locked_ember_chat(session, organization_id, workflow_copilot_chat_id)
             current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
             if current is None or not isinstance(chat.proposed_workflow, dict):
-                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
+                raise EmberProposalConflictError("Copilot proposal changed", reason="candidate_missing")
             if current.claim_is_live(datetime.now(timezone.utc)):
-                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
-            if chat.proposed_workflow.get("_copilot_yaml") != expected_workflow_yaml:
-                raise CopilotProposalConflictError("Copilot proposal bytes changed", reason="bytes_changed")
+                raise EmberProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
+            if chat.proposed_workflow.get(EMBER_PROPOSAL_YAML_KEY) != expected_workflow_yaml:
+                raise EmberProposalConflictError("Copilot proposal bytes changed", reason="bytes_changed")
+            if expected_workflow_run_id is not _UNSET and current.workflow_run_id != expected_workflow_run_id:
+                raise EmberProposalConflictError("Copilot proposal run changed", reason="run_bound")
             # A new run is not yet proof. Turn end re-records the disposition from its result, but a turn
             # that exits without one must not leave a stale Tested beside this run.
             proven = current.disposition in ("review_tested", "auto_applicable")
@@ -977,51 +1005,51 @@ class WorkflowParametersRepository(BaseRepository):
             )
             chat.proposed_workflow = {
                 **chat.proposed_workflow,
-                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+                EMBER_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
             }
             await session.commit()
             await session.refresh(chat)
-            return WorkflowCopilotChat.model_validate(chat)
+            return EmberChat.model_validate(chat)
 
-    @db_operation("claim_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
-    async def claim_workflow_copilot_candidate(
+    @db_operation("claim_workflow_copilot_candidate", expected_errors=(EmberProposalConflictError,))
+    async def claim_ember_candidate(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
         *,
         expected_owner_turn_id: str,
         expected_revision: int,
-    ) -> WorkflowCopilotChat:
+    ) -> EmberChat:
         async with self.Session() as session:
-            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            chat = await self._locked_ember_chat(session, organization_id, workflow_copilot_chat_id)
             current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
             if current is None or not isinstance(chat.proposed_workflow, dict):
-                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
+                raise EmberProposalConflictError("Copilot proposal changed", reason="candidate_missing")
             if current.claim_is_live(datetime.now(timezone.utc)):
-                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
+                raise EmberProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
             metadata = current.model_copy(update={"disposition": "accepting", "claimed_at": datetime.now(timezone.utc)})
             chat.proposed_workflow = {
                 **chat.proposed_workflow,
-                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+                EMBER_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
             }
             await session.commit()
             await session.refresh(chat)
-            return WorkflowCopilotChat.model_validate(chat)
+            return EmberChat.model_validate(chat)
 
-    @db_operation("claim_untokened_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
-    async def claim_untokened_workflow_copilot_candidate(
+    @db_operation("claim_untokened_workflow_copilot_candidate", expected_errors=(EmberProposalConflictError,))
+    async def claim_untokened_ember_candidate(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
         *,
         expected_proposal: dict[str, Any],
         owner_turn_id: str,
-    ) -> tuple[WorkflowCopilotChat, int | None]:
+    ) -> tuple[EmberChat, int | None]:
         """Tokens a tokenless proposal, already claimed, and returns the saved version read in the claim's transaction."""
         async with self.Session() as session:
-            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            chat = await self._locked_ember_chat(session, organization_id, workflow_copilot_chat_id)
             if chat.proposed_workflow != expected_proposal:
-                raise CopilotProposalConflictError("Copilot proposal changed", reason="content_changed")
+                raise EmberProposalConflictError("Copilot proposal changed", reason="content_changed")
             # The proposal records no base, so this is the only version Accept can hold a later save against.
             # Same filter as WorkflowsRepository.get_workflow_by_permanent_id, the read expected_version uses.
             base_version = await session.scalar(
@@ -1029,15 +1057,13 @@ class WorkflowParametersRepository(BaseRepository):
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.workflow_permanent_id == chat.workflow_permanent_id)
                 .where(WorkflowModel.deleted_at.is_(None))
-                .where(
-                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
-                )
+                .where(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR))
                 .order_by(WorkflowModel.version.desc())
                 .limit(1)
             )
             # It was published against no recorded canonical, so the token records none. An empty fingerprint
             # never matches, which keeps reads from showing it while claimed or after a write whose clear failed.
-            metadata = CopilotProposalMetadata(
+            metadata = EmberProposalMetadata(
                 owner_turn_id=owner_turn_id,
                 revision=1,
                 canonical_fingerprint="",
@@ -1046,14 +1072,14 @@ class WorkflowParametersRepository(BaseRepository):
             )
             chat.proposed_workflow = {
                 **expected_proposal,
-                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+                EMBER_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
             }
             await session.commit()
             await session.refresh(chat)
-            return WorkflowCopilotChat.model_validate(chat), base_version
+            return EmberChat.model_validate(chat), base_version
 
-    @db_operation("release_workflow_copilot_candidate_claim", expected_errors=(CopilotProposalConflictError,))
-    async def release_workflow_copilot_candidate_claim(
+    @db_operation("release_workflow_copilot_candidate_claim", expected_errors=(EmberProposalConflictError,))
+    async def release_ember_candidate_claim(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -1063,9 +1089,9 @@ class WorkflowParametersRepository(BaseRepository):
         expected_claimed_at: datetime | None,
         disposition: ProposalDisposition,
         restore_untokened: bool = False,
-    ) -> WorkflowCopilotChat:
+    ) -> EmberChat:
         async with self.Session() as session:
-            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            chat = await self._locked_ember_chat(session, organization_id, workflow_copilot_chat_id)
             current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
             # The token names the candidate and survives a takeover, so only the claim timestamp
             # tells one holder's claim from its successor's.
@@ -1075,36 +1101,36 @@ class WorkflowParametersRepository(BaseRepository):
                 or current.disposition != "accepting"
                 or current.claimed_at != expected_claimed_at
             ):
-                raise CopilotProposalConflictError("Copilot proposal claim changed", reason="claim_changed")
+                raise EmberProposalConflictError("Copilot proposal claim changed", reason="claim_changed")
             if restore_untokened:
                 chat.proposed_workflow = {
-                    key: value for key, value in chat.proposed_workflow.items() if key != COPILOT_PROPOSAL_METADATA_KEY
+                    key: value for key, value in chat.proposed_workflow.items() if key != EMBER_PROPOSAL_METADATA_KEY
                 }
             else:
                 metadata = current.model_copy(update={"disposition": disposition, "claimed_at": None})
                 chat.proposed_workflow = {
                     **chat.proposed_workflow,
-                    COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+                    EMBER_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
                 }
             await session.commit()
             await session.refresh(chat)
-            return WorkflowCopilotChat.model_validate(chat)
+            return EmberChat.model_validate(chat)
 
-    @db_operation("clear_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
-    async def clear_workflow_copilot_candidate(
+    @db_operation("clear_workflow_copilot_candidate", expected_errors=(EmberProposalConflictError,))
+    async def clear_ember_candidate(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
         *,
         expected_owner_turn_id: str | None,
         expected_revision: int | None,
-        expected_disposition: CopilotCandidateDisposition | None = None,
+        expected_disposition: EmberCandidateDisposition | None = None,
         expected_claimed_at: datetime | None = None,
         auto_accept: bool | None = None,
         record_acceptance: bool = False,
-    ) -> WorkflowCopilotChat:
+    ) -> EmberChat:
         async with self.Session() as session:
-            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            chat = await self._locked_ember_chat(session, organization_id, workflow_copilot_chat_id)
             current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
             if current is not None and (
                 (expected_disposition is None and current.claim_is_live(datetime.now(timezone.utc)))
@@ -1112,10 +1138,10 @@ class WorkflowParametersRepository(BaseRepository):
                 # A claim the caller named must still be the one it took; see release above.
                 or (expected_claimed_at is not None and current.claimed_at != expected_claimed_at)
             ):
-                raise CopilotProposalConflictError("Copilot proposal disposition changed", reason="disposition_changed")
+                raise EmberProposalConflictError("Copilot proposal disposition changed", reason="disposition_changed")
             if record_acceptance:
                 if current is None:
-                    raise CopilotProposalConflictError(
+                    raise EmberProposalConflictError(
                         "Copilot proposal has no owner to record", reason="candidate_missing"
                     )
                 accepted_turn_ids = list(chat.accepted_turn_ids or [])
@@ -1127,47 +1153,45 @@ class WorkflowParametersRepository(BaseRepository):
                 chat.auto_accept = auto_accept
             await session.commit()
             await session.refresh(chat)
-            return WorkflowCopilotChat.model_validate(chat)
+            return EmberChat.model_validate(chat)
 
     @db_operation("get_workflow_copilot_claim_expires_in")
-    async def get_workflow_copilot_claim_expires_in(
-        self, organization_id: str, workflow_permanent_id: str
-    ) -> float | None:
+    async def get_ember_claim_expires_in(self, organization_id: str, workflow_permanent_id: str) -> float | None:
         """Seconds left on the longest live Accept claim held by any chat on the workflow."""
-        proposal = WorkflowCopilotChatModel.proposed_workflow
+        proposal = EmberChatModel.proposed_workflow
         async with self.Session() as session:
             claims = (
                 await session.scalars(
-                    select(proposal[COPILOT_PROPOSAL_METADATA_KEY])
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
-                    .where(proposal[(COPILOT_PROPOSAL_METADATA_KEY, "disposition")].as_string() == "accepting")
+                    select(proposal[EMBER_PROPOSAL_METADATA_KEY])
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(proposal[(EMBER_PROPOSAL_METADATA_KEY, "disposition")].as_string() == "accepting")
                 )
             ).all()
         now = datetime.now(timezone.utc)
         remaining = [
             metadata.claim_expires_in(now)
             for claim in claims
-            if (metadata := copilot_proposal_metadata({COPILOT_PROPOSAL_METADATA_KEY: claim})) is not None
+            if (metadata := ember_proposal_metadata({EMBER_PROPOSAL_METADATA_KEY: claim})) is not None
         ]
         return max((seconds for seconds in remaining if seconds is not None), default=None)
 
     @db_operation("create_workflow_copilot_chat_message")
-    async def create_workflow_copilot_chat_message(
+    async def create_ember_chat_message(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
-        sender: WorkflowCopilotChatSender,
+        sender: EmberChatSender,
         content: str,
         audio_artifact_id: str | None = None,
-        attached_files: list[CopilotAttachedFile] | None = None,
+        attached_files: list[EmberAttachedFile] | None = None,
         global_llm_context: str | None = None,
         turn_outcome: TurnOutcome | None = None,
         narrative_payload: TurnNarrativePayload | dict[str, Any] | None = None,
-    ) -> WorkflowCopilotChatMessage:
+    ) -> EmberChatMessage:
         async with self.Session() as session:
-            new_message = WorkflowCopilotChatMessageModel(
-                workflow_copilot_chat_id=workflow_copilot_chat_id,
+            new_message = EmberChatMessageModel(
+                ember_chat_id=workflow_copilot_chat_id,
                 organization_id=organization_id,
                 sender=sender,
                 content=content,
@@ -1180,28 +1204,25 @@ class WorkflowParametersRepository(BaseRepository):
             session.add(new_message)
             await session.commit()
             await session.refresh(new_message)
-            return convert_to_workflow_copilot_chat_message(new_message, self.debug_enabled)
+            return convert_to_ember_chat_message(new_message, self.debug_enabled)
 
     @db_operation("set_workflow_copilot_chat_message_feedback")
-    async def set_workflow_copilot_chat_message_feedback(
+    async def set_ember_chat_message_feedback(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
         workflow_copilot_chat_message_id: str,
-        rating: WorkflowCopilotMessageFeedbackRating | None,
+        rating: EmberMessageFeedbackRating | None,
         reason: str | None,
-    ) -> WorkflowCopilotChatMessage | None:
+    ) -> EmberChatMessage | None:
         async with self.Session() as session:
             message = (
                 await session.scalars(
-                    select(WorkflowCopilotChatMessageModel)
-                    .filter(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                    .filter(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                    .filter(
-                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id
-                        == workflow_copilot_chat_message_id
-                    )
-                    .filter(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                    select(EmberChatMessageModel)
+                    .filter(EmberChatMessageModel.organization_id == organization_id)
+                    .filter(EmberChatMessageModel.ember_chat_id == workflow_copilot_chat_id)
+                    .filter(EmberChatMessageModel.ember_chat_message_id == workflow_copilot_chat_message_id)
+                    .filter(EmberChatMessageModel.sender == EmberChatSender.AI)
                 )
             ).first()
             if message is None:
@@ -1216,33 +1237,64 @@ class WorkflowParametersRepository(BaseRepository):
                 message.feedback_at = naive_utc_now()
             await session.commit()
             await session.refresh(message)
-            return convert_to_workflow_copilot_chat_message(message, self.debug_enabled)
+            return convert_to_ember_chat_message(message, self.debug_enabled)
 
     @db_operation("start_copilot_turn")
-    async def start_copilot_turn(
+    async def start_ember_turn(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
-        pending_turn: CopilotPendingTurn,
+        pending_turn: EmberPendingTurn,
         user_message: str,
         audio_artifact_id: str | None = None,
-        attached_files: list[CopilotAttachedFile] | None = None,
-        sender: WorkflowCopilotChatSender = WorkflowCopilotChatSender.USER,
-    ) -> WorkflowCopilotChatMessage:
+        attached_files: list[EmberAttachedFile] | None = None,
+        sender: EmberChatSender = EmberChatSender.USER,
+        cancelled_tokens: Callable[[list[str]], Awaitable[Collection[str]]] | None = None,
+    ) -> EmberChatMessage:
         """Write the turn's opening row and its pending marker in one transaction.
 
         Two separate commits would leave a crash window in which the user
         message exists with no marker to reconcile it.
         """
         async with self.Session() as session:
-            chat = (
-                await session.scalars(
-                    select(WorkflowCopilotChatModel)
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                    .with_for_update()
+            workflow_chats: list[EmberChatModel] = []
+            stopped: Collection[str] = ()
+            if cancelled_tokens is not None:
+                workflow_permanent_id = await session.scalar(
+                    select(EmberChatModel.workflow_permanent_id)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
                 )
-            ).first()
+                on_workflow = (
+                    select(EmberChatModel)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.workflow_permanent_id == workflow_permanent_id)
+                    .order_by(EmberChatModel.ember_chat_id)
+                )
+                # Read before any row is locked, so a slow cache behind cancelled_tokens never holds the locks.
+                stopped = await cancelled_tokens(
+                    [
+                        token
+                        for pending_turns in await session.scalars(
+                            on_workflow.with_only_columns(EmberChatModel.pending_turns)
+                        )
+                        for entry in _prune_pending_turns(pending_turns).values()
+                        if isinstance(token := entry.get("cancel_token"), str) and token
+                    ]
+                )
+                # Every chat on the workflow, locked in one order: two requests in different chats can't both
+                # start, and neither holds a row the other locks first.
+                workflow_chats = list(await session.scalars(on_workflow.with_for_update()))
+                chat = next((row for row in workflow_chats if row.ember_chat_id == workflow_copilot_chat_id), None)
+            else:
+                chat = (
+                    await session.scalars(
+                        select(EmberChatModel)
+                        .where(EmberChatModel.organization_id == organization_id)
+                        .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
+                        .with_for_update()
+                    )
+                ).first()
             if chat is None:
                 raise NotFoundError(f"workflow copilot chat {workflow_copilot_chat_id}")
             pending = _prune_pending_turns(chat.pending_turns)
@@ -1251,15 +1303,30 @@ class WorkflowParametersRepository(BaseRepository):
                 pending_turn.idempotency_digest,
             )
             if existing_turn_id is not None:
-                raise DuplicateCopilotTurnError(existing_turn_id)
+                raise DuplicateEmberTurnError(existing_turn_id)
+            # The turns a new turn would supersede: a stopped one waiting for reconcile no longer counts. A token
+            # that appeared after the cache read belongs to a turn that just started, so it counts.
+            running = {
+                turn_id
+                for row in workflow_chats
+                for turn_id, entry in _prune_pending_turns(row.pending_turns).items()
+                if turn_id != pending_turn.turn_id
+                and entry.get("cancel_token")
+                and entry["cancel_token"] not in stopped
+                and entry.get("recovering_at") is None
+            }
+            if running and running - await _ended_ember_turn_ids(
+                session, organization_id, [row.ember_chat_id for row in workflow_chats], running
+            ):
+                raise EmberTurnRunningError(workflow_copilot_chat_id)
             if pending_turn.idempotency_digest is not None:
                 completed_outcomes = list(
                     await session.scalars(
-                        select(WorkflowCopilotChatMessageModel.turn_outcome)
-                        .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                        .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                        .where(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
-                        .where(WorkflowCopilotChatMessageModel.turn_outcome.is_not(None))
+                        select(EmberChatMessageModel.turn_outcome)
+                        .where(EmberChatMessageModel.organization_id == organization_id)
+                        .where(EmberChatMessageModel.ember_chat_id == workflow_copilot_chat_id)
+                        .where(EmberChatMessageModel.sender == EmberChatSender.AI)
+                        .where(EmberChatMessageModel.turn_outcome.is_not(None))
                     )
                 )
                 completed_turn_id = _completed_turn_id_for_idempotency_digest(
@@ -1267,9 +1334,9 @@ class WorkflowParametersRepository(BaseRepository):
                     pending_turn.idempotency_digest,
                 )
                 if completed_turn_id is not None:
-                    raise DuplicateCopilotTurnError(completed_turn_id)
-            new_message = WorkflowCopilotChatMessageModel(
-                workflow_copilot_chat_id=workflow_copilot_chat_id,
+                    raise DuplicateEmberTurnError(completed_turn_id)
+            new_message = EmberChatMessageModel(
+                ember_chat_id=workflow_copilot_chat_id,
                 organization_id=organization_id,
                 sender=sender,
                 content=user_message,
@@ -1279,21 +1346,19 @@ class WorkflowParametersRepository(BaseRepository):
             session.add(new_message)
             await session.flush()
             pending[pending_turn.turn_id] = pending_turn.model_copy(
-                update={"user_message_id": new_message.workflow_copilot_chat_message_id}
+                update={"user_message_id": new_message.ember_chat_message_id}
             ).model_dump(mode="json")
             chat.pending_turns = pending
             await session.commit()
             await session.refresh(new_message)
-            return convert_to_workflow_copilot_chat_message(new_message, self.debug_enabled)
+            return convert_to_ember_chat_message(new_message, self.debug_enabled)
 
-    async def _locked_question_chat(
-        self, session: AsyncSession, organization_id: str, chat_id: str
-    ) -> WorkflowCopilotChatModel:
+    async def _locked_question_chat(self, session: AsyncSession, organization_id: str, chat_id: str) -> EmberChatModel:
         chat = (
             await session.scalars(
-                select(WorkflowCopilotChatModel)
-                .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == chat_id)
+                select(EmberChatModel)
+                .where(EmberChatModel.organization_id == organization_id)
+                .where(EmberChatModel.ember_chat_id == chat_id)
                 .with_for_update()
             )
         ).first()
@@ -1302,11 +1367,9 @@ class WorkflowParametersRepository(BaseRepository):
         return chat
 
     @staticmethod
-    def _question_in_pending(
-        chat: WorkflowCopilotChatModel, interaction_id: str
-    ) -> tuple[CopilotPendingTurn, QuestionInteraction]:
+    def _question_in_pending(chat: EmberChatModel, interaction_id: str) -> tuple[EmberPendingTurn, QuestionInteraction]:
         for raw in (chat.pending_turns or {}).values():
-            entry = CopilotPendingTurn.model_validate(raw)
+            entry = EmberPendingTurn.model_validate(raw)
             for item in entry.question_interactions:
                 if item.interaction_id == interaction_id:
                     return entry, item
@@ -1317,10 +1380,10 @@ class WorkflowParametersRepository(BaseRepository):
         session: AsyncSession, organization_id: str, chat_id: str, interaction_id: str
     ) -> list[QuestionInteraction]:
         saved = await session.scalars(
-            select(WorkflowCopilotChatMessageModel.narrative_payload)
-            .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-            .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
-            .where(WorkflowCopilotChatMessageModel.narrative_payload.is_not(None))
+            select(EmberChatMessageModel.narrative_payload)
+            .where(EmberChatMessageModel.organization_id == organization_id)
+            .where(EmberChatMessageModel.ember_chat_id == chat_id)
+            .where(EmberChatMessageModel.narrative_payload.is_not(None))
         )
         return [
             QuestionInteraction.model_validate(raw)
@@ -1330,11 +1393,11 @@ class WorkflowParametersRepository(BaseRepository):
         ]
 
     @staticmethod
-    def _store_question_turn(chat: WorkflowCopilotChatModel, entry: CopilotPendingTurn) -> None:
+    def _store_question_turn(chat: EmberChatModel, entry: EmberPendingTurn) -> None:
         chat.pending_turns = {**(chat.pending_turns or {}), entry.turn_id: entry.model_dump(mode="json")}
 
     @staticmethod
-    def _expire_credential_deletion_leases(entry: CopilotPendingTurn, now: datetime) -> bool:
+    def _expire_credential_deletion_leases(entry: EmberPendingTurn, now: datetime) -> bool:
         expired = [
             item.interaction_id for item in entry.question_interactions if credential_deletion_lease_expired(item, now)
         ]
@@ -1347,30 +1410,27 @@ class WorkflowParametersRepository(BaseRepository):
         return bool(expired)
 
     @staticmethod
-    def _question_in_entry(entry: CopilotPendingTurn, interaction_id: str) -> QuestionInteraction:
+    def _question_in_entry(entry: EmberPendingTurn, interaction_id: str) -> QuestionInteraction:
         return next(item for item in entry.question_interactions if item.interaction_id == interaction_id)
 
     @classmethod
-    def _expire_absent_question_client(cls, entry: CopilotPendingTurn, now: datetime) -> bool:
+    def _expire_absent_question_client(cls, entry: EmberPendingTurn, now: datetime) -> bool:
         expired = cls._expire_credential_deletion_leases(entry, now)
         for item in entry.question_interactions:
-            if (
-                item.awaiting_answer
-                and now - (entry.question_client_seen_at or item.created_at) >= QUESTION_CLIENT_GRACE
-            ):
+            if item.awaiting_answer and now >= entry.question_client_deadline(item):
                 item.status = "interrupted"
                 expired = True
         return expired
 
     @db_operation("refresh_copilot_question_client")
-    async def refresh_copilot_question_client(
+    async def refresh_ember_question_client(
         self, organization_id: str, chat_id: str, seen_turn_ids: Collection[str] | None = None
-    ) -> dict[str, CopilotPendingTurn]:
+    ) -> dict[str, EmberPendingTurn]:
         """Expire absent-client questions on every turn; mark the client seen only on `seen_turn_ids` (None: all)."""
         async with self.Session() as session:
             chat = await self._locked_question_chat(session, organization_id, chat_id)
             now = datetime.now(timezone.utc)
-            entries = {key: CopilotPendingTurn.model_validate(raw) for key, raw in (chat.pending_turns or {}).items()}
+            entries = {key: EmberPendingTurn.model_validate(raw) for key, raw in (chat.pending_turns or {}).items()}
             for entry in entries.values():
                 expired = self._expire_absent_question_client(entry, now)
                 pending = any(item.status == "pending" for item in entry.question_interactions) and (
@@ -1384,15 +1444,13 @@ class WorkflowParametersRepository(BaseRepository):
             return entries
 
     @db_operation("start_copilot_question")
-    async def start_copilot_question(
-        self, organization_id: str, chat_id: str, interaction: QuestionInteraction
-    ) -> None:
+    async def start_ember_question(self, organization_id: str, chat_id: str, interaction: QuestionInteraction) -> None:
         async with self.Session() as session:
             chat = await self._locked_question_chat(session, organization_id, chat_id)
             raw = (chat.pending_turns or {}).get(interaction.turn_id)
             if raw is None:
                 raise ValueError("The Copilot execution has ended")
-            entry = CopilotPendingTurn.model_validate(raw)
+            entry = EmberPendingTurn.model_validate(raw)
             if any(item.tool_call_id == interaction.tool_call_id for item in entry.question_interactions):
                 raise ValueError("This tool call already has a question")
             entry.question_interactions.append(interaction)
@@ -1402,9 +1460,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("poll_copilot_question")
-    async def poll_copilot_question(
-        self, organization_id: str, chat_id: str, interaction_id: str
-    ) -> QuestionInteraction:
+    async def poll_ember_question(self, organization_id: str, chat_id: str, interaction_id: str) -> QuestionInteraction:
         async with self.Session() as session:
             chat = await self._locked_question_chat(session, organization_id, chat_id)
             entry, item = self._question_in_pending(chat, interaction_id)
@@ -1422,7 +1478,7 @@ class WorkflowParametersRepository(BaseRepository):
             return item
 
     @db_operation("resolve_copilot_question")
-    async def resolve_copilot_question(
+    async def resolve_ember_question(
         self,
         organization_id: str,
         chat_id: str,
@@ -1439,9 +1495,9 @@ class WorkflowParametersRepository(BaseRepository):
                 entry, item = self._question_in_pending(chat, interaction_id)
             except NotFoundError:
                 payloads = await session.scalars(
-                    select(WorkflowCopilotChatMessageModel.narrative_payload)
-                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
+                    select(EmberChatMessageModel.narrative_payload)
+                    .where(EmberChatMessageModel.organization_id == organization_id)
+                    .where(EmberChatMessageModel.ember_chat_id == chat_id)
                 )
                 for payload in payloads:
                     for raw in (payload or {}).get("questionInteractions", []):
@@ -1482,7 +1538,7 @@ class WorkflowParametersRepository(BaseRepository):
             return resolved
 
     @db_operation("record_copilot_account_group_submission")
-    async def record_copilot_account_group_submission(
+    async def record_ember_account_group_submission(
         self, organization_id: str, chat_id: str, interaction_id: str, workflow_run_group_id: str
     ) -> None:
         async with self.Session() as session:
@@ -1495,7 +1551,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("record_copilot_single_run")
-    async def record_copilot_single_run(
+    async def record_ember_single_run(
         self, organization_id: str, chat_id: str, interaction_id: str, workflow_run_id: str
     ) -> None:
         async with self.Session() as session:
@@ -1508,7 +1564,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("record_copilot_single_run_save")
-    async def record_copilot_single_run_save(
+    async def record_ember_single_run_save(
         self,
         organization_id: str,
         chat_id: str,
@@ -1551,7 +1607,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("record_copilot_draft_acceptance")
-    async def record_copilot_draft_acceptance(
+    async def record_ember_draft_acceptance(
         self,
         organization_id: str,
         chat_id: str,
@@ -1566,17 +1622,17 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             chat = await self._locked_question_chat(session, organization_id, chat_id)
             stored = (
-                CopilotAcceptedTestedRun.model_validate(chat.accepted_tested_run)
+                EmberAcceptedTestedRun.model_validate(chat.accepted_tested_run)
                 if chat.accepted_tested_run is not None
                 else None
             )
             # A slower Accept of an older version must not replace the receipt of a newer one.
             if stored is None or stored.modified_at <= modified_at:
-                chat.accepted_tested_run = CopilotAcceptedTestedRun(
+                chat.accepted_tested_run = EmberAcceptedTestedRun(
                     workflow_id=workflow_id, modified_at=modified_at, workflow_run_id=tested_workflow_run_id
                 ).model_dump(mode="json")
             for raw in list((chat.pending_turns or {}).values()):
-                entry = CopilotPendingTurn.model_validate(raw)
+                entry = EmberPendingTurn.model_validate(raw)
                 stamped = False
                 for item in entry.question_interactions:
                     review = item.account_group_review
@@ -1598,7 +1654,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("unlink_copilot_single_run")
-    async def unlink_copilot_single_run(
+    async def unlink_ember_single_run(
         self, organization_id: str, chat_id: str, interaction_id: str, workflow_run_id: str
     ) -> None:
         async with self.Session() as session:
@@ -1628,7 +1684,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("claim_copilot_credential_deletion")
-    async def claim_copilot_credential_deletion(
+    async def claim_ember_credential_deletion(
         self,
         organization_id: str,
         chat_id: str,
@@ -1661,7 +1717,7 @@ class WorkflowParametersRepository(BaseRepository):
             return claimed
 
     @db_operation("record_copilot_credential_deletion")
-    async def record_copilot_credential_deletion(
+    async def record_ember_credential_deletion(
         self, organization_id: str, chat_id: str, interaction_id: str, outcomes: list[CredentialDeleteOutcome]
     ) -> QuestionInteraction:
         """Resolve a claimed deletion with its outcomes, in the pending turn or, once that turn ended, its row."""
@@ -1670,7 +1726,7 @@ class WorkflowParametersRepository(BaseRepository):
         )
 
     @db_operation("fail_copilot_credential_deletion")
-    async def fail_copilot_credential_deletion(
+    async def fail_ember_credential_deletion(
         self, organization_id: str, chat_id: str, interaction_id: str
     ) -> QuestionInteraction:
         return await self._settle_credential_deletion(
@@ -1678,7 +1734,7 @@ class WorkflowParametersRepository(BaseRepository):
         )
 
     @db_operation("expire_copilot_credential_deletion_leases")
-    async def expire_copilot_credential_deletion_leases(
+    async def expire_ember_credential_deletion_leases(
         self, organization_id: str, chat_id: str, interactions: list[QuestionInteraction]
     ) -> list[QuestionInteraction]:
         now = datetime.now(timezone.utc)
@@ -1725,14 +1781,21 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
             return resolved
 
+    @db_operation("get_copilot_history_question")
+    async def get_ember_history_question(
+        self, organization_id: str, chat_id: str, interaction_id: str
+    ) -> QuestionInteraction | None:
+        async with self.Session() as session:
+            return await self._narrative_question(session, organization_id, chat_id, interaction_id)
+
     @staticmethod
     async def _narrative_question(
         session: AsyncSession, organization_id: str, chat_id: str, interaction_id: str
     ) -> QuestionInteraction | None:
         payloads = await session.scalars(
-            select(WorkflowCopilotChatMessageModel.narrative_payload)
-            .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-            .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
+            select(EmberChatMessageModel.narrative_payload)
+            .where(EmberChatMessageModel.organization_id == organization_id)
+            .where(EmberChatMessageModel.ember_chat_id == chat_id)
         )
         for payload in payloads:
             for raw in (payload or {}).get("questionInteractions", []):
@@ -1746,14 +1809,14 @@ class WorkflowParametersRepository(BaseRepository):
     ) -> None:
         by_id = {item.interaction_id: item.model_dump(mode="json") for item in interactions}
         messages = await session.scalars(
-            select(WorkflowCopilotChatMessageModel)
-            .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-            .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
-            .where(WorkflowCopilotChatMessageModel.narrative_payload.is_not(None))
+            select(EmberChatMessageModel)
+            .where(EmberChatMessageModel.organization_id == organization_id)
+            .where(EmberChatMessageModel.ember_chat_id == chat_id)
+            .where(EmberChatMessageModel.narrative_payload.is_not(None))
             .options(
                 load_only(
-                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id,
-                    WorkflowCopilotChatMessageModel.narrative_payload,
+                    EmberChatMessageModel.ember_chat_message_id,
+                    EmberChatMessageModel.narrative_payload,
                 )
             )
         )
@@ -1765,7 +1828,7 @@ class WorkflowParametersRepository(BaseRepository):
                 message.narrative_payload = payload
 
     @db_operation("interrupt_copilot_question")
-    async def interrupt_copilot_question(
+    async def interrupt_ember_question(
         self, organization_id: str, chat_id: str, interaction_id: str, *, stale_only: bool = False
     ) -> QuestionInteraction | None:
         async with self.Session() as session:
@@ -1786,12 +1849,12 @@ class WorkflowParametersRepository(BaseRepository):
             return item
 
     @db_operation("cancel_copilot_questions")
-    async def cancel_copilot_questions(self, organization_id: str, chat_id: str, cancel_token: str) -> bool:
+    async def cancel_ember_questions(self, organization_id: str, chat_id: str, cancel_token: str) -> bool:
         async with self.Session() as session:
             chat = await self._locked_question_chat(session, organization_id, chat_id)
             changed = False
             for raw in list((chat.pending_turns or {}).values()):
-                entry = CopilotPendingTurn.model_validate(raw)
+                entry = EmberPendingTurn.model_validate(raw)
                 if entry.cancel_token != cancel_token:
                     continue
                 self._expire_credential_deletion_leases(entry, datetime.now(timezone.utc))
@@ -1804,14 +1867,14 @@ class WorkflowParametersRepository(BaseRepository):
             return changed
 
     @db_operation("record_copilot_steer_message", expected_errors=(ValueError,))
-    async def record_copilot_steer_message(
+    async def record_ember_steer_message(
         self,
         organization_id: str,
         chat_id: str,
         cancel_token: str,
         steer_id: str,
-        steer: CopilotSteerMessage | None = None,
-    ) -> CopilotSteerMessage | None:
+        steer: EmberSteerMessage | None = None,
+    ) -> EmberSteerMessage | None:
         """Validate the running turn before external screening (``steer`` None), then recheck and record.
 
         An already-recorded ``steer_id`` returns the stored message, so a retry never records twice.
@@ -1821,7 +1884,7 @@ class WorkflowParametersRepository(BaseRepository):
             entry = next(
                 (
                     candidate
-                    for candidate in map(CopilotPendingTurn.model_validate, (chat.pending_turns or {}).values())
+                    for candidate in map(EmberPendingTurn.model_validate, (chat.pending_turns or {}).values())
                     if candidate.cancel_token == cancel_token and candidate.recovering_at is None
                 ),
                 None,
@@ -1842,31 +1905,31 @@ class WorkflowParametersRepository(BaseRepository):
             return steer
 
     @db_operation("undelivered_copilot_steer_ids")
-    async def undelivered_copilot_steer_ids(self, organization_id: str, chat_id: str, turn_id: str) -> set[str]:
+    async def undelivered_ember_steer_ids(self, organization_id: str, chat_id: str, turn_id: str) -> set[str]:
         async with self.Session() as session:
             pending_turns = (
                 await session.scalars(
-                    select(WorkflowCopilotChatModel.pending_turns)
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == chat_id)
+                    select(EmberChatModel.pending_turns)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.ember_chat_id == chat_id)
                 )
             ).first()
         raw = (pending_turns or {}).get(turn_id)
         if raw is None:
             return set()
-        entry = CopilotPendingTurn.model_validate(raw)
+        entry = EmberPendingTurn.model_validate(raw)
         return {item.steer_id for item in entry.steer_messages if item.delivered_at is None}
 
     @db_operation("take_copilot_steer_messages")
-    async def take_copilot_steer_messages(
+    async def take_ember_steer_messages(
         self, organization_id: str, chat_id: str, turn_id: str
-    ) -> list[CopilotSteerMessage]:
+    ) -> list[EmberSteerMessage]:
         async with self.Session() as session:
             chat = await self._locked_question_chat(session, organization_id, chat_id)
             raw = (chat.pending_turns or {}).get(turn_id)
             if raw is None:
                 return []
-            entry = CopilotPendingTurn.model_validate(raw)
+            entry = EmberPendingTurn.model_validate(raw)
             undelivered = [item for item in entry.steer_messages if item.delivered_at is None]
             if not undelivered:
                 return []
@@ -1878,7 +1941,7 @@ class WorkflowParametersRepository(BaseRepository):
             return undelivered
 
     @db_operation("claim_pending_copilot_turn")
-    async def claim_pending_copilot_turn(
+    async def claim_pending_ember_turn(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -1890,9 +1953,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             chat = (
                 await session.scalars(
-                    select(WorkflowCopilotChatModel)
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatModel)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
                     .with_for_update()
                 )
             ).first()
@@ -1902,7 +1965,7 @@ class WorkflowParametersRepository(BaseRepository):
             entry = pending.get(turn_id)
             if not isinstance(entry, dict):
                 return "refused"
-            question_turn = CopilotPendingTurn.model_validate(entry)
+            question_turn = EmberPendingTurn.model_validate(entry)
             if any(item.status == "pending" for item in question_turn.question_interactions) and question_wait_is_live(
                 question_turn.question_heartbeat_at, datetime.now(timezone.utc)
             ):
@@ -1926,7 +1989,7 @@ class WorkflowParametersRepository(BaseRepository):
             return "claimed"
 
     @db_operation("record_pending_copilot_turn_credential_resume")
-    async def record_pending_copilot_turn_credential_resume(
+    async def record_pending_ember_turn_credential_resume(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -1935,9 +1998,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             chat = (
                 await session.scalars(
-                    select(WorkflowCopilotChatModel)
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatModel)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
                     .with_for_update()
                 )
             ).first()
@@ -1952,7 +2015,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("claim_pending_copilot_turn_for_finalisation")
-    async def claim_pending_copilot_turn_for_finalisation(
+    async def claim_pending_ember_turn_for_finalisation(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -1963,9 +2026,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             chat = (
                 await session.scalars(
-                    select(WorkflowCopilotChatModel)
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatModel)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
                     .with_for_update()
                 )
             ).first()
@@ -1977,7 +2040,7 @@ class WorkflowParametersRepository(BaseRepository):
             return "reconciling" if entry.get("recovering_at") is not None else "claimed"
 
     @asynccontextmanager
-    async def hold_copilot_turn_finalisation(self, workflow_copilot_chat_id: str, turn_id: str) -> AsyncIterator[None]:
+    async def hold_ember_turn_finalisation(self, workflow_copilot_chat_id: str, turn_id: str) -> AsyncIterator[None]:
         """Keep reconcile off this turn while the live handler writes its outcome. The lock lives on this
         transaction's connection, so a dead process releases it and a stalled live one keeps it."""
         if self._db_engine is None:
@@ -1996,7 +2059,7 @@ class WorkflowParametersRepository(BaseRepository):
             yield
 
     @db_operation("clear_pending_copilot_turn")
-    async def clear_pending_copilot_turn(
+    async def clear_pending_ember_turn(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -2005,9 +2068,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             chat = (
                 await session.scalars(
-                    select(WorkflowCopilotChatModel)
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatModel)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
                     .with_for_update()
                 )
             ).first()
@@ -2018,15 +2081,15 @@ class WorkflowParametersRepository(BaseRepository):
             if popped is None:
                 return
             chat.pending_turns = pending
-            entry = CopilotPendingTurn.model_validate(popped)
+            entry = EmberPendingTurn.model_validate(popped)
             if entry.request_browser_allocations is not None:
                 terminal = (
                     await session.scalars(
-                        select(WorkflowCopilotChatMessageModel)
-                        .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                        .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                        .where(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
-                        .where(WorkflowCopilotChatMessageModel.turn_outcome["copilot_turn_id"].as_string() == turn_id)
+                        select(EmberChatMessageModel)
+                        .where(EmberChatMessageModel.organization_id == organization_id)
+                        .where(EmberChatMessageModel.ember_chat_id == workflow_copilot_chat_id)
+                        .where(EmberChatMessageModel.sender == EmberChatSender.AI)
+                        .where(EmberChatMessageModel.turn_outcome["copilot_turn_id"].as_string() == turn_id)
                         .with_for_update()
                     )
                 ).one_or_none()
@@ -2049,7 +2112,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("record_copilot_browser_allocation")
-    async def record_copilot_browser_allocation(
+    async def record_ember_browser_allocation(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -2067,7 +2130,7 @@ class WorkflowParametersRepository(BaseRepository):
             raw_entry = pending.get(turn_id)
             message = None
             if isinstance(raw_entry, dict):
-                entry = CopilotPendingTurn.model_validate(raw_entry)
+                entry = EmberPendingTurn.model_validate(raw_entry)
                 if entry.cancel_token != request_cancel_token:
                     raise ValueError("Copilot allocation request does not match")
                 receipt = entry.request_browser_allocations
@@ -2076,11 +2139,11 @@ class WorkflowParametersRepository(BaseRepository):
                     raise ValueError("The Copilot execution has ended")
                 message = (
                     await session.scalars(
-                        select(WorkflowCopilotChatMessageModel)
-                        .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                        .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                        .where(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
-                        .where(WorkflowCopilotChatMessageModel.turn_outcome["copilot_turn_id"].as_string() == turn_id)
+                        select(EmberChatMessageModel)
+                        .where(EmberChatMessageModel.organization_id == organization_id)
+                        .where(EmberChatMessageModel.ember_chat_id == workflow_copilot_chat_id)
+                        .where(EmberChatMessageModel.sender == EmberChatSender.AI)
+                        .where(EmberChatMessageModel.turn_outcome["copilot_turn_id"].as_string() == turn_id)
                         .with_for_update()
                     )
                 ).one_or_none()
@@ -2093,7 +2156,7 @@ class WorkflowParametersRepository(BaseRepository):
             if receipt is None:
                 if browser_session_id is not None:
                     raise ValueError("Copilot allocation has no recorded intent")
-                receipt = CopilotRequestBrowserAllocations(
+                receipt = EmberRequestBrowserAllocations(
                     organization_id=organization_id,
                     workflow_permanent_id=workflow_permanent_id,
                     workflow_copilot_chat_id=workflow_copilot_chat_id,
@@ -2116,7 +2179,7 @@ class WorkflowParametersRepository(BaseRepository):
                     if len(allocations) >= 64:
                         truncated = True
                     else:
-                        allocations.append(CopilotBrowserAllocation(allocation_id=allocation_id))
+                        allocations.append(EmberBrowserAllocation(allocation_id=allocation_id))
             elif previous is None:
                 if not truncated:
                     raise ValueError("Copilot allocation has no recorded intent")
@@ -2161,9 +2224,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             chat = (
                 await session.scalars(
-                    select(WorkflowCopilotChatModel)
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatModel)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
                     .with_for_update()
                 )
             ).first()
@@ -2193,9 +2256,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             chat = (
                 await session.scalars(
-                    select(WorkflowCopilotChatModel)
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatModel)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
                 )
             ).first()
             if chat is None:
@@ -2209,7 +2272,7 @@ class WorkflowParametersRepository(BaseRepository):
             return False
 
     @db_operation("record_pending_copilot_turn_canonical_write")
-    async def record_pending_copilot_turn_canonical_write(
+    async def record_pending_ember_turn_canonical_write(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -2220,9 +2283,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             chat = (
                 await session.scalars(
-                    select(WorkflowCopilotChatModel)
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatModel)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
                     .with_for_update()
                 )
             ).first()
@@ -2237,7 +2300,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("record_pending_copilot_turn_draft", log_errors=False)
-    async def record_pending_copilot_turn_draft(
+    async def record_pending_ember_turn_draft(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -2248,9 +2311,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             chat = (
                 await session.scalars(
-                    select(WorkflowCopilotChatModel)
-                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatModel)
+                    .where(EmberChatModel.organization_id == organization_id)
+                    .where(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
                     .with_for_update()
                 )
             ).first()
@@ -2268,7 +2331,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("replace_workflow_copilot_chat_message")
-    async def replace_workflow_copilot_chat_message(
+    async def replace_ember_chat_message(
         self,
         organization_id: str,
         workflow_copilot_chat_message_id: str,
@@ -2276,16 +2339,13 @@ class WorkflowParametersRepository(BaseRepository):
         global_llm_context: str | None,
         turn_outcome: TurnOutcome | None,
         narrative_payload: TurnNarrativePayload | dict[str, Any] | None,
-    ) -> WorkflowCopilotChatMessage | None:
+    ) -> EmberChatMessage | None:
         async with self.Session() as session:
             message = (
                 await session.scalars(
-                    select(WorkflowCopilotChatMessageModel)
-                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                    .where(
-                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id
-                        == workflow_copilot_chat_message_id
-                    )
+                    select(EmberChatMessageModel)
+                    .where(EmberChatMessageModel.organization_id == organization_id)
+                    .where(EmberChatMessageModel.ember_chat_message_id == workflow_copilot_chat_message_id)
                 )
             ).first()
             if message is None:
@@ -2296,10 +2356,10 @@ class WorkflowParametersRepository(BaseRepository):
             message.narrative_payload = narrative_payload
             await session.commit()
             await session.refresh(message)
-            return WorkflowCopilotChatMessage.model_validate(message)
+            return EmberChatMessage.model_validate(message)
 
     @db_operation("mark_workflow_copilot_video_attachments_unsafe")
-    async def mark_workflow_copilot_video_attachments_unsafe(
+    async def mark_ember_video_attachments_unsafe(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -2310,9 +2370,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             messages = (
                 await session.scalars(
-                    select(WorkflowCopilotChatMessageModel)
-                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatMessageModel)
+                    .where(EmberChatMessageModel.organization_id == organization_id)
+                    .where(EmberChatMessageModel.ember_chat_id == workflow_copilot_chat_id)
                     .with_for_update()
                 )
             ).all()
@@ -2338,7 +2398,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("mark_workflow_copilot_video_attachments_too_long")
-    async def mark_workflow_copilot_video_attachments_too_long(
+    async def mark_ember_video_attachments_too_long(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -2349,9 +2409,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             messages = (
                 await session.scalars(
-                    select(WorkflowCopilotChatMessageModel)
-                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatMessageModel)
+                    .where(EmberChatMessageModel.organization_id == organization_id)
+                    .where(EmberChatMessageModel.ember_chat_id == workflow_copilot_chat_id)
                     .with_for_update()
                 )
             ).all()
@@ -2380,20 +2440,20 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("persist_workflow_copilot_video_evidence_artifacts")
-    async def persist_workflow_copilot_video_evidence_artifacts(
+    async def persist_ember_video_evidence_artifacts(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
-        artifacts: dict[str, CopilotVideoEvidenceArtifact],
+        artifacts: dict[str, EmberVideoEvidenceArtifact],
     ) -> None:
         if not artifacts:
             return
         async with self.Session() as session:
             messages = (
                 await session.scalars(
-                    select(WorkflowCopilotChatMessageModel)
-                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    select(EmberChatMessageModel)
+                    .where(EmberChatMessageModel.organization_id == organization_id)
+                    .where(EmberChatMessageModel.ember_chat_id == workflow_copilot_chat_id)
                     .with_for_update()
                 )
             ).all()
@@ -2424,22 +2484,22 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("get_workflow_copilot_chat_messages", expected_errors=(DatabaseConnectionUnavailableError,))
-    async def get_workflow_copilot_chat_messages(
+    async def get_ember_chat_messages(
         self,
         workflow_copilot_chat_id: str,
-    ) -> list[WorkflowCopilotChatMessage]:
-        async def read(session: AsyncSession) -> list[WorkflowCopilotChatMessage]:
+    ) -> list[EmberChatMessage]:
+        async def read(session: AsyncSession) -> list[EmberChatMessage]:
             query = (
-                select(WorkflowCopilotChatMessageModel)
-                .filter(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                select(EmberChatMessageModel)
+                .filter(EmberChatMessageModel.ember_chat_id == workflow_copilot_chat_id)
                 # Within one second, ids follow the worker hash and a wrapping 10-bit sequence, not write order.
                 .order_by(
-                    WorkflowCopilotChatMessageModel.created_at.asc(),
-                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc(),
+                    EmberChatMessageModel.created_at.asc(),
+                    EmberChatMessageModel.ember_chat_message_id.asc(),
                 )
             )
             messages = (await session.scalars(query)).all()
-            return [convert_to_workflow_copilot_chat_message(message, self.debug_enabled) for message in messages]
+            return [convert_to_ember_chat_message(message, self.debug_enabled) for message in messages]
 
         return await read_with_disconnect_recovery(
             self.Session,
@@ -2448,108 +2508,133 @@ class WorkflowParametersRepository(BaseRepository):
             workflow_copilot_chat_id=workflow_copilot_chat_id,
         )
 
+    @db_operation("get_ended_copilot_turn_ids")
+    async def get_ended_ember_turn_ids(
+        self, organization_id: str, workflow_copilot_chat_id: str, turn_ids: Collection[str]
+    ) -> set[str]:
+        if not turn_ids:
+            return set()
+        async with self.Session() as session:
+            return await _ended_ember_turn_ids(session, organization_id, [workflow_copilot_chat_id], turn_ids)
+
     @db_operation("get_workflow_copilot_chat_by_id")
-    async def get_workflow_copilot_chat_by_id(
+    async def get_ember_chat_by_id(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
-    ) -> WorkflowCopilotChat | None:
+    ) -> EmberChat | None:
         async with self.Session() as session:
             query = (
-                select(WorkflowCopilotChatModel)
-                .filter(WorkflowCopilotChatModel.organization_id == organization_id)
-                .filter(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                .order_by(WorkflowCopilotChatModel.created_at.desc())
+                select(EmberChatModel)
+                .filter(EmberChatModel.organization_id == organization_id)
+                .filter(EmberChatModel.ember_chat_id == workflow_copilot_chat_id)
+                .order_by(EmberChatModel.created_at.desc())
                 .limit(1)
             )
             chat = (await session.scalars(query)).first()
             if not chat:
                 return None
-            return WorkflowCopilotChat.model_validate(chat)
+            return EmberChat.model_validate(chat)
 
     @db_operation("get_latest_workflow_copilot_chat")
-    async def get_latest_workflow_copilot_chat(
+    async def get_latest_ember_chat(
         self,
         organization_id: str,
         workflow_permanent_id: str,
         request_cancel_token: str | None = None,
-    ) -> WorkflowCopilotChat | None:
+    ) -> EmberChat | None:
         async with self.Session() as session:
             query = (
-                select(WorkflowCopilotChatModel)
-                .filter(WorkflowCopilotChatModel.organization_id == organization_id)
-                .filter(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
+                select(EmberChatModel)
+                .filter(EmberChatModel.organization_id == organization_id)
+                .filter(EmberChatModel.workflow_permanent_id == workflow_permanent_id)
             )
             if request_cancel_token is not None:
                 completed_turn = (
-                    select(WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id)
+                    select(EmberChatMessageModel.ember_chat_message_id)
+                    .where(EmberChatMessageModel.ember_chat_id == EmberChatModel.ember_chat_id)
+                    .where(EmberChatMessageModel.organization_id == organization_id)
                     .where(
-                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_id
-                        == WorkflowCopilotChatModel.workflow_copilot_chat_id
-                    )
-                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                    .where(
-                        WorkflowCopilotChatMessageModel.turn_outcome["request_cancel_token"].as_string()
-                        == request_cancel_token
+                        EmberChatMessageModel.turn_outcome["request_cancel_token"].as_string() == request_cancel_token
                     )
                     .exists()
                 )
                 pending_turn = func.jsonb_path_exists(
-                    cast(WorkflowCopilotChatModel.pending_turns, JSONB),
+                    cast(EmberChatModel.pending_turns, JSONB),
                     cast("$.* ? (@.cancel_token == $token)", JSONPATH),
                     func.jsonb_build_object("token", request_cancel_token),
                 )
                 query = query.filter(or_(pending_turn, completed_turn))
-            query = query.order_by(WorkflowCopilotChatModel.created_at.desc()).limit(1)
+            query = query.order_by(EmberChatModel.created_at.desc()).limit(1)
             chat = (await session.scalars(query)).first()
             if not chat:
                 return None
-            return WorkflowCopilotChat.model_validate(chat)
+            return EmberChat.model_validate(chat)
 
     @db_operation("get_workflow_copilot_chats")
-    async def get_workflow_copilot_chats(
+    async def get_ember_chats(
         self,
         organization_id: str,
         workflow_permanent_id: str | None = None,
         page: int = 1,
         page_size: int = 20,
         search: str | None = None,
-    ) -> list[WorkflowCopilotChatSummary]:
+    ) -> list[EmberChatSummary]:
         page = max(page, 1)
         page_size = max(min(page_size, 100), 1)
-        folder_filter = await _folder_access_filter(organization_id, WorkflowCopilotChatModel.workflow_permanent_id)
+        folder_filter = await _folder_access_filter(organization_id, EmberChatModel.workflow_permanent_id)
         async with self.Session() as session:
             # Each chat's first message (earliest created_at) is its title source and proves the
             # chat is non-empty; DISTINCT ON keeps one opening row per chat.
             first_message = (
                 select(
-                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_id.label("chat_id"),
-                    WorkflowCopilotChatMessageModel.content.label("title"),
+                    EmberChatMessageModel.ember_chat_id.label("chat_id"),
+                    EmberChatMessageModel.content.label("title"),
                 )
-                .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                .distinct(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id)
+                .where(EmberChatMessageModel.organization_id == organization_id)
+                .distinct(EmberChatMessageModel.ember_chat_id)
                 .order_by(
-                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_id,
-                    WorkflowCopilotChatMessageModel.created_at.asc(),
-                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc(),
+                    EmberChatMessageModel.ember_chat_id,
+                    EmberChatMessageModel.created_at.asc(),
+                    EmberChatMessageModel.ember_chat_message_id.asc(),
                 )
                 .subquery()
             )
+            # Same rule chat-history uses for its in-flight turn: not being recovered and no outcome recorded yet.
+            pending_turn = func.jsonb_path_query(
+                cast(EmberChatModel.pending_turns, JSONB), cast("$.*", JSONPATH), type_=JSONB
+            ).column_valued("pending_turn")
+            answered = (
+                select(EmberChatMessageModel.ember_chat_message_id)
+                .where(
+                    EmberChatMessageModel.ember_chat_id == EmberChatModel.ember_chat_id,
+                    cast(EmberChatMessageModel.turn_outcome, JSONB)["copilot_turn_id"].astext
+                    == pending_turn["turn_id"].astext,
+                )
+                .correlate_except(EmberChatMessageModel)
+            )
+            in_flight = (
+                select(pending_turn)
+                .where(pending_turn["recovering_at"].astext.is_(None), ~answered.exists())
+                .exists()
+                .label("in_flight")
+            )
             query = (
                 select(
-                    WorkflowCopilotChatModel,
+                    EmberChatModel,
                     first_message.c.title,
                     func.jsonb_path_query_array(
-                        cast(WorkflowCopilotChatModel.pending_turns, JSONB),
+                        cast(EmberChatModel.pending_turns, JSONB),
                         cast('$.* ? (@.question_interactions[*].status == "pending").question_heartbeat_at', JSONPATH),
                     ).label("question_heartbeats"),
+                    in_flight,
                 )
-                .options(defer(WorkflowCopilotChatModel.pending_turns))
-                .join(first_message, first_message.c.chat_id == WorkflowCopilotChatModel.workflow_copilot_chat_id)
-                .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                .options(defer(EmberChatModel.pending_turns))
+                .join(first_message, first_message.c.chat_id == EmberChatModel.ember_chat_id)
+                .where(EmberChatModel.organization_id == organization_id)
             )
             if workflow_permanent_id is not None:
-                query = query.where(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
+                query = query.where(EmberChatModel.workflow_permanent_id == workflow_permanent_id)
             if folder_filter is not None:
                 query = query.where(folder_filter)
             if search and search.strip():
@@ -2557,15 +2642,11 @@ class WorkflowParametersRepository(BaseRepository):
                 # add a pg_trgm index on content if per-org chat counts grow large.
                 escaped = escape_like_term(search.strip())
                 query = query.where(first_message.c.title.ilike(f"%{escaped}%", escape="\\"))
-            query = (
-                query.order_by(WorkflowCopilotChatModel.created_at.desc())
-                .offset((page - 1) * page_size)
-                .limit(page_size)
-            )
+            query = query.order_by(EmberChatModel.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
             rows = (await session.execute(query)).all()
 
             workflow_titles: dict[str, str] = {}
-            permanent_ids = {chat.workflow_permanent_id for chat, _, _ in rows}
+            permanent_ids = {chat.workflow_permanent_id for chat, _, _, _ in rows}
             if permanent_ids:
                 title_rows = (
                     await session.execute(
@@ -2580,35 +2661,36 @@ class WorkflowParametersRepository(BaseRepository):
                     workflow_titles.setdefault(permanent_id, title)
 
             return [
-                WorkflowCopilotChatSummary(
-                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                EmberChatSummary(
+                    workflow_copilot_chat_id=chat.ember_chat_id,
                     workflow_permanent_id=chat.workflow_permanent_id,
                     workflow_title=workflow_titles.get(chat.workflow_permanent_id),
-                    title=summarize_copilot_chat_title(content),
+                    title=summarize_ember_chat_title(content),
                     created_at=chat.created_at,
                     modified_at=chat.modified_at,
                     awaiting_user_input=any(
                         question_wait_is_live(_parse_pending_turn_timestamp(heartbeat), datetime.now(timezone.utc))
                         for heartbeat in (question_heartbeats or [])
                     ),
+                    in_flight=bool(chat_in_flight),
                 )
-                for chat, content, question_heartbeats in rows
+                for chat, content, question_heartbeats, chat_in_flight in rows
             ]
 
     @db_operation("get_latest_workflow_copilot_completion_criteria_set")
-    async def get_latest_workflow_copilot_completion_criteria_set(
+    async def get_latest_ember_completion_criteria_set(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
-    ) -> WorkflowCopilotCompletionCriteriaSet | NonAdoptableCriteriaSet | None:
+    ) -> EmberCompletionCriteriaSet | NonAdoptableCriteriaSet | None:
         async with self.Session() as session:
             query = (
-                select(WorkflowCopilotCompletionCriteriaSetModel)
-                .filter(WorkflowCopilotCompletionCriteriaSetModel.organization_id == organization_id)
-                .filter(WorkflowCopilotCompletionCriteriaSetModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                select(EmberCompletionCriteriaSetModel)
+                .filter(EmberCompletionCriteriaSetModel.organization_id == organization_id)
+                .filter(EmberCompletionCriteriaSetModel.ember_chat_id == workflow_copilot_chat_id)
                 .order_by(
-                    WorkflowCopilotCompletionCriteriaSetModel.goal_epoch.desc(),
-                    WorkflowCopilotCompletionCriteriaSetModel.created_at.desc(),
+                    EmberCompletionCriteriaSetModel.goal_epoch.desc(),
+                    EmberCompletionCriteriaSetModel.created_at.desc(),
                 )
                 .limit(1)
             )
@@ -2618,7 +2700,7 @@ class WorkflowParametersRepository(BaseRepository):
             return _decode_completion_criteria_set(row)
 
     @db_operation("create_workflow_copilot_completion_criteria_set")
-    async def create_workflow_copilot_completion_criteria_set(
+    async def create_ember_completion_criteria_set(
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
@@ -2628,11 +2710,11 @@ class WorkflowParametersRepository(BaseRepository):
         source_goal_text: str | None = None,
         consecutive_all_no_evidence: int = 0,
         last_fully_satisfied_workflow_yaml: str | None = None,
-    ) -> WorkflowCopilotCompletionCriteriaSet:
+    ) -> EmberCompletionCriteriaSet:
         async with self.Session() as session:
-            new_set = WorkflowCopilotCompletionCriteriaSetModel(
+            new_set = EmberCompletionCriteriaSetModel(
                 organization_id=organization_id,
-                workflow_copilot_chat_id=workflow_copilot_chat_id,
+                ember_chat_id=workflow_copilot_chat_id,
                 goal_epoch=goal_epoch,
                 status="active",
                 criteria=criteria,
@@ -2645,10 +2727,10 @@ class WorkflowParametersRepository(BaseRepository):
             session.add(new_set)
             await session.commit()
             await session.refresh(new_set)
-            return WorkflowCopilotCompletionCriteriaSet.model_validate(new_set)
+            return EmberCompletionCriteriaSet.model_validate(new_set)
 
     @db_operation("supersede_workflow_copilot_completion_criteria_set")
-    async def supersede_workflow_copilot_completion_criteria_set(
+    async def supersede_ember_completion_criteria_set(
         self,
         organization_id: str,
         completion_criteria_set_id: str,
@@ -2658,12 +2740,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             row = (
                 await session.scalars(
-                    select(WorkflowCopilotCompletionCriteriaSetModel)
-                    .where(WorkflowCopilotCompletionCriteriaSetModel.organization_id == organization_id)
-                    .where(
-                        WorkflowCopilotCompletionCriteriaSetModel.completion_criteria_set_id
-                        == completion_criteria_set_id
-                    )
+                    select(EmberCompletionCriteriaSetModel)
+                    .where(EmberCompletionCriteriaSetModel.organization_id == organization_id)
+                    .where(EmberCompletionCriteriaSetModel.completion_criteria_set_id == completion_criteria_set_id)
                 )
             ).first()
             if not row:
@@ -2677,7 +2756,7 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
 
     @db_operation("update_workflow_copilot_completion_criteria_set_state")
-    async def update_workflow_copilot_completion_criteria_set_state(
+    async def update_ember_completion_criteria_set_state(
         self,
         organization_id: str,
         completion_criteria_set_id: str,
@@ -2688,12 +2767,9 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             row = (
                 await session.scalars(
-                    select(WorkflowCopilotCompletionCriteriaSetModel)
-                    .where(WorkflowCopilotCompletionCriteriaSetModel.organization_id == organization_id)
-                    .where(
-                        WorkflowCopilotCompletionCriteriaSetModel.completion_criteria_set_id
-                        == completion_criteria_set_id
-                    )
+                    select(EmberCompletionCriteriaSetModel)
+                    .where(EmberCompletionCriteriaSetModel.organization_id == organization_id)
+                    .where(EmberCompletionCriteriaSetModel.completion_criteria_set_id == completion_criteria_set_id)
                 )
             ).first()
             if not row:

@@ -753,6 +753,7 @@ class SkyvernContext:
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
+    otp_request_id: str | None = None
     requested_by: str | None = None
     root_workflow_run_id: str | None = None
     task_v2_id: str | None = None
@@ -779,7 +780,7 @@ class SkyvernContext:
     # Set only by the in-process copilot block-test path, on that run's own context. A dispatched
     # run's context is rebuilt on the worker and never carries it, so runner selection can tell the
     # two apart instead of inferring it from a process-wide capability.
-    copilot_inline_execution: bool = False
+    ember_inline_execution: bool = False
     # The CodeBlock arm the rollout assigned this run to ("secure_runner" / "legacy_in_process"),
     # stamped only on an authoritative flag/pin verdict so log lines can be grouped by arm for an
     # unbiased secure-vs-legacy comparison. Left None when no genuine assignment was made (no browser
@@ -835,7 +836,7 @@ class SkyvernContext:
     runtime_secret_values: set[str] = field(default_factory=builtins.set)
     # Copilot credential values this request filled or scrubbed with. Its log lines and span exceptions
     # scrub them at any length, while other sessions' values reach its log lines only above a length floor.
-    copilot_scrub_values: set[str] = field(default_factory=builtins.set, repr=False)
+    ember_scrub_values: set[str] = field(default_factory=builtins.set, repr=False)
     # Subset of runtime_secret_values that must also never reach the model's own view of tool
     # output (e.g. a magic sign-in link), as opposed to values the model needs to read (e.g. a TOTP
     # code) that are only scrubbed from artifacts/logs.
@@ -874,9 +875,8 @@ class SkyvernContext:
     vertex_cache_key: str | None = None  # Logical cache key (includes variant + llm key)
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
     prompt_caching_settings: dict[str, bool] | None = None
-    # SKY-9718 Layer 1 — gates apply_lean_recipe in prompt_engine + agent.
-    # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
-    # and read sync from prompt-build sites.
+    # Set by the agent step before it builds its prompt; prompt-build sites read it to apply the lean
+    # element-tree transforms. Paths that never run an agent step keep rendering the full tree.
     enable_lean_element_tree: bool = False
     # PRESERVE_TRANSIENT_UI_CAPTURE experiment arm, resolved per run. Tri-state: True=treatment
     # (suppress a scroll that would dismiss an open transient popup), False=control (shadow-detect
@@ -924,6 +924,8 @@ class SkyvernContext:
     # with a different id re-resolves. Written and read only through skyvern.forge.taskv3.run_arms.
     run_arms: dict[str, tuple[str, RunArm]] = field(default_factory=dict)
     run_arms_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    html_content_bounded_transport_pins: dict[tuple[str, str, str], bool] = field(default_factory=dict)
+    html_content_bounded_transport_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # Run-level SLIM_LLM_OUTPUT_PROMPTS assignment, resolved once by slim_llm_output.
     # The lock makes first-use resolution single-flight under parallel prompt builds.

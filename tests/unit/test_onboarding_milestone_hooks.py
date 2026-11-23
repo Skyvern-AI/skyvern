@@ -297,32 +297,6 @@ class TestWorkflowRoutesThreadUser:
         assert audit_event.related_resource_ids == ("fld_body",)
 
     @pytest.mark.asyncio
-    async def test_shared_create_route_succeeds_with_oss_audit_noop(self) -> None:
-        from skyvern.forge.sdk.routes.agent_protocol import create_workflow_legacy
-
-        saved = MagicMock()
-        organization = MagicMock()
-        organization.organization_id = "o_123"
-        raw_request = MagicMock()
-        raw_request.body = AsyncMock(
-            return_value=b"title: Funnel Workflow\nworkflow_definition:\n  parameters: []\n  blocks: []\n"
-        )
-
-        with patch("skyvern.forge.sdk.routes.agent_protocol.app") as mock_app:
-            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(
-                return_value=(saved, ("workflow_definition",))
-            )
-            mock_app.AGENT_FUNCTION = AgentFunction()
-            result = await create_workflow_legacy(
-                request=raw_request,
-                folder_id=None,
-                current_org=organization,
-                user_id="u_456",
-            )
-
-        assert result is saved
-
-    @pytest.mark.asyncio
     async def test_update_workflow_legacy_route_passes_user(self) -> None:
         from skyvern.forge.sdk.routes.agent_protocol import update_workflow_legacy
 
@@ -381,6 +355,9 @@ class TestRunCreatedHookWiring:
 
     @pytest.mark.asyncio
     async def test_run_workflow_routes_schedule_run_created_hook(self) -> None:
+        from fastapi import HTTPException
+
+        from skyvern.forge.sdk.db.exceptions import OTPRequestAlreadyBoundError
         from skyvern.forge.sdk.routes import agent_protocol
         from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
         from skyvern.schemas.runs import WorkflowRunRequest
@@ -392,15 +369,17 @@ class TestRunCreatedHookWiring:
         checker.check = AsyncMock()
         mock_app = MagicMock()
         mock_app.RATE_LIMITER.rate_limit_submit_run = AsyncMock()
+        run_workflow_returning_owned_workflow = AsyncMock(return_value=(workflow_run, MagicMock(title="Test")))
+        run_workflow = AsyncMock(return_value=workflow_run)
 
         with (
             patch.object(agent_protocol.PermissionCheckerFactory, "get_instance", return_value=checker),
             patch.object(
                 agent_protocol.workflow_service,
                 "run_workflow_returning_owned_workflow",
-                AsyncMock(return_value=(workflow_run, MagicMock(title="Test"))),
+                run_workflow_returning_owned_workflow,
             ),
-            patch.object(agent_protocol.workflow_service, "run_workflow", AsyncMock(return_value=workflow_run)),
+            patch.object(agent_protocol.workflow_service, "run_workflow", run_workflow),
             patch.object(agent_protocol.skyvern_context, "ensure_context", return_value=MagicMock(request_id="req_1")),
             patch.object(agent_protocol, "WorkflowRunResponse", side_effect=lambda **kwargs: kwargs),
             patch.object(agent_protocol.analytics, "capture"),
@@ -429,7 +408,37 @@ class TestRunCreatedHookWiring:
                 x_max_steps_override=None,
                 x_user_agent=None,
             )
+            run_workflow_returning_owned_workflow.side_effect = OTPRequestAlreadyBoundError(
+                owner_type="workflow_run", owner_id="wr_owner"
+            )
+            with pytest.raises(HTTPException, match="already bound") as conflict:
+                await agent_protocol.run_workflow(
+                    request=MagicMock(),
+                    background_tasks=background_tasks,
+                    workflow_run_request=WorkflowRunRequest(workflow_id="wpid_1"),
+                    caller=caller,
+                    template=False,
+                    x_api_key=None,
+                    x_max_steps_override=None,
+                    x_user_agent=None,
+                )
+            run_workflow.side_effect = OTPRequestAlreadyBoundError(owner_type="workflow_run", owner_id="wr_owner")
+            with pytest.raises(HTTPException, match="already bound") as legacy_conflict:
+                await agent_protocol.run_workflow_legacy(
+                    request=MagicMock(scope={"route": MagicMock(path="/v1/otp-bound/workflows/{workflow_id}/run")}),
+                    background_tasks=background_tasks,
+                    workflow_id="wpid_1",
+                    workflow_request=WorkflowRequestBody(otp_request_id="otpr_retry"),
+                    version=None,
+                    caller=caller,
+                    template=False,
+                    x_api_key=None,
+                    x_max_steps_override=None,
+                    x_user_agent=None,
+                )
 
+        assert conflict.value.status_code == 409
+        assert legacy_conflict.value.status_code == 409
         assert background_tasks.add_task.call_count == 2
         for call in background_tasks.add_task.call_args_list:
             assert call.args == (mock_app.AGENT_FUNCTION.on_run_created,)
@@ -442,6 +451,9 @@ class TestRunCreatedHookWiring:
 
     @pytest.mark.asyncio
     async def test_retry_route_schedules_run_created_hook(self) -> None:
+        from fastapi import HTTPException
+
+        from skyvern.forge.sdk.db.exceptions import OTPRequestAlreadyBoundError
         from skyvern.forge.sdk.routes import agent_protocol
         from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
 
@@ -452,6 +464,7 @@ class TestRunCreatedHookWiring:
             workflow_id="wf_old",
             workflow_permanent_id="wpid_1",
             browser_session_id=None,
+            otp_request_id=None,
             ignore_inherited_workflow_system_prompt=False,
         )
         original_run.status.is_final.return_value = True
@@ -468,10 +481,11 @@ class TestRunCreatedHookWiring:
         mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=original_workflow)
         mock_app.AGENT_FUNCTION.get_workflow_run_retry_refusal = AsyncMock(return_value=None)
         mock_app.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=False)
+        retry_workflow = AsyncMock(return_value=retried_run)
 
         with (
             patch.object(agent_protocol.PermissionCheckerFactory, "get_instance", return_value=checker),
-            patch.object(agent_protocol.workflow_service, "run_workflow", AsyncMock(return_value=retried_run)),
+            patch.object(agent_protocol.workflow_service, "run_workflow", retry_workflow),
             patch.object(
                 agent_protocol.workflow_service,
                 "workflow_request_body_from_existing_run",
@@ -492,7 +506,22 @@ class TestRunCreatedHookWiring:
                 x_max_steps_override=None,
                 x_user_agent=None,
             )
+            retry_workflow.side_effect = OTPRequestAlreadyBoundError(owner_type="workflow_run", owner_id="wr_owner")
+            with pytest.raises(HTTPException, match="already bound") as retry_conflict:
+                await agent_protocol.retry_workflow_run(
+                    request=MagicMock(
+                        scope={"route": MagicMock(path="/v1/otp-bound/workflows/runs/{workflow_run_id}/retry")}
+                    ),
+                    background_tasks=background_tasks,
+                    workflow_run_id="wr_old",
+                    otp_request_id="otpr_retry",
+                    caller=caller,
+                    x_api_key=None,
+                    x_max_steps_override=None,
+                    x_user_agent=None,
+                )
 
+        assert retry_conflict.value.status_code == 409
         background_tasks.add_task.assert_called_once_with(
             mock_app.AGENT_FUNCTION.on_run_created,
             organization_id="o_123",

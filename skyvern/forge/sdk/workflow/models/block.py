@@ -101,6 +101,7 @@ from skyvern.config import settings
 from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     BROWSER_DOWNLOADING_SUFFIX,
+    EMBER_RUN_CREATOR,
     FILE_PARSE_STEP_TIMEOUT_SECONDS,
     FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS,
     GET_DOWNLOADED_FILES_TIMEOUT,
@@ -151,6 +152,8 @@ from skyvern.exceptions import (
     WorkflowRunContextNotInitialized,
     get_user_facing_exception_message,
 )
+from skyvern.file_parser.client import IsolatedParserResult, parse_file_remotely
+from skyvern.file_parser.transport import MAX_PARSER_INPUT_BYTES, MAX_PARSER_OUTPUT_BYTES
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
@@ -199,17 +202,17 @@ from skyvern.forge.sdk.api.llm.utils import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import run_stoppable_comparison, unique_pdf_paths
-from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_release_scope
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import PERSON_STARTED_TRIGGER_TYPES, TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
+from skyvern.forge.sdk.ember.turn_origin import TurnOrigin
 from skyvern.forge.sdk.executor.run_liveness import (
     block_outcome_authority,
     run_lease_final_write_blocked,
@@ -217,7 +220,9 @@ from skyvern.forge.sdk.executor.run_liveness import (
     run_lease_tasks_enabled,
 )
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
+from skyvern.forge.sdk.experimentation.drive_shared_drive_search import drive_shared_drive_search_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
+from skyvern.forge.sdk.experimentation.sheets_save_as_sheet import sheets_save_as_sheet_enabled
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     run_honors_chosen_engine,
     task_v3_disabled,
@@ -382,7 +387,7 @@ from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_settings import requested_timezone_id
 from skyvern.schemas.emails import (
-    CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON,
+    CONNECTED_ACCOUNT_EMBER_TEST_RUN_REASON,
     CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON,
     CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON,
     CONNECTED_ACCOUNT_RESAVE_REASON,
@@ -2106,18 +2111,18 @@ class Block(BaseModel, abc.ABC):
     def get_workflow_run_context(workflow_run_id: str) -> WorkflowRunContext:
         return app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
 
-    async def _workflow_copilot_lineage(self, workflow_run_context: WorkflowRunContext) -> bool | None:
+    async def _ember_lineage(self, workflow_run_context: WorkflowRunContext) -> bool | None:
         """Whether Copilot wrote any version of this workflow, or None when the lookup failed."""
         workflow = workflow_run_context.workflow
         if workflow is None:
             return False
-        if "copilot" in (workflow.created_by, workflow.edited_by):
+        if EMBER_RUN_CREATOR in (workflow.created_by, workflow.edited_by):
             return True
         # User saves re-stamp both fields with the user id, so the current version alone is
         # not durable; fall back to lineage (copilot stamps every version it writes). A lookup
         # failure must never mask a block failure.
         try:
-            copilot_authored = await app.DATABASE.workflows.is_workflow_copilot_authored(
+            copilot_authored = await app.DATABASE.workflows.is_ember_authored(
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 organization_id=workflow.organization_id,
             )
@@ -3025,7 +3030,7 @@ class BaseTaskBlock(Block):
             if task_url_parameter_value:
                 LOG.info(
                     "Task URL is parameterized, using parameter value",
-                    task_url_parameter_value=task_url_parameter_value,
+                    task_parameter_url=task_url_parameter_value,
                     task_url_parameter_key=self.url,
                 )
                 self.url = task_url_parameter_value
@@ -6122,6 +6127,7 @@ def _sheets_read_output_keys(workflow_run_context: WorkflowRunContext) -> set[st
         block.output_parameter.key
         for block in get_all_blocks(workflow.workflow_definition.blocks)
         if block.block_type == BlockType.GOOGLE_SHEETS_READ
+        or (isinstance(block, IntegrationActionBlock) and block.runs_block_type() == BlockType.GOOGLE_SHEETS_READ)
     }
 
 
@@ -6325,90 +6331,6 @@ _OTP_VERB_BY_TYPE = {
     OTPType.MAGIC_LINK: "await <credential>.magic_link(page)",
 }
 
-_OTP_NOUN_BY_TYPE = {
-    OTPType.TOTP: "code",
-    OTPType.MAGIC_LINK: "sign-in link",
-}
-
-
-def _otp_sources_checked(
-    totp_identifier: str,
-    expected_otp_type: OTPType,
-    email_context: otp_email.EmailOTPVerificationContext,
-    raw_context: otp_service.RawOTPVerificationContext,
-) -> str:
-    """Counts only: addresses, credential ids, identifiers and codes must never reach this text."""
-    inbox_facts: list[str] = []
-    # An identifier without an "@" never reaches the inbox search, so no mailbox fact holds for it.
-    inboxes_apply = "@" in totp_identifier
-    connected_everywhere_empty = inboxes_apply
-    if inboxes_apply:
-        for label, source_name in (
-            ("Gmail", otp_email.GmailOTPSource.name),
-            ("Outlook", otp_email.OutlookOTPSource.name),
-        ):
-            source = email_context.per_source.get(source_name)
-            if source is None:
-                inbox_facts.append(f"{label} inboxes not checked")
-                connected_everywhere_empty = False
-            elif source.credential_ids is None:
-                inbox_facts.append(f"{label} inbox list never loaded")
-                connected_everywhere_empty = False
-            elif not source.credential_ids:
-                if source.credential_list_refresh_failed:
-                    inbox_facts.append(f"{label} inbox list not refreshed")
-                    connected_everywhere_empty = False
-                else:
-                    inbox_facts.append(f"no {label} inbox connected")
-            else:
-                connected_everywhere_empty = False
-                connected = set(source.credential_ids)
-                inboxes = len(connected)
-                # Counted here rather than pruned on refresh: the message sets also drive dedupe,
-                # and forgetting a key would re-parse a message the caller already paid for.
-                messages = sum(1 for credential_id, _ in source.seen_message_keys if credential_id in connected)
-                unreadable = sum(1 for credential_id, _ in source.unreadable_message_keys if credential_id in connected)
-                capped = source.messages_evicted
-                shown = f"{messages}+" if capped else str(messages)
-                if messages and unreadable:
-                    reached = messages + unreadable
-                    # One count carries both: an appended clause would not survive the shortest
-                    # consumer, and a bare checked count hides the candidates the parser refused.
-                    read_fact = f"{shown} of {reached}{'+' if capped else ''} messages read"
-                elif messages:
-                    read_fact = f"{shown} message{'s' if messages != 1 else ''} checked"
-                elif source.failed_credential_ids:
-                    read_fact = "search failed"
-                elif unreadable:
-                    read_fact = f"{unreadable} message{'s' if unreadable != 1 else ''} could not be read"
-                else:
-                    read_fact = "no messages read"
-                plural = "es" if inboxes != 1 else ""
-                # Coverage shares the clause with the read fact, which on its own would hide an inbox
-                # that failed or was still in flight whenever a sibling inbox answered.
-                searched = len(source.completed_credential_ids & connected)
-                coverage = (
-                    f"{searched} of {inboxes} {label} inbox{plural} searched"
-                    if searched < inboxes
-                    else f"{inboxes} {label} inbox{plural} connected"
-                )
-                inbox_facts.append(f"{coverage}, {read_fact}")
-    rows = len(raw_context.seen_row_ids)
-    noun = _OTP_NOUN_BY_TYPE.get(expected_otp_type, "OTP")
-    store_empty = raw_context.store_queried and not rows
-    if connected_everywhere_empty and store_empty:
-        return f"No Gmail or Outlook inbox is connected and no {noun} has been stored."
-    if not raw_context.store_queried and all(fact.endswith("not checked") for fact in inbox_facts):
-        return "No delivery source was checked before the wait ended."
-    if not raw_context.store_queried:
-        row_fact = f"stored {noun}s not checked"
-    elif rows:
-        # "found", not "checked": the reparse budget stops the scan before every row is parsed.
-        row_fact = f"{rows} stored OTP message{'s' if rows != 1 else ''} found"
-    else:
-        row_fact = f"no {noun} has been stored"
-    return f"Sources checked: {'; '.join([*inbox_facts, row_fact])}."
-
 
 def _otp_wait_failure(
     totp_identifier: str,
@@ -6429,7 +6351,7 @@ def _otp_wait_failure(
         # Sources first: every downstream cap slices a prefix, and the shortest (120 chars in
         # copilot turn compaction) starts after a ~45-char platform frame.
         return CodeBlockOTPError(
-            f"{_otp_sources_checked(totp_identifier, expected_otp_type, email_context, raw_context)} "
+            f"{otp_service.otp_sources_checked(totp_identifier, expected_otp_type, email_context, raw_context)} "
             f"OTP was not received within {budget_seconds} seconds."
         )
     found = ", ".join(observed.value for observed in mismatched)
@@ -6482,6 +6404,7 @@ async def _poll_code_block_otp(
                 workflow_id=workflow_run.workflow_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
+                otp_request_id=workflow_run.otp_request_id,
                 totp_identifier=totp_identifier,
                 created_after=created_after,
                 expected_otp_type=expected_otp_type,
@@ -8792,7 +8715,7 @@ async def wrapper({default_args}):
         LOG.warning(
             "codeblock.download_intent_unregistered",
             engine=engine,
-            copilot_authored=await self._workflow_is_copilot_authored(workflow_run_context),
+            copilot_authored=await self._workflow_is_ember_authored(workflow_run_context),
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             block_label=self.label,
@@ -8801,8 +8724,8 @@ async def wrapper({default_args}):
             organization_id=organization_id,
         )
 
-    async def _workflow_is_copilot_authored(self, workflow_run_context: WorkflowRunContext) -> bool:
-        return await self._workflow_copilot_lineage(workflow_run_context) is True
+    async def _workflow_is_ember_authored(self, workflow_run_context: WorkflowRunContext) -> bool:
+        return await self._ember_lineage(workflow_run_context) is True
 
     async def _ai_fallback_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         workflow = workflow_run_context.workflow
@@ -9059,7 +8982,7 @@ async def wrapper({default_args}):
             recovery_release_parameter_keys = [
                 parameter.key for parameter in self.parameters if _is_secret_or_credential_parameter(parameter)
             ]
-            recovery_enforce_vault_sites = await self._workflow_copilot_lineage(workflow_run_context) is not False
+            recovery_enforce_vault_sites = await self._ember_lineage(workflow_run_context) is not False
 
             workflow_system_prompt = (
                 None
@@ -10468,11 +10391,11 @@ async def wrapper({default_args}):
             authorized_file_materializations: dict[str, AuthorizedFileMaterialization] = {}
             credential_parameter_keys: set[str] = set()
             credential_release_guard = CredentialReleaseGuard(workflow_run_id=workflow_run_id, block_label=self.label)
-            copilot_lineage = await self._workflow_copilot_lineage(workflow_run_context)
-            copilot_authored = copilot_lineage is True
+            ember_lineage = await self._ember_lineage(workflow_run_context)
+            copilot_authored = ember_lineage is True
             # Editor-built vault logins are only logged off their item's sites until production counts show refusing
             # them would not break working workflows. Unknown lineage still enforces.
-            enforce_vault_sites = copilot_lineage is not False
+            enforce_vault_sites = ember_lineage is not False
             sheets_read_output_keys = _sheets_read_output_keys(workflow_run_context)
             sheets_read_parameter_keys: list[str] = []
             for parameter in self.parameters:
@@ -12437,7 +12360,7 @@ class DownloadToS3Block(Block):
             if task_url_parameter_value:
                 LOG.info(
                     "DownloadToS3Block Task URL is parameterized, using parameter value",
-                    task_url_parameter_value=task_url_parameter_value,
+                    task_parameter_url=task_url_parameter_value,
                     task_url_parameter_key=self.url,
                 )
                 self.url = task_url_parameter_value
@@ -13016,6 +12939,7 @@ class FileDestinationBlock(Block):
         *,
         access_token: str,
         folder_id: str | None,
+        google_drive_save_as_sheet: bool,
     ) -> FileUploadDestination:
         uri = (
             f"https://drive.google.com/drive/folders/{folder_id}"
@@ -13028,6 +12952,7 @@ class FileDestinationBlock(Block):
             sdk_uri=uri,
             google_access_token=access_token,
             google_drive_folder_id=folder_id,
+            google_drive_save_as_sheet=google_drive_save_as_sheet,
         )
 
     def _build_sftp_destination(
@@ -13075,6 +13000,7 @@ class FileDestinationBlock(Block):
         organization_id: str | None,
         workflow_run_context: WorkflowRunContext,
         google_access_token: str | None = None,
+        google_drive_save_as_sheet: bool = False,
     ) -> list[str]:
         uploaded_uris: list[str] = []
         if not files_to_upload:
@@ -13172,11 +13098,17 @@ class FileDestinationBlock(Block):
                 google_access_token = drive_access
 
             folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id)
+            if google_drive_save_as_sheet and not await sheets_save_as_sheet_enabled(org_id):
+                raise ValueError(
+                    "Save as Google Sheet is not available for this organization. "
+                    "Turn it off on this File Upload block to upload the original files."
+                )
             for file_path in files_to_upload:
                 LOG.info("Uploading file to Google Drive customer storage", file_path=file_path)
                 destination = self._build_google_drive_destination(
                     access_token=google_access_token,
                     folder_id=folder_id,
+                    google_drive_save_as_sheet=google_drive_save_as_sheet,
                 )
                 customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
                     file_path=file_path,
@@ -13571,6 +13503,7 @@ class FileUploadBlock(FileDestinationBlock):
     block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
 
     storage_type: FileStorageType = FileStorageType.S3
+    google_drive_save_as_sheet: bool = False
 
     def get_all_parameters(
         self,
@@ -13776,6 +13709,7 @@ class FileUploadBlock(FileDestinationBlock):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
                 workflow_run_context=workflow_run_context,
+                google_drive_save_as_sheet=self.google_drive_save_as_sheet,
             )
 
         except Exception as e:
@@ -13966,15 +13900,8 @@ GMAIL_SEND_FAILURE_MESSAGES: dict[GmailSendErrorCode, str] = {
 
 # The trigger kinds a connected account's capability may be prepared for; never for the rest. A child run carries
 # its chain root's kind, so admitting a kind admits that kind's children too.
-_CONNECTED_ACCOUNT_TRIGGER_TYPES = frozenset(
-    {
-        None,
-        WorkflowRunTriggerType.manual,
-        WorkflowRunTriggerType.mcp,
-        WorkflowRunTriggerType.api,
-        WorkflowRunTriggerType.scheduled,
-        WorkflowRunTriggerType.event,
-    }
+_CONNECTED_ACCOUNT_TRIGGER_TYPES = PERSON_STARTED_TRIGGER_TYPES | frozenset(
+    {WorkflowRunTriggerType.scheduled, WorkflowRunTriggerType.event}
 )
 
 
@@ -14602,9 +14529,9 @@ class SendEmailBlock(Block):
                 raise _GmailSendRefused(
                     GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON} Nothing was sent."
                 )
-            if refusal == GmailHopRefusal.copilot_test_run:
+            if refusal == GmailHopRefusal.ember_test_run:
                 raise _GmailSendRefused(
-                    GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON} Nothing was sent."
+                    GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_EMBER_TEST_RUN_REASON} Nothing was sent."
                 )
             if refusal == GmailHopRefusal.run_not_supported or (
                 refusal is None and await _is_unsupported_connected_account_run(workflow_run_id, organization_id)
@@ -14612,7 +14539,8 @@ class SendEmailBlock(Block):
                 raise _GmailSendRefused(
                     GmailSendErrorCode.CONFIGURATION,
                     "This Gmail account cannot send in a run started with an API key, or in a webhook, job recipe or "
-                    "directory submission run; use a natively connected Google account for those. Nothing was sent.",
+                    "directory submission run; use a natively connected Google account for those. For a scheduled run, "
+                    "open the schedule on the Schedules page and save it. Nothing was sent.",
                 )
             raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
         to = self._resolve_recipient_entries(self.recipients, workflow_run_context)
@@ -15163,6 +15091,8 @@ class FileParserBlock(Block):
     _CSV_SNIFF_LINES = 5
     _CSV_BINARY_PREFIX_BYTES = 4096
     _CSV_UTF_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)
+    # Unrestricted, csv.Sniffer picks a letter as the delimiter of a one-column file.
+    _CSV_DELIMITERS = ",\t;|:"
     # Shape checks on the head of a file that reached the CSV fallback (log only; detection is unchanged).
     _FALLBACK_SNIFF_BYTES: ClassVar[int] = 8192
     _FALLBACK_SNIFF_ROWS: ClassVar[int] = 20
@@ -15348,7 +15278,7 @@ class FileParserBlock(Block):
             return
         facts["sampled_rows"] = len(rows) - 1
         try:
-            delimiter = csv.Sniffer().sniff("".join(rows)).delimiter
+            delimiter = csv.Sniffer().sniff("".join(rows), delimiters=self._CSV_DELIMITERS).delimiter
             facts["delimiter_sniffed"] = True
         except csv.Error:
             # Same fallback the CSV parser applies when the sniffer gives up (see _sniff_csv_delimiter).
@@ -15414,6 +15344,10 @@ class FileParserBlock(Block):
         with open(file_path, "rb") as f:
             raw_data = f.read(sample_size)
 
+        # charset-normalizer reports a UTF-8 BOM file as utf_8, which leaves the BOM in the first header.
+        if raw_data.startswith(codecs.BOM_UTF8):
+            return "utf-8-sig"
+
         result = from_bytes(raw_data)
         best_match = result.best()
         if best_match and best_match.encoding:
@@ -15460,7 +15394,7 @@ class FileParserBlock(Block):
             raise csv.Error("File is empty")
 
         try:
-            delimiter = csv.Sniffer().sniff(sample).delimiter
+            delimiter = csv.Sniffer().sniff(sample, delimiters=self._CSV_DELIMITERS).delimiter
         except csv.Error:
             delimiter = "\t" if file_path.lower().endswith(".tsv") else ","
         return delimiter, encoding
@@ -15847,13 +15781,24 @@ class FileParserBlock(Block):
         organization_id: str | None = None,
     ) -> str:
         """Parse image file using vision LLM for OCR."""
+        with open(file_path, "rb") as file:
+            image_bytes = file.read()
+        return await self._ocr_image_bytes(
+            image_bytes,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+    async def _ocr_image_bytes(
+        self,
+        image_bytes: bytes | list[bytes],
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> str:
         if self.ocr_validation_max_attempts <= 0:
             raise ValueError("OCR validation max attempts must be greater than 0.")
 
         try:
-            with open(file_path, "rb") as f:
-                image_bytes = f.read()
-
             llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
             default_handler = await self._resolve_file_parser_handler(
                 "extract-text-from-image", workflow_run_block_id, organization_id
@@ -15871,7 +15816,7 @@ class FileParserBlock(Block):
                         llm_response = await llm_api_handler(
                             prompt=prompt_for_attempt,
                             prompt_name="extract-text-from-image",
-                            screenshots=[image_bytes],
+                            screenshots=image_bytes if isinstance(image_bytes, list) else [image_bytes],
                             # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
                             force_dict=False,
                             workflow_run_block_id=workflow_run_block_id,
@@ -16395,7 +16340,7 @@ class FileParserBlock(Block):
                 else:
                     LOG.info(
                         "FileParserBlock File URL is parameterized, using parameter value",
-                        file_url_parameter_value=file_url_parameter_value,
+                        file_parameter_url=file_url_parameter_value,
                         file_url_parameter_key=self.file_url,
                     )
                     self.file_url = file_url_parameter_value
@@ -16444,39 +16389,40 @@ class FileParserBlock(Block):
             run_id = context.run_id if context and context.run_id else workflow_run_id
             file_path = await resolve_local_or_download_file(self.file_url, run_id, organization_id=organization_id)
 
-            # Resolve AUTO_DETECT (and legacy CSV-as-default) via URL/magic-byte detection;
-            # IMAGE/EXCEL/PDF/DOCX/ZIP are honored as user overrides.
-            auto_detected_csv_fallback = False
-            if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX, FileType.ZIP):
-                configured_file_type = self.file_type
-                detected_file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
-                auto_detected_csv_fallback = (
-                    configured_file_type in (FileType.AUTO_DETECT, FileType.CSV)
-                    and detected_file_type == FileType.CSV
-                    and Path(urlparse(self.file_url).path).suffix.lower() not in {".csv", ".tsv"}
-                )
-                self.file_type = detected_file_type
-            else:
-                self._telemetry.detection_source = "explicit"
-                self._telemetry.file_type_detected = self.file_type
+            if not settings.FILE_PARSER_SERVICE_TARGET.strip():
+                # Resolve AUTO_DETECT (and legacy CSV-as-default) via URL/magic-byte detection;
+                # IMAGE/EXCEL/PDF/DOCX/ZIP are honored as user overrides.
+                auto_detected_csv_fallback = False
+                if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX, FileType.ZIP):
+                    configured_file_type = self.file_type
+                    detected_file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
+                    auto_detected_csv_fallback = (
+                        configured_file_type in (FileType.AUTO_DETECT, FileType.CSV)
+                        and detected_file_type == FileType.CSV
+                        and Path(urlparse(self.file_url).path).suffix.lower() not in {".csv", ".tsv"}
+                    )
+                    self.file_type = detected_file_type
+                else:
+                    self._telemetry.detection_source = "explicit"
+                    self._telemetry.file_type_detected = self.file_type
 
-            # Validation opens the document, so on a large file it is as slow as the parse itself.
-            try:
-                await _run_blocking_parse_step(
-                    "file type validation", self.file_url, self.validate_file_type, self.file_url, file_path
-                )
-            except InvalidFileType as e:
-                if auto_detected_csv_fallback:
-                    validation_error = str(e).partition("Error: ")[2] or str(e)
-                    raise InvalidFileType(
-                        file_url=self.file_url,
-                        file_type="auto-detect",
-                        error=(
-                            "Unable to auto-detect a supported file type from the downloaded file. "
-                            f"Underlying validation error: {validation_error}"
-                        ),
-                    ) from e
-                raise
+                # Validation opens the document, so on a large file it is as slow as the parse itself.
+                try:
+                    await _run_blocking_parse_step(
+                        "file type validation", self.file_url, self.validate_file_type, self.file_url, file_path
+                    )
+                except InvalidFileType as e:
+                    if auto_detected_csv_fallback:
+                        validation_error = str(e).partition("Error: ")[2] or str(e)
+                        raise InvalidFileType(
+                            file_url=self.file_url,
+                            file_type="auto-detect",
+                            error=(
+                                "Unable to auto-detect a supported file type from the downloaded file. "
+                                f"Underlying validation error: {validation_error}"
+                            ),
+                        ) from e
+                    raise
         except Exception as e:
             return await self._record_failure(
                 workflow_run_context,
@@ -16504,7 +16450,63 @@ class FileParserBlock(Block):
         # Parse the file based on type
         parsed_data: str | list[dict[str, Any]]
         try:
-            if self.file_type == FileType.ZIP:
+            parser_target = settings.FILE_PARSER_SERVICE_TARGET.strip()
+            if parser_target:
+                zip_stem = sanitize_filename(Path(file_path).stem, default="archive")
+                isolated_result: IsolatedParserResult = await parse_file_remotely(
+                    parser_target,
+                    Path(file_path),
+                    file_name=Path(urlparse(self.file_url).path).name or Path(file_path).name,
+                    configured_file_type=self.file_type.value,
+                    worksheet=self.worksheet,
+                    force_ocr=self.force_ocr,
+                    output_dir=(
+                        get_path_for_workflow_download_directory(run_id)
+                        / "unzipped"
+                        / f"{zip_stem}_{workflow_run_block_id}"
+                    ),
+                    timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS,
+                    max_input_bytes=MAX_PARSER_INPUT_BYTES,
+                    max_output_bytes=MAX_PARSER_OUTPUT_BYTES,
+                    max_tokens=MAX_FILE_PARSE_INPUT_TOKENS,
+                    max_pdf_ocr_pages=MAX_PDF_OCR_PAGES,
+                    pdf_memory_bytes=settings.PDFPLUMBER_MAX_MEMORY_BYTES,
+                    pdf_result_bytes=settings.PDFPLUMBER_MAX_RESULT_BYTES,
+                )
+                self.file_type = FileType(isolated_result.file_type)
+                self._telemetry.file_type_detected = self.file_type
+                self._telemetry.detection_source = cast(DetectionSource, isolated_result.detection_source)
+                self._telemetry.total_pages = isolated_result.metadata.get("total_pages")
+                if isolated_result.metadata.get("truncated"):
+                    content = isolated_result.content if isinstance(isolated_result.content, str) else ""
+                    self._telemetry.mark_platform_cap(
+                        limit="token_limit",
+                        tokens_included=count_tokens(content),
+                        token_limit=MAX_FILE_PARSE_INPUT_TOKENS,
+                    )
+                if isolated_result.kind == "files":
+                    parsed_data = isolated_result.files or []
+                elif isolated_result.kind == "images":
+                    images = isolated_result.images or []
+                    if self.file_type == FileType.PDF:
+                        parsed_data = await self._ocr_pdf_pages(
+                            images,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
+                    elif self.file_type == FileType.IMAGE and images:
+                        parsed_data = await self._ocr_image_bytes(
+                            images if len(images) > 1 else images[0],
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
+                    else:
+                        raise ValueError("Isolated parser returned an invalid image result")
+                elif isolated_result.content is not None:
+                    parsed_data = isolated_result.content
+                else:
+                    raise ValueError("Isolated parser returned no content")
+            elif self.file_type == FileType.ZIP:
                 extracted_zip_files = await asyncio.to_thread(
                     self._extract_zip_file, file_path, workflow_run_id, workflow_run_block_id
                 )
@@ -16653,7 +16655,7 @@ class PDFParserBlock(Block):
             if file_url_parameter_value:
                 LOG.info(
                     "PDFParserBlock File URL is parameterized, using parameter value",
-                    file_url_parameter_value=file_url_parameter_value,
+                    file_parameter_url=file_url_parameter_value,
                     file_url_parameter_key=self.file_url,
                 )
                 self.file_url = file_url_parameter_value
@@ -17623,6 +17625,11 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                 file_id=file_id,
             )
             return None
+        except google_drive_service.GoogleDriveAPIError as exc:
+            explained = google_drive_service.explain_access_error(exc, operation="download")
+            if explained and await drive_shared_drive_search_enabled(org_id):
+                raise explained from None
+            raise
 
         downloaded_files = await self._register_authenticated_download(
             organization_id=org_id,
@@ -18491,7 +18498,7 @@ class HttpRequestBlock(Block):
     headers: dict[str, str] | None = None
     body: dict[str, Any] | None = None  # Changed to consistently be dict only
     files: dict[str, str] | None = None  # Dictionary mapping field names to file paths for multipart file uploads
-    timeout: int = 30
+    timeout: int = Field(default=30, ge=1)
     follow_redirects: bool = True
     download_filename: str | None = None
     save_response_as_file: bool = False
@@ -18833,7 +18840,7 @@ class HttpRequestBlock(Block):
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         if workflow_run_context.bitwarden_login_sites:
             # As on the code-block seam, vault sites bind only Copilot-written workflows; others keep the tested URL.
-            self._enforce_vault_sites = await self._workflow_copilot_lineage(workflow_run_context) is not False
+            self._enforce_vault_sites = await self._ember_lineage(workflow_run_context) is not False
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
@@ -19058,12 +19065,14 @@ class HttpRequestBlock(Block):
             status_code, response_headers, response_body = await aiohttp_request(
                 method=self.method,
                 url=self.url,
+                organization_id=organization_id,
                 headers=self.headers,
                 data=self.body,
                 files=self.files,
                 timeout=self.timeout,
                 follow_redirects=self.follow_redirects,
                 authorize_redirect=self._authorize_redirect if self._confined_references else None,
+                use_controlled_egress=True,
             )
 
             success = 200 <= status_code < 300
@@ -21358,6 +21367,21 @@ class WorkflowTriggerBlock(Block):
                 organization_id,
             )
 
+        ambient_context = skyvern_context.current()
+        if ambient_context is not None and ambient_context.otp_request_id is not None:
+            unsupported_strict_child_modes = []
+            if self.wait_for_completion:
+                unsupported_strict_child_modes.append("synchronous child")
+            if self.browser_session_id:
+                unsupported_strict_child_modes.append("supplied browser session")
+            if self.use_parent_browser_session:
+                unsupported_strict_child_modes.append("parent browser reuse")
+            if unsupported_strict_child_modes:
+                return await _fail(
+                    "Strict OTP child workflows require asynchronous dispatch to a fresh local worker-owned browser; "
+                    "unsupported modes: " + ", ".join(unsupported_strict_child_modes)
+                )
+
         resolved_workflow_permanent_id = self.workflow_permanent_id
         resolved_payload = self.payload
 
@@ -21454,6 +21478,7 @@ class WorkflowTriggerBlock(Block):
                     proxy_location=proxy_location,
                     timeout_minutes=30,
                     session_kind=BrowserSessionKind.workflow_run,
+                    workflow_permanent_id=resolved_workflow_permanent_id,
                     **child_session_kwargs,
                 )
                 resolved_browser_session_id = child_browser_session.persistent_browser_session_id
@@ -21489,6 +21514,7 @@ class WorkflowTriggerBlock(Block):
                 skyvern_context.SkyvernContext(
                     run_id=parent_context.run_id if parent_context else None,
                     root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
+                    otp_request_id=parent_context.otp_request_id if parent_context else None,
                     requested_by=parent_context.requested_by if parent_context else None,
                     copilot_session_id=parent_context.copilot_session_id if parent_context else None,
                     trigger_type=inherited_trigger_type,
@@ -21641,6 +21667,7 @@ class WorkflowTriggerBlock(Block):
                         root_workflow_run_id=async_parent_context.root_workflow_run_id
                         if async_parent_context
                         else None,
+                        otp_request_id=async_parent_context.otp_request_id if async_parent_context else None,
                         requested_by=async_parent_context.requested_by if async_parent_context else None,
                         copilot_session_id=async_parent_context.copilot_session_id if async_parent_context else None,
                         trigger_type=async_inherited_trigger_type,
@@ -21859,6 +21886,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
 )
+from skyvern.forge.sdk.workflow.models.integration_action_block import IntegrationActionBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.powerbi_query_block import PowerBIQueryBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock  # noqa: E402
@@ -21896,6 +21924,7 @@ BlockSubclasses = Union[
     EmailInboxBlock,
     GoogleSheetsWriteBlock,
     PowerBIQueryBlock,
+    IntegrationActionBlock,
     PdfFillBlock,
     SplitPdfBlock,
     DataExportBlock,

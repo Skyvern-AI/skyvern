@@ -1,3 +1,4 @@
+import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import {
   SaveRefusedError,
   SaveStaleError,
@@ -144,14 +145,7 @@ import {
 } from "../../collapse/useNodeCollapseStore";
 import { useWorkflowEditorMode } from "../../hooks/useWorkflowEditorMode";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
-
-class ValidationFailureError extends Error {
-  readonly isValidationFailure = true;
-  constructor() {
-    super("workflow validation failed");
-    this.name = "ValidationFailureError";
-  }
-}
+import { ValidationFailureError } from "./ValidationFailureError";
 
 function formatLabelList(labels: string[]): string {
   if (labels.length <= 1) return labels[0] ?? "";
@@ -344,6 +338,7 @@ function NodeHeader({
   });
   const saveWorkflow = useWorkflowSave();
   const reactFlow = useReactFlow<AppNode>();
+  const activeOrgId = useActiveOrgId();
 
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued &&
@@ -467,7 +462,7 @@ function NodeHeader({
       // formats errors as `${label}: ${message}` - if that ever drifts,
       // errors for this block would silently slip past this gate.
       const blockErrors = runLabels.flatMap((runLabel) =>
-        blockRunErrors(reactFlow.getNodes(), runLabel),
+        blockRunErrors(reactFlow.getNodes(), runLabel, activeOrgId),
       );
       if (
         isMissingRequiredStartUrl(

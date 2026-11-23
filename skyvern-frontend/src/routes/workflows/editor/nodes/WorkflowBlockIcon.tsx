@@ -14,6 +14,7 @@ import {
   GlobeIcon,
   HandIcon,
   ListBulletIcon,
+  Link2Icon,
   LockOpen1Icon,
   MagnifyingGlassIcon,
   StopwatchIcon,
@@ -133,6 +134,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "powerbi_query": {
       return <PowerBIIcon className={className} />;
+    }
+    case "integration_action": {
+      return <Link2Icon className={className} />;
     }
   }
 }

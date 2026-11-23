@@ -114,8 +114,7 @@ def test_type_exports_match_generated_type_modules() -> None:
 
     assert not drift, (
         f"SDK type export drift detected: {drift}. "
-        "Register the listed types in the generated lazy-export tables; for a full regeneration, "
-        "run `fern generate --group python-sdk` and sync the vendored SDK."
+        "Register the listed types in the lazy-export tables of both `__init__.py` files."
     )
 
 
@@ -123,6 +122,29 @@ def test_types_resolve_to_the_same_object_from_both_public_sdk_namespaces() -> N
     """The top-level SDK must re-export each type-package public type unchanged."""
     for name in client_types.__all__:
         assert getattr(client_types, name) is getattr(client, name), name
+    for name in (
+        "EmailInboxBlock",
+        "EmailInboxBlockYaml",
+        "ForLoopBlockLoopBlocksItem_EmailInbox",
+        "ForLoopBlockYamlLoopBlocksItem_EmailInbox",
+        "WhileLoopBlockLoopBlocksItem_EmailInbox",
+        "WhileLoopBlockYamlLoopBlocksItem_EmailInbox",
+        "WorkflowDefinitionBlocksItem_EmailInbox",
+        "WorkflowDefinitionYamlBlocksItem_EmailInbox",
+    ):
+        fields = getattr(client_types, name).model_fields
+        assert {"organize_action", "organize_label", "credential_source", "connection_id"} <= fields.keys()
+    for name in ("EmailInboxBlockYaml", "WorkflowDefinitionYamlBlocksItem_EmailInbox"):
+        block = getattr(client_types, name)(
+            label="mail",
+            email_client="gmail",
+            credential_source="nango",
+            connection_id="ngc_test",
+            organize_action="move",
+            organize_label="Later",
+        )
+        assert block.model_dump(exclude_none=True)["credential_source"] == "nango"
+        assert block.model_dump(exclude_none=True)["connection_id"] == "ngc_test"
 
 
 def test_top_level_sdk_dynamic_imports_and_all_match() -> None:

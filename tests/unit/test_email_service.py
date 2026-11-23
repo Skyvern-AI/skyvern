@@ -142,6 +142,7 @@ def test_gmail_build_folder_query_clamps_newer_than_days() -> None:
 @pytest.mark.asyncio
 async def test_gmail_list_folder_messages_uses_escaped_query(monkeypatch: pytest.MonkeyPatch) -> None:
     captured_query = None
+    html = '<p>Sign in <a href="https://example.test/login">here</a>.</p>'
 
     async def fake_get_json(
         client: httpx.AsyncClient,
@@ -159,7 +160,11 @@ async def test_gmail_list_folder_messages_uses_escaped_query(monkeypatch: pytest
             "threadId": "thread_1",
             "labelIds": ["INBOX"],
             "snippet": "snippet",
-            "payload": {"headers": [{"name": "Subject", "value": "subject"}]},
+            "payload": {
+                "headers": [{"name": "Subject", "value": "subject"}],
+                "mimeType": "text/html",
+                "body": {"data": base64.urlsafe_b64encode(html.encode()).decode()},
+            },
         }
 
     monkeypatch.setattr(email.gmail, "get_json", fake_get_json)
@@ -170,14 +175,16 @@ async def test_gmail_list_folder_messages_uses_escaped_query(monkeypatch: pytest
         sender="x OR label:SENT newer_than:10y",
         subject='a" OR b',
         newer_than_days=10,
-        include_body=False,
+        include_body=True,
     )
 
     assert [message.id for message in messages] == ["msg_1"]
     assert captured_query == 'from:"x OR label:SENT newer_than:10y" subject:"a OR b" newer_than:10d'
     assert "from:x OR label:SENT" not in captured_query
     assert 'subject:a" OR b' not in captured_query
-    assert messages[0].has_attachments is None
+    assert messages[0].body_text == "Sign in here (https://example.test/login)."
+    assert messages[0].body_html == html
+    assert messages[0].has_attachments is False
     assert messages[0].web_link == "https://mail.google.com/mail/u/0/#all/thread_1"
 
 

@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 import yaml
 
-from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
+from skyvern.forge.sdk.ember.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.workflow.code_block_steps import (
     analyze_code_actions,
     bind_referenced_parameters_in_yaml,
@@ -342,7 +342,7 @@ async def test_process_workflow_yaml_derives_code_block_steps_for_replace_path()
     # frontend-facing workflow via _process_workflow_yaml without first deriving
     # steps, so a generated code block surfaced as "No steps yet" in the plain
     # editor view while the update_workflow tool path showed them.
-    from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+    from skyvern.forge.sdk.routes.ember import _process_workflow_yaml
 
     yaml_str = (
         "title: HN Login\n"
@@ -370,7 +370,7 @@ async def test_process_workflow_yaml_derives_code_block_steps_for_replace_path()
 
 @pytest.mark.asyncio
 async def test_process_workflow_yaml_binds_a_parameter_the_code_names():
-    from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+    from skyvern.forge.sdk.routes.ember import _process_workflow_yaml
 
     yaml_str = (
         "title: Login\n"
@@ -923,7 +923,7 @@ def test_code_edited_by_hand_is_carried_from_the_prior_on_a_model_owned_block(
         pytest.param(True, None, id="rebuilding-a-pending-owned-goal-clears-it"),
     ],
 )
-def test_a_goal_rewriting_copilot_write_on_a_hand_edited_owned_block(
+def test_a_goal_rewriting_ember_write_on_a_hand_edited_owned_block(
     goal_needs_regeneration: bool, expected: bool | None
 ):
     prior = _goal_yaml(
@@ -945,7 +945,7 @@ def test_a_goal_rewriting_copilot_write_on_a_hand_edited_owned_block(
     assert block.get("code_edited_by_hand") is expected
 
 
-def test_an_unaccepted_copilot_goal_on_a_hand_edited_owned_block_keeps_the_stored_goal_and_flag():
+def test_an_unaccepted_ember_goal_on_a_hand_edited_owned_block_keeps_the_stored_goal_and_flag():
     prior = _goal_yaml(
         prompt="Read the order total",
         code="return {'total': 1, 'currency': 'USD'}",
@@ -963,7 +963,7 @@ def test_an_unaccepted_copilot_goal_on_a_hand_edited_owned_block_keeps_the_store
     assert carry.kept == ["login"]
 
 
-def test_an_accepted_goal_update_survives_a_later_copilot_write():
+def test_an_accepted_goal_update_survives_a_later_ember_write():
     accepted = _goal_yaml(
         prompt="Read the order total and its currency",
         code="return {'total': 1, 'currency': 'USD'}",

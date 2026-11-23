@@ -108,11 +108,11 @@ curl https://api.skyvern.com/.well-known/oauth-protected-resource
 
 | Property | Value |
 | --- | --- |
-| Issuer | `https://clerk.skyvern.com` |
+| Issuer | `https://api.skyvern.com` |
 | Authorization endpoint | `https://api.skyvern.com/oauth/authorize` |
 | Token endpoint | `https://api.skyvern.com/oauth/token` |
 | Revocation endpoint | `https://clerk.skyvern.com/oauth/token/revoke` |
-| Dynamic client registration | `https://clerk.skyvern.com/oauth/register` |
+| Dynamic client registration | `https://api.skyvern.com/oauth/register` |
 | Grant types | `authorization_code`, `refresh_token` |
 | PKCE | `S256` required |
 | Protected resource | `https://api.skyvern.com/mcp` |
@@ -261,7 +261,7 @@ Open **Settings → Billing**. On the Trial and Hobby plans, the **Upgrade plan*
 
 ### How credits are used
 
-One credit is $0.001. Credits are charged for what the browser does:
+One credit is $0.001. Credits are charged for what the browser and the AI do:
 
 | Usage | Credits |
 |---|---|
@@ -270,6 +270,7 @@ One credit is $0.001. Credits are charged for what the browser does:
 | Browser uptime | 200 per hour ($0.20) |
 | One-time code read from an email or text message | 10 ($0.01) |
 | Agent block tool call, including reads of the run's data (not counting `finish`) | 30 ($0.03) |
+| Text Prompt or PDF Fill block | 30 ($0.03) per block |
 
 A short login takes a few actions; a long multi-page run takes many more. Two job recipes have their own prices: applying to a job costs 200 credits per application (400 when it signs in with a saved login), and extracting a job posting costs 50 credits per attempt. Other recipes are billed like any other run. The blocks an Agent block runs are billed as usual.
 
@@ -302,7 +303,7 @@ On a paid plan, **Buy Extra Credits** lets you top up with a one-time purchase (
 
 ### Runs refused for credits
 
-Skyvern checks credits before it starts a run and returns `402` if they don't cover it. Scheduled runs and retries are checked as they start, so an out-of-credit run fails before a browser opens. Code blocks and cached actions are checked when the run reaches them: a refused block fails and the run stops, even when **On block failure** would otherwise continue.
+Skyvern checks credits before it starts a run and returns `402` if they don't cover it. Scheduled runs and retries are checked as they start, so an out-of-credit run fails before a browser opens. Code, Text Prompt and PDF Fill blocks and cached actions are checked when the run reaches them: a refused block fails and the run stops, even when **On block failure** would otherwise continue.
 
 | Message | Why | Fix |
 |---|---|---|

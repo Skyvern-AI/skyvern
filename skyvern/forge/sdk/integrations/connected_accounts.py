@@ -11,7 +11,8 @@ import structlog
 from pydantic import BaseModel
 
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
+from skyvern.forge.sdk.integrations.catalog import all_integration_entries, entry_action
+from skyvern.forge.sdk.schemas.ember_turn_outcome import ConnectedAccountChoice
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, microsoft_oauth_service
@@ -83,15 +84,46 @@ def settable_connected_account_fields(
     )
 
 
+def _integration_action_acts(block: Mapping[str, Any]) -> bool:
+    # An unknown action counts as acting, so its account still gets the stricter approval.
+    found = entry_action(
+        all_integration_entries(),
+        str(block.get("integration_id")),
+        str(block.get("action_id")),
+    )
+    return found is None or found[1].acts
+
+
 def connected_account_fields(block: Mapping[str, Any], *, acting_only: bool = False) -> tuple[str, ...]:
     """The marked fields this block reads, given the sibling values each mark's condition names. With
-    `acting_only`, only those the schema marks as acting on the outside world."""
+    `acting_only`, only those acting on the outside world: the schema's mark, or an integration action's `acts`."""
+    acts = block.get("block_type") == BlockType.INTEGRATION_ACTION.value and _integration_action_acts(block)
     return tuple(
         field.name
         for field in _connected_account_fields().get(str(block.get("block_type")), ())
-        if (field.acts or not acting_only)
+        if (field.acts or acts or not acting_only)
         and all(block.get(key, default) == value for key, (value, default) in field.condition.items())
     )
+
+
+def as_run_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
+    """An integration_action block seen as the existing block it runs, with the same field precedence the block uses
+    at run time; any other block, or an action that runs no existing block, comes back unchanged."""
+    if block.get("block_type") != BlockType.INTEGRATION_ACTION.value:
+        return block
+    found = entry_action(all_integration_entries(), str(block.get("integration_id")), str(block.get("action_id")))
+    kind, _, block_type = found[1].runs_via.partition(":") if found else ("", "", "")
+    if found is None or kind != "block":
+        return block
+    pins = {
+        name: schema["const"] for name, schema in found[1].inputs.get("properties", {}).items() if "const" in schema
+    }
+    inputs = block.get("inputs")
+    view = {**block, **pins, **(inputs if isinstance(inputs, dict) else {}), "block_type": block_type}
+    account_fields = connected_account_fields(view)
+    if account_fields and block.get("connection_id"):
+        view[account_fields[0]] = block["connection_id"]
+    return view
 
 
 def block_connection_refs(block: Mapping[str, Any], *, acting_only: bool = False) -> list[str]:
@@ -206,7 +238,6 @@ async def org_connections(organization_id: str, user_id: str | None = None) -> l
 
 # A run Copilot starts offers its agent steps only the accounts the chat approved, recorded here at dispatch.
 _RUN_ACCOUNTS_TTL_SECONDS = 3 * 24 * 60 * 60
-COPILOT_RUN_CREATOR = "copilot"
 
 
 def _run_accounts_key(organization_id: str, workflow_run_id: str) -> str:

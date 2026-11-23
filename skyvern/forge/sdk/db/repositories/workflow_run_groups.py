@@ -25,11 +25,13 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunGroupModel,
 )
 from skyvern.forge.sdk.services.request_principal import (
+    AuthKind,
     get_request_principal,
+    key_requester_id,
     scoped_api_key_actor_id,
     trigger_owner_id,
 )
-from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR
+from skyvern.forge.sdk.workflow.models.workflow import EMBER_TEST_WORKFLOW_CREATOR
 from skyvern.schemas.workflow_run_groups import (
     DEFAULT_MAX_CONCURRENCY,
     IN_FLIGHT_ITEM_STATES,
@@ -143,7 +145,7 @@ class WorkflowRunGroupsRepository(BaseRepository):
                     .where(
                         or_(
                             WorkflowModel.created_by.is_(None),
-                            WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR,
+                            WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR,
                         )
                     )
                     .order_by(WorkflowModel.version.desc())
@@ -173,6 +175,8 @@ class WorkflowRunGroupsRepository(BaseRepository):
                     if principal is not None
                     and principal.api_key_access_mode == "scoped"
                     and principal.api_key_token_id is not None
+                    else key_requester_id(principal, organization_id)
+                    if principal is not None and principal.auth_kind == AuthKind.member_api_key
                     else None
                 ),
             )

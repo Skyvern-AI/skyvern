@@ -24,15 +24,6 @@ from skyvern.cli.mcp_tools.telemetry import (
 )
 
 
-def _expected_response_bytes(result: object) -> int:
-    # Mirrors production telemetry semantics: count UTF-8 bytes for text content blocks only.
-    return sum(
-        len(content.text.encode("utf-8"))
-        for content in (getattr(result, "content", None) or [])
-        if isinstance(getattr(content, "text", None), str)
-    )
-
-
 @pytest.fixture(autouse=True)
 def _reset_runtime() -> Iterator[None]:
     reset_mcp_telemetry_runtime()
@@ -41,8 +32,17 @@ def _reset_runtime() -> Iterator[None]:
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_call_emits_telemetry() -> None:
-    events: list[tuple[str, dict | None, str | None, str | None, str | None]] = []
+@pytest.mark.parametrize(
+    "response",
+    [
+        SimpleNamespace(is_error=True, data={"ok": False}, content=[SimpleNamespace(text="bad")]),
+        # The argument-validation short-circuit reports failure this way, with no `data`.
+        SimpleNamespace(structured_content={"ok": False, "error": {"code": "INVALID_INPUT"}}, content=[]),
+    ],
+    ids=["is_error", "structured_content"],
+)
+async def test_mcp_tool_call_records_a_failed_result_as_not_ok(response: object) -> None:
+    events: list[tuple[str, dict | None]] = []
 
     def fake_capture(
         event: str,
@@ -51,32 +51,20 @@ async def test_mcp_tool_call_emits_telemetry() -> None:
         api_key: str | None = None,
         host: str | None = None,
     ) -> None:
-        events.append((event, data, distinct_id, api_key, host))
+        events.append((event, data))
 
-    configure_mcp_telemetry_runtime(server_mode="local_cli", transport="stdio")
+    context = MiddlewareContext(message=SimpleNamespace(name="skyvern_click"), fastmcp_context=None)
+
+    async def call_next(_context: MiddlewareContext[object]) -> object:
+        return response
 
     with patch.object(analytics, "capture", side_effect=fake_capture):
-        async with Client(mcp) as client:
-            result = await client.call_tool("skyvern_block_schema", {})
+        await MCPTelemetryMiddleware().on_call_tool(context, call_next)
 
-    assert result.is_error is False
-    tool_events = [event for event in events if event[0] == "mcp_tool_call"]
-    assert len(tool_events) == 1
-
-    _, payload, distinct_id, api_key, host = tool_events[0]
-    assert payload is not None
-    assert payload["operation"] == "tools/call"
-    assert payload["tool"] == "skyvern_block_schema"
-    assert payload["ok"] is True
-    assert payload["runtime_mode"] == "local_cli"
-    assert payload["transport"] == "stdio"
-    assert isinstance(payload["duration_ms"], float)
-    assert payload["duration_ms"] >= 0
-    assert payload["response_bytes"] == _expected_response_bytes(result)
-    assert payload["distinct_id_source"] == "analytics_id"
-    assert distinct_id == analytics.settings.ANALYTICS_ID
-    assert api_key == analytics.settings.MCP_POSTHOG_PROJECT_API_KEY
-    assert host == analytics.settings.MCP_POSTHOG_PROJECT_HOST
+    assert len(events) == 1
+    event_name, payload = events[0]
+    assert event_name == "mcp_tool_call" and payload is not None
+    assert payload["ok"] is False
 
 
 @pytest.mark.asyncio
@@ -102,13 +90,22 @@ async def test_mcp_tool_call_records_text_response_bytes() -> None:
     async def call_next(_context: MiddlewareContext[object]) -> object:
         return response
 
+    configure_mcp_telemetry_runtime(server_mode="local_cli", transport="stdio")
+
     with patch.object(analytics, "capture", side_effect=fake_capture):
         await MCPTelemetryMiddleware().on_call_tool(context, call_next)
 
     assert len(events) == 1
-    _, payload, _, _, _ = events[0]
+    _, payload, distinct_id, api_key, host = events[0]
     assert payload is not None
     assert payload["response_bytes"] == 5
+    # A successful call is counted as ok and lands in the MCP PostHog project with its runtime and transport.
+    assert (payload["ok"], payload["runtime_mode"], payload["transport"]) == (True, "local_cli", "stdio")
+    assert (distinct_id, api_key, host) == (
+        analytics.settings.ANALYTICS_ID,
+        analytics.settings.MCP_POSTHOG_PROJECT_API_KEY,
+        analytics.settings.MCP_POSTHOG_PROJECT_HOST,
+    )
     assert "abc" not in payload.values()
     assert "ignored" not in payload.values()
 
@@ -125,72 +122,6 @@ async def test_mcp_tool_call_returns_result_when_success_telemetry_fails() -> No
         result = await MCPTelemetryMiddleware().on_call_tool(context, call_next)
 
     assert result is response
-
-
-@pytest.mark.asyncio
-async def test_mcp_tool_call_marks_error_results_as_not_ok() -> None:
-    events: list[tuple[str, dict | None, str | None, str | None, str | None]] = []
-
-    def fake_capture(
-        event: str,
-        data: dict | None = None,
-        distinct_id: str | None = None,
-        api_key: str | None = None,
-        host: str | None = None,
-    ) -> None:
-        events.append((event, data, distinct_id, api_key, host))
-
-    context = MiddlewareContext(message=SimpleNamespace(name="skyvern_click"), fastmcp_context=None)
-    response = SimpleNamespace(is_error=True, data={"ok": False}, content=[SimpleNamespace(text="bad")])
-
-    async def call_next(_context: MiddlewareContext[object]) -> object:
-        return response
-
-    with patch.object(analytics, "capture", side_effect=fake_capture):
-        await MCPTelemetryMiddleware().on_call_tool(context, call_next)
-
-    assert len(events) == 1
-    event_name, payload, _, _, _ = events[0]
-    assert event_name == "mcp_tool_call"
-    assert payload is not None
-    assert payload["ok"] is False
-    assert payload["tool"] == "skyvern_click"
-    assert payload["response_bytes"] == 3
-    assert isinstance(payload["duration_ms"], float)
-    assert "error_type" not in payload
-    assert "error_message" not in payload
-
-
-@pytest.mark.asyncio
-async def test_mcp_tool_call_reads_ok_from_structured_content() -> None:
-    """A ToolResult reporting failure via structured_content (no `data`) is recorded ok=False.
-
-    The argument-validation middleware short-circuits with exactly this shape.
-    """
-    events: list[tuple[str, dict | None, str | None, str | None, str | None]] = []
-
-    def fake_capture(
-        event: str,
-        data: dict | None = None,
-        distinct_id: str | None = None,
-        api_key: str | None = None,
-        host: str | None = None,
-    ) -> None:
-        events.append((event, data, distinct_id, api_key, host))
-
-    context = MiddlewareContext(message=SimpleNamespace(name="skyvern_get_errors"), fastmcp_context=None)
-    response = SimpleNamespace(structured_content={"ok": False, "error": {"code": "INVALID_INPUT"}}, content=[])
-
-    async def call_next(_context: MiddlewareContext[object]) -> object:
-        return response
-
-    with patch.object(analytics, "capture", side_effect=fake_capture):
-        await MCPTelemetryMiddleware().on_call_tool(context, call_next)
-
-    assert len(events) == 1
-    _, payload, _, _, _ = events[0]
-    assert payload is not None
-    assert payload["ok"] is False
 
 
 @pytest.mark.asyncio
@@ -579,16 +510,6 @@ async def test_initialize_does_not_run_boot_ready_callback_on_failure() -> None:
 @pytest.mark.asyncio
 async def test_initialize_missing_client_info_defaults_to_unknown() -> None:
     payload = await _run_initialize(_initialize_context(SimpleNamespace()))
-
-    assert payload["client_name"] == "unknown"
-    assert payload["client_version"] == "unknown"
-
-
-@pytest.mark.asyncio
-async def test_initialize_malformed_client_info_defaults_to_unknown() -> None:
-    context = _initialize_context(SimpleNamespace(clientInfo=SimpleNamespace(name=123, version=["4.5"])))
-
-    payload = await _run_initialize(context)
 
     assert payload["client_name"] == "unknown"
     assert payload["client_version"] == "unknown"

@@ -103,7 +103,7 @@ beforeEach(() => {
   localStorage.clear();
   useStudioBrowserStore.setState({ debugStream: null, runStream: null });
   useAutoplayStore.getState().clearAutoplay();
-  for (const id of ["studio-panel-copilot", "studio-panel-browser"]) {
+  for (const id of ["studio-panel-ember", "studio-panel-browser"]) {
     const el = document.createElement("section");
     el.id = id;
     document.body.appendChild(el);
@@ -126,7 +126,7 @@ describe("useStudioOnboardingTour", () => {
     expect(driver).toHaveBeenCalledTimes(1);
     const config = vi.mocked(driver).mock.calls[0]![0] as Config;
     expect(config.steps?.map((s) => s.element)).toEqual([
-      "#studio-panel-copilot",
+      "#studio-panel-ember",
       "#studio-panel-browser",
       "[data-tour='studio-pane-toggles']",
     ]);
@@ -189,7 +189,7 @@ describe("useStudioOnboardingTour", () => {
     renderTour();
     const config = vi.mocked(driver).mock.calls[0]![0] as Config;
     expect(config.steps?.map((s) => s.element)).toEqual([
-      "#studio-panel-copilot",
+      "#studio-panel-ember",
       "[data-tour='studio-pane-toggles']",
     ]);
   });

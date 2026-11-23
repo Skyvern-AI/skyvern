@@ -121,7 +121,7 @@ export function PendingGoalChangesPublisher() {
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
         const response = await client.post<GoalSuggestionResponse>(
-          "/workflow/copilot/suggest-goal",
+          "/workflow/suggest-goal",
           {
             label,
             code: forCode,

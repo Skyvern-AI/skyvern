@@ -2538,6 +2538,11 @@ async function buildElementObject(
       isReadonlyInputDropdown(element),
   };
 
+  // Computed, so designMode documents and blocks inside an editing host count; the trimmer strips it.
+  if (element.isContentEditable === true) {
+    elementObj.isContentEditable = true;
+  }
+
   let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
   if (isInShadowRoot) {
     let shadowHostEle = element.getRootNode().host;

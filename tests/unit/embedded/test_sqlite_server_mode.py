@@ -447,6 +447,39 @@ async def test_create_embedded_server_uses_settings_api_key_in_persistent_mode()
     assert seen_headers[b"x-api-key"] == b"dummy-key"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({"WORKFLOW_COPILOT_LLM_KEY": "OLD"}, "OLD"),
+        ({"WORKFLOW_COPILOT_LLM_KEY": "OLD", "EMBER_LLM_KEY": "NEW"}, "NEW"),
+        ({"EMBER_LLM_KEY": "NEW", "WORKFLOW_COPILOT_LLM_KEY": "OLD"}, "NEW"),
+    ],
+)
+async def test_embedded_settings_accept_renamed_names(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, str], expected: str
+) -> None:
+    from skyvern.config import settings
+    from skyvern.library.embedded_server_factory import create_embedded_server
+
+    monkeypatch.setattr(settings, "EMBER_LLM_KEY", None)
+
+    async def fake_app(scope, receive, send):  # type: ignore[no-untyped-def]
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"[]"})
+
+    client = create_embedded_server(
+        settings_overrides={"SKYVERN_API_KEY": "dummy-key", **overrides}, use_in_memory_db=False
+    )
+    try:
+        with patch("skyvern.library.embedded_server_factory.create_api_app", return_value=fake_app):
+            assert (await client.get("/")).status_code == 200
+    finally:
+        await client.aclose()
+
+    assert settings.EMBER_LLM_KEY == expected
+
+
 def test_settings_snapshot_restore_roundtrip() -> None:
     """Snapshot captures values and restore puts them back after mutation."""
     from skyvern.config import settings

@@ -6,6 +6,8 @@ import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowT
 export const MAX_STEPS_DEFAULT = 25;
 
 export type NavigationNodeData = NodeBaseData & {
+  completeVerification?: boolean;
+  completeCriterionIsUntrusted?: boolean;
   url: string;
   navigationGoal: string;
   errorCodeMapping: string;

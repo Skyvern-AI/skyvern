@@ -293,7 +293,7 @@ function LocationProbe() {
   return <div data-testid="location-search">{location.search}</div>;
 }
 
-const STUDIO_PATH = "/workflows/wpid_test/studio?panes=copilot,browser";
+const STUDIO_PATH = "/workflows/wpid_test/studio?panes=ember,browser";
 
 beforeEach(() => {
   useStudioBrowserStore.setState(initialBrowserState, true);
@@ -585,7 +585,7 @@ describe("BrowserTab view machine", () => {
       ),
     ];
     mocks.debugSession = { browser_session_id: "pbs_test" };
-    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=copilot`);
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=ember`);
 
     expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
     expect(screen.queryByTestId("hero-recording")).toBeNull();
@@ -599,7 +599,7 @@ describe("BrowserTab view machine", () => {
       recordingUrl: "https://r.test/1.mp4",
     });
     mocks.debugSession = { browser_session_id: "pbs_test" };
-    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=copilot`);
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=ember`);
 
     expect(screen.getByTestId("hero-recording")).toBeTruthy();
     expect(screen.queryByTestId("browser-pane-stream-slot")).toBeNull();
@@ -709,7 +709,7 @@ describe("BrowserTab view machine", () => {
   it("shows the inspected step's screenshot when ?active= is set", () => {
     seedRun({ status: Status.Completed });
     mocks.debugSession = { browser_session_id: "pbs_test" };
-    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=copilot&active=act_1`);
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=ember&active=act_1`);
 
     const shot = screen.getByTestId("hero-screenshot");
     expect(JSON.parse(shot.getAttribute("data-selection") ?? "{}")).toEqual({
@@ -1123,7 +1123,7 @@ describe("BrowserTab pills and selection sync", () => {
       recordingUrl: "https://r.test/1.mp4",
     });
     mocks.debugSession = { browser_session_id: "pbs_test" };
-    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=copilot`);
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=ember`);
 
     expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
 

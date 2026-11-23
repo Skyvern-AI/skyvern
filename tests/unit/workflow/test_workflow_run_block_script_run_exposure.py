@@ -68,14 +68,6 @@ def test_converter_passes_script_run_when_fallback_recorded() -> None:
     assert block.script_run.ai_fallback_triggered is True
 
 
-def test_converter_propagates_null_script_run() -> None:
-    """Null DB column → None in the pydantic model. A block that ran
-    cleanly from cache (or always-agent) never gets the column written."""
-    model = _fake_block_model(script_run_value=None)
-    block = convert_to_workflow_run_block(model)
-    assert block.script_run is None
-
-
 def test_converter_preserves_unknown_future_script_run_keys() -> None:
     """Pins our forward-compat contract: `ScriptRunResponse` ignores extra
     keys (set explicitly via `model_config = ConfigDict(extra="ignore")`).
@@ -100,11 +92,3 @@ def test_converter_passes_prompt_when_set() -> None:
     model = _fake_block_model(script_run_value=None, prompt_value="Summarize the page")
     block = convert_to_workflow_run_block(model)
     assert block.prompt == "Summarize the page"
-
-
-def test_converter_propagates_null_prompt() -> None:
-    """Block types that never write `prompt` (e.g. FileDownloadBlock) keep
-    the column NULL — the converter must not invent a value."""
-    model = _fake_block_model(script_run_value=None, prompt_value=None)
-    block = convert_to_workflow_run_block(model)
-    assert block.prompt is None

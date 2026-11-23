@@ -36,12 +36,12 @@ from skyvern.forge import app as forge_app
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.request_logging import RequestLoggingMiddleware, log_raw_request_exception
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_from_database
-from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import assert_signing_key_usable
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, NotFoundError, is_connection_failure
 from skyvern.forge.sdk.db.sqlite_schema import ensure_sqlite_schema
+from skyvern.forge.sdk.ember.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.executor.run_liveness import start_run_lease_tasks, stop_run_lease_tasks
@@ -695,7 +695,8 @@ def create_api_app() -> FastAPI:
             # Both validation messages and unknown field names can contain reported contact details.
             return JSONResponse(status_code=422, content={"detail": "invalid_onboarding_data"})
         sensitive_prefixes = ("/v1/credentials", "/api/v1/credentials", "/v1/browser_sessions/external")
-        if path != "/v1/agent_feedback" and not any(
+        sensitive_paths = ("/v1/agent_feedback", "/v1/workflow/copilot/chat-post", "/v1/ember/chat-post")
+        if path not in sensitive_paths and not any(
             path == prefix or path.startswith(f"{prefix}/") for prefix in sensitive_prefixes
         ):
             return await request_validation_exception_handler(request, exc)

@@ -333,12 +333,23 @@ class MicrosoftOAuthRepository(BaseRepository):
     async def list_active_for_org(
         self, organization_id: str, user_id: str | None = None
     ) -> list[MicrosoftOAuthCredentialBase]:
+        return await self._list_for_org_in_states(organization_id, [STATE_ACTIVE], user_id)
+
+    @db_operation("list_visible_for_org")
+    async def list_visible_for_org(
+        self, organization_id: str, user_id: str | None = None
+    ) -> list[MicrosoftOAuthCredentialBase]:
+        return await self._list_for_org_in_states(organization_id, [STATE_ACTIVE, STATE_ERROR], user_id)
+
+    async def _list_for_org_in_states(
+        self, organization_id: str, states: list[str], user_id: str | None
+    ) -> list[MicrosoftOAuthCredentialBase]:
         async with self.Session() as session:
             stmt = (
                 select(MicrosoftOAuthCredentialModel)
                 .where(
                     MicrosoftOAuthCredentialModel.organization_id == organization_id,
-                    MicrosoftOAuthCredentialModel.state == STATE_ACTIVE,
+                    MicrosoftOAuthCredentialModel.state.in_(states),
                 )
                 .order_by(MicrosoftOAuthCredentialModel.created_at.desc())
             )
@@ -530,7 +541,7 @@ class MicrosoftOAuthRepository(BaseRepository):
                 .where(
                     MicrosoftOAuthCredentialModel.id == credential_id,
                     MicrosoftOAuthCredentialModel.organization_id == organization_id,
-                    MicrosoftOAuthCredentialModel.state == STATE_ACTIVE,
+                    MicrosoftOAuthCredentialModel.state.in_([STATE_ACTIVE, STATE_ERROR]),
                 )
                 .values(credential_name=credential_name, modified_at=now)
                 .returning(MicrosoftOAuthCredentialModel)
@@ -602,6 +613,34 @@ class MicrosoftOAuthRepository(BaseRepository):
             conditions.append(MicrosoftOAuthCredentialModel.encrypted_refresh_token == expected_encrypted_refresh_token)
         async with self.Session() as session:
             stmt = update(MicrosoftOAuthCredentialModel).where(*conditions).values(**values)
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount > 0
+
+    @db_operation("mark_needs_reconnect")
+    async def mark_needs_reconnect(
+        self,
+        *,
+        organization_id: str,
+        credential_id: str,
+        expected_encrypted_refresh_token: str,
+        now: datetime.datetime,
+    ) -> bool:
+        """Flip an active credential to ``error`` after Microsoft rejects its refresh token.
+
+        No-op when the row was reconnected or rotated after the failing refresh loaded it.
+        """
+        async with self.Session() as session:
+            stmt = (
+                update(MicrosoftOAuthCredentialModel)
+                .where(
+                    MicrosoftOAuthCredentialModel.id == credential_id,
+                    MicrosoftOAuthCredentialModel.organization_id == organization_id,
+                    MicrosoftOAuthCredentialModel.state == STATE_ACTIVE,
+                    MicrosoftOAuthCredentialModel.encrypted_refresh_token == expected_encrypted_refresh_token,
+                )
+                .values(state=STATE_ERROR, modified_at=now)
+            )
             result = await session.execute(stmt)
             await session.commit()
             return result.rowcount > 0

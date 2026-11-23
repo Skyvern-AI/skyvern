@@ -2,6 +2,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator
 
+GMAIL_ORGANIZE_UNCERTAIN_ERROR_CODE = "gmail_organize_uncertain"
+
 
 class EmailBodyFormat(StrEnum):
     TEXT = "text"
@@ -21,7 +23,7 @@ class GmailHopRefusal(StrEnum):
     account_unavailable = "account_unavailable"
     resave_required = "resave_required"
     owner_unconfirmed = "owner_unconfirmed"
-    copilot_test_run = "copilot_test_run"
+    ember_test_run = "copilot_test_run"
 
 
 # Shared by the inbox and send blocks, which word the rest of their refusal differently.
@@ -48,8 +50,27 @@ def is_connected_gmail_id(value: str | None) -> bool:
     return bool(value) and str(value).startswith(_CONNECTED_GMAIL_ID_PREFIX)
 
 
-CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON = (
+CONNECTED_ACCOUNT_EMBER_TEST_RUN_REASON = (
     "Copilot test runs can't use a Connected Gmail account. Save the workflow, then run it to use this account."
+)
+
+
+class EmailOrganizeAction(StrEnum):
+    """One change an Email Inbox block applies to every email it matched."""
+
+    LABEL = "label"
+    ARCHIVE = "archive"
+    MOVE = "move"
+    MARK_READ = "mark_read"
+
+
+# Actions that name a target label; the rest must not.
+ORGANIZE_ACTIONS_WITH_LABEL = frozenset({EmailOrganizeAction.LABEL, EmailOrganizeAction.MOVE})
+GMAIL_IMMUTABLE_LABELS = frozenset({"SENT", "DRAFT"})
+GMAIL_ORGANIZE_FORBIDDEN_TARGETS = GMAIL_IMMUTABLE_LABELS | {"SPAM", "TRASH"}
+ORGANIZE_NEEDS_CONNECTED_GMAIL_REASON = (
+    "Labeling, archiving, moving or marking email read needs a Connected Gmail account. The Google account selected "
+    "in this block can only read and send email. Select a Connected Gmail account in this block. Nothing was changed."
 )
 
 
@@ -111,3 +132,5 @@ class EmailMessage(BaseModel):
     attachment_list_error: str | None = Field(default=None, exclude=True)
     is_read: bool = True
     web_link: str | None = None
+    # Opaque proof, issued with a connected-account listing, that an organize call targets a listed email.
+    organize_grant: str | None = Field(default=None, exclude=True, repr=False)

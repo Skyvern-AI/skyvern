@@ -14,6 +14,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { DialogTrigger } from "@/components/ui/dialog";
+import { DisabledReasonMenuItem } from "@/components/DisabledReasonMenuItem";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -46,6 +47,8 @@ type RowActionItem =
       onSelect?: () => void;
       destructive?: boolean;
       disabled?: boolean;
+      // Set when a permission disables the item; the reason is shown under the label.
+      denied?: { reason: string };
       // Wraps the item in a DialogTrigger so a confirm dialog owned by an
       // ancestor <Dialog> opens reliably from either menu.
       dialogTrigger?: boolean;
@@ -65,12 +68,17 @@ type RowActionItem =
     };
 
 type MenuKit = {
-  Item: React.ComponentType<{
-    className?: string;
-    disabled?: boolean;
-    onSelect?: (event: Event) => void;
-    children?: React.ReactNode;
-  }>;
+  Item: React.ComponentType<
+    Pick<
+      React.AriaAttributes,
+      "aria-disabled" | "aria-label" | "aria-describedby"
+    > & {
+      className?: string;
+      disabled?: boolean;
+      onSelect?: (event: Event) => void;
+      children?: React.ReactNode;
+    }
+  >;
   Label: React.ComponentType<{
     className?: string;
     children?: React.ReactNode;
@@ -151,6 +159,17 @@ function RowActionMenuItems({
               </kit.Sub>
             );
           case "item": {
+            if (item.denied && !item.disabled) {
+              return (
+                <DisabledReasonMenuItem
+                  key={index}
+                  item={kit.Item}
+                  label={item.label}
+                  icon={item.icon}
+                  reason={item.denied.reason}
+                />
+              );
+            }
             const { onSelect } = item;
             const menuItem = (
               <kit.Item

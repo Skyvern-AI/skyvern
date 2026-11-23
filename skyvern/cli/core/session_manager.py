@@ -21,7 +21,7 @@ from skyvern.webeye.browser_errors import is_context_lost_message, is_target_clo
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import get_active_api_key, get_skyvern, has_api_key_override
-from .copilot_sessions import registered_copilot_session, unregister_copilot_session
+from .ember_sessions import registered_ember_session, unregister_ember_session
 from .result import BrowserContext, ErrorCode, count_browser_attach, make_error
 from .trajectory_store import delete_session_trajectories
 
@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
     from skyvern.webeye.browser_engine import EngineFrame
+    from skyvern.webeye.http_interception import HttpInterception
 
     from .hosted_driver import HostedDriver
 
@@ -150,6 +151,7 @@ class SessionState:
     _page_pending_tasks: dict[int, set[asyncio.Task[None]]] = field(default_factory=dict)
     # Routes keyed by page id — Playwright registers routes per-page, so tracking must match.
     active_routes: dict[int, set[str]] = field(default_factory=dict)
+    _http_interceptors: set[HttpInterception] = field(default_factory=set)
     # -- Iframe frame context --
     _working_frame: EngineFrame | None = None
     _observed_refs: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -744,7 +746,7 @@ async def resolve_browser(
     # does not propagate through FastMCP in-process transport).
     organization_id = _current_organization_id.get()
     registered = (
-        registered_copilot_session(session_id, organization_id=organization_id)
+        registered_ember_session(session_id, organization_id=organization_id)
         if session_id and organization_id
         else None
     )
@@ -868,6 +870,29 @@ async def _reconnect_extension_session(
 
 
 async def _close_session_state(current: SessionState, *, close_via_active_client: bool) -> None:
+    # Callers replace the state afterward, so cancellation must retain the entire cleanup tail.
+    closing = asyncio.create_task(
+        _finish_close_session_state(current, close_via_active_client=close_via_active_client),
+        name="browser-session-close",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(closing)
+            break
+        except asyncio.CancelledError as error:
+            if closing.cancelled():
+                raise
+            cancellation = error
+        except Exception:
+            if cancellation is not None:
+                raise cancellation
+            raise
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _finish_close_session_state(current: SessionState, *, close_via_active_client: bool) -> None:
     from .session_ops import do_session_close
 
     try:
@@ -896,6 +921,13 @@ async def _close_session_state(current: SessionState, *, close_via_active_client
         for task in current._pending_tasks:
             task.cancel()
         current._pending_tasks.clear()
+        for owner in tuple(current._http_interceptors):
+            try:
+                await owner.close()
+            except Exception:
+                LOG.warning("Best-effort HTTP interception close failed", exc_info=True)
+            finally:
+                current._http_interceptors.discard(owner)
         current.active_routes.clear()
         if current.browser is not None:
             await current.browser.close()
@@ -905,7 +937,7 @@ async def _close_session_state(current: SessionState, *, close_via_active_client
             delete_session_trajectories(current.context.session_id)
             organization_id = _current_organization_id.get() or current.organization_id
             if organization_id is not None:
-                unregister_copilot_session(
+                unregister_ember_session(
                     current.context.session_id,
                     organization_id=organization_id,
                     expected_state=current,

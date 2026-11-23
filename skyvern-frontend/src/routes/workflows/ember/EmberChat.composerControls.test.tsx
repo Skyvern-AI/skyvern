@@ -297,7 +297,7 @@ describe("EmberChat — unflagged S4 composer", () => {
     const stopping = screen.getByRole("button", { name: "Stopping…" });
     expect((stopping as HTMLButtonElement).disabled).toBe(true);
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.anything(),
       expect.objectContaining({
         timeout: 15_000,
@@ -357,7 +357,7 @@ describe("EmberChat — unflagged S4 composer", () => {
     });
     await waitFor(() => expect(cancelPost).toHaveBeenCalledTimes(1));
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.objectContaining({ source: "stop_button" }),
       expect.objectContaining({
         timeout: 15_000,

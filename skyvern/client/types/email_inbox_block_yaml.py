@@ -4,6 +4,7 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from .email_organize_action import EmailOrganizeAction
 from .email_inbox_block_yaml_email_client import EmailInboxBlockYamlEmailClient
 
 
@@ -23,6 +24,8 @@ class EmailInboxBlockYaml(UniversalBaseModel):
     ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     email_client: EmailInboxBlockYamlEmailClient
+    credential_source: typing.Optional[typing.Literal["native", "nango"]] = None
+    connection_id: typing.Optional[str] = None
     credential_id: typing.Optional[str] = None
     folder: typing.Optional[str] = None
     prompt: typing.Optional[str] = None
@@ -31,6 +34,8 @@ class EmailInboxBlockYaml(UniversalBaseModel):
     newer_than_days: typing.Optional[int] = None
     max_results: typing.Optional[int] = None
     include_body: typing.Optional[bool] = None
+    organize_action: typing.Optional[EmailOrganizeAction] = None
+    organize_label: typing.Optional[str] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:

@@ -500,7 +500,7 @@ const cancelledContinuationResponse = (turnId = "turn-10") => ({
 
 function credentialResponsePosts() {
   return sansApiPost.mock.calls.filter(
-    (call) => call[0] === "/workflow/copilot/credential-response",
+    (call) => call[0] === "/ember/credential-response",
   );
 }
 
@@ -1483,7 +1483,7 @@ describe("EmberChat — credential card wiring", () => {
             ),
           );
           expect(sansApiPost).toHaveBeenCalledWith(
-            "/workflow/copilot/question-response",
+            "/ember/question-response",
             expect.objectContaining({
               interaction_id: question.interaction_id,
             }),
@@ -1500,9 +1500,7 @@ describe("EmberChat — credential card wiring", () => {
       apiGet.mockClear();
       await act(async () => vi.advanceTimersByTimeAsync(5_000));
       expect(
-        apiGet.mock.calls.filter(
-          ([path]) => path === "/workflow/copilot/chat-history",
-        ),
+        apiGet.mock.calls.filter(([path]) => path === "/ember/chat-history"),
       ).toHaveLength(1);
       expect(useWorkflowYamlEditorStore.getState().emberAcceptance).toBe(
         reservation,
@@ -1539,9 +1537,7 @@ describe("EmberChat — credential card wiring", () => {
       apiGet.mockClear();
       await act(async () => vi.advanceTimersByTimeAsync(30_000));
       expect(
-        apiGet.mock.calls.filter(
-          ([path]) => path === "/workflow/copilot/chat-history",
-        ),
+        apiGet.mock.calls.filter(([path]) => path === "/ember/chat-history"),
       ).toHaveLength(0);
       await submit("Another edit");
       expect(streamCalls).toHaveLength(2);
@@ -1629,10 +1625,10 @@ describe("EmberChat — credential card wiring", () => {
     ];
     await renderChat();
     expect(apiGet).toHaveBeenCalledWith(
-      "/workflow/copilot/chat-history",
+      "/ember/chat-history",
       expect.objectContaining({
         headers: {
-          "X-Copilot-Credential-Recovery-Token": recoveryToken,
+          "X-Ember-Credential-Recovery-Token": recoveryToken,
         },
       }),
     );
@@ -1666,7 +1662,7 @@ describe("EmberChat — credential card wiring", () => {
     await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
     expect(credentialResponsePosts()[0]![1]).toMatchObject({
       turn_id: "turn-1",
-      workflow_copilot_chat_id: "chat-1",
+      ember_chat_id: "chat-1",
       resume_token: "rt-abc",
       action: "connected",
       credential_id: "cred-hn",
@@ -1898,7 +1894,7 @@ describe("EmberChat — credential card wiring", () => {
     >;
     expect(skipBody).toMatchObject({
       turn_id: "turn-1",
-      workflow_copilot_chat_id: "chat-1",
+      ember_chat_id: "chat-1",
       resume_token: "rt-abc",
       action: "skip",
     });
@@ -1916,7 +1912,7 @@ describe("EmberChat — credential card wiring", () => {
     async (generateResult, message) => {
       sansApiPost.mockImplementation((path: string) =>
         Promise.resolve(
-          path === "/workflow/copilot/credential-generate"
+          path === "/ember/credential-generate"
             ? { data: { result: generateResult } }
             : {},
         ),
@@ -1945,12 +1941,12 @@ describe("EmberChat — credential card wiring", () => {
       });
       const generatePosts = () =>
         sansApiPost.mock.calls.filter(
-          (call) => call[0] === "/workflow/copilot/credential-generate",
+          (call) => call[0] === "/ember/credential-generate",
         );
       await waitFor(() => expect(generatePosts()).toHaveLength(1));
       expect(generatePosts()[0]![1]).toEqual({
         turn_id: "turn-1",
-        workflow_copilot_chat_id: "chat-1",
+        ember_chat_id: "chat-1",
         resume_token: "rt-abc",
       });
       expect(await screen.findAllByText(message)).not.toHaveLength(0);
@@ -1988,7 +1984,7 @@ describe("EmberChat — credential card wiring", () => {
     const extendedDeadline = new Date(Date.now() + 600_000).toISOString();
     sansApiPost.mockImplementation((path: string) =>
       Promise.resolve(
-        path === "/workflow/copilot/credential-generate"
+        path === "/ember/credential-generate"
           ? {
               data: {
                 result: "unknown",
@@ -2031,7 +2027,7 @@ describe("EmberChat — credential card wiring", () => {
 
   it("registration Generate whose POST fails reads the card back instead of offering a retry", async () => {
     sansApiPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/credential-generate"
+      path === "/ember/credential-generate"
         ? Promise.reject(new Error("gateway timeout"))
         : Promise.resolve({}),
     );
@@ -2061,9 +2057,7 @@ describe("EmberChat — credential card wiring", () => {
       (await screen.findAllByText(/The vault didn't confirm the save/)).length,
     ).toBeGreaterThan(0);
     expect(
-      apiGet.mock.calls.some(
-        ([path]) => path === "/workflow/copilot/chat-history",
-      ),
+      apiGet.mock.calls.some(([path]) => path === "/ember/chat-history"),
     ).toBe(true);
     expect(
       screen.queryByRole("button", { name: "Generate and save" }),
@@ -2073,7 +2067,7 @@ describe("EmberChat — credential card wiring", () => {
 
   it("registration Generate whose POST fails keeps reading the card until the save settles", async () => {
     sansApiPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/credential-generate"
+      path === "/ember/credential-generate"
         ? Promise.reject(new Error("gateway timeout"))
         : Promise.resolve({}),
     );
@@ -2100,9 +2094,8 @@ describe("EmberChat — credential card wiring", () => {
       pending_credential_requests: [registrationCard({})],
     };
     const historyReads = () =>
-      apiGet.mock.calls.filter(
-        ([path]) => path === "/workflow/copilot/chat-history",
-      ).length;
+      apiGet.mock.calls.filter(([path]) => path === "/ember/chat-history")
+        .length;
     vi.useFakeTimers();
     const readsBefore = historyReads();
     await act(async () => {
@@ -2168,7 +2161,7 @@ describe("EmberChat — credential card wiring", () => {
     >;
     expect(pickBody).toMatchObject({
       turn_id: "turn-1",
-      workflow_copilot_chat_id: "chat-1",
+      ember_chat_id: "chat-1",
       resume_token: "rt-abc",
       action: "connected",
       credential_id: "cred-hn",
@@ -2177,9 +2170,9 @@ describe("EmberChat — credential card wiring", () => {
       "action",
       "asks_site",
       "credential_id",
+      "ember_chat_id",
       "resume_token",
       "turn_id",
-      "workflow_copilot_chat_id",
     ]);
     expect(postStreaming).toHaveBeenCalledTimes(1);
     // Receipt keeps the credential name after the turn goes terminal.
@@ -2634,7 +2627,7 @@ describe("EmberChat — credential card wiring", () => {
       expect(screen.queryByPlaceholderText("Search credentials...")).toBeNull(),
     );
     expect(sansApiPost).not.toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.anything(),
       expect.anything(),
     );
@@ -3678,10 +3671,10 @@ describe("EmberChat — reload during a running turn", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reject" }));
     await advance(0);
     expect(sansApiPost).toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.objectContaining({
         cancel_token: "cancel-1",
-        workflow_copilot_chat_id: "chat-1",
+        ember_chat_id: "chat-1",
       }),
       expect.anything(),
     );

@@ -56,3 +56,14 @@ export const StudioWorkflowDeletedContext = createContext<string | null>(null);
 export function useStudioWorkflowDeletedAt(): string | null {
   return useContext(StudioWorkflowDeletedContext);
 }
+
+// Whether the studio shows a global (read-only) agent, undefined until known.
+// The shell reads the global-workflows query once, so pane hooks used
+// everywhere stay query-free.
+export const StudioGlobalWorkflowContext = createContext<boolean | undefined>(
+  false,
+);
+
+export function useStudioGlobalWorkflow(): boolean | undefined {
+  return useContext(StudioGlobalWorkflowContext);
+}

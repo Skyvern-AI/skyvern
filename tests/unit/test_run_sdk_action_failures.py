@@ -30,6 +30,14 @@ from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.routes.sdk import _sdk_action_context_refcounts, run_sdk_action
+from skyvern.forge.sdk.schemas.sdk_actions import (
+    ActAction,
+    ClickAction,
+    InputTextAction,
+    SdkAction,
+    SelectOptionAction,
+    UploadFileAction,
+)
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
@@ -328,31 +336,84 @@ async def test_handler_returns_400_when_action_raises_scraping_failed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("error", "expected_detail_fragment"),
+    ("error", "expected_detail_fragment", "action", "expected_selector_supplied"),
     [
         (
             ScreenshotTargetClosed(error_message="Page.screenshot: Target page, context or browser has been closed"),
             "was closed before the action could complete",
+            ClickAction(),
+            False,
         ),
         (
             ScreenshotPageHasNoDrawnArea(
                 error_message="Page.screenshot: Protocol error (Page.captureScreenshot): Cannot take screenshot with 0 width."
             ),
             "no drawn area to capture",
+            ClickAction(),
+            False,
         ),
-        (MissingElement(selector="//div[1]", element_id="CATO"), "not found on the page"),
-        (MissingElementDict("DAAX"), "not in the page's current snapshot"),
-        (ActionDeadlineExceeded("The browser did not answer within 5000 ms"), "before the action's deadline"),
+        (
+            MissingElement(selector="//div[1]", element_id="CATO"),
+            "not found on the page",
+            ClickAction(selector="#target"),
+            True,
+        ),
+        (MissingElementDict("DAAX"), "not in the page's current snapshot", ClickAction(), False),
+        (MissingElementDict("DAAX"), "not in the page's current snapshot", ClickAction(selector=None), False),
+        (
+            MissingElementDict("DAAX"),
+            "not in the page's current snapshot",
+            InputTextAction(selector="#target", value="value"),
+            True,
+        ),
+        (
+            MissingElementDict("DAAX"),
+            "not in the page's current snapshot",
+            SelectOptionAction(selector="#target", value="option"),
+            True,
+        ),
+        (
+            MissingElementDict("DAAX"),
+            "not in the page's current snapshot",
+            UploadFileAction(selector="#target", file_url="https://example.com/file.txt"),
+            True,
+        ),
+        (MissingElementDict("DAAX"), "not in the page's current snapshot", ActAction(), False),
+        (
+            ActionDeadlineExceeded("The browser did not answer within 5000 ms"),
+            "before the action's deadline",
+            ClickAction(),
+            False,
+        ),
     ],
-    ids=["closed-target", "zero-width-screenshot", "missing-element", "element-id-not-in-scrape", "action-deadline"],
+    ids=[
+        "closed-target",
+        "zero-width-screenshot",
+        "missing-element",
+        "element-id-not-in-scrape",
+        "null-selector-element-id-not-in-scrape",
+        "selector-element-id-not-in-scrape",
+        "select-element-id-not-in-scrape",
+        "upload-element-id-not-in-scrape",
+        "action-without-selector",
+        "action-deadline",
+    ],
 )
 async def test_page_and_action_failures_answer_422(
-    mock_request: Any, mock_organization: Any, mock_app: Any, error: Exception, expected_detail_fragment: str
+    mock_request: Any,
+    mock_organization: Any,
+    mock_app: Any,
+    error: Exception,
+    expected_detail_fragment: str,
+    action: SdkAction,
+    expected_selector_supplied: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The page or the requested action caused each of these, not the server, so none may reach the
     catch-all and surface as a 500. The closed-target case also pins the clause ordering: it
     subclasses FailedToTakeScreenshot, so it must keep its own message rather than the generic one.
     """
+    mock_request.action = action
     with (
         patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
         patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
@@ -368,7 +429,16 @@ async def test_page_and_action_failures_answer_422(
 
     assert exc_info.value.status_code == 422
     assert expected_detail_fragment in str(exc_info.value.detail)
-    assert mock_app.DATABASE.tasks.update_task.await_args.kwargs["status"] == TaskStatus.failed
+    if isinstance(error, (MissingElement, MissingElementDict)):
+        failure_log = next(
+            record.msg
+            for record in caplog.records
+            if record.name == "skyvern.forge.sdk.routes.sdk"
+            and isinstance(record.msg, dict)
+            and record.msg.get("error") == str(error)
+        )
+        assert failure_log["error_type"] == type(error).__name__
+        assert failure_log["selector_supplied"] is expected_selector_supplied
 
 
 @pytest.mark.asyncio

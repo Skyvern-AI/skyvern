@@ -619,6 +619,7 @@ async def test_agent_magic_link_poll_receives_task_url(monkeypatch: pytest.Monke
         organization_id="o_test",
         task_id="tsk_test",
         workflow_run_id="wr_test",
+        otp_request_id="otpr_agent_magic_link",
         totp_verification_url=None,
         totp_identifier="user@example.com",
         url="https://app.example.com/login",
@@ -636,6 +637,7 @@ async def test_agent_magic_link_poll_receives_task_url(monkeypatch: pytest.Monke
     )
 
     assert captured["task_url"] == task.url
+    assert captured["otp_request_id"] == "otpr_agent_magic_link"
     assert actions[0].url == "https://app.example.com/verify?t=ok"
 
 

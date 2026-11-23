@@ -33,4 +33,4 @@ from skyvern.forge.sdk.routes.streaming import vnc  # noqa: F401
 # skyvern[local] starts the embedded API app without that extra, so skip these
 # private routes unless the SDK package is installed.
 if importlib.util.find_spec("agents") is not None:
-    from skyvern.forge.sdk.routes import workflow_copilot  # noqa: F401
+    from skyvern.forge.sdk.routes import ember  # noqa: F401

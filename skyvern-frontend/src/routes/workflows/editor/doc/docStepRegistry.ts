@@ -55,6 +55,7 @@ const tagColors: Record<WorkflowBlockType, DocTagColor> = {
   email_inbox: "orange",
   google_sheets_read: "orange",
   google_sheets_write: "orange",
+  integration_action: "orange",
   file_download: "brown",
   download_to_s3: "brown",
   upload_to_s3: "brown",
@@ -85,6 +86,7 @@ const OUTPUT_BLOCK_TYPES = new Set<WorkflowBlockType>([
   "file_download",
   "download_to_s3",
   "workflow_trigger",
+  "integration_action",
 ]);
 
 /** Whether the step hands data to later steps; the others don't name an output. */
@@ -314,6 +316,10 @@ function fixedStepSummary(node: Node): string | null {
       return text(node, "prompt") || "Run Python code";
     case "fileParser":
       return "Read data from a file";
+    case "integrationAction":
+      return text(node, "actionId")
+        ? `Run ${text(node, "integrationId").replace(/_/g, " ")}: ${text(node, "actionId").replace(/_/g, " ")}`
+        : "Run an app action";
     case "pdfParser":
       return "Read data from a PDF";
     case "upload":

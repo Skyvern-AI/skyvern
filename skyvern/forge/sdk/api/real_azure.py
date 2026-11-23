@@ -323,7 +323,7 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
     def create_sas_url(
         self,
         uri: str,
-        expiry_hours: int = 24,
+        expiry_seconds: int = 24 * 60 * 60,
         attachment_filename: str | None = None,
         inline_content_type: str | None = None,
     ) -> str | None:
@@ -343,7 +343,7 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
                 blob_name=parsed.blob_path,
                 account_key=self.account_key,
                 permission=BlobSasPermissions(read=True),
-                expiry=datetime.now(timezone.utc) + timedelta(hours=expiry_hours),
+                expiry=datetime.now(timezone.utc) + timedelta(seconds=expiry_seconds),
                 content_disposition=content_disposition,
                 content_type=content_type,
             )
@@ -357,7 +357,7 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
     async def create_sas_urls(
         self,
         uris: list[str],
-        expiry_hours: int = 24,
+        expiry_seconds: int = 24 * 60 * 60,
         attachment_filenames: list[str | None] | None = None,
         inline_content_type: str | None = None,
     ) -> list[str] | None:
@@ -373,7 +373,10 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
                 if attachment_filenames is not None:
                     attachment_filename = attachment_filenames[index] or os.path.basename(AzureUri(uri).blob_path)
                 url = self.create_sas_url(
-                    uri, expiry_hours, attachment_filename=attachment_filename, inline_content_type=inline_content_type
+                    uri,
+                    expiry_seconds,
+                    attachment_filename=attachment_filename,
+                    inline_content_type=inline_content_type,
                 )
                 if url is None:
                     LOG.warning("SAS URL generation failed, aborting batch", failed_uri=uri, uris=uris)

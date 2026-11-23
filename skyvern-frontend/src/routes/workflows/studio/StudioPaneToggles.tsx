@@ -30,13 +30,9 @@ import { PastRunsList } from "./PastRunsList";
 import { StudioPaneAttentionDot } from "./StudioPaneAttentionDot";
 import { studioPanelId, studioTabId } from "./constants";
 import { STUDIO_PANE_META, railLabel } from "./paneMeta";
-import {
-  STUDIO_PANE_IDS,
-  WORKFLOW_AUTHORING_PANES,
-  type StudioPaneId,
-} from "./panes";
+import { WORKFLOW_AUTHORING_PANES, type StudioPaneId } from "./panes";
 import { useStudioNarrow } from "./useStudioNarrow";
-import { useStudioPanes } from "./useStudioPanes";
+import { useStudioPaneIds, useStudioPanes } from "./useStudioPanes";
 import { useStudioRunSignals } from "./useStudioRunSignals";
 import {
   useStudioShellContext,
@@ -109,9 +105,10 @@ export function StudioPaneToggles() {
   // At phone width the pane switch under the stage picks panes; only the run
   // control (it holds Past Runs) stays up here.
   const narrow = useStudioNarrow();
+  const availablePaneIds = useStudioPaneIds();
   const paneIds = narrow
-    ? STUDIO_PANE_IDS.filter((id) => id === "overview")
-    : STUDIO_PANE_IDS;
+    ? availablePaneIds.filter((id) => id === "overview")
+    : availablePaneIds;
   const [runsSelectorOpen, setRunsSelectorOpen] = useState(false);
 
   // Picking a run in the selector opens/retargets the run pane. The row's own
@@ -197,7 +194,7 @@ export function StudioPaneToggles() {
         const showActivityDot =
           id === "browser" && hasUnseenBrowserActivity && (!open || folded);
         // Shown even with the pane open: the request can still be off-screen behind other panes.
-        const awaiting = id === "copilot" ? emberAttention : null;
+        const awaiting = id === "ember" ? emberAttention : null;
         const showRunStatusDot = isRunControl && Boolean(runStatus);
         const ariaLabel = showActivityDot
           ? "Browser, new activity"

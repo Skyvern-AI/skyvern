@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -30,27 +31,36 @@ from agents import (
 from agents._tool_identity import build_function_tool_lookup_map, get_function_tool_lookup_key_for_call
 from agents.models.interface import Model
 from agents.tool_context import ToolContext
+from jsonschema import Draft202012Validator
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputRefusal
 from openai.types.shared import Reasoning
 from pydantic import JsonValue, ValidationError
 
 from skyvern.config import settings
+from skyvern.constants import EMBER_RUN_CREATOR
 from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge import app
-from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.copilot_model_usage import copilot_usage_observer
-from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
-from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-from skyvern.forge.sdk.copilot.model_telemetry import (
-    CopilotLitellmModel,
-    current_model_attempt_telemetry,
-    model_attempt_telemetry_scope,
+from skyvern.forge.sdk.agents.skills import (
+    EVERYONE_SKILL_LABEL,
+    LOAD_SKILL_TOOL_NAME,
+    READ_SKILL_RESOURCE_TOOL_NAME,
+    SKILL_TOOL_NAMES,
+    SkillLoadResult,
+    SkillReadResult,
+    SkillSession,
+    render_skills_catalog,
 )
+from skyvern.forge.sdk.api.llm.agents_model import current_model_attempt_telemetry, model_attempt_telemetry_scope
+from skyvern.forge.sdk.api.llm.agents_model_resolver import resolve_agents_model
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.api.llm.model_usage import model_usage_observer
+from skyvern.forge.sdk.api.llm.prompt_cache_envelope import CacheableSystemInstructions
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.run_liveness import run_write_authority
+from skyvern.forge.sdk.integrations.account_fit import block_fit, block_needs, connection_fit
+from skyvern.forge.sdk.integrations.catalog import IntegrationAction, IntegrationEntry
 from skyvern.forge.sdk.integrations.connected_accounts import (
-    COPILOT_RUN_CREATOR,
     OrgConnection,
     org_connections_by_id,
     run_connection_ids,
@@ -61,14 +71,17 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext, _is_platform_smtp_aws_key
 from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
-from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.agent_step_tools import (
+    CATALOG_ACTION_TOOLS,
     DEDICATED_BLOCK_TOOLS,
     FILES_DESCRIPTION,
     FINISH_DESCRIPTION,
+    READ_SKILL_RESOURCE_DESCRIPTION,
     RUN_BLOCK_TYPES,
     RUN_TOOL_DESCRIPTIONS,
+    SAVED_BLOCK_ONLY_TOOLS,
     BlockTool,
+    action_description,
     block_description,
     run_block_description,
 )
@@ -85,15 +98,22 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
 from skyvern.forge.taskv3.handoff_redaction import sanitize_handoff_url, string_leaves
 from skyvern.forge.taskv3.opaque_refs import _TOKEN_PREFIX, mask_opaque_urls
-from skyvern.schemas.agent_step_tool_names import ALWAYS_OFFERED_TOOLS
+from skyvern.schemas.agent_step_tool_names import (
+    ALWAYS_OFFERED_TOOLS,
+    CATALOG_TOOL_NAMES,
+    LEGACY_AGENT_STEP_TOOL_NAMES,
+    is_known_tool_name,
+)
 from skyvern.schemas.run_enums import RunEngine
-from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
+from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, IntegrationActionBlockYAML
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.secret_redaction import redact_secrets_from_text
-from skyvern.webeye.actions.actions import UploadFileAction
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action, GotoUrlAction, UploadFileAction, reasoning_is_turn_scoped
 
 if TYPE_CHECKING:
     from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
+    from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 
 LOG = structlog.get_logger()
 _MAX_TOOL_RESULT_CHARS = 20_000
@@ -103,6 +123,7 @@ _MAX_TRAIL_BYTES = 512 * 1024
 _TRAIL_WRITE_SECONDS = 2
 _MASK = "*****"
 _Fact = str | list[dict[str, str]]
+_OPAQUE_TOKEN = re.compile(rf"{_TOKEN_PREFIX}[0-9a-f]{{8}}")
 
 _INSTRUCTIONS = (
     "You are one step of an unattended workflow run; nobody can answer questions. "
@@ -110,6 +131,8 @@ _INSTRUCTIONS = (
     "and returns its status, output and error. When you have the answer, call finish with it."
 )
 _FINISH_ONLY = "Only finish can run now. Call finish with the best answer the tool results support."
+_SKILL_LIST_HEADER = "load_skill(name) returns a skill's instructions and file list."
+_HIDDEN_SKILL_ARGUMENTS = json.dumps({"name": EVERYONE_SKILL_LABEL})
 
 
 class _RunEnded(Exception):
@@ -134,6 +157,10 @@ class _RunState:
     credential_keys: list[str]
     ignore_workflow_system_prompt: bool
     connected_accounts: list[OrgConnection] = field(default_factory=list)
+    # The owner has a Nango Gmail account, which only a saved block can use (ADR 0033 point 8).
+    saved_block_gmail: bool = False
+    # Catalog actions offered as tools, by tool name, each with the accounts that may run it.
+    actions: dict[str, tuple[IntegrationEntry, IntegrationAction, list[OrgConnection]]] = field(default_factory=dict)
     workflow_system_prompt: str | None = None
     tools: list[str] | None = None
     file_keys: list[str] = field(default_factory=list)
@@ -157,6 +184,9 @@ class _RunState:
     running: AgentStepToolCall | None = None
     pending_trail: list[AgentStepToolCall] | None = None
     trail_writer: asyncio.Task[None] | None = None
+    skills: SkillSession | None = None
+    # The exact text appended to the instructions, so stored model requests can swap it for the public list.
+    skill_list: str | None = None
 
 
 def _capped(text: str) -> str:
@@ -228,7 +258,8 @@ def _running_entry(
         displayed = _redacted_json(state, shown)
     except Exception:
         # Redacted before encoding: a secret the model already escaped would not match once escaped again.
-        block_type, displayed = None, json.dumps(_scrubbed(state, arguments))
+        block_type = None
+        displayed = _HIDDEN_SKILL_ARGUMENTS if tool in SKILL_TOOL_NAMES else json.dumps(_scrubbed(state, arguments))
     return AgentStepToolCall(
         index=len(state.trail) + 1,
         tool=tool,
@@ -349,7 +380,7 @@ class _LoopHooks(RunHooks[Any]):
 
     async def _store(self, artifact_type: ArtifactType, payload: dict[str, object]) -> None:
         try:
-            data = json.dumps(pydantic_core.to_jsonable_python(payload)).encode("utf-8")
+            data = json.dumps(_stored_view(self.state, pydantic_core.to_jsonable_python(payload))).encode("utf-8")
             await app.ARTIFACT_MANAGER.create_workflow_run_block_artifacts(
                 workflow_run_block=self.block_row, artifacts=[(artifact_type, data)]
             )
@@ -360,6 +391,47 @@ class _LoopHooks(RunHooks[Any]):
                 workflow_run_block_id=self.block_row.workflow_run_block_id,
                 exc_info=True,
             )
+
+
+def _skill_call_name(arguments: JsonValue) -> JsonValue:
+    try:
+        parsed = json.loads(arguments) if isinstance(arguments, str) else None
+    except json.JSONDecodeError:
+        return None
+    return parsed.get("name") if isinstance(parsed, dict) else None
+
+
+def _stored_view(state: _RunState, data: JsonValue) -> JsonValue:
+    """Hide everyone skills from a stored model call; data is a fresh copy, so it is edited in place."""
+    session, skill_list = state.skills, state.skill_list
+    if session is None or skill_list is None or not isinstance(data, dict):
+        return data
+    system_prompt = data.get("system_prompt")
+    if isinstance(system_prompt, str):
+        data["system_prompt"] = system_prompt.replace(
+            skill_list, "\n".join([_SKILL_LIST_HEADER, *session.public_catalog_lines()])
+        )
+    items = [
+        item
+        for key in ("input", "output")
+        if isinstance(listed := data.get(key), list)
+        for item in listed
+        if isinstance(item, dict)
+    ]
+    hidden_calls: set[str] = set()
+    for item in items:
+        if (
+            item.get("type") == "function_call"
+            and item.get("name") in SKILL_TOOL_NAMES
+            and not session.shows_name(_skill_call_name(item.get("arguments")))
+        ):
+            item["arguments"] = _HIDDEN_SKILL_ARGUMENTS
+            if isinstance(call_id := item.get("call_id"), str):
+                hidden_calls.add(call_id)
+    for item in items:
+        if item.get("type") == "function_call_output" and item.get("call_id") in hidden_calls:
+            item["output"] = _HIDDEN_SKILL_ARGUMENTS
+    return data
 
 
 def _scrubbed(state: _RunState, text: str) -> str:
@@ -425,16 +497,11 @@ def _record_call(
 
 
 def resolve_agent_model(llm_key: str) -> tuple[str | Model, RunConfig]:
-    model_name, copilot_run_config, _, _ = resolve_model_config(None, llm_key_override=llm_key)
-    model = copilot_run_config.model
-    # Copilot's RunConfig also carries session callbacks that read its chat context, and an input filter that rewrites
-    # recent tool outputs. Without that filter this history only grows, so its newest tool output can be cached.
-    if isinstance(model, CopilotLitellmModel):
-        model.history_append_only = True
-    return model_name, RunConfig(
-        model=model,
-        model_provider=copilot_run_config.model_provider,
-        model_settings=copilot_run_config.model_settings,
+    resolved = resolve_agents_model(llm_key, agent_name="agent_step")
+    return resolved.model_name, RunConfig(
+        model=resolved.model,
+        model_provider=resolved.provider,
+        model_settings=resolved.model_settings,
         tracing_disabled=True,
     )
 
@@ -483,10 +550,14 @@ def _arguments_schema(tool: BlockTool, state: _RunState) -> dict[str, Any]:
     if "files" in pseudo:
         params["properties"]["files"] = {"type": "array", "items": {"type": "string"}, "description": FILES_DESCRIPTION}
     account_fields = settable_connected_account_fields(tool.yaml_class, tool.fields)
+    accounts = _tool_accounts(tool, state) if account_fields else []
+    # run_block merges every branch's $defs, so a list narrowed for one block type needs a name of its own.
+    narrowed = bool(account_fields) and accounts != state.connected_accounts
+    account_def = f"{_ACCOUNT_DEF}_{_block_type(tool).value}" if narrowed else _ACCOUNT_DEF
     for name in account_fields:
         described = schema["properties"][name].get("description")
         params["properties"][name] = {
-            "$ref": f"#/$defs/{_ACCOUNT_DEF}",
+            "$ref": f"#/$defs/{account_def}",
             **({"description": described} if described else {}),
         }
     # Only the definitions a kept field reaches; the rest describe fields the model never sees.
@@ -497,10 +568,10 @@ def _arguments_schema(tool: BlockTool, state: _RunState) -> dict[str, Any]:
         used |= {name: defs[name] for name in names}
         reached = json.dumps([defs[name] for name in names])
     if account_fields:
-        used[_ACCOUNT_DEF] = {
+        used[account_def] = {
             "type": "string",
-            "description": f"The id of {_account_choices(state)}",
-            **({"enum": [account.id for account in state.connected_accounts]} if state.connected_accounts else {}),
+            "description": f"The id of {_account_choices(accounts, state, _tool_needs(tool, state))}",
+            **({"enum": [account.id for account in accounts]} if accounts else {}),
         }
     if used:
         params["$defs"] = used
@@ -510,10 +581,31 @@ def _arguments_schema(tool: BlockTool, state: _RunState) -> dict[str, Any]:
 _ACCOUNT_DEF = "ConnectedAccountId"
 
 
-def _account_choices(state: _RunState) -> str:
-    if not state.connected_accounts:
+def _block_type(tool: BlockTool) -> BlockType:
+    return BlockType(tool.yaml_class.model_fields["block_type"].default)
+
+
+def _tool_accounts(tool: BlockTool, state: _RunState) -> list[OrgConnection]:
+    """The run's accounts minus those known to lack the permission this tool's block needs; unknown ones stay."""
+    return [account for account in state.connected_accounts if block_fit(account, _block_type(tool)) != "no"]
+
+
+def _tool_needs(tool: BlockTool, state: _RunState) -> list[str]:
+    return block_needs(_block_type(tool), {account.provider for account in state.connected_accounts})
+
+
+def _account_choices(accounts: list[OrgConnection], state: _RunState, needs: Sequence[str] = ()) -> str:
+    if not accounts and state.connected_accounts:
+        # Several scopes come from different providers' actions, so any one of them is enough.
+        listed = needs[0] if len(needs) == 1 else f"one of {', '.join(needs)}"
+        permission = f"the permission this block needs ({listed})" if needs else "the permission it needs"
+        return (
+            f"a connected account with {permission}, and none of the run's connected accounts has it; reconnect an "
+            "account with that permission on the Integrations page"
+        )
+    if not accounts:
         return "a connected account, and no connected account is available to this run"
-    choices = [{k: v for k, v in a.facts().items() if k != "state"} for a in state.connected_accounts]
+    choices = [{k: v for k, v in a.facts().items() if k != "state"} for a in accounts]
     return f"one of the run's connected accounts: {json.dumps(choices)}"
 
 
@@ -521,11 +613,13 @@ def _yaml_arguments(tool: BlockTool, written: dict[str, Any], state: _RunState) 
     if unknown := sorted(set(written) - set(tool.arguments)):
         raise ValueError(f"Unknown arguments {unknown}; the allowed arguments are {list(tool.arguments)}.")
     arguments = dict(written)
-    account_ids = {account.id for account in state.connected_accounts}
-    for name in settable_connected_account_fields(tool.yaml_class, tool.fields):
+    account_fields = settable_connected_account_fields(tool.yaml_class, tool.fields)
+    accounts = _tool_accounts(tool, state) if account_fields else []
+    account_ids = {account.id for account in accounts}
+    for name in account_fields:
         value = arguments.get(name)
         if value is not None and not (isinstance(value, str) and value in account_ids):
-            raise ValueError(f"{name} must be the id of {_account_choices(state)}.")
+            raise ValueError(f"{name} must be the id of {_account_choices(accounts, state, _tool_needs(tool, state))}.")
     pseudo = _pseudo_fields(tool)
     parameter_keys: list[str] = []
     if "credential" in pseudo:
@@ -563,12 +657,14 @@ def _dedicated_tool(block_type: BlockType, tool: BlockTool, state: _RunState) ->
     )
 
 
-def _run_block_schema(state: _RunState, block_types: list[str]) -> dict[str, Any]:
+def _run_block_schema(
+    state: _RunState, block_types: list[str], table: Mapping[str, tuple[BlockType, BlockTool]] = RUN_BLOCK_TYPES
+) -> dict[str, Any]:
     branches: list[dict[str, Any]] = []
     # Each block's references read "#/$defs/X", which resolve against this tool's root, not the branch.
     defs: dict[str, Any] = {}
     for name in block_types:
-        branch = _arguments_schema(RUN_BLOCK_TYPES[name][1], state)
+        branch = _arguments_schema(table[name][1], state)
         defs.update(branch.pop("$defs", {}))
         branches.append(branch)
     return {
@@ -590,6 +686,12 @@ def _run_block_tool(state: _RunState, block_types: list[str]) -> FunctionTool:
         except json.JSONDecodeError:
             call = None
         if not isinstance(call, dict) or call.get("block_type") not in block_types:
+            # A prompt written before a block type became catalog tools still names it; point to the new tool.
+            renamed = LEGACY_AGENT_STEP_TOOL_NAMES.get(str(call.get("block_type"))) if isinstance(call, dict) else None
+            if renamed in state.actions:
+                return f"{call['block_type']} is now the tool {renamed}; call it directly with its own arguments."
+            if renamed in CATALOG_TOOL_NAMES:
+                return f"{call['block_type']} is now the tool {renamed}, which this run does not offer."
             return f"Pass block_type, one of {block_types}, and that block's arguments."
         block_type, tool = RUN_BLOCK_TYPES[call["block_type"]]
         return await _run_child_block("run_block", block_type, tool, call.get("arguments") or {}, state)
@@ -642,6 +744,7 @@ def _run_tool(
     required: list[str],
     run: Callable[..., Awaitable[Any]],
     state: _RunState,
+    describe: Callable[[JsonValue], tuple[BlockType | None, JsonValue]] | None = None,
 ) -> FunctionTool:
     async def invoke(arguments: str) -> str:
         try:
@@ -655,7 +758,7 @@ def _run_tool(
             raise
         except Exception as e:
             report = {"status": "failed", "output": None, "error": f"{type(e).__name__}: {e}"}
-        _record_call(state, written, tool=name, status=report["status"])
+        _record_call(state, describe(written)[1] if describe else written, tool=name, status=report["status"])
         # A read_run_data window is already masked text cut from a longer result.
         if name == "read_run_data" and report["status"] == "completed":
             return report["output"]
@@ -670,7 +773,7 @@ def _run_tool(
             "required": required,
             "additionalProperties": False,
         },
-        on_invoke_tool=_in_turn(state, invoke),
+        on_invoke_tool=_in_turn(state, invoke, describe),
         strict_json_schema=False,
     )
 
@@ -808,7 +911,7 @@ _RUN_TOOLS: tuple[tuple[str, dict[str, Any], list[str], Callable[..., Awaitable[
     ("page_fill", {"prompt": _TEXT, "value": _TEXT}, ["prompt", "value"], _page_fill),
     ("page_extract", {"prompt": _TEXT, "schema": {"type": "object"}}, ["prompt"], _page_extract),
 )
-if {name for name, *_ in _RUN_TOOLS} != set(RUN_TOOL_DESCRIPTIONS):
+if {name for name, *_ in _RUN_TOOLS} != set(RUN_TOOL_DESCRIPTIONS) - {LOAD_SKILL_TOOL_NAME}:
     raise RuntimeError("_RUN_TOOLS and RUN_TOOL_DESCRIPTIONS must name the same tools.")
 
 
@@ -830,11 +933,206 @@ def _tools(state: _RunState) -> list[FunctionTool]:
         ),
         *([_run_block_tool(state, block_types)] if block_types else []),
         *(
+            _action_tool(name, entry, action, accounts, state)
+            for name, (entry, action, accounts) in state.actions.items()
+        ),
+        *(
             _run_tool(name, RUN_TOOL_DESCRIPTIONS[name], properties, required, run, state)
             for name, properties, required, run in _RUN_TOOLS
             if _offers(state, name)
         ),
     ]
+
+
+_INTEGRATION_ACTION_TOOL = BlockTool(IntegrationActionBlockYAML, ("integration_id", "action_id", "inputs"))
+
+
+def _withheld_note(withheld: list[str], saved_block_gmail: bool = False) -> str:
+    """Tells the model why listed catalog tools are missing, so it can say so instead of guessing."""
+    saved_only = [name for name in withheld if name in SAVED_BLOCK_ONLY_TOOLS]
+    nango_gmail = [
+        name
+        for name in withheld
+        if saved_block_gmail and name in CATALOG_ACTION_TOOLS and CATALOG_ACTION_TOOLS[name][0].id == "gmail"
+    ]
+    # A listed name the step cannot offer at all, such as a saved block only one, is not told as an account problem.
+    others = [name for name in withheld if name in CATALOG_ACTION_TOOLS and name not in nango_gmail]
+    note = "".join(
+        f"\n\n{name} runs only as a saved block, not from this step; if the task needs it, say that a saved "
+        f"{entry.name}: {action.name} block must be placed before or after this step."
+        for name in saved_only
+        for entry, action in [SAVED_BLOCK_ONLY_TOOLS[name]]
+    )
+    note += "".join(
+        f"\n\n{name} is not available in this run: the run owner's connected Gmail is a Nango account, which "
+        "only a saved block can use, and no other account has the permission it needs. If the task needs it, say "
+        f"that a saved "
+        f"{entry.name}: {action.name} block must be placed before or after this step, or that a Google account "
+        "with that permission must be connected."
+        for name in nango_gmail
+        for entry, action in [CATALOG_ACTION_TOOLS[name]]
+    )
+    if others:
+        note += (
+            "\n\nThese tools this step lists are not available in this run, usually because no connected account "
+            "this run may use has the permission they need; if the task needs one, say so in your answer: "
+            f"{', '.join(others)}."
+        )
+    return note
+
+
+def _catalog_actions(state: _RunState) -> dict[str, tuple[IntegrationEntry, IntegrationAction, list[OrgConnection]]]:
+    """The catalog actions the author listed, each with the run's accounts that are not known to lack its permission.
+    An action no account can run is not offered."""
+    actions = {}
+    for name, (entry, action) in CATALOG_ACTION_TOOLS.items():
+        if entry.status != "live" or not _offers(state, name):
+            continue
+        accounts = [
+            account
+            for account in state.connected_accounts
+            if account.provider == entry.oauth_provider and connection_fit(account, action) != "no"
+        ]
+        if accounts:
+            actions[name] = (entry, action, accounts)
+    return actions
+
+
+def _action_schema(action: IntegrationAction, accounts: list[OrgConnection], state: _RunState) -> dict[str, Any]:
+    # A const input is fixed by the action (e.g. which email client), so the model never sets it.
+    properties = {name: schema for name, schema in action.inputs.get("properties", {}).items() if "const" not in schema}
+    # Built on the action's own schema, so any other keyword it uses (allOf, oneOf, if) still holds the model's call;
+    # such a keyword must not name a fixed input, which the model never sees.
+    return {
+        **action.inputs,
+        "type": "object",
+        "properties": {
+            **properties,
+            "connection_id": {
+                "type": "string",
+                "enum": [account.id for account in accounts],
+                "description": f"The id of {_account_choices(accounts, state, action.needs)}",
+            },
+        },
+        "required": [*(name for name in action.inputs.get("required", []) if name in properties), "connection_id"],
+        "additionalProperties": False,
+    }
+
+
+def _action_arguments_error(
+    written: JsonValue,
+    schema: dict[str, Any],
+    validator: Draft202012Validator,
+    accounts: list[OrgConnection],
+    state: _RunState,
+    needs: Sequence[str],
+) -> str | None:
+    if not isinstance(written, dict):
+        return "arguments must be a JSON object."
+    if written.get("connection_id") not in schema["properties"]["connection_id"]["enum"]:
+        return f"connection_id must be the id of {_account_choices(accounts, state, needs)}."
+    # An agent's text is never a template, so every value is held to the schema as written.
+    errors = sorted(validator.iter_errors(written), key=lambda e: [str(p) for p in e.path])
+    if not errors:
+        return None
+    error = errors[0]
+    field = ".".join(str(part) for part in error.path) or "arguments"
+    # These two messages name only keys; every other one repeats the value, which can be the model's whole input.
+    if error.validator in ("required", "additionalProperties"):
+        return f"{field}: {error.message}"
+    return f"{field} must satisfy {error.validator}: {json.dumps(error.validator_value, default=str)[:200]}"
+
+
+def _action_tool(
+    name: str, entry: IntegrationEntry, action: IntegrationAction, accounts: list[OrgConnection], state: _RunState
+) -> FunctionTool:
+    schema = _action_schema(action, accounts, state)
+    validator = Draft202012Validator(schema)
+
+    async def invoke(arguments: str) -> str:
+        try:
+            written = json.loads(arguments or "{}")
+        except json.JSONDecodeError as e:
+            return f"Arguments are not valid JSON ({e})."
+        # Checked here so a model's slip comes back with the schema instead of becoming a failed child block.
+        error = _action_arguments_error(written, schema, validator, accounts, state, action.needs)
+        if error is not None or not isinstance(written, dict):
+            report = {"status": "invalid_arguments", "output": None, "error": error, "argument_schema": schema}
+            _record_call(state, written, tool=name, status="invalid_arguments")
+            return _window(_masked_text(report, state.run_context))
+        inputs = {key: value for key, value in written.items() if key != "connection_id"}
+        call = {
+            "integration_id": entry.id,
+            "action_id": action.id,
+            "connection_id": written["connection_id"],
+            "inputs": inputs,
+        }
+        return await _run_child_block(name, BlockType.INTEGRATION_ACTION, _INTEGRATION_ACTION_TOOL, call, state)
+
+    return FunctionTool(
+        name=name,
+        description=action_description(entry, action),
+        params_json_schema=schema,
+        on_invoke_tool=_in_turn(state, invoke, lambda written: (BlockType.INTEGRATION_ACTION, written)),
+        strict_json_schema=False,
+    )
+
+
+def _skill_tools(state: _RunState, session: SkillSession) -> list[FunctionTool]:
+    async def load(_state: _RunState, name: str) -> SkillLoadResult:
+        return session.load(name)
+
+    async def read(_state: _RunState, name: str, path: str) -> SkillReadResult:
+        return session.read_resource(name, path)
+
+    def describe(written: JsonValue) -> tuple[BlockType | None, JsonValue]:
+        return None, session.public_arguments(written if isinstance(written, dict) else {})
+
+    return [
+        _run_tool(
+            LOAD_SKILL_TOOL_NAME,
+            RUN_TOOL_DESCRIPTIONS[LOAD_SKILL_TOOL_NAME],
+            {"name": _TEXT},
+            ["name"],
+            load,
+            state,
+            describe,
+        ),
+        _run_tool(
+            READ_SKILL_RESOURCE_TOOL_NAME,
+            READ_SKILL_RESOURCE_DESCRIPTION,
+            {"name": _TEXT, "path": _TEXT},
+            ["name", "path"],
+            read,
+            state,
+            describe,
+        ),
+    ]
+
+
+async def _skill_session(state: _RunState) -> SkillSession | None:
+    if not _offers(state, LOAD_SKILL_TOOL_NAME) or state.organization_id is None:
+        return None
+    try:
+        skills = await app.AGENT_FUNCTION.agent_skills(
+            organization_id=state.organization_id,
+            workflow_permanent_id=state.run_context.workflow_permanent_id,
+            agent="agent_step",
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to list the agent step's skills", workflow_run_block_id=state.workflow_run_block_id, exc_info=True
+        )
+        return None
+    if not skills:
+        return None
+    return SkillSession(
+        skills,
+        agent="agent_step",
+        organization_id=state.organization_id,
+        workflow_run_id=state.workflow_run_id,
+        workflow_run_block_id=state.workflow_run_block_id,
+    )
 
 
 def _tool_not_found_formatter(
@@ -930,10 +1228,9 @@ async def _run_child_block(
             report, child_block_id = await _execute_child(child, written, state)
             if page_url is not None:
                 facts["page_url_at_start"] = page_url
-            if "files" in tool.fields:
-                attempts = await _upload_attempts(state, child_block_id, written.get("files") or [])
-                if attempts is not None:
-                    facts["upload_attempts"] = attempts
+            if tool.nested_agent:
+                files = (written.get("files") or []) if "files" in tool.fields else None
+                facts.update(await _child_action_facts(state, child_block_id, files))
             # Ahead of output, so the window that cuts a long output keeps them.
             report = {"status": report["status"], **facts, **report}
             if (
@@ -966,7 +1263,7 @@ async def _execute_child(child: Block, written: dict[str, Any], state: _RunState
     child._agent_smtp_isolation = True
     child.mark_fields_prerendered(written)
     # Children write their own LLM cost to their own rows.
-    with copilot_usage_observer(None):
+    with model_usage_observer(None):
         result = await child.execute_safe(
             workflow_run_id=state.workflow_run_id,
             parent_workflow_run_block_id=state.workflow_run_block_id,
@@ -978,7 +1275,7 @@ async def _execute_child(child: Block, written: dict[str, Any], state: _RunState
 
 
 def _url_fact(url: str) -> str:
-    if url == "about:blank" or url.startswith(_TOKEN_PREFIX):
+    if url == "about:blank" or _OPAQUE_TOKEN.fullmatch(url):
         return url
     return sanitize_handoff_url(url) or "unparseable url"
 
@@ -993,40 +1290,61 @@ async def _page_url_at_start(state: _RunState) -> str | None:
         return None
 
 
-async def _upload_attempts(
-    state: _RunState, workflow_run_block_id: str | None, files: list[str]
-) -> list[dict[str, str]] | None:
+async def _child_action_facts(
+    state: _RunState, workflow_run_block_id: str | None, files: list[str] | None
+) -> dict[str, _Fact]:
     try:
         if workflow_run_block_id is None:
-            return None
+            return {}
         run_block = await app.DATABASE.observer.get_workflow_run_block(
             workflow_run_block_id, organization_id=state.organization_id
         )
         if run_block.task_id is None:
-            return None
+            return {}
         actions = await app.DATABASE.tasks.get_task_actions_hydrated(
             run_block.task_id, organization_id=state.organization_id
         )
-        handed = {key: state.run_context.values.get(key) for key in files}
-        attempts = []
-        for action in actions:
-            if not isinstance(action, UploadFileAction):
-                continue
-            # Task V3 stores the file argument as its model wrote it, so a handed signed URL is its opaque_url_ token.
-            parameter = next(
-                (
-                    key
-                    for key, value in handed.items()
-                    if mask_opaque_urls({key: value}).resolve(action.file_url) in string_leaves(value)
-                ),
-                None,
-            )
-            named = {"parameter": parameter} if parameter else {"source": _url_fact(action.file_url)}
-            attempts.append({**named, "status": action.status.value})
-        return attempts
+        facts: dict[str, _Fact] = {} if files is None else {"upload_attempts": _upload_attempts(state, actions, files)}
+        return facts | _recorded_actions(actions)
     except Exception:
-        LOG.warning("Could not read a nested agent's uploads", label=state.label, exc_info=True)
-        return None
+        LOG.warning("Could not read a nested agent's actions", label=state.label, exc_info=True)
+        return {}
+
+
+def _upload_attempts(state: _RunState, actions: list[Action], files: list[str]) -> list[dict[str, str]]:
+    handed = {key: state.run_context.values.get(key) for key in files}
+    attempts = []
+    for action in actions:
+        if not isinstance(action, UploadFileAction):
+            continue
+        # Task V3 stores the file argument as its model wrote it, so a handed signed URL is its opaque_url_ token.
+        parameter = next(
+            (
+                key
+                for key, value in handed.items()
+                if mask_opaque_urls({key: value}).resolve(action.file_url) in string_leaves(value)
+            ),
+            None,
+        )
+        named = {"parameter": parameter} if parameter else {"source": _url_fact(action.file_url)}
+        attempts.append({**named, "status": action.status.value})
+    return attempts
+
+
+def _recorded_actions(actions: list[Action]) -> dict[str, _Fact]:
+    # Only Task V3 rows carry an LLM-free target label in intention; a navigation's intention holds its raw URL.
+    if not all(reasoning_is_turn_scoped(action.description) for action in actions):
+        return {}
+    entries = []
+    for action in actions:
+        if action.action_type == ActionType.GOTO_URL:
+            entry = {"action": "navigate"}
+            if isinstance(action, GotoUrlAction):
+                entry["url"] = _url_fact(action.url)
+        else:
+            entry = {"action": action.intention or action.action_type.value}
+        entries.append({**entry, "status": action.status.value})
+    return {"recorded_actions": entries}
 
 
 def _credential_keys(parameters: list[PARAMETER_TYPE]) -> list[str]:
@@ -1043,7 +1361,7 @@ _MAX_PARENT_RUN_HOPS = 2 * WorkflowTriggerBlock.MAX_TRIGGER_DEPTH
 
 
 async def _connected_accounts(organization_id: str | None, workflow_run_id: str) -> list[OrgConnection]:
-    """The accounts the run's owner may use, which every block tool's connected-account argument chooses from."""
+    """The active accounts the run's owner may use, Nango ones included although only a saved block can use those."""
     if organization_id is None:
         return []
     workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
@@ -1064,14 +1382,14 @@ async def _connected_accounts(organization_id: str | None, workflow_run_id: str)
         if parent is None:
             break
         root = parent
-    if chain_unresolved and settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS:
+    if chain_unresolved and settings.EMBER_NARROW_AGENT_STEP_ACCOUNTS:
         # The top run's creator is unknown, so whether a record holds this run is too.
         LOG.warning(
             "agent_step_run_chain_unresolved", workflow_run_id=workflow_run_id, last_run_id=root.workflow_run_id
         )
         return []
     connections = await org_connections_by_id(organization_id, workflow_run.created_by)
-    if root.created_by == COPILOT_RUN_CREATOR:
+    if root.created_by == EMBER_RUN_CREATOR:
         allowed = await run_connection_ids(organization_id, root.workflow_run_id)
         # A record is always enforced. Without one, narrowing on means none; off, the dispatching API predates
         # the record and required every account, so every account stays offered. That is why every worker turns
@@ -1084,9 +1402,9 @@ async def _connected_accounts(organization_id: str | None, workflow_run_id: str)
                 record_run_id=root.workflow_run_id,
                 cache_shared=app.CACHE.is_shared,
             )
-        if allowed is not None or settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS:
+        if allowed is not None or settings.EMBER_NARROW_AGENT_STEP_ACCOUNTS:
             connections = [connection for connection in connections if connection.id in (allowed or set())]
-    return [connection for connection in connections if connection.active and connection.agent_step_usable]
+    return [connection for connection in connections if connection.active]
 
 
 async def run_agent_step(
@@ -1119,15 +1437,32 @@ async def run_agent_step(
         workflow_system_prompt=block.workflow_system_prompt,
         tools=block.tools,
     )
-    if any(
+    listed = [name for name in block.tools or () if name in CATALOG_TOOL_NAMES]
+    withheld: list[str] = []
+    # Saving refuses unknown names, but a stored step keeps a name the catalog later dropped without a legacy entry.
+    if unknown := sorted(name for name in block.tools or () if not is_known_tool_name(name)):
+        LOG.warning("agent_step_unknown_tools", tools=unknown, workflow_run_id=workflow_run_id)
+    if listed or any(
         _offers(state, name) and settable_connected_account_fields(tool.yaml_class, tool.fields)
         for name, (_, tool) in {**DEDICATED_BLOCK_TOOLS, **RUN_BLOCK_TYPES}.items()
     ):
-        state.connected_accounts = await _connected_accounts(organization_id, workflow_run_id)
+        accounts = await _connected_accounts(organization_id, workflow_run_id)
+        # Every block tool's connected-account argument chooses from these.
+        state.connected_accounts = [account for account in accounts if account.agent_step_usable]
+        # The owner's Nango accounts are their connected Gmail (own_connected_gmail_connections).
+        state.saved_block_gmail = any(account.provider == "nango" for account in accounts)
+    if listed:
+        state.actions = _catalog_actions(state)
+        if withheld := sorted(set(listed) - set(state.actions)):
+            # No account of the run can run it, or it runs only as a saved block.
+            LOG.warning("agent_step_catalog_tools_not_offered", tools=withheld, workflow_run_id=workflow_run_id)
     effort = LLMConfigRegistry.get_config(llm_key).reasoning_effort
     model, run_config = resolve_agent_model(llm_key)
+    state.skills = await _skill_session(state)
+    if state.skills:
+        state.skill_list = f"{_SKILL_LIST_HEADER}\n{render_skills_catalog(state.skills)}"
     finish = _finish_tool(block.data_schema, state)
-    tools = [*_tools(state), finish]
+    tools = [*_tools(state), *(_skill_tools(state, state.skills) if state.skills else []), finish]
     run_config = replace(
         run_config,
         tool_not_found_behavior="return_error_to_model",
@@ -1136,12 +1471,14 @@ async def run_agent_step(
     agent = Agent(
         name=block.label,
         # LiteLLM's chat-to-Responses bridge drops the served service tier, which leaves GPT calls unpriced;
-        # Copilot's cacheable instructions take its direct Responses path, which keeps it.
+        # Cacheable instructions take the model's direct Responses path, which keeps it.
         # web_search needs today's date, which follows the cached prefix and stays fixed for the run.
         instructions=CacheableSystemInstructions(
             _INSTRUCTIONS,
             f"\n\nCurrent UTC datetime: {datetime.now(UTC).isoformat(timespec='seconds')}"
-            + (f"\n\n{block.workflow_system_prompt}" if block.workflow_system_prompt else ""),
+            + (f"\n\n{block.workflow_system_prompt}" if block.workflow_system_prompt else "")
+            + (f"\n\n{state.skill_list}" if state.skill_list else "")
+            + _withheld_note(withheld, state.saved_block_gmail),
             cache_namespace=workflow_run_block_id,
         ),
         tools=tools,
@@ -1220,7 +1557,7 @@ async def run_agent_step(
                         await asyncio.shield(_publish_trail(state))
 
     try:
-        with copilot_usage_observer(lambda event: costs.append(event.cost or 0.0)), model_attempt_telemetry_scope():
+        with model_usage_observer(lambda event: costs.append(event.cost or 0.0)), model_attempt_telemetry_scope():
             result = await Runner.run(
                 agent,
                 prompt,

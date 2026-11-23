@@ -63,7 +63,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLO
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import service as workflow_service_module
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import (
     LEASE_TAKEOVER_SECONDS,
     WEBHOOK_FALLBACK_GRACE_SECONDS,
@@ -112,7 +112,7 @@ def _query_sql(query: Any) -> str:
     return str(query.compile(compile_kwargs={"literal_binds": True}))
 
 
-def _assert_not_filtering_copilot_authored_workflows(where_clause: str) -> None:
+def _assert_not_filtering_ember_authored_workflows(where_clause: str) -> None:
     assert "workflows.created_by" not in where_clause
     assert "workflows.edited_by" not in where_clause
 
@@ -149,6 +149,8 @@ def _workflow_run_model(
     failure_category: list[dict[str, Any]] | None = None,
     browser_profile_id: str | None = None,
     webhook_callback_url: str | None = None,
+    otp_request_id: str | None = None,
+    started_at: datetime | None = None,
 ) -> WorkflowRunModel:
     return WorkflowRunModel(
         workflow_run_id=workflow_run_id,
@@ -165,8 +167,93 @@ def _workflow_run_model(
         created_at=queued_at,
         modified_at=queued_at,
         queued_at=queued_at,
+        started_at=started_at,
+        otp_request_id=otp_request_id,
         failure_category=failure_category,
     )
+
+
+async def _assert_public_workflow_run_lists_filter_strict_reservations_by_projected_status(
+    sqlite_db: AgentDB,
+) -> None:
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+    organization_id = "org_status_projection"
+    async with sqlite_db.Session() as session:
+        session.add(
+            OrganizationModel(organization_id=organization_id, organization_name="Status Projection Organization")
+        )
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_test",
+                workflow_permanent_id="wpid_test",
+                organization_id=organization_id,
+                title="Strict reservation status reads",
+                workflow_definition={},
+                version=1,
+            )
+        )
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_reserved",
+                    queued_at=now,
+                    status=WorkflowRunStatus.running.value,
+                    organization_id=organization_id,
+                    otp_request_id="otp_reserved",
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_started",
+                    queued_at=now - timedelta(seconds=1),
+                    status=WorkflowRunStatus.running.value,
+                    organization_id=organization_id,
+                    otp_request_id="otp_started",
+                    started_at=now,
+                ),
+            ]
+        )
+        await session.commit()
+
+    async def run_ids(method: str, status: WorkflowRunStatus, *, projected: bool) -> list[str]:
+        kwargs: dict[str, Any] = {
+            "organization_id": organization_id,
+            "status": [status],
+            "project_status_for_reads": projected,
+        }
+        if method == "per_workflow":
+            kwargs["workflow_permanent_id"] = "wpid_test"
+            runs = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(**kwargs)
+        elif method == "workflow":
+            runs = await sqlite_db.workflow_runs.get_workflow_runs(**kwargs)
+        else:
+            runs = await sqlite_db.workflow_runs.get_all_runs(**kwargs)
+        return [run.workflow_run_id for run in runs if isinstance(run, WorkflowRun)]
+
+    for method in ("all", "workflow", "per_workflow"):
+        assert await run_ids(method, WorkflowRunStatus.queued, projected=True) == ["wr_reserved"]
+        assert await run_ids(method, WorkflowRunStatus.running, projected=True) == ["wr_started"]
+        assert await run_ids(method, WorkflowRunStatus.running, projected=False) == ["wr_reserved", "wr_started"]
+
+    assert (
+        await sqlite_db.workflow_runs.get_workflow_runs_count(
+            organization_id, [WorkflowRunStatus.queued], project_status_for_reads=True
+        )
+        == 1
+    )
+    assert (
+        await sqlite_db.workflow_runs.get_workflow_runs_count(
+            organization_id, [WorkflowRunStatus.running], project_status_for_reads=True
+        )
+        == 1
+    )
+    assert await sqlite_db.workflow_runs.get_workflow_runs_count(organization_id, [WorkflowRunStatus.running]) == 2
+
+    reserved = (
+        await sqlite_db.workflow_runs.get_workflow_runs(
+            organization_id, status=[WorkflowRunStatus.queued], project_status_for_reads=True
+        )
+    )[0]
+    assert reserved.status == WorkflowRunStatus.running
+    assert reserved.model_dump(mode="json")["status"] == WorkflowRunStatus.queued.value
 
 
 def _credential_run(
@@ -247,6 +334,8 @@ async def test_routed_task_queue_reaches_the_run_but_never_its_api_payload(sqlit
     assert run is not None
     assert run.task_queue == "fairness-patchright-1vcpu-4gb"
     assert "task_queue" not in run.model_dump()
+    await _assert_public_workflow_run_lists_filter_strict_reservations_by_projected_status(sqlite_db)
+    await _assert_get_all_runs_v2_projects_and_filters_strict_reservation_as_queued(sqlite_db)
 
 
 @pytest.mark.asyncio
@@ -1730,7 +1819,7 @@ async def test_preexisting_timeout_finish_only_updates_unfinished_timeout() -> N
 
 
 @pytest.mark.asyncio
-async def test_bulk_update_can_guard_status_and_returns_only_updated_ids() -> None:
+async def test_bulk_update_can_guard_status_and_returns_only_updated_ids(sqlite_db: AgentDB) -> None:
     execute_result = MagicMock()
     execute_result.scalars.return_value.all.return_value = ["wr_running"]
     session = AsyncMock()
@@ -1763,6 +1852,103 @@ async def test_bulk_update_can_guard_status_and_returns_only_updated_ids() -> No
         v for v in statement_parameters.values() if isinstance(v, dict) and "primary_infra_component" in v
     ]
     assert persisted_attribution and persisted_attribution[0]["primary_infra_component"] == "unattributed"
+    await _assert_bulk_update_queued_guard_claims_only_unstarted_strict_reservations(sqlite_db)
+
+
+async def _assert_bulk_update_queued_guard_claims_only_unstarted_strict_reservations(sqlite_db: AgentDB) -> None:
+    now = naive_utc_now()
+    workflow_run_ids = ["wr_queued", "wr_reserved", "wr_started", "wr_ordinary_running"]
+    queued = _workflow_run_model(workflow_run_id="wr_queued", queued_at=now)
+    reserved = _workflow_run_model(
+        workflow_run_id="wr_reserved",
+        queued_at=now,
+        status=WorkflowRunStatus.running.value,
+    )
+    reserved.otp_request_id = "otpr_reserved"
+    started = _workflow_run_model(
+        workflow_run_id="wr_started",
+        queued_at=now,
+        status=WorkflowRunStatus.running.value,
+    )
+    started.otp_request_id = "otpr_started"
+    started.started_at = now
+    ordinary_running = _workflow_run_model(
+        workflow_run_id="wr_ordinary_running",
+        queued_at=now,
+        status=WorkflowRunStatus.running.value,
+    )
+    async with sqlite_db.Session() as session:
+        session.add_all([queued, reserved, started, ordinary_running])
+        await session.commit()
+
+    updated = await sqlite_db.workflow_runs.bulk_update_workflow_runs(
+        workflow_run_ids=workflow_run_ids,
+        status=WorkflowRunStatus.timed_out,
+        only_if_status_in=[WorkflowRunStatus.queued],
+        include_strict_otp_reservations_as_queued=True,
+    )
+
+    assert set(updated) == {"wr_queued", "wr_reserved"}
+    async with sqlite_db.Session() as session:
+        rows = {
+            row.workflow_run_id: row.status
+            for row in (
+                await session.scalars(
+                    select(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
+                )
+            ).all()
+        }
+    assert rows == {
+        "wr_queued": WorkflowRunStatus.timed_out.value,
+        "wr_reserved": WorkflowRunStatus.timed_out.value,
+        "wr_started": WorkflowRunStatus.running.value,
+        "wr_ordinary_running": WorkflowRunStatus.running.value,
+    }
+
+
+async def _assert_get_all_runs_v2_projects_and_filters_strict_reservation_as_queued(sqlite_db: AgentDB) -> None:
+    organization = await sqlite_db.organizations.create_organization("strict runs list projection")
+    workflow = await sqlite_db.workflows.create_workflow(
+        title="Strict runs list projection",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=organization.organization_id,
+    )
+    strict_reservation = await sqlite_db.workflow_runs.create_workflow_run(
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        workflow_id=workflow.workflow_id,
+        organization_id=organization.organization_id,
+        otp_request_id="otpr_runs_v2_projection",
+    )
+    await sqlite_db.tasks.create_task_run(
+        task_run_type=RunType.workflow_run,
+        organization_id=organization.organization_id,
+        run_id=strict_reservation.workflow_run_id,
+        title=workflow.title,
+        status=WorkflowRunStatus.running.value,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+    )
+    await sqlite_db.tasks.create_task_run(
+        task_run_type=RunType.task_v2,
+        organization_id=organization.organization_id,
+        run_id="tsk_v2_running_control",
+        title="Running control",
+        status=WorkflowRunStatus.running.value,
+    )
+
+    all_rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id=organization.organization_id)
+    queued_rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id=organization.organization_id,
+        status=[WorkflowRunStatus.queued.value],
+    )
+    running_rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id=organization.organization_id,
+        status=[WorkflowRunStatus.running.value],
+    )
+
+    assert {row["run_id"]: row["status"] for row in all_rows}[strict_reservation.workflow_run_id] == "queued"
+    assert strict_reservation.workflow_run_id in {row["run_id"] for row in queued_rows}
+    assert strict_reservation.workflow_run_id not in {row["run_id"] for row in running_rows}
+    assert "tsk_v2_running_control" in {row["run_id"] for row in running_rows}
 
 
 @pytest.mark.asyncio
@@ -2456,9 +2642,15 @@ async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool)
 async def test_get_all_runs_v2_search_key_matches_run_identifiers(sqlite_db: AgentDB) -> None:
     await _seed_run_identifier_runs(sqlite_db, with_task_runs=True)
 
-    for search_key, expected_run_id in _RUN_IDENTIFIER_SEARCH_CASES:
+    async with sqlite_db.Session() as session:
+        task_run = (await session.scalars(select(TaskRunModel).where(TaskRunModel.run_id == "wr_webhook"))).one()
+        task_run.searchable_text = "projection-only-text-match"
+        await session.commit()
+
+    for search_key, expected_run_id in (*_RUN_IDENTIFIER_SEARCH_CASES, ("projection-only-text-match", "wr_webhook")):
         rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test", search_key=search_key)
         assert {row["run_id"] for row in rows} == {expected_run_id}, search_key
+        assert all("searchable_text" not in row for row in rows), search_key
 
 
 @pytest.mark.asyncio
@@ -2883,7 +3075,10 @@ async def test_get_all_runs_v2_status_filter_uses_coalesced_effective_status() -
     await repo.get_all_runs_v2(organization_id="o_test")
 
     where_clause = _where_clause_sql(captured["query"]).lower()
-    assert "coalesce(workflow_runs.status, task_runs.status) is not null" in where_clause
+    assert "coalesce(case when" in where_clause
+    assert "workflow_runs.otp_request_id is not null" in where_clause
+    assert "workflow_runs.started_at is null" in where_clause
+    assert "then 'queued' else workflow_runs.status end, task_runs.status) is not null" in where_clause
     assert "task_runs.status is not null" not in where_clause
 
 
@@ -3141,6 +3336,7 @@ async def test_get_all_runs_v2_workflow_filter_applies_to_search_fallback(sqlite
 
     assert "wr_orphan_target" not in {row["run_id"] for row in excluded_rows}
     assert "wr_orphan_target" in {row["run_id"] for row in included_rows}
+    assert all("searchable_text" not in row for row in included_rows)
 
 
 @pytest.mark.asyncio
@@ -3180,16 +3376,30 @@ async def test_get_all_runs_v2_workflow_filter_merges_orphan_runs_by_created_at(
                     created_at=oldest,
                     workflow_permanent_id="wpid_target",
                 ),
+                _workflow_run_model(
+                    workflow_run_id="wr_orphan_oldest",
+                    workflow_permanent_id="wpid_target",
+                    queued_at=oldest,
+                    status=WorkflowRunStatus.completed.value,
+                ),
             ]
         )
         await session.commit()
 
-    rows = await sqlite_db.workflow_runs.get_all_runs_v2(
-        organization_id="org_test",
-        workflow_permanent_ids=["wpid_target"],
-    )
-
-    assert [row["run_id"] for row in rows] == ["wr_backed_newest", "wr_orphan_middle", "wr_backed_oldest"]
+    expected_pages = [
+        ["wr_backed_newest", "wr_orphan_middle", "wr_backed_oldest"],
+        ["wr_orphan_oldest"],
+        [],
+    ]
+    for page, expected_run_ids in enumerate(expected_pages, start=1):
+        rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+            organization_id="org_test",
+            workflow_permanent_ids=["wpid_target"],
+            page=page,
+            page_size=3,
+        )
+        assert [row["run_id"] for row in rows] == expected_run_ids
+        assert all(type(row) is dict for row in rows)
 
 
 @pytest.mark.asyncio
@@ -3272,7 +3482,7 @@ async def test_get_all_runs_v2_workflow_filter_uses_joined_wpid_for_legacy_task_
 
 
 @pytest.mark.asyncio
-async def test_get_all_runs_v2_excludes_copilot_session_workflow_runs() -> None:
+async def test_get_all_runs_v2_excludes_ember_session_workflow_runs() -> None:
     captured: dict[str, Any] = {}
 
     async def _execute(query):
@@ -3288,11 +3498,11 @@ async def test_get_all_runs_v2_excludes_copilot_session_workflow_runs() -> None:
 
     where_clause = _where_clause_sql(captured["query"])
     assert "workflow_runs.copilot_session_id IS NULL" in where_clause
-    _assert_not_filtering_copilot_authored_workflows(where_clause)
+    _assert_not_filtering_ember_authored_workflows(where_clause)
 
 
 @pytest.mark.asyncio
-async def test_get_all_runs_excludes_copilot_session_workflow_runs() -> None:
+async def test_get_all_runs_excludes_ember_session_workflow_runs() -> None:
     captured: dict[str, Any] = {}
 
     async def _execute(query):
@@ -3309,11 +3519,11 @@ async def test_get_all_runs_excludes_copilot_session_workflow_runs() -> None:
 
     where_clause = _where_clause_sql(captured["query"])
     assert "workflow_runs.copilot_session_id IS NULL" in where_clause
-    _assert_not_filtering_copilot_authored_workflows(where_clause)
+    _assert_not_filtering_ember_authored_workflows(where_clause)
 
 
 @pytest.mark.asyncio
-async def test_workflow_run_history_queries_exclude_copilot_session_runs() -> None:
+async def test_workflow_run_history_queries_exclude_ember_session_runs() -> None:
     captured_queries: list[Any] = []
 
     async def _execute(query):
@@ -3336,7 +3546,7 @@ async def test_workflow_run_history_queries_exclude_copilot_session_runs() -> No
     for query in captured_queries:
         where_clause = _where_clause_sql(query)
         assert "workflow_runs.copilot_session_id IS NULL" in where_clause
-        _assert_not_filtering_copilot_authored_workflows(where_clause)
+        _assert_not_filtering_ember_authored_workflows(where_clause)
     workflow_runs_for_workflow_clause = _where_clause_sql(captured_queries[1])
     assert "workflow_runs.parent_workflow_run_id IS NULL" in workflow_runs_for_workflow_clause
 
@@ -3391,7 +3601,7 @@ async def test_get_workflow_runs_for_browser_session_filters_and_excludes(
     assert "workflow_runs.organization_id = 'o_test'" in where_clause
     assert "workflow_runs.parent_workflow_run_id IS NULL" in where_clause
     assert "workflow_runs.copilot_session_id IS NULL" in where_clause
-    _assert_not_filtering_copilot_authored_workflows(where_clause)
+    _assert_not_filtering_ember_authored_workflows(where_clause)
 
     rendered = str(captured["query"].compile(compile_kwargs={"literal_binds": True}))
     assert "ORDER BY workflow_runs.created_at DESC" in rendered
@@ -3410,8 +3620,8 @@ async def test_get_workflow_runs_for_browser_session_filters_and_excludes(
     )
     child = _workflow_run_model(workflow_run_id="wr_child", queued_at=now, browser_session_id="pbs_test")
     child.parent_workflow_run_id = runs[0].workflow_run_id
-    copilot = _workflow_run_model(workflow_run_id="wr_copilot", queued_at=now, browser_session_id="pbs_test")
-    copilot.copilot_session_id = "cps_test"
+    ember = _workflow_run_model(workflow_run_id="wr_copilot", queued_at=now, browser_session_id="pbs_test")
+    ember.ember_session_id = "cps_test"
     other_session = _workflow_run_model(
         workflow_run_id="wr_other_session", queued_at=now, browser_session_id="pbs_other"
     )
@@ -3421,7 +3631,7 @@ async def test_get_workflow_runs_for_browser_session_filters_and_excludes(
                 workflow_id="wf_test", workflow_permanent_id="wpid_test", title="test", workflow_definition={}
             )
         )
-        session.add_all([*runs, foreign, child, copilot, other_session])
+        session.add_all([*runs, foreign, child, ember, other_session])
         session.add_all(
             [
                 WorkflowRunAttemptModel(
@@ -3450,7 +3660,9 @@ async def test_get_workflow_runs_for_browser_session_filters_and_excludes(
 
 
 @pytest.mark.asyncio
-async def test_get_last_queued_workflow_run_can_include_browser_session_rows(sqlite_db: AgentDB) -> None:
+async def test_get_last_queued_workflow_run_lane_includes_session_rows_on_request_and_unstarted_reservations(
+    sqlite_db: AgentDB,
+) -> None:
     created_at = datetime(2026, 7, 4, 12, 0, tzinfo=timezone.utc)
 
     async with sqlite_db.Session() as session:
@@ -3468,7 +3680,33 @@ async def test_get_last_queued_workflow_run_can_include_browser_session_rows(sql
                 queued_at=created_at,
             )
         )
+        # A marked run is reserved as running before it starts; the started one is newer, so a raw
+        # running match would return it instead of the reservation.
+        for run_id, started_at, minutes in (("wr_reserved", None, 1), ("wr_reserved_started", created_at, 2)):
+            session.add(
+                WorkflowRunModel(
+                    workflow_run_id=run_id,
+                    workflow_id="wf_test",
+                    workflow_permanent_id="wpid_reserved",
+                    organization_id="org_test",
+                    status=WorkflowRunStatus.running.value,
+                    otp_request_id=f"otpr_{run_id}",
+                    started_at=started_at,
+                    sequential_key="key_reserved",
+                    created_at=created_at,
+                    modified_at=created_at + timedelta(minutes=minutes),
+                    queued_at=created_at,
+                )
+            )
         await session.commit()
+
+    reserved_predecessor = await sqlite_db.workflow_runs.get_last_queued_workflow_run(
+        "wpid_reserved",
+        "org_test",
+        "key_reserved",
+    )
+    assert reserved_predecessor is not None
+    assert reserved_predecessor.workflow_run_id == "wr_reserved"
 
     default_result = await sqlite_db.workflow_runs.get_last_queued_workflow_run(
         "wpid_test",
@@ -4703,10 +4941,28 @@ async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sql
                     created_by="user_prompter",
                 ),
                 TaskV2Model(observer_cruise_id="tsk_v2_1", organization_id="org_test", workflow_run_id="wr_task_v2"),
+                TaskV2Model(
+                    observer_cruise_id="tsk_v2_missing", organization_id="org_test", workflow_run_id="wr_missing"
+                ),
+                TaskV2Model(
+                    observer_cruise_id="tsk_v2_foreign", organization_id="org_other", workflow_run_id="wr_task_v2"
+                ),
                 _task_run_model(run_id="wr_member", created_at=now, workflow_permanent_id="wpid_member"),
                 _task_run_model(
                     run_id="tsk_v2_1",
                     created_at=now - timedelta(seconds=1),
+                    workflow_permanent_id=None,
+                    task_run_type=RunType.task_v2.value,
+                ),
+                _task_run_model(
+                    run_id="tsk_v2_missing",
+                    created_at=now - timedelta(seconds=2),
+                    workflow_permanent_id=None,
+                    task_run_type=RunType.task_v2.value,
+                ),
+                _task_run_model(
+                    run_id="tsk_v2_foreign",
+                    created_at=now - timedelta(seconds=3),
                     workflow_permanent_id=None,
                     task_run_type=RunType.task_v2.value,
                 ),
@@ -4719,11 +4975,13 @@ async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sql
     assert {row["run_id"]: row["created_by"] for row in rows} == {
         "wr_member": "user_member",
         "tsk_v2_1": "user_prompter",
+        "tsk_v2_missing": None,
+        "tsk_v2_foreign": None,
     }
 
 
 @pytest.mark.asyncio
-async def test_browser_session_metadata_query_is_select_only_scoped_and_includes_copilot_children():
+async def test_browser_session_metadata_query_is_select_only_scoped_and_includes_ember_children():
     session = MagicMock()
     result = MagicMock()
     result.mappings.return_value.all.return_value = []
@@ -4767,15 +5025,13 @@ async def test_metadata_route_reads_real_rows_with_no_reconcile_write_or_provide
     from skyvern.forge.sdk.routes import browser_sessions as browser_routes
 
     now = datetime(2026, 10, 7, 9, 13, tzinfo=UTC)
-    copilot = _workflow_run_model(
-        workflow_run_id="wr_201", queued_at=now, browser_session_id="pbs_123", status="paused"
-    )
-    copilot.copilot_session_id = "wcc_201"
-    copilot.credits_used = 7
+    ember = _workflow_run_model(workflow_run_id="wr_201", queued_at=now, browser_session_id="pbs_123", status="paused")
+    ember.ember_session_id = "wcc_201"
+    ember.credits_used = 7
     child = _workflow_run_model(workflow_run_id="wr_202", queued_at=now, browser_session_id="pbs_456")
     child.parent_workflow_run_id = "wr_201"
     pinned = _workflow_run_model(workflow_run_id="wr_204", queued_at=now, browser_session_id=None, status="paused")
-    pinned.copilot_session_id = "wcc_204"
+    pinned.ember_session_id = "wcc_204"
     pinned.credits_used = 9
     foreign = _workflow_run_model(
         workflow_run_id="wr_203", queued_at=now, browser_session_id="pbs_123", organization_id="org_other"
@@ -4798,7 +5054,7 @@ async def test_metadata_route_reads_real_rows_with_no_reconcile_write_or_provide
             )
         )
         await session.flush()
-        session.add_all([copilot, child, foreign, pinned])
+        session.add_all([ember, child, foreign, pinned])
         await session.flush()
         session.add_all(
             [
@@ -5400,7 +5656,7 @@ async def test_latest_finished_run_for_a_version_is_its_newest_final_top_level_r
             workflow_id="wf_draft",
             status=WorkflowRunStatus.completed.value,
         )
-        draft_test.copilot_session_id = "wcc_test"
+        draft_test.ember_session_id = "wcc_test"
         session.add(draft_test)
         await session.commit()
 

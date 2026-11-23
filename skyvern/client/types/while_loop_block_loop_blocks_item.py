@@ -16,6 +16,7 @@ from .branch_condition import BranchCondition
 from .code_block_data_schema import CodeBlockDataSchema
 from .code_block_parameters_item import CodeBlockParametersItem
 from .code_block_step import CodeBlockStep
+from .email_organize_action import EmailOrganizeAction
 from .email_inbox_block_email_client import EmailInboxBlockEmailClient
 from .email_inbox_block_parameters_item import EmailInboxBlockParametersItem
 from .extraction_block_data_schema import ExtractionBlockDataSchema
@@ -179,6 +180,8 @@ class WhileLoopBlockLoopBlocksItem_EmailInbox(UniversalBaseModel):
     ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     email_client: EmailInboxBlockEmailClient
+    credential_source: typing.Optional[typing.Literal["native", "nango"]] = None
+    connection_id: typing.Optional[str] = None
     credential_id: typing.Optional[str] = None
     folder: typing.Optional[str] = None
     prompt: typing.Optional[str] = None
@@ -187,6 +190,8 @@ class WhileLoopBlockLoopBlocksItem_EmailInbox(UniversalBaseModel):
     newer_than_days: typing.Optional[int] = None
     max_results: typing.Optional[int] = None
     include_body: typing.Optional[bool] = None
+    organize_action: typing.Optional[EmailOrganizeAction] = None
+    organize_label: typing.Optional[str] = None
     parameters: typing.Optional[typing.List[EmailInboxBlockParametersItem]] = None
 
     if IS_PYDANTIC_V2:
@@ -303,6 +308,7 @@ class WhileLoopBlockLoopBlocksItem_FileUpload(UniversalBaseModel):
     azure_blob_container_name: typing.Optional[str] = None
     google_credential_id: typing.Optional[str] = None
     google_drive_folder_id: typing.Optional[str] = None
+    google_drive_save_as_sheet: typing.Optional[bool] = None
     sftp_host: typing.Optional[str] = None
     sftp_port: typing.Optional[int] = None
     sftp_username: typing.Optional[str] = None

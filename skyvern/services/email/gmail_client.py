@@ -124,6 +124,17 @@ def decode(data: str | None) -> str:
     return decoded
 
 
+def body_text(decoded: str, mime_type: str) -> str:
+    if mime_type != "text/html":
+        return decoded
+
+    from bs4 import BeautifulSoup
+
+    from skyvern.forge.sdk.api.email import _plain_text
+
+    return _plain_text(BeautifulSoup(decoded, "html.parser")).strip()
+
+
 def payload_text(payload: dict[str, Any]) -> list[str]:
     texts: list[str] = []
     raw_body = payload.get("body")
@@ -131,7 +142,7 @@ def payload_text(payload: dict[str, Any]) -> list[str]:
     decoded = decode(body.get("data"))
     mime_type = str(payload.get("mimeType") or "").lower()
     if decoded and mime_type in {"text/plain", "text/html"}:
-        texts.append(decoded)
+        texts.append(body_text(decoded, mime_type))
     for part in payload.get("parts") or []:
         if isinstance(part, dict):
             texts.extend(payload_text(part))

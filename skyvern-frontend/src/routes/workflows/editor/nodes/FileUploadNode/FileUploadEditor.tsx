@@ -3,7 +3,9 @@ import { useNodesData } from "@xyflow/react";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
 import {
   Select,
@@ -18,6 +20,7 @@ import { helpTooltips } from "../../helpContent";
 import { SftpPrivateKeyField } from "../components/SftpPrivateKeyField";
 import { type FileUploadNode, type FileUploadNodeData } from "./types";
 import { useUpdate } from "../../useUpdate";
+import { useGoogleDriveFolderHelp } from "../useGoogleDriveFolderHelp";
 
 function FileUploadEditor({ blockId }: { blockId: string }) {
   // Subscribe to this node's data slice. The sidebar mount lives outside the
@@ -37,6 +40,10 @@ function FileUploadEditorBody({
   blockId: string;
   data: FileUploadNodeData;
 }) {
+  const driveFolderHelp = useGoogleDriveFolderHelp();
+  // Undefined while flags load, if they fail, and always in OSS builds: neither enabled nor known disabled.
+  const saveAsSheetFlag = useFeatureFlag("SHEETS_SAVE_AS_SHEET");
+  const saveAsSheetEnabled = saveAsSheetFlag === true;
   const {
     editable,
     storageType,
@@ -52,6 +59,7 @@ function FileUploadEditorBody({
     azureBlobContainerName,
     googleCredentialId,
     googleDriveFolderId,
+    googleDriveSaveAsSheet,
     sftpHost,
     sftpPort,
     sftpUsername,
@@ -314,7 +322,7 @@ function FileUploadEditorBody({
               <Label className="text-sm text-muted-foreground">
                 Google Drive Folder ID (Optional)
               </Label>
-              <HelpTooltip content="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root." />
+              <HelpTooltip content={driveFolderHelp} />
             </div>
             <WorkflowBlockInputTextarea
               name="googleDriveFolderId"
@@ -324,6 +332,34 @@ function FileUploadEditorBody({
               className="nopan text-xs"
             />
           </div>
+          {(saveAsSheetEnabled || googleDriveSaveAsSheet) && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between">
+                <Label
+                  htmlFor={`${blockId}-google-drive-save-as-sheet`}
+                  className="text-sm text-muted-foreground"
+                >
+                  Save as Google Sheet
+                </Label>
+                <Switch
+                  id={`${blockId}-google-drive-save-as-sheet`}
+                  checked={googleDriveSaveAsSheet}
+                  disabled={!editable}
+                  onCheckedChange={(checked) => {
+                    if (checked && !saveAsSheetEnabled) return;
+                    update({ googleDriveSaveAsSheet: checked });
+                  }}
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {saveAsSheetFlag === undefined
+                  ? "Saving as a Google Sheet must be enabled for this organization."
+                  : saveAsSheetEnabled
+                    ? "CSV and Excel files are saved as Google Sheets."
+                    : "Not available for this organization. Turn it off to upload the original files."}
+              </p>
+            </div>
+          )}
         </>
       )}
 

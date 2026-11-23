@@ -10,7 +10,7 @@ import pytest
 
 from skyvern.forge.failure_classifier import HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
-from skyvern.services import task_v2_service
+from skyvern.services import task_v2_service, workflow_service
 from tests.unit.conftest import cancel_once_parked
 
 PRIMARY = {"category": "WEBSITE_ERROR", "confidence_float": 0.9, "reasoning": "x"}
@@ -135,6 +135,7 @@ class Harness:
 async def test_run_task_v2_sends_its_terminal_webhook_once_cleanup_recorded_the_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    build_run_response = task_v2_service.build_task_v2_run_response
     harness = Harness(monkeypatch)
 
     await task_v2_service.run_task_v2(ORGANIZATION, "oc_1")  # type: ignore[arg-type]
@@ -142,6 +143,14 @@ async def test_run_task_v2_sends_its_terminal_webhook_once_cleanup_recorded_the_
     assert harness.order == ["terminal_write", "cleanup", "webhook"]
     [payload] = harness.payloads
     assert payload["failure_category"] == [PRIMARY, DIAGNOSTIC]
+
+    allowed_access = SimpleNamespace(allowed=True, redact_output=lambda value: value)
+    monkeypatch.setattr(task_v2_service, "browser_session_artifact_access", AsyncMock(return_value=allowed_access))
+    monkeypatch.setattr(task_v2_service, "child_run_artifact_access", AsyncMock(return_value=allowed_access))
+    monkeypatch.setattr(workflow_service, "get_workflow_run_response", AsyncMock(return_value=None))
+    reconstructed = await build_run_response(harness.task_v2.model_copy(update={"otp_request_id": "otpr_response"}))
+    assert reconstructed.run_request is not None
+    assert reconstructed.run_request.otp_request_id == "otpr_response"
 
 
 @pytest.mark.asyncio

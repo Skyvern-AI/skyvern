@@ -863,8 +863,10 @@ class BrowserContextFactory:
         # Inside a run, its recordings and HAR go in <root>/<org>/<run>, which the run's teardown deletes.
         today = datetime.utcnow().strftime("%Y-%m-%d")
         video_dir = get_current_run_dir(settings.VIDEO_PATH) or f"{settings.VIDEO_PATH}/{today}"
-        har_folder = get_current_run_dir(settings.HAR_PATH) or f"{settings.HAR_PATH}/{today}"
-        har_dir = f"{har_folder}/{BrowserContextFactory.get_subdir()}.har"
+        har_dir: str | None = None
+        if settings.BROWSER_HAR_RECORDING_ENABLED:
+            har_folder = get_current_run_dir(settings.HAR_PATH) or f"{settings.HAR_PATH}/{today}"
+            har_dir = f"{har_folder}/{BrowserContextFactory.get_subdir()}.har"
 
         extension_paths = []
         if settings.EXTENSIONS and settings.EXTENSIONS_BASE_PATH:

@@ -347,6 +347,27 @@ test("isElementVisible: display:contents parent containing an option does not ov
       );
     });
   }
+  for (const [name, editable, interactable] of [
+    ["designMode block", true, true],
+    ["editable block that ignores pointer events", true, false],
+    ["static block", false, true],
+  ]) {
+    const block = el({ attributes: { unique_id: name } });
+    block.isContentEditable = editable;
+    block.attributes = [];
+    block.ownerDocument = { documentElement: { hasAttribute: () => false } };
+    const serialized = await context.buildElementObject(
+      "main.frame",
+      block,
+      interactable,
+    );
+    test(`serializer records computed editability: ${name}`, () => {
+      assert(
+        serialized.isContentEditable === (editable ? true : undefined),
+        `${name}: isContentEditable is ${serialized.isContentEditable}`,
+      );
+    });
+  }
   test("OTP stamp pass covers hidden light and shadow inputs", () => {
     const root = el({
       tagName: "html",

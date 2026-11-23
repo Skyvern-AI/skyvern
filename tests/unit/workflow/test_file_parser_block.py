@@ -245,6 +245,62 @@ class TestValidateFileType:
 
 @pytest.mark.asyncio
 class TestFileParserBlockAutoDetectExecution:
+    async def test_configured_service_bypasses_local_parsers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"synthetic")
+        block = _make_file_parser_block("https://example.com/download", FileType.AUTO_DETECT)
+        remote_parse = AsyncMock(
+            return_value=block_module.IsolatedParserResult(
+                file_type="csv",
+                detection_source="magic",
+                kind="json",
+                metadata={},
+                content=[{"name": "alpha"}],
+            )
+        )
+        monkeypatch.setattr(settings, "FILE_PARSER_SERVICE_TARGET", "file-parser.test.svc:7820")
+        monkeypatch.setattr(block_module, "parse_file_remotely", remote_parse)
+        monkeypatch.setattr(
+            FileParserBlock, "_detect_file_type_from_url", MagicMock(side_effect=AssertionError("local detect"))
+        )
+        monkeypatch.setattr(
+            FileParserBlock, "validate_file_type", MagicMock(side_effect=AssertionError("local validate"))
+        )
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == [{"name": "alpha"}]
+        assert block.file_type == FileType.CSV
+
+        image_block = _make_file_parser_block("https://example.com/pages.tiff", FileType.AUTO_DETECT)
+        remote_parse.return_value = block_module.IsolatedParserResult(
+            file_type="image",
+            detection_source="magic",
+            kind="images",
+            metadata={"total_pages": 2},
+            images=[b"synthetic-page-1", b"synthetic-page-2"],
+        )
+        received_images: list[bytes | list[bytes]] = []
+
+        async def ocr_images(
+            _self: FileParserBlock,
+            image_bytes: bytes | list[bytes],
+            workflow_run_block_id: str | None = None,
+            organization_id: str | None = None,
+        ) -> str:
+            received_images.append(image_bytes)
+            return "synthetic pages"
+
+        monkeypatch.setattr(FileParserBlock, "_ocr_image_bytes", ocr_images)
+        image_result = await _execute_with_downloaded_file(image_block, path, monkeypatch)
+
+        assert image_result.success is True
+        assert image_result.output_parameter_value == {"value": "synthetic pages"}
+        assert received_images == [[b"synthetic-page-1", b"synthetic-page-2"]]
+
     async def test_docx_downloaded_from_extensionless_url_is_parsed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1183,14 +1239,15 @@ def _build_pdf(
     cid_to_unicode_range: str | None = None,
     cid_to_unicode_char: str | None = None,
     content_length: int | None = None,
+    page_tree_depth: int = 1,
 ) -> bytes:
     """Build a one-page PDF that always draws plain ASCII codes, so ``remap`` alone makes the ToUnicode map lie.
 
     The other options each shape one structure a limit test needs: Flate, LZW, run-length, gzip-wrapped Flate or JBIG2
     content (at most one; gzip reaches pypdf's recovery loop, JBIG2 stays undecoded), a PNG predictor as
     (Colors, Columns) on Flate content, a Flate xref stream, repeated /Contents, a CID font with its /W array and
-    ToUnicode bfrange or bfchar, and a replaced content /Length. Options that would silently override or ignore each
-    other raise ValueError.
+    ToUnicode bfrange or bfchar, a replaced content /Length, and the page nested page_tree_depth levels deep. Options
+    that would silently override or ignore each other raise ValueError.
     """
     if sum([flate_content, lzw_content, run_length_content, gzip_content, jbig2_content]) > 1:
         raise ValueError("the content encodings are mutually exclusive")
@@ -1266,6 +1323,13 @@ def _build_pdf(
             "CMapName currentdict /CMap defineresource pop\nend\nend"
         ).encode()
         objects.append(b"<< /Length %d >>\nstream\n" % len(cmap) + cmap + b"\nendstream")
+    if page_tree_depth > 1:
+        chain = [2, *range(len(objects) + 1, len(objects) + page_tree_depth)]
+        objects[1] = b"<< /Type /Pages /Kids [%d 0 R] /Count 1 >>" % chain[1]
+        objects[2] = objects[2].replace(b"/Parent 2 0 R", b"/Parent %d 0 R" % chain[-1])
+        for level in range(1, page_tree_depth):
+            kid = chain[level + 1] if level + 1 < page_tree_depth else 3
+            objects.append(b"<< /Type /Pages /Parent %d 0 R /Kids [%d 0 R] /Count 1 >>" % (chain[level - 1], kid))
 
     out = bytearray(b"%PDF-1.4\n")
     offsets = []
@@ -1525,6 +1589,16 @@ class TestPypdfLimitFallback:
                 {},
                 id="to_unicode_code_length",
             ),
+            # The parent stops at the depth limit, so the size cap is hit by the pypdf retry in the capped child.
+            pytest.param(
+                {
+                    "page_tree_depth": 150,
+                    "cid_widths": b"[0 [500]]",
+                    "cid_to_unicode_range": "<000000000000000041> <000000000000000042> <0041>",
+                },
+                {},
+                id="to_unicode_code_length_in_deep_page_tree",
+            ),
         ],
     )
     def test_other_size_cap_pdfminer_lacks_fails_without_falling_back(
@@ -1556,7 +1630,8 @@ class TestPypdfLimitFallback:
                 {},
                 id="oversized_bfchar_string",
             ),
-            pytest.param({}, {"page_tree_maximum_depth": 0}, id="page_tree_depth"),
+            # Past pdfminer's recursion limit, so only the pypdf retry in the capped child reads it.
+            pytest.param({"page_tree_depth": 1200}, {}, id="page_tree_depth"),
             pytest.param({"flate_content": True, "png_predictor": (17, 1)}, {}, id="predictor_colors"),
             pytest.param(
                 {"flate_content": True, "png_predictor": (1, 17)},
@@ -1577,6 +1652,7 @@ class TestPypdfLimitFallback:
                 PdfReader(str(pdf_path)).pages[0].extract_text()
 
             assert "17 Aug 26" in extract_pdf_file(str(pdf_path))
+            assert validate_pdf_file(str(pdf_path))
 
     def test_jbig2_buffer_limit_still_falls_back_to_pdfplumber(self, tmp_path: Path) -> None:
         # pdfminer passes a JBIG2 stream through undecoded, so only pypdf's jbig2dec call can hit the limit.

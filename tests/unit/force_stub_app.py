@@ -6,7 +6,7 @@ from skyvern.config import settings
 from skyvern.forge import set_force_app_instance
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_app import ForgeApp
-from skyvern.forge.sdk.copilot.browser_ablation import CopilotBrowserCodeMode
+from skyvern.forge.sdk.ember.browser_ablation import EmberBrowserCodeMode
 from skyvern.forge.sdk.services.request_principal import APIKeyAuthProfile
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
@@ -100,12 +100,16 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.should_use_codeblock_runner = AsyncMock(return_value=False)
     # Same footgun on the copilot browser-code gate: an auto-mocked mode would offer run_browser_code
     # instead of the OSS default.
-    fake_app_module.AGENT_FUNCTION.copilot_browser_code_mode = AsyncMock(return_value=CopilotBrowserCodeMode.OFF)
+    fake_app_module.AGENT_FUNCTION.ember_browser_code_mode = AsyncMock(return_value=EmberBrowserCodeMode.OFF)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
+    fake_app_module.AGENT_FUNCTION.relay_http_request_hop = base_agent_function.relay_http_request_hop
+    fake_app_module.AGENT_FUNCTION.relay_http_download_hop = base_agent_function.relay_http_download_hop
+    fake_app_module.AGENT_FUNCTION.classify_failure = base_agent_function.classify_failure
     fake_app_module.AGENT_FUNCTION.note_page_action = base_agent_function.note_page_action
     fake_app_module.AGENT_FUNCTION.page_submission_evidence = base_agent_function.page_submission_evidence
     fake_app_module.AGENT_FUNCTION.settle_page_reload_signal = base_agent_function.settle_page_reload_signal
+    fake_app_module.AGENT_FUNCTION.agent_skills = base_agent_function.agent_skills
     fake_app_module.AGENT_FUNCTION.enforce_platform_aws_secret_ownership = (
         base_agent_function.enforce_platform_aws_secret_ownership
     )
@@ -126,13 +130,16 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.enforce_folder_access = base_agent_function.enforce_folder_access
     fake_app_module.AGENT_FUNCTION.enforce_folder_access_for_runs = base_agent_function.enforce_folder_access_for_runs
     fake_app_module.AGENT_FUNCTION.on_folder_created = base_agent_function.on_folder_created
-    fake_app_module.AGENT_FUNCTION.copilot_browser_pattern_accepting_calls = (
-        base_agent_function.copilot_browser_pattern_accepting_calls
+    fake_app_module.AGENT_FUNCTION.ember_browser_pattern_accepting_calls = (
+        base_agent_function.ember_browser_pattern_accepting_calls
     )
-    fake_app_module.AGENT_FUNCTION.copilot_trigger_sources = base_agent_function.copilot_trigger_sources
+    fake_app_module.AGENT_FUNCTION.ember_trigger_sources = base_agent_function.ember_trigger_sources
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
+    fake_app_module.AGENT_FUNCTION.task_v3_authorized_agent_default = (
+        base_agent_function.task_v3_authorized_agent_default
+    )
     fake_app_module.AGENT_FUNCTION.task_v3_age_default = base_agent_function.task_v3_age_default
     fake_app_module.AGENT_FUNCTION.task_v3_application_defaults = base_agent_function.task_v3_application_defaults
     fake_app_module.AGENT_FUNCTION.task_v3_application_context_texts = (
@@ -150,7 +157,7 @@ def create_forge_stub_app() -> ForgeApp:
     # Copilot worker-dispatch gate — _LazyNamespace would auto-mock this as a truthy AsyncMock
     # and route copilot block runs down the worker-dispatch path. Match the real OSS base
     # default (False) so unit tests exercise the unavailable-worker path.
-    fake_app_module.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
+    fake_app_module.AGENT_FUNCTION.should_dispatch_ember_block_run_to_worker = AsyncMock(return_value=False)
     # Advisory scanner hook — _LazyNamespace would auto-mock this as an AsyncMock returning a
     # non-iterable MagicMock, silently exercising the fail-open path instead of the OSS no-op.
     fake_app_module.AGENT_FUNCTION.scan_code_block_source = AsyncMock(return_value=[])
@@ -158,15 +165,16 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.browser_session_create_admission = MagicMock(return_value=nullcontext())
     # Sync methods — _LazyNamespace would auto-mock these as AsyncMock and break callers that use
     # the return value directly. Match the real OSS defaults.
-    fake_app_module.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type = MagicMock(return_value=None)
-    fake_app_module.AGENT_FUNCTION.allow_copilot_inline_code_execution = MagicMock(return_value=False)
+    fake_app_module.AGENT_FUNCTION.browser_session_creation_disallows_fallback = (
+        base_agent_function.browser_session_creation_disallows_fallback
+    )
+    fake_app_module.AGENT_FUNCTION.resolve_ember_dispatch_trigger_type = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.allow_ember_inline_code_execution = MagicMock(return_value=False)
     fake_app_module.AGENT_FUNCTION.is_backup_queue_organization = base_agent_function.is_backup_queue_organization
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_member_api_key = AsyncMock(return_value=None)
-    fake_app_module.AGENT_FUNCTION.resolve_copilot_loopback_api_key = (
-        base_agent_function.resolve_copilot_loopback_api_key
-    )
-    fake_app_module.AGENT_FUNCTION.copilot_turn_control_allowed = base_agent_function.copilot_turn_control_allowed
+    fake_app_module.AGENT_FUNCTION.resolve_ember_loopback_api_key = base_agent_function.resolve_ember_loopback_api_key
+    fake_app_module.AGENT_FUNCTION.ember_turn_control_allowed = base_agent_function.ember_turn_control_allowed
     fake_app_module.AGENT_FUNCTION.resolve_api_key_profile = AsyncMock(
         return_value=APIKeyAuthProfile("full_org", None, True)
     )
@@ -249,6 +257,7 @@ def make_workflow_run_attempts_fake() -> SimpleNamespace:
         get_attempts=AsyncMock(return_value=[]),
         get_interim_payload_snapshot=AsyncMock(return_value={}),
         get_latest_attempts_for_runs=AsyncMock(return_value={}),
+        get_latest_attempt_summaries_for_runs=AsyncMock(return_value={}),
         list_stale_pending_retries=AsyncMock(return_value=[]),
         list_attempts_needing_recovery=AsyncMock(return_value=[]),
         list_stale_dispatch_claims=AsyncMock(return_value=[]),

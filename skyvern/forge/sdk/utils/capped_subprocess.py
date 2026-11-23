@@ -26,7 +26,15 @@ LOG = structlog.get_logger(__name__)
 _T = TypeVar("_T")
 _Ts = TypeVarTuple("_Ts")
 
-CappedSubprocessFailure = Literal["error", "out_of_memory", "timeout", "crashed", "result_too_large", "no_headroom"]
+CappedSubprocessFailure = Literal[
+    "error",
+    "out_of_memory",
+    "timeout",
+    "cancelled",
+    "crashed",
+    "result_too_large",
+    "no_headroom",
+]
 
 # Only Linux enforces RLIMIT_AS; macOS refuses to lower it, so there the memory watchdog is the only memory guard.
 MEMORY_CAP_ENFORCED = sys.platform.startswith("linux")
@@ -47,12 +55,15 @@ _EXIT_GRACE_SECONDS = 5
 _WATCHDOG_POLL_SECONDS = 0.25
 _STDERR_TAIL_BYTES = 4096
 _URL_QUERY = re.compile(r"(\w+://[^\s?#]*)[?#]\S*")
+_PROCESS_GROUP_ENV = "SKYVERN_CAPPED_SUBPROCESS_GROUP"
 
 
 class CappedSubprocessError(Exception):
-    def __init__(self, message: str, kind: CappedSubprocessFailure) -> None:
+    def __init__(self, message: str, kind: CappedSubprocessFailure, error_type: str | None = None) -> None:
         super().__init__(message)
         self.kind = kind
+        # The class name of the exception the work raised in the child, when kind is "error".
+        self.error_type = error_type
 
 
 class _ResultTooLarge(Exception):
@@ -142,13 +153,14 @@ class _MemoryWatchdog:
     """Reads the child's resident memory with psutil and kills it once it has grown past its allowance from the
     baseline taken when it reported ready. RLIMIT_AS bounds a Linux child first; here it also bounds a macOS one."""
 
-    def __init__(self, process: subprocess.Popen[bytes], allowance_bytes: int) -> None:
+    def __init__(self, process: subprocess.Popen[bytes], allowance_bytes: int, owns_process_group: bool) -> None:
         self.allowance_bytes = allowance_bytes
         self.baseline_bytes: int | None = None
         self.peak_sampled_bytes: int | None = None
         self.rss_at_kill_bytes: int | None = None
         self.killed = threading.Event()
         self._process = process
+        self._owns_process_group = owns_process_group
         self._child: psutil.Process | None = None
         self._lock = threading.Lock()
         self._finished = threading.Event()
@@ -197,7 +209,7 @@ class _MemoryWatchdog:
             if rss > baseline + self.allowance_bytes:
                 self.rss_at_kill_bytes = rss
                 self.killed.set()
-                self._process.kill()
+                _kill_process_tree(self._process, self._owns_process_group)
                 return
 
 
@@ -238,6 +250,7 @@ def run_in_capped_subprocess(
     timeout_seconds: float,
     result_memory_factor: int = DEFAULT_RESULT_MEMORY_FACTOR,
     log_fields: Mapping[str, object] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> _T:
     """Call func(*args) in a child that may grow by up to memory_limit_bytes once func's module is imported, by less
     when the pod has less free memory, or not at all (no_headroom). func is pickled by reference, so it must be a
@@ -256,6 +269,7 @@ def run_in_capped_subprocess(
             timeout_seconds=timeout_seconds,
             target=target,
             log_fields=log_fields,
+            cancel_event=cancel_event,
         )
     result_reserve_bytes = max_result_bytes * result_memory_factor
     with _reserved_memory(memory_limit_bytes, result_reserve_bytes) as reservation:
@@ -283,6 +297,7 @@ def run_in_capped_subprocess(
             timeout_seconds=timeout_seconds,
             target=target,
             log_fields=fields,
+            cancel_event=cancel_event,
         )
 
 
@@ -297,6 +312,7 @@ def _run_child(
     timeout_seconds: float,
     target: str,
     log_fields: Mapping[str, object] | None,
+    cancel_event: threading.Event | None,
 ) -> _T:
     request = pickle.dumps(
         {
@@ -310,18 +326,28 @@ def _run_child(
         protocol=pickle.HIGHEST_PROTOCOL,
     )
     started = time.monotonic()
+    owns_process_group = os.name == "posix" and os.environ.get(_PROCESS_GROUP_ENV) != "1"
     process = subprocess.Popen(
         [sys.executable, "-I", "-c", _CHILD_BOOTSTRAP, *sys.path],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env={**os.environ, _PROCESS_GROUP_ENV: "1"},
+        start_new_session=owns_process_group,
     )
     stdin, stdout, stderr = (cast(IO[bytes], stream) for stream in (process.stdin, process.stdout, process.stderr))
     stderr_tail = bytearray()
     timed_out = threading.Event()
+    cancelled = threading.Event()
+    finished = threading.Event()
     drain: threading.Thread | None = None
+    cancel_watch: threading.Thread | None = None
     timer: threading.Timer | None = None
-    watchdog = _MemoryWatchdog(process, allowance if allowance is not None else memory_limit_bytes)
+    watchdog = _MemoryWatchdog(
+        process,
+        allowance if allowance is not None else memory_limit_bytes,
+        owns_process_group,
+    )
     outcome: dict[str, Any] | None = None
     result_error: str | None = None
     result_problem: str | None = None
@@ -329,7 +355,14 @@ def _run_child(
 
     def _kill_on_timeout() -> None:
         timed_out.set()
-        process.kill()
+        _kill_process_tree(process, owns_process_group)
+
+    def _kill_on_cancel() -> None:
+        while not finished.wait(_WATCHDOG_POLL_SECONDS):
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled.set()
+                _kill_process_tree(process, owns_process_group)
+                return
 
     try:
         draining = threading.Thread(target=_keep_tail, args=(stderr, stderr_tail), daemon=True)
@@ -338,6 +371,9 @@ def _run_child(
         timer = threading.Timer(timeout_seconds, _kill_on_timeout)
         timer.daemon = True
         timer.start()
+        if cancel_event is not None:
+            cancel_watch = threading.Thread(target=_kill_on_cancel, daemon=True)
+            cancel_watch.start()
         watchdog.start()
         # A child that died before reading its request closes the pipe; reading its exit below reports that. Stdin
         # stays open for the ready acknowledgement and until the child's memory has been read.
@@ -364,14 +400,17 @@ def _run_child(
         except Exception as exc:
             result_error = type(exc).__name__
     finally:
+        finished.set()
         if timer is not None:
             timer.cancel()
+        if cancel_watch is not None:
+            cancel_watch.join(timeout=2)
         watchdog.stop()
         if outcome is None and process.poll() is None:
-            process.kill()
+            _kill_process_tree(process, owns_process_group)
         with contextlib.suppress(OSError):
             stdin.close()
-        returncode = _wait_for_exit(process)
+        returncode = _wait_for_exit(process, owns_process_group)
         if drain is not None:
             drain.join(timeout=5)
         stdout.close()
@@ -421,6 +460,9 @@ def _run_child(
     elif result_problem is not None:
         kind = "crashed"
         message = f"returned a result that {result_problem}"
+    elif cancelled.is_set():
+        kind = "cancelled"
+        message = "was stopped because its caller cancelled"
     elif timed_out.is_set() or (sys.platform != "win32" and returncode == -signal.SIGXCPU):
         kind = "timeout"
         message = f"did not finish within {_describe_seconds(timeout_seconds)} and was stopped"
@@ -446,18 +488,46 @@ def _run_child(
     )
 
 
-def _wait_for_exit(process: subprocess.Popen[bytes]) -> int:
+def _kill_process_tree(process: subprocess.Popen[bytes], owns_process_group: bool) -> None:
+    try:
+        descendants = psutil.Process(process.pid).children(recursive=True)
+    except psutil.Error:
+        descendants = []
+    if owns_process_group:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        else:
+            _, alive = psutil.wait_procs(descendants, timeout=_EXIT_GRACE_SECONDS)
+            for descendant in alive:
+                with contextlib.suppress(psutil.Error):
+                    descendant.kill()
+            psutil.wait_procs(alive, timeout=_EXIT_GRACE_SECONDS)
+            return
+    if process.poll() is not None:
+        return
+    for descendant in reversed(descendants):
+        with contextlib.suppress(psutil.Error):
+            descendant.kill()
+    with contextlib.suppress(OSError):
+        process.kill()
+    psutil.wait_procs(descendants, timeout=_EXIT_GRACE_SECONDS)
+
+
+def _wait_for_exit(process: subprocess.Popen[bytes], owns_process_group: bool = False) -> int:
     # A child that has handed over its outcome exits at once; one that does not is not allowed to hold the call.
     try:
         return process.wait(timeout=_EXIT_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
-        process.kill()
+        _kill_process_tree(process, owns_process_group)
         return process.wait()
 
 
 def _raise_failure(kind: CappedSubprocessFailure, message: str, **log_fields: object) -> NoReturn:
     LOG.warning("Capped subprocess failed", failure=kind, **log_fields)
-    raise CappedSubprocessError(message, kind=kind)
+    error_type = log_fields.get("error_type")
+    raise CappedSubprocessError(message, kind=kind, error_type=error_type if isinstance(error_type, str) else None)
 
 
 def _describe_bytes(count: int) -> str:

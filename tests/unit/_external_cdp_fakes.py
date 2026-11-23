@@ -37,6 +37,8 @@ from tests.unit.shared_route_app import api_app_build_settings, lend_app
 
 TOKEN = "tok-9f3c1d7e5b"
 CDP_URL = f"wss://127.0.0.1:9333/devtools/browser/b1?token={TOKEN}"
+CDP_V2_TEST_KEY = "external-cdp-test-v2-key"
+CDP_V2_TEST_SALT = "external-cdp-test-v2-salt"
 ORG_A = "org_a"
 ORG_B = "org_b"
 
@@ -131,7 +133,11 @@ async def external_cdp_stack() -> AsyncIterator[SimpleNamespace]:
             patch.object(settings, "ENV", "local"),
             patch.dict(encryptor._methods),
         ):
-            register_aes_encryptor(secret_key="external-cdp-test-key")
+            register_aes_encryptor(
+                secret_key="external-cdp-test-key",
+                v2_secret_key=CDP_V2_TEST_KEY,
+                v2_salt=CDP_V2_TEST_SALT,
+            )
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=http_app), base_url="http://test") as client:
                 yield SimpleNamespace(
                     client=client, manager=manager, repo=repo, session_factory=session_factory, caller=caller

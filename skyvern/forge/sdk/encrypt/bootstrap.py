@@ -12,7 +12,8 @@ from collections.abc import Iterable
 
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.aes import AES
-from skyvern.forge.sdk.encrypt.aes_gcm import AESGCMEncryptor
+from skyvern.forge.sdk.encrypt.aes_gcm import AESGCMEncryptor, ScopedAESGCMEncryptor
+from skyvern.forge.sdk.encrypt.base import BaseEncryptor, EncryptMethod
 
 PLACEHOLDER_SECRET_KEY = "fillmein"
 
@@ -62,12 +63,54 @@ def create_aes_encryptor(
     )
 
 
-def create_aes_gcm_encryptor(*, secret_key: str, salt: str | None = None) -> AESGCMEncryptor:
+def create_aes_gcm_encryptor(
+    *,
+    secret_key: str,
+    salt: str | None = None,
+    method: EncryptMethod = EncryptMethod.AES_GCM,
+) -> AESGCMEncryptor:
     _require_real_secret_key(secret_key)
+    if method is EncryptMethod.AES_GCM_V2 and not salt:
+        raise RuntimeError("ENCRYPTOR_AES_SALT_V2 is required when ENCRYPTOR_AES_SECRET_KEY_V2 is configured")
     return AESGCMEncryptor(
         secret_key=secret_key,
         salt=salt or _derive_from_secret_key(secret_key, _SALT_DERIVATION_LABEL),
+        method=method,
     )
+
+
+def validate_aes_v2_material(
+    *,
+    secret_key: str,
+    salt: str | None,
+    v2_secret_key: str | None,
+    v2_salt: str | None,
+) -> tuple[str, str] | None:
+    if v2_secret_key is None and v2_salt is None:
+        return None
+    if not v2_secret_key or not v2_salt:
+        raise RuntimeError("ENCRYPTOR_AES_SECRET_KEY_V2 and ENCRYPTOR_AES_SALT_V2 must be configured together")
+    if v2_secret_key == PLACEHOLDER_SECRET_KEY:
+        raise RuntimeError("ENCRYPTOR_AES_SECRET_KEY_V2 must not be a placeholder")
+    if v2_secret_key == secret_key or v2_salt == (salt or _derive_from_secret_key(secret_key, _SALT_DERIVATION_LABEL)):
+        raise RuntimeError("AES v2 key and salt must differ from v1")
+    return v2_secret_key, v2_salt
+
+
+def create_deployment_gcm_encryptor(
+    secret_key: str, salt: str | None, scoped_secret_key: str | None, *, write_scoped: bool = False
+) -> BaseEncryptor:
+    if write_scoped and not scoped_secret_key:
+        raise RuntimeError("ENCRYPTOR_AES_WRITE_SCOPED requires ENCRYPTOR_AES_SCOPED_SECRET_KEY")
+    shared = create_aes_gcm_encryptor(secret_key=secret_key, salt=salt)
+    gcm: BaseEncryptor = shared
+    if scoped_secret_key is not None:
+        if scoped_secret_key == secret_key:
+            raise RuntimeError("ENCRYPTOR_AES_SCOPED_SECRET_KEY must differ from the primary key")
+        scoped = create_aes_gcm_encryptor(secret_key=scoped_secret_key, salt=salt)
+        gcm = ScopedAESGCMEncryptor(shared, scoped, write_scoped=write_scoped)
+
+    return gcm
 
 
 def register_aes_encryptor(
@@ -75,8 +118,21 @@ def register_aes_encryptor(
     secret_key: str,
     salt: str | None = None,
     iv: str | None = None,
+    v2_secret_key: str | None = None,
+    v2_salt: str | None = None,
+    write_version: str = "v1",
+    scoped_secret_key: str | None = None,
+    write_scoped: bool = False,
     fallback_decrypt_keys: Iterable[tuple[str | None, str | None]] | None = None,
 ) -> None:
+    _require_real_secret_key(secret_key)
+    if write_version != "v1":
+        raise RuntimeError("Only ENCRYPTOR_AES_WRITE_VERSION=v1 is supported")
+    v2_material = validate_aes_v2_material(
+        secret_key=secret_key, salt=salt, v2_secret_key=v2_secret_key, v2_salt=v2_salt
+    )
+
+    gcm = create_deployment_gcm_encryptor(secret_key, salt, scoped_secret_key, write_scoped=write_scoped)
     encryptor.add_encrypt_method(
         create_aes_encryptor(
             secret_key=secret_key,
@@ -85,4 +141,15 @@ def register_aes_encryptor(
             fallback_decrypt_keys=fallback_decrypt_keys,
         )
     )
-    encryptor.add_encrypt_method(create_aes_gcm_encryptor(secret_key=secret_key, salt=salt))
+    encryptor.add_encrypt_method(gcm)
+    if v2_material is not None:
+        v2_secret_key, v2_salt = v2_material
+        encryptor.add_encrypt_method(
+            create_aes_gcm_encryptor(
+                secret_key=v2_secret_key,
+                salt=v2_salt,
+                method=EncryptMethod.AES_GCM_V2,
+            )
+        )
+    else:
+        encryptor._methods.pop(EncryptMethod.AES_GCM_V2, None)

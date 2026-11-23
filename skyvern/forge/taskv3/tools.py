@@ -28,7 +28,7 @@ import sys
 import time
 import weakref
 from collections import Counter, defaultdict, deque
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
@@ -38,7 +38,7 @@ from urllib.parse import unquote, urlparse
 
 import structlog
 from PIL import Image, ImageDraw
-from playwright.async_api import BrowserContext, Download, Page, Request, Response
+from playwright.async_api import BrowserContext, Download, ElementHandle, Frame, Page, Request, Response
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
@@ -99,13 +99,16 @@ from skyvern.forge.taskv3.loop import (
     PAGE_UNAVAILABLE_ERROR,
     PICKED_OPTION_DATA_KEY,
     REF_SELECTOR_RE,
+    REQUEST_RECORD_DATA_KEY,
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
     TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY,
+    TARGET_SHOWN_TEXT_DATA_KEY,
     BlockingLayer,
     CoveredBranch,
     CoveredLayerKind,
     DownloadFailureFacts,
+    DownloadUntil,
     LayerCheck,
     SemanticCommitStats,
     ToolHandler,
@@ -115,6 +118,7 @@ from skyvern.forge.taskv3.loop import (
     UnseenPageText,
     _may_submit,
     current_tool_call_seq,
+    current_turn,
     mark_is_filler,
     record_click_dispatched,
     record_click_path,
@@ -127,6 +131,7 @@ from skyvern.forge.taskv3.loop import (
     record_type_caret_held,
     record_type_reach,
     set_driver_timeout_predicate,
+    set_request_record_on_error,
     telemetry_hash,
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
@@ -140,15 +145,19 @@ from skyvern.utils.date_values import canonical_iso_date
 from skyvern.webeye.action_deadline import cancellable_driver_call, under_action_deadline
 from skyvern.webeye.actions.handler import (
     _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
-    _collect_inline_iframe_src_candidates,
-    _recover_blocked_inline_pdf_download,
+    _download_target_path,
+    _record_configured_target,
 )
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
 from skyvern.webeye.cdp_download_interceptor import (
+    MAX_FILE_SIZE_BYTES,
     begin_replay_candidate_hold,
     download_tally_for_context,
+    extract_filename,
+    normalize_download_filename,
+    publish_download_bytes_for_context,
     replay_candidates_for_context,
     resolve_replay_candidates_for_context,
     set_replay_candidate_mode_for_context,
@@ -158,7 +167,7 @@ from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_err
 from skyvern.webeye.utils.challenge_signature import (
     CHALLENGE_VENDOR_FRAME_URL,
     CHALLENGE_VENDOR_SIGNATURE,
-    rendered_challenge_vendor_reading,
+    challenge_frame_reading,
 )
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 from skyvern.webeye.utils.flutter_semantics import (
@@ -218,9 +227,25 @@ _OBSERVE_DESCRIPTION_BASE = (
 _OBSERVE_DESCRIPTION_FRAME_REACH = (
     "Elements inside the page's child frames are included in the same list and are acted on by ref "
     "exactly like the page's own — you never need to switch frames or mention one. The iframes line "
-    "reports the frames present and names any whose contents could NOT be read, so a frame missing from "
-    "the element list is stated rather than silent. Call once per page, then act by ref."
+    "reports the frames present, each with its own ref, and names any whose contents could NOT be read, so a "
+    "frame missing from the element list is stated rather than silent, and any frame whose document the browser "
+    "received and did not show. Call once per page, then act by ref."
 )
+
+_DOWNLOAD_DESCRIPTION = (
+    "Click a control and wait for the file that click delivers: a download, an export, or a document that opens in a "
+    "new tab. It makes one click, the same click the click tool makes, so it is the tool for a step that says to "
+    "click something to get a file. Name the control by an observe ref, a CSS selector, or mark=N from the last "
+    "look(). The result gives the file's name and size. If no file arrives, it says so and what the browser received "
+    "instead. To save a document a frame received and did not show, name that frame's ref from "
+    "observe: the tool does not click, it fetches the document again from the frame's address, which can differ from "
+    "what the frame first received."
+)
+_OBSERVE_DESCRIPTION_SCREENSHOT = (
+    " A screenshot of the viewport is attached to your next turn when one could be taken; if look also attaches "
+    "one that turn, the pictures arrive in the order of the two results."
+)
+OBSERVE_SCREENSHOT_TIMEOUT_SECONDS = 3.0
 
 # Cap on what get_html returns, for markup and for rendered text alike.
 HTML_MAX_CHARS = 20000
@@ -433,15 +458,14 @@ def _escape_tags_in_text(text: str) -> str:
 
 # The exact selector shapes our own enrichment mints: data-tv3 by observe(), data-tv3-menu by the
 # click menu probe, data-tv3-act by act-by-mark (written on the look-resolved element at act time and
-# kept for the life of the document, so the submit watch can still resolve it turns later), data-tv3-close by
-# the covered probe for an unmarked onclick close. Each
-# exists only where we set it, so one that matches nothing now cannot reappear without a fresh
-# observe / menu-opening click / look.
+# kept for the life of the document, so the submit watch can still resolve it turns later), data-tv3-ctl by
+# the covered probe for a covering layer's control that has no other address. These exist only where we set them,
+# so one that matches nothing now cannot reappear without a fresh observe / menu-opening click / look / covered probe.
 _TV3_MARKER_SELECTOR_RE = re.compile(
-    r'^\[data-tv3(?:(?:-menu|-act|-close)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
+    r'^\[data-tv3(?:(?:-menu|-act|-ctl)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
 )
 # Any v3 marker inside a selector, including one observe composed a host-anchored selector around.
-_TV3_MARKER_ANYWHERE_RE = re.compile(r'\[data-tv3(?:-menu|-act|-sugg|-close)?="')
+_TV3_MARKER_ANYWHERE_RE = re.compile(r'\[data-tv3(?:-menu|-act|-sugg|-ctl)?="')
 # An opaque identifier (a uuid, or a run of 12+ hex digits) does not survive a model's copy: one
 # transposed pair sends every later call to a selector that matches nothing. observe addresses its
 # own elements by ref for that reason; this is what look()'s legend refuses to use as a label.
@@ -1860,6 +1884,16 @@ OBSERVE_POINTER_ROOT_CAP = 40
 # Pointer roots the collector records per realm, ahead of the listing cap, before it stops scanning; elements it rejects
 # do not count toward it.
 _POINTER_ROOT_SCAN_CEILING = 400
+
+
+def _pointer_state_js(retain: str) -> str:
+    return (
+        "{ pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), "
+        "held: new Set(), extra: new Set(), extraCount: 0, icons: new Set(), iconCount: 0, iconOverflow: 0, "
+        f"notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: {OBSERVE_POINTER_ROOT_CAP}, count: 0, "
+        f"retain: {retain}, ceiling: {_POINTER_ROOT_SCAN_CEILING} }}"
+    )
+
 
 # A color paints nothing only when its ALPHA is zero. Parse the alpha channel, never a trailing ",0)",
 # which also matches an opaque color whose last channel is 0 (`rgb(0,0,0)`, `rgb(255,0,0)`). A form that
@@ -4222,6 +4256,8 @@ def _shows_omitted_note(count: int) -> str:
 LINK_DESTINATION_MAX = 60
 # Per reading across every frame, framing included; what it leaves off is reported, never silent.
 LINK_DESTINATION_TOTAL_CAP = 1200
+# The same for the in= of same-caption links that only to= tells apart.
+LINK_BOX_TEXT_TOTAL_CAP = 2400
 _LINK_EXTENSION_RE = re.compile(r"\.[a-z0-9]{1,5}$", re.IGNORECASE)
 
 
@@ -5738,7 +5774,7 @@ _LOOK_ENUM_JS = (
 )
 
 _ACT_ATTR_RE = re.compile(r'\s*data-tv3-act="[^"]*"')
-_CLOSE_ATTR_RE = re.compile(r' data-tv3-close="[^"]*"')
+_CTL_ATTR_RE = re.compile(r' data-tv3-ctl="[^"]*"')
 # A withheld menu's rows carry a salted tag so no position can be guessed; printing it would hand the model one.
 _SALTED_MENU_ATTR_RE = re.compile(r'\s*data-tv3-menu="w[^"]*"')
 # Visible only: a closed menu's lingering rows are stale, not an open menu whose rows went unnumbered.
@@ -6112,13 +6148,16 @@ _NATIVE_LABEL_JS = r"""
   };
 """
 
-# A visible stand-in resolved by THIS realm: the control's native label first, else the first
-# aria-labelledby target looked up through the prototype in the element's own root. Requires the
-# helpers of _NATIVE_LABEL_JS in scope, and an `arg` whose allowOwnLabel is false in a patchable realm.
+# A visible stand-in: the control's native label first, else the first aria-labelledby target looked up through the
+# prototype in the element's own root. Requires the helpers of _NATIVE_LABEL_JS in scope.
 _NATIVE_PROXY_JS = r"""
   const _nativeProxy = (el) => {
-    if (arg.allowOwnLabel === false) return null;
-    const vis = (n) => { try { const b = n.getBoundingClientRect(); return b.width > 0 && b.height > 0; } catch (e) { return false; } };
+    const vis = (n) => {
+      try {
+        const b = n.getBoundingClientRect();
+        return b.width > 0 && b.height > 0 && getComputedStyle(n).visibility !== 'hidden';
+      } catch (e) { return false; }
+    };
     for (const l of nativeLabelsOf(el)) if (vis(l)) return l;
     const lbId = _attr(el, 'aria-labelledby');
     if (!lbId) return null;
@@ -6129,12 +6168,69 @@ _NATIVE_PROXY_JS = r"""
   };
 """
 
+# What a label holds besides its control that a click on the label may activate instead.
+_LABEL_HELD_CONTROLS = "button,a[href],input:not([type=hidden]),select,textarea"
+
+# Of the candidate labels, the first visible one in tree order that is the control's own (nativeControlOf) and holds no
+# other control, else the first own one, marked `held`. Needs _NATIVE_LABEL_JS.
+_OWN_LABEL_PICK_JS = (
+    r"""(el, labels) => {
+  const shown = (n) => {
+    const b = n.getBoundingClientRect();
+    return b.width > 0 && b.height > 0 && getComputedStyle(n).visibility !== 'hidden';
+  };
+  const own = labels.filter((l) => nativeControlOf(l) === el && shown(l))
+    .sort((x, y) => (x.compareDocumentPosition(y) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+  const held = (l) => _qsa(l, '"""
+    + _LABEL_HELD_CONTROLS
+    + r"""').filter((c) => c !== el);
+  const clear = own.find((l) => held(l).length === 0);
+  if (clear) return { index: labels.indexOf(clear), held: false };
+  return own[0] ? { index: labels.indexOf(own[0]), held: true } : null;
+}"""
+)
+
+# Opacity does not stop hit-testing and multiplies down the tree, so a faded-out panel, or stacked translucent wrappers,
+# hide an input that elementFromPoint still returns. The input's own opacity is excluded.
+_FADED_ANCESTRY_JS = r"""(el) => {
+  let o = 1;
+  for (let n = el.assignedSlot || el.parentNode || el.host, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
+    if (n.nodeType === 1) o *= parseFloat(getComputedStyle(n).opacity || '1');
+  }
+  return o < 0.05;
+}"""
+
+# The pick run on an element handle, over label handles the driver found.
+_OWN_LABEL_PICK_CALL_JS = (
+    r"""(el, labels) => {
+"""
+    + _NATIVE_LABEL_JS
+    + r"""
+  return ("""
+    + _OWN_LABEL_PICK_JS
+    + r""")(el, labels);
+}"""
+)
+
+# The element every skinned-toggle probe resolves, as a handle the driver can act from.
+_PROBE_TARGET_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  return _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+}"""
+)
+
+
+def _css_string(value: str) -> str:
+    return '"' + re.sub(r'["\\\x00-\x1f\x7f]', lambda m: f"\\{ord(m.group()):x} ", value) + '"'
+
 
 # Whether a visible label (or aria-labelledby proxy) of this hidden element reaches it while the rendered
 # match is not that label: click's label path would act on this element, not on the rendered one.
 _LABEL_REACHES_OTHER_THAN_JS = (
     r"""(el, rendered) => {
-  const arg = {};
 """
     + _NATIVE_LABEL_JS
     + _NATIVE_PROXY_JS
@@ -6164,6 +6260,9 @@ _PER_KEY_TIMEOUT_MS = 250
 _TYPING_TIMEOUT_CAP_MS = 120_000
 # How long a click on a matched suggestion row waits to land before the pick is reported as not clicked.
 _SUGGESTION_ROW_CLICK_TIMEOUT_MS = 3000
+# How long the driver may take to click the own label of a hidden radio or checkbox. It outlasts the driver's retry
+# backoff, not a cover that needs dismissing.
+_LABEL_CLICK_TIMEOUT_MS = 3000
 # How long one box of a one-character-per-box code field may stay disabled once the box before it holds a character.
 _CODE_BOX_ENABLE_WAIT_MS = 1500
 # Fewer adjacent one-character boxes (initials, a two-box suffix) are separate fields, not one segmented field.
@@ -6198,6 +6297,9 @@ _TARGET_NAME_JS = (
     + r""";
   const _labelText = """
     + _LABEL_TEXT_JS
+    + r""";
+  const _shownText = """
+    + _SHOWN_TEXT_JS
     + r""";
 """
     + _NATIVE_LABEL_JS
@@ -6340,7 +6442,31 @@ _TARGET_NAME_JS = (
       kind = 'textbox';
     }
   }
-  return { name: finalName, kind: kind, placeholder: Boolean(hint) && finalName !== null };
+  // The same gate as observe's shows=, limited to plain action controls, whose visible text is a caption. A
+  // link's text is often row data, and a value, checkable, pressed or popup control shows its current state.
+  const captioned = _matches(el, 'button,summary,[role=button],[role=menuitem],[role=tab]')
+    && !_matches(el, '[role]:not([role=button],[role=menuitem],[role=tab]),[aria-checked],[aria-pressed],'
+      + '[aria-haspopup]:not([aria-haspopup=false])');
+  // innerText keeps screen-reader-only text, which stays rendered while clipped, shrunk to a pixel or moved
+  // off the control. A control holding any such text has no caption this probe can vouch for.
+  const hidesText = (root) => {
+    try {
+      const box = Element.prototype.getBoundingClientRect.call(root);
+      for (const d of _qsa(root, '*')) {
+        if (!String(d.textContent || '').trim() || Element.prototype.getClientRects.call(d).length === 0) continue;
+        const cs = getComputedStyle(d);
+        const r = Element.prototype.getBoundingClientRect.call(d);
+        if (cs.opacity === '0' || cs.clip !== 'auto' || cs.clipPath !== 'none' || r.width <= 1 || r.height <= 1
+          || r.right <= box.left || r.left >= box.right || r.bottom <= box.top || r.top >= box.bottom) return true;
+      }
+      return false;
+    } catch (e) {
+      return true;
+    }
+  };
+  const visibleText = finalName && captioned ? _shownText(el, finalName) : '';
+  const shown = visibleText && !hidesText(el) ? visibleText : '';
+  return { name: finalName, kind: kind, placeholder: Boolean(hint) && finalName !== null, shown: shown };
 }"""
 )
 
@@ -6696,7 +6822,6 @@ _TYPE_TARGET_PROBE_JS = (
     + r"""
   try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
   try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
-  try { _q.all('[data-tv3-close]').forEach((n) => n.removeAttribute('data-tv3-close')); } catch (e) { /* best-effort */ }
 """
     + _TARGET_READONLY_JS
     + r"""  const RETEST_SCROLLABLE_CLIP = false;
@@ -7420,15 +7545,30 @@ _TYPE_TARGET_PROBE_JS = (
     const _shownText = """
     + _SHOWN_TEXT_JS
     + r""";
-    for (const c of found) {
+    // observe's pointer-cursor scan, run on this layer alone, merged with the named controls in document order, so an
+    // href-less <a> or a <div> styled as a button is listed.
+    const pointerState = """
+    + _pointer_state_js("60")
+    + r""";
+    const ordered = [];
+    try {
+      const _withPointerRoots = """
+    + _WITH_POINTER_ROOTS_JS
+    + r""";
+      _withPointerRoots(layer, """
+    + json.dumps(_BASE_CONTROL_SEL)
+    + r""", found, pointerState, (n) => { ordered.push(n); }, (c) => visible(c) && !isDisabled(c));
+    } catch (e) { ordered.length = 0; for (const c of found) ordered.push(c); }
+    const picked = [];
+    for (const c of ordered) {
       if (c === el || !visible(c) || isDisabled(c)) continue;
-      const csel = idSelector(c) || markerSelector(c);
+      const pointerRoot = pointerState.roots.has(c);
+      if (pointerRoot && c.contains(el)) continue;
       // ownName covers aria-label and root-scoped aria-labelledby, same priority order and same
       // shadow-aware resolution the layer's own name uses.
-      const label = boundedClean(ownName(c) || c.textContent || c.value || (c.getAttribute && c.getAttribute('title')) || '', 60);
-      if (!label && !csel) continue;
-      const shows = boundedClean(_shownText(c, label), 60);
-      allControls.push(shows ? { selector: csel, label, shows } : { selector: csel, label });
+      const label = boundedClean(ownName(c) || c.textContent || c.value || (c.getAttribute && c.getAttribute('title'))
+        || (pointerRoot ? pointerState.roots.get(c) : '') || '', 60);
+      picked.push({ c, label });
     }
     // A real dismisser (Accept, Confirm, Close) routinely comes AFTER a list of category rows or
     // toggles in document order -- a Privacy Preference Center's footer buttons follow its list of
@@ -7436,13 +7576,44 @@ _TYPE_TARGET_PROBE_JS = (
     // needs and keep only the toggles it was already flailing between, reproducing the ticket's own
     // motivating bug with more words. Keep both ends: the first few for context, the last few
     // because that is where a footer actually lives.
-    const truncated = allControls.length > 8;
+    const truncated = picked.length > 8;
+    // Page script can replace Math.random, so a key passed in from Python is used whenever one is given.
+    const ctlNonce = typeof arg.ctl === 'string' && /^[a-z0-9]{5}$/.test(arg.ctl)
+      ? arg.ctl : Math.random().toString(36).slice(2, 7);
+    let minted = 0;
+    // A key an earlier probe minted is reused while this element alone holds it, and taken off every holder once a
+    // clone copies it, so a printed address finds its element or nothing. A new key is kept only if it names it alone.
+    const ctlAddress = (c) => {
+      const prior = c.getAttribute && c.getAttribute('data-tv3-ctl');
+      if (prior && /^[a-z0-9]{1,8}-\d{1,4}$/.test(prior)) {
+        const priorSel = '[data-tv3-ctl="' + prior + '"]';
+        const s = uniqueSelector(priorSel, c);
+        if (s) return s;
+        try { _q.all(priorSel).forEach((n) => n.removeAttribute('data-tv3-ctl')); } catch (e) { /* best-effort */ }
+      }
+      for (let tries = 0; tries < 8; tries++) {
+        const key = ctlNonce + '-' + minted++;
+        try { c.setAttribute('data-tv3-ctl', key); } catch (e) { return null; }
+        const s = uniqueSelector('[data-tv3-ctl="' + key + '"]', c);
+        if (s) return s;
+        try { c.removeAttribute('data-tv3-ctl'); } catch (e) { return null; }
+      }
+      return null;
+    };
+    const listed = new Set();
+    for (const { c, label } of truncated ? picked.slice(0, 5).concat(picked.slice(-3)) : picked) {
+      const csel = idSelector(c) || markerSelector(c) || ctlAddress(c);
+      if (!label && !csel) continue;
+      const shows = boundedClean(_shownText(c, label), 60);
+      allControls.push(shows ? { selector: csel, label, shows } : { selector: csel, label });
+      listed.add(c);
+    }
     // An icon-only close is often a bare <div onclick>, which no tag or role above names. Only a leaf
     // handler counts (a row, card or body handler wraps other controls), and at most two are added
     // after the named ones, so a list of row handlers cannot displace the layer's own controls.
     const leaves = [];
     for (const c of deepAll(layer, '[onclick]').slice(0, 200)) {
-      if (c === layer || c === el || !visible(c) || isDisabled(c)) continue;
+      if (c === layer || c === el || !visible(c) || isDisabled(c) || listed.has(c)) continue;
       if (c.matches && c.matches(controlSel)) continue;
       if (c.contains(el) || c.querySelector('[onclick],' + controlSel)) continue;
       if (c.parentElement && c.parentElement.closest(controlSel)) continue;
@@ -7451,23 +7622,18 @@ _TYPE_TARGET_PROBE_JS = (
     }
     // An icon close has no text, so unlabeled leaves go first; a run of labelled rows cannot fill the slots ahead of it.
     leaves.sort((a, b) => (a.label ? 1 : 0) - (b.label ? 1 : 0));
-    // Fresh per probe, so a selector an earlier probe printed matches nothing rather than another element.
-    const closeNonce = Math.random().toString(36).slice(2, 7);
     const onclickControls = [];
     for (const { c, label } of leaves) {
       if (onclickControls.length >= 2) break;
-      let csel = idSelector(c) || markerSelector(c);
-      if (!csel) {
-        // A close that appeared after the last observe carries no marker, so the probe names it itself.
-        const key = closeNonce + '-' + onclickControls.length;
-        try { c.setAttribute('data-tv3-close', key); csel = '[data-tv3-close="' + key + '"]'; } catch (e) { continue; }
-      }
+      const csel = idSelector(c) || markerSelector(c) || ctlAddress(c);
+      if (!csel) continue;
       onclickControls.push({ selector: csel, label });
     }
-    const controls = (truncated ? allControls.slice(0, 5).concat(allControls.slice(-3)) : allControls)
-      .concat(onclickControls);
+    const controls = allControls.concat(onclickControls);
     try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
+    // The scan above reads only this document, so a frame's own controls are never listed.
+    if (/^i?frame$/i.test(String(layer.tagName || ''))) out.occluder.frame = true;
     if (layerText.join('').trim()) { out.occluder.text = layerText; out.occluder.textCut = layerTextCut; }
     out.occluder.layerKind = layerKind;
     // Which layer node this is, and the state of its controls, kept only in a realm the page cannot read or patch
@@ -7623,15 +7789,13 @@ async def _disabled_click_refusal(page: Any, selector: str) -> ToolResult:
     # The model reads no pixels and observe cannot list a cross-origin widget, so a gate drawn by a challenge frame
     # is invisible to it. Only a frame measured as rendered is named; an unmeasured one is no evidence of a challenge.
     try:
-        vendor, _unmeasured = await rendered_challenge_vendor_reading(
-            [frame for frame in page.frames if frame.parent_frame is not None]
-        )
+        reading = await challenge_frame_reading([frame for frame in page.frames if frame.parent_frame is not None])
     except Exception:
         LOG.info("taskv3 disabled-click challenge probe failed", exc_info=True)
-        vendor = None
-    if vendor:
+        return ToolResult.error(message, error_class="disabled")
+    if reading.rendered:
         # An observation, not a diagnosis: the frame and the disabled control can be unrelated.
-        message += f". A challenge frame ({vendor}) is rendered on screen. solve_captcha acts on it."
+        message += ". " + reading.frames_sentence()
     return ToolResult.error(message, error_class="disabled")
 
 
@@ -8138,6 +8302,19 @@ _CARET_TO_END_JS = """el => {
   }
 }"""
 
+# Puts the caret at the end of the focused input or textarea only when it holds exactly the given text.
+_FOCUSED_HOLDING_CARET_TO_END_JS = """(text) => {
+  let el = document.activeElement;
+  while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+  if (!el || !["INPUT", "TEXTAREA"].includes(el.tagName) || el.value !== text) return false;
+  try {
+    el.setSelectionRange(text.length, text.length);
+    return true;
+  } catch (e) {
+    return "end_key";
+  }
+}"""
+
 
 # Design-system forms render a <select> at zero size behind a styled listbox proxy. Playwright's
 # actionability wait never resolves against it, so select_option probes visibility first and only
@@ -8161,13 +8338,15 @@ _SELECT_VISIBILITY_JS = (
     const r = el.getBoundingClientRect();
     const cs = getComputedStyle(el);
     // Forcing a value onto a select nothing stands in for carries a value the user never saw into
-    // whatever the run submits next -- so the stand-in is resolved by this realm, never by the page's.
+    // whatever the run submits next -- so the stand-in is read from the label association, never from the
+    // page's `labels`. In the page's own realm that is only as honest as the page, as observe's listing is.
     return {
       exists: true,
       nodeName: (el.nodeName || '').toLowerCase(),
       visible: r.width > 0 && r.height > 0 && cs.visibility !== 'hidden',
       disabled: !!el.disabled,
-      proxied: !!_nativeProxy(el),
+      // A page-realm answer is not trusted to force a hidden select.
+      proxied: arg.allowOwnLabel !== false && !!_nativeProxy(el),
       multiple: el.multiple === true,
     };
   } catch (e) { return { exists: false, visible: false }; }
@@ -8581,12 +8760,15 @@ _SELECT_READBACK_JS = (
 # The native radio/checkbox a click on `el` actually toggles: itself, its <label>'s control, or the
 # sole native input a thin host wraps. An ARIA-only or ARIA-toggle-role host resolves to null on
 # purpose -- aria-checked is app-set on its own schedule, not a readback bearer.
-_TOGGLE_OWNER_JS = r"""(el) => {
+_TOGGLE_OWNER_JS = (
+    r"""(el) => {
   if (_isToggle(el)) return el;
   if (_isLabel(el)) {
     const ctl = nativeControlOf(el);
     if (!_isToggle(ctl)) return null;
-    const wrapsOther = _qsa(el, 'button,a[href],input,select,textarea').some((c) => c !== ctl);
+    const wrapsOther = _qsa(el, '"""
+    + _LABEL_HELD_CONTROLS
+    + r"""').some((c) => c !== ctl);
     return wrapsOther ? null : ctl;
   }
   // A control that is itself interactive (a trigger, a menu row, a link, an ARIA toggle) may wrap
@@ -8607,6 +8789,7 @@ _TOGGLE_OWNER_JS = r"""(el) => {
   try { if (el.shadowRoot) others = others.concat(_qsa(el.shadowRoot, 'button,a[href],select,textarea,input:not([type=hidden])')); } catch (e) {}
   return others.some((c) => c !== owner) ? null : owner;
 }"""
+)
 
 # A skinned checkbox/radio is a zero-size or invisible native input whose visible <label> is the
 # real click target; the label is tagged (stale tags cleared first) so click can act on it.
@@ -8628,29 +8811,34 @@ _SKINNED_CHECKBOX_PROBE_JS = (
   const _toggleOwner = """
     + _TOGGLE_OWNER_JS
     + r""";
+  const _ownLabelPick = """
+    + _OWN_LABEL_PICK_JS
+    + r""";
+  const _fadedAncestry = """
+    + _FADED_ANCESTRY_JS
+    + r""";
   const toggleFields = (owner) =>
     owner ? { toggle: true, radio: String(_attr(owner, 'type') || '').toLowerCase() === 'radio', toggleDisabled: !!owner.disabled } : {};
   try {
     const el = _q.find(sel) || _executorEl;
-    if (!el) return { exists: false, skinned: false, labelClick: null };
+    if (!el) return { exists: false, skinned: false };
     const type = String(el.type || '').toLowerCase();
-    if (el.tagName === 'INPUT' && type === 'file') return { exists: true, skinned: false, labelClick: null, file: true };
+    if (el.tagName === 'INPUT' && type === 'file') return { exists: true, skinned: false, file: true };
     const r = el.getBoundingClientRect();
     const cs = getComputedStyle(el);
     const invisible = r.width === 0 || r.height === 0 || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.05;
     if (el.tagName === 'SELECT') {
-      return { exists: true, skinned: false, labelClick: null, select: true, invisible, proxied: !!_nativeProxy(el) };
+      return { exists: true, skinned: false, select: true, invisible, proxied: arg.allowOwnLabel !== false && !!_nativeProxy(el) };
     }
     if (el.tagName !== 'INPUT' || (type !== 'checkbox' && type !== 'radio')) {
-      return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
+      return { exists: true, skinned: false, ...toggleFields(_toggleOwner(el)) };
     }
-    const drawn = { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
+    const drawn = { exists: true, skinned: false, ...toggleFields(_toggleOwner(el)) };
     const radio = type === 'radio';
     // :disabled covers a disabled <fieldset>, unlike el.disabled.
     const disabled = el.matches(':disabled');
-    // The click lands on coordinates this realm measured, never through a marker the page could move
-    // onto something else, so the point has to be the target's own: a cover there is a cover.
-    // Returns the point on a hit on the target, false under an unrelated element, null for no hit or a clipped-off point.
+    // A cover at the target's own centre is a cover. Returns true on a hit on the target, false under an unrelated
+    // element, null for no hit or a clipped-off point.
     // A clip that can scroll (a long list) is scrolled once to bring the target into it; only one that cannot is final.
     let lastHit = null;
     const centreHit = (t, retried) => {
@@ -8673,7 +8861,7 @@ _SKINNED_CHECKBOX_PROBE_JS = (
       }
       lastHit = hit;
       for (let n = hit, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
-        if (n === t || n === el) return { x, y };
+        if (n === t || n === el) return true;
       }
       if (!hit) return null;
       for (let n = t.assignedSlot || t.parentNode || t.host, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
@@ -8688,53 +8876,50 @@ _SKINNED_CHECKBOX_PROBE_JS = (
       }
       return false;
     };
-    // Opacity does not stop hit-testing and multiplies down the tree, so a faded-out panel, or stacked
-    // translucent wrappers, hide an input that elementFromPoint still returns. The input's own is excluded.
-    const fadedAncestry = () => {
-      let o = 1;
-      for (let n = el.assignedSlot || el.parentNode || el.host, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
-        if (n.nodeType === 1) o *= parseFloat(getComputedStyle(n).opacity || '1');
-      }
-      return o < 0.05;
+    // The driver aims only at a part of the box holding more than a square pixel of the viewport, however far it
+    // scrolls, so a box parked off-screen or drawn sub-pixel is one no pointer is ever sent to.
+    const aimless = () => {
+      const b = el.getBoundingClientRect();
+      const w = Math.min(b.right, innerWidth) - Math.max(b.left, 0);
+      const h = Math.min(b.bottom, innerHeight) - Math.max(b.top, 0);
+      return !(w > 0 && h > 0 && w * h > 0.99);
     };
-    // A label that also wraps another control (a button, link, or a second input) is not a safe
-    // proxy: a real click on it can activate that control instead.
-    const wrapsOther = (l) => Array.from(_qsa(l, 'button,a[href],input,select,textarea')).some((c) => c !== el);
-    const ownLabel = () => nativeLabelsOf(el).find((l) => {
-      const b = l.getBoundingClientRect();
-      return b.width > 0 && b.height > 0 && !wrapsOther(l);
-    }) || null;
     if (!invisible) {
       // A drawn input the pointer cannot reach at its own centre (a 1px clipped box, one stacked under a
       // sibling's label) is clicked through its own clear label; anything else keeps the plain click's diagnosis.
-      if (arg.allowOwnLabel === false || !_nativeProxy(el) || fadedAncestry() || disabled) return drawn;
-      if (centreHit(el) !== false) return drawn;
-      const label = ownLabel();
-      const at = label && nativeControlOf(label) === el ? centreHit(label) : null;
-      if (!at || !ownLabelHitClear(lastHit, el, label)) return drawn;
-      return { ...drawn, skinned: true, labelClick: at, radio, disabled: false, drawnLabel: true };
-    }
-    if (!_nativeProxy(el)) {
+      if (_fadedAncestry(el) || disabled) return drawn;
+      const proxied = !!_nativeProxy(el);
+      const reach = centreHit(el);
+      // Measured after centreHit's scroll. A clip only refuses a box wholly in the viewport, the one case where every
+      // driver aims at the same clipped-off centre; a proxied one with no point at all is reached as an invisible one is.
+      const b = el.getBoundingClientRect();
+      const clipped = reach === null && b.left >= 0 && b.top >= 0 && b.right <= innerWidth && b.bottom <= innerHeight;
+      if (!proxied && (clipped || aimless())) return { exists: true, skinned: false, radio, unnamed: true, clipped };
+      if (!aimless()) {
+        if (!proxied || reach !== false) return drawn;
+        const labels = nativeLabelsOf(el);
+        const pick = _ownLabelPick(el, labels);
+        const label = pick && !pick.held ? labels[pick.index] : null;
+        if (!label || !centreHit(label) || !ownLabelHitClear(lastHit, el, label)) return drawn;
+        return { ...drawn, skinned: true, radio, disabled: false, drawnLabel: true };
+      }
+    } else {
       // Only the input's own transparency is waived: it still needs a box, no visibility:hidden, visible
       // ancestors, and to be on top at its own centre, so it is clicked directly and read back as a toggle.
-      const at = r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && !fadedAncestry() ? centreHit(el) : null;
-      if (at) return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
-      if (at === false) return { exists: true, skinned: false, labelClick: null, radio, covered: true };
-      return { exists: true, skinned: false, labelClick: null, radio, unproxied: true };
+      const at = r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && !_fadedAncestry(el) ? centreHit(el) : null;
+      if (at && !aimless()) return { exists: true, skinned: false, ...toggleFields(_toggleOwner(el)) };
+      if (!_nativeProxy(el)) {
+        if (at === false) return { exists: true, skinned: false, radio, covered: true };
+        return { exists: true, skinned: false, radio, unnamed: true };
+      }
     }
-    const none = { exists: true, skinned: true, labelClick: null, radio, disabled };
-    // `none` still gets a script click, so a proxy inside a faded panel is refused outright.
-    if (fadedAncestry()) return { ...none, unproxied: true };
-    // Only a real <label> activates its control on click, and only the association THIS realm derives
-    // counts: an `el.labels` the page shadows names a decoy, not a proxy. A realm the page can patch
-    // (the main-world fallback) never offers one.
-    if (arg.allowOwnLabel === false) return none;
-    const label = ownLabel();
-    if (!label || nativeControlOf(label) !== el) return none;
-    const at = centreHit(label);
-    if (!at) return { ...none, labelCovered: true };
-    return { exists: true, skinned: true, labelClick: at, radio, disabled };
-  } catch (e) { return { exists: false, skinned: false, labelClick: null }; }
+    // Something visible names the control, so it takes the label route; no point is measured here, because one from
+    // this realm is frame-relative and, in the page's own realm, forgeable. The driver finds and clicks the label.
+    const none = { exists: true, skinned: true, radio, disabled };
+    // `none` may still get a script click, so a proxy inside a faded panel is refused outright.
+    if (_fadedAncestry(el)) return { ...none, unproxied: true };
+    return none;
+  } catch (e) { return { exists: false, skinned: false }; }
 }"""
 )
 
@@ -9892,16 +10077,20 @@ _OBSERVE_QUALIFIER_PASSES = 4
 
 
 def _disambiguate_digest_bodies(
-    elements: list[dict[str, Any]], bodies: list[str], field: Callable[[str, int], str]
-) -> tuple[list[str], int]:
+    elements: list[dict[str, Any]], bodies: list[str], field: Callable[[str, int], str], keys: list[str]
+) -> tuple[list[str], int, int, int]:
     """Two element lines that render the same bytes are two addresses with nothing to choose between
     them. `field` renders a value exactly as the digest prints it: quoted, clip span included. Append to
     each of a colliding set the shallowest thing the page itself says about where that control sits --
     its own identity, the identity of what encloses it, the heading it is filed under -- that tells the
-    set apart. Returns the bodies and how many lines are still identical to
-    another afterwards, which is what production has to be able to see."""
+    set apart. Lines whose `keys` (each line without a captioned link's to=) still match after that get the
+    text of their own enclosing box (in=) only where each gets a different one. Returns the bodies, how many
+    lines are still identical to another afterwards, which is what production has to be able to see, and how
+    many lines that second pass qualified and how many its budget left off."""
     parsed: list[tuple[list[tuple[str, str]], list[tuple[str, str]], str | None, str | None]] = []
     located: list[tuple[list[str], str | None]] = []
+    boxes: list[str | None] = []
+    holds: list[set[str]] = []
     for e in elements:
         owns: list[tuple[str, str]] = []
         within: list[tuple[str, str]] = []
@@ -9909,6 +10098,8 @@ def _disambiguate_digest_bodies(
         section: str | None = None
         units: list[str] = []
         nth: str | None = None
+        box: str | None = None
+        held: set[str] = set()
         for entry in e.get("placement") or []:
             if not isinstance(entry, (list, tuple)) or len(entry) != 2:
                 continue
@@ -9917,6 +10108,12 @@ def _disambiguate_digest_bodies(
             if kind == _OBSERVE_UNIT_KIND:
                 if value:
                     units.append(value)
+                continue
+            if kind == "in.apart":
+                box = box or value or None
+                continue
+            if kind == "in.holds":
+                held = set(value.split())
                 continue
             if kind == _OBSERVE_NTH_KIND:
                 nth = nth or value or None
@@ -9939,6 +10136,8 @@ def _disambiguate_digest_bodies(
                 section = value
         parsed.append((owns, within, field_label, section))
         located.append((units, nth))
+        boxes.append(box)
+        holds.append(held)
 
     tiers: list[tuple[str, int]] = [("own", i) for i in range(max((len(o) for o, _, _, _ in parsed), default=1) or 1)]
     tiers.append((_OBSERVE_FIELD_KIND, 0))
@@ -10010,8 +10209,32 @@ def _disambiguate_digest_bodies(
                     progressed = True
         if not progressed:
             break
+    # These lines are already apart, so only the text of each link's own box is added, and only when every one
+    # differs: a shared or missing box would be worse than none.
+    apart: dict[str, list[int]] = defaultdict(list)
+    for i, body in enumerate(final):
+        if body == bodies[i]:
+            apart[_observe_line_identity(keys[i])].append(i)
+    qualified, omitted, left = 0, 0, LINK_BOX_TEXT_TOTAL_CAP
+    for ix in apart.values():
+        if len(ix) < 2 or len({_observe_line_identity(bodies[i]) for i in ix}) < len(ix):
+            continue
+        width = OBSERVE_DISPLAY_WIDTHS["qualifier"]
+        # A box that also holds another line of this set is not that link's alone, so the set stays bare.
+        ids = {str(elements[i].get("i")) for i in ix}
+        mine = ((boxes[i], holds[i]) for i in ix)
+        rendered = [f" {_OBSERVE_UNIT_KIND}={field(box, width)}" for box, held in mine if box and not held & ids]
+        if len({_observe_line_identity(r) for r in rendered}) == len(ix):
+            for i, appended in zip(ix, rendered):
+                # As with to=, once one is left off every later one is too, so the note's count is a tail.
+                if omitted or len(appended) > left:
+                    omitted += 1
+                    continue
+                left -= len(appended)
+                final[i] += appended
+                qualified += 1
     counts = Counter(_observe_line_identity(body) for body in final)
-    return final, sum(n for n in counts.values() if n > 1)
+    return final, sum(n for n in counts.values() if n > 1), qualified, omitted
 
 
 OBSERVE_GROUP_TEXT_TOTAL_CAP = 4000
@@ -10943,6 +11166,19 @@ async (__tv3TextArgs) => {
   const _visibleProxy = """
     + _VISIBLE_PROXY_JS
     + r""";
+  // One inlining per observe, so the id map behind nativeControlOf is built once per root, not once per control.
+  const _ownLabelPick = (() => {
+"""
+    + _NATIVE_LABEL_JS
+    + r"""
+    const pick = """
+    + _OWN_LABEL_PICK_JS
+    + r""";
+    return (el) => pick(el, nativeLabelsOf(el));
+  })();
+  const _fadedAncestry = """
+    + _FADED_ANCESTRY_JS
+    + r""";
   const _labelText = """
     + _LABEL_TEXT_JS
     + r""";
@@ -11045,6 +11281,35 @@ async (__tv3TextArgs) => {
     }
     return false;
   };
+  const _transparentContainer = (el, includeSelf = false) => {
+    for (let node = el; node; node = _assignedSlotOf.call(node) || _composedParent(node)) {
+      if (node !== el || includeSelf) {
+        const cs = getComputedStyle(node);
+        if (cs.display !== 'contents' && Number(cs.opacity) === 0) return true;
+      }
+      // Native top-layer boxes paint independently of their DOM containers.
+      if (_matches.call(node, ':modal,:popover-open')) break;
+    }
+    return false;
+  };
+  const _controlProxy = (el, accept = () => true) => {
+    const proxy = _visibleProxy(el);
+    if (proxy && accept(proxy)) return proxy;
+    for (const label of el.labels || []) {
+      const r = _bcr.call(label);
+      if (r.width > 0 && r.height > 0 && getComputedStyle(label).visibility === 'visible'
+          && !_transparentContainer(label, true) && !_offCanvas(label, r) && accept(label)) return label;
+    }
+    return null;
+  };
+  const _paintedControl = (el) => {
+    if (!_transparentContainer(el)) return true;
+    const tag = String(el.tagName || '').toLowerCase(), type = String(el.type || '').toLowerCase();
+    const skin = tag === 'select' || (tag === 'input' && /^(checkbox|radio|file)$/.test(type));
+    return skin && !!_controlProxy(el, proxy =>
+      getComputedStyle(proxy).visibility === 'visible' && !_transparentContainer(proxy, true)
+      && !_offCanvas(proxy, _bcr.call(proxy)));
+  };
   // The element loop's own drop decision for `el`, made before it builds a record: `why` names the
   // hidden-counter a drop lands in, and a skinned native it keeps comes back `hidden`. The pointer-root
   // pass asks the same of the controls inside a candidate, so a wrapper stands aside exactly when the
@@ -11064,6 +11329,7 @@ async (__tv3TextArgs) => {
       if (gp) { gateEl = gp; gr = _bcr.call(gp); }
     }
     const s = { why: null, hidden: false, r, gr, gateEl, ownGated };
+    if (!_paintedControl(el)) { s.why = 'visibility'; return s; }
     // Off-canvas gate, mirroring v1 isElementVisible (domUtils.js): an element whose horizontal
     // center sits left of the page is off-screen and not interactable, unless a horizontally
     // scrolled ancestor explains it. X only, never Y -- an overflow ancestor makes Y unreliable, so
@@ -11084,7 +11350,7 @@ async (__tv3TextArgs) => {
       const tag = el.tagName;
       const type = String(el.type || '').toLowerCase();
       const skinnable = tag === 'SELECT' || (tag === 'INPUT' && (type === 'checkbox' || type === 'radio' || type === 'file'));
-      if (skinnable && _visibleProxy(el)) {
+      if (skinnable && _controlProxy(el)) {
         s.hidden = true;
       } else if (!_unseen(el) && _contentsRenders(el, 0)) {
         // A display:contents host has a zero rect of its own but is not hidden -- its rendered
@@ -11102,11 +11368,9 @@ async (__tv3TextArgs) => {
   const _screenListable = (el) => {
     try { return _screen(el, false).why === null; } catch (e) { return false; }
   };
-  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), extra: new Set(), extraCount: 0, icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
-    + str(OBSERVE_POINTER_ROOT_CAP)
-    + r""", count: 0, retain: _RETAIN_WIDTH, ceiling: """
-    + str(_POINTER_ROOT_SCAN_CEILING)
-    + r""" };
+  const _pointerState = """
+    + _pointer_state_js("_RETAIN_WIDTH")
+    + r""";
   let pointerListed = 0;
   // Anchors listed beside the root that misses them (`extra`): a budget of their own, so none takes a root's place.
   let extraListed = 0;
@@ -12201,6 +12465,10 @@ async (__tv3TextArgs) => {
     const to = _linkDestination(el);
     if (to) rec.to = to.slice(0, _RETAIN_WIDTH);
     if (hidden) rec.hidden = true;
+    if (hidden && (el.type === 'checkbox' || el.type === 'radio')) {
+      // click picks its label the same way and refuses one under a faded ancestry, so the promise is printed only where it delivers.
+      try { const pick = _ownLabelPick(el); if (pick && !pick.held && !_fadedAncestry(el)) rec.labelDelivers = true; } catch (e) { /* none */ }
+    }
     if (removedBy) rec.a11yRemoved = removedBy;
     // A widget role is what the element IS -- a <div role="switch"> renders as a bare div otherwise,
     // and the model cannot tell it from decoration. The role travels with its state below, or it is
@@ -12464,14 +12732,25 @@ async (__tv3TextArgs) => {
         }
       } else if (rec.selector) { checkInconclusive = false; ok = resolvesTo(rec.selector, el) || checkInconclusive; }
     }
+    let visibilityRejected = false;
+    if (ok && stamp && (mutated || pageCodeEpoch > 0)) {
+      try {
+        visibilityRejected = !_paintedControl(el) || (rec.hidden && !_controlProxy(el));
+        ok = !visibilityRejected;
+      } catch (e) { ok = false; }
+    }
     if (!ok) {
       // Dropped from the digest, but the control can still BE there -- a page that changes a second
       // field's label mid-run fails the fingerprint without detaching it. It must not name anything
       // (it has no line for the model to read), and it must still COUNT, or the box it sits in reads
       // as holding one field when it holds two.
-      if (el && connected) droppedStillLive.push(el);
+      if (el && connected && !visibilityRejected) droppedStillLive.push(el);
       labelOfControl.delete(el); boundLabelOfControl.delete(el); out.splice(k, 1);
-      if (rec.pointerRoot) { if (rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
+      if (rec.hidden) hiddenListed--;
+      if (rec.pointerRoot) { if (rec.pointerExtra) extraListed--; else pointerListed--; }
+      if (visibilityRejected) { hiddenDropped++; hiddenDroppedVisibility++; }
+      else if (rec.pointerRoot) pointerDropped++;
+      else dropped++;
     }
     else if (el) {
       // Recomputed after the drain rather than added to the fingerprint above: a page's own observer
@@ -12603,6 +12882,16 @@ async (__tv3TextArgs) => {
         if (members.length > 1) where.push(['nth', `${members.indexOf(el) + 1} of ${members.length}`]);
         for (const w of where) place.push(w);
       } catch (e) { /* fail open: this control keeps the qualifiers it had */ }
+    } else if (rec.to && rec.label && out.some((o) => o !== rec && o.to && o.label === rec.label)) {
+      try {
+        // Not this link's alone if it holds a control of this caption; the renderer checks captions that print alike.
+        const u = unitsOf(el)[0];
+        const inside = out.filter((o) => o !== rec && Node.prototype.contains.call(u, elOfRec.get(o) || null));
+        if (u && !inside.some((o) => o.label === rec.label)) {
+          place.push(['in.apart', String(unitText.get(u)).slice(0, _RETAIN_WIDTH)]);
+          place.push(['in.holds', inside.filter((o) => o.to).map((o) => o.i).join(' ')]);
+        }
+      } catch (e) { /* fail open: the link is listed without its box text */ }
     }
     if (place.length) rec.placement = place;
   }
@@ -12809,16 +13098,14 @@ async (__tv3TextArgs) => {
       }
     }
   } catch (e) { texts.length = 0; textDropped = 0; }
-  // Iframe PRESENCE: an anti-bot/captcha widget can live in a child frame — same- or cross-origin —
-  // and main-frame element perception can never list its contents, so this records host + signature
-  // (plus origin and viewport-fill) instead. What it REPORTS is attributes only, never the frame's
-  // document (page.frames-based traversal was considered and rejected: presence is the contract
-  // here, not cross-frame reach). The census below is the one exception and is not part of this
-  // contract: it reads same-origin frames, but only to count, and never reports what it saw.
+  // Iframe PRESENCE, run in every realm observe reads: host, path, signature, origin and viewport-fill
+  // per frame, plus the element itself so the frame can be given a ref. It reports attributes only,
+  // never the frame's document; the census below reads same-origin frames only to count them.
   // Same visibility rule as elements, so hidden tracking pixels stay out.
   // `failed` and `unread` are this channel's own bookkeeping, not a question put to the page: on the
   // section that reports gates, "found none" and "could not look" must not render as one sentence.
   const iframeInfo = { total: 0, inComponents: 0, entries: [], failed: false, unread: 0 };
+  const iframeEls = [];
   // TELEMETRY ONLY (SKY-15590), never rendered to the model: `iframeInfo` counts frames worth
   // REPORTING, which is the wrong denominator for how often a page carries a frame v3 cannot see
   // into. Counted above those presentation filters but below the zero-size skip, which excludes
@@ -12904,6 +13191,9 @@ async (__tv3TextArgs) => {
             const ttl = (f.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 80);
             const isCaptcha = sig.test(src + ' ' + ttl);
             const sameOrigin = u.origin === location.origin;
+            // A same-origin address whose document this realm cannot read holds something the browser put there instead.
+            let unreadable = false;
+            if (sameOrigin) { try { unreadable = f.contentDocument === null; } catch (e6) { unreadable = true; } }
             // A measurement of the on-screen share, never a verdict on what the frame is; kept in tens so
             // layout jitter cannot change the digest of an unchanged page.
             const onW = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
@@ -12911,30 +13201,32 @@ async (__tv3TextArgs) => {
             const viewportPct = vw * vh > 0 ? Math.min(100, Math.round((onW * onH) / (vw * vh) * 10) * 10) : 0;
             // Same-origin helper frames (tiny or off-screen) are common on ordinary pages; only one the user
             // can see at a meaningful size, or one carrying a challenge signature, is worth a digest entry.
-            if (sameOrigin && !isCaptcha && onW * onH < 0.05 * vw * vh) continue;
+            if (sameOrigin && !isCaptcha && !unreadable && onW * onH < 0.05 * vw * vh) continue;
             // Counted once every throwable read has succeeded: incrementing earlier put a frame in
             // `total` and in `unread` at once, so the two summed past the page's real count.
             iframeInfo.total++;
             if (root !== document) iframeInfo.inComponents++;
-            const entry = { host: u.host.slice(0, 80), title: ttl, captcha: isCaptcha, sameOrigin: sameOrigin, viewportPct: viewportPct };
+            // The address is kept whole for masking and only for a same-origin frame; another origin's is its host alone.
+            const entry = { host: u.host.slice(0, 80), href: sameOrigin ? u.href.slice(0, _RETAIN_WIDTH) : '', title: ttl, captcha: isCaptcha, sameOrigin: sameOrigin, unreadable: unreadable, viewportPct: viewportPct };
             if (iframeInfo.entries.length < 8) {
               iframeInfo.entries.push(entry);
+              iframeEls.push(f);
             } else {
               // Spending all 8 slots on lower-signal frames and dropping the one this channel exists to
               // report defeats the channel, so a frame evicts the lowest-ranked entry only when it outranks it.
               // Additive, so a viewport-filling challenge still outranks a row of small challenge widgets.
-              const rank = (e) => (e.captcha ? 4 : 0) + (e.viewportPct >= 80 ? 2 : 0) + (e.sameOrigin ? 1 : 0);
+              const rank = (e) => (e.unreadable ? 8 : 0) + (e.captcha ? 4 : 0) + (e.viewportPct >= 80 ? 2 : 0) + (e.sameOrigin ? 1 : 0);
               let lo = 0;
               for (let k = 1; k < iframeInfo.entries.length; k++) {
                 if (rank(iframeInfo.entries[k]) < rank(iframeInfo.entries[lo])) lo = k;
               }
-              if (rank(entry) > rank(iframeInfo.entries[lo])) iframeInfo.entries[lo] = entry;
+              if (rank(entry) > rank(iframeInfo.entries[lo])) { iframeInfo.entries[lo] = entry; iframeEls[lo] = f; }
             }
           } catch (e) { iframeInfo.unread++; continue; }
         }
       } catch (e) { iframeInfo.unread++; continue; }
     }
-  } catch (e) { iframeInfo.total = 0; iframeInfo.inComponents = 0; iframeInfo.entries.length = 0; iframeInfo.unread = 0; iframeInfo.failed = true; frameCensus.sameOrigin = 0; frameCensus.crossOrigin = 0; frameCensus.sameOriginInteractive = 0; frameCensus.peeked = 0; frameCensus.peekFailed = 0; }
+  } catch (e) { iframeInfo.total = 0; iframeInfo.inComponents = 0; iframeInfo.entries.length = 0; iframeEls.length = 0; iframeInfo.unread = 0; iframeInfo.failed = true; frameCensus.sameOrigin = 0; frameCensus.crossOrigin = 0; frameCensus.sameOriginInteractive = 0; frameCensus.peeked = 0; frameCensus.peekFailed = 0; }
 
   // Ref identity. The same NODE keeps the same ref across observe() calls, so a frozen page renders an
   // identical digest and a ref read earlier still names the element it described. Held in a WeakMap,
@@ -12971,6 +13263,21 @@ async (__tv3TextArgs) => {
       }
     }
     rec.ref = typeof r === 'number' ? r : null;
+  }
+  // A listed frame's element gets an id from the same map, so a frame is addressed by ref like any element.
+  const frameEls = [];
+  for (let k = 0; k < iframeInfo.entries.length; k++) {
+    const el = iframeEls[k] || null;
+    Object.defineProperty(frameEls, String(k), { value: el, enumerable: true, configurable: true });
+    let r = null;
+    if (el) {
+      try { r = _wmGet.call(window.__tv3_refs, el); } catch (e) { r = null; }
+      if (typeof r !== 'number') {
+        r = window.__tv3_ref_next++;
+        try { _wmSet.call(window.__tv3_refs, el, r); } catch (e) { r = null; }
+      }
+    }
+    iframeInfo.entries[k].ref = typeof r === 'number' ? r : null;
   }
   __OBSERVE_TEXT_DELTA__
   // A page-defined toJSON (legacy libraries put one on Array.prototype) encodes every array as a string. It is
@@ -13028,7 +13335,7 @@ def observe_handles_js(retain_width: int = OBSERVE_RETAIN_WIDTH_MIN) -> str:
     # One evaluate for the digest AND the live elements behind it, handed back on the returned object
     # rather than through a global: `els[N]` is the element `elements[N]` describes, it is read in the
     # same continuation that built it, and a page cannot define an accessor to intercept a local.
-    return _observe_js_returning("{ json: payload, els: outEls }", retain_width)
+    return _observe_js_returning("{ json: payload, els: outEls, frames: frameEls }", retain_width)
 
 
 def _menu_mark_parts(options: list[dict[str, Any]], cap: int, text_cap: int = _MENU_ROW_TEXT_MAX) -> list[str]:
@@ -13285,6 +13592,7 @@ def _newly_rendered_lines(before: str, after: str) -> list[str]:
 _TEXT_DELTA_TOOL_NAMES = frozenset(
     {
         "click",
+        "download",
         "type",
         "select_option",
         "select_combobox",
@@ -14277,6 +14585,8 @@ async def _observable_child_frames(page: Any) -> tuple[list[Any], int, int]:
 _UNKNOWN_REALM = object()
 # Set by the click echo for one call; the click path records the kind of choice control it found under the target.
 _CLICK_CHOICE_KIND: ContextVar[list[str] | None] = ContextVar("taskv3_click_choice_kind", default=None)
+# Set by the click echo for one call: the clicked control as the latest observe named it, with the ref used.
+_CLICK_TARGET_NAME: ContextVar[str] = ContextVar("taskv3_click_target_name", default="")
 
 
 class _RealmChangedDuringRead(Exception):
@@ -14341,12 +14651,14 @@ class _Observation(NamedTuple):
     capped_frames: int = 0
     # Whether this reading switched a canvas-drawn app's accessibility tree on, or found it still off after trying.
     semantics: SemanticsActivation | None = None
+    # Per entry of `data["iframes"]["entries"]`, the frame element's handle and the realm it was read in.
+    frame_handles: tuple[Any, ...] = ()
+    frame_owners: tuple[Any, ...] = ()
 
 
 # Summed across realms: each is a count of something the reading gave up, and the model needs the
-# page-wide total. `url`/`title` stay the main frame's (they are the page's identity), and `iframes`
-# stays the main frame's untouched -- the presence channel reports the page's frames, and folding a
-# frame's own scan into it would change a channel whose contract is presence, not reach.
+# page-wide total. `url`/`title` stay the main frame's (they are the page's identity). `iframes` stays the
+# main frame's unless frames get refs, when each read realm's frames are listed after the page's own.
 _OBSERVE_SUMMED_KEYS = (
     "textDropped",
     "dropped",
@@ -14414,6 +14726,31 @@ def _iframe_reach_clause(observation: _Observation) -> str:
             f"{unread} frame(s) could not be read and their contents are NOT listed)"
         )
     return "(contents are among the elements above and actionable by ref, same as the page's own)"
+
+
+_OBSERVE_FRAME_ENTRY_MAX = 8
+# Bounds the per-frame reads every observe makes for the frames line, so a frame that will not answer costs only this.
+_FRAME_FACT_TIMEOUT_SECONDS = 5.0
+
+
+def _merge_frame_entries(into: dict[str, Any], other: dict[str, Any]) -> None:
+    """Append a child realm's listed frames to the page's, after the page's own."""
+    theirs = other.get("iframes") or {}
+    ours = into.setdefault("iframes", {"total": 0, "inComponents": 0, "entries": [], "failed": False, "unread": 0})
+    ours.setdefault("entries", []).extend(theirs.get("entries") or [])
+    for key in ("total", "inComponents", "unread"):
+        ours[key] = (ours.get(key) or 0) + (theirs.get(key) or 0)
+
+
+def _cap_frame_entries(data: dict[str, Any]) -> list[int]:
+    """Keeps at most the per-reading frame cap, frames whose document the page cannot read first, and returns the
+    kept indices in their original order."""
+    entries = (data.get("iframes") or {}).get("entries") or []
+    order = sorted(range(len(entries)), key=lambda i: not entries[i].get("unreadable"))
+    kept = sorted(order[:_OBSERVE_FRAME_ENTRY_MAX])
+    if len(kept) < len(entries):
+        data["iframes"]["entries"] = [entries[i] for i in kept]
+    return kept
 
 
 def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
@@ -14560,7 +14897,8 @@ def _probe_was_isolated() -> bool | None:
 
 async def _probe_evaluate(target: Any, js: str, selector: str, arg: dict[str, Any]) -> Any:
     """Isolated-world probe, falling back to the realm's OWN world with own-label granting disabled --
-    a realm the page can patch must not be able to hand a label a hit-test bypass.
+    a realm the page can patch must not be able to hand a label a hit-test bypass. `allowOwnLabel` is read by
+    _REACH_PROBE_NEEDED_JS and _TYPE_TARGET_PROBE_JS.
 
     `target` is the realm the element lives in. The fallback deliberately stays in THAT realm rather
     than dropping to the page's: losing isolation is the trade this fallback has always made, but
@@ -14609,10 +14947,12 @@ def build_browser_tools(
     resolve_totp_placeholder: TotpPlaceholderResolver | None = None,
     opaque_refs: OpaqueUrlRefs | None = None,
     vision_enabled: bool = True,
+    observe_screenshot_width: int = 0,
     semantic_commit_stats: SemanticCommitStats | None = None,
     unseen_text: UnseenPageText | None = None,
     download_failures: DownloadFailureWatch | None = None,
     download_wait: Callable[[], Awaitable[None]] | None = None,
+    download_until: DownloadUntil | None = None,
     recover_page: Callable[[Any], Awaitable[bool | None]] | None = None,
 ) -> list[ToolSpec]:
     """Raw-browser tools that resolve their page from `page_provider` on every call.
@@ -14897,9 +15237,33 @@ def build_browser_tools(
     # The main frame's nonce and rendered text (None past the char bound) from the last observe evaluate.
     observed_text: list[tuple[Any, str, str | None]] = []
 
-    async def _read_one_realm(target: Any, text_args: list[Any] | None = None) -> tuple[dict[str, Any], list[Any], str]:
-        """One realm's reading. `target` is the page (its main frame) or a child frame; the payload and
-        the handles come from the SAME evaluate in that realm, which is what pairs them by index."""
+    async def _handles_of(holder: Any) -> list[Any]:
+        props = await holder.get_properties()
+        handles: list[Any] = []
+        for i in range(len(props)):
+            prop = props.get(str(i))
+            element = prop.as_element() if prop is not None else None
+            if element is None and prop is not None:
+                try:
+                    await prop.dispose()
+                except Exception:
+                    pass
+            handles.append(element)
+        return handles
+
+    async def _dispose_all(handles: Iterable[Any]) -> None:
+        for handle in handles:
+            if handle is not None:
+                try:
+                    await handle.dispose()
+                except Exception:
+                    pass
+
+    async def _read_one_realm(
+        target: Any, text_args: list[Any] | None = None
+    ) -> tuple[dict[str, Any], list[Any], str, list[Any]]:
+        """One realm's reading. `target` is the page (its main frame) or a child frame; the payload, the
+        element handles and the listed frames' handles come from the SAME evaluate, which pairs them by index."""
         before = await _realm_document_id(target)
         payload = await target.evaluate_handle(_observe_handles_js(), text_args)
         # Each get_property is its own remote-object reference, and observe runs on nearly every turn:
@@ -14911,23 +15275,16 @@ def build_browser_tools(
             raw = await json_handle.json_value()
             els_handle = await payload.get_property("els")
             holders.append(els_handle)
-            props = await els_handle.get_properties()
+            handles = await _handles_of(els_handle)
+            frames_handle = await payload.get_property("frames")
+            holders.append(frames_handle)
+            frame_handles = await _handles_of(frames_handle)
         finally:
             for holder in holders:
                 try:
                     await holder.dispose()
                 except Exception:
                     pass
-        handles: list[Any] = []
-        for i in range(len(props)):
-            prop = props.get(str(i))
-            element = prop.as_element() if prop is not None else None
-            if element is None and prop is not None:
-                try:
-                    await prop.dispose()
-                except Exception:
-                    pass
-            handles.append(element)
         # A per-DOCUMENT identity, read with the payload rather than sampled later. The url alone cannot
         # see a document REPLACED at the same url -- a frame reloading itself, which a widget on a timer
         # does routinely -- and a detached handle would then re-resolve the remembered selector against
@@ -14939,16 +15296,13 @@ def build_browser_tools(
         # identity that belongs to neither document.
         after = await _realm_document_id(target)
         if after != before:
+            await _dispose_all(frame_handles)
             raise _RealmChangedDuringRead(f"realm changed during the read: {before!r} -> {after!r}")
         try:
             data = _realm_reading(raw)
         except _RealmUnreadable:
-            for handle in handles:
-                if handle is not None:
-                    try:
-                        await handle.dispose()
-                    except Exception:
-                        pass
+            await _dispose_all(handles)
+            await _dispose_all(frame_handles)
             raise
         inline = data.pop("textDelta", None)
         if text_args is not None:
@@ -14958,7 +15312,7 @@ def build_browser_tools(
             if isinstance(inline, list) and len(inline) == 2 and isinstance(inline[0], str):
                 if inline[1] is None or isinstance(inline[1], str):
                     observed_text[:] = [(target, inline[0], inline[1])]
-        return data, handles, after
+        return data, handles, after, frame_handles
 
     async def _read_observation(page: Any) -> _Observation:
         """The page's reading, taken again whenever switching on a canvas-drawn app's accessibility tree may have
@@ -15025,18 +15379,27 @@ def build_browser_tools(
         """
         # A document already read past the char bound, or that failed twice, is not read until it navigates.
         skip_text = page in unread and page not in navigated
-        main_data, main_handles, main_document = await _read_one_realm(
+        main_data, main_handles, main_document, frame_handles = await _read_one_realm(
             page, None if skip_text else [secrets.token_hex(8), _TEXT_DELTA_TEXT_MAX_CHARS]
         )
         documents: dict[Any, str] = {None: main_document}
         owners: list[Any] = [None] * len(main_handles)
+        frame_owners: list[Any] = [None] * len(frame_handles)
         frames, skipped, unjudged = await _observable_child_frames(page)
         if not frames:
             # `skipped` travels this path too. Dropped, a page whose every frame was capped out reports
             # full reach and silently omits them -- the confident "the form never rendered" this
             # disclosure exists to prevent.
             return _Observation(
-                main_data, main_handles, owners, {None: bool(main_data.get("refsFresh"))}, documents, unjudged, skipped
+                main_data,
+                main_handles,
+                owners,
+                {None: bool(main_data.get("refsFresh"))},
+                documents,
+                unjudged,
+                skipped,
+                frame_handles=tuple(frame_handles),
+                frame_owners=tuple(frame_owners),
             )
         # Concurrently under one deadline, for the reason captcha_solver.py:153-170 gives for its own
         # frame scan: a sequential walk lets an early wedged frame spend the whole budget before the
@@ -15054,20 +15417,23 @@ def build_browser_tools(
                     LOG.debug("taskv3 observe could not read a child frame", exc_info=result)
                 unreadable += 1
                 continue
-            frame_data, frame_handles, frame_document = result
+            frame_data, frame_handles_here, frame_document, nested_handles = result
             documents[frame] = frame_document
+            _merge_frame_entries(main_data, frame_data)
+            frame_handles.extend(nested_handles)
+            frame_owners.extend([frame] * len(nested_handles))
             kept = _merge_realm(main_data, frame_data)
             # Filtered in step with the element list: the three are paired by index, and a split is
             # exactly what makes observe refuse every ref it just minted.
             kept_set = set(kept)
-            for i, spare in enumerate(frame_handles):
+            for i, spare in enumerate(frame_handles_here):
                 if spare is None or i in kept_set:
                     continue
                 try:
                     await spare.dispose()
                 except Exception:
                     pass
-            main_handles.extend(frame_handles[i] for i in kept)
+            main_handles.extend(frame_handles_here[i] for i in kept)
             owners.extend([frame] * len(kept))
             fresh[frame] = bool(frame_data.get("refsFresh"))
         # A split reading already fails closed at pairing, so it is left for that check to refuse.
@@ -15087,8 +15453,141 @@ def build_browser_tools(
         # stale on their own, refs into a newly loaded child would stay valid and be acted on as though
         # the model had seen them in this page.
         if await _realm_document_id(page) != main_document:
+            await _dispose_all(frame_handles)
             raise _RealmChangedDuringRead("the page navigated while its frames were being read")
-        return _Observation(main_data, main_handles, owners, fresh, documents, unreadable, skipped)
+        kept_frames = _cap_frame_entries(main_data)
+        await _dispose_all(handle for i, handle in enumerate(frame_handles) if i not in kept_frames)
+        return _Observation(
+            main_data,
+            main_handles,
+            owners,
+            fresh,
+            documents,
+            unreadable,
+            skipped,
+            frame_handles=tuple(frame_handles[i] for i in kept_frames),
+            frame_owners=tuple(frame_owners[i] for i in kept_frames),
+        )
+
+    def _frame_entry_text(entry: dict[str, Any], flag: str, title: str) -> str:
+        ref = f"ref={entry['ref']} " if isinstance(entry.get("ref"), int) else ""
+        inside = f"[inside ref={entry['inside']}] " if isinstance(entry.get("inside"), int) else ""
+        if entry.get("sameOrigin"):
+            # Masked whole, then cut to its path: the masker knows a payload address only by its full text.
+            href = str(entry.get("href") or "")
+            reached = len(href.encode("utf-16-le", "surrogatepass")) // 2 >= _observe_retain_width()
+            where = _digest_token(_download_url_path(_mask_refs(href, cut=reached)), 120)
+        else:
+            where = _digest_token(entry.get("host") or "?", 80)
+        text = f"{ref}{flag}{inside}{where}{title}"
+        received = entry.get("received")
+        if received is None:
+            # The error page also stands for a frame that never loaded, so alone it says nothing about a document.
+            return text + (", the browser shows its own error page here" if entry.get("errorPage") else "")
+        _url, media, size = received
+        text += f", the browser received a document here and did not show it: {_digest_token(media, 80)}"
+        return text + (f", {_human_download_size(size)}" if size is not None else "")
+
+    async def _download(click: ToolHandler, args: dict[str, Any]) -> ToolResult:
+        """A frame ref saves that frame's document; any other target is clicked through click's own handler."""
+        match = REF_SELECTOR_RE.match(args.get("selector") or "") if isinstance(args.get("selector"), str) else None
+        entry = _observe_manifest.get(int(match.group(1))) if match is not None else None
+        if match is None or entry is None or entry.get("tag") != "iframe":
+            result = await click(args)
+            return dataclasses.replace(result, data={**(result.data or {}), DOWNLOAD_TARGET_DATA_KEY: "control"})
+        ref = int(match.group(1))
+        data: dict[str, Any] = {DOWNLOAD_TARGET_DATA_KEY: "frame"}
+        page, error = await _resolve_page()
+        if error is not None:
+            return dataclasses.replace(error, data={**(error.data or {}), **data})
+        _selector, ref_error = await _resolve_ref(page, ref)
+        if ref_error is not None:
+            return dataclasses.replace(ref_error, data={**(ref_error.data or {}), **data})
+        frame = await entry["handle"].content_frame()
+        received = None
+        if download_failures is not None and frame is not None:
+            received = download_failures.frame_document(frame)
+        # What answered the frame's latest navigation is its address; the element's src is where it started.
+        src = received[0] if received else str(await entry["handle"].evaluate("(el) => el.src") or "")
+        shown = _download_url_path(_mask_refs(src, cut=True))
+        if not src.startswith(("http://", "https://")) or not downloads_dir:
+            return ToolResult.error(
+                f"No file saved: frame ref={ref} has no web address to save from.",
+                data=data,
+                error_class="frame_not_saved",
+            )
+        failure = await _save_frame_document(_current_page(), src, downloads_dir, received[1] if received else None)
+        if failure is not None:
+            return ToolResult.error(
+                f"No file saved from frame ref={ref} ({shown}): {failure}.",
+                data={**data, DOWNLOAD_SAVE_FAILED_DATA_KEY: True},
+                error_class="frame_not_saved",
+            )
+        return ToolResult.ok(f"Saved the document of frame ref={ref} ({shown}).", data=data)
+
+    async def _frame_facts(
+        data: dict[str, Any], observation: _Observation, public_ref: Callable[[Any, Any, str], int]
+    ) -> None:
+        """Gives each listed frame a ref, and each frame the page cannot read the document the failure watch saw it
+        receive and not show, and whether it shows the browser's error page."""
+        entries = (data.get("iframes") or {}).get("entries") or []
+        handles = list(observation.frame_handles)
+        owners = list(observation.frame_owners)
+        if len(handles) != len(entries):
+            await _dispose_all(handles)
+            # An entry's own number is the page's index, not a ref any tool accepts.
+            for entry in entries:
+                entry["ref"] = None
+            return
+        for entry, handle, owner in zip(entries, handles, owners):
+            if handle is None:
+                entry["ref"] = None
+                continue
+            ref = public_ref(owner, entry.get("ref"), "iframe")
+            entry["ref"] = ref
+            _observe_manifest[ref] = {
+                "handle": handle,
+                "tag": "iframe",
+                "selector": "",
+                "binding": "",
+                "owner": owner,
+                "document": observation.documents.get(owner, ""),
+                "question": "",
+                "option": "",
+                "choice": "",
+            }
+        try:
+            async with asyncio.timeout(_FRAME_FACT_TIMEOUT_SECONDS):
+                for entry, handle in zip(entries, handles):
+                    # A same-origin frame this realm can read is showing its document.
+                    if handle is None or (entry.get("sameOrigin") and not entry.get("unreadable")):
+                        continue
+                    content = await handle.content_frame()
+                    if content is None:
+                        continue
+                    entry["errorPage"] = _shows_browser_error_page(content)
+                    if download_failures is not None:
+                        entry["received"] = download_failures.frame_document(content)
+                main_frame = _current_page().main_frame
+                for frame in dict.fromkeys(owner for owner in owners if owner is not None):
+                    parent = frame.parent_frame
+                    parent_owner = None if parent is None or parent is main_frame else parent
+                    host = await frame.frame_element()
+                    try:
+                        for entry, handle, owner in zip(entries, handles, owners):
+                            if owner is parent_owner and handle is not None:
+                                if await host.evaluate("(a, b) => a === b", handle):
+                                    inside = entry["ref"]
+                                    break
+                        else:
+                            continue
+                    finally:
+                        await _dispose_all([host])
+                    for entry, owner in zip(entries, owners):
+                        if owner is frame:
+                            entry["inside"] = inside
+        except Exception:
+            LOG.info("taskv3 observe could not read every frame's state", exc_info=True)
 
     async def observe(_args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -15162,10 +15661,8 @@ def build_browser_tools(
         # the wrong-element commit the whole ref mechanism exists to prevent.
         _realm_documents = observation.documents
         _seen_js: set[tuple[Any, int]] = set()
-        for _idx, e in enumerate(elements):
-            _tag = str(e.get("tag") or "")
-            _owner = owners[_idx] if _idx < len(owners) else None
-            _js_ref = e.get("ref")
+
+        def _public_ref(_owner: Any, _js_ref: Any, _tag: str) -> int:
             _js_ref = _js_ref if isinstance(_js_ref, int) and not isinstance(_js_ref, bool) else None
             # Keyed by (realm, id): the id comes from a WeakMap in the realm that produced it, so the
             # same number from two realms describes two different elements. Keyed by id alone, a frame's
@@ -15183,6 +15680,12 @@ def build_browser_tools(
             if _realm_key is not None:
                 _public_ref_for_js[_realm_key] = (_public, _tag)
                 _seen_js.add(_realm_key)
+            return _public
+
+        for _idx, e in enumerate(elements):
+            _tag = str(e.get("tag") or "")
+            _owner = owners[_idx] if _idx < len(owners) else None
+            _public = _public_ref(_owner, e.get("ref"), _tag)
             e["ref"] = _public
             # The selector rides along as the RE-RESOLVE path, not as an address: a framework that
             # replaces its nodes on every render detaches the handle, where the selector observe
@@ -15200,9 +15703,11 @@ def build_browser_tools(
                 # A radio or checkbox's question and caption as observe read them, for a click's answer.
                 "question": _mask_refs(str(e.get("question") or "")),
                 "option": _mask_refs(str(e.get("label") or "")),
+                "kind": _observe_kind(e),
                 "choice": next((c for c in (e.get("role"), e.get("type")) if c in ("radio", "checkbox")), "")
                 or ("toggle" if e.get("toggle_choice") else ""),
             }
+        await _frame_facts(data, observation, _public_ref)
         # Compact rendering keeps the persistent-conversation prefix small (cost is ~linear in it).
         raw_url = _mask_refs(str(data.get("url") or ""))
         # Stripping forgery chars is not truncation: only the cap changes what the URL points at, so
@@ -15310,7 +15815,7 @@ def build_browser_tools(
                     tags.append(f"[fills {viewport_pct}% of viewport]")
                 flag = f"{' '.join(tags)} " if tags else ""
                 title = f" {f['title']!r}" if f.get("title") else ""
-                parts.append(f"{flag}{_digest_token(f.get('host') or '?', 80)}{title}")
+                parts.append(_frame_entry_text(f, flag, title))
             overflow = f" (+{total - len(iframe_entries)} more)" if total > len(iframe_entries) else ""
             # `total` counts what was readable, so without this the sentence is an absolute claim
             # about a page some of which was never read.
@@ -15321,7 +15826,8 @@ def build_browser_tools(
             # changes in the same commit as the capability -- a message that runs ahead of the behaviour
             # it describes would have the model emit selectors for elements no tool can reach.
             lines.append(
-                f"iframes: {total} in the page and its open component roots "
+                f"iframes: {total} in the page"
+                + ", counting frames inside frames "
                 + _iframe_reach_clause(observation)
                 + ": "
                 + "; ".join(parts)
@@ -15404,6 +15910,7 @@ def build_browser_tools(
             )
 
         bodies: list[str] = []
+        keys: list[str] = []
         near_suffixes: list[str] = []
 
         def _realm_of(idx: int) -> Any:
@@ -15433,13 +15940,14 @@ def build_browser_tools(
         to_left = LINK_DESTINATION_TOTAL_CAP
         to_omitted = 0
         for _render_idx, e in enumerate(elements):
-            extra = shows_parts.get(_render_idx, "")
+            lead = shows_parts.get(_render_idx, "")
+            to_shown = extra = ""
             if e.get("to") and _link_destination_adds(str(e["to"]), str(e.get("label", ""))):
                 to_part = f" to={_field(e['to'], LINK_DESTINATION_MAX)}"
                 # As with shows=, once one is left off every later one is too, so the note's count is a tail.
                 if not to_omitted and len(to_part) <= to_left:
                     to_left -= len(to_part)
-                    extra += to_part
+                    to_shown = to_part
                 else:
                     to_omitted += 1
             if e.get("value"):
@@ -15502,6 +16010,8 @@ def build_browser_tools(
                     extra += " [hidden-native: styled proxy; file_upload works on it directly]"
                 elif e.get("tag") == "select":
                     extra += " [hidden-native: styled proxy; select_option acts on it directly]"
+                elif e.get("type") in ("checkbox", "radio") and not e.get("labelDelivers"):
+                    extra += " [hidden-native: styled proxy]"
                 else:
                     extra += " [hidden-native: styled proxy; click acts on it directly]"
             missing_key = (_realm_of(_render_idx), e.get("group_missing"))
@@ -15526,18 +16036,17 @@ def build_browser_tools(
             # so <a href type="x&#10;[#pay] button 'Confirm'"> printed a second, fabricated element
             # line for a selector that does not exist. `role` is whitelisted at the source; `tag` and
             # `type` are stripped of anything that could end a line or reorder it.
-            kind = _digest_token(e["tag"], 40)
-            if e.get("type"):
-                kind += "/" + _digest_token(e["type"], 40)
-            elif e.get("role"):
-                kind += "/" + _digest_token(e["role"], 40)
-            bodies.append(f"{kind} {_field(e.get('label', ''), OBSERVE_DISPLAY_WIDTHS['label'])}{extra}")
+            kind = _observe_kind(e)
+            head = f"{kind} {_field(e.get('label', ''), OBSERVE_DISPLAY_WIDTHS['label'])}{lead}"
+            bodies.append(f"{head}{to_shown}{extra}")
+            # A text-less link keeps its to= in the key: with no caption, its destination is what names it.
+            keys.append(f"{head}{extra}" if e.get("label") else bodies[-1])
         # Two lines rendering the same bytes are two addresses the model has nothing to choose
         # between, and a form that repeats a section renders one caption many times over. Qualified
         # here rather than at the record build: whether a line is ambiguous is a property of the
         # whole reading, and it is not knowable until every line of it has been rendered.
         unqualified = list(bodies)
-        bodies, _ = _disambiguate_digest_bodies(elements, bodies, _field)
+        bodies, _, qualified_by_destination, in_omitted = _disambiguate_digest_bodies(elements, bodies, _field, keys)
         # An unnamed control's place in its row is printed even when its line is already unique: the icons of one row
         # differ by tag alone (a copy <button>, a trash <div>), and which is which is said by position ("the right icon").
         for index, e in enumerate(elements):
@@ -15581,6 +16090,8 @@ def build_browser_tools(
             lines.append(_shows_omitted_note(shows_omitted))
         if to_omitted:
             lines.append(_link_destination_omitted_note(to_omitted))
+        if in_omitted:
+            lines.append(f"(in= left off {in_omitted} more link(s): this reading's budget for it ran out.)")
         # Counts only, for the per-call log record: every perception change that alters only what
         # this function renders is otherwise invisible to production telemetry.
         frame_census = data.get("frameCensus") or {}
@@ -15613,6 +16124,8 @@ def build_browser_tools(
                 ).values()
                 if n > 1
             ),
+            # Lines given a location because they differed from another only in to=.
+            "qualified_by_destination": qualified_by_destination,
             # SKY-15590. These ride the per-call record so EVERY observe is counted, frame-free
             # ones included: a channel that speaks only when frames exist cannot state a rate.
             # Deliberately not `iframes.total`, which is filtered for the model.
@@ -16397,7 +16910,7 @@ def build_browser_tools(
         # The click/type reaction gate stamps data-tv3-pre on every visible element and the reach probe
         # marks the layer it names; bookkeeping that, left in place, costs truncation budget in noise.
         html = html.replace(' data-tv3-pre="1"', "").replace(' data-tv3-cover="1"', "")
-        html = _CLOSE_ATTR_RE.sub("", html)
+        html = _CTL_ATTR_RE.sub("", html)
         html = _COLLATERAL_ATTR_RE.sub("", html)
         html = _DATE_SEGMENT_ATTR_RE.sub("", html)
         # The act-by-mark tag outlives its call, so unlike the other data-tv3-* bookkeeping it is
@@ -16458,19 +16971,13 @@ def build_browser_tools(
             data = {**data, "notice_at": data["notice_at"] + len(line)}
         return dataclasses.replace(result, content=line + result.content, data=data)
 
-    async def _unreachable_error(selector: str) -> ToolResult:
-        # A native checkbox or <select> inside a hidden template is refused HERE, by a visibility
-        # pre-gate, before anything raises -- so it never reaches the guard's diagnosis and used to be
-        # told its section is collapsed and to go find the trigger, which a template does not have.
-        # Same question, same probe, asked one layer earlier.
+    async def _unreachable_error(selector: str, *, stand_in_checked: bool = True) -> ToolResult:
+        # A native checkbox or <select> inside a hidden template is refused here by a visibility pre-gate, before
+        # anything raises, so it is told it is in a template rather than sent to look for a trigger it does not have.
         if await _target_is_inert(selector):
             return _inert_target_error(selector)
-        return ToolResult.error(
-            f"{selector} is not rendered and nothing visible stands in for it — its section is collapsed, "
-            "closed or inactive, so a person could not reach this control either. Act on whatever reveals "
-            "it (the section header, the step, the modal trigger), then re-observe.",
-            error_class="unreachable",
-        )
+        tail = ", and no label or element naming it is drawn where a click could reach it" if stand_in_checked else ""
+        return ToolResult.error(f"{selector} is not rendered on screen{tail}.", error_class="unreachable")
 
     def _not_editable_error(exc: _FieldNotEditable) -> ToolResult:
         if exc.read_only:
@@ -16621,6 +17128,8 @@ def build_browser_tools(
         controls_desc = "; ".join(parts) if parts else "none named"
         if (occluder or {}).get("truncated"):
             controls_desc += "; more controls exist (re-observe to see the rest)"
+        is_frame = bool((occluder or {}).get("frame"))
+        frame_note = "It is a frame, and the probe does not read inside frames"
         if branch == "challenge":
             return ToolResult.error(
                 f"{selector} is covered by {layer_desc}, which contains a challenge frame "
@@ -16651,10 +17160,14 @@ def build_browser_tools(
         # A layer that is quoted is reported, not prescribed for: its text may be the page answering the last action,
         # which closing it and retrying the same field does not address.
         if said and not parts:
+            none_found = (
+                frame_note
+                if is_frame
+                else "The probe found no named controls on it; one without a label (an icon or an ×) would show "
+                f"in get_html of {layer_selector or 'the layer'}"
+            )
             return ToolResult.error(
-                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} The probe found no "
-                f"named controls on it; one without a label (an icon or an ×) would show in get_html of "
-                f"{layer_selector or 'the layer'}.",
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} {none_found}.",
                 data=blocker,
                 error_class="covered",
             )
@@ -16666,12 +17179,17 @@ def build_browser_tools(
                 error_class="covered",
             )
         if not parts:
-            # The probe names controls by tag, role and inline onclick; a close wired by a script listener is
-            # none of those, so an empty list is no evidence the layer has no way out.
+            # The probe names controls by tag, role, pointer cursor and inline onclick; a close wired by a script
+            # listener is none of those, so an empty list is no evidence the layer has no way out.
+            none_found = (
+                frame_note
+                if is_frame
+                else "The probe found no named controls on it, but it may still have an unlabeled close (an icon or "
+                f"an ×): read get_html of {layer_selector or 'the layer'} to find it, close the layer, then retry "
+                f"{selector}"
+            )
             return ToolResult.error(
-                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. The probe found no named "
-                "controls on it, but it may still have an unlabeled close (an icon or an ×): read get_html of "
-                f"{layer_selector or 'the layer'} to find it, close the layer, then retry {selector}.",
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. {none_found}.",
                 data=blocker,
                 error_class="covered",
             )
@@ -16701,13 +17219,109 @@ def build_browser_tools(
         # action will actually land on -- consulted only where the per-root lookup finds nothing.
         # Only a composed selector needs it, and hostAnchored composes with a space, so anything
         # without one keeps its single round trip. A quoted space costs a spare lookup, never a miss.
+        ctl = secrets.token_hex(3)[:5]
         if " " not in selector:
-            return {"sel": selector, "el": None}
+            return {"sel": selector, "el": None, "ctl": ctl}
         try:
             element = await page.query_selector(selector)
         except Exception:
             element = None
-        return {"sel": selector, "el": element}
+        return {"sel": selector, "el": element, "ctl": ctl}
+
+    def _no_point_refusal(selector: str, cause: str) -> str:
+        return f"{selector} was not clicked: it has no on-screen point of its own, and {cause}"
+
+    def _left_page_error(selector: str) -> ToolResult:
+        return ToolResult.error(
+            f"{selector} left the page before the click could land — it was replaced by a "
+            "re-render; re-observe and act on fresh selectors",
+            data={"page_state_changed": True},
+            error_class="stale_selector",
+        )
+
+    def _label_click_refusal(selector: str, exc: Exception) -> ToolResult:
+        # Only the driver's own fixed phrases are echoed: its call log also quotes the page's markup.
+        if "intercepts pointer events" in str(exc):
+            _record_covered(None, "unnamed", controls=[])
+            return ToolResult.error(
+                _no_point_refusal(selector, "another element is drawn over its label where the click would land"),
+                error_class="covered",
+            )
+        states = re.findall(r"element is (not visible|not stable|not enabled|outside of the viewport)", str(exc))
+        found = f"was {states[-1]}" if states else f"could not be clicked ({type(exc).__name__})"
+        return ToolResult.error(
+            _no_point_refusal(selector, f"its label {found} after {_LABEL_CLICK_TIMEOUT_MS / 1000:g} s"),
+            error_class="unreachable",
+        )
+
+    async def _probe_target(realm: input_dispatch.Realm, arg: dict[str, Any]) -> ElementHandle | None:
+        try:
+            return (await realm.evaluate_handle(_PROBE_TARGET_JS, arg)).as_element()
+        except Exception:
+            return None
+
+    async def _driver_own_label(target: ElementHandle) -> tuple[ElementHandle, dict[str, float] | None] | None:
+        # The driver finds the candidates from DOM attributes; only the choice among them runs in the page's world. A
+        # page that forges that choice can at worst steer a real, hit-tested click onto an element inside a label the
+        # driver found for this target.
+        labels: list[ElementHandle] = []
+        picked = None
+        try:
+            labels = await target.query_selector_all("xpath=ancestor::label[not(@for)]")
+            dom_id = await target.get_attribute("id")
+            frame = await target.owner_frame()
+            if dom_id and frame is not None:
+                labels += await frame.query_selector_all(f"label[for={_css_string(dom_id)}]")
+            if labels:
+                picked = await target.evaluate(_OWN_LABEL_PICK_CALL_JS, labels)
+        except Exception:
+            picked = None
+        index = picked.get("index") if isinstance(picked, dict) else None
+        chosen = labels[index] if isinstance(index, int) and 0 <= index < len(labels) else None
+        for handle in labels:
+            if handle is not chosen:
+                with contextlib.suppress(Exception):
+                    await handle.dispose()
+        if chosen is None or not isinstance(picked, dict):
+            return None
+        if picked.get("held") is not True:
+            return chosen, None
+        position = None
+        with contextlib.suppress(Exception):
+            position = await _off_control_position(chosen, target)
+        if position is None:
+            with contextlib.suppress(Exception):
+                await chosen.dispose()
+            return None
+        return chosen, position
+
+    async def _off_control_position(label: ElementHandle, target: ElementHandle) -> dict[str, float] | None:
+        # Driver boxes, all in the label's own frame on either engine: mid-height at the centre, then 3 px in from either
+        # side, the first off every other control the label holds, as the padding-box offset `position` takes.
+        box = await label.bounding_box()
+        if box is None:
+            return None
+        held = await label.query_selector_all(_LABEL_HELD_CONTROLS)
+        boxes: list[dict[str, float]] = []
+        try:
+            for control in held:
+                if not await control.evaluate("(c, el) => c === el", target):
+                    held_box = await control.bounding_box()
+                    if held_box is not None:
+                        boxes.append(held_box)
+        finally:
+            for control in held:
+                with contextlib.suppress(Exception):
+                    await control.dispose()
+        border_left, border_top = await label.evaluate(
+            "(l) => { const s = getComputedStyle(l);"
+            " return [parseInt(s.borderLeftWidth, 10) || 0, parseInt(s.borderTopWidth, 10) || 0]; }"
+        )
+        y = box["y"] + box["height"] / 2
+        for x in (box["x"] + box["width"] / 2, box["x"] + 3, box["x"] + box["width"] - 3):
+            if not any(b["x"] <= x <= b["x"] + b["width"] and b["y"] <= y <= b["y"] + b["height"] for b in boxes):
+                return {"x": x - box["x"] - border_left, "y": y - box["y"] - border_top}
+        return None
 
     def _with_target_label(handler: ToolHandler) -> ToolHandler:
         """Capture the target's page-visible name and kind BEFORE the handler runs and carry both on
@@ -16722,6 +17336,7 @@ def build_browser_tools(
             selector = args.get("selector")
             name: str | None = None
             kind: str | None = None
+            shown: str | None = None
             from_placeholder = False
             # The page comes from the preflight handoff, read and not popped -- the handler's own
             # _resolve_page consumes it. Never page_provider(): a second must_get_working_page can
@@ -16760,6 +17375,8 @@ def build_browser_tools(
                     name = raw_name if isinstance(raw_name, str) and raw_name.strip() else None
                     raw_kind = raw.get("kind")
                     kind = raw_kind if isinstance(raw_kind, str) and raw_kind else None
+                    raw_shown = raw.get("shown")
+                    shown = raw_shown if name is not None and isinstance(raw_shown, str) and raw_shown.strip() else None
                     from_placeholder = raw.get("placeholder") is True
             result = await handler(args)
             # Only a call that acted carries a name/kind. The probe resolves the selector on its own,
@@ -16775,6 +17392,8 @@ def build_browser_tools(
                 data[TARGET_LABEL_DATA_KEY] = name
                 if from_placeholder:
                     data[TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY] = True
+                if shown is not None:
+                    data[TARGET_SHOWN_TEXT_DATA_KEY] = shown
             if kind is not None:
                 data[TARGET_KIND_DATA_KEY] = kind
             # `replace`, not a positional rebuild: this carries every field the result already has,
@@ -16809,7 +17428,21 @@ def build_browser_tools(
             return None
         # The element the driver waited on, which is not always the one the caller named.
         acted = _acted_selector.get(selector, selector)
-        return _inert_target_error(acted) if await _target_is_inert(acted) else None
+        probe: str | None = acted
+        if _ENGINE_SELECTOR_RE.match(acted.strip()) and _acted_page:
+            # The isolated probe reads CSS only, so a text= or xpath target is first named by the driver's own engine.
+            realm = _acted_realm[0] if _acted_realm else _acted_page[0]
+            handle = None
+            try:
+                handle = await realm.locator(acted).first.element_handle(timeout=1000)
+                probe = await _resolve_handle_selector(realm, handle) if handle is not None else None
+            except Exception:
+                probe = None
+            finally:
+                if handle is not None:
+                    with contextlib.suppress(Exception):
+                        await handle.dispose()
+        return _inert_target_error(acted) if probe is not None and await _target_is_inert(probe) else None
 
     async def _typing_target(page: Any, selector: str) -> str:
         """The element a type call acts on: the one its selector names, or the control a named shadow host mirrors."""
@@ -17278,6 +17911,7 @@ def build_browser_tools(
         selector = args.get("selector")
         if not selector:
             return ToolResult.error("click needs a selector, or mark=N from the last look().")
+        clicked_name = _CLICK_TARGET_NAME.get() or selector
         if _NUMBERED_MENU_SELECTOR_RE.match(selector.strip()) and await _rows_unlisted(page, selector):
             # Not a page change: the menu is still open, its rows were simply never numbered.
             raise ToolRefusal(
@@ -17446,8 +18080,8 @@ def build_browser_tools(
             if not (isinstance(skin_probe, dict) and "radio" in skin_probe):
                 break
             if await _engine_enabled(page, selector):
-                # A page that enables a control can move it in the same step, so the label point is measured after
-                # the enabled read, never before it.
+                # A page that enables a control can move it in the same step, so the probe runs again after the
+                # enabled read.
                 pre_click_arg = await _probe_arg(page, selector)
                 with contextlib.suppress(Exception):
                     skin_probe = await _probe_evaluate(page, _SKINNED_CHECKBOX_PROBE_JS, selector, pre_click_arg)
@@ -17458,24 +18092,23 @@ def build_browser_tools(
                     error_class="disabled",
                 )
             await asyncio.sleep(0.1)
-            # Enabling can re-render or move the control, so the label point is measured again after the wait.
+            # Enabling can re-render or move the control, so the probe runs again after the wait.
             pre_click_arg = await _probe_arg(page, selector)
+        # Read now: the readback probes below overwrite it.
+        skin_isolated = _probe_was_isolated()
         if isinstance(skin_probe, dict) and "radio" in skin_probe and (kinds := _CLICK_CHOICE_KIND.get()) is not None:
             kinds.append("radio" if skin_probe["radio"] else "checkbox")
-        if isinstance(skin_probe, dict) and skin_probe.get("drawnLabel") and (label_over_control or _acted_realm):
-            # A drawn input under its own label is already force-clicked below, and a frame's label point is
-            # frame-relative, so neither takes the label route.
-            skin_probe = {**skin_probe, "skinned": False, "labelClick": None}
+        if isinstance(skin_probe, dict) and skin_probe.get("drawnLabel") and label_over_control:
+            # A drawn input under its own label is already force-clicked below.
+            skin_probe = {**skin_probe, "skinned": False}
         if isinstance(skin_probe, dict) and skin_probe.get("file"):
             return ToolResult.error(
                 f"{selector} is a file input — clicking it opens a native picker the run cannot drive; "
                 "use file_upload with this selector instead"
             )
         if isinstance(skin_probe, dict) and skin_probe.get("select") and skin_probe.get("invisible"):
-            # Playwright's actionability wait never resolves against it, so a click here is 15s of pure
-            # loss followed by a raise; select_option forces past that on the same selector — but only
-            # for one something visible stands in for, so an unreachable select is sent to reveal first
-            # rather than to a tool that would refuse it a turn later.
+            # Playwright's actionability wait never resolves against it, so a click here is 15s of loss and a raise.
+            # select_option forces past that only for one something visible stands in for, so any other is refused here.
             if not skin_probe.get("proxied"):
                 return await _unreachable_error(selector)
             return ToolResult.error(
@@ -17484,12 +18117,21 @@ def build_browser_tools(
             )
         if isinstance(skin_probe, dict) and skin_probe.get("unproxied"):
             return await _unreachable_error(selector)
+        if isinstance(skin_probe, dict) and skin_probe.get("unnamed"):
+            if await _target_is_inert(selector):
+                return _inert_target_error(selector)
+            if skin_probe.get("clipped"):
+                return ToolResult.error(
+                    f"{selector} was not clicked: a container clips off the point a click aims at, and no <label> or "
+                    "element naming it is drawn",
+                    error_class="unreachable",
+                )
+            return ToolResult.error(
+                _no_point_refusal(selector, "no <label> or element naming it is drawn"), error_class="unreachable"
+            )
         skinned = bool(isinstance(skin_probe, dict) and skin_probe.get("skinned"))
-        if isinstance(skin_probe, dict) and (skin_probe.get("covered") or (skinned and skin_probe.get("labelCovered"))):
+        if isinstance(skin_probe, dict) and skin_probe.get("covered"):
             return _covered_error(selector, None, verb="clicked")
-        label_click = skin_probe.get("labelClick") if isinstance(skin_probe, dict) else None
-        if not isinstance(label_click, dict):
-            label_click = None
         # A forced own-label click can land on something inside the label that is not the control (a
         # nested <details>, a scripted link); a toggle target earns a before/after readback.
         toggle_target = isinstance(reach_pre, dict) and bool(reach_pre.get("toggle"))
@@ -17537,41 +18179,49 @@ def build_browser_tools(
                 checked_before = None
 
         document_replaced = False
-        if skinned and label_click:
-            if _acted_realm:
-                # The coordinates come from a getBoundingClientRect inside the element's own realm, so
-                # in a child frame they are FRAME-relative while page.mouse takes viewport coordinates.
-                # Clicking them anyway would land wherever that offset happens to point -- a click on
-                # something else, reported as a click on this. Refused instead, because nothing here can
-                # be verified afterwards: the wrong element may well have accepted the click.
-                # Translating them by the frame's own offset (and by each ancestor frame's) is the
-                # follow-up; it is not free and it is not this change.
-                return ToolResult.error(
-                    f"{selector} is a styled control whose only clickable surface is its label, and it "
-                    "sits inside a frame where that label cannot be aimed at reliably — act on a "
-                    "different control, or use the native control directly if the page exposes one"
-                )
+        label_clicked = False
+        if skinned:
+            target = await _probe_target(page, pre_click_arg)
             try:
-                await input_dispatch.click_at(_current_page(), float(label_click["x"]), float(label_click["y"]))
-            except Exception as e:
-                return ToolResult.error(
-                    f"click on {selector} via its label failed ({type(e).__name__}) — the page may have "
-                    "re-rendered; re-observe and act on fresh selectors"
-                )
-            base = f"clicked {selector} via its label — now at {await _url(page)}"
-        elif skinned:
-            # Resolved again here rather than reused: this evaluate is the action, not a probe, and a
-            # selector naming a control through its host resolves ONLY through the handle -- a node the
-            # page replaced while the probes ran would be clicked off-document, silently.
-            fired = await input_dispatch.js_click(page, _ROOT_QUERY_JS, await _probe_arg(page, selector))
-            if not fired:
-                return ToolResult.error(
-                    f"{selector} left the page before the click could land — it was replaced by a "
-                    "re-render; re-observe and act on fresh selectors",
-                    data={"page_state_changed": True},
-                    error_class="stale_selector",
-                )
-            base = f"clicked {selector} (hidden native control, toggled directly) — now at {await _url(page)}"
+                picked = await _driver_own_label(target) if target is not None else None
+                if picked is not None:
+                    label, position = picked
+                    try:
+                        await input_dispatch.click_handle(
+                            page, label, timeout=_LABEL_CLICK_TIMEOUT_MS, position=position
+                        )
+                    except Exception as e:
+                        return _label_click_refusal(selector, e)
+                    finally:
+                        with contextlib.suppress(Exception):
+                            await label.dispose()
+                    label_clicked = True
+                    base = f"clicked {clicked_name} via its label — now at {await _url(page)}"
+                elif skin_isolated is not True:
+                    # What a script toggle finds and reads back in a realm the page can patch is the page's to forge.
+                    connected = None
+                    if target is not None:
+                        with contextlib.suppress(Exception):
+                            connected = await target.evaluate("(el) => el.isConnected")
+                    if target is None or connected is False:
+                        return _left_page_error(selector)
+                    return ToolResult.error(
+                        _no_point_refusal(selector, "no <label> that can be clicked away from other controls"),
+                        error_class="unreachable",
+                    )
+                else:
+                    # Resolved again by the probe's rule, with the probe's element as the fallback, so a node the page
+                    # replaced while the probes ran is refused rather than clicked off-document.
+                    fired = await input_dispatch.js_click(page, _ROOT_QUERY_JS, {"sel": selector, "el": target})
+                    if not fired:
+                        return _left_page_error(selector)
+                    base = (
+                        f"clicked {clicked_name} (hidden native control, toggled directly) — now at {await _url(page)}"
+                    )
+            finally:
+                if target is not None:
+                    with contextlib.suppress(Exception):
+                        await target.dispose()
         else:
             marker_armed = True
             try:
@@ -17686,7 +18336,7 @@ def build_browser_tools(
                     data={"page_state_changed": True},
                     error_class="stale_selector",
                 )
-            base = f"clicked {selector} — now at {await _url(page)}"
+            base = f"clicked {clicked_name} — now at {await _url(page)}"
             if document_replaced:
                 base += f" — {_navigated_phrase()}"
 
@@ -17776,19 +18426,16 @@ def build_browser_tools(
                 # pre-read raced): as before the unified verdict, fall through to the ordinary post path
                 # rather than claim the control left the page.
             if verdict is CommitStatus.DID_NOT_COMMIT:
-                drawn_label = skinned and bool(skin_probe.get("drawnLabel"))
-                if skinned and not drawn_label:
+                if skinned and not label_clicked:
                     return ToolResult.error(
-                        f"click on {selector} did NOT commit: the control still reads checked={checked_after!r} — "
-                        "the styled proxy may not sync from its hidden control; re-observe and act on the visible "
-                        "proxy instead",
+                        f"click on {selector} did NOT commit: it was toggled directly and still reads "
+                        f"checked={checked_after!r}",
                         data=transition_data,
                     )
-                if verify_toggle or drawn_label:
+                if verify_toggle or label_clicked:
                     return ToolResult.error(
-                        f"click on {selector} did NOT commit: the control still reads checked={checked_after!r} — "
-                        "its label took the click but the control did not change (the page may refuse the toggle, "
-                        "or something inside the label took it); re-observe before retrying",
+                        f"click on {selector} did NOT commit: it was clicked through its label and still reads "
+                        f"checked={checked_after!r}",
                         data=transition_data,
                     )
                 # The click may have done something other than toggle (opened a menu, selected an
@@ -17989,7 +18636,7 @@ def build_browser_tools(
         occluder = probe.get("occluder") if isinstance(probe, dict) else None
         if occluded and probe.get("unrendered"):
             # Whatever the hit test met is drawn where the undrawn field sits, so it covers nothing.
-            raise ToolRefusal.of(await _unreachable_error(selector))
+            raise ToolRefusal.of(await _unreachable_error(selector, stand_in_checked=False))
         if occluded and not probe.get("skinned"):
             await _annotate_challenge_frame(page, _current_page(), occluder)
             return False, occluded, occluder
@@ -19740,6 +20387,10 @@ def build_browser_tools(
             "range",
         }
     )
+    # The browser takes these values only whole: a key in them steps or picks, it does not insert a character.
+    _VALUE_SET_TYPES = frozenset({"date", "datetime-local", "month", "time", "week", "color", "range"})
+    # Playwright's fill throws on a number field given text that is not a number, such as "-" or "1e".
+    _NUMBER_PREFIX_RE = re.compile(r"\s*[-+]?\d+(\.\d*)?\s*")
 
     async def _unverifiable_because(page: Any, selector: str) -> str | None:
         # Returns the clause explaining why a check could not be run, or None when it could. "The
@@ -20985,7 +21636,55 @@ def build_browser_tools(
                         "after the field was focused, so nothing was typed. Re-observe the field before typing again.",
                         error_class="text_not_held",
                     )
-            await input_dispatch.fill(page, selector, written, timeout=_ACTION_TIMEOUT_MS)
+            # A field that registers its value only from key events gets the last character as a real key.
+            cut = len(written) - 1
+            key_last = bool(
+                written
+                and written[-1].isprintable()
+                and not written[-1].isspace()
+                and not (typed_secret or box_text or flutter_field or field_type in _VALUE_SET_TYPES)
+                and (field_type != "number" or _NUMBER_PREFIX_RE.fullmatch(written[:cut]))
+            )
+            sent = 0
+            gone = False
+            if key_last:
+                # fill("") on an empty field still sends Delete, which drops a chip or re-mounts some inputs.
+                if cut or await _read_field_value(page, selector) != "":
+                    await input_dispatch.fill(page, selector, written[:cut], timeout=_ACTION_TIMEOUT_MS)
+                # A field re-mounted by the prefix write is followed to its replacement. One that cannot be followed
+                # gets no whole fill, which would wait out the timeout on the detached node.
+                with contextlib.suppress(Exception):
+                    gone = not await page.locator(selector).count() and not await _follow_replaced_field(page, selector)
+                caret: bool | str = False
+                if gone:
+                    # A replacement a look() mark cannot follow gets the key if it has focus and holds the prefix.
+                    with contextlib.suppress(Exception):
+                        caret = await page.evaluate(_FOCUSED_HOLDING_CARET_TO_END_JS, written[:cut])
+                elif await _read_field_value(page, selector) is not None:
+                    # The key goes where the page put the caret, such as a mask's next slot, unless the text after the
+                    # caret is the end of what was just written: then the caret sits inside the tool's own text.
+                    with contextlib.suppress(Exception):
+                        caret = await page.eval_on_selector(
+                            selector,
+                            "(el, prefix) => el.getRootNode().activeElement === el && el.selectionStart > 0"
+                            " && !prefix.endsWith(el.value.slice(el.selectionStart))",
+                            written[:cut],
+                        )
+                    if not caret:
+                        with contextlib.suppress(Exception):
+                            caret = await page.eval_on_selector(selector, _CARET_TO_END_JS)
+                if caret:
+                    with contextlib.suppress(Exception):
+                        sent = await _type_keys_before_deadline(written[cut:], press_end=caret == "end_key")
+            if gone and not sent:
+                record_entry_variant(f"native_{field_type}" if field_type in _ENTRY_VARIANT_TYPES else "native_other")
+                return ToolResult.error(
+                    f"typed into {selector}, but the field left the page before its last character could be typed, "
+                    "so the text is NOT entered. Re-observe the field before typing again.",
+                    error_class="text_not_held",
+                )
+            if not sent:
+                await input_dispatch.fill(page, selector, written, timeout=_ACTION_TIMEOUT_MS)
             if box_text and await _read_field_value(page, selector) != text:
                 return ToolResult.error(
                     f"typed into {selector}, but it takes one character and does not hold the typed text "
@@ -23530,8 +24229,14 @@ def build_browser_tools(
             return ToolResult.ok(
                 f"selected on {selector} — it now holds {len(held)} option(s): {_selection_report(held)}", data=data
             )
+        receipt = (
+            f" — read back selected option: {_selection_report([shown])}"
+            if isinstance(shown, str) and shown.strip()
+            else ""
+        )
         return ToolResult.ok(
-            f"selected on {selector} (hidden native select, set directly)" if force else f"selected on {selector}",
+            (f"selected on {selector} (hidden native select, set directly)" if force else f"selected on {selector}")
+            + receipt,
             data=data,
         )
 
@@ -23933,9 +24638,9 @@ def build_browser_tools(
         # lands here: the recoverable error this used to be drew no retry from the model either.
         return ToolResult.ok(
             f"uploaded 1 file to {selector}: the input holds it, and the site sent no upload request yet — "
-            f"normal for a form that sends the file when it is submitted. A hidden file input does not show "
-            f"in observe, so re-checking it will not show the file; look instead for an upload error or a "
-            f"still-required file field on the page",
+            f"normal for a form that sends the file when it is submitted. When observe lists this input, it shows "
+            f"value=C:\\fakepath\\<file name> while the input holds the file; listed with no value, it holds none "
+            f"(a form re-rendered after a rejected submit comes back empty)",
             staged,
             ok_class="attached_no_activity",
         )
@@ -24115,6 +24820,59 @@ def build_browser_tools(
             lines.append(_shows_omitted_note(int(data["showsOmitted"])))
         legend = header + "\n" + "\n".join(lines)
         return ToolResult.ok(legend, data=renumbered, screenshots=[annotated])
+
+    def _scaled_viewport(png: bytes) -> tuple[bytes, int, int]:
+        scaled = _annotate_screenshot(png, [], 0, max_width=observe_screenshot_width)
+        width, height = Image.open(io.BytesIO(scaled)).size
+        return scaled, width, height
+
+    def _with_observe_screenshot(handler: ToolHandler) -> ToolHandler:
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            result = await handler(args)
+            if result.status != "ok":
+                return result
+            started = time.monotonic()
+            top = _current_page()
+            image: bytes | None = None
+            width = height = 0
+            outcome = "attached"
+            try:
+                if top is None:
+                    raise RuntimeError("no page")
+                async with asyncio.timeout(OBSERVE_SCREENSHOT_TIMEOUT_SECONDS):
+                    # Playwright runs one screenshot per page at a time; without its own timeout a cancelled
+                    # capture keeps the driver busy for 30s and queues every later observe and look behind it.
+                    png = await top.screenshot(timeout=OBSERVE_SCREENSHOT_TIMEOUT_SECONDS * 1000)
+                    image, width, height = await asyncio.to_thread(_scaled_viewport, png)
+                line = (
+                    f"screenshot: attached (observe) to your next turn, the viewport as rendered now "
+                    f"({width}x{height}); a later observe in this turn replaces it"
+                )
+            except Exception as exc:
+                # By class name, so Playwright's and Patchright's TimeoutError count as a timeout too.
+                if type(exc).__name__ == "TimeoutError":
+                    outcome = "timeout"
+                    line = f"screenshot: not attached (timed out after {OBSERVE_SCREENSHOT_TIMEOUT_SECONDS:g}s)"
+                else:
+                    outcome = "error"
+                    line = f"screenshot: not attached (capture failed: {type(exc).__name__})"
+            LOG.info(
+                "taskv3 observe screenshot",
+                width=width,
+                height=height,
+                bytes=len(image) if image is not None else 0,
+                capture_ms=round((time.monotonic() - started) * 1000),
+                outcome=outcome,
+                target_width=observe_screenshot_width,
+            )
+            return dataclasses.replace(
+                result,
+                content=result.content + "\n" + line,
+                data={**(result.data or {}), "screenshot_at": len(result.content)},
+                screenshots=[image] if image is not None else None,
+            )
+
+        return wrapped
 
     async def _holders(target: Any, selector: str) -> int:
         """How many elements the engine sees for `selector` IN `target`'s document, without leaking the
@@ -24847,10 +25605,20 @@ def build_browser_tools(
             entry = (_observe_manifest.get(int(ref.group(1))) if ref else None) or {}
             kinds: list[str] = []
             token = _CLICK_CHOICE_KIND.set(kinds)
+            label = _observe_quoted_field(
+                str(entry.get("option") or ""), OBSERVE_DISPLAY_WIDTHS["label"], cut_before=False
+            )
+            named = (
+                f"{entry.get('kind') or ''} {_observe_render_clips(label)} (ref={ref.group(1)})"
+                if ref and entry
+                else ""
+            )
+            name_token = _CLICK_TARGET_NAME.set(named)
             try:
                 result = await handler(args)
             finally:
                 _CLICK_CHOICE_KIND.reset(token)
+                _CLICK_TARGET_NAME.reset(name_token)
             kind = entry.get("choice") or (kinds[0] if kinds else "")
             question = None if entry.get("reresolved") else entry.get("question")
             # A lone checkbox is mostly a consent that names itself; an unknown question there says nothing.
@@ -24944,7 +25712,9 @@ def build_browser_tools(
     tools = [
         _spec(
             "observe",
-            _OBSERVE_DESCRIPTION_BASE + _OBSERVE_DESCRIPTION_FRAME_REACH,
+            _OBSERVE_DESCRIPTION_BASE
+            + _OBSERVE_DESCRIPTION_FRAME_REACH
+            + (_OBSERVE_DESCRIPTION_SCREENSHOT if observe_screenshot_width else ""),
             _obj({}),
             observe,
         ),
@@ -24992,8 +25762,15 @@ def build_browser_tools(
             "Click an element by its observe ref (e.g. ref=12), a CSS selector, or mark=N from the last look(). If the click opens a "
             'menu of options, the result lists them with [data-tv3-menu="N"] selectors — click one of '
             "those to select (verified: you get a loud error, not a silent no-op, if the selection does "
-            "not commit; do not blindly repeat a failed click). If the click triggers a file download, "
-            "the tool result reports it when detected.",
+            "not commit; do not blindly repeat a failed click). "
+            + (
+                "click returns once the page has reacted and does not wait for a file. When a click is meant to "
+                "deliver a file, use download on that control: it makes the same single click and waits for the file."
+                if download_wait is not None
+                else "If the click triggers a file download, the tool result reports it when detected."
+            )
+            + ' For text that observe and look do not list, selector text="<exact visible text>" clicks the '
+            "element showing exactly that text.",
             _obj(
                 {
                     "selector": {"type": "string"},
@@ -25197,9 +25974,28 @@ def build_browser_tools(
         if _tool_spec.name in ("click", "type"):
             # Inside the text-delta and download wrappers applied below, so it never cuts a download wait short.
             _tool_spec.handler = _with_act_deadline(_tool_spec.name, _tool_spec.handler)
+    if download_wait is not None:
+        click_spec = next(spec for spec in tools if spec.name == "click")
+        download_spec = _spec(
+            "download",
+            _DOWNLOAD_DESCRIPTION,
+            click_spec.parameters,
+            functools.partial(_download, click_spec.handler),
+        )
+        download_spec.billable = True
+        download_spec.toggle_probe = click_spec.toggle_probe
+        download_spec.address_probe = click_spec.address_probe
+        tools.insert(tools.index(click_spec) + 1, download_spec)
     # Inside the download signal, so download lines and failures follow the page-text delta.
     _apply_text_delta(tools)
-    _apply_download_signal(tools, downloads_dir, download_failures, download_wait, page_provider)
+    _apply_download_signal(
+        tools, downloads_dir, download_failures, download_wait, page_provider, download_until, opaque_refs
+    )
+    if observe_screenshot_width:
+        # Outermost, so the screenshot line is the result's last line, after text-delta and download lines.
+        for _tool_spec in tools:
+            if _tool_spec.name == "observe":
+                _tool_spec.handler = _with_observe_screenshot(_tool_spec.handler)
     if unseen_text is not None:
         unseen_text.unreported = _unreported_text
     return tools
@@ -25231,6 +26027,11 @@ def _digest_token(value: object, cap: int) -> str:
     quote -- but they do split a digest line in two.
     """
     return _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", str(value))[:cap]
+
+
+def _observe_kind(e: dict[str, Any]) -> str:
+    sub = e.get("type") or e.get("role")
+    return _digest_token(e["tag"], 40) + (f"/{_digest_token(sub, 40)}" if sub else "")
 
 
 def _download_signal_identity(name: str) -> str:
@@ -25526,15 +26327,128 @@ _DOWNLOAD_FAILURE_RESOURCE_TYPES = frozenset({"xhr", "fetch"})
 _DOWNLOAD_FAILURE_SETTLE_SECONDS = 2.5
 _SESSION_DOWNLOAD_LIST_TIMEOUT_SECONDS = 2.0
 DOWNLOAD_NO_FILE_THIS_ACTION = "No file downloaded during this action."
-_BLOCKED_INLINE_FRAME_BASELINE_TIMEOUT_SECONDS = 5.0
 DOWNLOAD_NO_SESSION_FILE_YET = "No file has reached the browser session's storage yet."
 _DOWNLOAD_FAILURE_URL_MAX = 120
+DOWNLOAD_TARGET_DATA_KEY = "download_target"
+DOWNLOAD_SAVE_FAILED_DATA_KEY = "download_save_failed"
 _DOWNLOAD_NAME_WAIT_SECONDS = 1.0
+_FRAME_DOCUMENTS_KEPT = 32
+
+
+def _download_no_file_lines(
+    new_hidden: list[tuple[str, str, int | None]],
+    masked_path: Callable[[str], str],
+    in_session: bool,
+    *,
+    state_absence: bool = True,
+) -> list[str]:
+    """What a `download` on a control that got no file tells the model, with each frame that received a document
+    during the wait and did not show it. The wait's length goes to the log only: stated beside the no-file sentence
+    it made a false `completed` more likely. The no-file sentence is left out when absence is not known, and in a
+    session beside a line naming a file an earlier call left there, since it speaks of the whole storage."""
+    lines = [DOWNLOAD_NO_SESSION_FILE_YET if in_session else DOWNLOAD_NO_FILE_THIS_ACTION] if state_absence else []
+    for url, media, size in new_hidden[:DOWNLOAD_FAILURE_MAX_LINES]:
+        what = f" ({_digest_token(media or 'no type', 80)}" + (f", {_human_download_size(size)})" if size else ")")
+        lines.append(f"A frame received a document and did not show it: {masked_path(url)}{what}.")
+    if new_hidden:
+        # A frame with no size on the page is not listed, so the listing is not promised.
+        lines.append("observe gives each frame it lists a ref; download on that ref saves the frame's document.")
+    return lines
+
+
+def _block_files_line(files: list[str], in_progress: int) -> str:
+    """What `observe` states on a download block: the files its results have reported as downloaded so far."""
+    shown = "; ".join(files[:_DOWNLOAD_SIGNAL_MAX_LINES])
+    more = len(files) - _DOWNLOAD_SIGNAL_MAX_LINES
+    listed = f"{len(files)} ({shown}{f'; +{more} more' if more > 0 else ''})" if files else "none"
+    return f"files downloaded in this block: {listed}" + (f"; {in_progress} still downloading" if in_progress else "")
+
+
+def _download_url_path(url: str) -> str:
+    return _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", urlparse(url).path or "/")[:_DOWNLOAD_FAILURE_URL_MAX]
+
+
+def _saves_as_document(media: str) -> bool:
+    """`download` on a frame refuses a web page, so one neither ends a download's wait nor is offered for saving."""
+    return media != "text/html"
+
+
+def _shows_browser_error_page(frame: Frame) -> bool:
+    """Chromium's own error page stands in both for a document it received and would not display and for one that
+    never arrived, so this alone does not say a document was received."""
+    try:
+        return str(frame.url).startswith("chrome-error:")
+    except Exception:
+        return False
+
+
+async def _save_frame_document(
+    browser_page: Page, url: str, downloads_dir: str, expected_type: str | None
+) -> str | None:
+    """Fetches `url` again from the page and saves it as a download, returning why nothing was saved or None. A
+    re-fetch is not the response the frame got, so a document loaded by a POST, or one served once, can differ."""
+    context = skyvern_context.current()
+    try:
+        async with asyncio.timeout(_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS):
+            response = await SkyvernFrame.read_http_url_response(
+                browser_page,
+                url,
+                workflow_run_id=context.workflow_run_id if context is not None else None,
+                max_size_bytes=MAX_FILE_SIZE_BYTES,
+                timeout_ms=_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS * 1000,
+            )
+    except TimeoutError:
+        return f"fetching it again did not finish within {_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS:g} s"
+    if response is None:
+        return "it could not be fetched again from this page"
+    media = response.content_type.split(";", 1)[0].strip().lower()
+    if not _saves_as_document(media):
+        return "fetching it again returned a web page, not a document"
+    if expected_type and media != expected_type:
+        return (
+            f"fetching it again returned {_digest_token(media or 'no type', 80)}, not the {expected_type} it received"
+        )
+    name = normalize_download_filename(
+        extract_filename({"content-disposition": response.content_disposition}, url), media
+    )
+    handled, published = publish_download_bytes_for_context(
+        browser_page.context, response.body, name or "download", media
+    )
+    if handled:
+        return None if published is not None else "the browser's download store did not accept it"
+    target = _download_target_path(Path(downloads_dir), name or None)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(response.body)
+        await _record_configured_target(target)
+    except OSError:
+        LOG.warning("taskv3 frame document save failed", exc_info=True)
+        return "it could not be written to the run's downloads"
+    return None
+
+
+def downloaded_line(name: str, size: int | None, in_session: bool = False) -> str:
+    display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", name)[:_DOWNLOAD_FAILURE_URL_MAX]
+    if in_session:
+        return f"Downloaded: {display} (in the browser session's storage)"
+    return f"Downloaded: {display}" if size is None else f"Downloaded: {display} ({_human_download_size(size)})"
+
+
+@dataclasses.dataclass
+class _FrameLoad:
+    """A child frame's latest navigation while it loads: its request, the document that answered it (2xx), and whether
+    the browser saved the load as a download."""
+
+    request: Request
+    document: tuple[str, str, int | None] | None = None
+    saved: bool = False
 
 
 class DownloadFailureWatch:
     """Records, on a download block, xhr/fetch requests and documents a call started that came back 4xx/5xx or failed,
-    and browser downloads the interceptor could not save, into `facts` for the next tool result to report."""
+    and browser downloads the interceptor could not save, into `facts` for the next tool result to report. It also
+    keeps what each frame received and did not show. With `report_failures` off it keeps only that, for a block that
+    waits on downloads without holding its completion on them."""
 
     def __init__(
         self,
@@ -25542,7 +26456,9 @@ class DownloadFailureWatch:
         opaque_refs: OpaqueUrlRefs | None = None,
         *,
         native_download_attempt: NativeDownloadAttempt | None = None,
+        report_failures: bool = True,
     ) -> None:
+        self._report_failures = report_failures
         self.facts = DownloadFailureFacts(
             refresh=self._read_tally,
             held_candidates=lambda: replay_candidates_for_context(self._context),
@@ -25569,12 +26485,30 @@ class DownloadFailureWatch:
         self._page_names: dict[str, str] = {}
         self._naming: set[asyncio.Task[None]] = set()
         self._named_pages: weakref.WeakSet[Any] = weakref.WeakSet()
+        # A document a child frame's navigation was answered with (2xx) whose load the browser then gave up without
+        # saving it as a download, which is how a document it will not display ends whatever it shows in its place
+        # (its error page under a restrictive frame policy, its "Open" placeholder otherwise): (url, media type, size
+        # or None). Kept whether or not a call is open, and dropped when that frame starts another navigation.
+        self._frame_documents: dict[Frame, tuple[str, str, int | None]] = {}
+        # Each child frame's latest navigation while it loads. One that finishes was displayed and is forgotten; one a
+        # later navigation of the same frame replaces was given up for that navigation, not left unshown.
+        self._frame_loads: dict[Frame, _FrameLoad] = {}
 
         def on_request(request: Request) -> None:
+            with contextlib.suppress(Exception):
+                if request.resource_type == "document" and request.url.startswith("http"):
+                    self._frame_documents.pop(request.frame, None)
+                    if request.frame.parent_frame:
+                        self._frame_loads.pop(request.frame, None)
+                        self._frame_loads[request.frame] = _FrameLoad(request)
+                        # A load that never reports its end must not be kept for the life of the watch.
+                        while len(self._frame_loads) > _FRAME_DOCUMENTS_KEPT:
+                            self._frame_loads.pop(next(iter(self._frame_loads)))
             try:
                 kind = request.resource_type
                 call = self._call_seq if self._open_calls > 0 else None
-                if kind in _DOWNLOAD_FAILURE_RESOURCE_TYPES or (kind == "document" and call is not None):
+                tracked = kind in _DOWNLOAD_FAILURE_RESOURCE_TYPES or (kind == "document" and call is not None)
+                if tracked and self._report_failures:
                     self._live[request] = call
             except Exception:
                 LOG.debug("taskv3 download failure watch request hook failed", exc_info=True)
@@ -25582,6 +26516,17 @@ class DownloadFailureWatch:
         def on_response(response: Response) -> None:
             try:
                 request = response.request
+                with contextlib.suppress(Exception):
+                    # 204 and 205 are 2xx answers that carry no document.
+                    carries_document = response.ok and response.status not in (204, 205)
+                    if request.resource_type == "document" and carries_document and response.frame.parent_frame:
+                        # A load that began before the watch attached is first seen here.
+                        load = self._frame_loads.setdefault(response.frame, _FrameLoad(request))
+                        if load.request is request:
+                            headers = response.headers
+                            length = headers.get("content-length", "")
+                            media = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                            load.document = (response.url, media, int(length) if length.isdigit() else None)
                 if request in self._live:
                     self._responded.add(request)
                     if response.status >= 400:
@@ -25590,12 +26535,28 @@ class DownloadFailureWatch:
             except Exception:
                 LOG.debug("taskv3 download failure watch response hook failed", exc_info=True)
 
+        def ended(request: Request) -> tuple[Frame, _FrameLoad] | None:
+            """The frame load `request` was, no longer loading; None unless it was its frame's latest navigation."""
+            with contextlib.suppress(Exception):
+                if request.resource_type == "document":
+                    load = self._frame_loads.get(request.frame)
+                    if load is not None and load.request is request:
+                        return request.frame, self._frame_loads.pop(request.frame)
+            return None
+
         def on_finished(request: Request) -> None:
+            ended(request)
             self._live.pop(request, None)
             self._responded.discard(request)
             self._changed.set()
 
         def on_failed(request: Request) -> None:
+            load = ended(request)
+            if load is not None and load[1].document is not None and not load[1].saved:
+                self._frame_documents.pop(load[0], None)
+                self._frame_documents[load[0]] = load[1].document
+                while len(self._frame_documents) > _FRAME_DOCUMENTS_KEPT:
+                    self._frame_documents.pop(next(iter(self._frame_documents)))
             try:
                 # A navigation the browser turns into a download fails after its response arrived; only a request
                 # that never got one failed to reach the server.
@@ -25616,12 +26577,34 @@ class DownloadFailureWatch:
             "page": self._name_downloads_on,
         }
 
+    def frame_document(self, frame: Frame) -> tuple[str, str, int | None] | None:
+        """The document `frame`'s latest navigation received and the browser neither displayed nor saved: its
+        address, type and size."""
+        document = self._frame_documents.get(frame)
+        if document is None:
+            return None
+        # A body cut off part-way also ends in a failed load, and the frame then shows what arrived at the document's
+        # own address.
+        showing = str(frame.url).split("#", 1)[0] == document[0].split("#", 1)[0]
+        return None if showing else document
+
+    def documents_not_shown(self, frames: Iterable[Frame]) -> dict[Frame, tuple[str, str, int | None]]:
+        """The frames whose latest navigation received a document the browser neither displayed nor saved."""
+        return {frame: document for frame in frames if (document := self.frame_document(frame)) is not None}
+
     def _name_downloads_on(self, tab: Page) -> None:
         if tab not in self._named_pages:
             tab.on("download", self._on_download)
             self._named_pages.add(tab)
 
     def _on_download(self, download: Download) -> None:
+        with contextlib.suppress(Exception):
+            # The load a download came from is given up like a document left unshown, before or after this event.
+            for load in self._frame_loads.values():
+                if load.request.url == download.url:
+                    load.saved = True
+            for frame in [f for f, document in self._frame_documents.items() if document[0] == download.url]:
+                del self._frame_documents[frame]
         task = asyncio.ensure_future(self._name_download(download))
         self._naming.add(task)
         task.add_done_callback(self._naming.discard)
@@ -25657,6 +26640,8 @@ class DownloadFailureWatch:
         self.facts.add(f"Request failed: {self._describe(request)} {what}", repeat=self._live[request] is not None)
 
     def _read_tally(self) -> None:
+        if not self._report_failures:
+            return
         attempt = self._native_download_attempt
         if attempt is not None and not attempt.closed and attempt.observer.context is self._context:
             if attempt.interrupted > self._native_failures_seen[0]:
@@ -25691,7 +26676,7 @@ class DownloadFailureWatch:
                     self.close()
                     self._context = context
                     # Inside a run's scope the scope ends this hold, after the task's cleanup rather than at close().
-                    self._owns_candidate_mode = begin_replay_candidate_hold(context)
+                    self._owns_candidate_mode = self._report_failures and begin_replay_candidate_hold(context)
                     self._tally_generation = None
                     self._read_tally()
                     for event, hook in self._hooks.items():
@@ -25766,6 +26751,246 @@ class DownloadFailureWatch:
         self._context = None
         self._live.clear()
         self._responded.clear()
+        self._frame_loads.clear()
+
+
+REQUEST_RECORD_MAX = 8
+_REQUEST_RECORD_READS = frozenset({"observe", "get_html", "look"})
+# The longest standard method and its space, ahead of the URL cap the download lines use.
+_REQUEST_SHOWN_MAX = len("OPTIONS ") + _DOWNLOAD_FAILURE_URL_MAX
+# The page picks the method, and Chromium accepts any token thousands of characters long.
+_REQUEST_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE"})
+
+
+@dataclasses.dataclass
+class _SentRequest:
+    request: Request
+    tool: str
+    turn: int | None
+    call: int
+    started: float
+    number: int
+    after: float | None = None
+    status: int | None = None
+    reported: bool = False
+    waiter: asyncio.Future[None] | None = None
+
+
+class RequestRecord:
+    """The last non-GET requests this run's pages sent while an acting call ran, and how the site answered each.
+
+    It listens on the context only for the length of an acting call, so a tab the call opens is included from its
+    first request and a service worker's request is not; an answer that comes later is read off the request,
+    nothing waits."""
+
+    def __init__(self, page_provider: PageProvider, opaque_refs: OpaqueUrlRefs | None = None) -> None:
+        self._page_provider = page_provider
+        self._opaque_refs = opaque_refs
+        self._sent: list[_SentRequest] = []
+        self._calls = 0
+        self._numbered = 0
+        self._evicted = 0
+        self._unlisted = 0
+        self._unattached_logged = False
+
+    # Built with the result, not in the request hook: that hook runs in Playwright's task, where the run's
+    # context and its hidden values are not current.
+    def _shown(self, sent: _SentRequest) -> str:
+        request = sent.request
+        method = request.method if request.method in _REQUEST_METHODS else "OTHER"
+        ctx = skyvern_context.current()
+        # Only an opened sign-in link registers model-hidden values. A page can echo any piece of it in any request URL,
+        # which no pattern recognises, so once one is open no address is shown; a number ties a late answer to its line.
+        if ctx is not None and ctx.model_hidden_values:
+            return f"{method} request {sent.number}"
+        masked = self._opaque_refs.mask(request.url, cut=True) if self._opaque_refs is not None else request.url
+        parsed = urlparse(masked)
+        where = parsed.netloc.rsplit("@", 1)[-1] + (parsed.path or "/")
+        return _model_text(_DOWNLOAD_NOTICE_SANITIZE_RE.sub("", f"{method} {where}"), _REQUEST_SHOWN_MAX)
+
+    def _make_room(self, call: int) -> bool:
+        # Older calls' entries go oldest first; a call never drops its own, so a submit sent amid a burst of
+        # beacons or autosaves keeps its answer and a request past the call's 8th is not recorded.
+        if len(self._sent) < REQUEST_RECORD_MAX:
+            return True
+        if self._sent[0].call == call:
+            self._unlisted += 1
+            return False
+        evicted = self._sent.pop(0)
+        if evicted.waiter is not None:
+            evicted.waiter.cancel()
+        if not evicted.reported:
+            self._evicted += 1
+        return True
+
+    @staticmethod
+    def _answer(sent: _SentRequest) -> str | None:
+        if sent.after is None:
+            return None
+        if sent.status is not None:
+            return f"answered {sent.status} after {sent.after:.1f} s"
+        failure = _model_text(_DOWNLOAD_NOTICE_SANITIZE_RE.sub("", sent.request.failure or ""), 80)
+        return f"failed ({failure}) after {sent.after:.1f} s"
+
+    async def _read_answer(self, sent: _SentRequest) -> None:
+        try:
+            response = await sent.request.response()
+        except Exception:
+            sent.reported = True
+            return
+        if response is not None:
+            sent.status = response.status
+        # The browser's own first-byte time when it reported one.
+        first_byte = sent.request.timing.get("responseStart", -1) if response is not None else -1
+        sent.after = first_byte / 1000 if first_byte >= 0 else time.monotonic() - sent.started
+
+    async def listen(self, tool: str) -> tuple[int, Callable[[], None]] | None:
+        """Starts recording for one acting call; returns the call's number and the function that stops it."""
+        try:
+            context = (await self._page_provider()).context
+        except Exception:
+            # With no working page this fails on every acting call, and the page lookup logs its own error.
+            if not self._unattached_logged:
+                self._unattached_logged = True
+                LOG.info("taskv3 request record could not attach", exc_info=True)
+            return None
+        self._calls += 1
+        self._unlisted = 0
+        call, turn = self._calls, current_turn()
+
+        def on_request(request: Request) -> None:
+            try:
+                if request.method == "GET" or request.service_worker is not None or not self._make_room(call):
+                    return
+                self._numbered += 1
+                sent = _SentRequest(request, tool, turn, call, time.monotonic(), self._numbered)
+                sent.waiter = asyncio.ensure_future(self._read_answer(sent))
+                self._sent.append(sent)
+            except Exception:
+                LOG.debug("taskv3 request record request hook failed", exc_info=True)
+
+        def stop() -> None:
+            with contextlib.suppress(Exception):
+                context.remove_listener("request", on_request)
+
+        try:
+            # On the context, not each page: a tab the action opens sends its first requests before a listener
+            # added when the context announces the tab is on.
+            context.on("request", on_request)
+        except Exception:
+            LOG.info("taskv3 request record could not attach", exc_info=True)
+            return None
+        return call, stop
+
+    def lines(self, tool: str, call: int | None) -> tuple[list[str], list[int], bool]:
+        """The result's lines, the status codes of the answers they report, and whether the first line is this call's
+        own."""
+        now = time.monotonic()
+        lines: list[str] = []
+        if self._evicted:
+            LOG.info("taskv3 request record evicted unreported requests", count=self._evicted)
+            lines.append(
+                f"Earlier non-GET requests dropped from the record before an answer was reported: {self._evicted}."
+            )
+            self._evicted = 0
+        statuses: list[int] = []
+        own = [sent for sent in self._sent if sent.call == call]
+        if own:
+            listed: list[str] = []
+            for sent in own:
+                answer = self._answer(sent)
+                sent.reported = sent.reported or answer is not None
+                if sent.status is not None:
+                    statuses.append(sent.status)
+                listed.append(
+                    f"{self._shown(sent)} "
+                    f"{answer or f'not answered when this result was built ({now - sent.started:.1f} s)'}"
+                )
+            if self._unlisted:
+                listed.append(f"{self._unlisted} more not listed")
+            lines.append(f"Non-GET requests sent while this {tool} ran: {'; '.join(listed)}.")
+        for sent in self._sent:
+            if sent.call == call or sent.reported:
+                continue
+            by = f"sent while your {sent.tool}" + (f" at turn {sent.turn}" if sent.turn is not None else "") + " ran"
+            answer = self._answer(sent)
+            if answer is not None:
+                sent.reported = True
+                if sent.status is not None:
+                    statuses.append(sent.status)
+                lines.append(f"{self._shown(sent)}, {by}, {answer}.")
+            elif tool in _REQUEST_RECORD_READS:
+                lines.append(
+                    f"{self._shown(sent)}, {by}, not answered when this result was built ({now - sent.started:.1f} s)."
+                )
+        return lines, statuses, bool(own)
+
+    def late_lines(self) -> str | None:
+        """Answers no result has reported yet, for the end of a batch whose last result the loop built itself."""
+        lines, statuses, _ = self.lines("", None)
+        if not lines:
+            return None
+        LOG.info("taskv3 request record lines", tool=None, lines=len(lines), own=0, statuses=statuses)
+        return "\n".join(lines)
+
+    def close(self) -> None:
+        for sent in self._sent:
+            if sent.waiter is not None:
+                sent.waiter.cancel()
+        self._sent.clear()
+
+
+def apply_request_record(tools: list[ToolSpec], record: RequestRecord | None) -> None:
+    """Every call that may submit records the non-GET requests the run's pages send while it runs; every result
+    reports the record's answers it has not reported yet, and a read also the requests still unanswered."""
+    if record is None:
+        return
+    for tool_spec in tools:
+        if tool_spec.terminal:
+            continue
+
+        async def wrapped(
+            args: dict[str, Any],
+            _handler: Callable[[dict[str, Any]], Awaitable[ToolResult]] = tool_spec.handler,
+            _tool_name: str = tool_spec.name,
+        ) -> ToolResult:
+            listening = await record.listen(_tool_name) if _may_submit(_tool_name, args) else None
+
+            def stop() -> None:
+                if listening is not None:
+                    listening[1]()
+
+            def report() -> str | None:
+                lines, statuses, own = record.lines(_tool_name, listening[0] if listening is not None else None)
+                if not lines:
+                    return None
+                LOG.info(
+                    "taskv3 request record lines",
+                    tool=_tool_name,
+                    lines=len(lines),
+                    own=int(own),
+                    statuses=statuses,
+                    tool_call_seq=current_tool_call_seq(),
+                )
+                return "\n".join(lines)
+
+            try:
+                result = await _handler(args)
+            except BaseException:
+                stop()
+                # The loop makes this call's result from the error or the deadline, in this task.
+                set_request_record_on_error(report())
+                raise
+            finally:
+                stop()
+            shown = report()
+            # A deadline can still fire after the handler returns, when the result here is discarded.
+            set_request_record_on_error(shown)
+            if shown is None:
+                return result
+            return dataclasses.replace(result, data={**(result.data or {}), REQUEST_RECORD_DATA_KEY: shown})
+
+        tool_spec.handler = wrapped
 
 
 def _apply_download_signal(
@@ -25774,19 +26999,21 @@ def _apply_download_signal(
     failure_watch: DownloadFailureWatch | None = None,
     download_wait: Callable[[], Awaitable[None]] | None = None,
     page_provider: PageProvider | None = None,
+    download_until: DownloadUntil | None = None,
+    opaque_refs: OpaqueUrlRefs | None = None,
 ) -> None:
     """Wrap every tool so the next wrapped result reports files landing in `downloads_dir` and failures `failure_watch`
-    saw. A billable call, or one that leaves a download in flight, first awaits `download_wait` so it names its file."""
+    saw. A billable call, or one that leaves a download in flight, first awaits `download_wait` so it names its file.
+    `download` alone first waits through `download_until` for a file, or for a frame that did not show its document."""
     if not downloads_dir and failure_watch is None:
         return
-    # Only a block the engine built a download wait for: elsewhere the per-call iframe enumeration
-    # below would be paid by every click for a recovery that has no file to stand in for.
-    recover_blocked_frames = bool(downloads_dir) and download_wait is not None and page_provider is not None
 
     seen_completed: set[str] = set()
     seen_started: set[str] = set()
     seen_session: set[str] = set()
     session_baselined = False
+    session_baseline_late = False
+    block_files: list[str] = []
     pending: list[str] = []
     baseline = {"done": False}
     baseline_lock = asyncio.Lock()
@@ -25809,6 +27036,12 @@ def _apply_download_signal(
             return [], []
         completed = [n for n in names if not n.endswith(BROWSER_DOWNLOADING_SUFFIX)]
         in_progress = [n for n in names if n.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+        # The browser saves a download with no extension and its handler adds one a moment later. A listing between
+        # the two has seen the file, so the renamed file is that download, not a new one.
+        for name in completed:
+            stem, extension = os.path.splitext(name)
+            if extension and stem in seen_completed and stem not in names:
+                seen_completed.add(name)
         return completed, in_progress
 
     def _in_browser_session() -> bool:
@@ -25846,59 +27079,90 @@ def _apply_download_signal(
             return None
         return listed
 
-    def _landed_a_file_this_call(session_files: list[str] | None) -> bool:
-        completed, in_progress = _list_split()
-        return (
-            any(name not in seen_completed for name in completed)
-            or bool(in_progress)
-            or any(uri not in seen_session for uri in session_files or ())
-        )
+    def _partial_files() -> set[str]:
+        return {_download_signal_identity(name) for name in _list_split()[1]}
 
-    async def _inline_iframe_baseline() -> tuple[Any, list[str]] | None:
-        """The page and its iframe srcs before the call, which the recovery below attributes a frame by."""
-        assert page_provider is not None
-        try:
-            page = await page_provider()
-            if page is None:
-                return None
-            # Unlike v1's once-per-download-action read, this runs before every may-submit call on a
-            # download block, so it is bounded: enumeration is one evaluate per frame, and a frame
-            # that will not answer must delay the click itself by a known amount, not by its own timeout.
-            async with asyncio.timeout(_BLOCKED_INLINE_FRAME_BASELINE_TIMEOUT_SECONDS):
-                return page, await _collect_inline_iframe_src_candidates(page)
-        except Exception:
-            LOG.info("taskv3 inline iframe baseline failed", exc_info=True)
+    def _landed_a_file_this_call(partial_before: Collection[str], files_before: Collection[str]) -> bool:
+        """Whether downloads_dir holds a file from this call. One that was already there when the call began, finished
+        or partial, is an earlier call's, and so is that partial file once it finishes."""
+        return any(
+            name not in seen_completed
+            and name not in files_before
+            and _download_signal_identity(name) not in partial_before
+            for name in _list_split()[0]
+        ) or bool(_partial_files() - set(partial_before))
+
+    def _session_file_this_call(
+        session_files: Collection[str] | None, session_before: Collection[str] | None
+    ) -> bool | None:
+        """Whether the session's storage holds a file from this call. None when that cannot be told: the storage could
+        not be read now, or it was not read before the click and holds a file no result has named, which an earlier
+        call could have left."""
+        if session_files is None:
             return None
+        unnamed = [uri for uri in session_files if uri not in seen_session]
+        if session_before is None:
+            return None if unnamed else False
+        return any(uri not in session_before for uri in unnamed)
 
-    async def _recover_blocked_inline_pdf(baseline: tuple[Any, list[str]]) -> None:
-        """Save a PDF this call rendered in a frame the browser refused to display, so the lines below name it.
-
-        The target downloads fine; it just cannot be framed, so no download event ever fires and
-        nothing reaches `downloads_dir`. v1 recovers the bytes same-origin from the refused frame's
-        own src (SKY-12559); writing them into `downloads_dir` here rejoins the same reporting,
-        settle and finalize path a browser download takes.
-        """
-        assert page_provider is not None and downloads_dir
-        baseline_page, iframe_srcs_before = baseline
+    async def _session_downloading() -> set[str] | None:
+        """The session's rows still marked downloading; None when the listing could not be read."""
         context = skyvern_context.current()
+        if context is None or not context.browser_session_id or not context.organization_id:
+            return set()
         try:
-            page = await page_provider()
-            # A call that took the working page somewhere else (a popup it opened, a page it closed)
-            # leaves a baseline that belongs to a document this one no longer holds, so nothing in the
-            # page we can read now is attributable to it.
-            if page is None or page is not baseline_page:
-                return
-            # One whole-operation budget over every candidate fetch, as v1 caps it: a hung
-            # same-origin server must not out-wait the loop this recovery backstops.
-            async with asyncio.timeout(_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS):
-                await _recover_blocked_inline_pdf_download(
-                    page,
-                    Path(downloads_dir),
-                    workflow_run_id=context.workflow_run_id if context is not None else None,
-                    iframe_srcs_before=iframe_srcs_before,
+            async with asyncio.timeout(_SESSION_DOWNLOAD_LIST_TIMEOUT_SECONDS):
+                return set(
+                    await app.STORAGE.list_downloading_files_in_browser_session(
+                        organization_id=context.organization_id, browser_session_id=context.browser_session_id
+                    )
                 )
         except Exception:
-            LOG.warning("taskv3 blocked-inline PDF recovery failed", exc_info=True)
+            LOG.info("taskv3 browser session in-progress listing failed", exc_info=True)
+            return None
+
+    def _documents_not_shown(browser_page: Page | None) -> dict[Frame, tuple[str, str, int | None]]:
+        if browser_page is None or failure_watch is None:
+            return {}
+        try:
+            return failure_watch.documents_not_shown(browser_page.frames)
+        except Exception:
+            return {}
+
+    def _new_documents_not_shown(
+        browser_page: Page | None, before: Mapping[Frame, tuple[str, str, int | None]]
+    ) -> list[tuple[str, str, int | None]]:
+        """Each document a frame received and did not show since `before` that `download` on the frame would save; a
+        frame navigated again counts again."""
+        now = _documents_not_shown(browser_page)
+        return [
+            received
+            for frame, received in now.items()
+            if before.get(frame) is not received and _saves_as_document(received[1])
+        ]
+
+    async def _download_arrived(
+        browser_page: Page | None,
+        not_shown_before: Mapping[Frame, tuple[str, str, int | None]],
+        partial_before: Collection[str],
+        session_downloading_before: Collection[str] | None,
+        files_before: Collection[str],
+        session_before: Collection[str] | None,
+    ) -> bool:
+        """A file landed or started since the call began, or a frame newly did not show its document."""
+        if _landed_a_file_this_call(partial_before, files_before):
+            return True
+        if _in_browser_session():
+            # With no reading from before the click, a file or row cannot be told from one an earlier download left.
+            if session_baselined and _session_file_this_call(await _session_files(), session_before):
+                return True
+            if session_downloading_before is not None:
+                if (await _session_downloading() or set()) - set(session_downloading_before):
+                    return True
+        return bool(_new_documents_not_shown(browser_page, not_shown_before))
+
+    def _masked_path(url: str) -> str:
+        return _download_url_path(opaque_refs.mask(url, cut=True) if opaque_refs is not None else url)
 
     def _with_file_lines(
         result: ToolResult, compactable: bool, page_names: Mapping[str, str], session_files: list[str]
@@ -25922,7 +27186,8 @@ def _apply_download_signal(
             except OSError:
                 size = 0
             display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", page_names.get(name, name))[:_DOWNLOAD_FAILURE_URL_MAX]
-            new_lines.append(f"Downloaded: {display} ({_human_download_size(size)})")
+            new_lines.append(downloaded_line(display, size))
+            block_files.append(f"{display}, {_human_download_size(size)}")
         for uri in session_files:
             if uri in seen_session:
                 continue
@@ -25932,7 +27197,8 @@ def _apply_download_signal(
             if not name or name in seen_completed or name.endswith(BROWSER_DOWNLOADING_SUFFIX):
                 continue
             display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", name)[:_DOWNLOAD_FAILURE_URL_MAX]
-            new_lines.append(f"Downloaded: {display} (in the browser session's storage)")
+            new_lines.append(downloaded_line(display, None, in_session=True))
+            block_files.append(f"{display}, in the browser session's storage")
         for name in in_progress:
             identity = _download_signal_identity(name)
             if identity in seen_started or identity in seen_completed:
@@ -25968,10 +27234,12 @@ def _apply_download_signal(
             _tool_name: str = tool_spec.name,
             _billable: bool = tool_spec.billable,
         ) -> ToolResult:
-            nonlocal attempt_started_at
+            nonlocal attempt_started_at, session_baseline_late, session_baselined
             async with baseline_lock:
-                if not baseline["done"]:
+                first_call = not baseline["done"]
+                if first_call:
                     await _new_session_files()
+                    session_baseline_late = _in_browser_session() and not session_baselined
                     try:
                         context = skyvern_context.current()
                         attempt_started_at = await get_download_retry_started_at(
@@ -25985,10 +27253,25 @@ def _apply_download_signal(
                     except Exception:
                         LOG.warning("taskv3 download signal baseline snapshot failed", tool=_tool_name, exc_info=True)
                     baseline["done"] = True
-            # Before the handler: a frame already on the page is not the one this call opened.
-            iframe_baseline = (
-                await _inline_iframe_baseline() if recover_blocked_frames and _may_submit(_tool_name, args) else None
-            )
+            downloading = _tool_name == "download"
+            page_before = None
+            if downloading and page_provider is not None:
+                try:
+                    page_before = await page_provider()
+                except Exception:
+                    LOG.info("taskv3 download could not read the page before acting", exc_info=True)
+            not_shown_before = _documents_not_shown(page_before)
+            partial_before = _partial_files() if downloading else set()
+            session_downloading_before = await _session_downloading() if downloading else set()
+            # What had landed before the click, reported yet or not, so an earlier file cannot end this wait.
+            landed_before = set(_list_split()[0]) if downloading else set()
+            session_before = await _session_files() if downloading else []
+            if downloading and session_before is not None and not session_baselined:
+                # The first reading that succeeds is the baseline. Taken after the click it would absorb this call's file.
+                seen_session.update(session_before)
+                session_baselined = True
+                # On the block's first call that reading precedes every action, so it is not a late baseline.
+                session_baseline_late = session_baseline_late and not first_call
             call = await failure_watch.begin() if failure_watch is not None else 0
             try:
                 result = await _handler(args)
@@ -26002,6 +27285,30 @@ def _apply_download_signal(
                 failures = await failure_watch.settle(call, wait=_may_submit(_tool_name, args), deliver=False)
             # A file a tool staged itself (file_upload) is not a download to wait for.
             staged = bool((result.data or {}).get("staged_download"))
+            kind = str((result.data or {}).get(DOWNLOAD_TARGET_DATA_KEY) or "control")
+            clicked = result.status == "ok" or bool((result.data or {}).get(CLICK_DISPATCHED_DATA_KEY))
+            waited_from = time.monotonic()
+            if downloading and kind == "control" and clicked and download_until is not None:
+                # The wait is still this call, so a page or frame load that fails during it is reported like the
+                # click's own: the watch tracks a document only while a call is open.
+                if failure_watch is not None:
+                    await failure_watch.begin()
+                try:
+                    await download_until(
+                        functools.partial(
+                            _download_arrived,
+                            page_before,
+                            not_shown_before,
+                            partial_before,
+                            session_downloading_before,
+                            landed_before,
+                            session_before,
+                        )
+                    )
+                finally:
+                    if failure_watch is not None:
+                        failure_watch.end()
+            waited = time.monotonic() - waited_from
             if download_wait is not None and ((_billable and not staged) or _list_split()[1]):
                 try:
                     await download_wait()
@@ -26016,21 +27323,60 @@ def _apply_download_signal(
                 if landed:
                     page_names = await failure_watch.page_names(landed)
             session_files = await _new_session_files()
-            # Last, after every signal that a file did arrive: a recovery is for the call that got none.
-            if iframe_baseline is not None and not _landed_a_file_this_call(session_files):
-                await _recover_blocked_inline_pdf(iframe_baseline)
-            reported = True
+            new_hidden: list[tuple[str, str, int | None]] = []
+            route = "refetch" if kind == "frame" else "browser"
+            # Whether this call got a file, read before the file lines are built (they mark every file they name as
+            # seen). None when a session's storage cannot say, which is neither a file nor its absence.
+            got_a_file: bool | None = False
+            if downloading and kind == "control":
+                got_a_file = _landed_a_file_this_call(partial_before, landed_before) or (
+                    _session_file_this_call(session_files, session_before) if _in_browser_session() else False
+                )
+            if downloading and kind == "control" and clicked and got_a_file is not True:
+                new_hidden = _new_documents_not_shown(page_before, not_shown_before)
+            reported: bool | None = None
+            files_before = len(block_files)
             try:
                 result, reported = _with_file_lines(result, _compactable, page_names, session_files or [])
             except Exception:
                 LOG.warning("taskv3 download signal computation failed", tool=_tool_name, exc_info=True)
-            # Stated, not left to a missing line: a page can claim a download that never reached the run. A persistent
-            # session's storage can get the file after the call returns, so there it is "yet", after a listing read.
-            if failure_watch is not None and not reported and _may_submit(_tool_name, args):
-                if not _in_browser_session():
-                    failures.append(DOWNLOAD_NO_FILE_THIS_ACTION)
-                elif session_files is not None:
-                    failures.append(DOWNLOAD_NO_SESSION_FILE_YET)
+            # A page can claim a download that never reached the run, so each look also says what did. Before the
+            # failure section, whose text the finish hold quotes. A session listing that was not read, or whose
+            # baseline was read only after the block had acted, says nothing: the list could be missing a file.
+            if (
+                _tool_name == "observe"
+                and download_wait is not None
+                and result.status == "ok"
+                and (session_files is not None or not _in_browser_session())
+                and not session_baseline_late
+            ):
+                result = dataclasses.replace(
+                    result, content=result.content + "\n" + _block_files_line(block_files, len(_list_split()[1]))
+                )
+            if downloading:
+                in_session = _in_browser_session()
+                # Absence is stated only when it is known, and in a session not beside a line naming a file an earlier
+                # call left there. A frame's undisplayed document is named unless the call is known to have got its file.
+                if reported is not None and got_a_file is not True and kind == "control" and clicked:
+                    absent = got_a_file is False and not (in_session and reported)
+                    failures.extend(_download_no_file_lines(new_hidden, _masked_path, in_session, state_absence=absent))
+                if kind == "frame":
+                    outcome = "file_landed" if result.status == "ok" else "save_failed"
+                elif got_a_file is not True and new_hidden:
+                    outcome = "document_not_shown"
+                elif got_a_file is False:
+                    outcome = "no_file"
+                elif len(block_files) > files_before:
+                    outcome = "file_landed"
+                else:
+                    outcome = "file_in_progress" if got_a_file else "no_file"
+                LOG.info(
+                    "taskv3 download tool finished",
+                    target_kind=kind,
+                    outcome=outcome,
+                    seconds=round(waited, 1),
+                    route=route,
+                )
             if not failures:
                 return result
             return dataclasses.replace(

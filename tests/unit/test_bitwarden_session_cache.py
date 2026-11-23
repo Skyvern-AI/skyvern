@@ -18,6 +18,7 @@ import os
 import random
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -567,7 +568,11 @@ async def test_an_expired_session_is_re_established_before_the_run_fails(cli: Fa
 
 
 @pytest.mark.asyncio
-async def test_a_failure_that_is_not_about_the_session_is_not_retried(cli: FakeVaultCli) -> None:
+async def test_a_failure_that_is_not_about_the_session_is_not_retried(
+    cli: FakeVaultCli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SECRET_KEY", "unit-test-server-key")
+    monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SALT", "unit-test-salt")
     await _fetch()
     cli.calls.clear()
     cli.get_failures = ["Something went wrong.", "Something went wrong."]
@@ -660,31 +665,67 @@ async def test_a_failed_refresh_still_reads_the_cached_vault(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("login_error", "seeded_per_read", "expected_error"),
+    [
+        (
+            bitwarden_module.BitwardenLoginError,
+            [[True, True], [True, True, False]],
+            bitwarden_module.BitwardenListItemsError,
+        ),
+        (
+            bitwarden_module.BitwardenCredentialsRejectedError,
+            [[True, True], [True, True, True]],
+            bitwarden_module.BitwardenListItemsError,
+        ),
+        (
+            bitwarden_module.BitwardenVerificationRequiredError,
+            [[True], [True]],
+            bitwarden_module.BitwardenVerificationRequiredError,
+        ),
+        (TimeoutError, [[True, True], [True, True, True]], bitwarden_module.BitwardenListItemsError),
+    ],
+)
 async def test_a_login_that_fails_leaves_no_half_built_session_behind(
-    cli: FakeVaultCli, monkeypatch: pytest.MonkeyPatch
+    cli: FakeVaultCli,
+    monkeypatch: pytest.MonkeyPatch,
+    login_error: type[Exception],
+    seeded_per_read: list[list[bool]],
+    expected_error: type[Exception],
 ) -> None:
-    logins = 0
+    monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SECRET_KEY", "unit-test-server-key")
+    monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SALT", "unit-test-salt")
+    seeded_devices: list[bool] = []
+    login_dirs: list[str] = []
 
-    async def failing_login(*_: object, **__: object) -> None:
-        nonlocal logins
-        logins += 1
-        raise bitwarden_module.BitwardenLoginError("new device verification required")
+    async def failing_login(*_: object, **kwargs: object) -> None:
+        login_dirs.append(str(kwargs["appdata_dir"]))
+        seeded_devices.append(os.path.exists(os.path.join(login_dirs[-1], "data.json")))
+        raise login_error("new device verification required")
 
     monkeypatch.setattr(BitwardenService, "login", failing_login)
 
-    with pytest.raises(bitwarden_module.BitwardenListItemsError):
-        await BitwardenService.get_secret_value_from_url(
-            client_id="client-id",
-            client_secret="client-secret",
-            master_password="master-password",
-            bw_organization_id="org-id",
-            bw_collection_ids=None,
-            item_id=ITEM_ID,
-            max_retries=2,
-        )
+    # One login per attempt, each on a new session. Only the third attempt of a read whose two logins
+    # Bitwarden refused uses a new device; the count starts again with each read, and a timeout, rejected
+    # credentials and a verification prompt never count.
+    for seeded_in_read in seeded_per_read:
+        seeded_devices.clear()
+        login_dirs.clear()
+        with pytest.raises(expected_error) as excinfo:
+            await BitwardenService.get_secret_value_from_url(
+                client_id="client-id",
+                client_secret="client-secret",
+                master_password="master-password",
+                bw_organization_id="org-id",
+                bw_collection_ids=None,
+                item_id=ITEM_ID,
+                max_retries=max(2, len(seeded_in_read)),
+            )
 
-    # A cached entry that never finished logging in must not be handed to the next run as if it had.
-    assert logins == 2
+        assert type(excinfo.value) is expected_error
+        assert seeded_devices == seeded_in_read
+        assert len(set(login_dirs)) == len(seeded_in_read)
+        assert not any(os.path.exists(login_dir) for login_dir in login_dirs)
 
 
 @pytest.mark.asyncio
@@ -977,13 +1018,21 @@ async def test_a_failed_list_reports_the_cli_error_not_a_json_error(cli: FakeVau
 
 
 @pytest.mark.asyncio
-async def test_retiring_a_session_cannot_delete_its_replacements_data(cli: FakeVaultCli) -> None:
+async def test_retiring_a_session_cannot_delete_its_replacements_data(
+    cli: FakeVaultCli, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A session torn down while another request still held it must not outlive its own generation."""
+    monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SECRET_KEY", "unit-test-server-key")
+    monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SALT", "unit-test-salt")
     identity = _identity_of()
     first = await bitwarden_module._cli_sessions.checkout(identity)
+    first_state = json.loads(await asyncio.to_thread(Path(first.appdata_dir, "data.json").read_text))
+    first_device_id = first_state["global_applicationId_appId"]
     await bitwarden_module._cli_sessions.discard(first)
 
-    second = await bitwarden_module._cli_sessions.checkout(identity)
+    second = await bitwarden_module._cli_sessions.checkout(_identity_of())
+    second_state = json.loads(await asyncio.to_thread(Path(second.appdata_dir, "data.json").read_text))
+    assert second_state["global_applicationId_appId"] == first_device_id == identity.device_id
     assert second is not first
     assert second.appdata_dir != first.appdata_dir
 
@@ -1217,7 +1266,9 @@ def test_the_identity_fingerprint_is_salted_per_process_and_cached(monkeypatch: 
     assert second_process.fingerprint != fingerprint
 
 
-def test_an_identity_never_reveals_its_secrets_when_logged() -> None:
+def test_an_identity_never_reveals_its_secrets_when_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SECRET_KEY", "unit-test-server-key")
+    monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SALT", "unit-test-salt")
     identity = _identity_of()
 
     rendered = f"{identity!r}"
@@ -1225,3 +1276,23 @@ def test_an_identity_never_reveals_its_secrets_when_logged() -> None:
     assert "master-password" not in rendered
     assert "client-secret" not in rendered
     assert identity.fingerprint[:12] in rendered
+    assert identity.device_id == "e4894896-280b-473c-9022-2c0ee1aecdd8"
+    assert identity.device_id not in rendered
+    assert _identity_of(master_password="another-master-password").device_id == identity.device_id
+    assert (
+        bitwarden_module._VaultIdentity.resolve(
+            client_id="client-id", client_secret="another-client-secret", email=None, master_password="master-password"
+        ).device_id
+        != identity.device_id
+    )
+    monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SECRET_KEY", "another-unit-test-server-key")
+    assert _identity_of().device_id != identity.device_id
+    monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SECRET_KEY", "fillmein")
+    assert _identity_of().device_id is None
+    monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SECRET_KEY", "unit-test-server-key")
+    assert (
+        bitwarden_module._VaultIdentity.resolve(
+            client_id=None, client_secret=None, email="user@example.com", master_password="master-password"
+        ).device_id
+        is None
+    )

@@ -208,7 +208,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
             artifacts,
             presign=self.async_client.create_sas_urls,
             presign_sensitive=lambda uris: self.async_client.create_sas_urls(
-                uris, expiry_hours=SENSITIVE_SHARE_URL_EXPIRY_HOURS
+                uris, expiry_seconds=SENSITIVE_SHARE_URL_EXPIRY_HOURS * 60 * 60
             ),
             presign_download=lambda uris: self.async_client.create_sas_urls(
                 uris, attachment_filenames=[None] * len(uris)
@@ -251,22 +251,28 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
         return await self.async_client.download_file(path, log_exception=False)
 
     async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
-        # Zip the directory to a temp file
-        temp_zip_file = create_named_temporary_file()
-        zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
         browser_session_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
-        LOG.debug(
-            "Storing browser session",
-            organization_id=organization_id,
-            workflow_permanent_id=workflow_permanent_id,
-            zip_file_path=zip_file_path,
-            browser_session_uri=browser_session_uri,
-            storage_tier=tier,
-            tags=tags,
-        )
-        await self.async_client.upload_file_from_path(browser_session_uri, zip_file_path, tier=tier, tags=tags)
+        # make_archive writes base_name + ".zip", a separate file the NamedTemporaryFile cleanup never
+        # removes, so name it up front and remove it even when archiving or upload fails.
+        with create_named_temporary_file() as temp_zip_file:
+            zip_file_path = f"{temp_zip_file.name}.zip"
+            try:
+                shutil.make_archive(temp_zip_file.name, "zip", directory)
+                LOG.debug(
+                    "Storing browser session",
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    zip_file_path=zip_file_path,
+                    browser_session_uri=browser_session_uri,
+                    storage_tier=tier,
+                    tags=tags,
+                )
+                await self.async_client.upload_file_from_path(browser_session_uri, zip_file_path, tier=tier, tags=tags)
+            finally:
+                if os.path.exists(zip_file_path):
+                    os.remove(zip_file_path)
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
         browser_session_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
@@ -1057,7 +1063,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
         self.assert_managed_file_access(uri, organization_id)
         urls = await self.async_client.create_sas_urls(
             [uri],
-            expiry_hours=max(1, expiry_seconds // 3600),
+            expiry_seconds=expiry_seconds,
             inline_content_type=inline_content_type,
         )
         return urls[0] if urls else None

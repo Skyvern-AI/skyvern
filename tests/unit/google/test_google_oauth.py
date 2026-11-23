@@ -1,6 +1,8 @@
 import asyncio
 import datetime
 import json
+import mimetypes
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
@@ -18,6 +20,8 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
+from skyvern.forge.sdk.experimentation.drive_shared_drive_search import DRIVE_SHARED_DRIVE_SEARCH_FLAG
+from skyvern.forge.sdk.experimentation.sheets_save_as_sheet import SHEETS_SAVE_AS_SHEET_FLAG
 from skyvern.forge.sdk.routes import google_oauth as google_oauth_routes
 from skyvern.forge.sdk.schemas.google_oauth import (
     CreateGoogleOAuthAuthorizeRequest,
@@ -27,6 +31,9 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     UpdateGoogleOAuthCredentialRequest,
 )
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, oauth_consent
+from skyvern.forge.sdk.workflow.models import block as block_module
+from skyvern.forge.sdk.workflow.models.block import FileUploadBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
 
 
@@ -126,29 +133,77 @@ def test_google_drive_extract_folder_id_treats_blank_as_my_drive_root(value: str
     assert google_drive_service.extract_folder_id(value) is None
 
 
-def test_google_drive_extract_folder_id_rejects_non_folder_url() -> None:
-    with pytest.raises(ValueError, match="folder URL"):
-        google_drive_service.extract_folder_id("https://drive.google.com/file/d/file_123/view")
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        ("https://drive.google.com/file/d/file_123/view", "folder URL"),
+        ("https://attacker.example.com/folders/folder_123", r"https://\*\.google\.com"),
+    ],
+)
+def test_google_drive_extract_folder_id_rejects_non_folder_or_non_google_url(value: str, error: str) -> None:
+    with pytest.raises(ValueError, match=error):
+        google_drive_service.extract_folder_id(value)
 
 
-def test_google_drive_extract_folder_id_rejects_non_google_folder_url() -> None:
-    with pytest.raises(ValueError, match=r"https://\*\.google\.com"):
-        google_drive_service.extract_folder_id("https://attacker.example.com/folders/folder_123")
+def _drive_upload_metadata_and_media_type(request: Any) -> tuple[dict[str, Any], str]:
+    if isinstance(request, google_drive_service.GoogleDriveResumableInitiateRequest):
+        return json.loads(request.content), request.headers["X-Upload-Content-Type"]
+    boundary = request.headers["Content-Type"].split("boundary=", 1)[1].encode()
+    metadata_part, media_part = request.content.split(b"--" + boundary)[1:3]
+    media_type = media_part.split(b"\r\n\r\n", 1)[0].split(b"Content-Type: ", 1)[1].decode()
+    return json.loads(metadata_part.split(b"\r\n\r\n", 1)[1].rstrip(b"\r\n")), media_type
+
+
+_XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_SHEET_METADATA = {"name": "report", "mimeType": google_drive_service.GOOGLE_SHEET_MIME_TYPE, "parents": ["folder_1"]}
 
 
 @pytest.mark.parametrize("builder_name", ["build_multipart_upload_request", "build_resumable_initiate_request"])
-def test_google_drive_upload_omits_parents_without_folder_id(builder_name: str, tmp_path) -> None:
-    source = tmp_path / "report.txt"
+@pytest.mark.parametrize(
+    ("file_name", "folder_id", "save_as_sheet", "host_mime_file", "expected_metadata", "expected_media_type"),
+    [
+        ("report.txt", None, False, True, {"name": "report.txt"}, "text/plain"),
+        ("report.csv", "folder_1", True, True, _SHEET_METADATA, "text/csv"),
+        ("report.xlsx", "folder_1", True, True, _SHEET_METADATA, _XLSX_MEDIA_TYPE),
+        ("report.pdf", "folder_1", True, True, {"name": "report.pdf", "parents": ["folder_1"]}, "application/pdf"),
+        ("report.xlsx", "folder_1", True, False, _SHEET_METADATA, _XLSX_MEDIA_TYPE),
+        ("REPORT.XLSX", "folder_1", True, False, {**_SHEET_METADATA, "name": "REPORT"}, _XLSX_MEDIA_TYPE),
+        (
+            "report.xlsx",
+            "folder_1",
+            False,
+            False,
+            {"name": "report.xlsx", "parents": ["folder_1"]},
+            "application/octet-stream",
+        ),
+    ],
+)
+def test_google_drive_upload_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    builder_name: str,
+    file_name: str,
+    folder_id: str | None,
+    save_as_sheet: bool,
+    host_mime_file: bool,
+    expected_metadata: dict[str, Any],
+    expected_media_type: str,
+    tmp_path,
+) -> None:
+    if not host_mime_file:
+        # A host without /etc/mime.types knows only Python's built-in table, which has no .xlsx entry.
+        monkeypatch.setattr(google_drive_service, "guess_type", mimetypes.MimeTypes(filenames=()).guess_type)
+    source = tmp_path / file_name
     source.write_text("hello-drive")
 
     request = getattr(google_drive_service, builder_name)(
         access_token="at-1",
         file_path=str(source),
-        folder_id=None,
+        folder_id=folder_id,
+        save_as_sheet=save_as_sheet,
     )
 
-    assert b'"parents"' not in request.content
-    assert b'"report.txt"' in request.content
+    assert _drive_upload_metadata_and_media_type(request) == (expected_metadata, expected_media_type)
+    assert parse_qs(urlparse(request.target_url).query)["supportsAllDrives"] == ["true"]
 
 
 @pytest.mark.parametrize(
@@ -644,47 +699,123 @@ async def test_google_drive_download_removes_partial_file_when_stream_exceeds_li
 
 
 @pytest.mark.asyncio
-async def test_google_drive_uploads_multipart(
+@pytest.mark.parametrize(
+    ("file_name", "save_as_sheet", "organization_id", "resumable", "expected_name", "converts"),
+    [
+        ("report.txt", False, "o_flag_off", False, "report.txt", False),
+        ("report.csv", True, "o_flag_on", False, "report", True),
+        ("report.xlsx", True, "o_flag_on", False, "report", True),
+        ("report.xlsx", True, "o_flag_on", True, "report", True),
+        ("report.pdf", True, "o_flag_on", False, "report.pdf", False),
+        ("report.csv", False, "o_flag_on", False, "report.csv", False),
+        ("report.csv", False, "o_flag_off", False, "report.csv", False),
+        ("report.csv", True, "o_flag_off", False, None, False),
+        ("report.pdf", True, "o_flag_off", False, None, False),
+    ],
+)
+async def test_file_upload_block_uploads_to_drive(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    file_name: str,
+    save_as_sheet: bool,
+    organization_id: str,
+    resumable: bool,
+    expected_name: str | None,
+    converts: bool,
 ) -> None:
-    source = tmp_path / "report.txt"
-    source.write_text("hello-drive")
-    captured: dict[str, Any] = {}
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    (download_dir / file_name).write_text("hello,drive")
+    drive_creates: list[SimpleNamespace] = []
+    chunk_media_types: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        captured["url"] = url
-        captured["auth"] = request.headers.get("Authorization")
-        captured["content_type"] = request.headers["Content-Type"]
-        captured["body"] = await request.aread()
+        content = await request.aread()
+        if request.method == "PUT":
+            chunk_media_types.append(request.headers["Content-Type"])
+        if request.method == "POST":
+            drive_creates.append(SimpleNamespace(url=request.url, headers=request.headers, content=content))
+            if resumable:
+                return httpx.Response(
+                    200,
+                    headers={"Location": "https://www.googleapis.com/upload/drive/v3/files?upload_id=session_1"},
+                )
         return httpx.Response(
             200,
-            json={
-                "id": "file_123",
-                "name": "report.txt",
-                "webViewLink": "https://drive.google.com/file/d/file_123/view",
-            },
+            json={"id": "file_123", "webViewLink": "https://drive.google.com/file/d/file_123/view"},
         )
 
-    _install_google_drive_transport(monkeypatch, handler)
+    async def flag_for_one_org(feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
+        return (
+            feature_name == SHEETS_SAVE_AS_SHEET_FLAG
+            and distinct_id == "o_flag_on"
+            and properties == {"organization_id": distinct_id}
+        )
 
-    uploaded = await google_drive_service.upload_file(
-        access_token="at-1",
-        file_path=str(source),
-        folder_id="folder_123",
+    async def build_block_result(self: FileUploadBlock, **kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(**kwargs)
+
+    _install_google_drive_transport(monkeypatch, handler)
+    if resumable:
+        monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 4)
+        # A host without /etc/mime.types: Python's built-in table has no .xlsx entry.
+        monkeypatch.setattr(google_drive_service, "guess_type", mimetypes.MimeTypes(filenames=()).guess_type)
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", flag_for_one_org)
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "upload_file_to_customer_storage", AgentFunction().upload_file_to_customer_storage
+    )
+    monkeypatch.setattr(block_module, "resolve_account_token", AsyncMock(return_value="at-1"))
+    monkeypatch.setattr(block_module, "get_path_for_workflow_download_directory", lambda _run_id: download_dir)
+    monkeypatch.setattr(block_module, "get_download_retry_started_at", AsyncMock(return_value=None))
+    monkeypatch.setattr(block_module.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(
+        FileUploadBlock,
+        "get_workflow_run_context",
+        lambda self, _run_id: MagicMock(
+            organization_id=organization_id, get_original_secret_value_or_none=MagicMock(return_value=None)
+        ),
+    )
+    monkeypatch.setattr(FileUploadBlock, "format_potential_template_parameters", lambda self, _context: None)
+    monkeypatch.setattr(FileUploadBlock, "record_output_parameter_value", AsyncMock())
+    monkeypatch.setattr(FileUploadBlock, "build_block_result", build_block_result)
+    now = datetime.datetime.now(datetime.UTC)
+    block = FileUploadBlock(
+        label="save",
+        output_parameter=OutputParameter(
+            output_parameter_id="op_1", workflow_id="w_1", key="save_output", created_at=now, modified_at=now
+        ),
+        storage_type=FileStorageType.GOOGLE_DRIVE,
+        google_credential_id="cred_1",
+        google_drive_folder_id="folder_123",
+        google_drive_save_as_sheet=save_as_sheet,
     )
 
-    assert uploaded.id == "file_123"
-    assert captured["auth"] == "Bearer at-1"
-    assert "/upload/drive/v3/files" in captured["url"]
-    assert "uploadType=multipart" in captured["url"]
-    assert "supportsAllDrives=true" in captured["url"]
-    assert str(captured["content_type"]).startswith("multipart/related; boundary=skyvern-")
-    body = captured["body"]
-    assert isinstance(body, bytes)
-    assert b'"parents":["folder_123"]' in body
-    assert b'"name":"report.txt"' in body
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="wrb_1", organization_id=organization_id)
+
+    if expected_name is None:
+        assert result.success is False
+        assert "Save as Google Sheet is not available for this organization" in result.failure_reason
+        assert drive_creates == []
+        return
+    assert result.success is True
+    assert result.output_parameter_value == ["https://drive.google.com/file/d/file_123/view"]
+    (create,) = drive_creates
+    assert create.headers["Authorization"] == "Bearer at-1"
+    assert create.url.params["uploadType"] == ("resumable" if resumable else "multipart")
+    assert create.url.params["supportsAllDrives"] == "true"
+    if resumable:
+        metadata, media_type = json.loads(create.content), create.headers["X-Upload-Content-Type"]
+        assert chunk_media_types == [media_type]
+    else:
+        assert str(create.headers["Content-Type"]).startswith("multipart/related; boundary=skyvern-")
+        metadata, media_type = _drive_upload_metadata_and_media_type(create)
+    expected_metadata: dict[str, Any] = {"name": expected_name, "parents": ["folder_123"]}
+    if converts:
+        expected_metadata["mimeType"] = google_drive_service.GOOGLE_SHEET_MIME_TYPE
+    assert metadata == expected_metadata
+    suffix = Path(file_name).suffix
+    expected_media_type = google_drive_service.SHEET_CONVERTIBLE_MEDIA_TYPES[suffix] if converts else None
+    assert media_type == (expected_media_type or mimetypes.guess_type(file_name)[0] or "application/octet-stream")
 
 
 @pytest.mark.asyncio
@@ -791,6 +922,59 @@ async def test_google_drive_upload_does_not_retry_retryable_create_response(
     assert exc_info.value.status == 503
     assert calls == 1
     sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "reason", "expected_hint"),
+    [
+        (403, "insufficientFilePermissions", "role must be Contributor or higher"),
+        (403, "teamDriveMembershipRequired", "role must be Contributor or higher"),
+        (404, "notFound", "cannot see this Drive folder or file"),
+    ],
+)
+@pytest.mark.parametrize("organization_id", ["o_flag_on", "o_flag_off"])
+async def test_google_drive_upload_explains_shared_drive_access_errors_only_for_flagged_org(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    status: int,
+    reason: str,
+    expected_hint: str,
+    organization_id: str,
+) -> None:
+    source = tmp_path / "report.txt"
+    source.write_text("hello-drive")
+    raw_google_message = "File not found: folder_123."
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": {"message": raw_google_message, "errors": [{"reason": reason}]}})
+
+    async def flag_for_one_org(feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
+        return feature_name == DRIVE_SHARED_DRIVE_SEARCH_FLAG and distinct_id == "o_flag_on"
+
+    _install_google_drive_transport(monkeypatch, handler)
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", flag_for_one_org)
+    destination = FileUploadDestination(
+        storage_type=FileStorageType.GOOGLE_DRIVE,
+        customer_uri="https://drive.google.com/drive/folders/folder_123",
+        sdk_uri="https://drive.google.com/drive/folders/folder_123",
+        google_access_token="at-1",
+        google_drive_folder_id="folder_123",
+    )
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await AgentFunction().upload_file_to_customer_storage(
+            file_path=str(source), destination=destination, organization_id=organization_id
+        )
+
+    assert exc_info.value.status == status
+    assert exc_info.value.code == reason
+    if organization_id == "o_flag_on":
+        assert expected_hint in exc_info.value.message
+        assert reason in exc_info.value.message
+        assert "folder_123" not in "".join(traceback.format_exception(exc_info.value))
+    else:
+        assert exc_info.value.message == raw_google_message
 
 
 @pytest.mark.asyncio
@@ -3542,6 +3726,7 @@ async def test_list_google_oauth_credentials_surfaces_error_state(monkeypatch: p
         organization_id="org_1",
         credential_name="Needs reconnect",
         state="error",
+        scopes_granted=["https://www.googleapis.com/auth/gmail.readonly"],
         created_at=now,
         modified_at=now,
     )
@@ -3554,6 +3739,9 @@ async def test_list_google_oauth_credentials_surfaces_error_state(monkeypatch: p
 
     assert response.credentials == [credential]
     assert response.credentials[0].state == "error"
+    # Pickers read each account's fit by credential id, from that credential's own grant.
+    fits = response.model_dump(mode="json")["action_fit"]["goac_error"]
+    assert (fits["gmail.read_inbox"], fits["gmail.send_email"]) == ("yes", "no")
     list_mock.assert_awaited_once_with(organization_id="org_1")
 
 

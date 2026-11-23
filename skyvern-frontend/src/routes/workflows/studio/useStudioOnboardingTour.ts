@@ -26,7 +26,7 @@ const TOUR_STEPS: { name: string; step: DriveStep }[] = [
   {
     name: EMBER_TOUR_STEP_NAME,
     step: {
-      element: `#${studioPanelId("copilot")}`,
+      element: `#${studioPanelId("ember")}`,
       popover: {
         title: "Meet Copilot",
         description:

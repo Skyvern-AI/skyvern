@@ -75,7 +75,7 @@ test.each([
     "wr_user_fail_in_chat",
     Status.Failed,
     null,
-    "&wrs=copilot",
+    "&wrs=ember",
     [["Run Failed", "destructive"]],
   ],
   ["wr_user_pass", Status.Completed, null, "", [["Run Completed", "success"]]],

@@ -1,0 +1,1096 @@
+"""Tests for Copilot build-time entrypoint discovery."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+import structlog.testing
+
+from skyvern.forge.sdk.ember import tools as tools_module
+from skyvern.forge.sdk.ember.agent_context import PendingBrowserInteractionObservation
+from skyvern.forge.sdk.ember.build_test_connect_failure import BuildTestConnectFailure
+from skyvern.forge.sdk.ember.composition_browser_expressions import (
+    COMPOSITION_STRIPPED_HTML_EXPRESSION,
+    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
+    COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
+)
+from skyvern.forge.sdk.ember.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _cap_tool_outputs
+from skyvern.forge.sdk.ember.request_policy import RequestPolicy, _ground_user_provided_sites
+from skyvern.forge.sdk.ember.runtime import (
+    _browser_session_acquisition_failure_result,
+    bound_call_browser_session,
+    current_call_browser_session_override,
+)
+from skyvern.forge.sdk.ember.tools import (
+    _discovery_walk,
+    _inspect_page_for_composition_impl,
+    _resolve_discovery_entry_url,
+)
+from skyvern.forge.sdk.ember.tools import _shared as shared_module
+from skyvern.forge.sdk.ember.turn_origin import TurnOrigin
+from skyvern.forge.sdk.ember.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.schemas.ember import EmberChatSender
+from skyvern.schemas.runs import ProxyLocation
+
+_VALID_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAIAAAACUFjqAAAAE0lEQVR4nGP8z4APMOGVZRip0gBBLAETee26JgAAAABJRU5ErkJggg=="
+)
+
+
+class _Ctx:
+    def __init__(self, server: object) -> None:
+        self.turn_origin = TurnOrigin.interactive
+        self.discovery_mcp_server = server
+        self.discovery_started_monotonic = None
+        self.discovery_step_count = 0
+        self.prior_page_inspection_calls_made = 0
+        self.page_inspection_calls_this_turn = 0
+        self.flow_evidence: list[dict[str, Any]] = []
+        self.composition_page_evidence = None
+        self.pending_browser_interaction_observation = None
+        self.workflow_verification_evidence = WorkflowVerificationEvidence()
+        self.browser_session_id = None
+        self.last_run_blocks_browser_session_id = None
+        self.organization_id = "o_test"
+        self.effective_workflow_proxy_location = None
+        self.last_workflow = None
+        self.request_policy = None
+        self.org_credentials_for_turn = None
+        self.supports_vision = True
+        self.pending_screenshots: list[Any] = []
+
+
+def _dense_structured_page() -> dict[str, Any]:
+    forms: list[dict[str, Any]] = []
+    for form_index in range(2):
+        fields: list[dict[str, Any]] = []
+        for select_index in range(5):
+            field_index = form_index * 5 + select_index
+            options = [
+                {
+                    "text": f"Option {field_index}-{option_index} " + "T" * 105,
+                    "value": f"value-{field_index}-{option_index}-" + "V" * 145,
+                    "selected": option_index == 0,
+                }
+                for option_index in range(30)
+            ]
+            fields.append(
+                {
+                    "name": f"select_{field_index}",
+                    "id": f"select_{field_index}",
+                    "label": f"Dense select {field_index}",
+                    "type": "select",
+                    "value": "",
+                    "class": [],
+                    "placeholder": "",
+                    "required": field_index % 2 == 0,
+                    "disabled": False,
+                    "readonly": False,
+                    "visible": True,
+                    "checked": False,
+                    "options": options,
+                    "option_count": len(options),
+                    "options_omitted": False,
+                    "selector": f"#select_{field_index}",
+                }
+            )
+        forms.append(
+            {
+                "id": f"dense_form_{form_index}",
+                "name": f"dense_form_{form_index}",
+                "action": f"/submit/{form_index}",
+                "method": "post",
+                "fields": fields,
+                "submit_controls": [
+                    {
+                        "text": f"Submit form {form_index}",
+                        "id": f"submit_{form_index}",
+                        "type": "submit",
+                        "selector": f"#submit_{form_index}",
+                    }
+                ],
+            }
+        )
+    return {
+        "page_title": "Dense Form",
+        "body_has_markup": True,
+        "forms": forms,
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "Dense form controls",
+        "anti_bot_indicators": [],
+    }
+
+
+class _DensePageServer:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(tool_name)
+        assert tool_name == "skyvern_evaluate"
+        return {"ok": True, "data": {"result": _dense_structured_page()}}
+
+
+def _structured_search_page(*, with_obstruction: bool = False) -> dict[str, Any]:
+    return {
+        "page_title": "Results",
+        "body_has_markup": True,
+        "forms": [
+            {
+                "selector": "form",
+                "fields": [
+                    {
+                        "name": "firstName",
+                        "type": "text",
+                        "selector": 'input[name="firstName"]',
+                    }
+                ],
+                "submit_controls": [{"text": "Search", "type": "submit", "selector": "button"}],
+            }
+        ],
+        "visual_obstruction_candidates": [
+            {
+                "source": "computed_style",
+                "position": "fixed",
+                "coverage": "viewport",
+                "has_visible_controls": True,
+            }
+        ]
+        if with_obstruction
+        else [],
+    }
+
+
+class _FailingNavigateServer:
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        assert tool_name == "skyvern_navigate"
+        assert arguments == {"url": "https://www.example.com", "timeout": 20000}
+        return {"ok": False, "error": "Failed to create browser session"}
+
+
+class _InspectableNoCandidateServer:
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "skyvern_navigate":
+            return {"ok": True, "data": {"url": arguments["url"]}}
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            return {"ok": True, "data": {"html": "<html><body><p>Welcome</p></body></html>"}}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _AnchorBeatsTitleServer:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "skyvern_navigate":
+            self.urls.append(arguments["url"])
+            return {"ok": True, "data": {"url": arguments["url"]}}
+        if tool_name == "skyvern_get_html":
+            if self.urls[-1] == "https://www.example.com":
+                return {
+                    "ok": True,
+                    "data": {
+                        "html": """
+                        <html><head><title>Example Certification</title></head>
+                        <body><a href="/registry">Find a Certificant</a></body></html>
+                        """
+                    },
+                }
+            return {
+                "ok": True,
+                "data": {
+                    "html": """
+                    <html><head><title>Find a Member</title></head>
+                    <body><form><input name="firstName"><button>Search</button></form></body></html>
+                    """
+                },
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _DeepLinkAntiBotRecoveryServer:
+    def __init__(self) -> None:
+        self.navigated_urls: list[str] = []
+        self.clicked_selectors: list[str] = []
+        self.current_url = ""
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "skyvern_navigate":
+            self.current_url = arguments["url"]
+            self.navigated_urls.append(self.current_url)
+            return {"ok": True, "data": {"url": self.current_url}}
+        if tool_name == "skyvern_click":
+            self.clicked_selectors.append(arguments["selector"])
+            self.current_url = "https://certboard.test/registry/search"
+            return {"ok": True, "data": {"url": self.current_url}}
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            if self.current_url == "https://certboard.test/registry/search" and not self.clicked_selectors:
+                return {
+                    "ok": True,
+                    "data": {
+                        "html": """
+                        <html><head><title>Just a moment</title></head>
+                        <body>Verify you are human before continuing.</body></html>
+                        """
+                    },
+                }
+            if self.current_url == "https://certboard.test/":
+                return {
+                    "ok": True,
+                    "data": {
+                        "html": """
+                        <html><head><title>Example Certifications</title></head>
+                        <body><a href="/find-a-member/">Find a Member</a></body></html>
+                        """
+                    },
+                }
+            return {
+                "ok": True,
+                "data": {
+                    "html": """
+                    <html><head><title>Example Certification Registry</title></head>
+                    <body><form><input name="first_name"><input name="last_name"><button>Search</button></form></body></html>
+                    """
+                },
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _EmbeddedChallengeUsefulPageServer:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "skyvern_navigate":
+            self.urls.append(arguments["url"])
+            return {"ok": True, "data": {"url": arguments["url"]}}
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            if self.urls[-1] == "https://certboard.test":
+                return {
+                    "ok": True,
+                    "data": {
+                        "html": """
+                        <html><head><title>Certification Board</title></head>
+                        <body><a href="/registry/search">Find a Certificant</a></body></html>
+                        """
+                    },
+                }
+            return {
+                "ok": True,
+                "data": {
+                    "html": """
+                    <html>
+                      <head>
+                        <title>Certificant Registry</title>
+                        <script src="https://challenges.example.test/turnstile/api.js"></script>
+                      </head>
+                      <body>
+                        <form>
+                          <label for="first-name">First Name</label>
+                          <input id="first-name" name="first_name">
+                          <label for="last-name">Last Name</label>
+                          <input id="last-name" name="last_name">
+                        </form>
+                      </body>
+                    </html>
+                    """
+                },
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _CurrentPageServer:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(tool_name)
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            return {
+                "ok": True,
+                "data": {
+                    "html": "<html><body><form><input name='firstName'><button>Search</button></form></body></html>"
+                },
+            }
+        if tool_name == "skyvern_evaluate":
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page()}}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _ProxyRejectedNavigationServer:
+    """A dead proxy hop: skyvern_navigate fails, and the capture that follows reads Chrome's own
+    error page rather than the target."""
+
+    def __init__(self, navigation_error: str, driver_code: str | None = None) -> None:
+        self.calls: list[str] = []
+        self.navigation_error = navigation_error
+        self.driver_code = driver_code
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(tool_name)
+        if tool_name == "skyvern_navigate":
+            # The shape mcp_to_copilot produces: the driver's code survives the flattening as a
+            # value beside the sentence, which is the only thing attribution reads.
+            failure: dict[str, Any] = {"ok": False, "error": self.navigation_error}
+            if self.driver_code:
+                failure["nav_error_code"] = self.driver_code
+            return failure
+        if tool_name == "skyvern_evaluate":
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page()}}
+        if tool_name == "skyvern_get_html":
+            return {"ok": True, "data": {"html": "<html><body></body></html>"}}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _GenericBarrierServer:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(tool_name)
+        if tool_name == "skyvern_navigate":
+            return {"ok": True, "data": {"url": arguments["url"]}}
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            return {
+                "ok": True,
+                "data": {
+                    "html": """
+                    <html><head>
+                      <style>
+                        .checkpoint-shell {
+                          position: fixed;
+                          inset: 0;
+                          z-index: 2000;
+                          background: rgba(0,0,0,.4);
+                        }
+                      </style>
+                    </head><body>
+                      <form id="search"><input name="q"><button>Search</button></form>
+                      <section id="checkpoint" class="checkpoint-shell">
+                        <p>Complete this checkpoint before continuing.</p>
+                        <button>Continue</button>
+                      </section>
+                    </body></html>
+                    """
+                },
+            }
+        if tool_name == "skyvern_evaluate":
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page(with_obstruction=True)}}
+        if tool_name == "skyvern_screenshot":
+            expected_session = arguments.get("session_id")
+            assert arguments == {"inline": True, **({"session_id": expected_session} if expected_session else {})}
+            return {
+                "ok": True,
+                "browser_context": {"session_id": expected_session},
+                "data": {"screenshot_base64": _VALID_PNG_B64},
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _TargetThenCurrentPageServer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.current_url = ""
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((tool_name, arguments))
+        if tool_name == "skyvern_navigate":
+            self.current_url = arguments["url"]
+            return {"ok": True, "data": {"url": self.current_url}}
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            return {
+                "ok": True,
+                "data": {
+                    "html": "<html><body><form><input name='firstName'><button>Search</button></form></body></html>"
+                },
+            }
+        if tool_name == "skyvern_evaluate":
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page()}}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+@pytest.mark.parametrize(
+    ("site_or_url", "expected"),
+    [
+        ("https://example.com/login", ("https://example.com/login", "url")),
+        ("HTTP://example.com/login", ("HTTP://example.com/login", "url")),
+        ("example.com", ("https://example.com", "domain")),
+        ("example.com/login?x=y", ("https://example.com/login?x=y", "domain")),
+        ("example", (None, "unresolved")),
+        ("example search portal", (None, "unresolved")),
+    ],
+)
+def test_resolve_discovery_entry_url_classifies_without_guessing(
+    site_or_url: str,
+    expected: tuple[str | None, str],
+) -> None:
+    assert _resolve_discovery_entry_url(site_or_url) == expected
+
+
+@pytest.mark.parametrize(
+    ("site_or_url", "expected"),
+    [
+        ("https://example.com/login", ("https://example.com/login", "url")),
+        ("HTTP://example.com/login", ("HTTP://example.com/login", "url")),
+        ("example.com", ("https://example.com", "domain")),
+        ("example.com/login?x=y", ("https://example.com/login?x=y", "domain")),
+    ],
+)
+def test_resolve_discovery_entry_url_preserves_url_and_domain_inputs(
+    site_or_url: str,
+    expected: tuple[str, str],
+) -> None:
+    assert _resolve_discovery_entry_url(site_or_url) == expected
+
+
+@pytest.mark.asyncio
+async def test_discovery_navigation_failure_falls_back_to_entry_url() -> None:
+    result = await _discovery_walk(
+        _Ctx(_FailingNavigateServer()),
+        entry_url="https://www.example.com",
+        intent_hint="find a member",
+    )
+
+    assert result["ok"] is True
+    assert result["error"] is None
+    assert result["data"]["candidate_url"] == "https://www.example.com"
+    assert result["data"]["failure_reason"] is None
+    assert result["data"]["confidence"] == 0.2
+    assert result["data"]["evidence_trail"][0]["transition_reason"].startswith("navigate_failed:")
+
+
+@pytest.mark.asyncio
+async def test_discovery_returns_a_refused_browser_start_instead_of_a_fallback_candidate() -> None:
+    refusal = _browser_session_acquisition_failure_result(
+        BuildTestConnectFailure(
+            state="browser_start_capacity", starting_sessions=10, max_starting_sessions=10, retry_after_seconds=17
+        )
+    )
+
+    class _RefusingServer:
+        async def call_internal_tool(self, tool_name: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            assert tool_name == "skyvern_navigate"
+            return refusal
+
+    result = await _discovery_walk(
+        _Ctx(_RefusingServer()),
+        entry_url="https://www.example.com",
+        intent_hint="find a member",
+    )
+
+    assert result == refusal
+
+
+@pytest.mark.asyncio
+async def test_discovery_successful_inspection_without_match_still_returns_no_candidate() -> None:
+    result = await _discovery_walk(
+        _Ctx(_InspectableNoCandidateServer()),
+        entry_url="https://www.example.com",
+        intent_hint="find a member",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["candidate_url"] is None
+    assert result["data"]["failure_reason"] == "no_candidate"
+
+
+@pytest.mark.asyncio
+async def test_discovery_follows_stronger_intent_anchor_before_settling_on_broad_title() -> None:
+    server = _AnchorBeatsTitleServer()
+
+    result = await _discovery_walk(
+        _Ctx(server),
+        entry_url="https://www.example.com",
+        intent_hint="find a member",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["candidate_url"] == "https://www.example.com/registry"
+    assert result["data"]["candidate_form_fields"] == [
+        {"label": "", "name": "firstName", "type": "input", "value_hint": ""}
+    ]
+    assert server.urls == ["https://www.example.com", "https://www.example.com/registry"]
+
+
+@pytest.mark.asyncio
+async def test_discovery_recovers_from_deep_link_anti_bot_by_clicking_from_origin() -> None:
+    server = _DeepLinkAntiBotRecoveryServer()
+
+    result = await _discovery_walk(
+        _Ctx(server),
+        entry_url="https://certboard.test/registry/search",
+        intent_hint="find a member",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["candidate_url"] == "https://certboard.test/registry/search"
+    assert result["data"]["failure_reason"] is None
+    assert result["data"]["candidate_form_fields"] == [
+        {"label": "", "name": "first_name", "type": "input", "value_hint": ""},
+        {"label": "", "name": "last_name", "type": "input", "value_hint": ""},
+    ]
+    assert server.navigated_urls == [
+        "https://certboard.test/registry/search",
+        "https://certboard.test/",
+    ]
+    assert server.clicked_selectors == ['a[href="/find-a-member/"]']
+    assert [item["transition_reason"] for item in result["data"]["evidence_trail"]] == [
+        "direct_deep_link_anti_bot",
+        "anchor_match",
+        "anchor_match",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discovery_keeps_candidate_when_challenge_markup_is_embedded_in_useful_page() -> None:
+    server = _EmbeddedChallengeUsefulPageServer()
+
+    result = await _discovery_walk(
+        _Ctx(server),
+        entry_url="https://certboard.test",
+        intent_hint="find certificant lookup page",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["candidate_url"] == "https://certboard.test/registry/search"
+    assert result["data"]["failure_reason"] is None
+    assert result["data"]["candidate_form_fields"] == [
+        {"label": "First Name", "name": "first_name", "type": "input", "value_hint": ""},
+        {"label": "Last Name", "name": "last_name", "type": "input", "value_hint": ""},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _CurrentPageServer()
+    ctx = _Ctx(server)
+    ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
+    ctx.composition_page_evidence = None  # type: ignore[attr-defined]
+
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
+        return "https://www.example.com/results", "Results"
+
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is True
+    assert server.calls == ["skyvern_evaluate"]
+    assert result["data"]["current_url"] == "https://www.example.com/results"
+    assert result["data"]["workflow_run_id"] == "wr_123"
+    assert result["data"]["observed_after_workflow_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_dense_inspect_packet_sheds_only_select_options_before_recent_tool_pruning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _DensePageServer()
+    ctx = _Ctx(server)
+
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
+        return "https://www.example.com/dense-form", "Dense Form"
+
+    async def fake_bind_credential(_ctx: object, _url: str, result: dict[str, Any]) -> None:
+        result["resolved_login_credential_id"] = "cred_saved_login"
+        result["resolved_login_credential_name"] = "Saved login"
+        result["resolved_login_credential_totp_type"] = "authenticator"
+        result["resolved_login_page_url"] = "https://www.example.com/dense-form"
+
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
+    monkeypatch.setattr(
+        tools_module.composition_capture,
+        "_bind_login_credential_for_observed_url",
+        fake_bind_credential,
+    )
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+    serialized = json.dumps(result)
+    with structlog.testing.capture_logs() as logs:
+        pruned = _cap_tool_outputs([{"type": "function_call_output", "call_id": "dense-inspect", "output": serialized}])
+
+    assert result["ok"] is True
+    assert len(serialized) < _RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert pruned[0]["output"] == serialized
+    assert not any(entry["event"] == "copilot_recent_tool_output_truncated" for entry in logs)
+    assert result["observation_step"] == 0
+    assert result["resolved_login_credential_id"] == "cred_saved_login"
+    assert result["resolved_login_credential_name"] == "Saved login"
+    assert result["resolved_login_credential_totp_type"] == "authenticator"
+    assert result["resolved_login_page_url"] == "https://www.example.com/dense-form"
+
+    forms = result["data"]["forms"]
+    assert [form["id"] for form in forms] == ["dense_form_0", "dense_form_1"]
+    assert all("selector" not in form["submit_controls"][0] for form in forms)
+    fields = [field for form in forms for field in form["fields"]]
+    assert all("selector" not in field for field in fields)
+    omitted = [field for field in fields if field["options_omitted"]]
+    retained = [field for field in fields if not field["options_omitted"]]
+    assert omitted
+    assert retained
+    assert all(field["option_count"] == 30 and field["options"] == [] for field in omitted)
+    assert all(field["option_count"] == 30 and len(field["options"]) == 30 for field in retained)
+
+    # Packet shaping is model-facing only; stored composition and trajectory evidence stay complete.
+    assert len(ctx.composition_page_evidence["forms"][0]["fields"][0]["options"]) == 30
+    assert len(ctx.flow_evidence[0]["evidence"]["forms"][0]["fields"][0]["options"]) == 30
+
+
+@pytest.mark.asyncio
+async def test_post_run_current_page_inspection_budget_bypass_does_not_consume_chat_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _CurrentPageServer()
+    ctx = _Ctx(server)
+    ctx.prior_page_inspection_calls_made = 6
+    ctx.page_inspection_calls_this_turn = 0
+    ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
+    ctx.last_test_ok = True  # type: ignore[attr-defined]
+    ctx.composition_page_evidence = None  # type: ignore[attr-defined]
+
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
+        return "https://www.example.com/results", "Results"
+
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is True
+    assert result["data"]["workflow_run_id"] == "wr_123"
+    assert result["data"]["observed_after_workflow_run"] is True
+    assert ctx.page_inspection_calls_this_turn == 0
+    assert ctx.post_run_current_page_inspection_workflow_run_id == "wr_123"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_current_page_inspection_without_earned_interaction_is_not_click_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _CurrentPageServer()
+    ctx = _Ctx(server)
+
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
+        return "https://www.example.com/results", "Results"
+
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is True
+    assert result["reached_via"] == "current_page"
+    assert ctx.flow_evidence[0]["reached_via"] == "current_page"
+
+
+@pytest.mark.asyncio
+async def test_current_page_inspection_after_browser_action_is_click_reached_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _CurrentPageServer()
+    ctx = _Ctx(server)
+    ctx.pending_browser_interaction_observation = PendingBrowserInteractionObservation(
+        tool_name="click",
+        url="https://www.example.com/results",
+    )
+
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
+        return "https://www.example.com/results", "Results"
+
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is True
+    assert result["reached_via"] == "interaction"
+    assert ctx.flow_evidence[0]["reached_via"] == "interaction"
+    assert ctx.pending_browser_interaction_observation is None
+
+
+class _EmptyPageServer:
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "skyvern_get_html":
+            return {"ok": True, "data": {"html": "<html><body></body></html>"}}
+        return {"ok": True, "data": {"result": None}}
+
+
+@pytest.mark.asyncio
+async def test_repeated_structured_inspection_is_not_rationed() -> None:
+    """Understanding a page should not get harder the more inspection it needs; a prior per-turn
+    cap rejected further structured looks and steered the agent onto hand-rolled probes."""
+    ctx = _Ctx(server=_EmptyPageServer())
+    ctx.page_inspection_calls_this_turn = 999
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert "budget" not in str(result.get("error") or "")
+
+
+@pytest.mark.asyncio
+async def test_target_url_inspection_uses_visual_summary_for_generic_obstruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _GenericBarrierServer()
+    ctx = _Ctx(server)
+
+    async def fake_visual_summary(
+        _ctx: object,
+        *,
+        evidence: dict[str, Any],
+        screenshot_b64: str,
+        requested_targets: tuple[str, ...] = (),
+    ) -> tuple[dict[str, Any], None]:
+        assert screenshot_b64 == _VALID_PNG_B64
+        assert evidence["visual_obstruction_candidates"][0]["coverage"] == "viewport"
+        return {
+            "summary": "A checkpoint panel blocks the search form.",
+            "challenge_detected": False,
+            "challenge_kind": "",
+            "challenge_location": "",
+            "submit_blocked": False,
+            "blocked_submit_controls": [],
+            "empty_page_visible": False,
+            "loading_state_visible": False,
+            "page_obstruction_detected": True,
+            "obstruction_kind": "checkpoint_panel",
+            "obstruction_location": "Centered over the form.",
+            "underlying_page_blocked": True,
+            "visible_dismiss_controls": ["Continue"],
+            "omissions": [],
+        }, None
+
+    monkeypatch.setattr(tools_module.composition_capture, "_composition_summarize_screenshot", fake_visual_summary)
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://www.example.com/search")
+
+    assert result["ok"] is True
+    assert "skyvern_evaluate" in server.calls
+    assert "skyvern_screenshot" in server.calls
+    assert result["data"]["screenshot_used"] is True
+    json.dumps(result["data"])
+    assert all("CapturedFrame" not in repr(value) for value in result["data"].values())
+    assert result["data"]["page_obstructions"] == [
+        {
+            "kind": "checkpoint_panel",
+            "source": "vision_summary",
+            "visual_location": "Centered over the form.",
+            "visible_controls": [{"text": "Continue"}],
+            "underlying_page_blocked": True,
+        }
+    ]
+    assert len(ctx.pending_screenshots) == 1
+    frame = ctx.pending_screenshots[0]
+    assert frame.provenance.source_tool == "inspect_page_for_composition"
+    assert frame.provenance.captured_url is None
+    assert frame.provenance.dispatch_url == "https://www.example.com/search"
+    assert frame.provenance.observation_step == result["observation_step"]
+    assert frame.provenance.browser_session_id is None
+    assert frame.provenance.session_binding.value == "unavailable"
+    assert frame.provenance.workflow_run_id is None
+    assert frame.provenance.action_relation.value == "same_page_observation"
+    assert frame.capture_id == f"sha256:{hashlib.sha256(base64.b64decode(_VALID_PNG_B64)).hexdigest()}"
+
+
+@pytest.mark.asyncio
+async def test_post_run_visual_fallback_binds_the_observed_run_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _GenericBarrierServer()
+    ctx = _Ctx(server)
+    ctx.browser_session_id = "pbs_scout"
+    ctx.last_run_blocks_browser_session_id = "pbs_run"
+    ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
+
+    async def fake_page_info(_ctx: object, session_id: str | None = None) -> tuple[str, str]:
+        assert session_id is None
+        assert current_call_browser_session_override() == "pbs_run"
+        return "https://www.example.com/search", "Search"
+
+    async def fake_visual_summary(
+        _ctx: object,
+        *,
+        evidence: dict[str, Any],
+        screenshot_b64: str,
+        requested_targets: tuple[str, ...] = (),
+    ) -> tuple[dict[str, Any], None]:
+        assert screenshot_b64 == _VALID_PNG_B64
+        return {
+            "summary": "A checkpoint panel blocks the search form.",
+            "challenge_detected": False,
+            "challenge_kind": "",
+            "challenge_location": "",
+            "submit_blocked": False,
+            "blocked_submit_controls": [],
+            "empty_page_visible": False,
+            "loading_state_visible": False,
+            "page_obstruction_detected": True,
+            "obstruction_kind": "checkpoint_panel",
+            "obstruction_location": "Centered over the form.",
+            "underlying_page_blocked": True,
+            "visible_dismiss_controls": ["Continue"],
+            "omissions": [],
+        }, None
+
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_page_info)
+    monkeypatch.setattr(tools_module.composition_capture, "_composition_summarize_screenshot", fake_visual_summary)
+
+    with bound_call_browser_session("pbs_run"):
+        result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["data"]["source_browser_session_id"] == "pbs_run"
+    assert result["data"]["workflow_run_id"] == "wr_123"
+    frame = ctx.pending_screenshots[0]
+    assert frame.provenance.captured_url is None
+    assert frame.provenance.dispatch_url == "https://www.example.com/search"
+    assert frame.provenance.observation_step == result["observation_step"]
+    assert frame.provenance.browser_session_id == "pbs_run"
+    assert frame.provenance.dispatch_browser_session_id == "pbs_run"
+    assert frame.provenance.producer_browser_session_id == "pbs_run"
+    assert frame.provenance.session_binding.value == "agree"
+    assert frame.provenance.workflow_run_id == "wr_123"
+    assert ctx.browser_session_id == "pbs_scout"
+
+
+@pytest.mark.asyncio
+async def test_target_url_inspection_clears_pending_interaction_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _TargetThenCurrentPageServer()
+    ctx = _Ctx(server)
+    ctx.pending_browser_interaction_observation = PendingBrowserInteractionObservation(
+        tool_name="click",
+        url="https://www.example.com/results",
+    )
+
+    target_result = await _inspect_page_for_composition_impl(ctx, "https://www.example.com/results")
+
+    assert target_result["ok"] is True
+    assert target_result["reached_via"] == "navigate"
+    assert ctx.pending_browser_interaction_observation is None
+
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
+        return "https://www.example.com/results", "Results"
+
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
+
+    current_result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert current_result["ok"] is True
+    assert current_result["reached_via"] == "current_page"
+    assert [entry["reached_via"] for entry in ctx.flow_evidence] == ["navigate", "current_page"]
+
+
+class _SizeCappedHtmlStrippedFallbackServer:
+    """Every page's get_html is dropped by the MCP size cap (a heavy DOM exceeds it).
+    The stripped-body evaluate fallback recovers each page, so the resolver can still
+    follow the intent anchor to the form and resolve an entrypoint instead of parsing
+    empty pages and giving up."""
+
+    def __init__(self) -> None:
+        self.tools: list[str] = []
+        self.urls: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.tools.append(tool_name)
+        if tool_name == "skyvern_navigate":
+            self.urls.append(arguments["url"])
+            return {"ok": True, "data": {"url": arguments["url"]}}
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            return {"ok": True, "data": {"size_capped": True}}
+        if tool_name == "skyvern_evaluate":
+            if self.urls[-1] == "https://www.example.com":
+                stripped = "<body><a href='/registry'>Find a Certificant</a></body>"
+            else:
+                stripped = "<body><form><input name='firstName'><button>Search</button></form></body>"
+            return {"ok": True, "data": {"result": stripped}}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+@pytest.mark.asyncio
+async def test_discovery_recovers_entrypoint_when_get_html_is_size_capped() -> None:
+    server = _SizeCappedHtmlStrippedFallbackServer()
+
+    result = await _discovery_walk(_Ctx(server), entry_url="https://www.example.com", intent_hint="find a member")
+
+    assert result["ok"] is True
+    assert result["data"]["candidate_url"] == "https://www.example.com/registry"
+    assert result["data"]["candidate_form_fields"] == [
+        {"label": "", "name": "firstName", "type": "input", "value_hint": ""}
+    ]
+    assert "skyvern_evaluate" in server.tools
+
+
+class _StrippedHtmlServer:
+    """get_html is size-capped (dropped); the stripped-body evaluate returns a fixed body so
+    the truncation flag can be exercised."""
+
+    def __init__(self, stripped: str) -> None:
+        self._stripped = stripped
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "skyvern_navigate":
+            return {"ok": True, "data": {"url": arguments["url"]}}
+        if tool_name == "skyvern_get_html":
+            return {"ok": True, "data": {"size_capped": True}}
+        if tool_name == "skyvern_evaluate":
+            expression = arguments["expression"]
+            if expression == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION:
+                return {"ok": True, "data": {"result": {"page_title": "Loading", "forms": []}}}
+            if expression == COMPOSITION_STRIPPED_HTML_EXPRESSION:
+                assert arguments["verbosity"] == "full"
+                return {"ok": True, "data": {"result": self._stripped}}
+            assert expression == COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION
+            return {"ok": True, "data": {"result": []}}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _RenderedStyleHtmlServer:
+    def __init__(self) -> None:
+        self.tools: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.tools.append(tool_name)
+        assert tool_name == "skyvern_evaluate"
+        assert arguments["expression"] == COMPOSITION_STRIPPED_HTML_EXPRESSION
+        return {
+            "ok": True,
+            "data": {
+                "result": (
+                    '<body><div id="veil" data-page-evidence-rendered-style="true" '
+                    'style="position:fixed;inset:0;z-index:1200"></div></body>'
+                )
+            },
+        }
+
+
+@pytest.mark.asyncio
+async def test_composition_get_html_prefers_rendered_style_snapshot() -> None:
+    from skyvern.forge.sdk.ember.tools import _composition_get_html
+
+    server = _RenderedStyleHtmlServer()
+    html, error, truncated, used_stripped = await _composition_get_html(_Ctx(server), rendered_style_snapshot=True)
+
+    assert error is None
+    assert truncated is False
+    assert used_stripped is True
+    assert "data-page-evidence-rendered-style" in html
+    assert server.tools == ["skyvern_evaluate"]
+
+
+@pytest.mark.asyncio
+async def test_composition_get_html_flags_truncation_when_stripped_body_hits_cap() -> None:
+    from skyvern.forge.sdk.ember.tools import _COMPOSITION_STRIPPED_HTML_MAX_CHARS, _composition_get_html
+
+    at_cap = "<body>" + "x" * _COMPOSITION_STRIPPED_HTML_MAX_CHARS
+    _, error, truncated, _ = await _composition_get_html(_Ctx(_StrippedHtmlServer(at_cap)))
+    assert error is None
+    assert truncated is True
+
+    under_cap = "<body><form><input name='x'></form></body>"
+    _, error, truncated, _ = await _composition_get_html(_Ctx(_StrippedHtmlServer(under_cap)))
+    assert error is None
+    assert truncated is False
+
+
+@pytest.mark.asyncio
+async def test_capture_composition_evidence_warns_when_html_sliced_at_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.ember.tools import _COMPOSITION_STRIPPED_HTML_MAX_CHARS, _capture_composition_evidence
+
+    # A real form near the top yields bounded schema (no hollow-recapture loop); the trailing
+    # padding pushes the stripped body past the cap so the fallback slice is detected as partial.
+    body = (
+        "<body><form><input name='firstName'><button>Search</button></form>"
+        + "x" * _COMPOSITION_STRIPPED_HTML_MAX_CHARS
+    )
+    monkeypatch.setattr(tools_module.composition_capture.asyncio, "sleep", AsyncMock())
+    evidence, error = await _capture_composition_evidence(
+        _Ctx(_StrippedHtmlServer(body)),
+        inspected_url="https://www.example.com/search",
+        current_url="https://www.example.com/search",
+    )
+    assert error is None
+    assert evidence is not None
+    assert "html_sliced_at_cap" in evidence["inspection_warnings"]
+
+
+def test_a_url_only_the_product_wrote_never_grounds_a_site() -> None:
+    """Grounding releases credentials, so it stays USER-only; widening it to every turn opener
+    would let a server-authored row authorize an origin the person never typed."""
+    policy = RequestPolicy()
+    _ground_user_provided_sites(
+        policy,
+        "fix it",
+        [
+            SimpleNamespace(
+                sender=EmberChatSender.PRODUCT,
+                content="Diagnose run wr_1 at https://impostor.example.com and repair the workflow.",
+            )
+        ],
+    )
+
+    assert policy.user_provided_site_urls == []
+
+
+_TUNNEL_NAVIGATION_ERROR = (
+    "Failed to navigate to url https://www.example.com/search. Error message: net::ERR_TUNNEL_CONNECTION_FAILED"
+)
+_DNS_NAVIGATION_ERROR = (
+    "Failed to navigate to url https://www.example.invalid/. Error message: net::ERR_NAME_NOT_RESOLVED"
+)
+
+
+def _proxy_scout_ctx(monkeypatch: pytest.MonkeyPatch, navigation_error: str, driver_code: str | None) -> _Ctx:
+    """``navigation_error`` is the sentence the tool returned; ``driver_code`` is what the browser
+    reported for that call. Only the second one decides who owns the failure."""
+    ctx = _Ctx(_ProxyRejectedNavigationServer(navigation_error, driver_code))
+    ctx.browser_session_id = "pbs_scout"
+    browser_state = SimpleNamespace(built_with_proxy_location=ProxyLocation.RESIDENTIAL_ES)
+    monkeypatch.setattr(shared_module, "resolve_browser_state_for_context", AsyncMock(return_value=browser_state))
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_proxy_rejected_inspection_names_the_proxy_hop_in_the_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _proxy_scout_ctx(monkeypatch, _TUNNEL_NAVIGATION_ERROR, "net::ERR_TUNNEL_CONNECTION_FAILED")
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://www.example.com/search")
+
+    warnings = result["data"]["inspection_warnings"]
+    assert any(
+        "Skyvern proxy hop failed (proxy_location=RESIDENTIAL_ES)" in warning
+        and "net::ERR_TUNNEL_CONNECTION_FAILED" in warning
+        for warning in warnings
+    )
+
+
+@pytest.mark.asyncio
+async def test_target_owned_navigation_failure_leaves_the_packet_unattributed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _proxy_scout_ctx(monkeypatch, _DNS_NAVIGATION_ERROR, "net::ERR_NAME_NOT_RESOLVED")
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://www.example.invalid/")
+
+    warnings = result["data"]["inspection_warnings"]
+    assert not any("Skyvern proxy hop failed" in warning for warning in warnings)

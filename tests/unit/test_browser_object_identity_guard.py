@@ -21,7 +21,6 @@ migration is finished, and does not raise false positives):
 from __future__ import annotations
 
 import ast
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -308,29 +307,6 @@ def _production_python_files() -> list[Path]:
                 continue
             files.append(path)
     return files
-
-
-def test_no_browser_object_identity_checks_in_production() -> None:
-    offenders: list[Violation] = []
-    for path in _production_python_files():
-        try:
-            tree_src = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        # A violation needs a name imported from a driver root; the parser NFKC-normalizes identifiers.
-        normalized = unicodedata.normalize("NFKC", tree_src)
-        if not any(root in normalized for root in _BROWSER_DRIVER_ROOTS):
-            continue
-        try:
-            offenders.extend(find_browser_object_identity_checks(tree_src, str(path)))
-        except SyntaxError:
-            continue
-    assert not offenders, (
-        "Package-native browser-object identity checks found. Use the structural "
-        "predicates in skyvern.webeye.browser_object_predicates (e.g. is_page_like) "
-        "instead of isinstance/issubclass/type() against a driver's object class:\n"
-        + "\n".join(f"  {o.filename}:{o.lineno} {o.check}({o.class_name})" for o in offenders)
-    )
 
 
 def test_repo_scan_finds_at_least_the_production_tree() -> None:

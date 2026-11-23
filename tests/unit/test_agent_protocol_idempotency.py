@@ -12,25 +12,25 @@ import httpx
 import pytest
 import yaml
 from fastapi import HTTPException
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 from starlette.requests import Request
 
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AuditEvent
 from skyvern.forge.api_app import create_api_app, handle_skyvern_http_exception
-from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.models import OutputParameterModel, WorkflowModel
 from skyvern.forge.sdk.db.repositories import workflows as workflows_repository
+from skyvern.forge.sdk.ember.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.routes import agent_protocol
-from skyvern.forge.sdk.routes.workflow_copilot import (
+from skyvern.forge.sdk.routes.ember import (
     _commit_staged_workflow,
     _restore_workflow_definition,
-    workflow_copilot_apply_proposed_workflow,
+    ember_apply_proposed_workflow,
 )
+from skyvern.forge.sdk.schemas.ember import EmberApplyProposedWorkflowRequest
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotApplyProposedWorkflowRequest
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow, NonTerminalFinallyBlock
 from skyvern.forge.sdk.workflow.models.block import NavigationBlock
@@ -1094,11 +1094,11 @@ async def test_workflow_setting_presence_preserves_persisted_values(
                 if entrypoint == "legacy_proposal":
                     proposal[field_name] = None
                 proposal["_copilot_yaml"] = document
-                chat = await lab.database.workflow_params.create_workflow_copilot_chat(
+                chat = await lab.database.workflow_params.create_ember_chat(
                     organization_id=lab.organization.organization_id,
                     workflow_permanent_id=stored.workflow_permanent_id,
                 )
-                await lab.database.workflow_params.update_workflow_copilot_chat(
+                await lab.database.workflow_params.update_ember_chat(
                     organization_id=lab.organization.organization_id,
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                     proposed_workflow=proposal,
@@ -1114,8 +1114,8 @@ async def test_workflow_setting_presence_preserves_persisted_values(
                     ):
                         assert staged.extra_http_headers == {"X-Test": "stored-value"}
                         expected = {"X-Test": "updated-value"}
-                saved = await workflow_copilot_apply_proposed_workflow(
-                    WorkflowCopilotApplyProposedWorkflowRequest(workflow_copilot_chat_id=chat.workflow_copilot_chat_id),
+                saved = await ember_apply_proposed_workflow(
+                    EmberApplyProposedWorkflowRequest(workflow_copilot_chat_id=chat.workflow_copilot_chat_id),
                     lab.organization,
                 )
                 saved_id = saved.workflow_id
@@ -1178,22 +1178,13 @@ async def test_each_surface_stamps_the_build_source_of_the_version_it_writes(
             staged_workflow=staged,
         )
         assert await build_source_of(api_version.workflow_id) == "copilot"
+        versions = await lab.client.get(f"/v1/workflows/{workflow_permanent_id}/versions")
+        assert versions.status_code == 200, versions.text
+        assert "copilot" in {version["build_source"] for version in versions.json()}
 
         # A rolled-back copilot turn must not leave its stamp on the version the API caller wrote.
         await _restore_workflow_definition(api_version, lab.organization.organization_id)
         assert await build_source_of(api_version.workflow_id) == "api"
-
-        async with lab.database.Session() as session:
-            await session.execute(
-                update(WorkflowModel)
-                .where(WorkflowModel.workflow_id == api_version.workflow_id)
-                .values(build_source="ember")
-            )
-            await session.commit()
-        assert await build_source_of(api_version.workflow_id) == "copilot"
-        versions = await lab.client.get(f"/v1/workflows/{workflow_permanent_id}/versions")
-        assert versions.status_code == 200, versions.text
-        assert "copilot" in {version["build_source"] for version in versions.json()}
 
 
 def _stored_workflow_with_forward_reference() -> Workflow:

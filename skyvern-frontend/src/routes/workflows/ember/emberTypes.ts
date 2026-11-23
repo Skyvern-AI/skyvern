@@ -3,6 +3,8 @@ import {
   WorkflowDefinition,
 } from "@/routes/workflows/types/workflowTypes";
 
+export const EMBER_API_PREFIX = "/ember";
+
 // The API sends both chat-id keys while the rename window is open; an older API sends only the old key.
 export function emberChatIdOf<
   T extends {
@@ -76,6 +78,7 @@ export interface AccountGroupRow {
   prior_outcome: AccountGroupOutcome | null;
   preselected: boolean;
   parameter_key?: string;
+  inputs?: Record<string, unknown> | null;
 }
 
 export interface AccountGroupReview {
@@ -91,6 +94,8 @@ export interface AccountGroupReview {
   rows: AccountGroupRow[];
   workflow_run_group_id: string | null;
   single_run?: boolean;
+  row_group?: boolean;
+  max_concurrency?: number | null;
   workflow_run_id?: string | null;
   saves_draft?: boolean;
   proposal_owner_turn_id?: string | null;
@@ -127,12 +132,14 @@ export interface AccountGroupRunRow {
 export interface AccountGroupCancelReview {
   workflow_run_group_id: string;
   unfinished_rows: AccountGroupRunRow[];
+  unfinished_count?: number | null;
   decision?: AccountGroupDecision | null;
 }
 
 export interface AccountGroupDecision {
   approved: boolean;
   credential_ids: string[];
+  item_keys?: string[] | null;
 }
 
 export type CredentialDeleteOutcomeKind = "deleted" | "not_found" | "failed";
@@ -149,6 +156,14 @@ export interface CredentialDeleteReview {
   claimed_at?: string | null;
   approved_credential_ids?: string[] | null;
   outcomes?: { credential_id: string; outcome: CredentialDeleteOutcomeKind }[];
+}
+
+export interface SkillWriteReview {
+  action: "save" | "delete";
+  name: string;
+  live_version: number | null;
+  skill_md?: string | null;
+  decision?: AccountGroupDecision | null;
 }
 
 export interface QuestionResponse {
@@ -170,6 +185,7 @@ export interface QuestionInteraction {
   account_group_review?: AccountGroupReview;
   account_group_cancel?: AccountGroupCancelReview;
   credential_delete_review?: CredentialDeleteReview;
+  skill_write_review?: SkillWriteReview;
 }
 
 export interface EmberQuestionRequired {
@@ -242,7 +258,7 @@ export interface EmberChatRequest {
   selected_connected_account_id?: string | null;
   workflow_permanent_id: string;
   workflow_id: string;
-  workflow_copilot_chat_id?: string | null;
+  ember_chat_id?: string | null;
   workflow_run_id?: string | null;
   browser_session_id?: string | null;
   message: string;
@@ -253,6 +269,7 @@ export interface EmberChatRequest {
   code_block?: boolean | null;
   /** Internal capability: send only when the document editor is active. */
   doc_editor_enabled?: boolean;
+  editor_settings_digest?: string | null;
   cancel_token?: string;
   idempotency_key?: string | null;
   target_block_label?: string | null;
@@ -271,7 +288,9 @@ export interface EmberChatRequest {
   supports_question_tool?: boolean;
   supports_account_group_card?: boolean;
   supports_single_run_card?: boolean;
+  supports_input_group_card?: boolean;
   supports_credential_delete_card?: boolean;
+  supports_skill_write_card?: boolean;
   supports_connection_card?: boolean;
   supports_demonstration_offer?: boolean;
 }
@@ -284,7 +303,7 @@ export interface EmberCancelRequest {
 }
 
 export interface EmberSteerRequest {
-  workflow_copilot_chat_id: string;
+  ember_chat_id: string;
   cancel_token: string;
   steer_id: string;
   message: string;
@@ -321,8 +340,8 @@ export interface EmberMessageFeedback {
 }
 
 export interface EmberMessageFeedbackRequest {
-  workflow_copilot_chat_id: string;
-  workflow_copilot_chat_message_id?: string | null;
+  ember_chat_id: string;
+  ember_chat_message_id?: string | null;
   turn_id?: string | null;
   rating: EmberMessageFeedbackRating | null;
   reason?: string | null;
@@ -377,6 +396,7 @@ export interface EmberChatHistoryResponse {
   question_interactions?: QuestionInteraction[];
   pending_question_cancel_token?: string | null;
   workflow_copilot_chat_id: string | null;
+  workflow_permanent_id?: string | null;
   ember_chat_id?: string | null;
   request_turn_id?: string | null;
   in_flight_turn?: EmberInFlightTurn | null;
@@ -425,14 +445,14 @@ export interface EmberChatSummary {
 }
 
 export interface EmberClearProposedWorkflowRequest {
-  workflow_copilot_chat_id: string;
+  ember_chat_id: string;
   auto_accept: boolean;
   owner_turn_id?: string | null;
   revision?: number | null;
 }
 
 export interface EmberApplyProposedWorkflowRequest {
-  workflow_copilot_chat_id: string;
+  ember_chat_id: string;
   auto_accept: boolean;
   owner_turn_id?: string | null;
   revision?: number | null;

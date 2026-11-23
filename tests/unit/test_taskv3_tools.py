@@ -15,6 +15,7 @@ import gc
 import html
 import html as html_lib
 import inspect
+import io
 import itertools
 import json
 import os
@@ -36,6 +37,7 @@ from urllib.parse import urlparse
 import pyotp
 import pytest
 import pytest_asyncio
+from PIL import Image
 from playwright.async_api import Browser, BrowserContext, ElementHandle
 from playwright.async_api import Error as _PlaywrightError
 from playwright.async_api import Frame, Page, Playwright, Route
@@ -62,9 +64,9 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
     CredentialReleaseGuard,
 )
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
-from skyvern.forge.taskv3 import input_dispatch
+from skyvern.forge.taskv3 import captcha_tools, input_dispatch
 from skyvern.forge.taskv3.answer_basis_audit import RecordedAnswer, apply_answer_basis_audit
-from skyvern.forge.taskv3.auth_tools import VerificationState
+from skyvern.forge.taskv3.auth_tools import VerificationState, _register_link_for_redaction
 from skyvern.forge.taskv3.code_surface import (
     CodeToolSurface,
     apply_surface,
@@ -76,12 +78,15 @@ from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     CODE_TOOL_NAME,
     PICKED_OPTION_DATA_KEY,
+    REQUEST_RECORD_DATA_KEY,
     SemanticCommitStats,
     ToolRefusal,
     ToolResult,
     ToolSpec,
     UnseenPageText,
     _navigate_record_fields,
+    set_request_record_on_error,
+    with_request_record_of,
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.run_arms import LOGIN_PACE_FLAG
@@ -112,6 +117,7 @@ from skyvern.forge.taskv3.tools import (
     PAGE_UNAVAILABLE_ERROR,
     BlankWorkingPageGuard,
     DownloadFailureWatch,
+    RequestRecord,
     _annotate_screenshot,
     _exact_tier_key,
     _invalid_selector_result,
@@ -123,13 +129,15 @@ from skyvern.forge.taskv3.tools import (
 from skyvern.forge.taskv3.tools import _upload_submit_delay as _REAL_UPLOAD_SUBMIT_DELAY
 from skyvern.forge.taskv3.tools import (
     apply_blank_page_guard,
+    apply_request_record,
     build_browser_tools,
     pending_marker,
 )
 from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secret_with_task
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus
 from tests.unit.conftest import CARD_SECRET_RUN_ID
-from tests.unit.copilot_test_helpers import page_with_unprobeable_vendor_embedder
+from tests.unit.ember_test_helpers import page_with_unprobeable_vendor_embedder
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 
@@ -696,6 +704,87 @@ async def test_observe_renders_checkbox_checked_state() -> None:
     assert _ref_line(r.content, "I agree") and "checked=" in r.content
 
 
+_PAY_ROW_HTML = (
+    "<!doctype html><html><body><h1>Pay with</h1>"
+    '<a href="#w"><svg role="img" aria-label="Wallet" width="80" height="30"><rect width="80" height="30"/></svg></a>'
+    "<button>Card</button><button>Bank transfer</button></body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.parametrize(
+    ("viewport", "width", "expected_size"),
+    [
+        pytest.param((1024, 900), 768, (768, 675), id="scaled_down"),
+        pytest.param((400, 300), 768, (400, 300), id="never_upscaled"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_observe_attaches_a_viewport_screenshot_only_when_a_width_is_set(
+    monkeypatch: pytest.MonkeyPatch, viewport: tuple[int, int], width: int, expected_size: tuple[int, int]
+) -> None:
+    async with _content_page(_PAY_ROW_HTML) as page:
+        await page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
+        real_screenshot = page.screenshot
+        screenshot_calls: list[str] = []
+
+        async def counted_screenshot(**kwargs: Any) -> bytes:
+            screenshot_calls.append("shot")
+            return await real_screenshot(**kwargs)
+
+        monkeypatch.setattr(page, "screenshot", counted_screenshot)
+        off_tools = build_browser_tools(_fixed_page_provider(page), observe_screenshot_width=0)
+        off = await _tool(off_tools, "observe").handler({})
+        assert screenshot_calls == []
+        on_tools = build_browser_tools(_fixed_page_provider(page), observe_screenshot_width=width)
+        with capture_logs() as logs:
+            on = await _tool(on_tools, "observe").handler({})
+
+    assert off.status == "ok" and off.screenshots is None and "screenshot" not in off.content
+    assert "screenshot_at" not in (off.data or {})
+    assert _tool(off_tools, "observe").description == (
+        taskv3_tools._OBSERVE_DESCRIPTION_BASE + taskv3_tools._OBSERVE_DESCRIPTION_FRAME_REACH
+    )
+    assert _tool(on_tools, "observe").description.endswith(taskv3_tools._OBSERVE_DESCRIPTION_SCREENSHOT)
+    assert on.status == "ok" and len(on.screenshots or []) == 1
+    assert Image.open(io.BytesIO(on.screenshots[0])).size == expected_size
+    assert on.content[: on.data["screenshot_at"]] == off.content
+    line = on.content[on.data["screenshot_at"] :]
+    assert line.startswith("\nscreenshot: attached") and f"({expected_size[0]}x{expected_size[1]})" in line
+    shots = [entry for entry in logs if entry["event"] == "taskv3 observe screenshot"]
+    assert [(e["outcome"], e["width"], e["height"], e["bytes"]) for e in shots] == [
+        ("attached", *expected_size, len(on.screenshots[0]))
+    ]
+
+
+@_skip_no_browser
+@pytest.mark.parametrize(
+    ("failure", "outcome"),
+    [pytest.param("raises", "error", id="raises"), pytest.param("slow", "timeout", id="slow")],
+)
+@pytest.mark.asyncio
+async def test_a_failed_or_slow_observe_screenshot_still_returns_the_reading(
+    monkeypatch: pytest.MonkeyPatch, failure: str, outcome: str
+) -> None:
+    async def broken_screenshot(**_kwargs: Any) -> bytes:
+        if failure == "slow":
+            await asyncio.sleep(5)
+        raise RuntimeError("Target page, context or browser has been closed")
+
+    monkeypatch.setattr(taskv3_tools, "OBSERVE_SCREENSHOT_TIMEOUT_SECONDS", 0.05)
+    async with _content_page(_PAY_ROW_HTML) as page:
+        off = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        monkeypatch.setattr(page, "screenshot", broken_screenshot)
+        tools = build_browser_tools(_fixed_page_provider(page), observe_screenshot_width=512)
+        with capture_logs() as logs:
+            result = await _tool(tools, "observe").handler({})
+
+    assert result.status == "ok" and result.screenshots is None
+    assert result.content.startswith(off.content + "\nscreenshot: not attached (")
+    assert result.data["screenshot_at"] == len(off.content)
+    assert [e["outcome"] for e in logs if e["event"] == "taskv3 observe screenshot"] == [outcome]
+
+
 _MARKER = f"group={_NO_QUESTION_MARKER}"
 
 _DISABLED_SHAPES_HTML = """
@@ -1143,15 +1232,129 @@ async def test_click_type_select_dispatch_raw_ops(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep)
     )  # the typeahead probe polls; skip real waiting in tests
-    page = _FakePage()
+    page = _TypeaheadFakePage(field_type="password", node_name="select")
     tools = build_browser_tools(_fixed_page_provider(page))
     await _tool(tools, "click").handler({"selector": "#submit"})
-    await _tool(tools, "type").handler({"selector": "#first", "text": "John"})
+    r = await _tool(tools, "type").handler({"selector": "#first", "text": "John"})
     await _tool(tools, "select_option").handler({"selector": "#country", "label": "United States"})
-    assert ("click", {"selector": "#submit"}) in page.calls
-    # `type` keystroke-types the value (typeahead-safe path) — the value is entered via page.type
-    assert ("fill", {"selector": "#first", "text": "John"}) in page.calls
+    assert ("click", "#submit") in page.calls
+    assert r.status == "ok" and page.held["#first"] == "John", r.content
     assert ("select_option", {"selector": "#country", "value": None, "label": "United States"}) in page.calls
+
+
+_KEYUP_PHONE_HTML = """<input id="phone" type="tel"><input id="masked" type="tel"><input id="gone" type="tel"><input id="reset" type="tel">
+<input id="qty" type="number"><input id="price" type="number"><input id="mail" type="email"><textarea id="note"></textarea>
+<textarea id="mid"></textarea><input id="code" type="tel"><input id="complete" type="tel">
+<script>
+const el = document.getElementById('phone');
+window.__registered = '';
+window.__submitted = false;
+el.addEventListener('keydown', (e) => { if (e.key.length === 1) e.preventDefault(); });
+el.addEventListener('keyup', (e) => {
+  if (!/^[0-9+]$/.test(e.key)) return;
+  const at = el.selectionStart;
+  const d = (el.value.slice(0, at) + e.key + el.value.slice(at)).replace(/\\D/g, '');
+  el.value = d.length === 10 ? '(' + d.slice(0, 3) + ') ' + d.slice(3, 6) + '-' + d.slice(6) : d;
+  window.__registered = el.value;
+});
+const masked = document.getElementById('masked');
+const shape = '(___) ___-____';
+const show = (d) => { let i = 0; return shape.replace(/_/g, () => d[i++] || '_'); };
+masked.value = show('');
+masked.addEventListener('input', () => {
+  const d = masked.value.slice(0, shape.length).replace(/\\D/g, '').slice(0, 10);
+  masked.value = show(d);
+  let at = 0;
+  for (let n = 0; n < d.length; at++) if (/\\d/.test(masked.value[at])) n++;
+  masked.setSelectionRange(at, at);
+});
+document.getElementById('gone').addEventListener('input', (e) => e.target.remove());
+document.getElementById('reset').addEventListener('input', (e) => e.target.setSelectionRange(0, 0));
+document.getElementById('mid').addEventListener('input', (e) => e.target.setSelectionRange(1, 1));
+document.getElementById('code').addEventListener('input', (e) => e.target.setSelectionRange(2, 2));
+document.getElementById('complete').addEventListener('input', (e) => {
+  const full = '2015550123', n = e.target.value.length;
+  if (n < full.length && full.startsWith(e.target.value)) { e.target.value = full; e.target.setSelectionRange(n, full.length); }
+});
+document.getElementById('note').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') window.__submitted = true;
+});
+</script>"""
+
+
+_REMOUNT_ON_INPUT_HTML = """<input id="tel" type="tel" aria-label="Phone"><input id="mail" type="email" aria-label="Email">
+<textarea id="note" aria-label="Note"></textarea><input id="one" type="tel" aria-label="Digit">
+<input id="fax" type="tel" aria-label="Fax">
+<script>
+for (const id of ['tel', 'mail', 'note', 'one', 'fax']) {
+  const first = document.getElementById(id);
+  first.addEventListener('input', () => {
+    const rep = document.createElement(first.tagName);
+    for (const name of ['id', 'type', 'aria-label'])
+      if (first.hasAttribute(name)) rep.setAttribute(name, first.getAttribute(name));
+    rep.value = first.value;
+    first.replaceWith(rep);
+    if (id === 'fax') return;
+    rep.focus();
+    try { rep.setSelectionRange(rep.value.length, rep.value.length); } catch (e) {}
+  }, { once: true });
+}
+</script>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_presses_the_last_character_so_a_key_only_phone_field_registers_it() -> None:
+    typed = {
+        "#reset": "2015550123",
+        "#mid": "hello",
+        "#code": "AB--X",
+        "#complete": "2015550123",
+        "#qty": "-5",
+        "#price": "12.5",
+        "#mail": "john@example.com",
+        "#note": "hello\n",
+    }
+    async with _content_page(_KEYUP_PHONE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        phone = await _tool(tools, "type").handler({"selector": "#phone", "text": "2015550123"})
+        masked = await _tool(tools, "type").handler({"selector": "#masked", "text": "2015550123"})
+        started = time.monotonic()
+        taskv3_loop._ENTRY_RECORD.set(None)
+        gone = await _tool(tools, "type").handler({"selector": "#gone", "text": "2015550123"})
+        gone_elapsed = time.monotonic() - started
+        gone_variant = taskv3_loop._ENTRY_RECORD.get()
+        results = {sel: await _tool(tools, "type").handler({"selector": sel, "text": t}) for sel, t in typed.items()}
+        registered = await page.evaluate("() => window.__registered")
+        submitted = await page.evaluate("() => window.__submitted")
+        held_mask = await page.eval_on_selector("#masked", "el => el.value")
+        held = {sel: await page.eval_on_selector(sel, "el => el.value") for sel in typed}
+    assert phone.status == "ok" and registered == "(201) 555-0123", (registered, phone.content)
+    assert masked.status == "ok" and held_mask == "(201) 555-0123", (held_mask, masked.content)
+    assert (gone.status, gone.error_class) == ("error", "text_not_held"), gone.content
+    assert gone_variant == {"entry_variant": "native_tel"}, gone_variant
+    assert gone_elapsed < 12, gone_elapsed
+    assert held == typed and all(r.status == "ok" for r in results.values()), (held, results)
+    assert not submitted
+    # Fields that re-mount on their first input, addressed by ref and by mark; only Fax's replacement takes no focus.
+    remount = {"Phone": "2015550123", "Email": "john@example.com", "Note": "hello", "Digit": "3", "Fax": "2015550123"}
+    for lister, line in (("observe", r"^ref=(\d+) .*{}"), ("look", r"^\[(\d+)\] .*{}")):
+        async with _content_page(_REMOUNT_ON_INPUT_HTML) as page:
+            tools = build_browser_tools(_fixed_page_provider(page))
+            listed = (await _tool(tools, lister).handler({})).content
+            found = {label: re.search(line.format(label), listed, re.MULTILINE) for label in remount}
+            assert all(found.values()), listed
+            remounted = {}
+            for label, match in found.items():
+                n = match.group(1) if match else ""
+                target = {"selector": f"ref={n}"} if lister == "observe" else {"mark": int(n)}
+                remounted[label] = await _tool(tools, "type").handler({**target, "text": remount[label]})
+            held_remount = {
+                label: await page.eval_on_selector(f"[aria-label={label}]", "el => el.value") for label in remount
+            }
+        short = {label for label in remount if held_remount[label] != remount[label]}
+        assert short <= {"Fax"}, (lister, held_remount, remounted)
+        assert all(remounted[label].error_class == "text_not_held" for label in short), (lister, remounted)
 
 
 @pytest.mark.asyncio
@@ -1465,6 +1668,35 @@ async def test_filled_state_probe_counts_an_attached_file_input(tmp_path: Any) -
         assert await _count_filled_fields(page) >= 1
         await page.fill("#name", "John Doe")
         assert await _count_filled_fields(page) >= 2
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_shows_whether_a_file_input_still_holds_its_file(tmp_path: Any) -> None:
+    # file_upload tells the model observe lists an input holding a file with its value and an emptied one without,
+    # hidden native inputs included: that is how it sees a form re-rendered after a rejected submit lost the file.
+    cv = tmp_path / "cv.pdf"
+    cv.write_bytes(b"%PDF-1.4 cv")
+    html = (
+        '<form id="f"><label for="cv">Resume</label><input type="file" id="cv">'
+        '<label for="cover" style="display:inline-block;width:120px;height:24px">Cover letter</label>'
+        '<input type="file" id="cover" style="position:absolute;width:0;height:0;opacity:0"></form>'
+    )
+
+    def file_line(digest: str, label: str) -> str:
+        return next(line for line in digest.splitlines() if "input/file" in line and f"'{label}'" in line)
+
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await page.set_input_files("#cv", str(cv))
+        await page.set_input_files("#cover", str(cv))
+        held = (await _tool(tools, "observe").handler({})).content
+        await page.evaluate("() => { const form = document.getElementById('f'); form.outerHTML = form.outerHTML; }")
+        emptied = (await _tool(tools, "observe").handler({})).content
+    assert "hidden-native" in file_line(held, "Cover letter"), held
+    for label in ("Resume", "Cover letter"):
+        assert "cv.pdf" in file_line(held, label), held
+        assert "value=" not in file_line(emptied, label), emptied
 
 
 def _readiness_tools(
@@ -2397,7 +2629,7 @@ async def test_off_site_credential_refusal_reaches_the_model_and_the_run_continu
 
 @pytest.mark.asyncio
 async def test_type_resolver_failure_or_non_string_falls_back_to_literal() -> None:
-    page = _FakePage()
+    page = _TypeaheadFakePage(field_type="password")
 
     def _raises(_text: str) -> str:
         raise RuntimeError("resolver blew up")
@@ -2406,11 +2638,7 @@ async def test_type_resolver_failure_or_non_string_falls_back_to_literal() -> No
     await _tool(tools, "type").handler({"selector": "#a", "text": "literal-1"})
     tools = build_browser_tools(_fixed_page_provider(page), resolve_typed_text=lambda _t: None)
     await _tool(tools, "type").handler({"selector": "#b", "text": "literal-2"})
-    filled = [c[1] for c in page.calls if c[0] == "fill"]
-    assert filled == [
-        {"selector": "#a", "text": "literal-1"},
-        {"selector": "#b", "text": "literal-2"},
-    ]
+    assert page.held == {"#a": "literal-1", "#b": "literal-2"}
 
 
 _TOTP_SEED = "JBSWY3DPEHPK3PXP"
@@ -2833,7 +3061,27 @@ async def test_navigate_resolves_secret_placeholder_before_goto(monkeypatch: pyt
     assert "placeholder_link" not in r.content
 
 
-class _TypeaheadFakePage:
+class _TypeaheadFakeLocator:
+    def __init__(self, page: _TypeaheadFakePage, selector: str) -> None:
+        self._page = page
+        self._selector = selector
+
+    @property
+    def first(self) -> _TypeaheadFakeLocator:
+        return self
+
+    async def count(self) -> int:
+        # Only modelled when a test sets match_count; otherwise raise so the tool fail-opens to n==1,
+        # exactly as it does when a real page cannot count the selector.
+        if self._page._match_count is None:
+            raise RuntimeError("locator not modelled")
+        return self._page._match_count
+
+    async def input_value(self, timeout: int | None = None) -> str:
+        return self._page.held.get(self._selector, "")
+
+
+class _TypeaheadFakePage(_FakePage):
     """Fake page for the BEHAVIORAL typeahead path. `evaluate` stands in for the JS suggestion-finder
     (_FIND_SUGGESTION_JS, identified by the data-tv3-sugg tag it sets) and the commit-verifier
     (_VERIFY_COMMIT_JS, identified by its `noSuggestionList` flag), so type()/select_combobox control flow can be
@@ -2852,6 +3100,7 @@ class _TypeaheadFakePage:
         node_name: str = "input",
         disabled: bool = False,
     ) -> None:
+        super().__init__()
         self._field_type = field_type
         self._suggestion = suggestion
         self._committed = committed
@@ -2859,26 +3108,30 @@ class _TypeaheadFakePage:
         self._reach = reach
         self._node_name = node_name
         self._disabled = disabled
+        self.held: dict[str, str] = {}
+        self.focused = ""
         self.calls: list[tuple[str, Any]] = []
         self.clicked_suggestion = False
 
-    def locator(self, selector: str) -> Any:
-        # Only modelled when a test sets match_count; otherwise raise so the tool fail-opens to n==1,
-        # exactly as it does when a real page cannot count the selector.
-        if self._match_count is None:
-            raise RuntimeError("locator not modelled")
-
-        class _FakeLocator:
-            def __init__(self, n: int) -> None:
-                self._n = n
-
-            async def count(self) -> int:
-                return self._n
-
-        return _FakeLocator(self._match_count)
+    def locator(self, selector: str) -> _TypeaheadFakeLocator:
+        return _TypeaheadFakeLocator(self, selector)
 
     async def eval_on_selector(self, selector: str, js: str) -> Any:
+        self.focused = selector
         return [self._field_type, None] if "maxlength" in js else self._field_type
+
+    class _KB(_FakePage._KB):
+        _page: _TypeaheadFakePage
+
+        async def type(self, text: str) -> None:
+            self._page.held[self._page.focused] = self._page.held.get(self._page.focused, "") + text
+
+        async def press(self, key: str) -> None:
+            self._page.calls.append(("kb_press", key))
+
+    @property
+    def keyboard(self) -> _TypeaheadFakePage._KB:
+        return _TypeaheadFakePage._KB(self)
 
     async def evaluate(self, js: str, arg: Any = None) -> Any:
         # Order matters: the verify JS also references data-tv3-sugg (its list-closed check), so match
@@ -2951,9 +3204,11 @@ class _TypeaheadFakePage:
 
     async def fill(self, selector: str, text: str, timeout: int | None = None) -> None:
         self.calls.append(("fill", (selector, text)))
+        self.held[selector] = text
 
     async def type(self, selector: str, text: str, delay: int | None = None, timeout: int | None = None) -> None:
         self.calls.append(("type", (selector, text)))
+        self.held[selector] = self.held.get(selector, "") + text
 
     async def press(self, selector: str, key: str) -> None:
         self.calls.append(("press", (selector, key)))
@@ -3029,13 +3284,14 @@ async def test_type_leaves_raw_text_when_no_suggestion_reacts(monkeypatch: pytes
 
 @pytest.mark.asyncio
 async def test_type_non_text_input_skips_probe_fast_path() -> None:
-    # A non-text input (email/tel/…) is never a typeahead: fast fill, no suggestion probe, no click —
-    # even if a suggestion would have been offered.
+    # A non-text input (email/tel/…) is never a typeahead: no suggestion probe, no click — even if a
+    # suggestion would have been offered.
     page = _TypeaheadFakePage(field_type="email", suggestion={"text": "x@y.com", "score": 9})
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "type").handler({"selector": "#email", "text": "john.smith@example.com"})
     assert r.status == "ok"
-    assert ("fill", ("#email", "john.smith@example.com")) in page.calls
+    assert page.held["#email"] == "john.smith@example.com"
+    assert not any(c[0] == "click" for c in page.calls)
     assert not page.clicked_suggestion
 
 
@@ -3478,24 +3734,6 @@ async def test_type_date_widget_that_normalizes_the_final_segment_on_blur_is_cau
     r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09/18/2026"})
     assert r.status == "error", r.content
     assert "year" in r.content
-
-
-@pytest.mark.asyncio
-async def test_type_date_widget_that_clamps_a_segment_on_blur_is_not_reported_as_filled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # _date_segment_holds only checks a segment right after typing it, while it still has focus. A
-    # day segment that clamps 31 -> 28 only once focus leaves it (its blur, which fires only once the
-    # loop focuses year) still reads "31" at that moment; the final re-verify must catch the drift.
-    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
-    page = _DateSegmentFakePage(
-        group_probe={"ok": True, "reason": None, "targetLabel": "month"},
-        blur_clamp=("day", "31", "28"),
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "02/31/2026"})
-    assert r.status == "error", r.content
-    assert "day" in r.content
 
 
 @pytest.mark.asyncio
@@ -4124,6 +4362,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "unnamed_not_icon",
         "links_listed",
         "link_capped",
+        "qualified_by_destination",
     }
     assert all(type(v) is int for v in summary.values())
     assert summary["invalid_fields"] == 1
@@ -4247,20 +4486,155 @@ async def test_observe_omits_an_offcanvas_role_button() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_omits_a_visibility_hidden_control() -> None:
-    # visibility:hidden keeps a non-zero layout box, so it sails past the zero-rect gate. v1 drops it
-    # on isElementStyleVisibilityVisible (domUtils.js); observe must too -- a hidden field is noise
-    # the agent could mis-fill.
+@pytest.mark.parametrize("hidden_style", ["visibility:hidden", "opacity:0"])
+async def test_observe_omits_a_visibility_hidden_control(hidden_style: str) -> None:
     html = (
         "<!doctype html><html><body>"
-        '<input aria-label="VISSHOWNMARK">'
-        '<input aria-label="VISHIDDENMARK" style="visibility:hidden">'
+        '<label>VISSHOWNMARK<input id="shown"></label>'
+        f'<section id="panel" style="{hidden_style}"><h2>HIDDENQUESTION</h2>'
+        '<label>HIDDENCHOICE<input type="radio" name="choice"></label></section>'
+        "<button id=\"mutate\" onclick=\"document.querySelector('#panel h2').textContent='HIDDENCHANGE'\">"
+        "Update background</button><h2>Visible heading</h2>"
+        '<svg role="heading" width="180" height="40"><text x="0" y="20">Vector heading</text></svg>'
+        '<table><tr><td>A<span style="opacity:0">HIDDENTABLE</span></td><td>B</td></tr></table>'
         "</body></html>"
     )
     async with _content_page(html) as page:
-        data = await _observe_data(page)
-    assert _surfaces(data, "VISSHOWNMARK"), "control regression: visible input vanished"
-    assert not _surfaces(data, "VISHIDDENMARK"), "visibility:hidden control must not be surfaced"
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observe = _tool(tools, "observe")
+        result = await observe.handler({})
+        assert "VISSHOWNMARK" in result.content
+        assert "Vector heading" in result.content and "Visible heading" in result.content
+        assert not _surfaces(await _observe_data(page), "HIDDENCHOICE")
+        mutated = await _tool(tools, "click").handler({"selector": "#mutate"})
+        assert mutated.status == "ok"
+        rendered = await _tool(tools, "get_html").handler({"format": "text"})
+        assert rendered.content.strip() == (await page.inner_text("body")).strip()
+        entered = await _tool(tools, "type").handler({"selector": "#shown", "text": "Invented"})
+        assert entered.status == "ok" and await page.locator("#shown").input_value() == "Invented"
+        await page.set_content(
+            '<h2>OUTSIDEDRAIN</h2><button id="stable">STABLEDRAIN</button>'
+            '<section id="fading"><h2>FADEDQUESTION</h2><button aria-label="FADEDACTION">Continue</button></section>'
+            "<script>window.faded = 0; new MutationObserver(records => {"
+            'if (!window.faded && records.some(r => r.attributeName === "data-tv3" && r.target.closest("#fading"))) {'
+            'document.getElementById("fading").style.opacity = "0"; window.faded++;}'
+            '}).observe(document, {subtree:true, attributes:true, attributeFilter:["data-tv3"]});</script>'
+        )
+        for _ in range(2):
+            result = await observe.handler({})
+            assert await page.evaluate("window.faded") == 1
+            assert await page.locator("#fading").evaluate("el => getComputedStyle(el).opacity") == "0"
+            assert "STABLEDRAIN" in result.content and "OUTSIDEDRAIN" in result.content
+            assert not _surfaces(await _observe_data(page), "FADEDACTION")
+            assert result.data["summary"]["hidden_dropped_visibility"] == 1, result.data
+            assert result.data["summary"]["elements_dropped"] == 0, result.data
+            assert "could not be described" not in result.content
+        for control in (
+            '<input aria-label="Fading field">',
+            '<label style="display:block">Fading choice<input type="checkbox"'
+            ' style="position:absolute;width:0;height:0;padding:0;border:0"></label>',
+        ):
+            await page.set_content(
+                f'<section id="fading">{control}</section>'
+                '<script>new MutationObserver(() => {document.getElementById("fading").style.opacity="0"})'
+                '.observe(document,{subtree:true,attributes:true,attributeFilter:["data-tv3"]});</script>'
+            )
+            for _ in range(2):
+                result = await observe.handler({})
+                assert result.status == "ok", result.content
+                summary = result.data["summary"]
+                assert summary["elements_listed"] == 0 and summary["hidden_listed"] == 0, summary
+                assert summary["hidden_dropped"] == summary["hidden_dropped_visibility"] == 1, summary
+                assert summary["elements_dropped"] == 0, summary
+                assert "present but not visible" in result.content
+                assert "could not be described" not in result.content
+        rows = "".join(
+            f'<div><label for="field{i}">{name}</label><input id="field{i}">'
+            '<section class="fading"><input aria-label="Fading field"></section>'
+            "<button>Search</button></div>"
+            for i, name in enumerate(("Account", "Policy"))
+        )
+        await page.set_content(
+            rows + '<script>new MutationObserver(() => {document.querySelectorAll(".fading")'
+            '.forEach(el => el.style.opacity="0")}).observe(document,'
+            '{subtree:true,attributes:true,attributeFilter:["data-tv3"]});</script>'
+        )
+        for _ in range(2):
+            result = await observe.handler({})
+            icons = [line for line in _lines(result.content) if "'Search'" in line]
+            assert len(icons) == 2, result.content
+            for name in ("Account", "Policy"):
+                assert sum(f"field={name!r}" in line for line in icons) == 1, result.content
+            assert result.data["summary"]["hidden_dropped_visibility"] == 2, result.data
+            assert result.data["summary"]["elements_dropped"] == 0, result.data
+        cases = [
+            ('<button id="kept" style="opacity:0">Own opacity</button>', True),
+            ('<div style="opacity:0"><button id="kept">Hidden panel</button></div>', False),
+            ('<div style="display:contents;opacity:0"><button id="kept">Contents</button></div>', True),
+            (
+                '<div style="visibility:hidden"><button id="kept" style="visibility:visible">Override</button></div>',
+                True,
+            ),
+            ('<div style="opacity:.5;pointer-events:none"><button id="kept">Partial</button></div>', True),
+            (
+                '<div style="opacity:0"><dialog id="layer"><button id="kept">Modal</button></dialog></div>'
+                '<script>document.getElementById("layer").showModal()</script>',
+                True,
+            ),
+            (
+                '<div style="opacity:0"><div id="layer" popover><button id="kept">Popover</button></div></div>'
+                '<script>document.getElementById("layer").showPopover()</script>',
+                True,
+            ),
+            ('<div style="opacity:0" role="dialog" aria-modal="true"><button id="kept">Declared</button></div>', False),
+            (
+                '<div style="opacity:0"><input type="checkbox" id="kept"></div>'
+                '<label for="kept" style="display:block">External proxy</label>',
+                True,
+            ),
+            (
+                '<div style="opacity:0"><input type="checkbox" id="kept">'
+                '<label for="kept" style="display:block">Hidden proxy</label></div>',
+                False,
+            ),
+            (
+                '<div id="host"><button id="kept">Slotted</button></div>'
+                '<script>host.attachShadow({mode:"open"}).innerHTML='
+                "'<section style=\"opacity:0\"><slot></slot></section>'</script>",
+                False,
+            ),
+            (
+                "<style>.panel:has([data-tv3]){opacity:0}</style>"
+                '<section class="panel"><button aria-label="kept">Marker panel</button></section>',
+                False,
+            ),
+            ('<style>[data-tv3]{opacity:0}</style><button aria-label="kept">Marker own</button>', True),
+        ]
+        for markup, expected in cases:
+            await page.set_content('<button id="outside">Outside</button>' + markup)
+            for _ in range(2):
+                data = await _observe_data(page)
+                assert _surfaces(data, "outside")
+                assert bool(_surfaces(data, "kept")) is expected, markup
+        for markup in (
+            '<details><summary>Summary</summary>Closed body<span style="opacity:0">Opaque</span></details>',
+            '<canvas>Fallback<span style="opacity:0">Opaque</span></canvas>',
+            '<video>Fallback<span style="opacity:0">Opaque</span></video>',
+            '<div hidden="until-found">Unfound<span style="opacity:0">Opaque</span></div>',
+            '<div id="host">Unslotted<span style="opacity:0">Opaque</span></div>'
+            '<script>host.attachShadow({mode:"open"}).innerHTML="<b>Shadow</b>"</script>',
+            '<svg width="100" height="30"><title>Metadata</title><text y="20">Vector</text></svg>'
+            '<span style="opacity:0">Opaque</span>',
+            '<table><tr><td>A</td><td style="opacity:0">Hidden</td><td>B</td></tr></table>',
+        ):
+            await page.set_content(markup)
+            native = await page.evaluate(
+                "() => [document.body.innerText, ...Array.from(document.querySelectorAll('*'))"
+                ".filter(el => el.shadowRoot).flatMap(el => Array.from(el.shadowRoot.children)"
+                ".map(child => child.innerText))].join(' ').trim()"
+            )
+            rendered = await _tool(tools, "get_html").handler({"format": "text"})
+            assert rendered.content.strip() == native.strip()
 
 
 @_skip_no_browser
@@ -4335,22 +4709,38 @@ async def test_observe_omits_a_display_contents_host_whose_only_text_does_not_re
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_keeps_a_shadow_dom_native_input_hidden_behind_a_styled_overlay() -> None:
-    # Web-component libraries hide the native input via CSS (visibility:hidden) inside a shadow root
-    # while rendering a styled overlay the user actually clicks. v1 force-keeps such a control
-    # (domUtils.js isElementVisible), so the visibility gate must not drop it -- doing so silently
-    # strips a real, interactable control.
+    # A visible component may hide its fillable native fields. Keep that existing carve-out for
+    # each field's own CSS, but opacity on the host or containing panel still hides the component.
     html = (
         "<!doctype html><html><body>"
-        '<div id="host"></div>'
+        '<input id="plain" aria-label="PLAINMARK"><section id="panel"><div id="host"></div></section>'
         "<script>"
         "const r = document.getElementById('host').attachShadow({mode:'open'});"
         'r.innerHTML = \'<label class="ovl">Accept terms</label>'
-        '<input type="checkbox" aria-label="SHADOWHIDDENMARK" style="visibility:hidden;position:absolute">\';'
+        '<input type="checkbox" aria-label="SHADOWHIDDENMARK" style="visibility:hidden;position:absolute">'
+        '<label for="shadow-text">SHADOWTEXTMARK</label>'
+        '<input id="shadow-text" aria-label="SHADOWTEXTMARK" style="opacity:0">'
+        '<label for="shadow-area">SHADOWAREAMARK</label>'
+        '<textarea id="shadow-area" aria-label="SHADOWAREAMARK" style="opacity:0"></textarea>\';'
         "</script></body></html>"
     )
     async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        for selector, text in [("#plain", "Visible"), ("#shadow-text", "Invented"), ("#shadow-area", "Notes")]:
+            entered = await _tool(tools, "type").handler({"selector": selector, "text": text})
+            assert entered.status == "ok" and await page.locator(selector).input_value() == text
         data = await _observe_data(page)
-    assert _surfaces(data, "SHADOWHIDDENMARK"), "a native form control hidden inside a shadow overlay must stay listed"
+        for marker in ["SHADOWHIDDENMARK", "SHADOWTEXTMARK", "SHADOWAREAMARK"]:
+            assert _surfaces(data, marker), "a fillable native control in a visible shadow component must stay listed"
+        for hidden in ["host", "panel"]:
+            await page.evaluate(
+                "id => { for (const key of ['host', 'panel']) document.getElementById(key).style.opacity = key === id ? '0' : '1'; }",
+                hidden,
+            )
+            data = await _observe_data(page)
+            assert _surfaces(data, "PLAINMARK")
+            for marker in ["SHADOWHIDDENMARK", "SHADOWTEXTMARK", "SHADOWAREAMARK"]:
+                assert not _surfaces(data, marker), "a transparent host or panel must hide its shadow controls"
 
 
 @_skip_no_browser
@@ -7513,6 +7903,7 @@ async def test_observe_clip_count_does_not_tell_two_same_caption_controls_apart(
     assert len(adds) == 2, r.content
     assert "section='Work History'" in adds[0] and "section='Education'" in adds[1], adds
     assert r.data["summary"]["duplicate_digest_lines"] == 0, r.data
+    assert r.data["summary"]["qualified_by_destination"] == 0, r.data
 
 
 @pytest.mark.asyncio
@@ -7529,6 +7920,157 @@ async def test_observe_counts_lines_that_differ_only_in_their_clip_count_as_dupl
     ).handler({})
     assert r.status == "ok"
     assert r.data["summary"]["duplicate_digest_lines"] == 2, r.data
+    for case in _DESTINATION_SPLIT_RECORDS:
+        elements, expected, qualified = case.values
+        page = _digest_page({"text": [], "elements": elements})
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert r.status == "ok", case.id
+        listed = [line for line in r.content.splitlines() if line.startswith(("ref=", "(in= left off"))]
+        assert listed == expected, (case.id, r.content)
+        assert r.data["summary"]["qualified_by_destination"] == qualified, (case.id, r.data)
+
+
+def _placed_link(i: int, label: str, to: str, section: str, box: str = "") -> dict[str, Any]:
+    return {
+        "i": i,
+        "tag": "a",
+        "type": None,
+        "selector": f"#l{i}",
+        "label": label,
+        "to": to,
+        "placement": [["section", section]] + ([["in.apart", box]] if box else []),
+    }
+
+
+_KESTREL = ("/tools/launch-kestrel", "Retirement plans", "Retirement plans Open planner")
+_PLANNER_SOFTWARE = ("/tools/launch-planner-software", "Education plans", "Education plans Open planner")
+
+
+# Lines a destination already tells apart get in= only where every one has its own, different box text.
+_BUDGET_BOXES = [f"Card {n:02d} " + "x" * 105 for n in range(21)] + ["Card 21"]
+_DESTINATION_SPLIT_RECORDS = [
+    pytest.param(
+        [_placed_link(n, "View", f"/item/{n:02d}", "Items", box) for n, box in enumerate(_BUDGET_BOXES)],
+        [
+            f"ref={n + 1} a 'View' to='/item/{n:02d}'" + (f" in='{box}'" if n < 20 else "")
+            for n, box in enumerate(_BUDGET_BOXES)
+        ]
+        + ["(in= left off 2 more link(s): this reading's budget for it ran out.)"],
+        20,
+        id="past_the_reading_budget",
+    ),
+    pytest.param(
+        [_placed_link(0, "Open planner", *_KESTREL), _placed_link(1, "Open planner", *_PLANNER_SOFTWARE)],
+        [
+            "ref=1 a 'Open planner' to='/tools/launch-kestrel' in='Retirement plans Open planner'",
+            "ref=2 a 'Open planner' to='/tools/launch-planner-software' in='Education plans Open planner'",
+        ],
+        2,
+        id="own_box_text",
+    ),
+    pytest.param(
+        [
+            {
+                **link,
+                "placement": [["within.data-testid", f"tool-card-{link['i'] + 1}"], *link["placement"]],
+            }
+            for link in (
+                _placed_link(0, "Open planner", *_KESTREL),
+                _placed_link(1, "Open planner", *_PLANNER_SOFTWARE),
+            )
+        ],
+        [
+            "ref=1 a 'Open planner' to='/tools/launch-kestrel' in='Retirement plans Open planner'",
+            "ref=2 a 'Open planner' to='/tools/launch-planner-software' in='Education plans Open planner'",
+        ],
+        2,
+        id="ids_not_offered",
+    ),
+    pytest.param(
+        [
+            {**_placed_link(0, "Open", *_KESTREL), "shows": "Open planner"},
+            {**_placed_link(1, "Open", *_PLANNER_SOFTWARE), "shows": "Open planner"},
+        ],
+        [
+            "ref=1 a 'Open' shows='Open planner' to='/tools/launch-kestrel' in='Retirement plans Open planner'",
+            "ref=2 a 'Open' shows='Open planner' to='/tools/launch-planner-software' in='Education plans Open planner'",
+        ],
+        2,
+        id="shows_before_to",
+    ),
+    pytest.param(
+        [
+            _placed_link(0, "Open planner", *_KESTREL[:2], "Plans Open planner"),
+            _placed_link(1, "Open planner", *_PLANNER_SOFTWARE[:2], "Plans Open planner"),
+        ],
+        [
+            "ref=1 a 'Open planner' to='/tools/launch-kestrel'",
+            "ref=2 a 'Open planner' to='/tools/launch-planner-software'",
+        ],
+        0,
+        id="same_box_text",
+    ),
+    pytest.param(
+        [_placed_link(0, "Open planner", *_KESTREL), _placed_link(1, "Open planner", *_PLANNER_SOFTWARE[:2])],
+        [
+            "ref=1 a 'Open planner' to='/tools/launch-kestrel'",
+            "ref=2 a 'Open planner' to='/tools/launch-planner-software'",
+        ],
+        0,
+        id="one_box_declined",
+    ),
+    pytest.param(
+        [
+            _placed_link(0, "Manage", "/rows/alpha", "Rows", "Row one Manage"),
+            _placed_link(1, "Manage", "/rows/alpha", "Rows", "Row two Manage"),
+            _placed_link(2, "Manage", "/rows/beta", "Other rows", "Row three Manage"),
+        ],
+        [
+            "ref=1 a 'Manage' to='/rows/alpha'",
+            "ref=2 a 'Manage' to='/rows/alpha'",
+            "ref=3 a 'Manage' to='/rows/beta'",
+        ],
+        0,
+        id="identical_pair_plus_a_third",
+    ),
+    pytest.param(
+        [
+            _placed_link(0, "Open planner", *_KESTREL),
+            _placed_link(1, "Read the guide", "/docs/handbook", "Education plans", "Education plans Read the guide"),
+        ],
+        ["ref=1 a 'Open planner' to='/tools/launch-kestrel'", "ref=2 a 'Read the guide' to='/docs/handbook'"],
+        0,
+        id="unique_names",
+    ),
+    pytest.param(
+        [
+            {**_placed_link(0, "Name", "", "Work"), "tag": "input", "type": "text", "value": "Ann"},
+            {**_placed_link(1, "Name", "", "School"), "tag": "input", "type": "text", "value": "Bo"},
+        ],
+        ["ref=1 input/text 'Name' value='Ann'", "ref=2 input/text 'Name' value='Bo'"],
+        0,
+        id="same_label_different_value",
+    ),
+    pytest.param(
+        [
+            {
+                **_placed_link(i, "Share", f"/social/{n}", "Contact"),
+                "icon": True,
+                "placement": [["nth", f"{i + 1} of 2"]],
+            }
+            for i, n in enumerate(("one", "two"))
+        ],
+        ["ref=1 a 'Share' to='/social/one' nth=1 of 2", "ref=2 a 'Share' to='/social/two' nth=2 of 2"],
+        0,
+        id="icons_main_already_numbers",
+    ),
+    pytest.param(
+        [_placed_link(0, "", *_KESTREL), _placed_link(1, "", *_PLANNER_SOFTWARE)],
+        ["ref=1 a '' to='/tools/launch-kestrel'", "ref=2 a '' to='/tools/launch-planner-software'"],
+        0,
+        id="text_less_links",
+    ),
+]
 
 
 @_skip_no_browser
@@ -8700,13 +9242,20 @@ async def test_observe_surfaces_a_same_origin_full_viewport_iframe() -> None:
             context = await browser.new_context(viewport={"width": 1024, "height": 900})
             page = await context.new_page()
 
+            # The frame's address is one the task's payload carries masked, signed in its path and its query.
+            signed = (
+                "http://sameorigin.test/files/tok-9f8e7d6c5b4a3f2e/frame"
+                "?X-Amz-Signature=3f9a1c7e5b2d8f4a6c0e9b1d3f5a7c9e"
+            )
+            refs = mask_opaque_urls({"bill": signed})
+
             async def _serve(route: Any) -> None:
-                if route.request.url.endswith("/frame"):
+                if "/frame" in route.request.url:
                     body = "<p>challenge content</p>"
                 else:
                     body = (
                         "<!doctype html><html><body>"
-                        '<iframe src="/frame" style="position:fixed;top:0;left:0;border:none" '
+                        f'<iframe src="{signed}" style="position:fixed;top:0;left:0;border:none" '
                         'width="1024" height="900"></iframe>'
                         '<iframe src="/helper" width="4" height="4"></iframe>'
                         "</body></html>"
@@ -8722,13 +9271,42 @@ async def test_observe_surfaces_a_same_origin_full_viewport_iframe() -> None:
             assert entries[0]["sameOrigin"] is True, entries[0]
             assert entries[0]["viewportPct"] >= 50, entries[0]
 
-            r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+            tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=refs)
+            r = await _tool(tools, "observe").handler({})
             line = next((ln for ln in r.content.splitlines() if ln.startswith("iframes:")), None)
             assert line is not None, r.content
             assert "[same-origin]" in line, line
             assert "% of viewport]" in line, line
+            # The frame is listed by the payload's token, never by a path that carries the signing value.
+            assert refs.mask(signed) in line, line
+            assert "tok-9f8e7d6c5b4a3f2e" not in r.content and "3f9a1c7e5b2d8f4a" not in r.content, r.content
         finally:
             await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_without_a_download_wait_frames_still_get_refs_and_no_download_tool_is_offered() -> None:
+    async def serve(route: Route) -> None:
+        if urlparse(route.request.url).path == "/statement":
+            body = "<p>Statement for May</p>"
+        else:
+            body = '<button id="go">Go</button><iframe src="/statement" width="900" height="500"></iframe>'
+        await route.fulfill(status=200, content_type="text/html", body=body)
+
+    async with _page_context(viewport={"width": 1024, "height": 900}) as context:
+        await context.route("**/*", serve)
+        page = await context.new_page()
+        await page.goto("http://statements.test/")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        line = next((ln for ln in observed.content.splitlines() if ln.startswith("iframes:")), "")
+        ref = re.search(r"ref=(\d+) \[same-origin\]", line)
+        assert ref is not None, line
+        read = await _tool(tools, "get_html").handler({"selector": f"ref={ref.group(1)}"})
+
+    assert read.status == "ok" and "/statement" in read.content, read.content
+    assert "download" not in {tool.name for tool in tools}
 
 
 @_skip_no_browser
@@ -9145,10 +9723,12 @@ async def test_observe_reports_a_captcha_iframe_packaged_inside_a_component() ->
         assert r.status == "ok"
         line = next((ln for ln in r.content.splitlines() if ln.startswith("iframes:")), None)
         # Pinned whole: asserting a substring lets the scope clause silently revert to the old
-        # "component roots not scanned", which is the false claim this change exists to retire.
+        # "component roots not scanned", which is the false claim this change exists to retire. The test host
+        # does not resolve, so Chromium shows its error page in the frame, and no document reached it to report.
         assert line == (
-            "iframes: 1 in the page and its open component roots (contents are among the elements above and "
-            "actionable by ref, same as the page's own): [captcha] challenges.antibot-vendor.test 'Sign-in widget'"
+            "iframes: 1 in the page, counting frames inside frames (contents are among the elements above and "
+            "actionable by ref, same as the page's own): ref=3 [captcha] challenges.antibot-vendor.test "
+            "'Sign-in widget', the browser shows its own error page here"
         ), line
 
 
@@ -9555,6 +10135,173 @@ async def test_a_download_saved_under_a_generated_id_is_reported_by_the_pages_na
     assert "Downloaded: dl1_receipt.txt (46 B)" in result.content, result.content
 
 
+def _request_record_lines(result: ToolResult) -> str:
+    return (result.data or {}).get(REQUEST_RECORD_DATA_KEY, "")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_click_reports_how_the_site_answered_the_request_it_sent() -> None:
+    answer = asyncio.Event()
+    async with _page_context() as context:
+        page = await context.new_page()
+
+        async def _serve(route: Route) -> None:
+            if route.request.method == "POST":
+                await answer.wait()
+                await route.fulfill(status=422 if "/apply" in route.request.url else 204)
+            else:
+                # A beacon before the submit and an autosave burst after it, more than the record holds.
+                send = "fetch('/beacon', {method: 'POST'}); fetch('/apply?id=7', {method: 'POST', body: '{}'}); "
+                send += "for (let i = 0; i < 8; i++) fetch('/autosave', {method: 'POST'});"
+                one = "fetch('/one', {method: 'POST'})"
+                await route.fulfill(
+                    content_type="text/html",
+                    body=f"<button id='go' onclick=\"{send}\">Submit</button><button id='one' onclick=\"{one}\">1</button>",
+                )
+
+        await page.route("**/*", _serve)
+        await page.goto("http://site.test/form")
+        record = RequestRecord(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observe = _tool(tools, "observe")
+        observe_handler = observe.handler
+        failing = False
+
+        async def observe_or_fail(args: dict[str, Any]) -> ToolResult:
+            result = await observe_handler(args)
+            if failing:
+                raise RuntimeError("page closed")
+            return result
+
+        observe.handler = observe_or_fail
+        apply_request_record(tools, record)
+
+        clicked = await _tool(tools, "click").handler({"selector": "#go"})
+        click = _request_record_lines(clicked)
+        await page.evaluate("void fetch('/late', {method: 'POST', body: '{}'})")
+        unanswered = _request_record_lines(await _tool(tools, "observe").handler({}))
+        # Full, so this click's one request pushes out the oldest earlier one: the beacon, not the submit.
+        second = _request_record_lines(await _tool(tools, "click").handler({"selector": "#one"}))
+        answer.set()
+        # Every later read raises: a raising call's lines reach the result the loop makes from the error.
+        failing = True
+        later = []
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            set_request_record_on_error(None)
+            with pytest.raises(RuntimeError):
+                await _tool(tools, "observe").handler({})
+            later.append(_request_record_lines(with_request_record_of(ToolResult.error("page closed"))))
+        # Every held entry was reported, so pushing them out says nothing about dropped answers.
+        again = _request_record_lines(await _tool(tools, "click").handler({"selector": "#go"}))
+        record.close()
+
+    assert "POST site.test/apply not answered" in click and "; 2 more not listed." in click, click
+    assert "sent while your click" in unanswered and "not answered" in unanswered, unanswered
+    assert "POST site.test/one not answered" in second and "more not listed" not in second, second
+    assert "dropped from the record before an answer was reported: 1." in second, second
+    assert sum("answered 422" in text for text in later) == 1, later
+    assert not later[-1], later
+    assert "id=7" not in "".join([click, unanswered, *later])
+    assert "/late" not in "".join([unanswered, *later]) and "/beacon" not in "".join(later), later
+    assert "/apply" not in clicked.content, clicked.content
+    assert "POST site.test/apply" in again and "dropped" not in again, again
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_click_whose_request_is_answered_at_once_reports_the_answer_only_on_its_own_result() -> None:
+    async with _page_context() as context:
+        page = await context.new_page()
+
+        async def _serve(route: Route) -> None:
+            if route.request.method == "POST":
+                await route.fulfill(status=422, content_type="application/json", body="{}")
+            else:
+                await route.fulfill(
+                    content_type="text/html",
+                    body="<button id='go' onclick=\"fetch('/apply', {method: 'POST', body: '{}'})\">Submit</button>",
+                )
+
+        await page.route("**/*", _serve)
+        await page.goto("http://site.test/form")
+        finished = asyncio.Event()
+        page.on("requestfinished", lambda request: finished.set() if request.method == "POST" else None)
+        record = RequestRecord(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click_spec = _tool(tools, "click")
+        click_handler = click_spec.handler
+
+        # Click returns as soon as the page takes the input, often before the answer is read; hold it until then.
+        async def click_until_answered(args: dict[str, Any]) -> ToolResult:
+            result = await click_handler(args)
+            await asyncio.wait_for(finished.wait(), 5)
+            return result
+
+        click_spec.handler = click_until_answered
+        apply_request_record(tools, record)
+        click = _request_record_lines(await _tool(tools, "click").handler({"selector": "#go"}))
+        after = _request_record_lines(await _tool(tools, "observe").handler({}))
+        record.close()
+
+    assert "POST site.test/apply answered 422" in click, click
+    assert not after, after
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_request_record_shows_no_address_once_a_sign_in_link_is_opened() -> None:
+    # Short and letters-free, so nothing that looks for token-shaped values would catch it.
+    token = "ab12cd9"
+    back = (
+        f"fetch('/verify/{token}', {{method: 'POST'}}); fetch('/api/verify/{token}', {{method: 'POST'}}); "
+        f"fetch('http://{token}.site.test/save', {{method: 'POST'}}).catch(() => 0)"
+    )
+    async with _page_context() as context:
+        page = await context.new_page()
+
+        async def _serve(route: Route) -> None:
+            if route.request.method != "POST":
+                # The form posts into a new tab.
+                await route.fulfill(
+                    content_type="text/html",
+                    body=(
+                        "<form action='/popped' method='post' target='_blank'>"
+                        "<button id='go' onclick=\"fetch('/down', {method: 'POST'}).catch(() => 0); "
+                        "fetch('/odd', {method: 'SUBMISSION_ACCEPTED'}).catch(() => 0)\">Submit</button></form>"
+                        f"<button id='back' onclick=\"{back}\">Confirm</button>"
+                    ),
+                )
+            elif route.request.url.endswith("/down"):
+                await route.abort("failed")
+            else:
+                await route.fulfill(status=422, body="{}")
+
+        # On the context, so the tab the form opens is served too.
+        await context.route("**/*", _serve)
+        await page.goto("http://site.test/form")
+        record = RequestRecord(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page))
+        apply_request_record(tools, record)
+        with skyvern_context.scoped(SkyvernContext(task_id="tsk_v3")):
+            shown = _request_record_lines(await _tool(tools, "click").handler({"selector": "#go"}))
+            for _ in range(20):
+                if "failed (" in shown:
+                    break
+                await asyncio.sleep(0.05)
+                shown += _request_record_lines(await _tool(tools, "observe").handler({}))
+            _register_link_for_redaction(f"http://site.test/verify/{token}?next=home")
+            confirmed = _request_record_lines(await _tool(tools, "click").handler({"selector": "#back"}))
+        record.close()
+
+    assert "failed (" in shown, shown
+    assert "OTHER site.test/odd" in shown and "SUBMISSION_ACCEPTED" not in shown, shown
+    assert "POST site.test/popped" in shown, shown
+    assert len(set(re.findall(r"POST request \d+ ", confirmed))) == 3 and token not in confirmed, confirmed
+    assert "site.test" not in confirmed, confirmed
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("block", ["complete_on_download", "download_timeout_only"])
 async def test_a_download_stored_only_in_the_browser_session_is_reported(
@@ -9569,15 +10316,14 @@ async def test_a_download_stored_only_in_the_browser_session_is_reported(
     async def download_wait() -> None:
         return None
 
-    # A download_timeout-only block waits on downloads but has no failure watch.
-    watch = DownloadFailureWatch(_fixed_page_provider(page)) if block == "complete_on_download" else None
+    # A download_timeout-only block waits on downloads and watches its frames, without the failure facts.
+    watch = DownloadFailureWatch(_fixed_page_provider(page), report_failures=block == "complete_on_download")
     tools = build_browser_tools(
         _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
     )
     with skyvern_context.scoped(SkyvernContext(organization_id="o_1", browser_session_id="pbs_1")):
         result = await _tool(tools, "click").handler({"selector": "#dl"})
-    if watch is not None:
-        watch.close()
+    watch.close()
 
     assert "Downloaded: statement.pdf (in the browser session's storage)" in result.content, result.content
     assert "earlier.pdf" not in result.content
@@ -9592,7 +10338,12 @@ async def test_a_session_baseline_hides_old_files_and_absence_is_claimed_only_af
         TimeoutError(),
         [earlier],
         [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"],
+        # The download call lists once before its click and once for its result.
         [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"],
+        [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"],
+        # The last download call cannot read the storage before its click, and afterwards it holds one more file.
+        TimeoutError(),
+        [earlier, "s3://bucket/o_1/pbs_1/statement.pdf", "s3://bucket/o_1/pbs_1/late.pdf"],
     ]
 
     async def listing(**_kwargs: str) -> list[str]:
@@ -9610,18 +10361,56 @@ async def test_a_session_baseline_hides_old_files_and_absence_is_claimed_only_af
     tools = build_browser_tools(
         _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
     )
+    frame = MagicMock(parent_frame=object(), url="chrome-error://chromewebdata/")
+    page.frames = [frame]  # type: ignore[attr-defined]
+    plain_click = page.click
+
+    async def click_that_opens_a_refused_frame(selector: str, timeout: int | None = None) -> None:
+        await plain_click(selector, timeout=timeout)
+        bill = _FakeRequest(method="GET", resource_type="document", url="https://app.example.test/bill")
+        bill.frame = frame  # type: ignore[attr-defined]
+        headers = {"content-type": "application/pdf", "content-length": "891"}
+        answer = SimpleNamespace(request=bill, status=200, ok=True, frame=frame, url=bill.url, headers=headers)
+        for hook, event in (("request", bill), ("response", answer), ("requestfailed", bill)):
+            watch._hooks[hook](event)
+
     with skyvern_context.scoped(SkyvernContext(organization_id="o_1", browser_session_id="pbs_1")):
         first = await _tool(tools, "click").handler({"selector": "#go"})
         second = await _tool(tools, "click").handler({"selector": "#dl"})
-        third = await _tool(tools, "click").handler({"selector": "#again"})
+        third = await _tool(tools, "download").handler({"selector": "#again"})
+        page.click = click_that_opens_a_refused_frame  # type: ignore[method-assign]
+        fourth = await _tool(tools, "download").handler({"selector": "#again"})
     watch.close()
 
     assert "earlier.pdf" not in first.content + second.content
     # The first click's listing only set the baseline, so what is missing is unknown and nothing is said.
     assert DOWNLOAD_NO_FILE_THIS_ACTION not in first.content and DOWNLOAD_NO_SESSION_FILE_YET not in first.content
     assert "Downloaded: statement.pdf (in the browser session's storage)" in second.content, second.content
-    # A session's storage can get a file after the call returns, so its absence is stated as "yet".
+    # A session's storage can get a file after the call returns, so its absence is stated as "yet", and only by download.
+    assert DOWNLOAD_NO_SESSION_FILE_YET not in first.content + second.content
     assert DOWNLOAD_NO_SESSION_FILE_YET in third.content and DOWNLOAD_NO_FILE_THIS_ACTION not in third.content
+    # With no reading from before its click, the new file could be an earlier call's: it is named, absence is not
+    # claimed, and the document the frame was refused is still stated.
+    assert "Downloaded: late.pdf (in the browser session's storage)" in fourth.content, fourth.content
+    assert "A frame received a document and did not show it: /bill (application/pdf, 891 B)." in fourth.content
+    assert DOWNLOAD_NO_SESSION_FILE_YET not in fourth.content
+
+    # A block whose first call is a download: the first read fails, the download's own read before its click works
+    # and is the baseline, so the file the click stores is named and not absorbed as one that was already there.
+    with_first = [earlier, "s3://bucket/o_1/pbs_1/first.pdf"]
+    listings[:] = [TimeoutError(), [earlier], with_first, with_first]
+    fresh = build_browser_tools(
+        _fixed_page_provider(_DownloadFakePage(tmp_path)), downloads_dir=str(tmp_path), download_wait=download_wait
+    )
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_1", browser_session_id="pbs_1")):
+        first_download = await _tool(fresh, "download").handler({"selector": "#dl"})
+        looked = await _tool(fresh, "observe").handler({})
+    assert "Downloaded: first.pdf (in the browser session's storage)" in first_download.content, first_download.content
+    assert "earlier.pdf" not in first_download.content
+    # That baseline came before every action, so the next look states the block's files.
+    assert "files downloaded in this block: 1 (first.pdf, in the browser session's storage)" in looked.content, (
+        looked.content
+    )
 
 
 @pytest.mark.asyncio
@@ -9681,133 +10470,83 @@ async def test_download_signal_surfaces_file_created_between_calls(tmp_path: Pat
     r2 = await _tool(tools, "get_html").handler({})
     assert "Downloaded: invoice.csv" in r2.content
 
+    # A file that landed before a download call is reported by it and is neither the file its wait is for nor its
+    # answer: the call still says it got none, and still names a document a frame received and did not show.
+    frame = MagicMock(parent_frame=object(), url="chrome-error://chromewebdata/")
+    page.frames = [frame]  # type: ignore[attr-defined]
+    watch = DownloadFailureWatch(_fixed_page_provider(page), report_failures=False)
+    frame_is_refused = [False, True]
+    arrived_answers: list[bool] = []
 
-class _BlockedInlineFramePage(_DownloadFakePage):
-    """A click that renders the target inline in an <iframe> the browser refuses to display: no
-    download event fires and no file lands, while the element keeps the src it was refused."""
-
-    def __init__(self, downloads_dir: Path) -> None:
-        super().__init__(downloads_dir)
-        self.iframe_srcs: list[str] = []
-        self.click_opens: str | None = None
-        self.clicked = False
-
-    async def click(self, selector: str, timeout: int | None = None) -> None:
-        self.clicked = True
-        if self.click_opens:
-            self.iframe_srcs = [self.click_opens]
-        await super().click(selector, timeout=timeout)
-
-    # The iframe enumeration arrives through SkyvernFrame.evaluate, which passes its expression by
-    # keyword; observe and the text delta call page.evaluate(js) positionally.
-    async def evaluate(self, expression: str = "", arg: Any = None) -> Any:
-        if "querySelectorAll('iframe')" in expression:
-            return list(self.iframe_srcs)
-        return await super().evaluate(expression)
-
-
-_BLOCKED_BILL_SRC = "https://portal.test/api/ViewBill?token=abc"
-
-
-@pytest.mark.asyncio
-async def test_a_bill_the_browser_refuses_to_frame_is_recovered_as_this_calls_download(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # v1 recovers these bytes same-origin (SKY-12559); on a download block v3 must too, or the model
-    # is told no file arrived for a click that did reach the right document (SKY-19922).
-    page = _BlockedInlineFramePage(tmp_path)
-    page.click_opens = _BLOCKED_BILL_SRC
-    pdf = b"%PDF-1.7 statement bytes"
-    monkeypatch.setattr("skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes", AsyncMock(return_value=pdf))
+    async def download_until(arrived: Callable[[], Awaitable[bool]]) -> None:
+        if frame_is_refused.pop(0):
+            bill = _FakeRequest(method="GET", resource_type="document", url="https://app.example.test/bill")
+            bill.frame = frame  # type: ignore[attr-defined]
+            headers = {"content-type": "application/pdf", "content-length": "891"}
+            answer = SimpleNamespace(request=bill, status=200, ok=True, frame=frame, url=bill.url, headers=headers)
+            for hook, event in (("request", bill), ("response", answer), ("requestfailed", bill)):
+                watch._hooks[hook](event)
+        arrived_answers.append(await arrived())
 
     async def download_wait() -> None:
         return None
 
-    watch = DownloadFailureWatch(_fixed_page_provider(page))
-    tools = build_browser_tools(
-        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
-    )
-    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
-    watch.close()
-
-    # Named by the same path a browser download takes: the run-unique prefix plus the frame's own basename.
-    assert re.search(r"Downloaded: [0-9a-f-]{36}-ViewBill\.pdf \(24 B\)", result.content), result.content
-    assert DOWNLOAD_NO_FILE_THIS_ACTION not in result.content
-    assert [path.read_bytes() for path in sorted(tmp_path.iterdir())] == [pdf]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("why_not", ["frame_was_already_there", "page_was_replaced", "not_a_download_block"])
-async def test_a_pdf_frame_this_call_did_not_open_is_not_recovered(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, why_not: str
-) -> None:
-    page = _BlockedInlineFramePage(tmp_path)
-    if why_not == "frame_was_already_there":
-        # A viewer left by an earlier click is not this click's file: attribution comes from the
-        # pre-call snapshot, so recovering it would mean saving an unrelated document.
-        page.iframe_srcs = [_BLOCKED_BILL_SRC]
-    else:
-        page.click_opens = _BLOCKED_BILL_SRC
-    monkeypatch.setattr(
-        "skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes",
-        AsyncMock(return_value=b"%PDF-1.7 statement bytes"),
-    )
-
-    async def download_wait() -> None:
-        return None
-
-    replacement: _BlockedInlineFramePage | None = None
-    if why_not == "page_was_replaced":
-        # The click opened a tab that took the working-page slot, so the baseline describes a
-        # document this call no longer holds and nothing readable now is attributable to it.
-        replacement = _BlockedInlineFramePage(tmp_path)
-        replacement.iframe_srcs = [_BLOCKED_BILL_SRC]
-
-    async def page_provider() -> Any:
-        return replacement if replacement is not None and page.clicked else page
-
-    watch = DownloadFailureWatch(page_provider)
-    tools = build_browser_tools(
-        page_provider,
+    waiting = build_browser_tools(
+        _fixed_page_provider(page),
         downloads_dir=str(tmp_path),
         download_failures=watch,
-        # A block the engine built no download machinery for pays none of this and recovers nothing.
-        download_wait=download_wait if why_not != "not_a_download_block" else None,
+        download_wait=download_wait,
+        download_until=download_until,
     )
-    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
+    await _prime(waiting)
+    (tmp_path / "guide.pdf").write_bytes(b"guide")
+    r3 = await _tool(waiting, "download").handler({"selector": "#export"})
+    (tmp_path / "faq.pdf").write_bytes(b"faq")
+    r4 = await _tool(waiting, "download").handler({"selector": "#export"})
     watch.close()
 
-    assert "Downloaded:" not in result.content, result.content
-    assert DOWNLOAD_NO_FILE_THIS_ACTION in result.content
-    assert list(tmp_path.iterdir()) == []
+    assert arrived_answers == [False, True]
+    assert "Downloaded: guide.pdf" in r3.content and DOWNLOAD_NO_FILE_THIS_ACTION in r3.content, r3.content
+    assert "Downloaded: faq.pdf" in r4.content and DOWNLOAD_NO_FILE_THIS_ACTION in r4.content, r4.content
+    assert "A frame received a document and did not show it: /bill (application/pdf, 891 B)." in r4.content
+
+
+class _LateDownloadPage(_DownloadFakePage):
+    """A download control whose click starts its file from a timer, after the click call has returned."""
+
+    def __init__(self, downloads_dir: Path, name: str, delay: float) -> None:
+        super().__init__(downloads_dir)
+        self._late = (name, delay)
+
+    async def click(self, selector: str, timeout: int | None = None) -> None:
+        await super().click(selector, timeout=timeout)
+        name, delay = self._late
+        asyncio.get_running_loop().call_later(delay, (self._downloads_dir / name).write_bytes, b"x" * 500)
 
 
 @pytest.mark.asyncio
-async def test_a_click_that_landed_its_file_does_not_also_recover_the_frame_it_opened(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A site that both downloads the bill and shows it in a viewer would otherwise record the same
-    # invoice twice, and the block would report two files for one statement.
-    page = _BlockedInlineFramePage(tmp_path)
-    page.click_opens = _BLOCKED_BILL_SRC
-    page._click_writes = "statement.pdf"
-    monkeypatch.setattr(
-        "skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes",
-        AsyncMock(return_value=b"%PDF-1.7 statement bytes"),
-    )
+async def test_download_stops_waiting_at_a_file_in_progress_and_lets_download_wait_finish_it(tmp_path: Path) -> None:
+    page = _DownloadFakePage(tmp_path)
+    page._click_writes = "statement.pdf.crdownload"
+    arrived_answers: list[bool] = []
+
+    async def download_until(arrived: Callable[[], Awaitable[bool]]) -> None:
+        arrived_answers.append(await arrived())
 
     async def download_wait() -> None:
-        return None
+        (tmp_path / "statement.pdf.crdownload").rename(tmp_path / "statement.pdf")
 
-    watch = DownloadFailureWatch(_fixed_page_provider(page))
     tools = build_browser_tools(
-        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
+        _fixed_page_provider(page),
+        downloads_dir=str(tmp_path),
+        download_wait=download_wait,
+        download_until=download_until,
     )
-    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
-    watch.close()
+    result = await _tool(tools, "download").handler({"selector": "#dl"})
 
-    assert "Downloaded: statement.pdf" in result.content, result.content
-    assert [path.name for path in tmp_path.iterdir()] == ["statement.pdf"]
+    # A download the browser has started counts as arrived, so the wait ends there and the file is finished after it.
+    assert arrived_answers == [True]
+    assert "Downloaded: statement.pdf (500 B)" in result.content, result.content
 
 
 @pytest.mark.asyncio
@@ -9841,6 +10580,20 @@ async def test_download_signal_lifecycle_started_then_completed_or_never(tmp_pat
     (tmp_path / ("export." + "f" * 32 + ".crdownload")).write_bytes(b"partial")
     r6 = await _tool(tools, "wait").handler({"time_ms": 1})
     assert "Download started: export (in progress — not yet complete)" in r6.content
+
+    # The browser saves a download with no extension and adds one a moment later: still one download.
+    (tmp_path / "53b6cbff").write_bytes(b"pdf")
+    r7 = await _tool(tools, "wait").handler({"time_ms": 1})
+    assert "Downloaded: 53b6cbff" in r7.content
+    (tmp_path / "53b6cbff").rename(tmp_path / "53b6cbff.pdf")
+    r8 = await _tool(tools, "wait").handler({"time_ms": 1})
+    assert "Downloaded:" not in r8.content
+    # Two files that share a stem and both exist are two downloads.
+    (tmp_path / "ledger").write_bytes(b"a")
+    await _tool(tools, "wait").handler({"time_ms": 1})
+    (tmp_path / "ledger.csv").write_bytes(b"b")
+    r9 = await _tool(tools, "wait").handler({"time_ms": 1})
+    assert "Downloaded: ledger.csv" in r9.content
 
 
 @pytest.mark.asyncio
@@ -10068,7 +10821,7 @@ async def test_a_download_action_whose_request_fails_late_reports_the_status(tmp
 
     tail = _failure_tail(result)
     assert "Request failed: POST /api/export returned HTTP 503" in tail, result.content
-    assert tail.endswith(DOWNLOAD_NO_FILE_THIS_ACTION), tail
+    assert DOWNLOAD_NO_FILE_THIS_ACTION not in tail, tail
     assert not (result.data or {}).get("download_notice") and not (result.data or {}).get("download_new")
 
 
@@ -10239,6 +10992,55 @@ async def test_the_failure_watch_waits_only_on_its_own_call_and_reports_only_the
         on["requestfinished"](poll)
         reports.append(await watch.settle(await watch.begin(), wait=True))
     assert reports == [["Request failed: GET /api/poll returned HTTP 503"], []]
+
+    # What a frame received and did not show follows the navigation it came from.
+    frame = MagicMock(parent_frame=object(), url="chrome-error://chromewebdata/")
+    bill = "https://app.example.test/bill"
+
+    def load(url: str) -> _FakeRequest:
+        request = _FakeRequest(method="GET", resource_type="document", url=url)
+        request.frame = frame  # type: ignore[attr-defined]
+        return request
+
+    def answered(request: _FakeRequest) -> _FakeRequest:
+        headers = {"content-type": "application/pdf", "content-length": "891"}
+        on["request"](request)
+        on["response"](
+            SimpleNamespace(request=request, status=200, ok=True, frame=frame, url=request.url, headers=headers)
+        )
+        return request
+
+    # An earlier browser download of the same address does not hide a document a frame is refused later.
+    watch._on_download(SimpleNamespace(url=bill))
+    on["requestfailed"](answered(load(bill)))
+    assert watch.frame_document(frame) == (bill, "application/pdf", 891)
+    # A load the browser saves as a download is not a document left unshown, whichever event comes first.
+    for download_first in (True, False):
+        saved_load = answered(load(bill))
+        if download_first:
+            watch._on_download(SimpleNamespace(url=bill))
+        on["requestfailed"](saved_load)
+        if not download_first:
+            watch._on_download(SimpleNamespace(url=bill))
+        assert watch.frame_document(frame) is None
+    # A load given up for the frame's next navigation is not one either.
+    superseded = answered(load(bill))
+    on["request"](load("https://app.example.test/next"))
+    on["requestfailed"](superseded)
+    assert watch.frame_document(frame) is None
+    watch.close()
+
+    # A block that only waits on downloads keeps the frame documents and none of the failure facts.
+    quiet = DownloadFailureWatch(_fixed_page_provider(_FakePage()), report_failures=False)
+    on = quiet._hooks
+    call = await quiet.begin()
+    failed = _FakeRequest(resource_type="fetch", url="https://app.example.test/api/export")
+    on["request"](failed)
+    on["response"](SimpleNamespace(request=failed, status=503))
+    on["requestfailed"](answered(load(bill)))
+    assert await quiet.settle(call, wait=True) == []
+    assert quiet.frame_document(frame) == (bill, "application/pdf", 891)
+    quiet.close()
 
 
 @pytest.mark.asyncio
@@ -12929,6 +13731,7 @@ async def test_a_submit_whose_response_outlasts_the_click_wait_reports_the_lande
         r = await _click_submit_on_a_slow_form(page, monkeypatch)
         assert (r.status, r.error_class) == ("ok", None), r.content
         assert "the page navigated" in r.content and "re-observe" not in r.content
+        assert re.match(r"clicked input/submit 'Send application' \(ref=\d+\) — now at ", r.content), r.content
         reported = taskv3_goal_check._REPORTED_URL_RES["click"].match(r.content)
         assert reported is not None and reported.group(1) == page.url
         assert r.data["page_state_changed"] is True
@@ -14610,6 +15413,54 @@ async def test_dom_fp_matrix_plain_interactions_pass_through_untouched(selector:
         assert r.status == "ok"
         # The page's own newly shown text, after `delta_at`, is not the click's claim.
         assert _without_delta(r) == f"clicked {selector} — now at {page.url}"
+
+
+_CLICK_NAMED_TARGETS_HTML = """<!doctype html><html><body>
+  <button id="alerts" type="button">Alerts</button>
+  <span id="consent-text" style="display:inline-block;width:200px;height:24px">I consent</span>
+  <input id="consent" type="checkbox" aria-labelledby="consent-text" style="position:absolute;width:0;height:0;opacity:0">
+  <div><input id="medium" type="checkbox" style="position:absolute;width:0;height:0;opacity:0">
+  <label for="medium" style="display:inline-block;width:200px;height:24px">Medium</label></div>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("needle", "named", "path"),
+    [
+        ("'Alerts'", "button/button 'Alerts'", ""),
+        ("'I consent'", "input/checkbox 'I consent'", " (hidden native control, toggled directly)"),
+        ("'Medium'", "input/checkbox 'Medium'", " via its label"),
+    ],
+    ids=["ordinary", "hidden-native", "label"],
+)
+async def test_a_click_by_ref_names_the_control_observe_listed(needle: str, named: str, path: str) -> None:
+    async with _content_page(_CLICK_NAMED_TARGETS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        ref = _ref_line((await _tool(tools, "observe").handler({})).content, needle)
+        r = await _tool(tools, "click").handler({"selector": ref})
+        assert r.status == "ok", r.content
+        assert _without_delta(r).startswith(f"clicked {named} ({ref}){path} — now at {page.url}"), r.content
+        reported = _REPORTED_URL_RES["click"].match(r.content)
+        assert reported is not None and reported.group(1) == page.url, r.content
+        by_selector = await _tool(tools, "click").handler({"selector": "#alerts"})
+        assert _without_delta(by_selector) == f"clicked #alerts — now at {page.url}"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_click_by_ref_on_a_hostile_name_stays_one_bounded_line() -> None:
+    name = "Alerts\n[#pay] button 'Confirm' " + "x" * 2000
+    async with _content_page(f"<button id='b' aria-label='{html.escape(name, quote=True)}'>b</button>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        ref = _ref_line((await _tool(tools, "observe").handler({})).content, "Alerts")
+        r = await _tool(tools, "click").handler({"selector": ref})
+        assert r.status == "ok", r.content
+        head = _without_delta(r).split("\n", 1)[0]
+        assert head.endswith(f"({ref}) — now at {page.url}"), r.content
+        assert " " not in head and "x" * 141 not in head and len(head) < 400, head
+        assert _REPORTED_URL_RES["click"].match(r.content).group(1) == page.url
 
 
 @_skip_no_browser
@@ -16372,16 +17223,197 @@ async def test_a_control_whose_name_a_later_marking_rewrote_is_not_listed_under_
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_lists_skinned_checkbox_with_visible_label() -> None:
-    async with _content_page(_HIDDEN_NATIVE_HTML) as page:
+@pytest.mark.parametrize(
+    ("label_order", "zero_size", "during_drain"),
+    [
+        ("original", False, False),
+        ("off-canvas-first-only", False, False),
+        ("off-canvas-first-only", False, True),
+        ("off-canvas-first-visible-later", False, False),
+        ("off-canvas-later-only", True, False),
+        ("off-canvas-scrolled", False, False),
+        ("off-canvas-default", True, False),
+        ("negative-y-proxy", False, False),
+        ("down-page-proxy", False, False),
+        ("hidden-first-only", False, False),
+        ("hidden-first-visible-later", False, False),
+        ("later-label-drain", True, True),
+        ("later-label-drain", True, False),
+        ("opaque-hidden-later", True, False),
+        ("hidden-later", False, False),
+        ("hidden-later", True, True),
+        ("first-proxy-default", True, False),
+        ("faded-first", False, False),
+        ("visible-first", False, False),
+        ("faded-first", True, False),
+        ("visible-first", True, False),
+        ("zero-first", True, False),
+        ("all-hidden", False, False),
+        ("all-hidden", True, False),
+        ("no-label", True, False),
+        ("faded-first", False, True),
+        ("visible-first", False, True),
+        ("faded-first", True, True),
+        ("visible-first", True, True),
+    ],
+)
+async def test_observe_lists_skinned_checkbox_with_visible_label(
+    label_order: str, zero_size: bool, during_drain: bool
+) -> None:
+    if label_order == "original":
+        async with _content_page(_HIDDEN_NATIVE_HTML) as page:
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "observe").handler({})
+            assert r.status == "ok"
+            assert _ref_line(r.content, "I agree")
+            assert "hidden-native" in r.content
+            # #nolabel carries no readable name: only the three skinned controls are listed.
+            assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "3"
+        return
+    native_style = "position:absolute;width:0;height:0;padding:0;border:0" if zero_size else ""
+    faded = '<label for="skinbox" style="display:inline-block;width:160px;height:24px">First label</label>'
+    visible = '<label for="skinbox" id="visible" style="display:block;width:160px;height:24px">Visible choice</label>'
+    external_first = ""
+    if label_order in ("hidden-first-only", "hidden-first-visible-later"):
+        external_first = (
+            '<label for="skinbox" id="hidden-first" style="visibility:hidden;display:block;width:160px;height:24px">'
+            "First label</label>"
+        )
+        faded = ""
+        if label_order == "hidden-first-only":
+            visible = ""
+    proxy_style = {
+        "off-canvas-first-only": "position:absolute;left:-9999px",
+        "off-canvas-first-visible-later": "position:absolute;left:-9999px",
+        "off-canvas-later-only": "position:absolute;left:-9999px",
+        "off-canvas-scrolled": "",
+        "off-canvas-default": "position:absolute;left:-9999px",
+        "negative-y-proxy": "position:absolute;left:24px;top:-9999px",
+        "down-page-proxy": "position:absolute;left:24px;top:9999px",
+    }.get(label_order)
+    if proxy_style is not None:
+        proxy = (
+            f'<label for="skinbox" id="positioned-proxy" style="display:block;width:160px;height:24px;{proxy_style}">'
+            "Positioned choice</label>"
+        )
+        if label_order == "off-canvas-scrolled":
+            proxy = (
+                '<div id="proxy-scroll" style="width:200px;overflow-x:auto">'
+                f'<div style="width:3000px">{proxy}</div></div>'
+            )
+        if label_order == "off-canvas-later-only":
+            visible = proxy
+        else:
+            external_first = proxy
+            faded = ""
+            if label_order != "off-canvas-first-visible-later":
+                visible = ""
+    if label_order in ("zero-first", "opaque-hidden-later", "later-label-drain", "off-canvas-later-only"):
+        faded = '<label for="skinbox" style="display:none">First label</label>'
+    if label_order in ("all-hidden", "opaque-hidden-later"):
+        visible = f'<div style="opacity:0">{visible}</div>'
+    if label_order == "hidden-later":
+        visible = f'<div style="visibility:hidden">{visible}</div>'
+    if label_order == "first-proxy-default":
+        faded = f'<div style="opacity:0">{faded}</div>'
+        visible = ""
+    if label_order == "no-label":
+        faded = visible = ""
+    if label_order == "later-label-drain":
+        visible = f'<div id="proxy-panel">{visible}</div>'
+    opaque_panel = label_order in (
+        "opaque-hidden-later",
+        "first-proxy-default",
+        "later-label-drain",
+        "off-canvas-later-only",
+        "off-canvas-default",
+    )
+    panel = (
+        f'<section id="panel" style="opacity:{1 if during_drain or opaque_panel else 0}">'
+        f'<input id="skinbox" type="checkbox" style="{native_style}">{faded}</section>'
+    )
+    ordered = visible + panel if label_order == "visible-first" else panel + visible
+    script = """<script>window.fades = 0; new MutationObserver(records => {
+      if (!window.fades && records.some(r => r.attributeName === 'data-tv3')) {
+        document.getElementById('panel').style.opacity = '0'; window.fades++;
+      }
+    }).observe(document,{subtree:true,attributes:true,attributeFilter:['data-tv3']});</script>"""
+    if label_order == "later-label-drain":
+        script = script.replace("getElementById('panel')", "getElementById('proxy-panel')")
+    html = (
+        '<!doctype html><button id="ordinary">Ordinary</button>' + external_first + ordered + "<button>Marker</button>"
+    )
+    async with _content_page(html + (script if during_drain else "")) as page:
+        if proxy_style is not None:
+            if label_order == "off-canvas-scrolled":
+                scroll_left = await page.locator("#proxy-scroll").evaluate(
+                    "el => { el.scrollLeft = 1000; return el.scrollLeft; }"
+                )
+                assert scroll_left > 0
+            label_index = 1 if label_order == "off-canvas-later-only" else 0
+            assert (
+                await page.locator("#skinbox").evaluate("(el, i) => el.labels[i].id", label_index) == "positioned-proxy"
+            )
+            box = await page.locator("#positioned-proxy").bounding_box()
+            assert box is not None and box["width"] > 0 and box["height"] > 0
+            scroll_x = await page.evaluate("window.scrollX")
+            if label_order.startswith("off-canvas"):
+                assert box["x"] + box["width"] + scroll_x < 0
+            else:
+                assert box["x"] + scroll_x >= 0
+                if label_order == "negative-y-proxy":
+                    assert box["y"] + box["height"] < 0
+                else:
+                    assert box["y"] > await page.evaluate("window.innerHeight")
+        elif external_first:
+            assert await page.locator("#skinbox").evaluate("el => Array.from(el.labels, label => label.id)") == (
+                ["hidden-first"] if label_order == "hidden-first-only" else ["hidden-first", "visible"]
+            )
+            first = page.locator("#hidden-first")
+            box = await first.bounding_box()
+            assert box is not None and box["width"] > 0 and box["height"] > 0
+            assert await first.evaluate("el => getComputedStyle(el).visibility") == "hidden"
         tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "observe").handler({})
-        assert r.status == "ok"
-        assert _ref_line(r.content, "I agree")
-        assert "hidden-native" in r.content
-        # #nolabel carries no readable name: the header count (not a selector substring, since none
-        # is printed anymore) is what proves it was dropped.
-        assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "3"
+        observations = []
+        for _ in range(2):
+            r = await _tool(tools, "observe").handler({})
+            assert r.status == "ok", r.content
+            assert _ref_line(r.content, "Ordinary")
+            assert await page.locator("#panel").evaluate("el => getComputedStyle(el).opacity") == (
+                "1" if opaque_panel else "0"
+            )
+            if label_order in ("opaque-hidden-later", "hidden-later"):
+                box = await page.locator("#visible").bounding_box()
+                assert box is not None and box["width"] > 0 and box["height"] > 0
+            if label_order == "hidden-later":
+                assert await page.locator("#visible").evaluate("el => getComputedStyle(el).visibility") == "hidden"
+            if during_drain:
+                assert await page.evaluate("window.fades") == 1
+                assert await page.locator("button[data-tv3]").count() == 1
+            kept = [line for line in _lines(r.content) if "input/checkbox" in line]
+            if label_order == "later-label-drain":
+                assert await page.locator("#proxy-panel").evaluate("el => getComputedStyle(el).opacity") == (
+                    "0" if during_drain else "1"
+                )
+                observations.append(r.content)
+                continue
+            assert bool(kept) is (
+                label_order
+                not in (
+                    "all-hidden",
+                    "no-label",
+                    "opaque-hidden-later",
+                    "hidden-later",
+                    "hidden-first-only",
+                    "off-canvas-first-only",
+                    "off-canvas-later-only",
+                )
+            ), r.content
+            if kept and zero_size:
+                assert "hidden-native: styled proxy" in kept[0]
+
+        if label_order == "later-label-drain":
+            assert ["input/checkbox" in content for content in observations] == [not during_drain] * 2, observations
 
 
 @_skip_no_browser
@@ -18026,20 +19058,15 @@ async def test_a_group_declared_on_a_shadow_host_still_bounds_the_repair() -> No
         assert held == ""
 
 
-# The page's own write, resolving ASYNCHRONOUSLY. The capture sits after the focus click so that a
-# focus-driven write is already in the snapshot -- but one that resolves on a timer lands after it, in
-# the window the suggestion poll holds open, and target equality cannot tell it from our keystrokes.
 _ASYNC_PAGE_WRITE_HTML = (
     _SEGMENTED_DATE_HTML
     + """
 <script>
   const _y = document.getElementById("year");
   _y.addEventListener("keydown", (e) => e.preventDefault());
-  _y.addEventListener(
-    "focus",
-    () => { setTimeout(() => { document.getElementById("month").value = "PAGE"; }, 250); },
-    { once: true }
-  );
+  window.__yearKeyups = [];
+  _y.addEventListener("keyup", (e) => window.__yearKeyups.push(e.key));
+  window.__completePageWrite = () => { document.getElementById("month").value = "PAGE"; };
 </script>
 """
 )
@@ -18048,15 +19075,54 @@ _ASYNC_PAGE_WRITE_HTML = (
 @pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_an_async_page_write_after_the_keys_is_not_collateral() -> None:
-    # The target takes nothing, so `ours` is true and the restore runs -- and the sibling holds a value
-    # the PAGE wrote a quarter-second after the keys stopped. Attribution from the target alone cannot
-    # see the difference; only the timing can, so the moved set is taken the moment the keys stop.
+async def test_an_async_page_write_after_the_keys_is_not_collateral(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Resolve the deferred write at suggestion polling, independently of collateral sampling, so
+    # moving or removing the post-key sample cannot move the write with it.
     async with _content_page(_ASYNC_PAGE_WRITE_HTML) as page:
-        tools = build_browser_tools(_fixed_page_provider(page))
-        with contextlib.suppress(Exception):
-            await _tool(tools, "type").handler({"selector": "#year", "text": "2026"})
-        assert await page.eval_on_selector("#month", "el => el.value") == "PAGE"
+        evaluate = page.evaluate
+        pending = True
+        snapshots: list[list[str | None]] = []
+        completed_keys: list[str] = []
+        sampled_keyups: list[str] = []
+        phases: list[str] = []
+
+        async def complete_on_poll(expression: str, arg: Any = None) -> Any:
+            nonlocal pending
+            if (
+                pending
+                and expression == taskv3_tools._FIND_SUGGESTION_JS
+                and isinstance(arg, dict)
+                and arg.get("field") == "#year"
+                and arg.get("value") == "2026"
+            ):
+                pending = False
+                completed_keys.append(
+                    await evaluate("() => window.__yearKeyups.filter(key => /^[0-9]$/.test(key)).join('')")
+                )
+                await evaluate("() => window.__completePageWrite()")
+                phases.append("page")
+            snapshot = await evaluate(expression, arg)
+            if expression == taskv3_tools._COLLATERAL_READBACK_JS:
+                sampled_keyups.append(
+                    await evaluate("() => window.__yearKeyups.filter(key => /^[0-9]$/.test(key)).join('')")
+                )
+                snapshots.append(snapshot)
+                phases.append("sample")
+            return snapshot
+
+        with monkeypatch.context() as evaluator_patch:
+            evaluator_patch.setattr(page, "evaluate", complete_on_poll)
+            tools = build_browser_tools(_fixed_page_provider(page))
+            result = await _tool(tools, "type").handler({"selector": "#year", "text": "2026"})
+            assert await page.eval_on_selector("#month", "el => el.value") == "PAGE"
+            assert await page.eval_on_selector("#year", "el => el.value") == ""
+            assert result.status == "error", result.content
+            assert result.error_class == "text_not_held", result.content
+            assert completed_keys == ["2026"]
+            assert sampled_keyups == ["2026"]
+            assert snapshots == [[""]]
+            assert phases == ["sample", "page"]
+        assert page.evaluate == evaluate
 
 
 # A field the page owns, OUTSIDE the declared group, rewritten while the keys are being sent. The
@@ -19755,6 +20821,491 @@ async def test_click_refuses_a_skinned_checkbox_with_no_proxy_at_all() -> None:
         assert await page.eval_on_selector("#nolabel", "el => el.checked") is False
 
 
+# Zero-size toggles behind a label, a wrapping label, or only aria-labelledby; `#refused` cancels its own toggle, `#bare`
+# has nothing naming it, `#closed` has a label only inside a collapsed section, and `#faded` sits in a faded-out panel.
+_HIDDEN_NATIVE_TOGGLES_HTML = """<!doctype html><html><body style="margin:0">
+<form style="margin:20px">
+  <label for="opt-yes" style="display:inline-block;width:160px;height:24px">Yes</label>
+  <input id="opt-yes" type="radio" name="opt" style="position:absolute;width:0;height:0;opacity:0;margin:0">
+  <label style="display:inline-block;width:160px;height:24px"><input id="opt-no" type="radio" name="opt"
+    style="position:absolute;width:0;height:0;opacity:0;margin:0">No</label>
+  <label for="terms" style="display:inline-block;width:160px;height:24px">I accept the terms</label>
+  <input id="terms" type="checkbox" style="position:absolute;width:0;height:0;opacity:0;margin:0">
+  <span id="news-name" style="display:inline-block;width:160px;height:24px">Send me job alerts</span>
+  <input id="news" type="checkbox" aria-labelledby="news-name"
+    style="position:absolute;width:0;height:0;opacity:0;margin:0">
+  <label for="refused" style="display:inline-block;width:160px;height:24px">Locked option</label>
+  <input id="refused" type="checkbox" onclick="event.preventDefault()"
+    style="position:absolute;width:0;height:0;opacity:0;margin:0">
+  <input id="bare" type="checkbox" style="position:absolute;width:0;height:0;opacity:0;margin:0">
+  <div style="height:0;overflow:hidden">
+    <label for="closed" style="display:inline-block;width:160px;height:24px">More options</label>
+    <input id="closed" type="checkbox" style="position:absolute;width:0;height:0;opacity:0;margin:0">
+  </div>
+  <label for="faded" style="display:inline-block;width:160px;height:24px">Email me</label>
+  <div style="opacity:0.01"><input id="faded" type="checkbox"
+    style="position:absolute;width:0;height:0;opacity:0;margin:0"></div>
+</form>
+<script>window.changes = []; document.addEventListener('change', (e) => window.changes.push(e.target.id));
+window.labelClicks = [];
+document.querySelectorAll('label[for]').forEach((l) => l.addEventListener('click', () => window.labelClicks.push(l.htmlFor)));
+</script>
+</body></html>"""
+
+
+@contextlib.asynccontextmanager
+async def _form_in(realm: str, form_html: str) -> AsyncIterator[tuple[Page, Frame]]:
+    """The form in the page itself, in a same-origin child frame, or in a cross-origin child frame that
+    site isolation puts out of process, which is the frame no isolated world is created for."""
+    cross_origin = realm == "cross_origin_frame"
+    async with _page_context(
+        ["--site-per-process"] if cross_origin else None, viewport={"width": 1024, "height": 900}
+    ) as ctx:
+        page = await ctx.new_page()
+        if realm in ("page", "page_without_isolation"):
+            await page.set_content(form_html)
+            yield page, page.main_frame
+            return
+        if cross_origin:
+            src = 'src="https://forms.example/apply"'
+        else:
+            src = "srcdoc='" + form_html.replace("'", "&apos;") + "'"
+        shell = (
+            f'<!doctype html><html><body style="margin:0"><iframe {src} '
+            'style="width:900px;height:600px;border:0"></iframe></body></html>'
+        )
+        bodies = {"careers.example": shell, "forms.example": form_html}
+
+        async def _fulfill(route: Route) -> None:
+            await route.fulfill(content_type="text/html", body=bodies[urlparse(route.request.url).hostname or ""])
+
+        # Served from a real site rather than set_content: an about:blank shell's process is not locked to
+        # a site, and the browser then keeps the cross-origin child in it.
+        await page.route(re.compile(r"https://(careers|forms)\.example/.*"), _fulfill)
+        await page.goto("https://careers.example/apply")
+        await page.frame_locator("iframe").locator("input").first.wait_for(state="attached")
+        frame = next(f for f in page.frames if f.parent_frame is page.main_frame)
+        if cross_origin:
+            # The probe can fire only if this frame really is the one prod probes from the page's own realm.
+            assert await taskv3_tools._evaluate_isolated(frame, "() => 1", "") is None
+        yield page, frame
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("realm", ["page", "page_without_isolation", "same_origin_frame", "cross_origin_frame"])
+async def test_click_acts_on_every_hidden_native_toggle_observe_says_it_acts_on(
+    realm: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if realm == "page_without_isolation":
+        monkeypatch.setattr(taskv3_tools, "_evaluate_isolated", _no_isolated_world)
+    async with _form_in(realm, _HIDDEN_NATIVE_TOGGLES_HTML) as (page, doc):
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = (await _tool(tools, "observe").handler({})).content
+        promise = "[hidden-native: styled proxy; click acts on it directly]"
+        promised = {
+            sel: next(line for line in observed.splitlines() if f"'{caption}'" in line)
+            for sel, caption in (
+                ("#opt-yes", "Yes"),
+                ("#opt-no", "No"),
+                ("#terms", "I accept the terms"),
+                ("#news", "Send me job alerts"),
+                ("#refused", "Locked option"),
+                ("#closed", "More options"),
+                ("#faded", "Email me"),
+            )
+        }
+        assert promised["#news"].endswith("[hidden-native: styled proxy]"), promised["#news"]
+        assert promised["#faded"].endswith("[hidden-native: styled proxy]"), promised["#faded"]
+        assert [sel for sel, line in promised.items() if promise in line] == [
+            "#opt-yes",
+            "#opt-no",
+            "#terms",
+            "#refused",
+            "#closed",
+        ], observed
+        click = _tool(tools, "click").handler
+        results = {
+            sel: await click({"selector": sel})
+            for sel in ("#opt-yes", "#opt-no", "#terms", "#news", "#refused", "#bare", "#closed", "#faded")
+        }
+        states = await doc.evaluate(
+            "() => ['opt-yes', 'opt-no', 'terms', 'news', 'refused', 'bare', 'closed', 'faded']"
+            ".map((id) => document.getElementById(id).checked)"
+        )
+        changes = await doc.evaluate("() => window.changes")
+        label_clicks = await doc.evaluate("() => window.labelClicks")
+    # `#news` has no label, so only a realm the page cannot patch toggles it by script.
+    scripted = realm in ("page", "same_origin_frame")
+    for sel in ("#opt-yes", "#opt-no", "#terms"):
+        assert results[sel].status == "ok" and "via its label" in results[sel].content, (sel, results[sel].content)
+    if scripted:
+        assert results["#news"].status == "ok" and "toggled directly" in results["#news"].content
+    else:
+        assert results["#news"].error_class == "unreachable", results["#news"].content
+        assert "no <label> that can be clicked away" in results["#news"].content
+    assert states == [False, True, True, scripted, False, False, False, False]
+    assert changes == ["opt-yes", "opt-no", "terms"] + (["news"] if scripted else [])
+    assert label_clicks == ["opt-yes", "terms", "refused"]
+    assert "clicked through its label and still reads checked=False" in results["#refused"].content
+    assert results["#bare"].error_class == "unreachable", results["#bare"].content
+    assert "no <label> or element naming it is drawn" in results["#bare"].content
+    assert results["#faded"].error_class == "unreachable", results["#faded"].content
+    for sel, line in promised.items():
+        if promise in line:
+            assert results[sel].error_class != "unreachable", (sel, results[sel].content)
+
+
+# What the parent page does to the frame: draw a wall over it, or park it where no pointer reaches.
+_PARENT_HIDES_THE_FRAME_JS = {
+    "wall": "document.body.insertAdjacentHTML('beforeend', '<div style=\"position:fixed;inset:0;z-index:9;"
+    "background:#fff\">Cookie settings</div>')",
+    "offscreen": "document.querySelector('iframe').style.cssText = "
+    "'position:fixed;left:-5000px;top:0;width:900px;height:600px;border:0'",
+}
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("realm", ["same_origin_frame", "cross_origin_frame"])
+@pytest.mark.parametrize(("parent", "error_class"), [("wall", "covered"), ("offscreen", "unreachable")])
+async def test_a_hidden_toggle_in_a_frame_stays_refused_where_the_parent_page_hides_its_stand_in(
+    realm: str, parent: str, error_class: str
+) -> None:
+    # The probe hit-tests inside the frame and cannot see the parent page; a person could not reach the label.
+    # Production timeouts: the refusal must not wait out the full action timeout.
+    async with _form_in(realm, _HIDDEN_NATIVE_TOGGLES_HTML) as (page, doc):
+        await page.evaluate(_PARENT_HIDES_THE_FRAME_JS[parent])
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler
+        taskv3_loop._COVERED_LAYER.set(None)
+        started = time.monotonic()
+        r = await click({"selector": "#terms"})
+        assert time.monotonic() - started < 4
+        assert r.status == "error" and r.error_class == error_class, r.content
+        assert await doc.eval_on_selector("#terms", "el => el.checked") is False
+        assert await doc.evaluate("() => window.labelClicks") == []
+    if error_class == "covered":
+        assert "another element is drawn over its label" in r.content, r.content
+        assert taskv3_loop._COVERED_LAYER.get() == {"branch": "unnamed", "controls": 0, "layer_kind": "unnamed"}
+    else:
+        assert "its label" in r.content and "after 3 s" in r.content, r.content
+
+
+# The page's own scripts claim the first label is the checkbox's; only the label the DOM names may be clicked.
+_FORGED_LABEL_FOR_A_HIDDEN_CHECKBOX_HTML = """<!doctype html><html><body style="margin:0">
+  <label id="decoy" style="display:inline-block;width:200px;height:24px">Delete account</label>
+  <label for="keep" style="display:inline-block;width:200px;height:24px">Keep me signed in</label>
+  <input id="keep" type="checkbox" style="position:absolute;width:0;height:0;opacity:0;margin:0">
+<script>
+  document.getElementById('decoy').addEventListener('click', () => { window.decoyFired = true; });
+  const _ga = Element.prototype.getAttribute;
+  Element.prototype.getAttribute = function (n) { return n === 'for' ? 'keep' : _ga.call(this, n); };
+</script>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("realm", ["page_without_isolation", "cross_origin_frame"])
+async def test_a_page_realm_probe_never_aims_at_a_label_the_page_could_have_forged(
+    realm: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if realm == "page_without_isolation":
+        monkeypatch.setattr(taskv3_tools, "_evaluate_isolated", _no_isolated_world)
+    async with _form_in(realm, _FORGED_LABEL_FOR_A_HIDDEN_CHECKBOX_HTML) as (page, doc):
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#keep"})
+        assert r.status == "ok" and "via its label" in r.content, r.content
+        assert await doc.evaluate("() => window.decoyFired === true") is False
+        assert await doc.eval_on_selector("#keep", "el => el.checked") is True
+
+
+# Zero-size radios whose labels hold more than a caption, or that have none, plus a transparent radio stretched over
+# its card; `data-set` on a label means its click handler sets the answer, on an input its change event does.
+_ZERO = 'type="radio" style="position:absolute;width:0;height:0;opacity:0;margin:0"'
+_LABELS_THAT_HOLD_MORE_HTML = f"""<!doctype html><html><body style="margin:0;font:16px sans-serif">
+<div style="margin:10px"><input id="lil-1" name="lil" {_ZERO}><label for="lil-1" data-set="lil" data-v="Premium"
+  style="display:inline-block;padding-left:30px">Premium plan, billed monthly <a href="#t">terms</a></label></div>
+<div style="margin:10px"><label style="display:inline-block;padding-left:30px"><input id="liw-1" name="liw"
+  data-set="liw" data-v="Premium" {_ZERO}>Premium plan, billed monthly <a href="#t">terms</a></label></div>
+<div style="margin:10px"><input id="two-1" name="two" {_ZERO}><label for="two-1" data-set="two" data-v="Premium"
+  >Premium</label> <label for="two-1" data-set="two" data-v="Premium caption">(billed monthly)</label></div>
+<div style="margin:10px"><input id="lal-1" name="lal" data-set="lal" data-v="Premium" {_ZERO}><label
+  for="lal-1"><a href="#t">Premium</a></label></div>
+<div style="margin:10px;position:relative;width:200px;height:24px"><input id="ovr-1" name="ovr" data-set="ovr"
+  data-v="Premium" aria-labelledby="ovr-name" {_ZERO}><span id="ovr-name">Premium</span>
+  <div class="hit" data-for="ovr-1" style="position:absolute;inset:0"></div></div>
+<div style="margin:10px"><span id="dup-host"></span><input id="dup" name="dup-light" {_ZERO}><label for="dup"
+  data-set="dup" data-v="Light">Light</label></div>
+<div style="margin:10px"><label data-v="Custom"><x-mark>*</x-mark><input id="ce-1" name="ce" data-set="ce"
+  data-v="Custom" {_ZERO}>Custom</label></div>
+<div style="margin:10px"><input id="med-1" name="med" data-set="med" data-v="Media" {_ZERO}><label for="med-1"
+  style="display:inline-block;position:relative;width:200px;height:40px"><video controls
+  style="position:absolute;left:20px;top:0;width:160px;height:40px"></video></label></div>
+<div style="margin:10px"><span id="sh-host"></span></div>
+<div style="margin:10px;position:relative;width:200px;height:24px"><label for="opc-1" data-v="Card">Premium card</label
+  ><input id="opc-1" name="opc" data-set="opc" data-v="Premium" type="radio"
+  style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0"></div>
+<script>
+  customElements.define('x-mark', class extends HTMLElement {{}});
+  const sr = document.getElementById('dup-host').attachShadow({{ mode: 'open' }});
+  sr.innerHTML = '<input id="dup" type="radio" name="dup-shadow"><label for="dup">Shadow</label>';
+  sr.querySelector('label').addEventListener('click', () => window.labelClicks.push('Shadow'));
+  const wrapped = document.getElementById('sh-host').attachShadow({{ mode: 'open' }});
+  wrapped.innerHTML = '<label style="display:inline-block;padding-left:30px"><input id="sh-1" name="sh" {_ZERO}'
+    + '>Premium, inside a component</label>';
+  wrapped.querySelector('label').addEventListener('click', () => {{
+    window.labelClicks.push('Wrapped');
+    window.state.sh = 'Premium';
+  }});
+  window.state = {{}}; window.labelClicks = []; window.linkClicks = 0;
+  document.querySelectorAll('label').forEach((l) => l.addEventListener('click', () => {{
+    window.labelClicks.push(l.dataset.v);
+    if (l.dataset.set) window.state[l.dataset.set] = l.dataset.v;
+  }}));
+  document.querySelectorAll('.hit').forEach((h) => h.addEventListener('click', () => {{
+    document.getElementById(h.dataset.for).click();
+  }}));
+  document.addEventListener('change', (e) => {{ if (e.target.dataset.set) window.state[e.target.dataset.set] = e.target.dataset.v; }});
+  document.querySelectorAll('a').forEach((a) => a.addEventListener('click', () => {{ window.linkClicks++; }}));
+</script></body></html>"""
+
+
+_VIA_LABEL = ("#lil-1", "#liw-1", "#two-1", "#dup", "#ce-1", "#sh-host #sh-1")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("realm", ["page", "same_origin_frame", "cross_origin_frame"])
+async def test_click_sets_a_hidden_radio_through_a_label_that_holds_more_than_a_caption(realm: str) -> None:
+    async with _form_in(realm, _LABELS_THAT_HOLD_MORE_HTML) as (page, doc):
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler
+        results = {sel: await click({"selector": sel}) for sel in (*_VIA_LABEL, "#lal-1", "#ovr-1", "#med-1", "#opc-1")}
+        state = await doc.evaluate("() => window.state")
+        label_clicks = await doc.evaluate("() => window.labelClicks")
+        followed = await doc.evaluate("() => [window.linkClicks, location.hash]")
+        dup = await doc.evaluate(
+            "() => [document.getElementById('dup').checked,"
+            " document.getElementById('dup-host').shadowRoot.getElementById('dup').checked]"
+        )
+    for sel in _VIA_LABEL:
+        assert results[sel].status == "ok" and "via its label" in results[sel].content, (sel, results[sel].content)
+    assert "clicked through its label and still reads checked=False" in results["#med-1"].content
+    assert results["#opc-1"].status == "ok" and "label" not in results["#opc-1"].content, results["#opc-1"].content
+    scripted = {"lal": "Premium", "ovr": "Premium"}
+    for sel in ("#lal-1", "#ovr-1"):
+        if realm == "cross_origin_frame":
+            assert results[sel].error_class == "unreachable", results[sel].content
+            assert "no <label> that can be clicked away" in results[sel].content
+        else:
+            assert results[sel].status == "ok" and "toggled directly" in results[sel].content, results[sel].content
+    assert state == {
+        "lil": "Premium",
+        "liw": "Premium",
+        "two": "Premium",
+        "dup": "Light",
+        "ce": "Custom",
+        "sh": "Premium",
+        "opc": "Premium",
+        **({} if realm == "cross_origin_frame" else scripted),
+    }
+    assert dup == [True, False]
+    assert "Premium caption" not in label_clicks and "Shadow" not in label_clicks and "Card" not in label_clicks
+    assert followed == [0, ""]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_hidden_toggle_with_no_label_is_not_scripted_when_only_the_readback_ran_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = taskv3_tools._evaluate_isolated
+
+    async def _probe_in_page_realm(target: Page | Frame, js: str, selector: str) -> Any | None:
+        return None if js == taskv3_tools._SKINNED_CHECKBOX_PROBE_JS else await real(target, js, selector)
+
+    monkeypatch.setattr(taskv3_tools, "_evaluate_isolated", _probe_in_page_realm)
+    async with _content_page(_LABELS_THAT_HOLD_MORE_HTML) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#ovr-1"})
+        assert r.error_class == "unreachable", r.content
+        assert await page.eval_on_selector("#ovr-1", "el => el.checked") is False
+
+
+# Radios whose box holds no square pixel of the viewport, each with a clear <label for>; `#plain` is ordinary.
+_AIMLESS_RADIOS_HTML = """<!doctype html><html><body style="margin:0">
+<div style="margin:20px">
+  <div style="position:relative;overflow:auto;width:300px;height:60px">
+    <input id="parked" type="radio" name="loc" style="position:absolute;left:-10000px;top:0;margin:0">
+    <label for="parked" style="display:inline-block;width:200px;height:24px">Remote</label>
+  </div>
+  <input id="tiny" type="radio" name="loc" style="width:0.5px;height:0.5px;margin:0;padding:0;border:0">
+  <label for="tiny" style="display:inline-block;width:200px;height:24px">On site</label>
+  <input id="plain" type="radio" name="loc"><label for="plain">Hybrid</label>
+</div>
+<script>window.changes = []; document.addEventListener('change', (e) => window.changes.push(e.target.id));</script>
+</body></html>"""
+
+
+# Drawn radios with no point in the viewport, or only a clipped-off centre, and nothing naming them, a hidden radio
+# whose wrapping label names a form-associated custom element that comes first in it, and a hidden checkbox whose only
+# label is visibility:hidden. `#tall` and `#edge` hang
+# off the viewport's bottom, the second inside a clip, and on the page a click takes their visible strips.
+_UNNAMED_AIMLESS_RADIOS_HTML = """<!doctype html><html><body style="margin:0">
+<div style="margin:20px">
+  <div style="position:relative;overflow:auto;width:300px;height:60px">
+    <input id="parked" type="radio" name="loc" style="position:absolute;left:-10000px;top:0;margin:0">
+  </div>
+  <input id="tiny" type="radio" name="loc" style="width:0.5px;height:0.5px;margin:0;padding:0;border:0">
+  <div style="position:relative;overflow:hidden;width:10px;height:20px"><input id="clip" type="radio" name="loc"
+    style="position:absolute;left:-20px;top:0;width:30px;height:20px;margin:0"></div>
+  <label style="display:inline-block;width:200px;height:24px"><x-field></x-field><input id="fa" type="radio"
+    name="loc" style="position:absolute;width:0;height:0;opacity:0;margin:0">Remote</label>
+  <input id="ghost" type="checkbox" style="width:0;height:0;margin:0;padding:0;border:0">
+  <label for="ghost" style="visibility:hidden;display:inline-block;width:100px;height:20px">Ghost</label>
+</div>
+<input id="tall" type="radio" name="loc" style="position:fixed;left:0;bottom:-60px;width:80px;height:80px;margin:0">
+<div style="position:fixed;left:200px;bottom:-10px;width:40px;height:20px;overflow:hidden"><input id="edge"
+  type="radio" name="loc" style="position:absolute;left:0;top:0;width:40px;height:40px;margin:0"></div>
+<script>
+  customElements.define('x-field', class extends HTMLElement { static formAssociated = true; });
+  window.changes = []; document.addEventListener('change', (e) => window.changes.push(e.target.id));
+</script>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("realm", ["page", "same_origin_frame", "cross_origin_frame"])
+async def test_click_refuses_a_radio_with_no_point_in_the_viewport_and_nothing_naming_it(realm: str) -> None:
+    async with _form_in(realm, _UNNAMED_AIMLESS_RADIOS_HTML) as (page, doc):
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler
+        for sel in ("#parked", "#tiny", "#clip", "#fa", "#ghost"):
+            started = time.monotonic()
+            r = await click({"selector": sel})
+            assert time.monotonic() - started < 4, sel
+            assert r.error_class == "unreachable", r.content
+            assert "no <label> or element naming it is drawn" in r.content
+            assert ("a container clips off" in r.content) == (sel == "#clip"), r.content
+        assert await doc.evaluate("() => window.changes") == []
+        edge = await click({"selector": "#edge"})
+        assert edge.status == "ok", edge.content
+        if realm == "page":
+            # Inside a frame the driver aims at #tall's full box centre, below the frame, and times out as on main.
+            tall = await click({"selector": "#tall"})
+            assert tall.status == "ok", tall.content
+        assert await doc.evaluate("() => window.changes") == (["edge", "tall"] if realm == "page" else ["edge"])
+
+
+# A 13x13 radio parked off screen inside its wrapping label, below the fold; a 1x0.5 checkbox in a wrapping label.
+_WRAPPED_AIMLESS_TOGGLES_HTML = (
+    '<!doctype html><html><body style="margin:0">'
+    + "".join(
+        f'<div style="height:60px"><label for="acct-{i}" style="position:relative;display:inline-block">'
+        f'<input id="acct-{i}" type="radio" name="acct" style="position:absolute;left:-9999px;width:13px;'
+        f'height:13px;margin:0">Account {i}</label></div>'
+        for i in range(31)
+    )
+    + '<label><input id="invoice" type="checkbox" style="width:1px;height:0.5px;margin:0;padding:0;border:0">'
+    '<span style="display:inline-block;width:20px;height:20px;border:2px solid #333"></span></label>'
+    "<script>window.changes = []; document.addEventListener('change', (e) => window.changes.push(e.target.id));"
+    "</script></body></html>"
+)
+
+
+# A drawn radio under its own sibling label, and a transparent checkbox under an unrelated cover whose label is
+# elsewhere: a person clicks the label in both.
+_TOGGLES_UNDER_A_COVER_HTML = """<!doctype html><html><body style="margin:0">
+<div style="position:relative;width:200px;height:40px;margin:20px">
+  <input type="radio" id="drawn" name="opt" style="position:absolute;left:0;top:0;width:200px;height:40px;margin:0">
+  <label for="drawn" style="position:absolute;left:0;top:0;width:200px;height:40px;background:#eee">Yes</label>
+</div>
+<div style="position:relative;width:24px;height:24px;margin:20px">
+  <input type="checkbox" id="veiled" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0">
+  <span style="position:absolute;inset:0;background:#fff;z-index:1"></span>
+</div>
+<label for="veiled" style="display:inline-block;width:200px;height:24px;margin:20px">Email me</label>
+<script>window.labelClicks = [];
+document.querySelectorAll('label').forEach((l) => l.addEventListener('click', () => window.labelClicks.push(l.htmlFor)));
+</script>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("realm", ["page", "same_origin_frame", "cross_origin_frame"])
+@pytest.mark.parametrize(
+    ("form_html", "sels", "via_label", "log_js", "log"),
+    [
+        (
+            _AIMLESS_RADIOS_HTML,
+            ("#parked", "#tiny", "#plain"),
+            ("#parked", "#tiny"),
+            "() => window.changes",
+            ["parked", "tiny", "plain"],
+        ),
+        (
+            _WRAPPED_AIMLESS_TOGGLES_HTML,
+            ("#acct-18", "#invoice"),
+            ("#acct-18", "#invoice"),
+            "() => window.changes",
+            ["acct-18", "invoice"],
+        ),
+        (_TOGGLES_UNDER_A_COVER_HTML, ("#drawn", "#veiled"), (), "() => window.labelClicks", ["drawn", "veiled"]),
+    ],
+    ids=["aimless", "wrapped_aimless", "under_a_cover"],
+)
+async def test_click_reaches_a_toggle_the_pointer_cannot_aim_at_through_its_label(
+    realm: str, form_html: str, sels: tuple[str, ...], via_label: tuple[str, ...], log_js: str, log: list[str]
+) -> None:
+    async with _form_in(realm, form_html) as (page, doc):
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler
+        for sel in sels:
+            started = time.monotonic()
+            r = await click({"selector": sel})
+            assert time.monotonic() - started < 4, sel
+            assert r.status == "ok", (sel, r.content)
+            assert await doc.eval_on_selector(sel, "el => el.checked") is True, sel
+            if sel in via_label:
+                assert "via its label" in r.content, r.content
+        assert await doc.evaluate(log_js) == log
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target_js", ["() => null", "() => document.createElement('input')"], ids=["unresolved", "detached"]
+)
+async def test_a_page_realm_toggle_whose_target_is_gone_is_refused_as_having_left_the_page(
+    target_js: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "_evaluate_isolated", _no_isolated_world)
+    monkeypatch.setattr(taskv3_tools, "_PROBE_TARGET_JS", target_js)
+    async with _content_page(_HIDDEN_NATIVE_TOGGLES_HTML) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#news"})
+        assert await page.eval_on_selector("#news", "el => el.checked") is False
+    assert r.error_class == "stale_selector" and "left the page" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_label_that_leaves_the_page_before_the_click_is_refused_without_echoing_the_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = input_dispatch.click_handle
+
+    async def _detach_first(realm: Page | Frame, handle: ElementHandle, **options: Any) -> None:
+        await handle.evaluate("(l) => l.remove()")
+        await real(realm, handle, **options)
+
+    monkeypatch.setattr(input_dispatch, "click_handle", _detach_first)
+    async with _content_page(_HIDDEN_NATIVE_TOGGLES_HTML) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#terms"})
+        assert await page.eval_on_selector("#terms", "el => el.checked") is False
+    assert r.error_class == "unreachable" and r.content == (
+        "#terms was not clicked: it has no on-screen point of its own, and its label could not be clicked (Error) "
+        "after 3 s"
+    )
+
+
 # A transparent native checkbox stretched over its own styled box is what a person clicks, in view, below
 # the fold, with only its top edge above the fold, or further down a scrollable list. One inside a collapsed
 # section, a faded-out panel (even behind its <label>), or stacked translucent wrappers, or under an unrelated
@@ -19821,10 +21372,10 @@ async def test_click_checks_a_transparent_checkbox_laid_over_its_own_styled_box(
 @pytest.mark.parametrize(
     ("selector", "diagnosis"),
     [
-        ("#collapsed", "not rendered"),
-        ("#faded", "not rendered"),
+        ("#collapsed", "no <label> or element naming it is drawn"),
+        ("#faded", "no <label> or element naming it is drawn"),
         ("#labelfaded", "not rendered"),
-        ("#stacked", "not rendered"),
+        ("#stacked", "no <label> or element naming it is drawn"),
         ("#covered", "something else is on top of it"),
     ],
 )
@@ -19835,6 +21386,33 @@ async def test_click_still_refuses_a_transparent_checkbox_nothing_reaches(select
         assert r.status == "error"
         assert diagnosis in r.content, r.content
         assert await page.eval_on_selector(selector, "el => el.checked") is False
+
+
+# Rows with no role or ref in a popup the trigger toggles; the row clicked by its text while the popup is closed.
+_CLOSED_POPUP_ROWS_HTML = """<!doctype html><html><body>
+<div id="pop" style="display:none"><ul id="rows"><li><div>12 ELM ST</div><div>004-0017</div></li></ul></div>
+<span id="trigger" style="cursor:pointer">004-0001</span>
+<script>
+document.getElementById('trigger').onclick = () => {
+  const pop = document.getElementById('pop');
+  pop.style.display = pop.style.display === 'none' ? 'block' : 'none';
+};
+document.getElementById('rows').onclick = (e) => { document.getElementById('trigger').textContent = e.target.closest('li').lastElementChild.textContent; };
+</script>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_by_text_on_a_closed_popup_row_is_diagnosed_not_rendered(expected_action_timeout: None) -> None:
+    async with _content_page(_CLOSED_POPUP_ROWS_HTML) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click")
+        closed = await click.handler({"selector": 'text="004-0017"'})
+        assert closed.status == "error" and "is not rendered" in closed.content, closed.content
+        assert (await click.handler({"selector": "#trigger"})).status == "ok"
+        opened = await click.handler({"selector": 'text="004-0017"'})
+        assert opened.status == "ok", opened.content
+        assert await page.inner_text("#trigger") == "004-0017"
 
 
 @_skip_no_browser
@@ -22010,6 +23588,20 @@ async def test_observe_role_links_never_take_an_icons_place(hidden: int) -> None
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_observe_a_pages_role_links_never_take_a_frames_icons_place_in_the_page_wide_budget() -> None:
+    frame = _buttons(50) + _POINTER_ICON * 20
+    html = _cursorless_links(40) + _buttons(150) + f"<iframe srcdoc='{frame}' width='800' height='600'></iframe>"
+    async with _live_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        summary = r.data["summary"]
+        assert (summary["icons_listed"], summary["icons_truncated"]) == (20, 0), (
+            "250 page-wide minus the 200 buttons leaves 50 for icons; the 40 role=links must not count against it",
+            r.content,
+        )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_observe_a_second_added_role_also_stays_out_of_the_element_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -23757,6 +25349,21 @@ async def test_a_link_whose_label_does_not_name_its_destination_shows_where_it_g
     for same in ("Do Not Sell My Info", "Home", "Email us", "Questions", "State"):
         assert " to=" not in lines[same], observed.content
     assert "from=home" not in observed.content and "ref=home" not in observed.content, observed.content
+
+    for case in _DESTINATION_SPLIT_PAGES:
+        links, expected, qualified = case.values
+        async with _page_context(viewport={"width": 1024, "height": 900}) as context:
+            page = await context.new_page()
+            await page.route("http://site.test/**", serve)
+            await page.goto("http://site.test/advisor")
+            r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+            raw = (await _observe_data(page))["elements"]
+        assert r.status == "ok", (case.id, r.content)
+        boxed = [e["label"] for e in raw if any(kind == "in.apart" for kind, _ in e.get("placement") or [])]
+        assert all([e["label"] for e in raw if e.get("to")].count(caption) > 1 for caption in boxed), (case.id, boxed)
+        listed = [ln for ln in (re.sub(r"^ref=\d+ ", "", ln) for ln in _lines(r.content)) if ln.startswith("a ")]
+        assert listed == expected, (case.id, r.content)
+        assert r.data["summary"]["qualified_by_destination"] == qualified, (case.id, r.data)
 
 
 @_skip_no_browser
@@ -25657,7 +27264,7 @@ async def test_disabled_click_refusal_names_only_a_rendered_challenge_frame(
     assert refused.error_class == "disabled", refused.content
     if hinted:
         assert refused.content == (
-            f"{unhinted}. A challenge frame (challenges.cloudflare) is rendered on screen. solve_captcha acts on it."
+            f"{unhinted}. Frames on screen whose address names a captcha vendor: 'challenges.cloudflare' 300x65 px."
         )
     else:
         assert refused.content == unhinted
@@ -25679,7 +27286,7 @@ async def test_disabled_click_refusal_in_a_child_frame_names_the_challenge_frame
         await _mount_challenge_frame(child, page, "#widget")
         refused = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#submit"})
     assert refused.error_class == "disabled", refused.content
-    assert "A challenge frame (challenges.cloudflare) is rendered on screen." in refused.content, refused.content
+    assert "captcha vendor: 'challenges.cloudflare' 300x65 px." in refused.content, refused.content
 
 
 @pytest.mark.asyncio
@@ -26238,22 +27845,20 @@ async def test_a_page_that_replaces_element_prototype_getattribute_cannot_forge_
         assert "covered by" in r.content, r.content
 
 
-@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_own_label_is_not_granted_when_the_probe_cannot_be_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Without a pristine realm the association is only as trustworthy as the page, so the grant is
-    # withheld and a label over its control reads as the cover it did before the grant existed.
-    async def _no_isolated_world(*args: Any, **kwargs: Any) -> None:
-        return None
-
+async def test_a_radio_under_its_own_label_is_clicked_through_it_when_the_probe_cannot_be_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without a pristine realm the force-click grant is withheld, so the driver clicks the label it found itself.
     monkeypatch.setattr(taskv3_tools, "_evaluate_isolated", _no_isolated_world)
     async with _content_page(_RADIO_UNDER_SIBLING_LABEL_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
+        started = time.monotonic()
         r = await _tool(tools, "click").handler({"selector": "#r"})
-        assert r.status == "error", r.content
-        assert "covered by" in r.content, r.content
-        assert await page.eval_on_selector("#r", "el => el.checked") is False
+        assert time.monotonic() - started < 4
+        assert r.status == "ok" and "via its label" in r.content, r.content
+        assert await page.eval_on_selector("#r", "el => el.checked") is True
 
 
 # A form-associated custom element is labelable under the HTML algorithm, so a <label for> over one
@@ -27296,12 +28901,193 @@ async def test_an_icon_only_onclick_close_is_named_and_clicking_it_clears_the_fi
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
         assert r.status == "error", r.content
-        minted = re.search(r'\[data-tv3-close="[^"]+"\]', r.content)
+        minted = re.search(r'\[data-tv3-ctl="[^"]+"\]', r.content)
         assert minted, r.content
         closed = await _tool(tools, "click").handler({"selector": minted.group(0)})
         assert closed.status == "ok", closed.content
         typed = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
         assert typed.status == "ok", typed.content
+
+
+_COOKIE_BAR_OVER_SEND_HTML = """
+<button id="send" style="position:fixed;left:20px;bottom:20px;width:120px;height:40px">Send</button>
+<div class="bar" style="position:fixed;left:0;bottom:0;width:100%;height:120px;background:#036;color:#fff">
+  <p>We use cookies. Read our <a href="https://elsewhere.example/privacy" style="color:#fff">Privacy Policy.</a></p>
+  <a class="ok" style="cursor:pointer;display:inline-block;padding:4px 12px;background:#fff;color:#036">Ok</a>
+</div>
+<script>document.querySelector('.ok').addEventListener('click', () => document.querySelector('.bar').remove());</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_covering_layers_pointer_styled_control_gets_an_address_that_survives_the_next_probe() -> None:
+    async with _content_page(_COOKIE_BAR_OVER_SEND_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        refused = await _tool(tools, "click").handler({"selector": "#send"})
+        assert refused.status == "error", refused.content
+        minted = re.search(r'(\[data-tv3-ctl="[^"]+"\]) "Ok"', refused.content)
+        assert minted, refused.content
+        controls = refused.content.partition("Its controls:")[2]
+        assert re.search(r'\[data-tv3(?:-[a-z]+)?="[^"]+"\] "Privacy Policy\."', controls), refused.content
+        await _tool(tools, "observe").handler({})
+        again = await _tool(tools, "click").handler({"selector": "#send"})
+        assert again.status == "error", again.content
+        closed = await _tool(tools, "click").handler({"selector": minted.group(1)})
+        assert closed.status == "ok", closed.content
+        sent = await _tool(tools, "click").handler({"selector": "#send"})
+        assert sent.status == "ok", sent.content
+
+
+_FRAME_OVER_BUTTON_HTML = """
+<button id="cta" style="position:fixed;left:20px;top:20px;width:200px;height:40px">Interested</button>
+<iframe srcdoc="<button>Close</button>" style="position:fixed;left:0;top:0;width:400px;height:200px;border:0"></iframe>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_frame_over_the_target_is_reported_as_a_frame_the_probe_does_not_read() -> None:
+    async with _content_page(_FRAME_OVER_BUTTON_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#cta"})
+        assert r.status == "error", r.content
+        assert "It is a frame, and the probe does not read inside frames." in r.content, r.content
+        assert "no named controls" not in r.content, r.content
+
+
+_TWO_BARS_AND_A_PATCHED_RANDOM_HTML = """
+<script>Math.random = () => 0.5;</script>
+<button id="t1" style="position:fixed;left:20px;top:20px;width:120px;height:40px">One</button>
+<button id="t2" style="position:fixed;left:20px;bottom:20px;width:120px;height:40px">Two</button>
+<div id="bar1" style="position:fixed;left:0;top:0;width:100%;height:100px;background:#036">
+  <a style="cursor:pointer;color:#fff" onclick="this.parentNode.remove()">Ok</a>
+</div>
+<div id="bar2" style="position:fixed;left:0;bottom:0;width:100%;height:100px;background:#036">
+  <a style="cursor:pointer;color:#fff" onclick="this.parentNode.remove()">Ok</a>
+</div>
+"""
+_A_THIRD_BAR_OVER_T1_HTML = (
+    '<div style="position:fixed;left:0;top:0;width:100%;height:100px;background:#036">'
+    '<a style="cursor:pointer;color:#fff">Ok</a></div>'
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_page_world_probe_mints_a_distinct_address_for_every_covering_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _no_isolated_world(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(taskv3_tools, "_evaluate_isolated", _no_isolated_world)
+    address = re.compile(r'(\[data-tv3-ctl="[^"]+"\]) "Ok"')
+    async with _content_page(_TWO_BARS_AND_A_PATCHED_RANDOM_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        first = address.search((await _tool(tools, "click").handler({"selector": "#t1"})).content)
+        second = address.search((await _tool(tools, "click").handler({"selector": "#t2"})).content)
+        assert first and second
+        assert first.group(1) != second.group(1)
+        closed = await _tool(tools, "click").handler({"selector": second.group(1)})
+        assert closed.status == "ok", closed.content
+        assert await page.evaluate("[!!document.getElementById('bar1'), !!document.getElementById('bar2')]") == [
+            True,
+            False,
+        ]
+        await _tool(tools, "click").handler({"selector": first.group(1)})
+        assert await page.evaluate("!document.getElementById('bar1')")
+        await page.evaluate("(h) => document.body.insertAdjacentHTML('beforeend', h)", _A_THIRD_BAR_OVER_T1_HTML)
+        third = address.search((await _tool(tools, "click").handler({"selector": "#t1"})).content)
+        assert third
+        assert third.group(1) not in {first.group(1), second.group(1)}
+        await page.evaluate(
+            "(s) => { const ok = document.querySelector(s); ok.parentNode.appendChild(ok.cloneNode(true)); }",
+            third.group(1),
+        )
+        after_clone = (await _tool(tools, "click").handler({"selector": "#t1"})).content
+        assert third.group(1) not in after_clone, after_clone
+        assert len(set(re.findall(r'\[data-tv3-ctl="[^"]+"\]', after_clone))) == 2, after_clone
+        assert await page.locator(third.group(1)).count() == 0
+
+
+_BAR_WITH_ONLY_AN_OFF_PAGE_LINK_HTML = """
+<button id="send" style="position:fixed;left:20px;bottom:20px;width:120px;height:40px">Send</button>
+<div id="bar" style="position:fixed;left:0;bottom:0;width:100%;height:120px;background:#036;color:#fff">
+  <a href="https://elsewhere.example/privacy" style="color:#fff">Privacy Policy.</a>
+  <span>We use cookies.</span>
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_layers_link_to_another_page_is_listed_with_an_address_like_any_other_control() -> None:
+    async with _content_page(_BAR_WITH_ONLY_AN_OFF_PAGE_LINK_HTML) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#send"})
+        assert r.error_class == "covered", r.content
+        assert re.search(r'Its controls: \[data-tv3(?:-[a-z]+)?="[^"]+"\] "Privacy Policy\."', r.content), r.content
+
+
+_DIALOG_WITH_A_POINTER_SVG_CLOSE_AMONG_MANY_CONTROLS_HTML = (
+    """
+<input id="city" type="text" style="width:200px;height:30px">
+<div id="prefs" role="dialog" aria-label="Preferences" style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff">
+"""
+    + "".join(f'<span style="cursor:pointer;display:block">Option {i}</span>' for i in range(5))
+    + """
+  <svg id="x" onclick="this.closest('[role=dialog]').remove()" style="cursor:pointer" width="24" height="24">
+    <path d="M4 4L20 20M20 4L4 20" stroke="#000" stroke-width="3"></path>
+  </svg>
+"""
+    + "".join(f'<span style="cursor:pointer;display:block">Option {i}</span>' for i in range(5, 10))
+    + "</div>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_pointer_styled_onclick_close_cut_by_truncation_is_still_listed_as_an_onclick_control() -> None:
+    async with _content_page(_DIALOG_WITH_A_POINTER_SVG_CLOSE_AMONG_MANY_CONTROLS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert r.error_class == "covered", r.content
+        assert "more controls exist" in r.content and "#x" in r.content, r.content
+        closed = await _tool(tools, "click").handler({"selector": "#x"})
+        assert closed.status == "ok", closed.content
+        typed = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert typed.status == "ok", typed.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra", "ending"),
+    [
+        (
+            {"text": ["We use cookies."], "textCut": False},
+            "would show in get_html of #bar.",
+        ),
+        ({}, "close the layer, then retry #name."),
+        ({"frame": True}, "does not read inside frames."),
+        (
+            {"layerKind": "hit_fallback"},
+            "named no controls on that element. Re-observe and reach #name another way or act on a different control.",
+        ),
+        (
+            {"challengeFrame": "iframe[title=challenge]"},
+            "Its controls: none named.",
+        ),
+    ],
+    ids=["quoted", "plain", "frame", "hit_fallback", "challenge"],
+)
+async def test_a_refusal_listing_no_control_keeps_its_next_step(extra: dict[str, Any], ending: str) -> None:
+    occluder = {"selector": "#bar", "name": "Notice", "controls": [], "truncated": False, "layerKind": "qualified"}
+    page = _CoveredProbeFakePage({**occluder, **extra})
+    r = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+        {"selector": "#name", "text": "Jane Doe"}
+    )
+    assert r.error_class == "covered", r.content
+    assert r.content.endswith(ending), r.content
 
 
 _DIALOG_FULL_OF_ONCLICK_WRAPPERS_AND_ROWS_HTML = (
@@ -31013,7 +32799,7 @@ def test_the_page_fingerprint_scrubs_every_marker_name_our_tools_write() -> None
     assert written - {"ref"} <= scrubbed, sorted(written - {"ref"} - scrubbed)
 
 
-_TV3_MARKERS = ("data-tv3-pre", "data-tv3-menu", "data-tv3-close", "data-tv3-focus", "data-tv3-look", "data-tv3-act")
+_TV3_MARKERS = ("data-tv3-pre", "data-tv3-menu", "data-tv3-ctl", "data-tv3-focus", "data-tv3-look", "data-tv3-act")
 
 
 @_skip_no_browser
@@ -42041,6 +43827,201 @@ async def test_observe_says_nothing_rather_than_naming_the_wrong_section() -> No
         assert r.data["summary"]["duplicate_digest_lines"] == 0, r.data
 
 
+_PLAN_CARDS = (("Retirement plans", "launch-kestrel"), ("Education plans", "launch-planner-software"))
+_CARD_IMG = '<img alt="" width="200" height="100" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">'
+
+
+def _plan_cards(template: str) -> str:
+    return "".join(template.format(h=h, s=s, n=n) for n, (h, s) in enumerate(_PLAN_CARDS, 1))
+
+
+_MIG69_CARDS = _plan_cards(
+    '<div class="card"><a href="/tools/{s}/">' + _CARD_IMG + '</a><div class="content"><h2>{h}</h2>'
+    '<a class="button" href="/tools/{s}/">Open planner</a></div></div>'
+)
+_OPEN_PLANNER_IN = [
+    "a 'Open planner' to='/tools/launch-kestrel/' in='Retirement plans Open planner'",
+    "a 'Open planner' to='/tools/launch-planner-software/' in='Education plans Open planner'",
+]
+_CONTACT_US_BARE = ["a 'Contact us' to='/about/reach'", "a 'Contact us' to='/help/reach-out'"]
+_PROMO_AND_SECTION = (
+    '<section><h3>Retirement plans</h3><a href="/tools/launch-kestrel/">Open planner</a></section>',
+    '<a href="/promo/spring">Open planner</a>',
+)
+_LONG_CAPTION = "Open the planner and its guide " * 5
+_HEALTH_CARD = (
+    '<div class="wrap"><section><h3>Health plans</h3><a href="/tools/health-planner/">Open planner</a></section></div>'
+)
+
+
+_DESTINATION_SPLIT_PAGES = [
+    pytest.param(
+        f"<main><h2>Planner Software</h2>{_MIG69_CARDS}</main>",
+        [
+            "a '' to='/tools/launch-kestrel/'",
+            _OPEN_PLANNER_IN[0],
+            "a '' to='/tools/launch-planner-software/'",
+            _OPEN_PLANNER_IN[1],
+        ],
+        2,
+        id="A_heading_then_link_in_each_card",
+    ),
+    pytest.param(
+        "<main><h2>Planner Software</h2>"
+        + _plan_cards(
+            '<div class="card"><a href="/tools/{s}/">Planner preview</a><div class="content"><h2>{h}</h2>'
+            "<p>Plan details</p></div></div>"
+        )
+        + "</main>",
+        [
+            "a 'Planner preview' to='/tools/launch-kestrel/' in='Planner preview Retirement plans Plan details'",
+            "a 'Planner preview' to='/tools/launch-planner-software/'"
+            " in='Planner preview Education plans Plan details'",
+        ],
+        2,
+        id="B_link_before_its_own_cards_heading",
+    ),
+    pytest.param(
+        '<header><nav><a href="/about/reach">Contact us</a></nav></header>'
+        "<main><h1>Welcome</h1><h2>News</h2><p>Body</p></main>"
+        '<footer><nav><a href="/help/reach-out">Contact us</a></nav></footer>',
+        _CONTACT_US_BARE,
+        0,
+        id="C2_header_and_footer_nav",
+    ),
+    pytest.param(
+        '<header><nav><a href="/about/reach">Contact us</a></nav></header>'
+        "<main><h1>Welcome</h1><p>Body</p></main>"
+        '<footer><nav><a href="/help/reach-out">Contact us</a></nav></footer>',
+        _CONTACT_US_BARE,
+        0,
+        id="C3_header_and_footer_nav_on_a_one_heading_page",
+    ),
+    pytest.param(
+        '<section><h2>Personal</h2><div><a href="/next/personal">Continue</a></div></section>'
+        "<section><h2>Billing</h2><aside><h3>Help</h3><p>Call us</p></aside>"
+        '<div><a href="/next/billing">Continue</a></div></section>',
+        [
+            "a 'Continue' to='/next/personal' in='Personal Continue'",
+            "a 'Continue' to='/next/billing' in='Billing Help Call us Continue'",
+        ],
+        2,
+        id="D_aside_heading_inside_a_section",
+    ),
+    pytest.param(
+        "<main><h2>Planner Software</h2>"
+        + _plan_cards(
+            '<div class="card" data-testid="tool-card-{n}"><div class="content"><h2>{h}</h2>'
+            '<a class="button" href="/tools/{s}/">Open planner</a></div></div>'
+        )
+        + "</main>",
+        _OPEN_PLANNER_IN,
+        2,
+        id="E_cards_with_test_ids",
+    ),
+    pytest.param(
+        '<main><h2>Retirement plans</h2><p>Text</p><a href="/tools/launch-kestrel/">Open planner</a>'
+        '<h2>Education plans</h2><p>Text</p><a href="/tools/launch-planner-software/">Open planner</a></main>',
+        ["a 'Open planner' to='/tools/launch-kestrel/'", "a 'Open planner' to='/tools/launch-planner-software/'"],
+        0,
+        id="F_flat_list",
+    ),
+    pytest.param(
+        "<div class=row><div class=card><h3>Retirement plans</h3><a href=/r>Learn more</a></div>"
+        "<div class=card><b>Education plans</b><a href=/tools/edu-planner>Open planner</a></div></div>"
+        "<div class=row><div class=card><h3>Health plans</h3>"
+        "<a href=/tools/health-planner>Open planner</a></div></div>",
+        [
+            "a 'Learn more'",
+            "a 'Open planner' to='/tools/edu-planner' in='Education plansOpen planner'",
+            "a 'Open planner' to='/tools/health-planner' in='Health plans Open planner'",
+        ],
+        2,
+        id="G_card_row_with_a_bold_title",
+    ),
+    pytest.param(
+        '<div class="wrap"><section><h2>Retirement plans</h2><p>Text</p></section>'
+        '<div class="promo"><a href="/promo/spring">Open planner</a></div></div>'
+        '<section><h2>Education plans</h2><a href="/tools/launch-planner-software/">Open planner</a></section>',
+        [
+            "a 'Open planner' to='/promo/spring' in='Retirement plans Text Open planner'",
+            "a 'Open planner' to='/tools/launch-planner-software/' in='Education plans Open planner'",
+        ],
+        2,
+        id="H_promo_after_a_headed_section_in_one_wrapper",
+    ),
+    *(
+        pytest.param(
+            f'<div class="wrap">{first}{second}</div>{_HEALTH_CARD}',
+            [f"a 'Open planner' to='{to}'" for to in order],
+            0,
+            id=f"J_wrapper_holding_two_of_the_set_{name}",
+        )
+        for name, (first, second), order in (
+            (
+                "section_first",
+                _PROMO_AND_SECTION,
+                ("/tools/launch-kestrel/", "/promo/spring", "/tools/health-planner/"),
+            ),
+            (
+                "promo_first",
+                _PROMO_AND_SECTION[::-1],
+                ("/promo/spring", "/tools/launch-kestrel/", "/tools/health-planner/"),
+            ),
+        )
+    ),
+    pytest.param(
+        f'<div class="wrap"><p>Offers</p><section><h3>Plans</h3><a href="/tools/launch-kestrel/">{_LONG_CAPTION}'
+        f'today</a></section><a href="/promo/spring">{_LONG_CAPTION}now</a></div>'
+        f'<section><h3>Health plans</h3><a href="/tools/health-planner/">{_LONG_CAPTION}today</a></section>'
+        f'<section><h3>Education plans</h3><a href="/tools/edu-planner/">{_LONG_CAPTION}now</a></section>',
+        [
+            f"a '{_LONG_CAPTION[:140]}' …[+{more} chars] to='{to}'"
+            for more, to in (
+                (20, "/tools/launch-kestrel/"),
+                (18, "/promo/spring"),
+                (20, "/tools/health-planner/"),
+                (18, "/tools/edu-planner/"),
+            )
+        ],
+        0,
+        id="J_wrapper_holding_two_captions_that_differ_past_the_display_width",
+    ),
+    pytest.param(
+        '<div class="card"><h2>Retirement plans</h2><a href="/tools/launch-kestrel/">Open planner</a>'
+        '<button>Open planner</button></div><div class="card"><h2>Education plans</h2>'
+        '<a href="/tools/launch-planner-software/">Open planner</a></div>',
+        ["a 'Open planner' to='/tools/launch-kestrel/'", "a 'Open planner' to='/tools/launch-planner-software/'"],
+        0,
+        id="J_box_holding_a_button_of_the_same_caption",
+    ),
+    pytest.param(
+        "<main>"
+        + _plan_cards('<div class="card"><h2>{h}</h2><a href="/tools/{s}/">Open planner</a></div>').replace(
+            "/tools/launch-planner-software/", "#education"
+        )
+        + "</main>",
+        ["a 'Open planner' to='/tools/launch-kestrel/'", "a 'Open planner'"],
+        0,
+        id="K_one_link_without_a_destination",
+    ),
+    pytest.param(
+        "<main>"
+        + _plan_cards(
+            '<div class="card"><h2>{h}</h2><a href="/share/{s}" aria-label="Share">'
+            '<svg width="16" height="16"><rect width="16" height="16"></rect></svg></a></div>'
+        )
+        + "</main>",
+        [
+            "a 'Share' to='/share/launch-kestrel' in='Retirement plans'",
+            "a 'Share' to='/share/launch-planner-software' in='Education plans'",
+        ],
+        2,
+        id="L_graphic_links_named_by_aria_label",
+    ),
+]
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_keeps_a_heading_boundary_the_page_makes_unreadable() -> None:
@@ -42618,6 +44599,10 @@ async def test_observe_withholds_the_field_when_the_box_holds_a_second_one_it_al
         icons = [line for line in _lines(r.content) if "'Search'" in line]
         assert len(icons) == 2, r.content
         assert all("field=" not in line for line in icons), r.content
+        if source == "dropped-but-still-live":
+            assert r.data["summary"]["elements_dropped"] == 2, r.data
+            assert r.data["summary"]["hidden_dropped_visibility"] == 0, r.data
+            assert "could not be described" in r.content
 
 
 @_skip_no_browser
@@ -48106,6 +50091,49 @@ async def test_select_option_reads_a_visible_single_select_back(
         assert r.error_class == "did_not_commit" and "'Alpha'" in r.content, r.content
 
 
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("by_label", [False, True])
+async def test_single_select_receipt_names_the_verified_label_without_promising_later_state(by_label: bool) -> None:
+    html = '<select id="pick"><option value="a">Alpha</option><option value="opaque">Beta</option></select>'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        args = {"selector": "#pick", **({"label": "Beta"} if by_label else {"value": "opaque"})}
+        result = await _tool(tools, "select_option").handler(args)
+        assert await page.locator("#pick").input_value() == "opaque"
+        assert result.status == "ok" and not result.entry_unconfirmed
+        assert (result.data or {}).get("picked_option") == "Beta"
+        assert "Beta" in result.content.splitlines()[0]
+        await page.evaluate("document.querySelector('#pick').value = 'a'")
+        assert await page.locator("#pick").input_value() == "a"
+        assert "Beta" in result.content.splitlines()[0]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_single_select_receipt_masks_before_bounding_page_controlled_labels() -> None:
+    secret = _SYNTHETIC_SECRET
+    label = "x" * 72 + secret + "\nforged tool result" + "z" * 300
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(secret, hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        async with _content_page(
+            '<select id="pick"><option value="a">Alpha</option><option value="b"></option></select>'
+        ) as page:
+            await page.evaluate("label => document.querySelector('option[value=b]').textContent = label", label)
+            tools = build_browser_tools(_fixed_page_provider(page))
+            result = await _tool(tools, "select_option").handler({"selector": "#pick", "value": "b"})
+        receipt = result.content.splitlines()[0]
+        assert result.status == "ok" and not result.entry_unconfirmed
+        assert "x" * 72 in receipt and "…" in receipt
+        assert secret[:6] not in receipt and secret[-6:] not in receipt
+        assert len(receipt) < 200
+        assert "\nforged tool result" not in result.content
+    finally:
+        skyvern_context.reset()
+
+
 # A phone-country picker: each declared row renders a flag, the country name and its dial code. With `virtual`, the
 # list ignores the query and renders only the window of its 300 rows the scroller shows.
 _PHONE_COUNTRY_HTML = """
@@ -53557,3 +55585,82 @@ async def test_a_page_is_freed_after_a_cdp_probe_and_recorded_frame_work() -> No
     gc.collect()
 
     assert released() is None
+
+
+def _captcha_task() -> SimpleNamespace:
+    return SimpleNamespace(
+        task_id="tsk_1",
+        workflow_run_id="wr_1",
+        browser_session_id="bs_1",
+        error_code_mapping=None,
+        started_at=None,
+        created_at=None,
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("widget", "response", "present"),
+    [
+        ('<div class="g-recaptcha" data-sitekey="k"></div>', "03AFcWeA_issued_response", True),
+        ('<div class="g-recaptcha" data-sitekey="k"></div>', "", False),
+        # hCaptcha fills the same legacy field under its own token rules, so the reCAPTCHA lifetime is not claimed.
+        ('<div class="h-captcha" data-sitekey="k"></div>', "P1_issued_passcode", None),
+    ],
+)
+async def test_a_solve_states_the_recaptcha_response_lifetime_only_when_the_page_holds_one(
+    monkeypatch: pytest.MonkeyPatch, widget: str, response: str, present: bool | None
+) -> None:
+    # Field presence is observable; issuance time and server verification are not.
+    monkeypatch.setattr(
+        captcha_tools,
+        "solve_challenge",
+        AsyncMock(return_value=ChallengeOutcome(ChallengeStatus.SOLVED, arm="dom_checkbox")),
+    )
+    async with _page_context() as context:
+        page = await context.new_page()
+        await page.set_content(
+            f'<form>{widget}<textarea name="g-recaptcha-response" style="display:none">{response}</textarea></form>'
+        )
+        tools, _ = captcha_tools.build_captcha_tools(_captcha_task(), _fixed_page_provider(page), organization_id="o_1")
+        with capture_logs() as logs:
+            result = await tools[0].handler({})
+
+    assert (result.status, result.ok_class) == ("ok", "solved")
+    [line] = [e for e in logs if e["event"] == "taskv3 captcha solve outcome"]
+    assert line["recaptcha_response_present"] is present
+    assert (captcha_tools._RECAPTCHA_RESPONSE_LIFETIME in result.content) is bool(present)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_blocked", [False, True])
+async def test_a_nonempty_response_does_not_establish_freshness_or_require_another_solve(
+    monkeypatch: pytest.MonkeyPatch, client_blocked: bool
+) -> None:
+    monkeypatch.setattr(
+        captcha_tools,
+        "solve_challenge",
+        AsyncMock(return_value=ChallengeOutcome(ChallengeStatus.SOLVED, arm="dom_checkbox")),
+    )
+    async with _page_context() as context:
+        page = await context.new_page()
+        await page.set_content(
+            '<form><input required><textarea name="g-recaptcha-response" style="display:none" '
+            'data-issued-at="0">stale-response</textarea><button>Submit</button></form>'
+        )
+        requests: list[str] = []
+        page.on("request", lambda request: requests.append(request.method))
+        if client_blocked:
+            await page.locator("button").click()
+            assert not await page.locator("input").evaluate("el => el.validity.valid")
+        tools, _ = captcha_tools.build_captcha_tools(_captcha_task(), _fixed_page_provider(page), organization_id="o_1")
+        result = await tools[0].handler({})
+
+        assert requests == []
+        assert await page.locator("textarea").input_value() == "stale-response"
+        assert (result.status, result.ok_class) == ("ok", "solved")
+        assert "does not establish" in result.content
+        assert all(fact in result.content for fact in ("issuance time", "freshness", "consumption", "site acceptance"))
+        assert "needs a new solve first" not in result.content

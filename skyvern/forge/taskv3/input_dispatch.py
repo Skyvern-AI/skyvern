@@ -18,6 +18,7 @@ import structlog
 from playwright.async_api import ElementHandle, FileChooser, Frame, Locator, Page
 
 from skyvern.config import settings
+from skyvern.exceptions import GestureNotSent
 from skyvern.forge.taskv3.run_arms import LOGIN_PACE_FLAG, run_arm_enabled
 from skyvern.webeye.browser_object_predicates import is_page_like
 
@@ -30,7 +31,7 @@ LOGIN_PACE_FLOOR_S = 45.0
 _CANCEL_POLL_S = 2.0
 
 
-class LoginPaceRefused(RuntimeError):
+class LoginPaceRefused(GestureNotSent):
     """The task was canceled, or the page moved, during the wait, so the held gesture is not sent."""
 
 
@@ -224,11 +225,6 @@ async def click_handle(
 ) -> None:
     await _hold_submit(realm)
     await handle.click(**_opts(timeout=timeout, force=force, position=position))
-
-
-async def click_at(page: Page, x: float, y: float) -> None:
-    await _hold_submit(page)
-    await page.mouse.click(x, y)
 
 
 async def hover(realm: Realm, selector: str, *, timeout: float | None = None) -> None:

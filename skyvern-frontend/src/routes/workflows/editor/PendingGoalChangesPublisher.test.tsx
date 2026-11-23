@@ -225,7 +225,7 @@ describe("a Goal update offered after a hand code edit", () => {
     await requestSuggestion();
 
     expect(vi.mocked(getClient)).toHaveBeenCalled();
-    expect(post).toHaveBeenCalledWith("/workflow/copilot/suggest-goal", {
+    expect(post).toHaveBeenCalledWith("/workflow/suggest-goal", {
       label: "read_total",
       code: handEditedCode,
       current_goal: editedGoal,

@@ -461,10 +461,13 @@ describe("BrowserStream", () => {
     // A paste sets the remote clipboard silently; copying that text back must
     // return it, not the earlier copy.
     fireEvent.keyDown(stream!, { key: "v", metaKey: true });
+    // The paste records its text only after the clipboard sync delay, right
+    // before it sends V, so the V press is what says the paste has finished.
     await waitFor(() => {
       expect(rfb.clipboardPasteFrom).toHaveBeenCalledWith(
         "https://example.test",
       );
+      expect(rfb.sendKey).toHaveBeenCalledWith(0x0076, "KeyV", true);
     });
     mocks.copyText.mockClear();
     vi.useFakeTimers();

@@ -702,6 +702,7 @@ def _setup_workflow_run() -> SimpleNamespace:
         browser_sink_profile_id=None,
         retried_from_workflow_run_id=None,
         proxy_location=None,
+        otp_request_id=None,
     )
 
 

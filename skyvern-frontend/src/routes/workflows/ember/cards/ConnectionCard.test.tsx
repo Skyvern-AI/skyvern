@@ -181,7 +181,11 @@ describe("ConnectionCard", () => {
 
     expect(screen.getByText("Connected")).toBeTruthy();
     expect(
-      screen.getByText("Work (work@example.com) can use Google Sheets."),
+      screen.getByText(
+        (_, node) =>
+          node?.textContent ===
+          "Work (work@example.com) can use Google Sheets.",
+      ),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: /^(Re)?connect/ })).toBeNull();
   });
@@ -384,7 +388,7 @@ describe("ConnectionCard", () => {
 
     expect(screen.getByText("nc_existing")).toBeTruthy();
   });
-  it("settles on a user's one Connected Gmail account instead of offering Connect", () => {
+  it("says a user's one Connected Gmail account is already connected instead of offering Connect", () => {
     const flow: ConnectedGmailFlow = {
       status: "default",
       canConnect: false,
@@ -418,11 +422,13 @@ describe("ConnectionCard", () => {
       </PageSlotsProvider>,
     );
 
-    expect(screen.getByText("Connected")).toBeTruthy();
+    expect(screen.getByText("Already connected")).toBeTruthy();
+    expect(screen.getByText(/allows one account per user/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Connect" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Admin required" })).toBeNull();
   });
   it("switches to Connected Gmail when native sign-in is refused because Connected Gmail is the way", async () => {
+    googleCredentials.current = [];
     startAuthorize.mockReset();
     startAuthorize.mockRejectedValue({ response: { status: 409 } });
     const popup = {
@@ -435,6 +441,7 @@ describe("ConnectionCard", () => {
       .spyOn(window, "open")
       .mockReturnValue(popup as unknown as Window);
     const start = vi.fn();
+    const onSelect = vi.fn();
     let flow: ConnectedGmailFlow = {
       status: "unavailable",
       canConnect: true,
@@ -456,6 +463,7 @@ describe("ConnectionCard", () => {
         }}
       >
         <ConnectionCard
+          onSelect={onSelect}
           card={{
             integrationId: "gmail",
             integrationName: "Gmail",
@@ -486,6 +494,22 @@ describe("ConnectionCard", () => {
     rerender(tree());
     expect(screen.queryByRole("button", { name: "Admin required" })).toBeNull();
     expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
+    // A successful retry adds the account even after the flow can no longer connect.
+    flow = {
+      ...flow,
+      connections: [{ connection_id: "ngc_new", name: "n***@example.com" }],
+    };
+    rerender(tree());
+    expect(screen.getByText("Connected")).toBeTruthy();
+    expect(
+      screen.getByText(
+        (_, node) => node?.textContent === "n***@example.com can use Gmail.",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: /n\*\*\*@example.com/ }),
+    );
+    expect(onSelect).toHaveBeenCalledWith("ngc_new");
     open.mockRestore();
     startAuthorize.mockReset();
   });

@@ -347,6 +347,8 @@ function GroupReviewCard({
   upNext,
 }: ReviewCardProps) {
   const titleId = useId();
+  const rowGroup = Boolean(review.row_group);
+  const [showRows, setShowRows] = useState(!rowGroup);
   const [checked, setChecked] = useState(
     () =>
       new Set(
@@ -364,43 +366,100 @@ function GroupReviewCard({
   const approved = review.rows
     .map((row) => row.credential_id)
     .filter((credentialId) => checked.has(credentialId));
+  const unchecked = review.rows.length - approved.length;
+  const ranBefore = review.rows.filter(
+    (row) =>
+      row.prior_outcome === "completed" ||
+      row.prior_outcome === "unknown" ||
+      row.prior_outcome === "failed",
+  ).length;
+  const inAnotherGroup = review.rows.filter(
+    (row) =>
+      row.prior_outcome === "pending" || row.prior_outcome === "in_progress",
+  ).length;
+  const atOnce = review.max_concurrency ?? 1;
 
   return (
     <AttentionTray
-      aria-label="Account review"
+      aria-label={rowGroup ? "Runs review" : "Account review"}
       aria-describedby={titleId}
-      title="Review the accounts before anything runs"
+      title={
+        rowGroup
+          ? "Review the runs before any start"
+          : "Review the accounts before anything runs"
+      }
       titleId={titleId}
       wrapTitle
-      collapsedTitle={`Copilot is waiting on your review of ${plural(review.rows.length, "account")}`}
+      collapsedTitle={`Copilot is waiting on your review of ${plural(review.rows.length, rowGroup ? "run" : "account")}`}
       collapsed={collapsed}
       onCollapsedChange={onCollapsedChange}
-      minimizeLabel="Minimize account review"
+      minimizeLabel={
+        rowGroup ? "Minimize runs review" : "Minimize account review"
+      }
       upNext={upNext}
     >
       <div className="flex min-h-0 flex-col gap-2 overflow-y-auto px-3 pb-2.5 pt-1 text-xs">
         <p className="whitespace-pre-wrap break-words text-[13.5px] font-medium leading-relaxed">
           {review.action_summary}
         </p>
-        <p className="text-muted-foreground">
-          {review.workflow_title} · version {review.version} · runs one account
-          at a time, each in a fresh browser, using the account's saved login as
-          it is when that run starts
-        </p>
-        {review.credential_parameter_used_by?.length === 0 ? (
+        {rowGroup ? (
+          <p className="text-muted-foreground">
+            {review.workflow_title} · version {review.version} ·{" "}
+            {plural(review.rows.length, "run")}, one per row,{" "}
+            {atOnce === 1 ? "one at a time" : `${atOnce} at a time`}, each in a
+            fresh browser with that row's inputs. Runs keep going after Copilot
+            replies.
+          </p>
+        ) : (
+          <p className="text-muted-foreground">
+            {review.workflow_title} · version {review.version} · runs one
+            account at a time, each in a fresh browser, using the account's
+            saved login as it is when that run starts
+          </p>
+        )}
+        {!rowGroup && review.credential_parameter_used_by?.length === 0 ? (
           <p className="text-amber-700 dark:text-yellow-400">
             No step of this workflow lists {review.credential_parameter_key}, so
             each run may not sign in as its own account.
           </p>
         ) : null}
-        {review.clean_group_run_id ? null : (
+        {rowGroup || review.clean_group_run_id ? null : (
           <p className="text-amber-700 dark:text-yellow-400">
             This version has not yet completed cleanly in a group for any
             selected account.
           </p>
         )}
         <InputList inputs={review.common_inputs} />
-        <ul className="flex flex-col gap-1">
+        {rowGroup ? (
+          <div className="flex flex-wrap items-baseline gap-x-2">
+            <span>
+              {[
+                plural(review.rows.length, "run"),
+                unchecked > 0 ? `${unchecked} unchecked` : null,
+                ranBefore > 0 ? `${ranBefore} ran before` : null,
+                inAnotherGroup > 0
+                  ? `${inAnotherGroup} in another group`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </span>
+            <button
+              type="button"
+              className="underline underline-offset-2"
+              aria-expanded={showRows}
+              onClick={() => setShowRows((open) => !open)}
+            >
+              {showRows ? "Hide runs" : "Show runs"}
+            </button>
+          </div>
+        ) : null}
+        {rowGroup && showRows ? (
+          <p className="text-muted-foreground">
+            Inputs a row leaves out use the workflow's saved values.
+          </p>
+        ) : null}
+        <ul className={cn("flex flex-col gap-1", !showRows && "hidden")}>
           {review.rows.map((row) => {
             const warning = row.prior_outcome
               ? PRIOR_EFFECT[row.prior_outcome]
@@ -419,15 +478,30 @@ function GroupReviewCard({
                     checked={checked.has(row.credential_id)}
                     onCheckedChange={() => toggle(row.credential_id)}
                   />
-                  <span className="min-w-0 break-words">
-                    {row.label}
-                    {warning ? (
-                      <span className="text-amber-700 dark:text-yellow-400">
-                        {" "}
-                        · {warning}
-                      </span>
-                    ) : null}
-                  </span>
+                  {rowGroup ? (
+                    <div className="min-w-0 break-words">
+                      {Object.keys(row.inputs ?? {}).length > 0 ? (
+                        <InputList inputs={row.inputs ?? {}} />
+                      ) : (
+                        row.label
+                      )}
+                      {warning ? (
+                        <div className="text-amber-700 dark:text-yellow-400">
+                          {warning}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <span className="min-w-0 break-words">
+                      {row.label}
+                      {warning ? (
+                        <span className="text-amber-700 dark:text-yellow-400">
+                          {" "}
+                          · {warning}
+                        </span>
+                      ) : null}
+                    </span>
+                  )}
                 </label>
               </li>
             );
@@ -469,12 +543,13 @@ export function AccountGroupCancelCard({
   upNext?: string | null;
 }) {
   const titleId = useId();
-  const count = review.unfinished_rows.length;
+  const count = review.unfinished_count ?? review.unfinished_rows.length;
+  const unlisted = count - review.unfinished_rows.length;
   return (
     <AttentionTray
       aria-label="Cancel review"
       aria-describedby={titleId}
-      title={`Stop ${plural(count, "account run")} that ${count === 1 ? "has" : "have"} not finished?`}
+      title={`Stop ${plural(count, "run")} that ${count === 1 ? "has" : "have"} not finished?`}
       titleId={titleId}
       wrapTitle
       collapsedTitle={`Copilot is waiting on your answer about stopping ${plural(count, "run")}`}
@@ -485,8 +560,11 @@ export function AccountGroupCancelCard({
     >
       <div className="flex min-h-0 flex-col gap-2 overflow-y-auto px-3 pb-2.5 pt-1 text-xs">
         <p className="text-muted-foreground">
-          Stopping cancels every run listed here. A run already in progress may
-          have acted before it stops. Finished runs keep their results.
+          {unlisted > 0
+            ? "Stopping cancels every run of this group that has not finished."
+            : "Stopping cancels every run listed here."}{" "}
+          A run already in progress may have acted before it stops. Finished
+          runs keep their results.
         </p>
         <ul className="flex flex-col gap-1">
           {review.unfinished_rows.map((row) => (
@@ -498,6 +576,11 @@ export function AccountGroupCancelCard({
               </span>
             </li>
           ))}
+          {unlisted > 0 ? (
+            <li className="text-muted-foreground">
+              and {plural(unlisted, "more run")}
+            </li>
+          ) : null}
         </ul>
       </div>
       <div

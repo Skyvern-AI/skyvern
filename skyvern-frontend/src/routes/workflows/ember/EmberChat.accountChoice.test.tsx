@@ -509,7 +509,9 @@ describe("EmberChat connected account choices", () => {
     );
     expect(screen.queryByText("goac_1")).toBeNull();
     expect(
-      screen.getByText("Selected Google Sheets — Connection …goac_1"),
+      screen.getByText(
+        "Selected \u2068Google Sheets\u2069 — Connection …goac_1",
+      ),
     ).toBeTruthy();
     expect(screen.getByText("Selected")).toBeTruthy();
   });
@@ -871,7 +873,9 @@ describe("EmberChat connected account choices", () => {
     // must resolve across it — the transcript must never expose the raw id.
     await waitFor(() =>
       expect(
-        screen.getByText("Selected Google Sheets — Connection …goac_1"),
+        screen.getByText(
+          "Selected \u2068Google Sheets\u2069 — Connection …goac_1",
+        ),
       ).toBeTruthy(),
     );
     expect(screen.queryByText("goac_1")).toBeNull();

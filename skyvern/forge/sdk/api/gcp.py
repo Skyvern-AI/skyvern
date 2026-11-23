@@ -77,7 +77,7 @@ class AsyncGcsStorageClient(Protocol):
     async def create_signed_urls(
         self,
         uris: list[str],
-        expiry_hours: int = 24,
+        expiry_seconds: int = 24 * 60 * 60,
         attachment_filenames: list[str | None] | None = None,
         inline_content_type: str | None = None,
     ) -> list[str] | None:

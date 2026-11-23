@@ -139,16 +139,15 @@ async def test_normal_select_shadow_disagreement_emits_rich_fields(
     event = logs[0]
     assert event["match_found"] is True
     assert event["match_agrees_with_llm"] is False
-    assert event["target_value"] == "Years"
+    assert event["target_value_length"] == len("Years")
     assert event["matched_index"] == 0
-    assert event["matched_label"] == "Years"
-    assert event["matched_value"] == "years"
+    assert event["matched_label_length"] == len("Years")
+    assert event["matched_value_length"] == len("years")
     assert event["llm_index"] == 1
-    assert event["llm_value"] == "months"
-    assert event["normalized_target_value"] == "years"
-    assert event["normalized_matched_label"] == "years"
-    assert event["normalized_matched_value"] == "years"
-    assert event["normalized_llm_value"] == "months"
+    assert event["llm_value_length"] == len("months")
+    assert event["llm_value_equals_matched_label_normalized"] is False
+    assert event["llm_value_equals_matched_value_normalized"] is False
+    assert not {"Years", "years", "months"} & {value for value in event.values() if isinstance(value, str)}
     assert "matched_element_id" not in event
     assert "llm_element_id" not in event
 
@@ -170,22 +169,20 @@ async def test_normal_select_agreement_stays_lean(
     for lean_only in (
         "target_value",
         "matched_index",
-        "matched_label",
-        "matched_value",
+        "matched_label_length",
+        "matched_value_length",
         "matched_element_id",
         "llm_index",
-        "llm_value",
+        "llm_value_length",
         "llm_element_id",
-        "normalized_target_value",
-        "normalized_matched_label",
-        "normalized_matched_value",
-        "normalized_llm_value",
+        "llm_value_equals_matched_label_normalized",
+        "llm_value_equals_matched_value_normalized",
     ):
         assert lean_only not in event
 
 
 @pytest.mark.asyncio
-async def test_normal_select_disagreement_truncates_free_text_fields(
+async def test_normal_select_disagreement_logs_option_lengths_not_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     long_target = "  " + "A’   B " * 40
@@ -203,20 +200,12 @@ async def test_normal_select_disagreement_truncates_free_text_fields(
 
     assert len(logs) == 1
     event = logs[0]
-    bound = handler.SELECT_SHADOW_MATCH_FIELD_MAX_CHARS
     assert event["match_agrees_with_llm"] is False
-    for field in ("target_value", "matched_label", "matched_value", "llm_value"):
-        value = event[field]
-        assert isinstance(value, str)
-        assert len(value) == bound + 1
-        assert value.endswith("…")
-    for field, raw_value in (
-        ("normalized_target_value", long_target),
-        ("normalized_matched_label", long_target),
-        ("normalized_matched_value", long_option),
-        ("normalized_llm_value", long_llm_value),
-    ):
-        assert event[field] == handler._truncate_select_shadow_field(handler._normalize_select_shadow_text(raw_value))
+    assert event["target_value_length"] == len(long_target)
+    assert isinstance(event["matched_label_length"], int)
+    assert isinstance(event["matched_value_length"], int)
+    assert event["llm_value_length"] == len(long_llm_value)
+    assert not any(isinstance(value, str) and ("’" in value) for value in event.values())
 
 
 @pytest.mark.asyncio
@@ -287,7 +276,7 @@ async def test_non_string_llm_values_are_coerced_not_dropped(
     assert len(logs) == 1
     event = logs[0]
     assert event["match_agrees_with_llm"] is False
-    assert event["llm_value"] == "2024"
+    assert event["llm_value_length"] == len("2024")
 
 
 def test_select_shadow_agreement_coerces_malformed_llm_fields() -> None:
@@ -479,8 +468,8 @@ async def test_auto_completion_call_path_forwards_committed_value_to_shadow_matc
     assert event["prompt_name"] == "auto-completion-choose-option"
     assert event["match_agrees_with_llm"] is expected_agrees
     if not expected_agrees:
-        assert event["normalized_matched_label"] == "committed value"
-        assert event["normalized_llm_value"] == "different value"
+        assert event["matched_label_length"] == len("committed value")
+        assert event["llm_value_equals_matched_label_normalized"] is False
 
 
 @pytest.mark.asyncio
@@ -743,7 +732,6 @@ async def _run_outcome_case(
     monkeypatch: pytest.MonkeyPatch,
     case: str,
     *,
-    family_enabled: bool = True,
     assigned: bool = False,
     execute: bool = True,
     entry_action_type: str = "select_option",
@@ -752,13 +740,8 @@ async def _run_outcome_case(
     select_depth: int = 0,
 ) -> tuple[object, dict[str, object] | None, SimpleNamespace, AsyncMock, AsyncMock]:
     handler._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
-    family = (
-        AsyncMock(side_effect=RuntimeError("gate")) if case == "gate_error" else AsyncMock(return_value=family_enabled)
-    )
-    provider = SimpleNamespace(
-        is_feature_enabled_cached=family,
-        resolve_feature_enabled_unrecorded=AsyncMock(return_value=assigned),
-    )
+    umbrella = AsyncMock(side_effect=RuntimeError("gate")) if case == "gate_error" else AsyncMock(return_value=assigned)
+    provider = SimpleNamespace(resolve_feature_enabled_unrecorded=umbrella)
     resolution = SimpleNamespace(
         fallback_to_llm=case == "no_match",
         matched_index=None if case == "no_match" else 2 if case == "bad_index" else 0,
@@ -1082,94 +1065,6 @@ async def test_click_ingress_routes_no_target_and_emits_nothing(monkeypatch: pyt
     assert [log for log in logs if log.get("event") == "custom_select_family_outcome"] == []
 
 
-@pytest.mark.asyncio
-async def test_outcome_event_once_per_dropdown_level_with_group_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    handler._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
-    monkeypatch.setattr(
-        handler.app,
-        "EXPERIMENTATION_PROVIDER",
-        SimpleNamespace(
-            is_feature_enabled_cached=AsyncMock(return_value=True),
-            resolve_feature_enabled_unrecorded=AsyncMock(return_value=False),
-        ),
-    )
-    monkeypatch.setattr(
-        handler.app,
-        "AGENT_FUNCTION",
-        SimpleNamespace(
-            resolve_field_option=AsyncMock(
-                return_value=SimpleNamespace(
-                    fallback_to_llm=False,
-                    matched_index=0,
-                    matched_label="Choice",
-                    matched_tier="exact",
-                )
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        handler.app,
-        "CUSTOM_SELECT_AGENT_LLM_API_HANDLER",
-        AsyncMock(return_value={"id": "matched-id", "value": "Choice", "action_type": "input_text"}),
-    )
-    monkeypatch.setattr(handler.prompt_engine, "load_prompt", Mock(return_value="prompt"))
-    monkeypatch.setattr(handler, "get_input_value", AsyncMock(return_value=""))
-    monkeypatch.setattr(
-        handler, "get_actual_value_of_parameter_if_secret_with_task", Mock(side_effect=lambda _, value: value)
-    )
-
-    dropdown = MagicMock(
-        get_element_handler=AsyncMock(return_value=MagicMock()),
-        get_locator=Mock(return_value=MagicMock(count=AsyncMock(return_value=1))),
-    )
-    input_element = MagicMock(
-        get_tag_name=Mock(return_value="input"),
-        get_locator=Mock(return_value=MagicMock()),
-        scroll_into_view=AsyncMock(),
-        is_readonly=AsyncMock(return_value=False),
-        input_clear=AsyncMock(),
-        input_sequentially=AsyncMock(),
-    )
-    skyvern_frame = MagicMock(
-        safe_wait_for_animation_end=AsyncMock(),
-        get_element_scrollable=AsyncMock(return_value=False),
-        get_element_visible=AsyncMock(return_value=True),
-    )
-    incremental_scraped = MagicMock(get_incremental_element_tree=AsyncMock(return_value=[_SHADOW_OPTION]))
-    incremental_scraped.build_element_tree.return_value = "<div>Choice</div>"
-    monkeypatch.setattr(handler, "try_to_find_potential_scrollable_element", AsyncMock(return_value=dropdown))
-    monkeypatch.setattr(handler.SkyvernElement, "create_from_incremental", AsyncMock(return_value=input_element))
-
-    action = SelectOptionAction(
-        element_id="field-id",
-        option=SelectOption(label="Choice"),
-        input_or_select_context=InputOrSelectContext(field="Field"),
-    )
-    with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
-        with structlog.testing.capture_logs() as logs:
-            await handler.sequentially_select_from_dropdown(
-                action=action,
-                input_or_select_context=InputOrSelectContext(field="Field"),
-                page=MagicMock(),
-                dom=MagicMock(),
-                skyvern_element=MagicMock(),
-                skyvern_frame=skyvern_frame,
-                incremental_scraped=incremental_scraped,
-                step=SimpleNamespace(step_id="step"),
-                task=_OUTCOME_TASK,
-                dropdown_menu_element=dropdown,
-                force_select=True,
-                target_value="Choice",
-            )
-
-    events = [log for log in logs if log.get("event") == "custom_select_family_outcome"]
-    assert len(events) == 3
-    assert [event["outcome"] for event in events] == ["llm_fallback_control"] * 3
-    assert events[0]["selection_group_id"]
-    assert len({event["selection_group_id"] for event in events}) == 1
-    assert [event["select_depth"] for event in events] == [0, 1, 2]
-
-
 async def _run_post_reset_fallback_case(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1311,29 +1206,6 @@ async def test_post_reset_llm_failure_emits_single_terminal_outcome(
 
 
 @pytest.mark.asyncio
-async def test_post_reset_restored_text_is_retyped_and_emits_single_proceeded_outcome(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    result, events, input_element, reset_locator, raised, _ = await _run_post_reset_fallback_case(
-        monkeypatch,
-        llm_response={"id": "matched-id", "value": "Committed Value", "action_type": "input_text"},
-    )
-
-    assert raised is None
-    assert isinstance(result.action_result, handler.ActionSuccess)
-    input_element.input_clear.assert_awaited_once()
-    input_element.input_sequentially.assert_awaited_once_with("Committed Value")
-    assert [c.args for c in reset_locator.fill.await_args_list] == [("",), ("Committed Value",)]
-    assert [event["outcome"] for event in events] == ["llm_fallback_reset_verified"]
-    assert events[0]["entry_action_type"] == "input_text"
-    assert events[0]["selection_group_id"] == "group-1"
-    assert events[0]["select_depth"] == 0
-    assert events[0]["family_gate_enabled"] is True
-    assert events[0]["assigned"] is True
-    assert events[0]["llm_fallback_requested"] is True
-
-
-@pytest.mark.asyncio
 async def test_select_option_reset_path_matches_main(monkeypatch: pytest.MonkeyPatch) -> None:
     llm_error = RuntimeError("fallback failed")
     result, events, _, reset_locator, raised, get_input_value_mock = await _run_post_reset_fallback_case(
@@ -1382,16 +1254,6 @@ async def test_unreadable_anchor_before_click_falls_back_without_clicking(monkey
 
 
 @pytest.mark.asyncio
-async def test_outcome_event_family_off_emits_without_assignment_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, event, provider, resolver, _ = await _run_outcome_case(monkeypatch, "family_off", family_enabled=False)
-    assert event is not None
-    assert event["outcome"] == "llm_fallback_family_off"
-    assert (event["assigned"], event["eligible"], event["match_tier"]) == (None, True, "exact")
-    provider.resolve_feature_enabled_unrecorded.assert_not_awaited()
-    resolver.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_outcome_event_key_allowlist_and_enum(monkeypatch: pytest.MonkeyPatch) -> None:
     _, event, _, _, _ = await _run_outcome_case(monkeypatch, "control")
     assert event is not None
@@ -1426,19 +1288,13 @@ async def test_outcome_event_gate_error_fields(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("case", "family_enabled", "assigned"),
-    [
-        (case, family, assigned)
-        for case in ("walker_error", "matcher_error")
-        for family, assigned in ((False, False), (True, False), (True, True))
-    ],
+    ("case", "assigned"),
+    [(case, assigned) for case in ("walker_error", "matcher_error") for assigned in (False, True)],
 )
 async def test_outcome_event_eval_error_emits_on_all_arms(
-    monkeypatch: pytest.MonkeyPatch, case: str, family_enabled: bool, assigned: bool
+    monkeypatch: pytest.MonkeyPatch, case: str, assigned: bool
 ) -> None:
-    result, event, _, _, _ = await _run_outcome_case(
-        monkeypatch, case, family_enabled=family_enabled, assigned=assigned
-    )
+    result, event, _, _, _ = await _run_outcome_case(monkeypatch, case, assigned=assigned)
     assert event is not None
     assert result is None
     assert event["outcome"] == "llm_fallback_eval_error"
@@ -1446,38 +1302,36 @@ async def test_outcome_event_eval_error_emits_on_all_arms(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("case", "family_enabled", "assigned", "outcome", "click_attempted", "return_shape"),
+    ("case", "assigned", "outcome", "click_attempted", "return_shape"),
     [
-        ("no_target", True, True, None, False, "none"),
-        ("date_related", True, True, None, False, "none"),
-        ("no_options", True, True, None, False, "none"),
-        ("gate_error", True, True, "llm_fallback_gate_error", False, "none"),
-        ("walker_error", True, True, "llm_fallback_eval_error", False, "none"),
-        ("matcher_error", True, True, "llm_fallback_eval_error", False, "none"),
-        ("family_off", False, True, "llm_fallback_family_off", False, "none"),
-        ("control", True, False, "llm_fallback_control", False, "none"),
-        ("no_match", True, True, "llm_fallback_no_match", False, "none"),
-        ("bad_index", True, True, "llm_fallback_match_unactionable", False, "none"),
-        ("stem", True, True, "llm_fallback_tier_excluded", False, "none"),
-        ("execution_disabled", True, True, "llm_fallback_execution_disabled", False, "none"),
-        ("no_element_id", True, True, "llm_fallback_match_unactionable", False, "none"),
-        ("listbox", True, True, "llm_fallback_match_unactionable", False, "none"),
-        ("pre_click", True, True, "llm_fallback_pre_click_error", False, "none"),
-        ("precommit_matched", True, True, "success_precommit", False, "success"),
-        ("precommit_scope", True, True, "success_precommit", False, "success"),
-        ("verified", True, True, "success_verified", True, "success"),
-        ("disabled_click", True, True, "llm_fallback_pre_click_error", True, "none"),
-        ("post_click", True, True, "terminal_post_click_exception", True, "failure"),
-        ("reset_ok", True, True, "llm_fallback_reset_verified", True, "none"),
-        ("reset_failed", True, True, "terminal_unverified_reset", True, "failure"),
-        ("nonchoice", True, True, "terminal_unverified_click", True, "failure"),
-        ("toggle", True, True, "terminal_unverified_toggle", True, "failure"),
+        ("no_target", True, None, False, "none"),
+        ("date_related", True, None, False, "none"),
+        ("no_options", True, None, False, "none"),
+        ("gate_error", True, "llm_fallback_gate_error", False, "none"),
+        ("walker_error", True, "llm_fallback_eval_error", False, "none"),
+        ("matcher_error", True, "llm_fallback_eval_error", False, "none"),
+        ("control", False, "llm_fallback_control", False, "none"),
+        ("no_match", True, "llm_fallback_no_match", False, "none"),
+        ("bad_index", True, "llm_fallback_match_unactionable", False, "none"),
+        ("stem", True, "llm_fallback_tier_excluded", False, "none"),
+        ("execution_disabled", True, "llm_fallback_execution_disabled", False, "none"),
+        ("no_element_id", True, "llm_fallback_match_unactionable", False, "none"),
+        ("listbox", True, "llm_fallback_match_unactionable", False, "none"),
+        ("pre_click", True, "llm_fallback_pre_click_error", False, "none"),
+        ("precommit_matched", True, "success_precommit", False, "success"),
+        ("precommit_scope", True, "success_precommit", False, "success"),
+        ("verified", True, "success_verified", True, "success"),
+        ("disabled_click", True, "llm_fallback_pre_click_error", True, "none"),
+        ("post_click", True, "terminal_post_click_exception", True, "failure"),
+        ("reset_ok", True, "llm_fallback_reset_verified", True, "none"),
+        ("reset_failed", True, "terminal_unverified_reset", True, "failure"),
+        ("nonchoice", True, "terminal_unverified_click", True, "failure"),
+        ("toggle", True, "terminal_unverified_toggle", True, "failure"),
     ],
 )
 async def test_deterministic_custom_select_exit_matrix(
     monkeypatch: pytest.MonkeyPatch,
     case: str,
-    family_enabled: bool,
     assigned: bool,
     outcome: str | None,
     click_attempted: bool,
@@ -1486,7 +1340,6 @@ async def test_deterministic_custom_select_exit_matrix(
     result, event, _, _, get_skyvern_element = await _run_outcome_case(
         monkeypatch,
         case,
-        family_enabled=family_enabled,
         assigned=assigned,
     )
 

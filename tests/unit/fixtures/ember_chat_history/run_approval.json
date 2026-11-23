@@ -1,0 +1,497 @@
+{
+ "pending_credential_requests": [],
+ "question_interactions": [
+  {
+   "interaction_id": "4f0b28615bb745dfa18df47613a70c38",
+   "turn_id": "a705cc1f46c647c782c4d3c5a9177298",
+   "tool_call_id": "toolu_011jq15xskQPuifXL6VejAzr",
+   "parts": [],
+   "status": "pending",
+   "response": null,
+   "created_at": "2026-11-14T11:37:27.444092Z",
+   "resolved_at": null,
+   "account_group_review": {
+    "workflow_permanent_id": "wpid_596877912165800228",
+    "workflow_id": "w_596877912165800226",
+    "version": 1,
+    "workflow_title": "Extract main heading from example.com",
+    "modified_at": "2026-11-14T11:11:11.420942",
+    "definition_hash": "36faea5e3e99739ceb8aef1c62957a8139164c0d0a0383a28dea01deac18a4f6",
+    "credential_parameter_key": "",
+    "action_summary": "Run the \"Extract main heading from example.com\" agent once. It opens https://example.com and returns the heading, source, paragraph, title and link texts.",
+    "common_inputs": {},
+    "single_run": true,
+    "saves_draft": true,
+    "proposal_owner_turn_id": "a42b48b9c40d4898b00bd0b79f20f0d7",
+    "proposal_revision": 3,
+    "cost": {
+     "credits_note": "Custom enterprise billing, so credit counters do not apply.",
+     "stop_rule": "Nothing stops these runs except Stop."
+    },
+    "clean_group_run_id": null,
+    "credential_parameter_used_by": [],
+    "rows": [],
+    "workflow_run_group_id": null
+   }
+  }
+ ],
+ "pending_question_cancel_token": "a2919fed-dd70-4411-beb6-0200c4b355f7",
+ "workflow_copilot_chat_id": "wcc_596877912165800232",
+ "request_turn_id": null,
+ "request_browser_allocations": null,
+ "in_flight_turn": {
+  "turn_id": "a705cc1f46c647c782c4d3c5a9177298",
+  "cancel_token": "a2919fed-dd70-4411-beb6-0200c4b355f7",
+  "latest_draft": null,
+  "latest_draft_at": null,
+  "steer_messages": [],
+  "narrative": {
+   "turnId": "a705cc1f46c647c782c4d3c5a9177298",
+   "turnIndex": 3,
+   "designStarted": true,
+   "designEnded": false,
+   "draft": null,
+   "blocks": [],
+   "terminal": "running",
+   "terminalMessage": null,
+   "narrativeSummary": null,
+   "priorBlockCount": 1,
+   "designActivity": [
+    {
+     "kind": "tool_call",
+     "text": "Reviewing the run with you\u2026",
+     "iteration": 0,
+     "toolName": "run_saved_workflow",
+     "displayLabel": "Reviewing the run with you",
+     "reason": "Starting one real run of the agent, as you asked.",
+     "activityStartedAt": "2026-11-14T11:37:27.359984+00:00",
+     "activityBucket": {
+      "kind": "design"
+     },
+     "id": "tc-toolu_011jq15xskQPuifXL6VejAzr",
+     "timestamp": "2026-11-14T11:37:27.359984+00:00"
+    }
+   ],
+   "startedAt": "2026-11-14T11:37:24.576396+00:00",
+   "endedAt": null,
+   "browserSessionId": null,
+   "pausedFor": "question"
+  }
+ },
+ "chat_history": [
+  {
+   "workflow_copilot_chat_message_id": "wccm_596878431856843278",
+   "sender": "ai",
+   "content": "Stopped. Before the stop, I changed extract_main_heading. The untested draft from this turn was preserved for review. Accept it to save, or discard.",
+   "turn_id": "a42b48b9c40d4898b00bd0b79f20f0d7",
+   "feedback": null,
+   "audio_artifact_id": null,
+   "attached_files": [],
+   "turn_outcome": {
+    "response_kind": "recover",
+    "reason_code": "",
+    "output_policy_reasons": [],
+    "actuation_obligation_key": "",
+    "normalized_reply_signature": "e4a6a0577479b2b4",
+    "tool_calls": [
+     "navigate_browser",
+     "evaluate",
+     "edit_block"
+    ],
+    "terminal_reason": "cancel",
+    "budget_expired": false,
+    "budget_expiry_source": null,
+    "budget_expiry_report_produced": null,
+    "budget_expiry_staged_draft_id": null,
+    "drain_fingerprint": null,
+    "cancel_source": "api",
+    "blocked_signatures": [],
+    "copilot_runtime": "agent",
+    "copilot_effective_mode": null,
+    "copilot_code_available": true,
+    "copilot_last_code_build_failed": false,
+    "copilot_pending_capability": null,
+    "copilot_turn_id": "a42b48b9c40d4898b00bd0b79f20f0d7",
+    "user_message_id": "wccm_596878358842399220",
+    "request_cancel_token": "d9099722-fbe5-4faa-ba0a-de587c0c1d27",
+    "request_browser_allocations": null,
+    "interrupted_row_final": false,
+    "idempotency_digest": null,
+    "connected_account_choices": null,
+    "output_files": null
+   },
+   "narrative_payload": {
+    "turnId": "a42b48b9c40d4898b00bd0b79f20f0d7",
+    "turnIndex": 2,
+    "designStarted": true,
+    "designEnded": true,
+    "draft": {
+     "blockCount": 1,
+     "blockLabels": [
+      "extract_main_heading"
+     ],
+     "summary": null
+    },
+    "blocks": [],
+    "terminal": "error",
+    "terminalMessage": "Stopped. Before the stop, I changed extract_main_heading. The untested draft from this turn was preserved for review. Accept it to save, or discard.",
+    "narrativeSummary": "Stopped. Before the stop, I changed extract_main_heading. The untested draft from this turn was preserved for review. Accept it to save, or discard.",
+    "priorBlockCount": 1,
+    "designActivity": [
+     {
+      "kind": "tool_call",
+      "text": "Opening page\u2026",
+      "iteration": 0,
+      "toolName": "navigate_browser",
+      "displayLabel": "Opening page",
+      "id": "tc-toolu_017BS1V8RSR4642T7DtfykzN",
+      "timestamp": "2026-11-14T11:12:55.971506+00:00",
+      "reason": "Open the page to see which links it has.",
+      "activityStartedAt": "2026-11-14T11:12:55.971506+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_result",
+      "text": "Navigated to https://example.com/",
+      "iteration": 0,
+      "toolName": "navigate_browser",
+      "displayLabel": "Opening page",
+      "success": true,
+      "id": "tr-toolu_017BS1V8RSR4642T7DtfykzN",
+      "timestamp": "2026-11-14T11:12:58.280993+00:00",
+      "reason": "Open the page to see which links it has.",
+      "activityStartedAt": "2026-11-14T11:12:55.971506+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_call",
+      "text": "Inspecting page\u2026",
+      "iteration": 1,
+      "toolName": "evaluate",
+      "displayLabel": "Inspecting page",
+      "id": "tc-toolu_01Dz8QK8uvKpSyQEtVURbRy2",
+      "timestamp": "2026-11-14T11:13:00.099485+00:00",
+      "reason": "Read the links present on the page.",
+      "activityStartedAt": "2026-11-14T11:13:00.099485+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_result",
+      "text": "Inspecting page",
+      "iteration": 1,
+      "toolName": "evaluate",
+      "displayLabel": "Inspecting page",
+      "success": true,
+      "id": "tr-toolu_01Dz8QK8uvKpSyQEtVURbRy2",
+      "timestamp": "2026-11-14T11:13:00.216953+00:00",
+      "reason": "Read the links present on the page.",
+      "activityStartedAt": "2026-11-14T11:13:00.099485+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_call",
+      "text": "Editing block \"Extract Main Heading\"\u2026",
+      "iteration": 2,
+      "toolName": "edit_block",
+      "displayLabel": "Editing block \"Extract Main Heading\"",
+      "id": "tc-toolu_018QRAJL28kW32s7u61ubTH1",
+      "timestamp": "2026-11-14T11:13:04.437415+00:00",
+      "reason": "Add the links field to the block's description and output schema.",
+      "activityStartedAt": "2026-11-14T11:13:04.437415+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_result",
+      "text": "Editing block \"Extract Main Heading\"",
+      "iteration": 2,
+      "toolName": "edit_block",
+      "displayLabel": "Editing block \"Extract Main Heading\"",
+      "success": true,
+      "id": "tr-toolu_018QRAJL28kW32s7u61ubTH1",
+      "timestamp": "2026-11-14T11:13:04.578578+00:00",
+      "reason": "Add the links field to the block's description and output schema.",
+      "activityStartedAt": "2026-11-14T11:13:04.437415+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_call",
+      "text": "Editing and testing block \"Extract Main Heading\"\u2026",
+      "iteration": 3,
+      "toolName": "edit_block_and_run",
+      "displayLabel": "Editing and testing block \"Extract Main Heading\"",
+      "id": "tc-toolu_01GPXE76VYmsxgWnKx3huQKH",
+      "timestamp": "2026-11-14T11:13:07.535048+00:00",
+      "reason": "Add link-text collection to the code and run it end to end.",
+      "activityStartedAt": "2026-11-14T11:13:07.535048+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     }
+    ],
+    "startedAt": "2026-11-14T11:12:53.840389+00:00",
+    "endedAt": "2026-11-14T11:13:08.685616+00:00",
+    "screenshots": [
+     {
+      "artifactId": "a_596878384612203002",
+      "capturedAt": "2026-11-14T11:12:58.263991+00:00",
+      "toolCallId": "toolu_017BS1V8RSR4642T7DtfykzN"
+     }
+    ],
+    "testedBlockFingerprints": {
+     "extract_main_heading": [
+      "023829966b0d2cefe87f25aebfc510fc9c5c6822c03e02b9696353cf0b6bbd0d",
+      "b560f97e9c7a4f02521eb8e1ea962cbeb15f5259456f814b6b2df605d5f2ccbb",
+      "b84457a74ee926ecffa8833ce6c9e09873ad0df04814bc4e4ece7bd7ed32415e"
+     ]
+    },
+    "review": {
+     "blocks": [
+      {
+       "label": "extract_main_heading",
+       "blockType": "code",
+       "change": "added",
+       "neverTested": true,
+       "coverage": "different_source"
+      }
+     ],
+     "duplicateWrites": [],
+     "inputs": []
+    },
+    "responseType": "REPLY",
+    "proposalDisposition": "review_untested",
+    "responseKind": "recover",
+    "turnFacts": {
+     "factsAvailable": true,
+     "evaluationState": null,
+     "runId": null,
+     "runCompleted": null,
+     "terminalCause": null,
+     "blocksRunThisTurn": 0,
+     "recordedFailure": null,
+     "ranCleanOnCurrentSource": false,
+     "authoredBlockCount": 1,
+     "matchingSourceBlockCount": 0,
+     "editedBlockLabels": [
+      "extract_main_heading"
+     ]
+    },
+    "cancelled": true
+   },
+   "created_at": "2026-11-14T11:13:09.172223",
+   "modified_at": "2026-11-14T11:13:09.172225",
+   "ember_chat_message_id": "wccm_596878431856843278"
+  },
+  {
+   "workflow_copilot_chat_message_id": "wccm_596884678907479516",
+   "sender": "user",
+   "content": "Run this workflow once now.",
+   "turn_id": "a705cc1f46c647c782c4d3c5a9177298",
+   "feedback": null,
+   "audio_artifact_id": null,
+   "attached_files": [],
+   "turn_outcome": null,
+   "narrative_payload": null,
+   "created_at": "2026-11-14T11:37:23.167824",
+   "modified_at": "2026-11-14T11:37:24.574764",
+   "ember_chat_message_id": "wccm_596884678907479516"
+  }
+ ],
+ "workflow_permanent_id": "wpid_596877912165800228",
+ "app_url": "http://localhost:8080",
+ "accepted_turn_ids": [],
+ "proposed_workflow": {
+  "workflow_id": "w_596877912165800226",
+  "organization_id": "o_596691277976876550",
+  "title": "Extract main heading from example.com",
+  "workflow_permanent_id": "wpid_596877912165800228",
+  "version": 1,
+  "is_saved_task": false,
+  "is_template": false,
+  "description": "",
+  "workflow_definition": {
+   "version": 1,
+   "parameters": [
+    {
+     "parameter_type": "output",
+     "key": "extract_main_heading_output",
+     "description": "Output parameter for block extract_main_heading",
+     "output_parameter_id": "op_596878423266908678",
+     "workflow_id": "w_596877912165800226",
+     "created_at": "2026-11-14T11:13:07.618659",
+     "modified_at": "2026-11-14T11:13:07.618662",
+     "deleted_at": null
+    }
+   ],
+   "blocks": [
+    {
+     "label": "extract_main_heading",
+     "next_block_label": null,
+     "block_type": "code",
+     "output_parameter": {
+      "parameter_type": "output",
+      "key": "extract_main_heading_output",
+      "description": "Output parameter for block extract_main_heading",
+      "output_parameter_id": "op_596878423266908678",
+      "workflow_id": "w_596877912165800226",
+      "created_at": "2026-11-14T11:13:07.618659",
+      "modified_at": "2026-11-14T11:13:07.618662",
+      "deleted_at": null
+     },
+     "continue_on_failure": false,
+     "model": null,
+     "disable_cache": false,
+     "ignore_workflow_system_prompt": false,
+     "next_loop_on_failure": false,
+     "code": "await page.goto(\"https://example.com\")\nawait page.wait_for_selector(\"body p\")\nh1 = page.locator(\"h1\")\nif await h1.count() > 0:\n    heading = (await h1.first.inner_text()).strip()\n    source = \"h1\"\nelse:\n    heading = (await page.locator(\"p\").first.inner_text()).strip()\n    source = \"first_paragraph\"\nparagraph = (await page.locator(\"p\").first.inner_text()).strip()\ntitle = await page.title()\nlink_texts = await page.locator(\"a\").all_inner_texts()\nlinks = [t.strip() for t in link_texts if t.strip()]\nreturn {\"heading\": heading, \"source\": source, \"paragraph\": paragraph, \"title\": title, \"links\": links}",
+     "parameters": [],
+     "error_code_mapping": null,
+     "prompt": "The example.com page is open, its main heading text is returned as heading, the first paragraph of the page is returned as paragraph, the browser tab title is returned as title, and the visible text of every link on the page is returned as links. The block opens https://example.com, waits for the page body text to render, reads the first h1 if one exists (otherwise the first paragraph), separately reads the first p element on the page, and collects the text of every a element.",
+     "steps": [
+      {
+       "description": "Open https://example.com",
+       "action_type": "goto_url",
+       "line_start": 1,
+       "line_end": 1
+      },
+      {
+       "description": "Extract heading",
+       "action_type": "extract",
+       "line_start": 5,
+       "line_end": 8
+      },
+      {
+       "description": "Extract paragraph",
+       "action_type": "extract",
+       "line_start": 10,
+       "line_end": 10
+      },
+      {
+       "description": "Extract link texts",
+       "action_type": "extract",
+       "line_start": 12,
+       "line_end": 12
+      }
+     ],
+     "data_schema": {
+      "type": "object",
+      "properties": {
+       "heading": {
+        "type": "string"
+       },
+       "source": {
+        "type": "string"
+       },
+       "paragraph": {
+        "type": "string"
+       },
+       "title": {
+        "type": "string"
+       },
+       "links": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "heading",
+       "paragraph",
+       "links"
+      ]
+     },
+     "user_owned_goal": null,
+     "goal_needs_regeneration": null,
+     "code_edited_by_hand": null
+    }
+   ],
+   "finally_block_label": null,
+   "error_code_mapping": null,
+   "retry_policy": null,
+   "workflow_system_prompt": null,
+   "completion_contract": null
+  },
+  "persist_browser_session": false,
+  "reuse_browser_session": false,
+  "mask_secrets": false,
+  "pin_saved_session_ip": false,
+  "browser_profile_id": null,
+  "browser_profile_key": null,
+  "model": null,
+  "status": "published",
+  "max_screenshot_scrolls": null,
+  "max_elapsed_time_minutes": null,
+  "run_with": "agent",
+  "browser_type": null,
+  "ai_fallback": true,
+  "cache_key": "default",
+  "adaptive_caching": false,
+  "enable_self_healing": false,
+  "code_version": 2,
+  "generate_script_on_terminal": false,
+  "run_sequentially": false,
+  "sequential_key": null,
+  "folder_id": null,
+  "import_error": null,
+  "created_by": null,
+  "edited_by": null,
+  "build_source": null,
+  "copilot_authored": false,
+  "original_created_by": null,
+  "original_created_at": null,
+  "created_at": "2026-11-14T11:13:07.626303Z",
+  "modified_at": "2026-11-14T11:13:07.626303Z",
+  "deleted_at": null,
+  "agent_id": "wpid_596877912165800228",
+  "_copilot_yaml": "title: Extract main heading from example.com\nworkflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: extract_main_heading\n    prompt: The example.com page is open, its main heading text is returned as heading,\n      the first paragraph of the page is returned as paragraph, the browser tab title\n      is returned as title, and the visible text of every link on the page is returned\n      as links. The block opens https://example.com, waits for the page body text\n      to render, reads the first h1 if one exists (otherwise the first paragraph),\n      separately reads the first p element on the page, and collects the text of every\n      a element.\n    code: \"await page.goto(\\\"https://example.com\\\")\\nawait page.wait_for_selector(\\\"\\\n      body p\\\")\\nh1 = page.locator(\\\"h1\\\")\\nif await h1.count() > 0:\\n    heading\\\n      \\ = (await h1.first.inner_text()).strip()\\n    source = \\\"h1\\\"\\nelse:\\n    heading\\\n      \\ = (await page.locator(\\\"p\\\").first.inner_text()).strip()\\n    source = \\\"\\\n      first_paragraph\\\"\\nparagraph = (await page.locator(\\\"p\\\").first.inner_text()).strip()\\n\\\n      title = await page.title()\\nlink_texts = await page.locator(\\\"a\\\").all_inner_texts()\\n\\\n      links = [t.strip() for t in link_texts if t.strip()]\\nreturn {\\\"heading\\\": heading,\\\n      \\ \\\"source\\\": source, \\\"paragraph\\\": paragraph, \\\"title\\\": title, \\\"links\\\"\\\n      : links}\"\n    data_schema:\n      type: object\n      properties:\n        heading:\n          type: string\n        source:\n          type: string\n        paragraph:\n          type: string\n        title:\n          type: string\n        links:\n          type: array\n          items:\n            type: string\n      required:\n      - heading\n      - paragraph\n      - links\n    steps:\n    - description: Open https://example.com\n      action_type: goto_url\n      line_start: 1\n      line_end: 1\n    - description: Extract heading\n      action_type: extract\n      line_start: 5\n      line_end: 8\n    - description: Extract paragraph\n      action_type: extract\n      line_start: 10\n      line_end: 10\n    - description: Extract link texts\n      action_type: extract\n      line_start: 12\n      line_end: 12\n",
+  "_copilot_unvalidated": true,
+  "_copilot_tested_block_fingerprints": {
+   "extract_main_heading": [
+    "023829966b0d2cefe87f25aebfc510fc9c5c6822c03e02b9696353cf0b6bbd0d",
+    "b560f97e9c7a4f02521eb8e1ea962cbeb15f5259456f814b6b2df605d5f2ccbb",
+    "b84457a74ee926ecffa8833ce6c9e09873ad0df04814bc4e4ece7bd7ed32415e"
+   ]
+  },
+  "_copilot_proposal": {
+   "owner_turn_id": "a42b48b9c40d4898b00bd0b79f20f0d7",
+   "revision": 3,
+   "canonical_fingerprint": "fc9b68d5a9670ce8982a319102f70570b5112a050777f9b0bbc4ac0bf439307b",
+   "canonical_title": "Extract main heading from example.com",
+   "disposition": "review_untested",
+   "workflow_run_id": null,
+   "claimed_at": null
+  },
+  "proxy_location": null,
+  "webhook_callback_url": null,
+  "totp_verification_url": null,
+  "totp_identifier": null,
+  "extra_http_headers": null,
+  "cdp_connect_headers": null
+ },
+ "proposed_workflow_metadata": {
+  "owner_turn_id": "a42b48b9c40d4898b00bd0b79f20f0d7",
+  "revision": 3,
+  "canonical_fingerprint": "fc9b68d5a9670ce8982a319102f70570b5112a050777f9b0bbc4ac0bf439307b",
+  "canonical_title": "Extract main heading from example.com",
+  "disposition": "review_untested",
+  "workflow_run_id": null,
+  "claimed_at": null
+ },
+ "proposed_claim_expires_in_seconds": null,
+ "proposed_workflow_run": null,
+ "auto_accept": false,
+ "work_plan": [],
+ "ember_chat_id": "wcc_596877912165800232"
+}

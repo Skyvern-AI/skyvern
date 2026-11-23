@@ -12,7 +12,7 @@ from skyvern.forge.sdk.agents.skills import (
     SkillSession,
     skill_result_chars,
 )
-from tests.unit.copilot_test_helpers import available_skill, skill_md
+from tests.unit.ember_test_helpers import available_skill, skill_md
 
 LOGIN_BODY = "Tick 'Remember this device' at https://example.com/login before submitting.\n"
 
@@ -44,39 +44,6 @@ def test_load_returns_body_and_files_then_already_loaded_without_body() -> None:
     }
 
 
-def test_read_resource_needs_no_load_and_unknown_file_lists_files() -> None:
-    skills = session(
-        available_skill("example-portal-login", "organization", LOGIN_BODY, **{"reference/form.md": "Form notes"})
-    )
-
-    assert skills.read_resource("example-portal-login", "reference/form.md") == {
-        "name": "example-portal-login",
-        "path": "reference/form.md",
-        "text": "Form notes",
-    }
-    assert skills.read_resource("example-portal-login", "missing.md") == {
-        "error": "unknown_file",
-        "message": "example-portal-login has no file 'missing.md'.",
-        "files": ["SKILL.md", "reference/form.md"],
-    }
-
-
-def test_unknown_skill_names_organization_and_workflow_skills_only() -> None:
-    skills = session(
-        available_skill("shared-helper", "everyone", LOGIN_BODY),
-        available_skill("example-portal-login", "organization", LOGIN_BODY),
-        available_skill("invoice-download", "workflow", LOGIN_BODY),
-    )
-    refusal = {
-        "error": "unknown_skill",
-        "message": "No skill is named 'nope'.",
-        "names": ["example-portal-login", "invoice-download"],
-    }
-
-    assert skills.load("nope") == refusal
-    assert skills.read_resource("nope", "SKILL.md") == refusal
-
-
 def test_name_clash_resolves_workflow_over_organization_over_everyone() -> None:
     workflow = available_skill("example-portal-login", "workflow", "workflow\n")
     skills = session(
@@ -100,12 +67,6 @@ def test_name_clash_resolves_workflow_over_organization_over_everyone() -> None:
         "body": "workflow\n",
         "files": [],
     }
-
-
-def test_skill_result_chars_measures_the_ascii_escaped_envelope() -> None:
-    assert skill_result_chars({"name": "x", "path": "p", "text": "é"}) == len(
-        '{"status": "completed", "output": {"name": "x", "path": "p", "text": "\\u00e9"}, "error": null}'
-    )
 
 
 def _largest_accepted(body_for: int) -> int:

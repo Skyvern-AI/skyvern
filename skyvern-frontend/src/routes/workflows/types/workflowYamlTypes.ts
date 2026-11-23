@@ -5,6 +5,7 @@ import {
   CredentialFallbackTrigger,
   CredentialSelectionStrategy,
   EmailBodyFormat,
+  EmailOrganizeAction,
   EmailTransport,
   WorkflowBlockDocFields,
   WorkflowBlockType,
@@ -185,7 +186,8 @@ export type BlockYAML =
   | GoogleSheetsWriteBlockYAML
   | PowerBIQueryBlockYAML
   | PdfFillBlockYAML
-  | SplitPdfBlockYAML;
+  | SplitPdfBlockYAML
+  | IntegrationActionBlockYAML;
 
 export type BlockYAMLBase = WorkflowBlockDocFields & {
   block_type: WorkflowBlockType;
@@ -201,6 +203,7 @@ export type BlockYAMLBase = WorkflowBlockDocFields & {
 
 export type TaskBlockYAML = BlockYAMLBase & {
   block_type: "task";
+  complete_verification?: boolean;
   url: string | null;
   title?: string;
   navigation_goal: string | null;
@@ -267,6 +270,8 @@ export type DataExportBlockYAML = BlockYAMLBase & {
 
 export type ActionBlockYAML = BlockYAMLBase & {
   block_type: "action";
+  selector?: string | null;
+  ai_fallback?: "fallback" | "proactive";
   url: string | null;
   title?: string;
   navigation_goal: string | null;
@@ -284,6 +289,8 @@ export type ActionBlockYAML = BlockYAMLBase & {
 
 export type NavigationBlockYAML = BlockYAMLBase & {
   block_type: "navigation";
+  complete_verification?: boolean;
+  complete_criterion_is_untrusted?: boolean;
   url: string | null;
   title?: string;
   navigation_goal: string | null;
@@ -324,6 +331,8 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
 
 export type LoginBlockYAML = BlockYAMLBase & {
   block_type: "login";
+  complete_verification?: boolean;
+  skip_saved_profile?: boolean;
   url: string | null;
   title?: string;
   navigation_goal: string | null;
@@ -449,6 +458,7 @@ export type FileUploadBlockYAML = BlockYAMLBase & {
   azure_blob_container_name?: string | null;
   google_credential_id?: string | null;
   google_drive_folder_id?: string | null;
+  google_drive_save_as_sheet?: boolean;
   sftp_host?: string | null;
   sftp_port?: number | null;
   sftp_username?: string | null;
@@ -605,6 +615,8 @@ export type EmailInboxBlockYAML = BlockYAMLBase & {
   include_body: boolean;
   download_attachments: boolean;
   message_id?: string | null;
+  organize_action?: EmailOrganizeAction | null;
+  organize_label?: string | null;
   parameter_keys?: Array<string> | null;
 };
 
@@ -655,5 +667,14 @@ export type SplitPdfBlockYAML = BlockYAMLBase & {
   file_url: string;
   prompt: string;
   llm_key?: string | null;
+  parameter_keys?: Array<string> | null;
+};
+
+export type IntegrationActionBlockYAML = BlockYAMLBase & {
+  block_type: "integration_action";
+  integration_id: string;
+  action_id: string;
+  connection_id: string | null;
+  inputs: Record<string, unknown>;
   parameter_keys?: Array<string> | null;
 };

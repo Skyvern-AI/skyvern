@@ -9,7 +9,7 @@ import {
 
 describe("paneLabel", () => {
   test("non-run panes keep their registry label", () => {
-    expect(paneLabel("copilot")).toBe("Copilot");
+    expect(paneLabel("ember")).toBe("Copilot");
     expect(paneLabel("editor")).toBe("Editor");
     expect(paneLabel("browser")).toBe("Browser");
   });
@@ -21,7 +21,7 @@ describe("paneLabel", () => {
 
 describe("paneAccessibleName", () => {
   test("non-run panes match their visible label", () => {
-    expect(paneAccessibleName("copilot")).toBe("Copilot");
+    expect(paneAccessibleName("ember")).toBe("Copilot");
     expect(paneAccessibleName("browser")).toBe("Browser");
   });
 
@@ -46,7 +46,7 @@ describe("railLabel", () => {
   });
 
   test("other tabs match their pane's accessible name, ignoring the run id", () => {
-    expect(railLabel("copilot")).toBe("Copilot");
+    expect(railLabel("ember")).toBe("Copilot");
     expect(railLabel("editor")).toBe("Editor");
     expect(railLabel("browser", "wr_5538abcdef")).toBe("Browser");
   });

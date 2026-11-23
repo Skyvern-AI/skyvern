@@ -3,6 +3,7 @@ Utility functions for PDF parsing with fallback support.
 
 This module provides robust PDF parsing that tries pypdf first and falls back
 to pdfplumber if pypdf fails, ensuring maximum compatibility with various PDF formats.
+A page tree past pypdf's depth limit is first read again with pypdf in a capped child.
 For image-based/scanned PDFs where text extraction yields no content, pages can be
 rendered as images via render_pdf_pages_as_images for vision-LLM OCR. A text layer that
 is non-empty but glyph-scrambled needs the same OCR fallback; scrambled_text_layer_reason
@@ -12,18 +13,16 @@ identifies it.
 import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from types import FrameType
 from typing import Any, NamedTuple, TypeVar, TypeVarTuple, Unpack
 
 import structlog
-from pypdf import PdfReader, get_configuration
-from pypdf.errors import LimitReachedError
+from pypdf import PdfReader
 
-from skyvern.config import settings
 from skyvern.constants import FILE_PARSE_STEP_TIMEOUT_SECONDS, MAX_FILE_PARSE_INPUT_TOKENS, MAX_PDF_OCR_PAGES
 from skyvern.exceptions import PDFParsingError
-from skyvern.forge.sdk.utils import docx_child, pdfplumber_child
+from skyvern.forge.sdk.utils import docx_child, pdfplumber_child, pypdf_child
 from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError, run_in_capped_subprocess
+from skyvern.forge.sdk.utils.pypdf_limits import hit_pypdf_page_tree_depth_limit, hit_pypdf_size_limit
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.utils.token_counter import count_tokens
 
@@ -78,47 +77,6 @@ _MIN_ISOLATED_GLYPH_SHARE = 0.6
 # Non-Latin scripts are read as-is: their characters fall outside the ranges above, so the
 # shares would be measuring the wrong thing.
 _MIN_ASCII_LETTER_SHARE = 0.5
-# pypdf raises one LimitReachedError class for every limit, sometimes re-raised as PdfReadError, so only the raising
-# frame (as of pypdf 6.21, the floor in pyproject.toml) tells a size cap from a structural limit pdfminer reads safely.
-# Any limit in the filter modules is a size cap unless carved out below, so one a later pypdf adds fails closed; the
-# frames after the carve-outs are the other caps pdfminer lacks: a content array, element and token counts, a ToUnicode
-# range, CID widths and an eager page tree.
-_PYPDF_DECOMPRESSION_LIMIT_MODULES = frozenset({"pypdf.filters", "pypdf._codecs._codecs"})
-# A predictor row length pdfminer never allocates, and JBIG2, which pdfminer passes through undecoded.
-_PYPDF_STRUCTURAL_FILTER_FRAMES = frozenset(
-    {("pypdf.filters", "FlateDecode.decode"), ("pypdf.filters", "JBIG2Decode.decode")}
-)
-_PYPDF_SIZE_LIMIT_FRAMES = frozenset(
-    {
-        ("pypdf.generic._data_structures", "ContentStream.__init__"),
-        ("pypdf.generic._data_structures", "ContentStream._check_limits"),
-        ("pypdf.generic._data_structures", "ArrayObject._check_limits"),
-        ("pypdf.generic._data_structures", "DictionaryObject.read_from_stream"),
-        ("pypdf.generic._data_structures", "DictionaryObject._read_stream_data"),
-        ("pypdf.generic._data_structures", "DictionaryObject._read_unsized_from_stream"),
-        ("pypdf._cmap", "_check_mapping_size"),
-        ("pypdf._doc_common", "PdfDocCommon._pop_next_page_tree_kid"),
-    }
-)
-# These frames also enforce structural limits (token lengths, simple-font widths), so the caller tells them apart.
-_PYPDF_SIZE_LIMIT_CALLS = frozenset(
-    {
-        (
-            ("pypdf._cmap", "_check_token_length"),
-            ("pypdf._cmap", "parse_bfrange"),
-        ),
-        (
-            ("pypdf._utils", "read_until_regex"),
-            ("pypdf.generic._data_structures", "DictionaryObject._read_stream_data"),
-        ),
-        (
-            ("pypdf.generic._font", "Font.__check_entry_count"),
-            ("pypdf.generic._font", "Font._collect_cid_character_widths"),
-        ),
-    }
-)
-_PYPDF_CID_WIDTH_RANGE_FRAME = ("pypdf.generic._font", "Font.__check_range_length")
-_PYPDF_PREDICTOR_PARAMETERS_FRAME = ("pypdf.filters", "FlateDecode._get_parameters")
 
 
 def _is_remapped_glyph(char: str) -> bool:
@@ -174,48 +132,27 @@ def scrambled_text_layer_reason(text: str) -> str | None:
     )
 
 
-def _frame_site(frame: FrameType) -> tuple[str | None, str]:
-    return frame.f_globals.get("__name__"), frame.f_code.co_qualname
+def _fallback_parsers(
+    pypdf_error: BaseException, pypdf_reader: Callable[..., _T], pdfplumber_reader: Callable[..., _T]
+) -> list[tuple[str, Callable[..., _T]]]:
+    if hit_pypdf_page_tree_depth_limit(pypdf_error):
+        return [("pypdf", pypdf_reader), ("pdfplumber", pdfplumber_reader)]
+    return [("pdfplumber", pdfplumber_reader)]
 
 
-def _is_size_limit_frame(frame: FrameType) -> bool:
-    site = _frame_site(frame)
-    if site == _PYPDF_PREDICTOR_PARAMETERS_FRAME:
-        # The same frame rejects a small Colors over 16, which pdfminer reads, but a huge Columns or row it would hold
-        # as Python ints without any limit. The row is sized at 8 bits per component, the most pdfminer decodes,
-        # because pypdf reads BitsPerComponent after this check.
-        columns, colors = frame.f_locals.get("columns"), frame.f_locals.get("colors")
-        configuration = get_configuration()
-        return isinstance(columns, int) and (
-            columns > configuration.flate_maximum_columns
-            or (isinstance(colors, int) and columns * colors + 1 > configuration.flate_maximum_row_length)
-        )
-    if site in _PYPDF_STRUCTURAL_FILTER_FRAMES:
-        return False
-    if site[0] in _PYPDF_DECOMPRESSION_LIMIT_MODULES or site in _PYPDF_SIZE_LIMIT_FRAMES:
-        return True
-    if frame.f_back is not None and (site, _frame_site(frame.f_back)) in _PYPDF_SIZE_LIMIT_CALLS:
-        return True
-    if site == _PYPDF_CID_WIDTH_RANGE_FRAME:
-        # The same frame rejects an inverted range, which expands to nothing in pdfminer.
-        start, end = frame.f_locals.get("start"), frame.f_locals.get("end")
-        return isinstance(start, int) and isinstance(end, int) and end >= start
-    return False
+def _stops_fallback(fallback: str, error: Exception) -> bool:
+    # A size limit the retry hits fails closed, as one hit in the parent does.
+    return (
+        fallback == "pypdf"
+        and isinstance(error, CappedSubprocessError)
+        and error.error_type == pypdf_child.PypdfSizeLimitError.__name__
+    )
 
 
-def _hit_pypdf_size_limit(error: BaseException) -> bool:
-    seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, LimitReachedError) and current.__traceback__ is not None:
-            innermost = current.__traceback__
-            while innermost.tb_next is not None:
-                innermost = innermost.tb_next
-            if _is_size_limit_frame(innermost.tb_frame):
-                return True
-        current = current.__cause__ or current.__context__
-    return False
+def _pdfplumber_error_text(fallback_errors: dict[str, str]) -> str:
+    if "pdfplumber" in fallback_errors:
+        return fallback_errors["pdfplumber"]
+    return f"not attempted; the pypdf retry with a deeper page-tree limit failed: {fallback_errors['pypdf']}"
 
 
 def _size_limit_failure(identifier: str, pypdf_error: Exception) -> PDFParsingError:
@@ -239,13 +176,18 @@ def _run_parser_child(
     log_identifier: str,
     started_at: float,
     budget_seconds: float | None = None,
+    memory_limit_bytes: int | None = None,
 ) -> _T:
     # A crafted document can grow a parser's memory until the pod is OOM-killed (pdfminer decodes PDF streams with no
     # size limit, and a .docx is a zip). The child is capped and gets what is left of the caller's parse budget.
+    if memory_limit_bytes is None:
+        from skyvern.config import settings  # noqa: PLC0415
+
+        memory_limit_bytes = settings.PDFPLUMBER_MAX_MEMORY_BYTES
     return run_in_capped_subprocess(
         func,
         *args,
-        memory_limit_bytes=settings.PDFPLUMBER_MAX_MEMORY_BYTES,
+        memory_limit_bytes=memory_limit_bytes,
         max_result_bytes=result.max_bytes,
         result_memory_factor=result.memory_factor,
         timeout_seconds=max(
@@ -277,12 +219,14 @@ def extract_pdf_file(
     file_identifier: str | None = None,
     max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS,
     stats: PdfExtractStats | None = None,
+    memory_limit_bytes: int | None = None,
 ) -> str:
     """
     Extract text from a PDF file with fallback support.
 
     This function attempts to parse the PDF using pypdf first. If that fails,
-    it automatically falls back to pdfplumber. This provides robust handling
+    it automatically falls back to pdfplumber; a page tree past pypdf's depth limit
+    is first read again with pypdf in a capped child. This provides robust handling
     of various PDF formats, including those with corrupted streams or non-standard
     formatting that may cause pypdf to fail.
 
@@ -345,106 +289,132 @@ def extract_pdf_file(
         return extracted_text
 
     except Exception as pypdf_error:
-        if _hit_pypdf_size_limit(pypdf_error):
+        if hit_pypdf_size_limit(pypdf_error):
             raise _size_limit_failure(identifier, pypdf_error) from pypdf_error
+        fallbacks = _fallback_parsers(pypdf_error, pypdf_child.page_texts, pdfplumber_child.page_texts)
         LOG.warning(
-            "Failed to parse PDF with pypdf, trying pdfplumber",
+            "Failed to parse PDF with pypdf, trying a fallback parser",
             file_identifier=log_identifier,
+            fallback=fallbacks[0][0],
             error=str(pypdf_error),
             error_type=type(pypdf_error).__name__,
         )
 
-        # Fallback to pdfplumber
-        try:
-            # Only text averaging over 8 characters a token, such as long runs of one symbol, stops at this limit
-            # before the token cap; the second pass then reads on to the most text a result may hold.
-            first_char_limit = (
-                min(max_tokens * _CHARS_PER_TOKEN_STOP, _TEXT_CHAR_LIMIT) if max_tokens else _TEXT_CHAR_LIMIT
-            )
-            page_texts, page_count, read_every_page = _run_parser_child(
-                pdfplumber_child.page_texts,
-                file_path,
-                first_char_limit,
-                _TEXT_RESULT.max_bytes,
-                result=_TEXT_RESULT,
-                log_identifier=log_identifier,
-                started_at=started_at,
-            )
-            extracted_text, truncated_at_page = _join_within_token_limit(page_texts, max_tokens)
-            read_on_failed = False
-            if truncated_at_page is None and not read_every_page and first_char_limit < _TEXT_CHAR_LIMIT:
-                try:
-                    more_texts, more_page_count, more_read_every_page = _run_parser_child(
-                        pdfplumber_child.page_texts,
-                        file_path,
-                        _TEXT_CHAR_LIMIT,
-                        _TEXT_RESULT.max_bytes,
-                        result=_TEXT_RESULT,
-                        log_identifier=log_identifier,
-                        started_at=started_at,
-                    )
-                except CappedSubprocessError as read_on_error:
-                    # The first pass already holds usable text, so a second pass that fails does not lose it.
-                    read_on_failed = True
+        fallback_errors: dict[str, str] = {}
+        stopped_by: Exception | None = None
+        for fallback, fallback_page_texts in fallbacks:
+            try:
+                # Only text averaging over 8 characters a token, such as long runs of one symbol, stops at this limit
+                # before the token cap; the second pass then reads on to the most text a result may hold.
+                first_char_limit = (
+                    min(max_tokens * _CHARS_PER_TOKEN_STOP, _TEXT_CHAR_LIMIT) if max_tokens else _TEXT_CHAR_LIMIT
+                )
+                page_texts, page_count, read_every_page = _run_parser_child(
+                    fallback_page_texts,
+                    file_path,
+                    first_char_limit,
+                    _TEXT_RESULT.max_bytes,
+                    result=_TEXT_RESULT,
+                    log_identifier=log_identifier,
+                    started_at=started_at,
+                    memory_limit_bytes=memory_limit_bytes,
+                )
+                extracted_text, truncated_at_page = _join_within_token_limit(page_texts, max_tokens)
+                read_on_failed = False
+                if truncated_at_page is None and not read_every_page and first_char_limit < _TEXT_CHAR_LIMIT:
+                    try:
+                        more_texts, more_page_count, more_read_every_page = _run_parser_child(
+                            fallback_page_texts,
+                            file_path,
+                            _TEXT_CHAR_LIMIT,
+                            _TEXT_RESULT.max_bytes,
+                            result=_TEXT_RESULT,
+                            log_identifier=log_identifier,
+                            started_at=started_at,
+                            memory_limit_bytes=memory_limit_bytes,
+                        )
+                    except CappedSubprocessError as read_on_error:
+                        # The first pass already holds usable text, so a second pass that fails does not lose it.
+                        read_on_failed = True
+                        LOG.warning(
+                            "Reading the rest of the PDF with a fallback parser failed, keeping the pages already read",
+                            fallback=fallback,
+                            file_identifier=log_identifier,
+                            failure=read_on_error.kind,
+                            error=str(read_on_error),
+                            pages_included=len(page_texts),
+                            total_pages=page_count,
+                        )
+                    else:
+                        page_texts, page_count, read_every_page = more_texts, more_page_count, more_read_every_page
+                        extracted_text, truncated_at_page = _join_within_token_limit(page_texts, max_tokens)
+                stats.page_count = page_count
+                stats.truncated = truncated_at_page is not None or not read_every_page
+                if truncated_at_page is not None:
                     LOG.warning(
-                        "Reading the rest of the PDF with pdfplumber failed, keeping the pages already read",
+                        "PDF text exceeds token limit, truncating at page boundary",
                         file_identifier=log_identifier,
-                        failure=read_on_error.kind,
-                        error=str(read_on_error),
+                        pages_included=truncated_at_page,
+                        total_pages=page_count,
+                        max_tokens=max_tokens,
+                    )
+                elif not read_every_page and not read_on_failed:
+                    LOG.warning(
+                        "PDF text exceeds the size limit for a fallback parse, truncating at page boundary",
+                        file_identifier=log_identifier,
                         pages_included=len(page_texts),
                         total_pages=page_count,
+                        char_limit=_TEXT_CHAR_LIMIT,
                     )
-                else:
-                    page_texts, page_count, read_every_page = more_texts, more_page_count, more_read_every_page
-                    extracted_text, truncated_at_page = _join_within_token_limit(page_texts, max_tokens)
-            stats.page_count = page_count
-            stats.truncated = truncated_at_page is not None or not read_every_page
-            if truncated_at_page is not None:
-                LOG.warning(
-                    "PDF text exceeds token limit, truncating at page boundary",
+
+                # Sanitize text to remove characters that cannot be stored in PostgreSQL
+                extracted_text = sanitize_postgres_text(extracted_text)
+
+                LOG.info(
+                    "Successfully parsed PDF with a fallback parser",
+                    fallback=fallback,
                     file_identifier=log_identifier,
-                    pages_included=truncated_at_page,
-                    total_pages=page_count,
-                    max_tokens=max_tokens,
+                    page_count=page_count,
+                    text_length=len(extracted_text),
                 )
-            elif not read_every_page and not read_on_failed:
+                return extracted_text
+
+            except Exception as fallback_error:
+                fallback_errors[fallback] = str(fallback_error)
+                if _stops_fallback(fallback, fallback_error):
+                    stopped_by = fallback_error
+                    break
+                if fallback == fallbacks[-1][0]:
+                    break
                 LOG.warning(
-                    "PDF text exceeds the size limit for a fallback parse, truncating at page boundary",
+                    "Fallback PDF parser failed, trying the next one",
                     file_identifier=log_identifier,
-                    pages_included=len(page_texts),
-                    total_pages=page_count,
-                    char_limit=_TEXT_CHAR_LIMIT,
+                    fallback=fallback,
+                    error=str(fallback_error),
                 )
 
-            # Sanitize text to remove characters that cannot be stored in PostgreSQL
-            extracted_text = sanitize_postgres_text(extracted_text)
-
-            LOG.info(
-                "Successfully parsed PDF with pdfplumber",
-                file_identifier=log_identifier,
-                page_count=page_count,
-                text_length=len(extracted_text),
-            )
-            return extracted_text
-
-        except Exception as pdfplumber_error:
-            LOG.error(
-                "Failed to parse PDF with both pypdf and pdfplumber",
-                file_identifier=log_identifier,
-                pypdf_error=str(pypdf_error),
-                pdfplumber_error=str(pdfplumber_error),
-            )
-            raise PDFParsingError(
-                file_identifier=identifier,
-                pypdf_error=str(pypdf_error),
-                pdfplumber_error=str(pdfplumber_error),
-            )
+        pdfplumber_error = _pdfplumber_error_text(fallback_errors)
+        LOG.error(
+            "Failed to parse PDF with pypdf and its fallback parsers",
+            file_identifier=log_identifier,
+            pypdf_error=str(pypdf_error),
+            fallback_errors=fallback_errors,
+        )
+        parsing_error = PDFParsingError(
+            file_identifier=identifier,
+            pypdf_error=str(pypdf_error),
+            pdfplumber_error=pdfplumber_error,
+        )
+        if stopped_by is not None:
+            raise parsing_error from stopped_by
+        raise parsing_error
 
 
 def extract_docx_file(
     file_path: str,
     file_identifier: str | None = None,
     max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS,
+    memory_limit_bytes: int | None = None,
 ) -> str:
     """Return a Word .docx file's paragraph and table-row text in document order, cut at max_tokens. Raises
     CappedSubprocessError when the file cannot be parsed or the capped child fails."""
@@ -457,6 +427,7 @@ def extract_docx_file(
         result=_TEXT_RESULT,
         log_identifier=log_identifier,
         started_at=time.monotonic(),
+        memory_limit_bytes=memory_limit_bytes,
     )
     extracted_text, truncated_at_block = _join_within_token_limit(block_texts, max_tokens)
     if truncated_at_block is not None:
@@ -480,12 +451,15 @@ def extract_docx_file(
 def validate_pdf_file(
     file_path: str,
     file_identifier: str | None = None,
+    *,
+    memory_limit_bytes: int | None = None,
 ) -> bool:
     """
     Validate that a file is a readable PDF.
 
     This function attempts to validate the PDF using pypdf first. If that fails,
-    it automatically falls back to pdfplumber validation.
+    it automatically falls back to pdfplumber validation; a page tree past pypdf's
+    depth limit is first counted again with pypdf in a capped child.
 
     Args:
         file_path: Path to the PDF file to validate
@@ -519,43 +493,58 @@ def validate_pdf_file(
         return True
 
     except Exception as pypdf_error:
-        if _hit_pypdf_size_limit(pypdf_error):
+        if hit_pypdf_size_limit(pypdf_error):
             raise _size_limit_failure(identifier, pypdf_error) from pypdf_error
+        # pdfminer recurses once per page-tree level, so pdfplumber cannot count the pages of a very deep tree.
+        fallbacks = _fallback_parsers(pypdf_error, pypdf_child.page_count, pdfplumber_child.page_count)
         LOG.debug(
-            "PDF validation with pypdf failed, trying pdfplumber",
+            "PDF validation with pypdf failed, trying a fallback parser",
             file_identifier=log_identifier,
+            fallback=fallbacks[0][0],
             error=str(pypdf_error),
         )
 
-        # Fallback to pdfplumber
-        try:
-            _run_parser_child(
-                pdfplumber_child.page_count,
-                file_path,
-                result=_PAGE_COUNT_RESULT,
-                log_identifier=log_identifier,
-                started_at=started_at,
-            )
-
+        fallback_errors: dict[str, str] = {}
+        stopped_by = None
+        for fallback, fallback_page_count in fallbacks:
+            try:
+                _run_parser_child(
+                    fallback_page_count,
+                    file_path,
+                    result=_PAGE_COUNT_RESULT,
+                    log_identifier=log_identifier,
+                    started_at=started_at,
+                    memory_limit_bytes=memory_limit_bytes,
+                )
+            except Exception as fallback_error:
+                fallback_errors[fallback] = str(fallback_error)
+                if _stops_fallback(fallback, fallback_error):
+                    stopped_by = fallback_error
+                    break
+                continue
             LOG.info(
-                "PDF validation: pypdf failed but pdfplumber succeeded",
+                "PDF validation: pypdf failed but a fallback parser succeeded",
                 file_identifier=log_identifier,
+                fallback=fallback,
                 pypdf_error=str(pypdf_error),
             )
             return True
 
-        except Exception as pdfplumber_error:
-            LOG.error(
-                "PDF validation failed with both pypdf and pdfplumber",
-                file_identifier=log_identifier,
-                pypdf_error=str(pypdf_error),
-                pdfplumber_error=str(pdfplumber_error),
-            )
-            raise PDFParsingError(
-                file_identifier=identifier,
-                pypdf_error=str(pypdf_error),
-                pdfplumber_error=str(pdfplumber_error),
-            )
+        pdfplumber_error = _pdfplumber_error_text(fallback_errors)
+        LOG.error(
+            "PDF validation failed with pypdf and its fallback parsers",
+            file_identifier=log_identifier,
+            pypdf_error=str(pypdf_error),
+            fallback_errors=fallback_errors,
+        )
+        parsing_error = PDFParsingError(
+            file_identifier=identifier,
+            pypdf_error=str(pypdf_error),
+            pdfplumber_error=pdfplumber_error,
+        )
+        if stopped_by is not None:
+            raise parsing_error from stopped_by
+        raise parsing_error
 
 
 def render_pdf_pages_as_images(
@@ -564,6 +553,8 @@ def render_pdf_pages_as_images(
     max_pages: int | None = MAX_PDF_OCR_PAGES,
     resolution: int = 150,
     timeout_seconds: float | None = None,
+    memory_limit_bytes: int | None = None,
+    max_result_bytes: int | None = None,
 ) -> list[bytes]:
     """Render PDF pages as PNG images using pdfplumber.
 
@@ -574,16 +565,21 @@ def render_pdf_pages_as_images(
     """
     identifier = file_identifier or file_path
     log_identifier = identifier.partition("?")[0]
+    if max_result_bytes is None:
+        from skyvern.config import settings  # noqa: PLC0415
+
+        max_result_bytes = settings.PDFPLUMBER_MAX_RESULT_BYTES
     page_images, total_pages = _run_parser_child(
         pdfplumber_child.page_images,
         file_path,
         max_pages,
         resolution,
-        settings.PDFPLUMBER_MAX_RESULT_BYTES,
-        result=_ResultLimit(settings.PDFPLUMBER_MAX_RESULT_BYTES, _PAGE_IMAGES_MEMORY_FACTOR),
+        max_result_bytes,
+        result=_ResultLimit(max_result_bytes, _PAGE_IMAGES_MEMORY_FACTOR),
         log_identifier=log_identifier,
         started_at=time.monotonic(),
         budget_seconds=timeout_seconds,
+        memory_limit_bytes=memory_limit_bytes,
     )
     if len(page_images) < total_pages:
         LOG.warning(

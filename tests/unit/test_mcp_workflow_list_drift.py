@@ -21,7 +21,6 @@ import httpx
 import pytest
 
 from skyvern.cli.mcp_tools import _workflow_http
-from skyvern.cli.mcp_tools import blocks as mcp_blocks
 from skyvern.cli.mcp_tools import workflow as mcp_workflow
 from skyvern.client.core.client_wrapper import AsyncClientWrapper
 from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_client
@@ -64,6 +63,14 @@ def _make_workflow_dict(workflow_id: str, block_type: str, *, label: str = "step
             query="EVALUATE VALUES('{{ table_name }}')",
             max_rows=500,
             parameter_keys=["table_name"],
+        )
+    elif block_type == "integration_action":
+        block.update(
+            integration_id="google_sheets",
+            action_id="read_rows",
+            connection_id="goac_sheets",
+            inputs={"spreadsheet_url": "{{ terms }}", "sheet_name": "Orders", "has_header_row": False},
+            parameter_keys=["terms"],
         )
     elif block_type == "terminate":
         block["reason"] = "ACCOUNT_NOT_FOUND: {{ account_number }}"
@@ -210,7 +217,7 @@ async def test_get_preserves_nested_powerbi_query_fields(monkeypatch: pytest.Mon
     }
 
 
-@pytest.mark.parametrize("block_type", ["web_search", "terminate", "powerbi_query"])
+@pytest.mark.parametrize("block_type", ["web_search", "terminate", "powerbi_query", "integration_action"])
 def test_block_fields_survive_mcp_definition_normalization(block_type: str) -> None:
     workflow = _make_workflow_dict("wpid_block", block_type)
     if block_type == "web_search":
@@ -271,13 +278,6 @@ def test_nested_powerbi_query_fields_survive_mcp_normalization() -> None:
 
     nested = normalized["workflow_definition"]["blocks"][0]["loop_blocks"][0]
     assert {key: nested[key] for key in powerbi_block} == powerbi_block
-
-
-def test_powerbi_query_is_registered_for_mcp_block_schema() -> None:
-    from skyvern.schemas.workflows import PowerBIQueryBlockYAML
-
-    assert mcp_blocks.BLOCK_TYPE_MAP["powerbi_query"] is PowerBIQueryBlockYAML
-    assert "powerbi_query" in mcp_blocks.BLOCK_SUMMARIES
 
 
 @pytest.mark.asyncio
@@ -356,21 +356,15 @@ async def test_raw_list_uses_fern_http_wrapper_auth_headers(monkeypatch: pytest.
     assert request.url.params["only_workflows"] == "true"
 
 
-def test_extract_error_detail_truncates_non_json_response_text() -> None:
-    """Avoid returning an entire proxy/load-balancer HTML page in MCP errors."""
+@pytest.mark.parametrize("json_body", [None, {"detail": "x" * 600}], ids=["non-json-page", "long-json-detail"])
+def test_extract_error_detail_truncates_long_error_text(json_body: dict[str, str] | None) -> None:
+    """A proxy's HTML page or a backend stack trace in ``detail`` is cut, not returned whole in MCP errors."""
     response = MagicMock()
-    response.json.side_effect = ValueError("not json")
-    response.text = "x" * 600
-
-    detail = _workflow_http.extract_error_detail(response)
-
-    assert detail == "x" * _workflow_http._ERROR_DETAIL_LIMIT
-
-
-def test_extract_error_detail_truncates_long_json_detail() -> None:
-    """A verbose ``detail`` field (e.g., a backend stack trace) is truncated too."""
-    response = MagicMock()
-    response.json.return_value = {"detail": "x" * 600}
+    if json_body is None:
+        response.json.side_effect = ValueError("not json")
+        response.text = "x" * 600
+    else:
+        response.json.return_value = json_body
 
     detail = _workflow_http.extract_error_detail(response)
 

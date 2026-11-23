@@ -164,7 +164,7 @@ class FastAPIEventSourceStream:
         # generator is torn down first (SSE client disconnect). The set is
         # bounded in practice by the handler's own timeout — every copilot
         # handler must eventually return (see TOTAL_TIMEOUT_SECONDS in
-        # skyvern/forge/sdk/copilot/enforcement.py) which removes the task
+        # skyvern/forge/sdk/ember/enforcement.py) which removes the task
         # from the set via the done_callback below. If you wire a new
         # EventSource endpoint through here, give its handler a similar
         # hard cap or this set becomes an unbounded leak.

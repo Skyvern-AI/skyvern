@@ -569,7 +569,7 @@ async def test_a_capture_has_no_observable_side_effect_on_the_page_it_captures()
     from bs4 import BeautifulSoup
 
     from skyvern.forge import agent
-    from skyvern.forge.sdk.copilot.composition_browser_expressions import COMPOSITION_STRIPPED_HTML_EXPRESSION
+    from skyvern.forge.sdk.ember.composition_browser_expressions import COMPOSITION_STRIPPED_HTML_EXPRESSION
     from skyvern.forge.taskv3.pre_submit_capture import pre_submit_screenshot
     from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS
 

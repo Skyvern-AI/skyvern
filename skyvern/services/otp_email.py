@@ -65,6 +65,8 @@ class EmailOTPSourceContext:
     # Eviction is recorded rather than inferred from the set size: the cap spans every credential,
     # so filtering to the connected ones can leave a count below it that is still a lower bound.
     messages_evicted: bool = False
+    # Set by the same list call as credential_ids, so it can lag a reconnect by one refresh interval.
+    needs_reconnect_count: int = 0
     provider_state: dict[str, dict] = field(default_factory=dict)
 
     def has_seen_message(self, credential_id: str, message_id: str) -> bool:
@@ -105,7 +107,7 @@ class EmailOTPVerificationContext:
 class EmailOTPSource(Protocol):
     name: str
 
-    async def list_credential_ids(self, organization_id: str) -> list[str]: ...
+    async def list_credential_ids(self, organization_id: str, context: EmailOTPSourceContext) -> list[str]: ...
 
     async def search_recent_otp_messages(
         self,
@@ -144,15 +146,28 @@ class GmailOTPSource:
     def __init__(self, get_credentials: _GoogleCredentialGetter) -> None:
         self._get_credentials = get_credentials
 
-    async def list_credential_ids(self, organization_id: str) -> list[str]:
-        return [
-            credential.id
-            for credential in await google_oauth_service.get_credentials_for_org(organization_id)
-            if google_oauth_service.has_required_scopes(
+    async def list_credential_ids(self, organization_id: str, context: EmailOTPSourceContext) -> list[str]:
+        active_ids: list[str] = []
+        active_addresses: set[str] = set()
+        errored_addresses: list[str | None] = []
+        for credential in await google_oauth_service.get_visible_credentials_for_org(organization_id):
+            if not google_oauth_service.has_required_scopes(
                 credential.scopes_granted,
                 google_oauth_service.GOOGLE_GMAIL_SCOPES,
-            )
-        ]
+            ):
+                continue
+            address = credential.email_address.lower() if credential.email_address else None
+            if credential.state == google_oauth_service.STATE_ACTIVE:
+                active_ids.append(credential.id)
+                if address:
+                    active_addresses.add(address)
+            else:
+                errored_addresses.append(address)
+        # An error row whose address also has an active row is not an inbox Skyvern cannot read.
+        context.needs_reconnect_count = sum(
+            1 for address in errored_addresses if address is None or address not in active_addresses
+        )
+        return active_ids
 
     async def search_recent_otp_messages(
         self,
@@ -218,7 +233,7 @@ class OutlookOTPSource:
     def __init__(self, get_credentials: _MicrosoftCredentialGetter) -> None:
         self._get_credentials = get_credentials
 
-    async def list_credential_ids(self, organization_id: str) -> list[str]:
+    async def list_credential_ids(self, organization_id: str, context: EmailOTPSourceContext) -> list[str]:
         return [
             credential.id
             for credential in await microsoft_oauth_service.get_credentials_for_org(organization_id)

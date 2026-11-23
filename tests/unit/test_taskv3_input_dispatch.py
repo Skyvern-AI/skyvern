@@ -70,7 +70,6 @@ async def test_each_gesture_is_the_exact_playwright_call_it_replaced(page: _Fake
     locator = page.locator("#seg")
     await input_dispatch.click(page, "#go", timeout=5000, force=True)
     await input_dispatch.click(page, locator, timeout=2000)
-    await input_dispatch.click_at(page, 10.0, 20.0)
     await input_dispatch.hover(page, "#menu", timeout=2000)
     await input_dispatch.focus(page, "#f", timeout=2000)
     await input_dispatch.fill(page, "#f", "v", timeout=100)
@@ -88,7 +87,6 @@ async def test_each_gesture_is_the_exact_playwright_call_it_replaced(page: _Fake
     assert page.calls == [
         ("page.click", ("#go",), {"timeout": 5000, "force": True}),
         ("locator(#seg).click", (), {"timeout": 2000}),
-        ("mouse.click", (10.0, 20.0), {}),
         ("page.hover", ("#menu",), {"timeout": 2000}),
         ("page.focus", ("#f",), {"timeout": 2000}),
         ("page.fill", ("#f", "v"), {"timeout": 100}),
@@ -191,7 +189,6 @@ async def test_the_dwell_is_measured_from_the_block_start_across_both_login_page
     [
         lambda page: input_dispatch.click(page, "#sign-in"),
         lambda page: input_dispatch.click(page, page.locator("#sign-in")),
-        lambda page: input_dispatch.click_at(page, 10.0, 20.0),
         lambda page: input_dispatch.press(page, "#pw", "Enter"),
         lambda page: input_dispatch.press(page, None, "Enter"),
         lambda page: input_dispatch.js_click(page, "document", {"sel": "#sign-in"}),

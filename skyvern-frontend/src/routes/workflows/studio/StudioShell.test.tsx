@@ -6,6 +6,7 @@ import { type ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { PageSlotsProvider } from "@/store/PageSlots";
 import { useEmberHeaderStore } from "@/store/useEmberHeaderStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
@@ -59,7 +60,7 @@ vi.mock("./EditorTab", async () => {
   return {
     EditorTab: () => (
       <span data-testid="copilot-on-screen">
-        {String(useStudioShellContext().isPaneOnScreen?.("copilot"))}
+        {String(useStudioShellContext().isPaneOnScreen?.("ember"))}
       </span>
     ),
   };
@@ -98,6 +99,13 @@ vi.mock("./useRunVisuals", () => ({
     recordingArchived: true,
     recordingUrls: [],
   }),
+}));
+const globalWorkflow = vi.hoisted(() => ({
+  value: false as boolean | undefined,
+}));
+vi.mock("../hooks/useIsGlobalWorkflow", () => ({
+  useIsGlobalWorkflow: () => globalWorkflow.value ?? false,
+  useGlobalWorkflowStatus: () => globalWorkflow.value,
 }));
 vi.mock("../workflowRun/WorkflowRunVerificationCodeForm", () => ({
   WorkflowRunVerificationCodeForm: ({
@@ -146,6 +154,78 @@ describe("StudioShell inspected run header", () => {
       within(header).queryByRole("button", { name: "Copy to clipboard" }),
     ).toBeNull();
   });
+});
+
+describe("StudioShell Triggers pane", () => {
+  afterEach(() => {
+    globalWorkflow.value = false;
+  });
+
+  test.each([
+    {
+      agent: "a live agent",
+      panes: "triggers",
+      deletedAt: null,
+      global: false,
+      mounted: true,
+    },
+    {
+      agent: "a live agent",
+      panes: "editor",
+      deletedAt: null,
+      global: false,
+      mounted: false,
+    },
+    {
+      agent: "a deleted agent",
+      panes: "triggers",
+      deletedAt: "2026-08-12T00:00:00Z",
+      global: false,
+      mounted: false,
+    },
+    {
+      agent: "a global agent",
+      panes: "triggers",
+      deletedAt: null,
+      global: true,
+      mounted: false,
+    },
+    {
+      agent: "an agent whose global status is loading",
+      panes: "triggers",
+      deletedAt: null,
+      global: undefined,
+      mounted: false,
+    },
+  ])(
+    "?panes=$panes on $agent mounts the trigger UI: $mounted",
+    ({ panes, deletedAt, global, mounted }) => {
+      globalWorkflow.value = global;
+      const props = {
+        workflow: {
+          workflow_permanent_id: "wpid_synthetic",
+          organization_id: "org_synthetic",
+          deleted_at: deletedAt,
+          workflow_definition: { blocks: [] },
+        },
+        initialTitle: "Synthetic workflow",
+      } as unknown as StudioWorkspaceProps;
+
+      render(
+        <MemoryRouter
+          initialEntries={[`/workflows/wpid_synthetic/studio?panes=${panes}`]}
+        >
+          <PageSlotsProvider
+            value={{ workflowTriggersPanel: () => <p>Trigger management</p> }}
+          >
+            <StudioShell {...props} />
+          </PageSlotsProvider>
+        </MemoryRouter>,
+      );
+
+      expect(screen.queryByText("Trigger management") !== null).toBe(mounted);
+    },
+  );
 });
 
 describe("StudioShell with a pane folded for the Doc", () => {
@@ -214,11 +294,11 @@ describe("StudioShell with a pane folded for the Doc", () => {
     screen.getAllByTestId("copilot-on-screen")[0]!.textContent;
 
   test("Ember folded into a strip is not on screen", () => {
-    const open = renderDoc("editor,copilot");
+    const open = renderDoc("editor,ember");
     expect(emberOnScreen()).toBe("true");
     open.unmount();
-    docFold.folded = ["copilot"];
-    renderDoc("editor,copilot");
+    docFold.folded = ["ember"];
+    renderDoc("editor,ember");
     expect(emberOnScreen()).toBe("false");
   });
 
@@ -235,7 +315,7 @@ describe("StudioShell with a pane folded for the Doc", () => {
       value: () => ({ cancel: () => {}, onfinish: null }),
     });
     try {
-      renderDoc("editor,copilot");
+      renderDoc("editor,ember");
       expect(emberOnScreen()).toBe("true");
       fireEvent.click(
         screen.getByRole("button", {
@@ -250,8 +330,8 @@ describe("StudioShell with a pane folded for the Doc", () => {
   });
 
   test("a folded Ember opened over the stage is on screen", () => {
-    docFold.folded = ["copilot"];
-    renderDoc("editor,copilot");
+    docFold.folded = ["ember"];
+    renderDoc("editor,ember");
     expect(emberOnScreen()).toBe("false");
     fireEvent.click(screen.getByRole("button", { name: /^Show Copilot pane/ }));
     expect(emberOnScreen()).toBe("true");
@@ -419,7 +499,7 @@ describe("StudioShell at phone width", () => {
   });
 
   test("signing in yourself shows a Browser open behind another pane", () => {
-    renderPhone("/workflows/wpid_synthetic/studio?panes=copilot,browser");
+    renderPhone("/workflows/wpid_synthetic/studio?panes=ember,browser");
     expect(shown()).toEqual(["Copilot"]);
     try {
       act(() => {
@@ -484,7 +564,7 @@ describe("StudioPane header", () => {
   const dataTransfer = () => ({ setData: vi.fn(), effectAllowed: "" });
 
   const renderPane = ({
-    id = "copilot",
+    id = "ember",
     headerActions,
     expanded = false,
     expansionTransitioning = false,
@@ -686,7 +766,7 @@ describe("StudioPane header", () => {
 
     expect(dt.setData).toHaveBeenCalledWith(
       "application/x-skyvern-studio-pane",
-      "copilot",
+      "ember",
     );
     expect(reorder.onStart).not.toHaveBeenCalled();
 

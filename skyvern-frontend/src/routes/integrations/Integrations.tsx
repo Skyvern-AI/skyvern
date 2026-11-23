@@ -64,7 +64,8 @@ const integrations = [
   {
     id: "gmail",
     title: "Gmail",
-    description: "Read verification codes and send email from your agents.",
+    description:
+      "Read emails, including verification codes, and send emails from your agents.",
     scopeProfile: "gmail",
     capabilityScopes: GOOGLE_GMAIL_REQUIRED_SCOPES,
   },

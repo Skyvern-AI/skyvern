@@ -71,6 +71,8 @@ import { PdfFillNode as PdfFillNodeComponent } from "./PdfFillNode/PdfFillNode";
 import { SplitPdfNode } from "./SplitPdfNode/types";
 import { SplitPdfNode as SplitPdfNodeComponent } from "./SplitPdfNode/SplitPdfNode";
 import { DataExportNode } from "./DataExportNode/types";
+import { IntegrationActionNode } from "./IntegrationActionNode/types";
+import { IntegrationActionNode as IntegrationActionNodeComponent } from "./IntegrationActionNode/IntegrationActionNode";
 import { DataExportNode as DataExportNodeComponent } from "./DataExportNode/DataExportNode";
 import { withSortableBlock } from "../sortable/withSortableBlock";
 import { withCollapsible } from "../collapse/withCollapsible";
@@ -115,7 +117,8 @@ export type WorkflowBlockNode =
   | PowerBIQueryNode
   | PdfFillNode
   | SplitPdfNode
-  | DataExportNode;
+  | DataExportNode
+  | IntegrationActionNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -206,4 +209,5 @@ export const nodeTypes = {
   pdfFill: wrapBlock(PdfFillNodeComponent),
   splitPdf: wrapBlock(SplitPdfNodeComponent),
   dataExport: wrapBlock(DataExportNodeComponent),
+  integrationAction: wrapBlock(IntegrationActionNodeComponent),
 } as const;

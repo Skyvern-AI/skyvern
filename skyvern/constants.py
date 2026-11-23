@@ -189,6 +189,10 @@ FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS = 250
 # one retry per page, at the ~30 s a slow OCR call takes. It, not the per-call ceiling, bounds a scan whose pages stall.
 PDF_OCR_TOTAL_TIMEOUT_SECONDS = 600
 MAX_IMAGE_BLOCKS = 20
+# A file under the upload cap can still decode to hundreds of megapixels in memory.
+MAX_DECODED_IMAGE_PIXELS = 25_000_000
+# Keep the frame cap as the limiting guard for roughly 4 MP fax pages.
+MAX_TOTAL_DECODED_IMAGE_PIXELS = MAX_IMAGE_BLOCKS * 4_000_000
 SCROLL_AMOUNT_MULTIPLIER = 100
 EXTRACT_ACTION_SCROLL_AMOUNT = 500  # pixels per scroll action from extract-action prompt
 
@@ -210,3 +214,8 @@ DEFAULT_WORKFLOW_TITLES = ("New Workflow", "New Agent")
 
 # What the data-retention scrubber writes over a stored value it removed.
 SCRUBBED_VALUE = "[removed]"
+
+# Rows and other services already hold these bytes, so renaming the code must not change them.
+EMBER_RUN_CREATOR = "copilot"
+EMBER_ANTIBOT_CLIENT = "copilot"
+EMBER_TEST_RUN_UNSUPPORTED_CODE = "copilot_test_run_unsupported"

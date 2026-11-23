@@ -40,6 +40,7 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import RunArm
+from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.taskv3.answer_basis_audit import apply_answer_basis_audit
 from skyvern.forge.taskv3.application_context import DECLARE_NOTICE, ApplicationContext, payload_check_reasons
@@ -72,6 +73,7 @@ from skyvern.forge.taskv3.loop import (
     ActivityRecency,
     CompletionGate,
     DownloadSettle,
+    DownloadUntil,
     DownloadWait,
     LoopOutcome,
     SemanticCommitStats,
@@ -79,6 +81,7 @@ from skyvern.forge.taskv3.loop import (
     ToolSpec,
     TurnEnd,
     TurnStart,
+    UnsavedDownloads,
     UnseenPageText,
     VerificationBlocker,
     make_finish_tool,
@@ -96,8 +99,10 @@ from skyvern.forge.taskv3.tools import (
     BlankWorkingPageGuard,
     DownloadFailureWatch,
     PageProvider,
+    RequestRecord,
     TotpPlaceholderResolver,
     apply_blank_page_guard,
+    apply_request_record,
     build_browser_tools,
 )
 from skyvern.forge.taskv3.turn_dom import TurnDomCapture
@@ -117,6 +122,7 @@ DEFAULT_DEADLINE_SECONDS = 1800  # wall-clock runaway guard
 # runaway trips this as budget_exhausted instead of surfacing as a provider context-window error.
 DEFAULT_MAX_TOKENS = 1_500_000
 DEFAULT_MAX_CALL_RETRIES = 2
+FILE_LANDED_HOLD_KILL_SWITCH = "DISABLE_TASK_V3_FILE_LANDED_HOLD"
 # A productive action round is at most a few perception turns plus one (possibly heavily batched)
 # action turn. Size the turn/tool-call runaway guards off the action-step budget with generous
 # per-round headroom so a real run is bounded by max_action_steps, not by these guards; only a run
@@ -190,6 +196,25 @@ def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, in
         max(DEFAULT_MAX_TOOL_CALLS, max_action_steps * MAX_TOOL_CALLS_PER_ACTION_STEP),
         min(MAX_TOKENS_CEILING, max(DEFAULT_MAX_TOKENS, max_action_steps * MAX_TOKENS_PER_ACTION_STEP)),
     )
+
+
+async def _file_landed_hold_enabled(task_id: str | None, organization_id: str | None) -> bool:
+    if settings.DISABLE_TASK_V3_FILE_LANDED_HOLD:
+        return False
+    provider = app.EXPERIMENTATION_PROVIDER
+    distinct_id = task_id or organization_id
+    if not distinct_id or isinstance(provider, NoOpExperimentationProvider):
+        return True
+    try:
+        disabled = await provider.is_feature_enabled_cached(
+            FILE_LANDED_HOLD_KILL_SWITCH, distinct_id, {"organization_id": organization_id}
+        )
+    except Exception:
+        LOG.warning("taskv3 file landed hold kill switch lookup failed; hold on", exc_info=True)
+        return True
+    if disabled:
+        LOG.info("taskv3 file landed hold disabled", organization_id=organization_id, task_id=task_id)
+    return not disabled
 
 
 def coerce_v3_parameters(navigation_payload: dict[str, Any] | list[Any] | str | None) -> dict[str, Any] | None:
@@ -306,7 +331,9 @@ async def run_task_v3_agent_loop(
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     download_wait: DownloadWait | None = None,
+    download_until: DownloadUntil | None = None,
     download_settle: DownloadSettle | None = None,
+    unsaved_downloads: UnsavedDownloads | None = None,
     native_download_attempt: NativeDownloadAttempt | None = None,
     completion_gate: CompletionGate | None = None,
     staged_downloads: set[str] | None = None,
@@ -421,6 +448,11 @@ async def run_task_v3_agent_loop(
             is_vision_fallback_prompt=prompt_name in VISION_FALLBACK_PROMPT_NAMES
         )
     )
+    observe_screenshot_width = (
+        await app.AGENT_FUNCTION.task_v3_observe_screenshot_width(organization_id=organization_id)
+        if vision_enabled and not page_free
+        else 0
+    )
     # Page-free mode is structural, not advisory: no browser tools exist to call and the system
     # prompt never mentions perception, so a data-only validation cannot read the live DOM.
     # The tier only ever increments under the verify flag, so the kill switch and the omit-vs-zero
@@ -456,11 +488,18 @@ async def run_task_v3_agent_loop(
             return await recover_page(page)
 
     unseen_text = None if page_free else UnseenPageText()
+    # A block that only waits on downloads still gets what each frame received, without the failure facts and holds.
     failure_watch = (
         None
-        if page_free or download_settle is None
-        else DownloadFailureWatch(page_provider, refs, native_download_attempt=native_download_attempt)
+        if page_free or (download_settle is None and download_wait is None)
+        else DownloadFailureWatch(
+            page_provider,
+            refs,
+            native_download_attempt=native_download_attempt,
+            report_failures=download_settle is not None,
+        )
     )
+    download_facts = failure_watch.facts if failure_watch is not None and download_settle is not None else None
     browser_tools = (
         []
         if page_free
@@ -473,10 +512,12 @@ async def run_task_v3_agent_loop(
             resolve_totp_placeholder=resolve_totp_placeholder,
             opaque_refs=refs,
             vision_enabled=vision_enabled,
+            observe_screenshot_width=observe_screenshot_width,
             semantic_commit_stats=semantic_commit_stats,
             unseen_text=unseen_text,
             download_failures=failure_watch,
             download_wait=download_wait,
+            download_until=download_until,
             recover_page=_recover if recover_page is not None else None,
         )
     )
@@ -541,6 +582,9 @@ async def run_task_v3_agent_loop(
         and await app.AGENT_FUNCTION.task_v3_justify_hold_enabled(
             task_id=ctx.task_id if ctx is not None else None, organization_id=organization_id
         )
+    )
+    file_landed_hold = download_settle is not None and await _file_landed_hold_enabled(
+        ctx.task_id if ctx is not None else None, organization_id
     )
     block_check_on = single_action_block and block_completion_judge is not None and judge_eligible
     tool_trail = ToolTrail() if reask_on or premise_on or block_check_on else None
@@ -705,10 +749,12 @@ async def run_task_v3_agent_loop(
         terminate_premise=_terminate_premise if premise_on else None,
         document_identity=None if page_free else document_identity,
         completion_gate=None if page_free else completion_gate,
-        download_facts=failure_watch.facts if failure_watch is not None else None,
+        download_facts=download_facts,
         error_code_mapping=error_code_mapping,
         intercepted_submissions=block_submissions,
         justify_stops=justify_on,
+        file_landed_hold=file_landed_hold,
+        unsaved_downloads=unsaved_downloads,
     )
     # An extraction block cannot enter input, so a yes has nothing to act on there and offering the tool cost a turn.
     context_texts = (
@@ -733,6 +779,10 @@ async def run_task_v3_agent_loop(
         + ([application_context.tool] if application_context else [])
         + [finish_tool]
     )
+    # Inside the guards and the answer audit, so listening starts only once a call runs: the audit's judge can take
+    # 20 s, and requests sent meanwhile are not this call's. Answers behind a refusal reach the model at the next turn.
+    request_record = None if page_free else RequestRecord(page_provider, refs)
+    apply_request_record(tools, request_record)
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
     # are appended here and would otherwise be able to inspect and act on a blank page.
     apply_blank_page_guard(tools, blank_page_guard)
@@ -758,6 +808,12 @@ async def run_task_v3_agent_loop(
             application_payload_qualified, age_text_withheld=context_age_text is None
         )
         defaults_text = context_task_text or ""
+    authorized_agent_text = (
+        None
+        if page_free or refuse_input_entry or refuse_navigation
+        else app.AGENT_FUNCTION.task_v3_authorized_agent_default()
+    )
+    defaults_text = "\n\n".join(text for text in (authorized_agent_text, defaults_text) if text)
     declaring = application_context is not None
     # Read before each wrapped call: a declaring run's audit stays out of the way until this turns true.
     armed = application_context.audit_armed if application_context else None
@@ -846,6 +902,7 @@ async def run_task_v3_agent_loop(
             on_llm_call_exhausted=lambda error: llm_caller.emit_retry_chain_exhausted(error, prompt_name),
             activity=activity,
             submit_watch=None if page_free else submit_watch,
+            late_request_lines=None if request_record is None else request_record.late_lines,
             verification_blocker=verification_blocker,
             staged_downloads=staged_downloads,
             initial_navigation_status=initial_navigation_status,
@@ -869,6 +926,7 @@ async def run_task_v3_agent_loop(
             tool_trail=tool_trail,
             single_action_block=single_action_block,
             target_action_reserve=target_action_reserve,
+            completes_on_download=download_settle is not None,
             block_completion_check=_block_completion_check if block_check_on else None,
             unseen_text=unseen_text,
             anthropic_cache_markers=anthropic_cache_markers,
@@ -877,6 +935,8 @@ async def run_task_v3_agent_loop(
         loop_ended = True
         if failure_watch is not None:
             failure_watch.close()
+        if request_record is not None:
+            request_record.close()
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
         # on the next block's first action.
         _exit_ctx = skyvern_context.current()
@@ -948,6 +1008,7 @@ async def run_task_v3_agent_loop(
             else application_context.delivered and bool(context_age_text)
         ),
         age_default_reason=age_default_reason,
+        authorized_agent_default_rendered=bool(authorized_agent_text),
         application_defaults_rendered=(
             bool(application_defaults_text) if application_context is None else application_context.delivered
         ),

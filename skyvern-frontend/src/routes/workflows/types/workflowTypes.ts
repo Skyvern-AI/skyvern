@@ -232,7 +232,8 @@ export type WorkflowBlock =
   | GoogleSheetsWriteBlock
   | PowerBIQueryBlock
   | PdfFillBlock
-  | SplitPdfBlock;
+  | SplitPdfBlock
+  | IntegrationActionBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -270,6 +271,7 @@ export const WorkflowBlockTypes = {
   PowerBIQuery: "powerbi_query",
   PDFFill: "pdf_fill",
   SplitPDF: "split_pdf",
+  IntegrationAction: "integration_action",
 } as const;
 
 // all of them
@@ -378,6 +380,7 @@ export type ConditionalBlock = WorkflowBlockBase & {
 
 export type TaskBlock = WorkflowBlockBase & {
   block_type: "task";
+  complete_verification?: boolean;
   url: string | null;
   title: string;
   navigation_goal: string | null;
@@ -483,6 +486,7 @@ export type FileUploadBlock = WorkflowBlockBase & {
   azure_blob_container_name: string | null;
   google_credential_id: string | null;
   google_drive_folder_id: string | null;
+  google_drive_save_as_sheet?: boolean;
   sftp_host: string | null;
   sftp_port: number | null;
   sftp_username: string | null;
@@ -566,6 +570,8 @@ export type DataExportBlock = WorkflowBlockBase & {
 
 export type ActionBlock = WorkflowBlockBase & {
   block_type: "action";
+  selector?: string | null;
+  ai_fallback?: "fallback" | "proactive";
   url: string | null;
   title: string;
   navigation_goal: string | null;
@@ -584,6 +590,8 @@ export type ActionBlock = WorkflowBlockBase & {
 
 export type NavigationBlock = WorkflowBlockBase & {
   block_type: "navigation";
+  complete_verification?: boolean;
+  complete_criterion_is_untrusted?: boolean;
   url: string | null;
   title: string;
   navigation_goal: string | null;
@@ -623,6 +631,8 @@ export type ExtractionBlock = WorkflowBlockBase & {
 
 export type LoginBlock = WorkflowBlockBase & {
   block_type: "login";
+  complete_verification?: boolean;
+  skip_saved_profile?: boolean;
   url: string | null;
   title: string;
   navigation_goal: string | null;
@@ -760,6 +770,8 @@ export type WorkflowTriggerBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type EmailOrganizeAction = "label" | "archive" | "move" | "mark_read";
+
 export type EmailInboxBlock = WorkflowBlockBase & {
   block_type: "email_inbox";
   email_client: "gmail" | "outlook";
@@ -775,6 +787,8 @@ export type EmailInboxBlock = WorkflowBlockBase & {
   include_body: boolean;
   download_attachments: boolean;
   message_id?: string | null;
+  organize_action?: EmailOrganizeAction | null;
+  organize_label?: string | null;
   parameters: Array<WorkflowParameter>;
 };
 
@@ -817,6 +831,15 @@ export type PdfFillBlock = WorkflowBlockBase & {
   prompt: string;
   payload: Record<string, unknown> | Array<unknown> | string | null;
   llm_key: string | null;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type IntegrationActionBlock = WorkflowBlockBase & {
+  block_type: "integration_action";
+  integration_id: string;
+  action_id: string;
+  connection_id: string | null;
+  inputs: Record<string, unknown>;
   parameters: Array<WorkflowParameter>;
 };
 

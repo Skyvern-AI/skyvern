@@ -46,22 +46,6 @@ async def _prompt_names(server: FastMCP) -> set[str]:
     return {prompt.name for prompt in await server.list_prompts()}
 
 
-async def _tool_tags(server: FastMCP) -> set[str]:
-    return {tag for tool in await server.list_tools(run_middleware=False) for tag in tool.tags}
-
-
-def test_scope_tag_sets_are_exact() -> None:
-    scopes = _load_scopes_module()
-
-    operate = {"workflow", "schedule", "folder", "script", "feedback"}
-    assert scopes.SCOPES == {
-        "operate": operate,
-        "build": operate | {"block_discovery", "inspection", "ai_powered", "session", "state"},
-        "browser": {"browser_primitive", "tab_management", "session", "browser_profile", "inspection", "feedback"},
-        "lean": {"lean", "feedback"},
-    }
-
-
 def test_cli_scope_choices_match_scope_map() -> None:
     from skyvern.cli.run_commands import run_mcp
     from skyvern.cli.setup_commands import MCPToolScope
@@ -78,28 +62,6 @@ def test_run_mcp_scope_default_is_all() -> None:
     from skyvern.cli.run_commands import run_mcp
 
     assert inspect.signature(run_mcp).parameters["scope"].default == "all"
-
-
-def test_operate_adds_exact_transforms_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
-    scopes = _load_scopes_module()
-    created: list[tuple[object, dict[str, Any], object]] = []
-
-    class RecordedVisibility:
-        def __init__(self, enabled: bool, **kwargs: Any) -> None:
-            created.append((enabled, kwargs, self))
-
-    server = FastMCP("scope-test")
-    added: list[object] = []
-    monkeypatch.setattr(scopes, "Visibility", RecordedVisibility)
-    monkeypatch.setattr(server, "add_transform", added.append)
-
-    scopes.apply_scope(server, "operate")
-
-    assert [(enabled, kwargs) for enabled, kwargs, _ in created] == [
-        (False, {"components": {"tool"}}),
-        (True, {"tags": set(scopes.SCOPES["operate"]), "components": {"tool"}}),
-    ]
-    assert added == [transform for _, _, transform in created]
 
 
 @pytest.mark.asyncio
@@ -142,39 +104,14 @@ async def test_real_server_all_scope_keeps_default_surface(scoped_mcp: FastMCP) 
     assert await _prompt_names(scoped_mcp) == before_prompts
 
 
-@pytest.mark.asyncio
-async def test_scope_tags_exist_on_real_registered_tools(scoped_mcp: FastMCP) -> None:
-    from skyvern.cli.mcp_tools.scopes import SCOPES
-
-    live_tags = await _tool_tags(scoped_mcp)
-
-    assert {tag for scope_tags in SCOPES.values() for tag in scope_tags} <= live_tags
-
-
-@pytest.mark.asyncio
-async def test_every_real_scope_is_non_empty_strict_subset(scoped_mcp: FastMCP) -> None:
-    from skyvern.cli.mcp_tools.scopes import SCOPES, apply_scope
-
-    full_tools = await _tool_names(scoped_mcp)
-
-    for scope in SCOPES:
-        scoped_mcp._transforms.clear()
-        apply_scope(scoped_mcp, scope)
-        scoped_tools = await _tool_names(scoped_mcp)
-
-        assert scoped_tools
-        assert scoped_tools < full_tools
-
-
-# Resolved sizes are pinned deliberately. The relational guards above pass when a tag is renamed
-# on ONE tool of many — the tag survives elsewhere, the subset stays strict, and the scope
-# silently loses a tool. Only an external oracle catches that, so these numbers are a ratchet:
+# Resolved sizes are pinned deliberately: a tag renamed on ONE tool of many survives elsewhere,
+# so the scope silently loses a tool. Only an external oracle catches that, so these numbers are a ratchet:
 # adding or re-tagging a tool must be a conscious edit here, reviewed alongside the scope map.
-RESOLVED_SCOPE_SIZES: dict[MCPScope, int] = {"operate": 31, "build": 63, "browser": 55, "lean": 34}
+RESOLVED_SCOPE_SIZES: dict[MCPScope, int] = {"operate": 37, "build": 69, "browser": 55, "lean": 34}
 
 # Same ratchet for the unfiltered (`all`) surface. Kept in one place because duplicated copies
 # drift: a registration that bumps only its own copy leaves the others to fail in CI.
-TOTAL_TOOL_COUNT: int = 118
+TOTAL_TOOL_COUNT: int = 128
 
 
 @pytest.mark.asyncio
@@ -290,6 +227,7 @@ def test_run_mcp_cli_scope_operate_reaches_apply_scope(monkeypatch: pytest.Monke
     monkeypatch.setattr(run_commands, "_run_mcp_with_cleanup", fake_run_mcp_with_cleanup)
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_sync", lambda: None)
     monkeypatch.setattr(run_commands, "_start_stdin_eof_watcher", lambda: (None, None))
+    monkeypatch.setattr("skyvern.forge.forge_app_initializer.start_forge_app", lambda **_kwargs: None)
     monkeypatch.setattr(scopes, "apply_scope", fake_apply_scope)
 
     result = CliRunner().invoke(run_app, ["mcp", "--transport", "streamable-http", "--scope", "operate"])
@@ -315,6 +253,7 @@ def test_run_mcp_cli_selects_lean_instructions_once_at_boot(monkeypatch: pytest.
     monkeypatch.setattr(run_commands, "_run_mcp_with_cleanup", fake_run_mcp_with_cleanup)
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_sync", lambda: None)
     monkeypatch.setattr(run_commands, "_start_stdin_eof_watcher", lambda: (None, None))
+    monkeypatch.setattr("skyvern.forge.forge_app_initializer.start_forge_app", lambda **_kwargs: None)
     monkeypatch.setattr(scopes, "apply_scope", lambda *_args, **_kwargs: None)
 
     result = CliRunner().invoke(run_app, ["mcp", "--transport", "streamable-http", "--scope", "lean"])

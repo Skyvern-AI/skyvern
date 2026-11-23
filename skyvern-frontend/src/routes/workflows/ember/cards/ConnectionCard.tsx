@@ -23,6 +23,7 @@ import {
 } from "@/routes/integrations/googleOAuth";
 import { markGoogleOAuthPopup } from "@/routes/integrations/googleOAuthPopup";
 import { useCurrentOrgId } from "@/hooks/useCurrentOrgId";
+import { stripBidiIsolates } from "@/util/bidiText";
 import {
   type ConnectedGmailFlow,
   useHasCapability,
@@ -221,7 +222,7 @@ function ConnectionCardBody({
       connection_id: connection.connection_id,
       name: connection.name,
       state: "active" as const,
-      email_address: null,
+      email_address: connection.email_address ?? null,
     })),
   ];
 
@@ -334,17 +335,51 @@ function ConnectionCardBody({
       ? `The connection was not completed. If your ${isGoogle ? "Google Workspace" : "Microsoft 365"} administrator blocks this app, ask them to allow it, then try again.`
       : ATTEMPT_FAILURES[attempt]);
   const actionLabel = card.reconnectConnectionId ? "Reconnect" : "Connect";
+  // The account a new Gmail card cannot add to: the user's one Connected Gmail, there before this card.
+  const onlyConnectedGmail =
+    !reconnectConnectionId &&
+    connected &&
+    gmailFlow &&
+    !gmailFlow.canConnect &&
+    initialIds?.has(connected.connection_id) &&
+    gmailFlow.connections.some(
+      (connection) => connection.connection_id === connected.connection_id,
+    );
 
   if (connected) {
     return (
       <div className="space-y-2">
         <div className="rounded-lg border border-success/40 bg-success/10 p-3 text-sm">
-          <div className="font-medium">Connected</div>
-          <div className="mt-1 text-xs text-muted-foreground">
-            {connected.name}
-            {connected.email_address ? ` (${connected.email_address})` : ""} can
-            use {card.integrationName}.
-          </div>
+          {onlyConnectedGmail ? (
+            <>
+              <div className="font-medium">Already connected</div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                You already have a Connected Gmail account, shown below.
+                Connected Gmail allows one account per user, so another one
+                cannot be added. To use a different Gmail account, reconnect or
+                disconnect this one on the Integrations page.
+              </div>
+              <a
+                className="mt-2 inline-block text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                href="/integrations"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Open the Integrations page
+              </a>
+            </>
+          ) : (
+            <>
+              <div className="font-medium">Connected</div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                <bdi>{stripBidiIsolates(connected.name)}</bdi>
+                {connected.email_address
+                  ? ` (${connected.email_address})`
+                  : ""}{" "}
+                can use {card.integrationName}.
+              </div>
+            </>
+          )}
         </div>
         <ConnectedAccountChoiceCard
           choices={choices}

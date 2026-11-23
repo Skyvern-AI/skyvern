@@ -1,0 +1,671 @@
+{
+ "pending_credential_requests": [],
+ "question_interactions": [
+  {
+   "interaction_id": "f08cd3a2a7f545c8816991d4aa2c7bc1",
+   "turn_id": "5bfdf5e10c1b494ea66b44186ee02eaf",
+   "tool_call_id": "toolu_01UYos2a6Z368wibSEAZ24hk",
+   "parts": [
+    {
+     "part_id": "ce3f5a0734e440f39b19bd9f10eaaf1c",
+     "prompt": "What should the workflow extract from https://example.com?",
+     "choices": [
+      {
+       "choice_id": "4bfc775104bd47de867e26471ea96d60",
+       "text": "Page title"
+      },
+      {
+       "choice_id": "34f56b6d4e774325ae9d961cf24740c2",
+       "text": "First heading (h1)"
+      }
+     ]
+    }
+   ],
+   "status": "resolved",
+   "response": {
+    "answers": [],
+    "text": "the page title",
+    "skipped": false
+   },
+   "created_at": "2026-11-14T06:12:42.480071Z",
+   "resolved_at": "2026-11-14T06:18:45.302636Z"
+  }
+ ],
+ "pending_question_cancel_token": null,
+ "workflow_copilot_chat_id": "wcc_596800992274100812",
+ "request_turn_id": null,
+ "request_browser_allocations": null,
+ "in_flight_turn": null,
+ "chat_history": [
+  {
+   "workflow_copilot_chat_message_id": "wccm_596800992274100814",
+   "sender": "user",
+   "content": "Before building anything, ask me whether to extract the page title or the first heading, then build a workflow that opens https://example.com and extracts what I chose.",
+   "turn_id": "5bfdf5e10c1b494ea66b44186ee02eaf",
+   "feedback": null,
+   "audio_artifact_id": null,
+   "attached_files": [],
+   "turn_outcome": null,
+   "narrative_payload": null,
+   "created_at": "2026-11-14T06:12:39.043179",
+   "modified_at": "2026-11-14T06:12:40.239433",
+   "ember_chat_message_id": "wccm_596800992274100814"
+  },
+  {
+   "workflow_copilot_chat_message_id": "wccm_596802757505659546",
+   "sender": "ai",
+   "content": "I built and tested the agent. It opens https://example.com and extracts the **page title**, which is what you chose.\n\nThe test run completed and returned `page_title` = `Example Domain`. The final screenshot shows the example.com notice page.\n\nThe agent has one code block, `extract_page_title`. It opens the page, waits until the document title is non-empty, and returns it.\n\nI saved the draft after the test, so the saved version is staged for your review. Accept it to make it the saved agent. I didn't re-run it after that save, but the code is the same as the tested version. Only its descriptive metadata was completed.\n\nThe page's visible heading is also \"Example Domain\", so the first-heading option would give the same text here. I didn't add it, since you picked the title.",
+   "turn_id": "5bfdf5e10c1b494ea66b44186ee02eaf",
+   "feedback": null,
+   "audio_artifact_id": null,
+   "attached_files": [],
+   "turn_outcome": {
+    "response_kind": "build",
+    "reason_code": "",
+    "output_policy_reasons": [],
+    "actuation_obligation_key": "",
+    "normalized_reply_signature": "f90114cefefe6a7a",
+    "tool_calls": [
+     "ask_user",
+     "get_workflow_knowledge",
+     "navigate_browser",
+     "get_block_schema",
+     "evaluate",
+     "update_and_run_blocks",
+     "update_workflow"
+    ],
+    "terminal_reason": null,
+    "budget_expired": false,
+    "budget_expiry_source": null,
+    "budget_expiry_report_produced": null,
+    "budget_expiry_staged_draft_id": null,
+    "drain_fingerprint": null,
+    "cancel_source": null,
+    "blocked_signatures": [],
+    "copilot_runtime": "agent",
+    "copilot_effective_mode": null,
+    "copilot_code_available": true,
+    "copilot_last_code_build_failed": false,
+    "copilot_pending_capability": null,
+    "copilot_turn_id": "5bfdf5e10c1b494ea66b44186ee02eaf",
+    "user_message_id": "wccm_596800992274100814",
+    "request_cancel_token": "a861b3b6-1361-4a4b-bfd7-140990f6a365",
+    "request_browser_allocations": null,
+    "interrupted_row_final": false,
+    "idempotency_digest": null,
+    "connected_account_choices": null,
+    "output_files": null
+   },
+   "narrative_payload": {
+    "turnId": "5bfdf5e10c1b494ea66b44186ee02eaf",
+    "turnIndex": 0,
+    "designStarted": true,
+    "designEnded": true,
+    "draft": {
+     "blockCount": 1,
+     "blockLabels": [
+      "extract_page_title"
+     ],
+     "summary": null
+    },
+    "blocks": [
+     {
+      "label": "extract_page_title",
+      "workflowRunBlockId": "wrb_596802628656640626",
+      "blockType": "code",
+      "state": "completed",
+      "lastSeenIteration": 5,
+      "activity": [],
+      "startedAt": "2026-11-14T06:19:00.778013",
+      "endedAt": "2026-11-14T06:19:01.142507",
+      "workflowRunId": "wr_596802628656640616",
+      "outcome": "not_evaluated",
+      "outcomeRole": "recorded"
+     }
+    ],
+    "terminal": "response",
+    "terminalMessage": "I built and tested the agent. It opens https://example.com and extracts the **page title**, which is what you chose.\n\nThe test run completed and returned `page_title` = `Example Domain`. The final screenshot shows the example.com notice page.\n\nThe agent has one code block, `extract_page_title`. It opens the page, waits until the document title is non-empty, and returns it.\n\nI saved the draft after the test, so the saved version is staged for your review. Accept it to make it the saved agent. I didn't re-run it after that save, but the code is the same as the tested version. Only its descriptive metadata was completed.\n\nThe page's visible heading is also \"Example Domain\", so the first-heading option would give the same text here. I didn't add it, since you picked the title.",
+    "narrativeSummary": "I built and tested the agent. It opens https://example.com and extracts the **page title**, which is what you chose.\n\nThe test run completed and returned `page_title` = `Example Domain`. The final screenshot shows the example.com notice page.\n\nThe agent has one code block, `extract_page_title`. It opens the page, waits until the document title is non-empty, and returns it.\n\nI saved the draft after the test, so the saved version is staged for your review. Accept it to make it the saved agent. I didn't re-run it after that save, but the code is the same as the tested version. Only its descriptive metadata was completed.\n\nThe page's visible heading is also \"Example Domain\", so the first-heading option would give the same text here. I didn't add it, since you picked the title.",
+    "priorBlockCount": 0,
+    "designActivity": [
+     {
+      "kind": "tool_call",
+      "text": "Asking you\u2026",
+      "iteration": 0,
+      "toolName": "ask_user",
+      "displayLabel": "Asking you",
+      "id": "tc-toolu_01UYos2a6Z368wibSEAZ24hk",
+      "timestamp": "2026-11-14T06:12:42.426736+00:00",
+      "reason": "Asking which value to extract before building",
+      "activityStartedAt": "2026-11-14T06:12:42.426736+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_result",
+      "text": "OK",
+      "iteration": 0,
+      "toolName": "ask_user",
+      "displayLabel": "Asking you",
+      "success": true,
+      "id": "tr-toolu_01UYos2a6Z368wibSEAZ24hk",
+      "timestamp": "2026-11-14T06:18:45.992890+00:00",
+      "reason": "Asking which value to extract before building",
+      "activityStartedAt": "2026-11-14T06:12:42.426736+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_call",
+      "text": "Opening page\u2026",
+      "iteration": 1,
+      "toolName": "navigate_browser",
+      "displayLabel": "Opening page",
+      "id": "tc-toolu_0119EbyheHdszHs2YhEwR4FU",
+      "timestamp": "2026-11-14T06:18:48.478706+00:00",
+      "reason": "Opening example.com to check the page title",
+      "activityStartedAt": "2026-11-14T06:18:48.478706+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_call",
+      "text": "Looking up workflow guidance\u2026",
+      "iteration": 1,
+      "toolName": "get_workflow_knowledge",
+      "displayLabel": "Looking up workflow guidance",
+      "id": "tc-toolu_01VJDST4wm4UBUg3qu7gKaWy",
+      "timestamp": "2026-11-14T06:18:48.517958+00:00",
+      "reason": "Checking how code blocks read the page",
+      "activityStartedAt": "2026-11-14T06:18:48.517958+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_result",
+      "text": "Navigated to https://example.com/",
+      "iteration": 1,
+      "toolName": "navigate_browser",
+      "displayLabel": "Opening page",
+      "success": true,
+      "id": "tr-toolu_0119EbyheHdszHs2YhEwR4FU",
+      "timestamp": "2026-11-14T06:18:50.904376+00:00",
+      "reason": "Opening example.com to check the page title",
+      "activityStartedAt": "2026-11-14T06:18:48.478706+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_result",
+      "text": "OK",
+      "iteration": 2,
+      "toolName": "get_workflow_knowledge",
+      "displayLabel": "Looking up workflow guidance",
+      "success": true,
+      "id": "tr-toolu_01VJDST4wm4UBUg3qu7gKaWy",
+      "timestamp": "2026-11-14T06:18:50.904456+00:00",
+      "reason": "Checking how code blocks read the page",
+      "activityStartedAt": "2026-11-14T06:18:48.517958+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_call",
+      "text": "Checking workflow block options\u2026",
+      "iteration": 3,
+      "toolName": "get_block_schema",
+      "displayLabel": "Checking workflow block options",
+      "id": "tc-toolu_01RM4gQKSBCjpg2hpJzabe78",
+      "timestamp": "2026-11-14T06:18:53.694676+00:00",
+      "reason": "Checking the code block fields",
+      "activityStartedAt": "2026-11-14T06:18:53.694676+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_call",
+      "text": "Inspecting page\u2026",
+      "iteration": 3,
+      "toolName": "evaluate",
+      "displayLabel": "Inspecting page",
+      "id": "tc-toolu_019vt7p7rQ7JkBQZZAENtqcD",
+      "timestamp": "2026-11-14T06:18:53.727163+00:00",
+      "reason": "Reading the page title on the live page",
+      "activityStartedAt": "2026-11-14T06:18:53.727163+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_result",
+      "text": "Schema for code",
+      "iteration": 3,
+      "toolName": "get_block_schema",
+      "displayLabel": "Checking workflow block options",
+      "success": true,
+      "id": "tr-toolu_01RM4gQKSBCjpg2hpJzabe78",
+      "timestamp": "2026-11-14T06:18:53.911831+00:00",
+      "reason": "Checking the code block fields",
+      "activityStartedAt": "2026-11-14T06:18:53.694676+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_result",
+      "text": "Inspecting page",
+      "iteration": 4,
+      "toolName": "evaluate",
+      "displayLabel": "Inspecting page",
+      "success": true,
+      "id": "tr-toolu_019vt7p7rQ7JkBQZZAENtqcD",
+      "timestamp": "2026-11-14T06:18:53.911884+00:00",
+      "reason": "Reading the page title on the live page",
+      "activityStartedAt": "2026-11-14T06:18:53.727163+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_call",
+      "text": "Testing workflow\u2026",
+      "iteration": 5,
+      "toolName": "update_and_run_blocks",
+      "displayLabel": "Testing workflow",
+      "id": "tc-toolu_01QAM6R9y1eT3CjWkaTk3icN",
+      "timestamp": "2026-11-14T06:18:58.930934+00:00",
+      "reason": "Building and testing the page-title extraction",
+      "activityStartedAt": "2026-11-14T06:18:58.930934+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_result",
+      "text": "Staged a workflow draft and ran it: completed",
+      "iteration": 5,
+      "toolName": "update_and_run_blocks",
+      "displayLabel": "Testing workflow",
+      "success": true,
+      "id": "tr-toolu_01QAM6R9y1eT3CjWkaTk3icN",
+      "timestamp": "2026-11-14T06:19:15.015736+00:00",
+      "codeDiffs": [
+       {
+        "label": "extract_page_title",
+        "added": 4,
+        "removed": 0,
+        "patch": "@@ -0,0 +1,4 @@\n+await page.goto(\"https://example.com\")\n+await page.wait_for_function(\"document.title && document.title.length > 0\")\n+title = await page.title()\n+return {\"page_title\": title}"
+       }
+      ],
+      "workflowRunId": "wr_596802628656640616",
+      "reason": "Building and testing the page-title extraction",
+      "activityStartedAt": "2026-11-14T06:18:58.930934+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_call",
+      "text": "Updating workflow\u2026",
+      "iteration": 6,
+      "toolName": "update_workflow",
+      "displayLabel": "Updating workflow",
+      "id": "tc-toolu_017YnGrWfJsp56dMcwVfs5Pz",
+      "timestamp": "2026-11-14T06:19:23.055590+00:00",
+      "reason": "Completing the block's metadata and saving the draft",
+      "activityStartedAt": "2026-11-14T06:19:23.055590+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     },
+     {
+      "kind": "tool_result",
+      "text": "Staged a workflow draft (1 blocks)",
+      "iteration": 6,
+      "toolName": "update_workflow",
+      "displayLabel": "Updating workflow",
+      "success": true,
+      "id": "tr-toolu_017YnGrWfJsp56dMcwVfs5Pz",
+      "timestamp": "2026-11-14T06:19:23.165110+00:00",
+      "reason": "Completing the block's metadata and saving the draft",
+      "activityStartedAt": "2026-11-14T06:19:23.055590+00:00",
+      "activityBucket": {
+       "kind": "design"
+      }
+     }
+    ],
+    "startedAt": "2026-11-14T06:12:40.242460+00:00",
+    "endedAt": "2026-11-14T06:19:28.537729+00:00",
+    "screenshots": [
+     {
+      "artifactId": "a_596802585706967636",
+      "capturedAt": "2026-11-14T06:18:50.881905+00:00",
+      "toolCallId": "toolu_0119EbyheHdszHs2YhEwR4FU"
+     }
+    ],
+    "testedBlockFingerprints": {
+     "extract_page_title": [
+      "e2de1d2d7355cca9615f413552a99d72b67af7d1a91eab39f9e7f8139b4acedd"
+     ]
+    },
+    "review": {
+     "blocks": [
+      {
+       "label": "extract_page_title",
+       "blockType": "code",
+       "change": "added",
+       "neverTested": false,
+       "coverage": "current_source"
+      }
+     ],
+     "duplicateWrites": [],
+     "inputs": []
+    },
+    "responseType": "REPLY",
+    "proposalDisposition": "review_untested",
+    "responseKind": "build",
+    "turnFacts": {
+     "factsAvailable": true,
+     "evaluationState": "not_evaluated",
+     "runId": "wr_596802628656640616",
+     "runCompleted": true,
+     "terminalCause": null,
+     "blocksRunThisTurn": 1,
+     "recordedFailure": null,
+     "ranCleanOnCurrentSource": true,
+     "authoredBlockCount": 1,
+     "matchingSourceBlockCount": 1,
+     "editedBlockLabels": [
+      "extract_page_title"
+     ]
+    },
+    "cancelled": false,
+    "questionInteractions": [
+     {
+      "interaction_id": "f08cd3a2a7f545c8816991d4aa2c7bc1",
+      "turn_id": "5bfdf5e10c1b494ea66b44186ee02eaf",
+      "tool_call_id": "toolu_01UYos2a6Z368wibSEAZ24hk",
+      "parts": [
+       {
+        "part_id": "ce3f5a0734e440f39b19bd9f10eaaf1c",
+        "prompt": "What should the workflow extract from https://example.com?",
+        "choices": [
+         {
+          "choice_id": "4bfc775104bd47de867e26471ea96d60",
+          "text": "Page title"
+         },
+         {
+          "choice_id": "34f56b6d4e774325ae9d961cf24740c2",
+          "text": "First heading (h1)"
+         }
+        ]
+       }
+      ],
+      "status": "resolved",
+      "response": {
+       "answers": [],
+       "text": "the page title",
+       "skipped": false
+      },
+      "created_at": "2026-11-14T06:12:42.480071Z",
+      "resolved_at": "2026-11-14T06:18:45.302636Z"
+     }
+    ]
+   },
+   "created_at": "2026-11-14T06:19:30.073975",
+   "modified_at": "2026-11-14T06:19:30.073978",
+   "ember_chat_message_id": "wccm_596802757505659546"
+  }
+ ],
+ "workflow_permanent_id": "wpid_596800987979133512",
+ "app_url": "http://localhost:8080",
+ "accepted_turn_ids": [],
+ "proposed_workflow": {
+  "workflow_id": "w_596800987979133510",
+  "organization_id": "o_596691277976876550",
+  "title": "Extract example.com page title",
+  "workflow_permanent_id": "wpid_596800987979133512",
+  "version": 1,
+  "is_saved_task": false,
+  "is_template": false,
+  "description": null,
+  "workflow_definition": {
+   "version": 1,
+   "parameters": [
+    {
+     "parameter_type": "output",
+     "key": "extract_page_title_output",
+     "description": "Output parameter for block extract_page_title",
+     "output_parameter_id": "op_596802727440888468",
+     "workflow_id": "w_596800987979133510",
+     "created_at": "2026-11-14T06:19:23.129155",
+     "modified_at": "2026-11-14T06:19:23.129157",
+     "deleted_at": null
+    }
+   ],
+   "blocks": [
+    {
+     "label": "extract_page_title",
+     "next_block_label": null,
+     "block_type": "code",
+     "output_parameter": {
+      "parameter_type": "output",
+      "key": "extract_page_title_output",
+      "description": "Output parameter for block extract_page_title",
+      "output_parameter_id": "op_596802727440888468",
+      "workflow_id": "w_596800987979133510",
+      "created_at": "2026-11-14T06:19:23.129155",
+      "modified_at": "2026-11-14T06:19:23.129157",
+      "deleted_at": null
+     },
+     "continue_on_failure": false,
+     "model": null,
+     "disable_cache": false,
+     "ignore_workflow_system_prompt": false,
+     "next_loop_on_failure": false,
+     "code": "await page.goto(\"https://example.com\")\nawait page.wait_for_function(\"document.title && document.title.length > 0\")\ntitle = await page.title()\nreturn {\"page_title\": title}",
+     "parameters": [],
+     "error_code_mapping": null,
+     "prompt": "The browser shows the example.com page, and page_title holds its browser tab title, 'Example Domain'. Opens https://example.com, waits for the document title to be non-empty, and reads it.",
+     "steps": [
+      {
+       "description": "Open https://example.com",
+       "action_type": "goto_url",
+       "line_start": 1,
+       "line_end": 1
+      }
+     ],
+     "data_schema": {
+      "type": "object",
+      "properties": {
+       "page_title": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "page_title"
+      ]
+     },
+     "user_owned_goal": null,
+     "goal_needs_regeneration": null,
+     "code_edited_by_hand": null
+    }
+   ],
+   "finally_block_label": null,
+   "error_code_mapping": null,
+   "retry_policy": null,
+   "workflow_system_prompt": null,
+   "completion_contract": null
+  },
+  "persist_browser_session": false,
+  "reuse_browser_session": false,
+  "mask_secrets": false,
+  "pin_saved_session_ip": false,
+  "browser_profile_id": null,
+  "browser_profile_key": null,
+  "model": null,
+  "status": "published",
+  "max_screenshot_scrolls": null,
+  "max_elapsed_time_minutes": null,
+  "run_with": "agent",
+  "browser_type": null,
+  "ai_fallback": true,
+  "cache_key": "default",
+  "adaptive_caching": false,
+  "enable_self_healing": false,
+  "code_version": 2,
+  "generate_script_on_terminal": false,
+  "run_sequentially": false,
+  "sequential_key": null,
+  "folder_id": null,
+  "import_error": null,
+  "created_by": null,
+  "edited_by": null,
+  "build_source": null,
+  "copilot_authored": false,
+  "original_created_by": null,
+  "original_created_at": null,
+  "created_at": "2026-11-14T06:19:23.132046Z",
+  "modified_at": "2026-11-14T06:19:23.132046Z",
+  "deleted_at": null,
+  "agent_id": "wpid_596800987979133512",
+  "_copilot_yaml": "title: Extract example.com page title\nworkflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: extract_page_title\n    prompt: The browser shows the example.com page, and page_title holds its browser\n      tab title, 'Example Domain'. Opens https://example.com, waits for the document\n      title to be non-empty, and reads it.\n    data_schema:\n      type: object\n      properties:\n        page_title:\n          type: string\n      required:\n      - page_title\n    code: 'await page.goto(\"https://example.com\")\n\n      await page.wait_for_function(\"document.title && document.title.length > 0\")\n\n      title = await page.title()\n\n      return {\"page_title\": title}'\n    steps:\n    - description: Open https://example.com\n      action_type: goto_url\n      line_start: 1\n      line_end: 1\n",
+  "_copilot_code_artifact_metadata": {
+   "extract_page_title": {
+    "artifact_id": "code_artifact:extract_page_title",
+    "block_label": "extract_page_title",
+    "declared_goal": "The browser shows the example.com page, and page_title holds its tab title: Example Domain. Opens https://example.com and reads the document title.",
+    "claimed_outcomes": [
+     {
+      "id": "o1",
+      "scope": "",
+      "text": "Returns the page title",
+      "status": "observed_not_verified",
+      "depends_on": [
+       "d1"
+      ],
+      "covered_criteria": [
+       "c1"
+      ],
+      "criteria_ids": [],
+      "goal_value_paths": [
+       "page_title"
+      ],
+      "extraction_schema": "{\"type\":\"object\",\"properties\":{\"page_title\":{\"type\":\"string\"}},\"required\":[\"page_title\"]}",
+      "extraction_schema_provenance": "self_authored",
+      "evidence_refs": [
+       "ev1"
+      ],
+      "observation_refs": [
+       "obs1"
+      ],
+      "required_tokens": [],
+      "entities": []
+     }
+    ],
+    "page_dependencies": [
+     {
+      "id": "d1",
+      "scope": "",
+      "status": "observed_not_verified",
+      "url_hint": "https://example.com/",
+      "required_affordances": [],
+      "required_outcomes": [],
+      "evidence_refs": [
+       "ev1"
+      ],
+      "observation_refs": [
+       "obs1"
+      ]
+     }
+    ],
+    "completion_criteria": [
+     {
+      "id": "c1",
+      "text": "page_title returned",
+      "level": "terminal",
+      "terminal": true,
+      "output_path": "page_title"
+     }
+    ],
+    "evidence_refs": [
+     {
+      "dependency_id": "d1",
+      "evidence_ref": "ev1",
+      "status": "observed_not_verified",
+      "source_tool": "evaluate",
+      "current_url": "https://example.com/"
+     }
+    ],
+    "observation_refs": [
+     {
+      "dependency_id": "d1",
+      "observation_ref": "obs1",
+      "status": "observed_not_verified",
+      "source_tool": "navigate_browser",
+      "current_url": "https://example.com/"
+     }
+    ],
+    "terminal_verifier_expectations": [
+     {
+      "id": "t1",
+      "text": "page_title equals Example Domain",
+      "criteria_ids": [
+       "c1"
+      ],
+      "claimed_outcome_ids": [
+       "o1"
+      ],
+      "goal_value_paths": [
+       "page_title"
+      ]
+     }
+    ],
+    "exploration_observations": [],
+    "input_bindings": []
+   }
+  },
+  "_copilot_unvalidated": true,
+  "_copilot_tested_block_fingerprints": {
+   "extract_page_title": [
+    "e2de1d2d7355cca9615f413552a99d72b67af7d1a91eab39f9e7f8139b4acedd"
+   ]
+  },
+  "_copilot_proposal": {
+   "owner_turn_id": "5bfdf5e10c1b494ea66b44186ee02eaf",
+   "revision": 3,
+   "canonical_fingerprint": "d5dd80a953733e2ac88bacda3dd0d1f568666b962579a759fde8714b9cff6774",
+   "canonical_title": "sky20621-question",
+   "disposition": "review_untested",
+   "workflow_run_id": null,
+   "claimed_at": null
+  },
+  "proxy_location": null,
+  "webhook_callback_url": null,
+  "totp_verification_url": null,
+  "totp_identifier": null,
+  "extra_http_headers": null,
+  "cdp_connect_headers": null
+ },
+ "proposed_workflow_metadata": {
+  "owner_turn_id": "5bfdf5e10c1b494ea66b44186ee02eaf",
+  "revision": 3,
+  "canonical_fingerprint": "d5dd80a953733e2ac88bacda3dd0d1f568666b962579a759fde8714b9cff6774",
+  "canonical_title": "sky20621-question",
+  "disposition": "review_untested",
+  "workflow_run_id": null,
+  "claimed_at": null
+ },
+ "proposed_claim_expires_in_seconds": null,
+ "proposed_workflow_run": null,
+ "auto_accept": false,
+ "work_plan": [],
+ "ember_chat_id": "wcc_596800992274100812"
+}
