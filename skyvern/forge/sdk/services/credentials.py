@@ -1,4 +1,5 @@
 import asyncio
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -326,6 +327,17 @@ async def wait_for_fresh_totp_window(totp_secret: str, *, min_remaining_seconds:
             return
         LOG.info("Waiting for a fresh TOTP window", wait_seconds=round(wait_seconds, 1))
         await asyncio.sleep(wait_seconds)
+
+
+# Codes that a site may still accept: some accept a code minutes old, and one from a fast clock a step ahead.
+LIVE_TOTP_SECONDS_BEHIND = 300
+LIVE_TOTP_STEPS_AHEAD = 1
+
+
+def live_totp_codes(totp: pyotp.TOTP, *, now: float) -> list[str]:
+    """The codes ``totp`` made in the five minutes before ``now``, whatever its period, and the next one."""
+    behind = math.ceil(LIVE_TOTP_SECONDS_BEHIND / totp.interval)
+    return [totp.at(now + step * totp.interval) for step in range(-behind, LIVE_TOTP_STEPS_AHEAD + 1)]
 
 
 def generate_totp_code(totp_secret: str, for_time: int | None = None) -> str:

@@ -1228,6 +1228,8 @@ NAV_DEAD_END_GUARD = "navigation_dead_end"
 PAGE_REFRESH_EXHAUSTED_GUARD = "page_refresh_exhausted"
 # The answer-basis audit refused moving on ANSWER_BASIS_MAX_HOLDS times in one run.
 ANSWER_BASIS_HOLD_BOUND_GUARD = "answer_basis_hold_bound"
+# The credential release guard refused CREDENTIAL_RELEASE_MAX_REFUSALS writes of a held secret in one task.
+CREDENTIAL_RELEASE_BOUND_GUARD = "credential_release_bound"
 # The browser or its page is gone: the page accessor behind every tool already tried to reopen a lost
 # tab and could not, so every later call raises the same error and the model spends turns on a browser
 # that cannot come back (SKY-18903). The only guard whose verdict is `failed` rather than `terminated`:

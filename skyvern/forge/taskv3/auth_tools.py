@@ -337,6 +337,8 @@ class VerificationState:
     last_status: str | None = field(default=None, init=False)
     # The block's credential scope, set by `build_auth_tools`; the type tool's refusal reads it.
     allowed_credential_parameter_keys: Sequence[str] | None = field(default=None, init=False)
+    # Set with bind_credential_codes: a code typed from a credential's placeholder never reaches the model's view.
+    hide_codes_from_model: bool = field(default=False, init=False)
     # Set when the latest verification answer asked the model to keep waiting for a sign-in link.
     link_wait_since: float | None = field(default=None, init=False)
     giveup_deferrals: int = field(default=0, init=False)
@@ -450,7 +452,7 @@ class VerificationState:
             await authorize(code, owner_key)
         context = skyvern_context.current()
         if context is not None:
-            context.register_secret_value(code)
+            context.register_secret_value(code, hide_from_model=self.hide_codes_from_model)
         # The workflow-run registry is what redacts the code from this run's other blocks and artifacts.
         _register_runtime_otp_value_best_effort(workflow_run_id, code)
         self.record_delivery("type")
@@ -587,19 +589,36 @@ def _code_credential_not_in_use(task: Task, allowed_credential_parameter_keys: S
     )
 
 
+def _credential_totp_placeholder(task: Task, parameter_key: str | None) -> str | None:
+    """The TOTP placeholder of the run credential ``parameter_key``, or None when it cannot be read."""
+    workflow_run_id = task.workflow_run_id
+    if (
+        parameter_key is None
+        or not workflow_run_id
+        or not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id)
+    ):
+        return None
+    value = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id).values.get(parameter_key)
+    placeholder = value.get("totp") if isinstance(value, dict) else None
+    return placeholder if isinstance(placeholder, str) else None
+
+
 def build_auth_tools(
     task: Task,
     page_provider: PageProvider | None = None,
     state: VerificationState | None = None,
     allowed_credential_parameter_keys: Sequence[str] | None = None,
+    bind_credential_codes: bool = False,
 ) -> tuple[list[ToolSpec], str]:
     """Return (tools, system-prompt guidance) for verification handling. The code tool is always offered and
     answers with a status when no code source can produce a code; the link tool needs a link source and a
     page to navigate. `state`, if given, is mutated as the tools poll and deliver values; pass its
-    `block_finish` to `make_finish_tool`. A caller with no use for that gate can omit `state` entirely."""
+    `block_finish` to `make_finish_tool`. A caller with no use for that gate can omit `state` entirely.
+    `bind_credential_codes` hands a code made from a credential's seed out as that credential's placeholder."""
     if state is None:
         state = VerificationState(task=task)
     state.allowed_credential_parameter_keys = allowed_credential_parameter_keys
+    state.hide_codes_from_model = bind_credential_codes
     offer_link_tool = page_provider is not None and has_otp_source(
         task, expected_otp_type=OTPType.MAGIC_LINK, allowed_credential_parameter_keys=allowed_credential_parameter_keys
     )
@@ -847,7 +866,7 @@ def build_auth_tools(
                 cached_otp_value = None
             else:
                 cached_otp_value = None
-                return _deliver_code(cached.value)
+                return _deliver_code(cached)
 
         polled = await _poll(OTPType.TOTP)
         if isinstance(polled, ToolResult):
@@ -880,9 +899,22 @@ def build_auth_tools(
                 _code_source_error("it returned a value that is not a code", state.remaining_budget_seconds),
                 arm=VerificationFailure.VALUE_NOT_A_CODE,
             )
-        return _deliver_code(otp_value.value)
+        return _deliver_code(otp_value)
 
-    def _deliver_code(code: str) -> ToolResult:
+    def _deliver_code(otp_value: OTPValue) -> ToolResult:
+        if bind_credential_codes and otp_value.from_credential_seed:
+            # The digits never reach the model. It types the credential's placeholder, and the field write
+            # judges that page against the credential's saved sites before it generates the code there.
+            placeholder = _credential_totp_placeholder(task, otp_value.credential_parameter_key)
+            if placeholder is None:
+                return _code_answer(NO_ONE_TIME_CODE_SOURCE)
+            # Counted as the digits were: whether the page still needs the code is the agent's verdict.
+            state.record_delivery("get_verification_code")
+            return ToolResult.ok(
+                f"verification_code: {placeholder}\n"
+                "Type this placeholder exactly as given; the field receives the one-time code."
+            )
+        code = otp_value.value
         context = skyvern_context.current()
         if context is not None:
             # Redact the code from this task's artifacts/logs (task-scoped, so bare tasks are covered).

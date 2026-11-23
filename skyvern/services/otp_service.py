@@ -278,6 +278,8 @@ class OTPValue(BaseModel):
     value: str = Field(..., description="The value of the OTP code.")
     type: OTPType | None = Field(None, description="The type of the OTP code.")
     from_credential_seed: bool = Field(default=False, exclude=True, repr=False)
+    # The credential whose seed generated the code, so a caller can keep the code bound to that credential.
+    credential_parameter_key: str | None = Field(default=None, exclude=True, repr=False)
 
     def get_otp_type(self) -> OTPType:
         if self.type:
@@ -767,7 +769,7 @@ def try_generate_totp_for_credential(
             credential_key=credential_key,
             exc_info=True,
         )
-    return OTPValue(value=code, type=OTPType.TOTP, from_credential_seed=True)
+    return OTPValue(value=code, type=OTPType.TOTP, from_credential_seed=True, credential_parameter_key=credential_key)
 
 
 def is_usable_credential_totp_placeholder(

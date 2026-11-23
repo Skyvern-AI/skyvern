@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Concatenate, Literal, NamedTuple, ParamSpec, Sequence, Tuple, cast
 
+import pyotp
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
 from opentelemetry import trace as otel_trace
@@ -216,12 +217,16 @@ from skyvern.forge.sdk.services.browser_session_artifacts import (
     child_run_artifact_access,
     redact_descendant_entity,
 )
-from skyvern.forge.sdk.services.credentials import parse_totp_config
+from skyvern.forge.sdk.services.credentials import live_totp_codes, parse_totp_config
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, task_requester_id
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced, traced_span
 from skyvern.forge.sdk.workflow.block_goal_wrapping import unwrap_goal_fields
-from skyvern.forge.sdk.workflow.context_manager import NON_SECRET_CREDENTIAL_FIELDS, WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import (
+    NON_SECRET_CREDENTIAL_FIELDS,
+    SECRET_SUBSTRING_MIN_LENGTH,
+    WorkflowRunContext,
+)
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
@@ -1444,11 +1449,78 @@ def block_credential_parameter_keys(task_block: BaseTaskBlock | None, workflow_r
     ]
 
 
+def confines_task_credentials_to_saved_sites(task: Task, task_block: BaseTaskBlock | None) -> bool:
+    return task_block is not None and app.AGENT_FUNCTION.confine_task_credentials_to_saved_sites(task) is True
+
+
+def _live_codes_now(totp: pyotp.TOTP) -> list[str]:
+    return live_totp_codes(totp, now=time.time())
+
+
+def hold_run_secrets_back(workflow_run_id: str | None, release_guard: CredentialReleaseGuard | None) -> None:
+    """Scrub every run credential's password from the model's view of tool output, and have the guard judge it and
+    each live code of the credential's seed in every written value, as text read off a page and typed back would be."""
+    keys = run_credential_parameter_keys(workflow_run_id)
+    if not workflow_run_id or not keys:
+        return
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    passwords: list[str] = []
+    seeds: dict[str, pyotp.TOTP] = {}
+    for key in keys:
+        fields = workflow_run_context.get_value_or_none(key)
+        placeholder = fields.get("password") if isinstance(fields, dict) else None
+        password = (
+            workflow_run_context.get_original_secret_value_or_none(placeholder)
+            if isinstance(placeholder, str)
+            else None
+        )
+        if isinstance(password, str) and password:
+            passwords.append(password)
+        totp_placeholder = fields.get("totp") if isinstance(fields, dict) else None
+        # Read from the store directly: the resolver raises on a placeholder-shaped key it does not hold.
+        seed = (
+            workflow_run_context.secrets.get(workflow_run_context.totp_secret_value_key(totp_placeholder))
+            if isinstance(totp_placeholder, str)
+            else None
+        )
+        totp = parse_totp_config(seed) if isinstance(seed, str) else None
+        if totp is not None:
+            seeds[key] = totp
+    if release_guard is not None:
+        release_guard.hold_typed_literals(passwords)
+        for key, totp in seeds.items():
+            release_guard.hold_codes(key, functools.partial(_live_codes_now, totp))
+    context = skyvern_context.current()
+    if context is None:
+        return
+    for password in passwords:
+        # A short value stays visible: replacing it as a substring would corrupt unrelated page text.
+        if len(password) >= SECRET_SUBSTRING_MIN_LENGTH:
+            context.hide_from_model_in_any_escape(password)
+
+
+def run_credential_parameter_keys(workflow_run_id: str | None) -> list[str]:
+    """Every credential parameter registered in the run, whatever a block lists or the run's mode."""
+    if not workflow_run_id or not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+        return []
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    return [
+        key
+        for key in workflow_run_context.parameters
+        if workflow_run_context.is_registered_credential_parameter_key(key)
+    ]
+
+
 def recovery_credential_release_guard(
-    task: Task, parameter_keys: Sequence[str] | None, *, enforce_vault_sites: bool
+    task: Task,
+    parameter_keys: Sequence[str] | None,
+    *,
+    enforce_vault_sites: bool,
+    refuse_siteless: bool = False,
 ) -> CredentialReleaseGuard | None:
-    """Arm a workflow-owned recovery's credentials against their saved sites, as the code block arms
-    its own before running; None when no credential has a site to compare against."""
+    """Arm a workflow-owned recovery's or a confined block's credentials against their saved sites, as the
+    code block arms its own before running; None when no credential has a site to compare against, unless
+    ``refuse_siteless`` arms such a credential to be refused everywhere."""
     if not parameter_keys or not task.workflow_run_id:
         return None
     if not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(task.workflow_run_id):
@@ -1458,28 +1530,33 @@ def recovery_credential_release_guard(
     for key in parameter_keys:
         tested_url = workflow_run_context.credential_tested_urls.get(key)
         fields = workflow_run_context.get_value_or_none(key)
-        armed = (
-            guard.arm_login(
-                [
-                    workflow_run_context.get_original_secret_value_or_none(placeholder)
-                    for field, placeholder in fields.items()
-                    if field not in NON_SECRET_CREDENTIAL_FIELDS
-                ],
-                key,
-                tested_url=tested_url,
-                vault_sites=workflow_run_context.bitwarden_login_sites.get(key),
-                enforce_vault_sites=enforce_vault_sites,
-                extra_site_urls=workflow_run_context.credential_extra_site_urls.get(key, ()),
-            )
+        secrets = (
+            [
+                workflow_run_context.get_original_secret_value_or_none(placeholder)
+                for field, placeholder in fields.items()
+                if field not in NON_SECRET_CREDENTIAL_FIELDS
+            ]
             if isinstance(fields, dict)
             else []
         )
+        armed = guard.arm_login(
+            secrets,
+            key,
+            tested_url=tested_url,
+            vault_sites=workflow_run_context.bitwarden_login_sites.get(key),
+            enforce_vault_sites=enforce_vault_sites,
+            extra_site_urls=workflow_run_context.credential_extra_site_urls.get(key, ()),
+        )
         if not any(entry.enforced for entry in armed):
+            if refuse_siteless:
+                for secret in secrets:
+                    guard.arm_siteless(secret, key)
             LOG.info(
                 "taskv3_credential_release_unarmed",
                 parameter_key=key,
                 has_tested_url=bool(tested_url),
                 observed=bool(armed),
+                refused_everywhere=refuse_siteless,
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
             )
@@ -4126,15 +4203,23 @@ class ForgeAgent:
             if task_block is not None
             else recovery_credential_parameter_keys
         )
-        release_guard = (
-            recovery_credential_release_guard(
+        release_guard: CredentialReleaseGuard | None = None
+        confined = confines_task_credentials_to_saved_sites(task, task_block)
+        if task_block is None and workflow_owned_recovery:
+            release_guard = recovery_credential_release_guard(
                 task,
                 recovery_release_parameter_keys or recovery_credential_parameter_keys,
                 enforce_vault_sites=recovery_enforce_vault_sites,
             )
-            if task_block is None and workflow_owned_recovery
-            else None
-        )
+        elif confined:
+            # Script mode hides a block's own credential scope, so a confined run arms every credential it holds.
+            release_guard = recovery_credential_release_guard(
+                task,
+                run_credential_parameter_keys(task.workflow_run_id),
+                enforce_vault_sites=True,
+                refuse_siteless=True,
+            )
+            hold_run_secrets_back(task.workflow_run_id, release_guard)
 
         # One cheap DOM sample per call: a content hash plus length and element count, so a swap
         # that preserves the page's shape still changes the fingerprint. A lost page returns None
@@ -4300,6 +4385,7 @@ class ForgeAgent:
                 None if page_free_validation else _page_provider,
                 state=verification_state,
                 allowed_credential_parameter_keys=allowed_credential_keys,
+                bind_credential_codes=confined,
             )
             # Offered on any page-aware run (a captcha can appear mid-run, so there is no build-time
             # source to gate on); solving routes through the AGENT_FUNCTION seam (OSS no-op, cloud solves).
@@ -5256,13 +5342,18 @@ class ForgeAgent:
                         await app.ARTIFACT_MANAGER.flush_task_step_archives_as_one(step)
                 return step, detailed_output, None
 
-            if workflow_owned_recovery:
+            confined = confines_task_credentials_to_saved_sites(task, task_block)
+            if workflow_owned_recovery or confined:
                 # A recovery on the step engine would hold the block's credential placeholders with
-                # run-scoped credential and OTP access, so it fails instead of falling through.
+                # run-scoped credential and OTP access, and the step engine has no saved-site check for a
+                # confined run's credentials, so either fails instead of falling through.
                 await self.fail_task(
                     task,
                     step,
-                    "Task V3 is unavailable, and a workflow-owned recovery does not run on the step engine.",
+                    "Task V3 is unavailable, and a block whose credentials may be typed only on their saved "
+                    "websites does not run on the step engine, which cannot check those websites."
+                    if confined
+                    else "Task V3 is unavailable, and a workflow-owned recovery does not run on the step engine.",
                     browser_state,
                 )
                 await self.clean_up_task(

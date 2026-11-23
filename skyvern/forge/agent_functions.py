@@ -1495,6 +1495,15 @@ class AgentFunction:
     ) -> None:
         """Cloud checks a standalone task's TOTP identifier against linked credentials."""
 
+    async def enforce_request_credential_use(
+        self, principal: RequestPrincipal | None, organization_id: str, credential_id: str
+    ) -> None:
+        """Cloud checks the caller's role and the credential's folder before a request binds the credential."""
+
+    def confine_task_credentials_to_saved_sites(self, task: Task) -> bool:
+        """Whether a block task may type its credentials only on their saved websites."""
+        return False
+
     async def enforce_task_credential_use(self, task: Task, browser_session_id: str | None) -> None:
         """Cloud revalidates a standalone task's recorded requester before browser access."""
 

@@ -55,6 +55,7 @@ from skyvern.config import settings
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.escaped_secrets import decoding_stages
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.services import credentials as credentials_module
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
@@ -66,7 +67,12 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.taskv3 import captcha_tools, input_dispatch
 from skyvern.forge.taskv3.answer_basis_audit import RecordedAnswer, apply_answer_basis_audit
-from skyvern.forge.taskv3.auth_tools import VerificationState, _register_link_for_redaction
+from skyvern.forge.taskv3.auth_tools import (
+    VerificationFailure,
+    VerificationState,
+    _register_link_for_redaction,
+    build_auth_tools,
+)
 from skyvern.forge.taskv3.code_surface import (
     CodeToolSurface,
     apply_surface,
@@ -106,6 +112,8 @@ from skyvern.forge.taskv3.tools import (
     _SEMANTIC_COMMIT_STATE_JS,
     _TYPE_TARGET_PROBE_JS,
     _TYPING_REACH_PROBE_JS,
+    CREDENTIAL_RELEASE_BOUND_REASON,
+    CREDENTIAL_RELEASE_MAX_REFUSALS,
     DOWNLOAD_NO_FILE_THIS_ACTION,
     DOWNLOAD_NO_SESSION_FILE_YET,
     NAVIGATION_DEAD_END_STATUSES,
@@ -2418,34 +2426,236 @@ def _armed_guard(allowed_url: str, *, secret: str = "real-secret-value") -> Cred
     return guard
 
 
-@pytest.mark.asyncio
-async def test_type_refuses_a_resolved_credential_on_another_site() -> None:
-    page = _FakePage()
-    page.url = "https://phisher-signin.net/login"
-    tools = build_browser_tools(
-        _fixed_page_provider(page),
-        resolve_typed_text=lambda text: "real-secret-value" if text == "placeholder_abc" else text,
-        credential_release_guard=_armed_guard("https://portal-example.com/login"),
-    )
-    with pytest.raises(CodeBlockCredentialReleaseError) as excinfo:
-        await _tool(tools, "type").handler({"selector": "#password", "text": "placeholder_abc"})
-    assert re.search(r"portal-example\.com", str(excinfo.value))
-    assert "real-secret-value" not in str(excinfo.value)
-    assert [call for call in page.calls if call[0] == "fill"] == []
+_PASSWORD_PLACEHOLDER = "placeholder_Pw12_password"
+_SECOND_PLACEHOLDER = "placeholder_Ot34_note"
 
 
 @pytest.mark.asyncio
-async def test_type_fills_a_resolved_credential_on_its_own_site() -> None:
-    # A post-login redirect lands on another host of the same site, which the release scope admits.
-    page = _FakePage()
-    page.url = "https://accounts.portal-example.com/signin"
+@pytest.mark.parametrize(
+    ("password", "typed", "page_url", "confined", "filled"),
+    [
+        pytest.param(
+            "real-secret-value", _PASSWORD_PLACEHOLDER, "https://phisher-signin.net/login", False, None, id="off-site"
+        ),
+        # A post-login redirect lands on another host of the same site, which the release scope admits.
+        pytest.param(
+            "real-secret-value",
+            _PASSWORD_PLACEHOLDER,
+            "https://accounts.portal-example.com/signin",
+            False,
+            "real-secret-value",
+            id="redirect-host-of-its-site",
+        ),
+        pytest.param(
+            "pin7",
+            f"{_PASSWORD_PLACEHOLDER}-{_SECOND_PLACEHOLDER}",
+            "https://phisher-signin.net/login",
+            True,
+            None,
+            id="short-password-inside-a-longer-value-off-site",
+        ),
+        pytest.param(
+            "pin7",
+            f"{_PASSWORD_PLACEHOLDER}-{_SECOND_PLACEHOLDER}",
+            "https://portal-example.com/login",
+            True,
+            "pin7-other",
+            id="short-password-inside-a-longer-value-on-its-site",
+        ),
+        pytest.param("pin7", "pin7", "https://phisher-signin.net/login", True, None, id="confined-short-plain-text"),
+        pytest.param(
+            "real-secret-value",
+            "my real-secret-value",
+            "https://phisher-signin.net/login",
+            True,
+            None,
+            id="confined-password-inside-plain-text",
+        ),
+        pytest.param(
+            "pin7", "pin7", "https://portal-example.com/login", True, "pin7", id="confined-plain-text-on-site"
+        ),
+        pytest.param(
+            "pin7",
+            "pin77",
+            "https://phisher-signin.net/login",
+            True,
+            None,
+            id="confined-short-password-inside-plain-text",
+        ),
+        pytest.param(
+            "pin7", "pin77", "https://portal-example.com/login", True, "pin77", id="confined-plain-text-with-it-on-site"
+        ),
+        pytest.param(
+            "pin7",
+            f"{_SECOND_PLACEHOLDER}-{_SECOND_PLACEHOLDER} pin7",
+            "https://phisher-signin.net/login",
+            True,
+            None,
+            id="confined-short-password-beside-resolved-values",
+        ),
+        pytest.param(
+            "pin7",
+            f"{_SECOND_PLACEHOLDER}-{_SECOND_PLACEHOLDER} pin7",
+            "https://portal-example.com/login",
+            True,
+            "other-other pin7",
+            id="confined-beside-resolved-values-on-site",
+        ),
+        pytest.param("pin7", "pi7", "https://phisher-signin.net/login", True, "pi7", id="confined-unrelated-text"),
+        pytest.param("pin7", "pin7", "https://phisher-signin.net/login", False, "pin7", id="unconfined-plain-text"),
+    ],
+)
+async def test_a_credential_is_typed_only_on_its_saved_site_however_the_text_carries_it(
+    monkeypatch: pytest.MonkeyPatch,
+    password: str,
+    typed: str,
+    page_url: str,
+    confined: bool,
+    filled: str | None,
+) -> None:
+    # The password reaches the field through its placeholder, alone or inside a longer value, or, on a confined run,
+    # as plain text the model read on a page or in a screenshot, at any length; text without it is never judged.
+    run_context = WorkflowRunContext(
+        workflow_title="t", workflow_id="w_pw", workflow_permanent_id="wp_pw", workflow_run_id="wr_pw", aws_client=None
+    )
+    run_context.secrets[_PASSWORD_PLACEHOLDER] = password
+    run_context.secrets[_SECOND_PLACEHOLDER] = "other"
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts["wr_pw"] = run_context
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    guard = CredentialReleaseGuard(workflow_run_id="wr_pw", block_label="sign_in")
+    assert guard.arm(password, "https://portal-example.com/login", "login")
+    if confined:
+        guard.hold_typed_literals([password])
+    page = _MaskRecordingPage()
+    page.url = page_url
+    task = SimpleNamespace(workflow_run_id="wr_pw")
     tools = build_browser_tools(
         _fixed_page_provider(page),
-        resolve_typed_text=lambda text: "real-secret-value" if text == "placeholder_abc" else text,
-        credential_release_guard=_armed_guard("https://portal-example.com/login"),
+        resolve_typed_text=lambda text: get_actual_value_of_parameter_if_secret_with_task(task, text),
+        credential_release_guard=guard,
     )
-    await _tool(tools, "type").handler({"selector": "#password", "text": "placeholder_abc"})
-    assert {"selector": "#password", "text": "real-secret-value"} in [c[1] for c in page.calls if c[0] == "fill"]
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_pw")):
+        if filled is None:
+            with pytest.raises(CodeBlockCredentialReleaseError) as excinfo:
+                await _tool(tools, "type").handler({"selector": "#password", "text": typed})
+            refusal = str(excinfo.value)
+            assert "belongs to https://portal-example.com," in refusal and password not in refusal
+        else:
+            await _tool(tools, "type").handler({"selector": "#password", "text": typed})
+    fills = [call[1]["text"] for call in page.calls if call[0] == "fill"]
+    if filled is None:
+        assert fills == []
+    else:
+        # Plain text may be written in more than one step; the field ends with the whole value.
+        assert fills[-1] == filled
+    # Only a confined run masks a field for a held password; it masks it before the write.
+    kinds = [call[0] for call in page.calls]
+    masked = confined and filled is not None and password in filled
+    assert ("mask" in kinds) is masked
+    if masked:
+        assert kinds.index("mask") < kinds.index("fill")
+
+
+_SAVED_SITE_TARGETS = ("https://portal-example.com/login", "https://accounts.portal-example.com/signin")
+_OTHER_SITE_TARGETS = (
+    "https://phisher-signin.net/login",
+    "https://portal-example.com.phisher-signin.net/login",
+    "https://unrelated-example.org/form",
+)
+
+
+def _model_typed_text(rng: random.Random, password: str, code: str) -> str:
+    """Text the model could type on a confined run: filler, the two placeholders, and the password or a code verbatim.
+    A placeholder inside other text gets a second one, the fewest that the resolver resolves there."""
+    choices = (_PASSWORD_PLACEHOLDER, _SECOND_PLACEHOLDER, password, code)
+    fragments = [
+        choices[kind - 1] if kind else "".join(rng.choices("abcdefgh ", k=rng.randint(1, 5)))
+        for kind in rng.choices(range(5), k=rng.randint(1, 4))
+    ]
+    if len(fragments) > 1 and sum(fragment in choices[:2] for fragment in fragments) == 1:
+        fragments.append(_SECOND_PLACEHOLDER)
+    return rng.choice((" ", "-")).join(fragments).strip() or "x"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed", range(4))
+async def test_a_confined_run_writes_a_held_secret_only_to_its_saved_site(
+    monkeypatch: pytest.MonkeyPatch, seed: int
+) -> None:
+    # The class invariant: on a confined run every write's final value is judged against the receiving page's site
+    # for each held secret it contains verbatim, whether a placeholder resolved it or the model typed it, and a field
+    # that receives one is masked first, so a value the model never saw cannot leave in another shape.
+    rng = random.Random(seed)
+    password = "".join(rng.choices("abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ-.@!", k=rng.randint(5, 14)))
+    # Codes are held for five minutes of time whatever the credential's period, read on a fixed clock.
+    period = (15, 30, 45, 60)[seed]
+    totp = credentials_module.parse_totp_config(f"otpauth://totp/login?secret={_TOTP_SEED}&period={period}")
+    assert totp is not None and totp.interval == period
+    now = 1_800_000_000.0
+    run_context = WorkflowRunContext(
+        workflow_title="t", workflow_id="w_pw", workflow_permanent_id="wp_pw", workflow_run_id="wr_pw", aws_client=None
+    )
+    run_context.secrets[_PASSWORD_PLACEHOLDER] = password
+    run_context.secrets[_SECOND_PLACEHOLDER] = "other"
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts["wr_pw"] = run_context
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    task = SimpleNamespace(workflow_run_id="wr_pw")
+    # get_html first, on another site whose page writes the password with escapes: the model's view keeps the page
+    # and drops the password, so the writes below can carry it only through a placeholder or a guess.
+    in_value = "".join(f"&#{ord(char)};" if position % 2 else char for position, char in enumerate(password))
+    in_script = "".join(f"\\u{ord(char):04x}" for char in password)
+    read_page = _FakeTextPage(f'<input type="password" value="{in_value}"><script>var p = "{in_script}";</script>', "")
+    read_page.url = _OTHER_SITE_TARGETS[0]
+    reading = SkyvernContext(workflow_run_id="wr_pw")
+    reading.hide_from_model_in_any_escape(password)
+    with skyvern_context.scoped(reading):
+        read = await _tool(build_browser_tools(_fixed_page_provider(read_page)), "get_html").handler({})
+    assert read.status == "ok" and 'type="password"' in read.content, read.content
+    assert all(password not in stage for stage in (read.content, *decoding_stages(read.content))), read.content
+    for index in range(14):
+        # A code from the last five minutes is held; one more than two periods older than that is not. The first two
+        # writes put a code just inside and just outside that window on another site.
+        live = index == 0 or (index > 1 and rng.random() < 0.7)
+        age = (
+            (299 if index == 0 else rng.uniform(0, 300))
+            if live
+            else 300 + 2 * period + (1 if index == 1 else rng.uniform(0, 300))
+        )
+        code = totp.at(now - age)
+        typed = code if index < 2 else _model_typed_text(rng, password, code)
+        page_url = _OTHER_SITE_TARGETS[0] if index < 2 else rng.choice(_SAVED_SITE_TARGETS + _OTHER_SITE_TARGETS)
+        guard = CredentialReleaseGuard(workflow_run_id="wr_pw", block_label="sign_in")
+        assert guard.arm(password, "https://portal-example.com/login", "login")
+        guard.hold_typed_literals([password])
+        guard.hold_codes("login", lambda: credentials_module.live_totp_codes(totp, now=now))
+        page = _MaskRecordingPage()
+        page.url = page_url
+        tools = build_browser_tools(
+            _fixed_page_provider(page),
+            resolve_typed_text=lambda text: get_actual_value_of_parameter_if_secret_with_task(task, text),
+            credential_release_guard=guard,
+        )
+        case = (typed, page_url)
+        with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_pw")):
+            final = get_actual_value_of_parameter_if_secret_with_task(task, typed)
+            carries = password in final or (live and code in final)
+            if carries and page_url in _OTHER_SITE_TARGETS:
+                with pytest.raises(CodeBlockCredentialReleaseError) as excinfo:
+                    await _tool(tools, "type").handler({"selector": "#field", "text": typed})
+                assert password not in str(excinfo.value) and code not in str(excinfo.value), case
+            else:
+                await _tool(tools, "type").handler({"selector": "#field", "text": typed})
+        kinds = [call[0] for call in page.calls]
+        fills = [call[1]["text"] for call in page.calls if call[0] == "fill"]
+        if carries and page_url in _OTHER_SITE_TARGETS:
+            assert fills == [] and "mask" not in kinds, case
+            continue
+        assert fills and fills[-1] == final, case
+        assert ("mask" in kinds) is carries, case
+        if carries:
+            assert kinds.index("mask") < kinds.index("fill"), case
 
 
 class _FramedPage(_FakePage):
@@ -2592,35 +2802,58 @@ async def test_type_without_a_guard_keeps_resolving(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_off_site_credential_refusal_reaches_the_model_and_the_run_continues() -> None:
+@pytest.mark.parametrize(
+    ("refusals", "confined", "same_field"),
+    [
+        (1, True, False),
+        (CREDENTIAL_RELEASE_MAX_REFUSALS, True, False),
+        (CREDENTIAL_RELEASE_MAX_REFUSALS, True, True),
+        (CREDENTIAL_RELEASE_MAX_REFUSALS, False, False),
+    ],
+)
+async def test_off_site_credential_refusals_reach_the_model_until_the_runs_bound(
+    refusals: int, confined: bool, same_field: bool
+) -> None:
     # End-to-end through the REAL type handler and the REAL loop: a refusal must reach the model as
     # this tool's error so it can continue on the credential's own site, not kill the run or, worse,
-    # be swallowed into typing the placeholder.
-    from skyvern.forge.taskv3.loop import make_finish_tool, run_agent_tool_loop
+    # be swallowed into typing the placeholder. On a confined run the bound-th refusal ends it with the guard's verdict,
+    # also when the model repeats one refused call, which the repeated-action guard would otherwise end unexplained.
+    from skyvern.forge.taskv3.loop import CREDENTIAL_RELEASE_BOUND_GUARD, make_finish_tool, run_agent_tool_loop
 
     page = _FakePage()
     page.url = "https://phisher-signin.net/login"
+    guard = _armed_guard("https://portal-example.com/login")
+    if confined:
+        guard.hold_typed_literals(["real-secret-value"])
     tools = build_browser_tools(
         _fixed_page_provider(page),
         resolve_typed_text=lambda text: "real-secret-value" if text == "placeholder_abc" else text,
-        credential_release_guard=_armed_guard("https://portal-example.com/login"),
+        credential_release_guard=guard,
     )
     script = [
-        [("type", {"selector": "#password", "text": "placeholder_abc"})],
+        *(
+            [("type", {"selector": "#password" if same_field else f"#password{i}", "text": "placeholder_abc"})]
+            for i in range(refusals)
+        ),
         [("finish", {"status": "terminated", "reason": "credential is for another site"})],
     ]
+    caller = _ScriptedCaller(script)
     outcome = await run_agent_tool_loop(
-        llm_caller=_ScriptedCaller(script),
+        llm_caller=caller,
         system_prompt="sys",
         user_prompt="goal",
         tools=tools + [make_finish_tool()],
-        max_turns=10,
-        max_tool_calls=20,
+        max_turns=refusals + 10,
+        max_tool_calls=refusals + 20,
     )
 
-    assert outcome.status == "terminated"
+    bound = confined and refusals == CREDENTIAL_RELEASE_MAX_REFUSALS
+    assert (outcome.status, outcome.guard) == ("terminated", CREDENTIAL_RELEASE_BOUND_GUARD if bound else None)
+    assert outcome.reason == (CREDENTIAL_RELEASE_BOUND_REASON if bound else "credential is for another site")
+    # The bound ends the run on its refusal: the model is not asked for another turn.
+    assert caller.calls == (refusals if bound else refusals + 1)
     type_messages = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "type"]
-    assert len(type_messages) == 1
+    assert len(type_messages) == refusals
     assert "CodeBlockCredentialReleaseError" in type_messages[0]["content"]
     assert re.search(r"portal-example\.com", type_messages[0]["content"])
     assert all("real-secret-value" not in str(message.get("content", "")) for message in outcome.messages)
@@ -2655,11 +2888,13 @@ def _credential_totp_run(
     other_credentials: dict[str, str] | None = None,
     window_wait: Callable[[_FakePage], None] | None = None,
     page: Any = None,
+    bind_credential_codes: bool | None = None,
 ) -> Any:
     """A workflow run whose login credential carries a TOTP field, wired through the real resolvers:
     the typed-text resolver v3 injects and the VerificationState that owns the one-time code.
     `other_credentials` (key -> TOTP placeholder) adds more credentials sharing the vault marker;
-    `window_wait`, if given, forces a wait for a fresh TOTP window and runs during it; `page` replaces the fake."""
+    `window_wait`, if given, forces a wait for a fresh TOTP window and runs during it; `page` replaces the fake;
+    `bind_credential_codes`, if given, adds the code tool built with that setting."""
     now = datetime.now(UTC)
     run_context = WorkflowRunContext(
         workflow_title="t",
@@ -2721,6 +2956,8 @@ def _credential_totp_run(
         credential_release_guard=guard,
         resolve_totp_placeholder=state.resolve_totp_placeholder,
     )
+    if bind_credential_codes is not None:
+        tools += build_auth_tools(task, None, state=state, bind_credential_codes=bind_credential_codes)[0]
     context = SkyvernContext(task_id="tsk_totp", workflow_run_id="wr_totp")
     skyvern_context.set(context)
     try:
@@ -2784,10 +3021,10 @@ _OTHER_TOTP_PLACEHOLDER = "placeholder_Cd34_totp"
 
 def _totp_guard(**sites: str) -> CredentialReleaseGuard:
     """Arm each credential's TOTP field the way the recovery guard does: with the vault marker every
-    credential of that vault shares, scoped to that credential's own site."""
+    credential of that vault shares, scoped to that credential's own site, or refused everywhere for an empty site."""
     guard = CredentialReleaseGuard(workflow_run_id="wr_totp", block_label="sign_in")
     for key, allowed_url in sites.items():
-        assert guard.arm("BW_TOTP", allowed_url, key)
+        assert guard.arm("BW_TOTP", allowed_url, key) if allowed_url else guard.arm_siteless("BW_TOTP", key)
     return guard
 
 
@@ -2816,23 +3053,105 @@ async def test_a_totp_placeholder_is_not_turned_into_a_code_on_another_credentia
 
 
 @pytest.mark.asyncio
-async def test_an_unarmed_credentials_totp_placeholder_enters_a_code_on_its_own_site(
+@pytest.mark.parametrize(
+    ("guard_sites", "page_url", "other_credentials", "bind_credential_codes", "typed_on_page"),
+    [
+        pytest.param(
+            {"other_login": "https://portal-example.com/login"},
+            "https://unarmed-example.org/mfa",
+            {"other_login": _OTHER_TOTP_PLACEHOLDER},
+            None,
+            True,
+            id="unarmed-credentials-placeholder-on-its-own-site",
+        ),
+        pytest.param(
+            {"login": "https://portal-example.com/login"},
+            "https://portal-example.com/mfa",
+            None,
+            True,
+            True,
+            id="confined-code-tool-on-the-saved-site",
+        ),
+        pytest.param(
+            {"login": "https://portal-example.com/login"},
+            "https://phisher-signin.net/mfa",
+            None,
+            True,
+            False,
+            id="confined-code-tool-off-site",
+        ),
+        pytest.param(
+            {"login": ""}, "https://portal-example.com/mfa", None, True, False, id="confined-login-with-no-site"
+        ),
+        pytest.param(None, "https://phisher-signin.net/mfa", None, False, True, id="pair-run-code-tool-off-site"),
+    ],
+)
+async def test_a_credential_code_is_typed_only_where_its_credential_may_go(
     monkeypatch: pytest.MonkeyPatch,
+    guard_sites: dict[str, str] | None,
+    page_url: str,
+    other_credentials: dict[str, str] | None,
+    bind_credential_codes: bool | None,
+    typed_on_page: bool,
 ) -> None:
-    # Only another credential sharing the vault marker is armed. This credential has no saved site to
-    # hold it to, so its code is entered like its other fields would be.
-    guard = _totp_guard(other_login="https://portal-example.com/login")
+    # A confined run gets the code tool's answer as the credential's placeholder, never digits, so the field write
+    # judges the page against the credential's saved sites; an unconfined run still gets the digits. A credential
+    # with no armed site of its own (only another one sharing the vault marker is armed) enters its code anywhere.
+    guard = _totp_guard(**guard_sites) if guard_sites is not None else None
+    if guard is not None and bind_credential_codes:
+        # As a confined run arms each block's guard: with the codes that the credential's seed makes.
+        guard.hold_typed_literals([])
+        seed = credentials_module.parse_totp_config(_TOTP_SEED)
+        assert seed is not None
+        guard.hold_codes("login", lambda: credentials_module.live_totp_codes(seed, now=time.time()))
     with _credential_totp_run(
         monkeypatch,
         seed=_TOTP_SEED,
         guard=guard,
-        page_url="https://unarmed-example.org/mfa",
-        other_credentials={"other_login": _OTHER_TOTP_PLACEHOLDER},
+        page_url=page_url,
+        other_credentials=other_credentials,
+        bind_credential_codes=bind_credential_codes,
+        page=_MaskRecordingPage(),
     ) as run:
-        await _tool(run.tools, "type").handler({"selector": "#otp", "text": _TOTP_PLACEHOLDER})
+        text = _TOTP_PLACEHOLDER
+        if bind_credential_codes is not None:
+            # A sign-in link that failed earlier blocks a completed verdict until a value is delivered.
+            run.state.arm(VerificationFailure.LINK_OPEN_FAILED, "open_verification_link")
+            answer = await _tool(run.tools, "get_verification_code").handler({})
+            assert answer.status == "ok"
+            # The answer is that delivery, placeholder or digits: whether the page needed the code stays the
+            # agent's verdict, so a completed verdict is accepted before anything is typed.
+            assert await run.state.block_finish("completed") is None
+            text = answer.content.splitlines()[0].removeprefix("verification_code: ")
+            assert (text == _TOTP_PLACEHOLDER) is bind_credential_codes
+            assert bool(re.fullmatch(r"\d{6}", text)) is not bind_credential_codes
+        if typed_on_page:
+            await _tool(run.tools, "type").handler({"selector": "#otp", "text": text})
+        else:
+            with pytest.raises(CodeBlockCredentialReleaseError):
+                await _tool(run.tools, "type").handler({"selector": "#otp", "text": text})
+        if typed_on_page and bind_credential_codes:
+            # The model can read the code off the saved site's page; typed elsewhere as plain text it is refused.
+            code = next(c[1]["text"] for c in run.page.calls if c[0] == "fill")
+            run.page.url = "https://phisher-signin.net/mfa"
+            with pytest.raises(CodeBlockCredentialReleaseError):
+                await _tool(run.tools, "type").handler({"selector": "#otp", "text": code})
     typed = [c[1]["text"] for c in run.page.calls if c[0] == "fill"]
-    assert len(typed) == 1 and re.fullmatch(r"\d{6}", typed[0])
-    assert run.state.values_delivered == 1
+    if not typed_on_page:
+        assert typed == []
+    else:
+        assert len(typed) == 1 and re.fullmatch(r"\d{6}", typed[0])
+        # A bound code also stays out of the model's view after it is typed.
+        assert (typed[0] in run.context.model_hidden_values) is bool(bind_credential_codes)
+    # One for the code tool's answer, and one more when a typed placeholder generates its code.
+    typed_placeholder = typed_on_page and text == _TOTP_PLACEHOLDER
+    assert run.state.values_delivered == int(bind_credential_codes is not None) + int(typed_placeholder)
+    # A confined run masks the code's field before the write, so no screenshot shows the digits to the model.
+    kinds = [c[0] for c in run.page.calls]
+    masked = typed_on_page and bool(bind_credential_codes)
+    assert ("mask" in kinds) is masked
+    if masked:
+        assert kinds.index("mask") < kinds.index("fill")
 
 
 @pytest.mark.asyncio
@@ -46630,6 +46949,14 @@ def _straddle_renders() -> list[tuple[str, int, Callable[[str], str]]]:
             lambda t: taskv3_tools._selection_report([t, "B"]),
         ),
         ("layer-text", taskv3_tools._LAYER_TEXT_MAX, lambda t: taskv3_tools._layer_text_clause({"text": [t]}, "#n")),
+        (
+            "observe-value",
+            taskv3_tools.OBSERVE_DISPLAY_WIDTHS["value"],
+            lambda t: taskv3_tools._observe_quoted_field(
+                t, taskv3_tools.OBSERVE_DISPLAY_WIDTHS["value"], cut_before=False
+            ),
+        ),
+        ("observe-url", taskv3_tools.OBSERVE_URL_MAX_CHARS, taskv3_tools._observe_url_field),
     ]
 
 
@@ -47315,28 +47642,66 @@ async def test_type_append_reports_success_when_the_field_holds_the_text() -> No
     assert values[2] == "keepX"
 
 
+_APPEND_PASSWORD = "real-secret-value"
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "body",
+    ("body", "site"),
     [
-        '<input id="t" value="abc">',
-        '<textarea id="t">abc</textarea>',
-        '<div id="t" contenteditable="true">abc</div>',
-        '<div id="t" contenteditable="true"><p>ab</p><p>c</p></div>',
-        '<div id="t" contenteditable="true"><div>abc</div><div><br></div></div>',
-        '<input id="t" type="email" value="abc">',
+        ('<input id="t" value="abc">', None),
+        ('<textarea id="t">abc</textarea>', None),
+        ('<div id="t" contenteditable="true">abc</div>', None),
+        ('<div id="t" contenteditable="true"><p>ab</p><p>c</p></div>', None),
+        ('<div id="t" contenteditable="true"><div>abc</div><div><br></div></div>', None),
+        ('<input id="t" type="email" value="abc">', None),
+        # On a confined run the whole value the field will hold is judged before an append: completing a held
+        # password there is refused off its saved site and leaves the field as it was; on the site it is masked.
+        pytest.param(
+            '<input id="t" value="real-secret-">', "https://phisher-signin.net/login", id="completes-password-off-site"
+        ),
+        pytest.param(
+            '<input id="t" type="email" value="real-secret-">',
+            "https://phisher-signin.net/login",
+            id="completes-password-off-site-end-key",
+        ),
+        pytest.param(
+            '<input id="t" value="real-secret-">', "https://portal-example.com/login", id="completes-password-on-site"
+        ),
     ],
 )
-async def test_type_append_lands_after_the_existing_content(body: str) -> None:
-    async with _content_page(f"<!doctype html><html><body>{body}</body></html>") as page:
-        tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "type").handler({"selector": "#t", "text": "de", "clear": False})
-        held = await page.evaluate(
-            "() => { const el = document.getElementById('t'); return el.isContentEditable ? el.innerText : el.value; }"
+async def test_type_append_lands_after_the_existing_content(body: str, site: str | None) -> None:
+    html = f"<!doctype html><html><body>{body}</body></html>"
+    guard = None
+    if site is not None:
+        guard = CredentialReleaseGuard(workflow_run_id="wr_append", block_label="sign_in")
+        assert guard.arm(_APPEND_PASSWORD, "https://portal-example.com/login", "login")
+        guard.hold_typed_literals([_APPEND_PASSWORD])
+    refused = site is not None and not site.startswith("https://portal-example.com/")
+    async with _content_page(html) as page:
+        if site is not None:
+
+            async def _serve(route: Any) -> None:
+                await route.fulfill(status=200, content_type="text/html", body=html)
+
+            await page.route("**/*", _serve)
+            await page.goto(site)
+        tools = build_browser_tools(_fixed_page_provider(page), credential_release_guard=guard)
+        args = {"selector": "#t", "text": "de" if site is None else "value", "clear": False}
+        if refused:
+            with pytest.raises(CodeBlockCredentialReleaseError):
+                await _tool(tools, "type").handler(args)
+        else:
+            r = await _tool(tools, "type").handler(args)
+            assert r.status == "ok", r.content
+        held, masked = await page.evaluate(
+            "() => { const el = document.getElementById('t');"
+            " return [el.isContentEditable ? el.innerText : el.value, el.hasAttribute('data-skyvern-secret-mask')]; }"
         )
-    assert r.status == "ok", r.content
-    assert held.replace("\n", "") == "abcde", held
+    expected = "abcde" if site is None else "real-secret-" if refused else _APPEND_PASSWORD
+    assert held.replace("\n", "") == expected, held
+    assert masked is (site is not None and not refused)
 
 
 @_skip_no_browser
