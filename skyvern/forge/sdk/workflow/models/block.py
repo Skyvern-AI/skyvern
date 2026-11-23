@@ -15091,6 +15091,8 @@ class FileParserBlock(Block):
     _CSV_SNIFF_LINES = 5
     _CSV_BINARY_PREFIX_BYTES = 4096
     _CSV_UTF_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)
+    # Unrestricted, csv.Sniffer picks a letter as the delimiter of a one-column file.
+    _CSV_DELIMITERS = ",\t;|:"
     # Shape checks on the head of a file that reached the CSV fallback (log only; detection is unchanged).
     _FALLBACK_SNIFF_BYTES: ClassVar[int] = 8192
     _FALLBACK_SNIFF_ROWS: ClassVar[int] = 20
@@ -15276,7 +15278,7 @@ class FileParserBlock(Block):
             return
         facts["sampled_rows"] = len(rows) - 1
         try:
-            delimiter = csv.Sniffer().sniff("".join(rows)).delimiter
+            delimiter = csv.Sniffer().sniff("".join(rows), delimiters=self._CSV_DELIMITERS).delimiter
             facts["delimiter_sniffed"] = True
         except csv.Error:
             # Same fallback the CSV parser applies when the sniffer gives up (see _sniff_csv_delimiter).
@@ -15342,6 +15344,10 @@ class FileParserBlock(Block):
         with open(file_path, "rb") as f:
             raw_data = f.read(sample_size)
 
+        # charset-normalizer reports a UTF-8 BOM file as utf_8, which leaves the BOM in the first header.
+        if raw_data.startswith(codecs.BOM_UTF8):
+            return "utf-8-sig"
+
         result = from_bytes(raw_data)
         best_match = result.best()
         if best_match and best_match.encoding:
@@ -15388,7 +15394,7 @@ class FileParserBlock(Block):
             raise csv.Error("File is empty")
 
         try:
-            delimiter = csv.Sniffer().sniff(sample).delimiter
+            delimiter = csv.Sniffer().sniff(sample, delimiters=self._CSV_DELIMITERS).delimiter
         except csv.Error:
             delimiter = "\t" if file_path.lower().endswith(".tsv") else ","
         return delimiter, encoding
