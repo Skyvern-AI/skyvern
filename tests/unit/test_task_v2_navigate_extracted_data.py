@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
+from skyvern.forge.sdk.schemas.tasks import TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockResult
 from skyvern.services import task_v2_service
@@ -46,14 +47,32 @@ def _block_result(output_parameter_value: object, success: bool = True) -> Block
     )
 
 
-def test_navigate_block_extracted_information_is_credited() -> None:
-    block_result = _block_result({"task_id": "tsk_1", "extracted_information": {"price": "$12,952"}})
-    assert _get_extracted_data_from_block_result(block_result, "navigate") == {"price": "$12,952"}
+def _loop_iteration(status: TaskStatus, rows: list[int]) -> list[dict[str, object]]:
+    envelope = TaskOutput(task_id=f"tsk_{status}", status=status, extracted_information={"rows": rows})
+    return [{"loop_value": status, "output_value": envelope.model_dump(mode="json")}]
 
 
-def test_navigate_block_without_extracted_information_returns_none() -> None:
-    block_result = _block_result({"task_id": "tsk_1", "extracted_information": None})
-    assert _get_extracted_data_from_block_result(block_result, "navigate") is None
+@pytest.mark.parametrize(
+    ("task_type", "output_parameter_value", "expected"),
+    [
+        ("navigate", {"task_id": "tsk_1", "extracted_information": {"price": "$12,952"}}, {"price": "$12,952"}),
+        ("navigate", {"task_id": "tsk_1", "extracted_information": None}, None),
+        (
+            "loop",
+            [_loop_iteration(TaskStatus.completed, [9]), _loop_iteration(TaskStatus.terminated, [1, 2, 3])],
+            [
+                [{"rows": [9]}],
+                [{"status": "terminated", "failure_reason": None, "extracted_information": {"rows": [1, 2, 3]}}],
+            ],
+        ),
+    ],
+    ids=["navigate_payload", "navigate_without_payload", "loop_keeps_non_completed_iteration_with_status"],
+)
+def test_block_extracted_data_reaches_task_history(
+    task_type: str, output_parameter_value: object, expected: object
+) -> None:
+    block_result = _block_result(output_parameter_value)
+    assert _get_extracted_data_from_block_result(block_result, task_type) == expected
 
 
 @pytest.mark.asyncio

@@ -157,6 +157,7 @@ from skyvern.forge.sdk.schemas.ember_turn_outcome import (
     ResponseKind,
     TurnOutcome,
 )
+from skyvern.forge.sdk.schemas.tasks import TaskOutput, TaskStatus
 from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
@@ -7177,9 +7178,22 @@ async def test_chat_history_leaves_a_young_pending_turn_alone(monkeypatch: pytes
     assert "turn-a" in chat.pending_turns
 
 
+_TERMINATED_TASK_OUTPUT = TaskOutput(
+    task_id="tsk-1", status=TaskStatus.terminated, extracted_information={"metric": "42"}
+).model_dump(mode="json")
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_value", "shown_value"),
+    [
+        ({"metric": "42"}, {"metric": "42"}),
+        (_TERMINATED_TASK_OUTPUT, _TERMINATED_TASK_OUTPUT),
+    ],
+    ids=["plain_output", "terminated_task_output"],
+)
 async def test_interrupted_draft_history_returns_owner_and_exact_run_facts(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, output_value: dict[str, Any], shown_value: dict[str, Any]
 ) -> None:
     canonical = _make_ember_workflow("Saved", _NOW)
     proposal = canonical.model_dump(mode="json")
@@ -7200,7 +7214,7 @@ async def test_interrupted_draft_history_returns_owner_and_exact_run_facts(
         status=WorkflowRunStatus.completed,
         failure_reason=None,
     )
-    output = SimpleNamespace(output_parameter_id="op-metric", value={"metric": "42"})
+    output = SimpleNamespace(output_parameter_id="op-metric", value=output_value)
     app.DATABASE.workflow_runs = SimpleNamespace(
         get_workflow_run=AsyncMock(return_value=run),
         get_workflow_run_output_parameters=AsyncMock(return_value=[output]),
@@ -7216,7 +7230,7 @@ async def test_interrupted_draft_history_returns_owner_and_exact_run_facts(
     assert response.proposed_workflow_run is not None
     assert response.proposed_workflow_run.workflow_run_id == "wr-exact"
     assert response.proposed_workflow_run.status == "completed"
-    assert response.proposed_workflow_run.outputs[0].value == {"metric": "42"}
+    assert response.proposed_workflow_run.outputs[0].value == shown_value
 
 
 @pytest.mark.asyncio
