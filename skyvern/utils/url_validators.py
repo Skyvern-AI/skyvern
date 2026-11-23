@@ -46,12 +46,20 @@ def strip_query_params(url: str) -> str:
     """
     if not url:
         return ""
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.hostname:
+    try:
+        parsed = urlparse(url)
+        # urlparse defers authority validation, so an unterminated IPv6 literal, a non-numeric port or an
+        # out-of-range port raises here rather than at parse time. Callers pass unvalidated strings (a
+        # Task's totp_verification_url, a page URL) into failure reasons and span attributes, where an
+        # exception would cost the record instead of the URL string, so it answers like any other
+        # unparseable input.
+        if not parsed.scheme or not parsed.hostname:
+            return ""
+        port = parsed.port
+    except ValueError:
         return ""
-    host = parsed.hostname
-    port_str = f":{parsed.port}" if parsed.port else ""
-    return f"{parsed.scheme}://{host}{port_str}{parsed.path}"
+    port_str = f":{port}" if port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port_str}{parsed.path}"
 
 
 def redact_url_query(url: str) -> str:

@@ -23,6 +23,11 @@ from skyvern.utils.url_validators import strip_query_params
         ("not-a-url", ""),
         ("/relative/path", ""),
         ("://missing-scheme", ""),
+        # Authorities the stdlib parser rejects only when the port is read: an unvalidated
+        # Task.totp_verification_url may carry one, and it must cost the string, not the record.
+        ("https://example.com:bad/path?token=secret", ""),
+        ("https://example.com:99999/path", ""),
+        ("http://[::1/path", ""),
     ],
 )
 def test_strip_query_params(url: str, expected: str) -> None:
