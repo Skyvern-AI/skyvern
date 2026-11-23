@@ -933,6 +933,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   select_option: "Selecting option",
   press_key: "Interacting with page",
   drag: "Interacting with page",
+  hover: "Interacting with page",
   navigate_browser: "Opening page",
   wait_for_either_state: "Waiting for the page",
   skyvern_frame_list: "Finding embedded pages",
