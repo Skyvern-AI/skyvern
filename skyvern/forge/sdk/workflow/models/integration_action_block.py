@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Collection, Sequence
 from typing import Any, ClassVar, Literal
 
+import structlog
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+from skyvern.forge import app
 from skyvern.forge.sdk.integrations.action_runners import ACTION_RUNNERS, ActionRunFailed, ActionRunner
 from skyvern.forge.sdk.integrations.catalog import (
     IntegrationAction,
@@ -16,8 +19,9 @@ from skyvern.forge.sdk.integrations.connected_accounts import connected_account_
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import Block, render_failure_reason
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
-from skyvern.schemas.emails import is_connected_gmail_id
 from skyvern.schemas.workflows import BLOCK_TYPE_MAP, BlockResult, BlockStatus, BlockType
+
+LOG = structlog.get_logger()
 
 
 class IntegrationActionError(Exception):
@@ -58,8 +62,46 @@ def validate_action_inputs(action: IntegrationAction, inputs: dict[str, Any]) ->
         raise IntegrationActionError(f"Input {field!r} does not fit this action ({detail}).")
 
 
-def _nango_only(entry: IntegrationEntry) -> bool:
-    return entry.credential_backend == "nango" and entry.oauth_provider is None
+def _takes_nango(entry: IntegrationEntry) -> bool:
+    return "nango" in {entry.credential_backend, *(entry.additional_credential_backends or [])}
+
+
+def _uses_nango(entry: IntegrationEntry, nango: bool) -> bool:
+    # An entry that takes both kinds of account cannot tell them apart from the id; the caller looked it up.
+    return _takes_nango(entry) and (entry.oauth_provider is None or nango)
+
+
+def runnable_blocks(blocks: Sequence[Block], nango_connection_ids: Collection[str] = frozenset()) -> list[Block]:
+    """Each saved block as it runs: an integration action becomes the existing block it runs via, under the same
+    label, so per-block checks keyed on that block type apply to it unchanged. One that cannot resolve is left out.
+    ``nango_connection_ids`` are the account ids a lookup found to be Nango connections."""
+    runnable: list[Block] = []
+    for block in blocks:
+        if not isinstance(block, IntegrationActionBlock):
+            runnable.append(block)
+            continue
+        try:
+            runnable.append(block.inner_block(nango=block.connection_id in nango_connection_ids))
+        except IntegrationActionError:
+            continue
+    return runnable
+
+
+async def nango_account_ids(blocks: Sequence[Block], organization_id: str) -> set[str]:
+    """The integration action accounts among ``blocks`` that are Nango connections of the organization, by lookup
+    (ADR 0033). A failed lookup finds none, which still fails closed: no other backend resolves a Nango account."""
+    candidates = {
+        block.connection_id
+        for block in blocks
+        if isinstance(block, IntegrationActionBlock) and block.connection_id and block.may_use_nango()
+    }
+    if not candidates:
+        return set()
+    try:
+        return await app.AGENT_FUNCTION.nango_connection_ids(organization_id, candidates)
+    except Exception as exc:  # noqa: BLE001 - one unreadable lookup must not stop a run's other blocks.
+        LOG.warning("Nango account lookup failed", organization_id=organization_id, error_type=type(exc).__name__)
+        return set()
 
 
 _INHERITED_FIELDS = frozenset(
@@ -160,7 +202,11 @@ class IntegrationActionBlock(Block):
             organization_id=organization_id,
         )
 
-    def inner_block(self) -> Block:
+    def may_use_nango(self) -> bool:
+        found = entry_action(all_integration_entries(), self.integration_id, self.action_id)
+        return found is not None and _takes_nango(found[0])
+
+    def inner_block(self, nango: bool = False) -> Block:
         """The existing block this action runs as, under this block's label and output."""
         # Late import: the converter imports every block model, this one included.
         from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block  # noqa: PLC0415
@@ -174,26 +220,24 @@ class IntegrationActionBlock(Block):
             raise IntegrationActionError(
                 f"{entry.name}: {action.name} cannot run: every action must run through a block."
             )
-        # A Nango account's per-run hop token is minted only for the concrete block types, so the inner block would
-        # fail its capability check.
-        if _nango_only(entry):
-            raise IntegrationActionError(f"{entry.name}: {action.name} is not supported yet.")
-        if is_connected_gmail_id(self.connection_id):
-            raise IntegrationActionError(f"{entry.name}: {action.name} with this account is not supported yet.")
         validate_action_inputs(action, self.inputs)
 
         # The block's own settings first, so an action input or pin of the same name is never shadowed by them.
         fields: dict[str, Any] = self.model_dump(include=_INHERITED_FIELDS, exclude_none=True)
         fields |= {name: schema["const"] for name, schema in action.inputs["properties"].items() if "const" in schema}
         fields |= self.inputs
+        yaml_class = BLOCK_TYPE_MAP[block_type]
         account_fields = connected_account_fields({"block_type": block_type, **fields})
         if self.connection_id:
-            if not account_fields:
+            if _uses_nango(entry, nango):
+                if "credential_source" in yaml_class.model_fields:
+                    fields["credential_source"] = "nango"
+                account_fields = ("connection_id",)
+            elif not account_fields:
                 raise IntegrationActionError(f"{entry.name}: {action.name} takes no connected account.")
             fields[account_fields[0]] = self.connection_id
         elif account_fields:
             raise IntegrationActionError(f"{entry.name}: {action.name} needs a connected account.")
-        yaml_class = BLOCK_TYPE_MAP[block_type]
         if "parameter_keys" in yaml_class.model_fields:
             fields["parameter_keys"] = [parameter.key for parameter in self.parameters]
         try:
@@ -263,8 +307,21 @@ class IntegrationActionBlock(Block):
             finally:
                 # The runner recorded on the rendered copy; the outer wrapper reads this block's flag.
                 self._output_recorded_this_execution = ran._output_recorded_this_execution
+        nango = False
+        if rendered.connection_id and rendered.may_use_nango():
+            try:
+                nango = bool(await app.AGENT_FUNCTION.nango_connection_ids(effective_org_id, {rendered.connection_id}))
+            except Exception as exc:  # noqa: BLE001 - an account of unknown kind must not run as either kind.
+                LOG.warning(
+                    "Nango account lookup failed", organization_id=effective_org_id, error_type=type(exc).__name__
+                )
+                return await self._failure(
+                    "Skyvern could not check this block's account. Run it again.",
+                    workflow_run_block_id,
+                    effective_org_id,
+                )
         try:
-            inner = rendered.inner_block()
+            inner = rendered.inner_block(nango=nango)
         except IntegrationActionError as e:
             return await self._failure(str(e), workflow_run_block_id, effective_org_id)
         # Values an agent wrote are text, never templates, so the inner block must not render them either.

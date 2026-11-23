@@ -6,7 +6,7 @@ import copy
 import hashlib
 import os
 import time
-from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Collection, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -1208,6 +1208,10 @@ class AgentFunction:
 
     async def nango_powerbi_catalog_available(self, organization_id: str) -> bool:
         return False
+
+    async def nango_connection_ids(self, organization_id: str, connection_ids: Collection[str]) -> set[str]:
+        """The ids among ``connection_ids`` that name a Nango connection of the organization."""
+        return set()
 
     async def hidden_integration_ids(self, organization_id: str) -> frozenset[str]:
         """Catalog entries this organization must not see at all, not even as coming soon."""

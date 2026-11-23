@@ -282,7 +282,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     takes_default_engine,
     v3_ab_ineligibility_reason,
 )
-from skyvern.forge.sdk.workflow.models.integration_action_block import IntegrationActionBlock
+from skyvern.forge.sdk.workflow.models.integration_action_block import IntegrationActionBlock, runnable_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     AzureVaultCredentialParameter,
@@ -490,7 +490,7 @@ from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, CredentialProfileFinalizer
 from skyvern.webeye.browser_manager import SupersededRunClaim
 from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss
-from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
+from skyvern.webeye.persistent_session_errors import BrowserProfilePreflightError, BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.persistent_sessions_manager import BROWSER_RETIREMENT_DENIED_NOTE
 from skyvern.webeye.profile_cookie_merge import cookie_delta, seed_cookie_values, union_cookies_into_profile_dir
 from skyvern.webeye.real_browser_manager import (
@@ -1574,7 +1574,7 @@ async def _validate_powerbi_workflow_save(
 
     async def collect_workflows(definition: WorkflowDefinition, depth: int = 0) -> None:
         blocks = get_all_blocks(definition.blocks)
-        powerbi_blocks = [block for block in blocks if isinstance(block, PowerBIQueryBlock)]
+        powerbi_blocks = [block for block in runnable_blocks(blocks) if isinstance(block, PowerBIQueryBlock)]
         if depth == 0 and any(not block.has_valid_input_shape() for block in powerbi_blocks):
             raise SkyvernHTTPException(
                 "Power BI query must be literal and dataset_id must be a UUID or one workflow input reference.",
@@ -14064,7 +14064,11 @@ class WorkflowService:
                         created_for_workflow_run_id=workflow_run.workflow_run_id,
                         workflow_permanent_id=workflow_permanent_id,
                     )
-            except (WorkflowAttemptDispatchSuperseded, BrowserSessionCreditAdmissionRefusal):
+            except (
+                WorkflowAttemptDispatchSuperseded,
+                BrowserSessionCreditAdmissionRefusal,
+                BrowserProfilePreflightError,
+            ):
                 raise
             except Exception as error:
                 if BROWSER_RETIREMENT_DENIED_NOTE in getattr(

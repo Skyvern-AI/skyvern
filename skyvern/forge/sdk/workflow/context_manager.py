@@ -3223,8 +3223,12 @@ class WorkflowContextManager:
         powerbi_hop_refusals: Mapping[str, str] = {}
         if workflow is not None:
             from skyvern.forge.sdk.workflow.models.block import get_all_blocks
+            from skyvern.forge.sdk.workflow.models.integration_action_block import nango_account_ids, runnable_blocks
 
-            all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+            saved_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+            all_blocks = runnable_blocks(
+                saved_blocks, await nango_account_ids(saved_blocks, organization.organization_id)
+            )
             powerbi_query_labels = [block.label for block in all_blocks if block.block_type == BlockType.POWERBI_QUERY]
             powerbi_block_labels = powerbi_query_labels + [
                 block.label
