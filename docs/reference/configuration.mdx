@@ -527,6 +527,40 @@ Groq specializes in fast inference for open-source models. Response times are ty
 
 ---
 
+## Nace Drex Max (decision model)
+
+[Drex Max](https://console.nace.ai/docs/drex/guides/drex-max) is a decision model, not a chat model: it answers bounded questions (yes/no, pick one option) over text and screenshots with a probability per option. Skyvern can send its bounded-choice prompts to it while `LLM_KEY` keeps doing the action planning and extraction:
+
+- goal verification (`check-user-goal`, `check-user-goal-with-termination` and the after-click check)
+- page classification (`page-classify`)
+- action-type inference (`infer-action-type`)
+- auto-completion suggestion choice (`auto-completion-choose-option`)
+
+```bash .env
+ENABLE_NACE=true
+NACE_API_KEY=your-nace-api-key
+```
+
+`LLM_KEY` is still required; Drex Max never plans actions. Organization defaults and explicit per-run `llm_key` overrides still win for these prompts, and when `ENABLE_NACE` is off (or `NACE_API_KEY` is missing) the prompts keep their usual handlers.
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint
+NACE_API_BASE=https://console.nace.ai
+# Model id. Default is drex-max-v1.1 (Drex Max v1.1): reads screenshots, $0.03 per 1M input tokens.
+# drex-latest and legacy nacedm-latest point at Drex Max v1.1. drex-max-finance also reads screenshots at the same price.
+# Retired ids drex-max, drex-v1.0, drex-v1.1 and drex-v1.5 are forwarded to drex-max-v1.1 and read screenshots.
+# drex-v2.0 is text only (no screenshots are sent), also $0.03 per 1M input tokens.
+NACE_MODEL=drex-max-v1.1
+```
+
+<Note>
+A workflow system prompt (`workflow_system_prompt`) is sent to Drex ahead of the prompt, so its constraints still apply to these decisions. Drex Max returns probabilities, not text, so the `thoughts`/`reasoning` fields of these prompts carry the decision and its probability. Validation-type tasks (`decisive-criterion-validate`) keep their usual planning handler; the deployment-wide opt-in does not route them. A run cannot select `NACE_DREX_MAX`: `Task.llm_key` only maps public `model.model_name` values, and this key is not in that map. The decision caller decodes that prompt only when code calls the registered handler directly. Any unsupported prompt sent to that key is rejected.
+</Note>
+
+---
+
 ## Using multiple models
 
 ### Primary and secondary models
