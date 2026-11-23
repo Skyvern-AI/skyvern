@@ -1928,6 +1928,9 @@ class AgentFunction:
         OSS default keeps the historical always-publish behavior."""
         return True
 
+    async def html_content_bounded_transport_enabled(self) -> bool:
+        return False
+
     async def resolve_recording_video_size(
         self,
         current_size: dict[str, int] | None,

@@ -54,6 +54,7 @@ from skyvern.webeye.browser_runtime_events import (
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 from skyvern.webeye.navigation import redact_url_secrets
+from skyvern.webeye.utils._html_content import read_html
 from skyvern.webeye.utils.flutter_semantics import FLUTTER_STATE_JS, FlutterSemanticsState
 
 if TYPE_CHECKING:
@@ -3090,7 +3091,7 @@ class SkyvernFrame:
     @traced(name="skyvern.browser.get_content")
     async def get_content(self, timeout: float = PAGE_CONTENT_TIMEOUT) -> str:
         async with asyncio.timeout(timeout):
-            return mask_otp_values_in_html(await self.frame.content())
+            return mask_otp_values_in_html(await read_html(self.frame, self.engine_selection))
 
     async def get_scroll_x_y(self) -> tuple[int, int]:
         js_script = with_dom_utils("() => getScrollXY()", ("getScrollXY",))

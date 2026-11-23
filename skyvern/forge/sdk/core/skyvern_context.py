@@ -924,6 +924,8 @@ class SkyvernContext:
     # with a different id re-resolves. Written and read only through skyvern.forge.taskv3.run_arms.
     run_arms: dict[str, tuple[str, RunArm]] = field(default_factory=dict)
     run_arms_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    html_content_bounded_transport_pins: dict[tuple[str, str, str], bool] = field(default_factory=dict)
+    html_content_bounded_transport_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # Run-level SLIM_LLM_OUTPUT_PROMPTS assignment, resolved once by slim_llm_output.
     # The lock makes first-use resolution single-flight under parallel prompt builds.
