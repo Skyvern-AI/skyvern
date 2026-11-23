@@ -178,6 +178,7 @@ class Skyvern:
         webhook_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
@@ -334,6 +335,7 @@ class Skyvern:
             webhook_url=webhook_url,
             totp_identifier=totp_identifier,
             totp_url=totp_url,
+            otp_request_id=otp_request_id,
             browser_session_id=browser_session_id,
             model=model,
             extra_http_headers=extra_http_headers,
@@ -361,6 +363,7 @@ class Skyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         max_elapsed_time_minutes: typing.Optional[int] = OMIT,
@@ -503,6 +506,7 @@ class Skyvern:
             webhook_url=webhook_url,
             totp_url=totp_url,
             totp_identifier=totp_identifier,
+            otp_request_id=otp_request_id,
             browser_session_id=browser_session_id,
             browser_profile_id=browser_profile_id,
             max_screenshot_scrolls=max_screenshot_scrolls,
@@ -2398,6 +2402,7 @@ class Skyvern:
         task_id: typing.Optional[str] = OMIT,
         workflow_id: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         source: typing.Optional[str] = OMIT,
         expired_at: typing.Optional[dt.datetime] = OMIT,
         type: typing.Optional[OtpType] = OMIT,
@@ -2422,6 +2427,9 @@ class Skyvern:
 
         workflow_run_id : typing.Optional[str]
             The workflow run id that the TOTP code is for. It can be the workflow run id of the workflow run that the TOTP code is for.
+
+        otp_request_id : typing.Optional[str]
+            Explicit request marker for strict run-bound OTP delivery. When present, the guarded delivery endpoint is used.
 
         source : typing.Optional[str]
             An optional field. The source of the TOTP code. e.g. email, sms, etc.
@@ -2458,6 +2466,7 @@ class Skyvern:
             task_id=task_id,
             workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
+            otp_request_id=otp_request_id,
             source=source,
             expired_at=expired_at,
             type=type,
@@ -3602,6 +3611,7 @@ class Skyvern:
         self,
         workflow_run_id: str,
         *,
+        otp_request_id: typing.Optional[str] = None,
         max_steps_override: typing.Optional[int] = None,
         user_agent: typing.Optional[str] = None,
         request_options: typing.Optional[RequestOptions] = None,
@@ -3613,6 +3623,9 @@ class Skyvern:
         ----------
         workflow_run_id : str
             The id of the workflow run to retry.
+
+        otp_request_id : typing.Optional[str]
+            A fresh explicit marker for a strict OTP-bound retry. Omission preserves legacy retry behavior.
 
         max_steps_override : typing.Optional[int]
 
@@ -3641,6 +3654,7 @@ class Skyvern:
         """
         _response = self._raw_client.retry_workflow_run(
             workflow_run_id,
+            otp_request_id=otp_request_id,
             max_steps_override=max_steps_override,
             user_agent=user_agent,
             request_options=request_options,
@@ -4055,6 +4069,7 @@ class AsyncSkyvern:
         webhook_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
@@ -4219,6 +4234,7 @@ class AsyncSkyvern:
             webhook_url=webhook_url,
             totp_identifier=totp_identifier,
             totp_url=totp_url,
+            otp_request_id=otp_request_id,
             browser_session_id=browser_session_id,
             model=model,
             extra_http_headers=extra_http_headers,
@@ -4246,6 +4262,7 @@ class AsyncSkyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         max_elapsed_time_minutes: typing.Optional[int] = OMIT,
@@ -4396,6 +4413,7 @@ class AsyncSkyvern:
             webhook_url=webhook_url,
             totp_url=totp_url,
             totp_identifier=totp_identifier,
+            otp_request_id=otp_request_id,
             browser_session_id=browser_session_id,
             browser_profile_id=browser_profile_id,
             max_screenshot_scrolls=max_screenshot_scrolls,
@@ -6646,6 +6664,7 @@ class AsyncSkyvern:
         task_id: typing.Optional[str] = OMIT,
         workflow_id: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
+        otp_request_id: typing.Optional[str] = OMIT,
         source: typing.Optional[str] = OMIT,
         expired_at: typing.Optional[dt.datetime] = OMIT,
         type: typing.Optional[OtpType] = OMIT,
@@ -6670,6 +6689,9 @@ class AsyncSkyvern:
 
         workflow_run_id : typing.Optional[str]
             The workflow run id that the TOTP code is for. It can be the workflow run id of the workflow run that the TOTP code is for.
+
+        otp_request_id : typing.Optional[str]
+            Explicit request marker for strict run-bound OTP delivery. When present, the guarded delivery endpoint is used.
 
         source : typing.Optional[str]
             An optional field. The source of the TOTP code. e.g. email, sms, etc.
@@ -6714,6 +6736,7 @@ class AsyncSkyvern:
             task_id=task_id,
             workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
+            otp_request_id=otp_request_id,
             source=source,
             expired_at=expired_at,
             type=type,
@@ -8033,6 +8056,7 @@ class AsyncSkyvern:
         self,
         workflow_run_id: str,
         *,
+        otp_request_id: typing.Optional[str] = None,
         max_steps_override: typing.Optional[int] = None,
         user_agent: typing.Optional[str] = None,
         request_options: typing.Optional[RequestOptions] = None,
@@ -8044,6 +8068,9 @@ class AsyncSkyvern:
         ----------
         workflow_run_id : str
             The id of the workflow run to retry.
+
+        otp_request_id : typing.Optional[str]
+            A fresh explicit marker for a strict OTP-bound retry. Omission preserves legacy retry behavior.
 
         max_steps_override : typing.Optional[int]
 
@@ -8080,6 +8107,7 @@ class AsyncSkyvern:
         """
         _response = await self._raw_client.retry_workflow_run(
             workflow_run_id,
+            otp_request_id=otp_request_id,
             max_steps_override=max_steps_override,
             user_agent=user_agent,
             request_options=request_options,

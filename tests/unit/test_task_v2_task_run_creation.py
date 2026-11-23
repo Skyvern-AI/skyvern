@@ -113,12 +113,17 @@ async def test_run_task_v2_keeps_org_age_in_execution_context(
         default_secondary_llm_key=None,
         created_at=created_at,
     )
-    task_v2 = SimpleNamespace(model=None, workflow_id=None, workflow_run_id=None)
-    observed: list[int | None] = []
+    task_v2 = SimpleNamespace(
+        model=None,
+        workflow_id=None,
+        workflow_run_id=None,
+        otp_request_id="otpr_task_v2_context",
+    )
+    observed: list[tuple[int | None, str | None]] = []
 
     async def capture_context(**_kwargs: object) -> tuple[None, None, SimpleNamespace]:
         context = skyvern_context.current()
-        observed.append(context.org_age if context else None)
+        observed.append((context.org_age if context else None, context.otp_request_id if context else None))
         return None, None, task_v2
 
     monkeypatch.setattr(app.DATABASE.observer, "get_task_v2", AsyncMock(return_value=task_v2))
@@ -132,4 +137,4 @@ async def test_run_task_v2_keeps_org_age_in_execution_context(
         skyvern_context.reset()
 
     assert result is task_v2
-    assert observed == [expected]
+    assert observed == [(expected, "otpr_task_v2_context")]

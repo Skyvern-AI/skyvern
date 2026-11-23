@@ -1088,6 +1088,7 @@ async def resolve_otp_value(
             workflow_id=workflow_id,
             workflow_run_id=task.workflow_run_id,
             workflow_permanent_id=workflow_permanent_id,
+            otp_request_id=task.otp_request_id,
             totp_verification_url=task.totp_verification_url,
             totp_identifier=task.totp_identifier,
             created_after=created_after or run_started_at,
@@ -1113,6 +1114,7 @@ async def poll_otp_value(
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
     workflow_permanent_id: str | None = None,
+    otp_request_id: str | None = None,
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
     created_after: datetime | None = None,
@@ -1232,13 +1234,35 @@ async def poll_otp_value(
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
                     workflow_permanent_id=workflow_permanent_id,
+                    otp_request_id=otp_request_id,
                     context=webhook_otp_context,
                     expected_otp_type=expected_otp_type,
                 )
+                if otp_request_id is not None and otp_value is not None:
+                    # A strict webhook response is not consumable until this exact
+                    # original owner wins the durable insert-and-claim race. Filter a
+                    # code the caller already rejected before recording the response,
+                    # so a later distinct resend can still win for this marker.
+                    otp_value = _exclude_rejected_otp(
+                        otp_value,
+                        rejected_code_hash,
+                        multi_field_expected_digits,
+                        task_id=task_id,
+                    )
+                    if otp_value is not None and not await app.DATABASE.otp.claim_strict_webhook_otp_code(
+                        organization_id=organization_id,
+                        otp_request_id=otp_request_id,
+                        content=otp_value.value,
+                        code=otp_value.value,
+                        otp_type=otp_value.get_otp_type(),
+                        task_id=task_id,
+                        workflow_run_id=workflow_run_id,
+                    ):
+                        otp_value = None
             otp_value = _exclude_rejected_otp(
                 otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task_id
             )
-            if otp_value is None and totp_identifier:
+            if otp_value is None and totp_identifier and otp_request_id is None:
                 source = "connected_email"
                 otp_value = await _get_otp_value_from_email(
                     organization_id=organization_id,
@@ -1262,6 +1286,7 @@ async def poll_otp_value(
                     task_id=task_id,
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run_id,
+                    otp_request_id=otp_request_id,
                     created_after=db_created_after,
                     expected_otp_type=expected_otp_type,
                     raw_context=raw_otp_context,
@@ -1304,6 +1329,7 @@ async def _get_otp_value_from_url(
     task_id: str | None = None,
     workflow_run_id: str | None = None,
     workflow_permanent_id: str | None = None,
+    otp_request_id: str | None = None,
     context: WebhookOTPVerificationContext | None = None,
     expected_otp_type: OTPType | None = None,
 ) -> OTPValue | None:
@@ -1314,6 +1340,8 @@ async def _get_otp_value_from_url(
         request_data["workflow_run_id"] = workflow_run_id
     if workflow_permanent_id:
         request_data["workflow_permanent_id"] = workflow_permanent_id
+    if otp_request_id:
+        request_data["otp_request_id"] = otp_request_id
     signed_data = generate_skyvern_webhook_signature(
         payload=request_data,
         api_key=api_key,
@@ -1378,6 +1406,15 @@ async def _get_otp_value_from_url(
             content_type=content_type,
             response_json_type=type(response_body).__name__,
             expected_response_shape=TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE,
+        )
+        return None
+
+    if otp_request_id is not None and response_body.get("otp_request_id") != otp_request_id:
+        LOG.warning(
+            "TOTP webhook response did not echo the strict request marker",
+            http_status=status_code,
+            content_type=content_type,
+            response_keys=list(response_body.keys()),
         )
         return None
 
@@ -1478,6 +1515,7 @@ async def _get_otp_value_from_db(
     task_id: str | None = None,
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
+    otp_request_id: str | None = None,
     created_after: datetime | None = None,
     expected_otp_type: OTPType | None = None,
     raw_context: RawOTPVerificationContext | None = None,
@@ -1487,6 +1525,46 @@ async def _get_otp_value_from_db(
     *,
     surface_magic_link: MagicLinkSurfacing | None = None,
 ) -> OTPValue | None:
+    context = raw_context or RawOTPVerificationContext()
+    if otp_request_id is not None:
+        claimed = await app.DATABASE.otp.claim_otp_code(
+            organization_id=organization_id,
+            totp_identifier=totp_identifier,
+            otp_request_id=otp_request_id,
+            task_id=task_id,
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id,
+            otp_type=expected_otp_type,
+            created_after=created_after,
+        )
+        context.store_queried = True
+        if claimed is None:
+            return None
+        context.seen_row_ids.add(claimed.totp_code_id)
+        claimed_value = _exclude_rejected_otp(
+            OTPValue(value=claimed.code, type=claimed.otp_type),
+            rejected_code_hash,
+            multi_field_expected_digits,
+            task_id=task_id,
+        )
+        if claimed_value is None:
+            await app.DATABASE.otp.reject_claimed_otp_code(
+                totp_code_id=claimed.totp_code_id,
+                organization_id=organization_id,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+            )
+            return None
+        if not _forwarded_magic_link_matches_task_site(claimed_value, claimed.source, task_url):
+            await app.DATABASE.otp.reject_claimed_otp_code(
+                totp_code_id=claimed.totp_code_id,
+                organization_id=organization_id,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+            )
+            return None
+        return claimed_value
+
     # Email/SMS deliveries can arrive through /v1/credentials/totp without run
     # scope, so include both exact run matches and unscoped rows in SQL.
     totp_codes = await app.DATABASE.otp.get_otp_codes(
@@ -1496,7 +1574,6 @@ async def _get_otp_value_from_db(
         include_unscoped_workflow_run=workflow_run_id is not None,
         created_after=created_after,
     )
-    context = raw_context or RawOTPVerificationContext()
     raw_rows: list[RawTOTPCode] = []
     if expected_otp_type is not None:
         raw_rows = await app.DATABASE.otp.get_raw_otp_codes(

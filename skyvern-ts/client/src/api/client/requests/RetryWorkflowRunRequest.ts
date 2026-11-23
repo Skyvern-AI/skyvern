@@ -10,4 +10,6 @@
 export interface RetryWorkflowRunRequest {
     "x-max-steps-override"?: number;
     "x-user-agent"?: string;
+    /** A fresh explicit marker for a strict OTP-bound retry. Omission preserves legacy retry behavior. */
+    otp_request_id?: string;
 }

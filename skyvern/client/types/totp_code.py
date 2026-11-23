@@ -29,6 +29,11 @@ class TotpCode(UniversalBaseModel):
     The workflow run id that the TOTP code is for. It can be the workflow run id of the workflow run that the TOTP code is for.
     """
 
+    otp_request_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Explicit request marker for strict run-bound OTP delivery.
+    """
+
     source: typing.Optional[str] = pydantic.Field(default=None)
     """
     An optional field. The source of the TOTP code. e.g. email, sms, etc.
@@ -78,6 +83,14 @@ class TotpCode(UniversalBaseModel):
     """
     The type of the OTP code.
     """
+
+    claimed_by_task_id: typing.Optional[str] = pydantic.Field(default=None)
+
+    claimed_by_workflow_run_id: typing.Optional[str] = pydantic.Field(default=None)
+
+    claimed_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)
+
+    rejected_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

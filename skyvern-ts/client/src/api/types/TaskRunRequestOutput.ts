@@ -78,6 +78,8 @@ export interface TaskRunRequestOutput {
      * URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
      */
     totp_url?: string;
+    /** Explicit request marker for strict run-bound OTP delivery. */
+    otp_request_id?: string;
     /**
      * Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
      */

@@ -5978,6 +5978,15 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_retry_workflow_run_v1_workflows_runs__workflow_run_id__retry_post"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successfully retried workflow run",
@@ -10933,6 +10942,26 @@
           "integration_action"
         ],
         "title": "BlockType"
+      },
+      "Body_retry_workflow_run_v1_workflows_runs__workflow_run_id__retry_post": {
+        "properties": {
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id"
+          }
+        },
+        "type": "object",
+        "title": "Body_retry_workflow_run_v1_workflows_runs__workflow_run_id__retry_post"
       },
       "Body_upload_file_v1_upload_file_post": {
         "properties": {
@@ -25746,6 +25775,24 @@
               "wr_123456"
             ]
           },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound delivery. Omit this field to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
+            ]
+          },
           "source": {
             "anyOf": [
               {
@@ -25840,6 +25887,52 @@
               }
             ],
             "description": "The type of the OTP code."
+          },
+          "claimed_by_task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed By Task Id"
+          },
+          "claimed_by_workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed By Workflow Run Id"
+          },
+          "claimed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed At"
+          },
+          "rejected_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rejected At"
           }
         },
         "type": "object",
@@ -25909,6 +26002,24 @@
             "description": "The workflow run id that the TOTP code is for. It can be the workflow run id of the workflow run that the TOTP code is for.",
             "examples": [
               "wr_123456"
+            ]
+          },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound delivery. Omit this field to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
             ]
           },
           "source": {
@@ -27360,6 +27471,24 @@
               "user_123"
             ]
           },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound OTP delivery. This field is accepted only on the otp-bound run endpoint; omit it to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
+            ]
+          },
           "totp_url": {
             "anyOf": [
               {
@@ -27699,6 +27828,24 @@
               "john.doe@example.com",
               "4155555555",
               "user_123"
+            ]
+          },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound OTP delivery. This field is accepted only on the otp-bound run endpoint; omit it to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
             ]
           },
           "totp_url": {
@@ -34585,6 +34732,24 @@
               "user_123"
             ]
           },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound OTP delivery. This field is accepted only on the otp-bound run endpoint; omit it to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
+            ]
+          },
           "browser_session_id": {
             "anyOf": [
               {
@@ -34882,6 +35047,24 @@
               "john.doe@example.com",
               "4155555555",
               "user_123"
+            ]
+          },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound OTP delivery. This field is accepted only on the otp-bound run endpoint; omit it to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
             ]
           },
           "browser_session_id": {

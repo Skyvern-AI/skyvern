@@ -1125,6 +1125,9 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
+    def strict_otp_execution_available(self) -> bool:
+        return False
+
     async def nango_gmail_catalog_available(self, organization_id: str) -> bool:
         return False
 

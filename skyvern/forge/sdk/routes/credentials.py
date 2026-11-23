@@ -47,7 +47,7 @@ from typing import Annotated, Any, NoReturn
 
 import pyotp
 import structlog
-from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response, status
+from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Request, Response, status
 from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 from onepassword.types import Item
@@ -547,10 +547,44 @@ def _cache_totp_code_preview(
     responses={402: {"description": "Insufficient credits to parse OTP content"}},
     include_in_schema=False,
 )
+@base_router.post(
+    "/otp-bound/credentials/totp",
+    response_model=TOTPCode,
+    responses={402: {"description": "Insufficient credits to parse OTP content"}},
+    include_in_schema=False,
+)
+@base_router.post(
+    "/otp-bound/credentials/totp/",
+    response_model=TOTPCode,
+    responses={402: {"description": "Insufficient credits to parse OTP content"}},
+    include_in_schema=False,
+)
 async def send_totp_code(
     data: TOTPCodeCreate,
     curr_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    request: Request = None,  # type: ignore[assignment]
 ) -> TOTPCode:
+    route = request.scope.get("route") if request is not None else None
+    route_path = getattr(route, "path", "")
+    guarded = isinstance(route_path, str) and "/otp-bound/" in route_path
+    if guarded and data.otp_request_id is None:
+        raise HTTPException(status_code=400, detail="otp_request_id is required on the otp-bound delivery endpoint")
+    if not guarded and data.otp_request_id is not None:
+        raise HTTPException(
+            status_code=400, detail="otp_request_id is accepted only on the otp-bound delivery endpoint"
+        )
+    if data.otp_request_id is not None and data.task_id is None and data.workflow_run_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Strict OTP delivery requires an exact task_id or workflow_run_id owner",
+        )
+    if (
+        data.otp_request_id is not None
+        and data.expired_at is not None
+        and to_naive_utc(data.expired_at) <= naive_utc_now()
+    ):
+        raise HTTPException(status_code=400, detail="Strict OTP delivery is already expired")
+
     totp_identifier = normalize_identifier_if_email(data.totp_identifier)
     redacted_totp_identifier = redact_otp_identifier_for_log(data.totp_identifier)
     LOG.info(
@@ -562,24 +596,72 @@ async def send_totp_code(
         workflow_run_id=data.workflow_run_id,
     )
     # validate task_id, workflow_id, workflow_run_id are valid ids in db if provided
+    task = None
+    task_v2 = None
+    workflow_run = None
+    resolved_task_id = data.task_id
+    resolved_workflow_run_id = data.workflow_run_id
     if data.task_id:
         task = await app.DATABASE.tasks.get_task(data.task_id, curr_org.organization_id)
         if not task:
-            raise HTTPException(status_code=400, detail=f"Invalid task id: {data.task_id}")
+            if data.otp_request_id is not None:
+                task_v2 = await app.DATABASE.observer.get_task_v2(data.task_id, curr_org.organization_id)
+            if task_v2 is None:
+                raise HTTPException(status_code=400, detail=f"Invalid task id: {data.task_id}")
+            if task_v2.otp_request_id != data.otp_request_id:
+                raise HTTPException(status_code=400, detail="OTP request marker does not match the task-v2 owner")
+            if task_v2.status.is_final():
+                raise HTTPException(status_code=409, detail="Strict OTP delivery task-v2 owner is terminal")
+            if task_v2.workflow_run_id is None:
+                raise HTTPException(status_code=409, detail="Strict OTP delivery task-v2 owner has no backing run")
+            resolved_task_id = None
+            resolved_workflow_run_id = task_v2.workflow_run_id
+        else:
+            if data.otp_request_id is not None and task.otp_request_id != data.otp_request_id:
+                raise HTTPException(status_code=400, detail="OTP request marker does not match the task owner")
+            if data.otp_request_id is not None and task.status.is_final():
+                raise HTTPException(status_code=409, detail="Strict OTP delivery task owner is terminal")
     if data.workflow_id:
         workflow = await app.DATABASE.workflows.get_workflow(data.workflow_id, curr_org.organization_id)
         if not workflow:
             raise HTTPException(status_code=400, detail=f"Invalid workflow id: {data.workflow_id}")
     if data.workflow_run_id:
-        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(data.workflow_run_id, curr_org.organization_id)
+        if resolved_workflow_run_id is not None and resolved_workflow_run_id != data.workflow_run_id:
+            raise HTTPException(status_code=400, detail="Task and workflow-run owners do not match")
+        resolved_workflow_run_id = data.workflow_run_id
+    if resolved_workflow_run_id is not None:
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+            resolved_workflow_run_id, curr_org.organization_id
+        )
         if not workflow_run:
-            raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
+            raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {resolved_workflow_run_id}")
+        if data.otp_request_id is not None and workflow_run.otp_request_id != data.otp_request_id:
+            raise HTTPException(status_code=400, detail="OTP request marker does not match the workflow-run owner")
+        if data.otp_request_id is not None and workflow_run.status.is_final():
+            raise HTTPException(status_code=409, detail="Strict OTP delivery workflow-run owner is terminal")
+    if data.otp_request_id is not None and task is not None and task.workflow_run_id is not None:
+        if resolved_workflow_run_id is not None and resolved_workflow_run_id != task.workflow_run_id:
+            raise HTTPException(status_code=400, detail="Task and workflow-run owners do not match")
+        resolved_workflow_run_id = task.workflow_run_id
+        if workflow_run is None:
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                resolved_workflow_run_id, curr_org.organization_id
+            )
+            if workflow_run is None or workflow_run.otp_request_id != data.otp_request_id:
+                raise HTTPException(
+                    status_code=400, detail="OTP request marker does not match the task's workflow owner"
+                )
+    resolved_workflow_id = data.workflow_id
+    if data.otp_request_id is not None and workflow_run is not None:
+        if resolved_workflow_id is not None and resolved_workflow_id != workflow_run.workflow_id:
+            raise HTTPException(status_code=400, detail="Workflow and workflow-run owners do not match")
+        resolved_workflow_id = workflow_run.workflow_id
     workflow_references = {
         (kind, value)
         for kind, value in (
-            ("task_id", data.task_id),
-            ("workflow_id", data.workflow_id),
-            ("workflow_run_id", data.workflow_run_id),
+            ("task_id", resolved_task_id),
+            ("workflow_id", resolved_workflow_id),
+            ("workflow_run_id", resolved_workflow_run_id),
         )
         if value is not None
     }
@@ -633,8 +715,9 @@ async def send_totp_code(
             organization_id=curr_org.organization_id,
             totp_identifier=redacted_totp_identifier,
             task_id=data.task_id,
-            workflow_id=data.workflow_id,
-            workflow_run_id=data.workflow_run_id,
+            workflow_id=resolved_workflow_id,
+            workflow_run_id=resolved_workflow_run_id,
+            otp_request_id=data.otp_request_id,
             content_length=len(data.content),
             exception_type=parse_exception_type_name,
         )
@@ -644,13 +727,15 @@ async def send_totp_code(
         )
 
     if not otp_value:
+        if data.otp_request_id is not None:
+            raise HTTPException(status_code=400, detail="Strict OTP delivery must contain a parseable code")
         if len(data.content) > settings.TOTP_RAW_CONTENT_MAX_LENGTH:
             raise HTTPException(status_code=400, detail="Failed to parse otp login")
         raw_row = await app.DATABASE.otp.create_raw_otp_code(
             organization_id=curr_org.organization_id,
             totp_identifier=totp_identifier,
             content=data.content,
-            task_id=data.task_id,
+            task_id=resolved_task_id,
             workflow_id=data.workflow_id,
             workflow_run_id=data.workflow_run_id,
             source=data.source,
@@ -668,18 +753,25 @@ async def send_totp_code(
             content=pending.model_dump_json(), status_code=200, media_type="application/json"
         )
 
-    return await app.DATABASE.otp.create_otp_code(
+    create = (
+        app.DATABASE.otp.create_otp_code_if_new if data.otp_request_id is not None else app.DATABASE.otp.create_otp_code
+    )
+    created = await create(
         organization_id=curr_org.organization_id,
         totp_identifier=totp_identifier,
         content=data.content,
         code=otp_value.value,
-        task_id=data.task_id,
-        workflow_id=data.workflow_id,
-        workflow_run_id=data.workflow_run_id,
+        task_id=resolved_task_id,
+        workflow_id=resolved_workflow_id,
+        workflow_run_id=resolved_workflow_run_id,
+        otp_request_id=data.otp_request_id,
         source=data.source,
         expired_at=data.expired_at,
         otp_type=otp_value.get_otp_type(),
     )
+    if created is None:
+        raise HTTPException(status_code=409, detail="Strict OTP delivery is a duplicate")
+    return created
 
 
 @base_router.get(

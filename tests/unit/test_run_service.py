@@ -246,6 +246,7 @@ async def test_task_run_response_builds_when_the_task_has_no_navigation_goal(
     task_response = TaskResponse(
         request=TaskBase(
             url="https://example.test",
+            otp_request_id="otpr_response",
             navigation_goal=navigation_goal,
             data_extraction_goal=data_extraction_goal,
         ),
@@ -270,6 +271,7 @@ async def test_task_run_response_builds_when_the_task_has_no_navigation_goal(
 
     assert isinstance(run_response, TaskRunResponse)
     assert run_response.run_request is not None
+    assert run_response.run_request.otp_request_id == "otpr_response"
     assert run_response.run_request.prompt == expected_prompt
 
 

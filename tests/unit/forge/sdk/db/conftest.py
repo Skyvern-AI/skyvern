@@ -44,6 +44,21 @@ def postgres_scratch_schema_url() -> Iterator[URL]:
             conn.exec_driver_sql(f'CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA "{schema}"')
             # With public on the path, existence checks would find its tables, hence checkfirst=False.
             conn.exec_driver_sql(f'SET LOCAL search_path TO "{schema}", public')
+            conn.exec_driver_sql(
+                """
+                CREATE FUNCTION skyvern_sha256_text_utf8(value text)
+                RETURNS bytea
+                LANGUAGE sql
+                IMMUTABLE
+                STRICT
+                PARALLEL SAFE
+                SECURITY INVOKER
+                SET search_path = pg_catalog
+                AS $function$
+                    SELECT pg_catalog.sha256(pg_catalog.convert_to(value, 'UTF8'))
+                $function$
+                """
+            )
             Base.metadata.create_all(conn, checkfirst=False)
         try:
             yield url.update_query_dict({"options": f"-c search_path={schema},public"})

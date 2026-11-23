@@ -1298,6 +1298,7 @@ def _existing_run(
         webhook_callback_url=None,
         totp_verification_url=None,
         totp_identifier=None,
+        otp_request_id=None,
         browser_session_id=None,
         browser_profile_id=browser_profile_id,
         browser_seed_source=browser_seed_source,

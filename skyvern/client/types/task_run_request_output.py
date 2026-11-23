@@ -108,6 +108,11 @@ class TaskRunRequestOutput(UniversalBaseModel):
     URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
     """
 
+    otp_request_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Explicit request marker for strict run-bound OTP delivery.
+    """
+
     browser_session_id: typing.Optional[str] = pydantic.Field(default=None)
     """
     

@@ -35,6 +35,7 @@ async def _run_task_v2_wiring_case(
     iterations: list[int],
     *,
     shared_flag_enabled: bool,
+    strict_reservation: bool = False,
     planner_response: dict[str, Any] | None = None,
     max_iterations: int | None = None,
 ) -> tuple[list[dict[str, Any]], AsyncMock]:
@@ -42,8 +43,14 @@ async def _run_task_v2_wiring_case(
     organization = SimpleNamespace(organization_id="org_test", max_steps_per_run=None)
     task_v2 = MagicMock(observer_cruise_id="t", status=TaskV2Status.queued, prompt="goal")
     task_v2.url, task_v2.workflow_run_id = "https://example.test", "wr_test"
+    task_v2.otp_request_id = "otpr_nested" if strict_reservation else None
     queued_run = MagicMock(
-        workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.queued, parent_workflow_run_id=None
+        workflow_run_id="wr_test",
+        workflow_id="wf_test",
+        status=WorkflowRunStatus.running if strict_reservation else WorkflowRunStatus.queued,
+        parent_workflow_run_id=None,
+        otp_request_id=task_v2.otp_request_id,
+        started_at=None,
     )
     running_run = MagicMock(
         workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.running, parent_workflow_run_id=None
@@ -92,7 +99,12 @@ async def _run_task_v2_wiring_case(
             raise _TaskV2WiringObserved
         return "prompt"
 
-    context = SimpleNamespace(run_id=None, root_workflow_run_id=None, tz_info=timezone.utc)
+    context = SimpleNamespace(
+        run_id=None,
+        root_workflow_run_id=None,
+        otp_request_id=task_v2.otp_request_id,
+        tz_info=timezone.utc,
+    )
     monkeypatch.setattr(task_v2_service, "app", test_app)
     monkeypatch.setattr(planner_levers.app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", provider)
     monkeypatch.setattr(planner_levers.settings, "TASK_V2_CONVERGE_PCT", 0)
@@ -212,7 +224,9 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
         workflow_run_id="workflow_run_test",
         max_screenshot_scrolls=None,
         proxy_location=None,
+        otp_request_id=None,
     )
+    parent_run = SimpleNamespace(otp_request_id="otpr_nested")
     queued_run = SimpleNamespace(
         workflow_run_id="workflow_run_test",
         workflow_id="workflow_test",
@@ -247,7 +261,7 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
     block = SimpleNamespace(execute_safe=AsyncMock(return_value=block_result))
     browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=None))
     workflow_service = SimpleNamespace(
-        get_workflow_run=AsyncMock(side_effect=[queued_run, running_run]),
+        get_workflow_run=AsyncMock(side_effect=[parent_run, queued_run, running_run]),
         get_workflow=AsyncMock(return_value=workflow),
         mark_workflow_run_as_running=AsyncMock(return_value=running_run),
         setup_workflow_run=AsyncMock(return_value=queued_run),
@@ -262,9 +276,10 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
 
     workflow_service.create_workflow_from_request = persist_workflow
     workflow_service.create_empty_workflow = MethodType(WorkflowService.create_empty_workflow, workflow_service)
+    created_task_kwargs: dict[str, Any] = {}
     database = SimpleNamespace(
         observer=SimpleNamespace(
-            create_task_v2=AsyncMock(return_value=task_v2),
+            create_task_v2=AsyncMock(side_effect=lambda **kwargs: (created_task_kwargs.update(kwargs), task_v2)[1]),
             update_task_v2=AsyncMock(return_value=task_v2),
         ),
         tasks=SimpleNamespace(
@@ -312,9 +327,11 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
         organization=organization,
         user_prompt="visit the page",
         publish_workflow=True,
+        parent_workflow_run_id="parent_workflow_run_test",
         extra_http_headers={"X-Request": "synthetic-http"},
         cdp_connect_headers={"X-Request-CDP": "synthetic-cdp"},
     )
+    assert created_task_kwargs["otp_request_id"] == "otpr_nested"
     assert persisted_requests[0].extra_http_headers == {"X-Request": "synthetic-http"}
     assert persisted_requests[0].cdp_connect_headers == {"X-Request-CDP": "synthetic-cdp"}
 
@@ -731,15 +748,17 @@ async def test_planner_mini_goal_improvements_resolver_falls_back_when_provider_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("lever_enabled", [True, False])
+@pytest.mark.parametrize(("lever_enabled", "strict_reservation"), [(True, False), (False, False), (True, True)])
 async def test_completion_gate_resolver_controls_post_navigate_check(
     lever_enabled: bool,
+    strict_reservation: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, llm_handler = await _run_task_v2_wiring_case(
         monkeypatch,
         [0],
         shared_flag_enabled=lever_enabled,
+        strict_reservation=strict_reservation,
         planner_response={
             "user_goal_achieved": False,
             "should_terminate": False,
@@ -751,6 +770,8 @@ async def test_completion_gate_resolver_controls_post_navigate_check(
 
     prompt_names = [call.kwargs["prompt_name"] for call in llm_handler.await_args_list]
     assert ("task_v2_check_completion" in prompt_names) is not lever_enabled
+    if strict_reservation:
+        assert task_v2_service.skyvern_context.ensure_context().otp_request_id == "otpr_nested"
 
 
 @pytest.mark.parametrize("task_type", ["navigate", "extract", "loop"])

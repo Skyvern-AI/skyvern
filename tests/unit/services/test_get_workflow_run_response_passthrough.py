@@ -25,6 +25,7 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
         workflow_id="w_123",
         workflow_permanent_id="wpid_123",
         organization_id="o_123",
+        otp_request_id="otpr_response",
         status=WorkflowRunStatus.completed,
         run_with="code",
         ai_fallback=True,
@@ -75,6 +76,7 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
     assert resp.status == RunStatus.completed
     assert resp.step_count == 4
     assert resp.run_request is not None
+    assert resp.run_request.otp_request_id == "otpr_response"
     assert resp.run_request.browser_session_id == "pbs_123"
 
 
@@ -88,6 +90,7 @@ def _fresh_run(*, start_fresh: bool, session_id: str | None) -> WorkflowRun:
         status=WorkflowRunStatus.failed,
         browser_session_id=session_id,
         start_fresh_browser=start_fresh,
+        otp_request_id="otpr_test",
         created_at=now,
         modified_at=now,
     )
@@ -104,6 +107,7 @@ def test_retry_omits_session_id_for_fresh_run() -> None:
 def test_retry_keeps_session_id_when_not_fresh() -> None:
     body = workflow_request_body_from_existing_run(_fresh_run(start_fresh=False, session_id="pbs_keep"))
     assert body.browser_session_id == "pbs_keep"
+    assert body.otp_request_id == "otpr_test"
 
 
 def test_persisted_private_browser_address_is_allowed_only_for_reconstruction() -> None:

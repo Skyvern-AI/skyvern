@@ -301,17 +301,33 @@ def test_extraction_goal_max_tokens_constant() -> None:
 def test_task_run_request_rejects_start_fresh_with_session() -> None:
     import pydantic
 
-    from skyvern.schemas.runs import TaskRunRequest
+    from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
+    from skyvern.forge.sdk.schemas.tasks import TaskRequest
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+    from skyvern.schemas.runs import TaskRunRequest, WorkflowRunRequest
 
     with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_session_id"):
         TaskRunRequest(prompt="t", browser_session_id="pbs_1", start_fresh_browser=True)
-
-
-def test_task_run_request_allows_session_or_start_fresh_alone() -> None:
-    from skyvern.schemas.runs import TaskRunRequest
-
     TaskRunRequest(prompt="t", browser_session_id="pbs_1")
     TaskRunRequest(prompt="t", start_fresh_browser=True)
+
+    marked_requests = [
+        TaskRunRequest(prompt="t", otp_request_id="otpr_test"),
+        WorkflowRunRequest(agent_id="wpid_test", otp_request_id="otpr_test"),
+        TaskRequest(url="https://example.test", otp_request_id="otpr_test"),
+        TaskV2Request(user_prompt="t", otp_request_id="otpr_test"),
+        WorkflowRequestBody(otp_request_id="otpr_test"),
+    ]
+    assert [getattr(request, "otp_request_id", None) for request in marked_requests] == ["otpr_test"] * 5
+    for request_type, kwargs in [
+        (TaskRunRequest, {"prompt": "t"}),
+        (WorkflowRunRequest, {"agent_id": "wpid_test"}),
+        (TaskRequest, {"url": "https://example.test"}),
+        (TaskV2Request, {"user_prompt": "t"}),
+        (WorkflowRequestBody, {}),
+    ]:
+        with pytest.raises(pydantic.ValidationError, match="otp_request_id"):
+            request_type(otp_request_id="not-a-marker", **kwargs)
 
 
 def test_workflow_run_request_rejects_start_fresh_with_session() -> None:

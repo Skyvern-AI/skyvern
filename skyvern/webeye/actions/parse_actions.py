@@ -1085,6 +1085,7 @@ async def generate_cua_fallback_actions(
                     organization_id=task.organization_id,
                     task_id=task.task_id,
                     workflow_run_id=task.workflow_run_id,
+                    otp_request_id=task.otp_request_id,
                     totp_verification_url=task.totp_verification_url,
                     totp_identifier=task.totp_identifier,
                     expected_otp_type=OTPType.MAGIC_LINK,

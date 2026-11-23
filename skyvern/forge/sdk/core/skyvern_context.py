@@ -753,6 +753,7 @@ class SkyvernContext:
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
+    otp_request_id: str | None = None
     requested_by: str | None = None
     root_workflow_run_id: str | None = None
     task_v2_id: str | None = None

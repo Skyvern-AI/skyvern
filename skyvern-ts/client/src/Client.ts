@@ -85,6 +85,7 @@ export class SkyvernClient {
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.TaskRunResponse>> {
         const { "x-user-agent": userAgent, ..._body } = request;
+        const _path = request.otp_request_id != null ? "v1/otp-bound/run/tasks" : "v1/run/tasks";
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
             mergeOnlyDefinedHeaders({
@@ -98,7 +99,7 @@ export class SkyvernClient {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                "v1/run/tasks",
+                _path,
             ),
             method: "POST",
             headers: _headers,
@@ -137,7 +138,7 @@ export class SkyvernClient {
                     rawResponse: _response.rawResponse,
                 });
             case "timeout":
-                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/run/tasks.");
+                throw new errors.SkyvernTimeoutError(`Timeout exceeded when calling POST /${_path}.`);
             case "unknown":
                 throw new errors.SkyvernError({
                     message: _response.error.errorMessage,
@@ -175,6 +176,7 @@ export class SkyvernClient {
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.WorkflowRunResponse>> {
         const { template, "x-max-steps-override": maxStepsOverride, "x-user-agent": userAgent, ..._body } = request;
+        const _path = request.otp_request_id != null ? "v1/otp-bound/run/agents" : "v1/run/agents";
         const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
         if (template != null) {
             _queryParams.template = template.toString();
@@ -194,7 +196,7 @@ export class SkyvernClient {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                "v1/run/agents",
+                _path,
             ),
             method: "POST",
             headers: _headers,
@@ -233,7 +235,7 @@ export class SkyvernClient {
                     rawResponse: _response.rawResponse,
                 });
             case "timeout":
-                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/run/agents.");
+                throw new errors.SkyvernTimeoutError(`Timeout exceeded when calling POST /${_path}.`);
             case "unknown":
                 throw new errors.SkyvernError({
                     message: _response.error.errorMessage,
@@ -4053,6 +4055,7 @@ export class SkyvernClient {
         request: Skyvern.TotpCodeCreate,
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.TotpCode>> {
+        const _path = request.otp_request_id != null ? "v1/otp-bound/credentials/totp" : "v1/credentials/totp";
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
             mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
@@ -4063,7 +4066,7 @@ export class SkyvernClient {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                "v1/credentials/totp",
+                _path,
             ),
             method: "POST",
             headers: _headers,
@@ -4100,7 +4103,7 @@ export class SkyvernClient {
                     rawResponse: _response.rawResponse,
                 });
             case "timeout":
-                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/credentials/totp.");
+                throw new errors.SkyvernTimeoutError(`Timeout exceeded when calling POST /${_path}.`);
             case "unknown":
                 throw new errors.SkyvernError({
                     message: _response.error.errorMessage,
@@ -5925,7 +5928,15 @@ export class SkyvernClient {
         request: Skyvern.RetryWorkflowRunRequest = {},
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.WorkflowRunResponse>> {
-        const { "x-max-steps-override": maxStepsOverride, "x-user-agent": userAgent } = request;
+        const {
+            "x-max-steps-override": maxStepsOverride,
+            "x-user-agent": userAgent,
+            otp_request_id: otpRequestId,
+        } = request;
+        const _path =
+            otpRequestId != null
+                ? `v1/otp-bound/workflows/runs/${core.url.encodePathParam(workflowRunId)}/retry`
+                : `v1/agents/runs/${core.url.encodePathParam(workflowRunId)}/retry`;
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
             mergeOnlyDefinedHeaders({
@@ -5940,10 +5951,13 @@ export class SkyvernClient {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                `v1/agents/runs/${core.url.encodePathParam(workflowRunId)}/retry`,
+                _path,
             ),
             method: "POST",
             headers: _headers,
+            contentType: "application/json",
+            requestType: "json",
+            body: otpRequestId != null ? { otp_request_id: otpRequestId } : undefined,
             queryParameters: requestOptions?.queryParams,
             timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
             maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
@@ -5978,9 +5992,7 @@ export class SkyvernClient {
                     rawResponse: _response.rawResponse,
                 });
             case "timeout":
-                throw new errors.SkyvernTimeoutError(
-                    "Timeout exceeded when calling POST /v1/agents/runs/{workflow_run_id}/retry.",
-                );
+                throw new errors.SkyvernTimeoutError(`Timeout exceeded when calling POST /${_path}.`);
             case "unknown":
                 throw new errors.SkyvernError({
                     message: _response.error.errorMessage,
