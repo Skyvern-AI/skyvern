@@ -698,6 +698,7 @@ function collectTimelineBlockActions(
 // window is sized to it — long enough to swallow the stray click, short enough that the
 // visible Stop is not dead while a turn hangs. The first frame arms sooner and clears it.
 const STOP_ARM_DOUBLE_TAP_MS = 500;
+const DEFERRED_DEMONSTRATION_POLL_MS = 500;
 
 const DELETION_STOP_BLOCKED_REASON =
   "Stop unavailable until the credential deletion finishes";
@@ -9663,11 +9664,29 @@ export function EmberChat({
   // would re-register the launcher on every navigation.
   const panesRef = useRef({ openPane, setOpenPanes, resolveLivePanes });
   panesRef.current = { openPane, setOpenPanes, resolveLivePanes };
+  const deferredDemonstrationTimer = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
+  const latestStartDemonstration = useRef<
+    (options?: StartDemonstrationOptions) => void
+  >(() => {});
+  // A start deferred for one agent or browser never fires against the next.
+  useEffect(
+    () => () => {
+      if (deferredDemonstrationTimer.current !== null)
+        clearTimeout(deferredDemonstrationTimer.current);
+      deferredDemonstrationTimer.current = null;
+    },
+    [liveBrowserSessionId, workflowPermanentId],
+  );
   const handleStartDemonstration = useCallback(
-    ({ insertion, keepEditor = false }: StartDemonstrationOptions = {}) => {
+    (options: StartDemonstrationOptions = {}) => {
+      if (deferredDemonstrationTimer.current !== null) {
+        clearTimeout(deferredDemonstrationTimer.current);
+        deferredDemonstrationTimer.current = null;
+      }
       if (!liveBrowserSessionId) return;
-      if (historyLoadedForRef.current !== workflowPermanentId) {
-        toast({ title: "Wait for Copilot to finish loading" });
+      if (isDemonstrating || demonstrationUnavailable || runOwnsBrowser) {
         noteDemonstrationStartFailed();
         return;
       }
@@ -9676,16 +9695,25 @@ export function EmberChat({
         noteDemonstrationStartFailed();
         return;
       }
+      // These refs flip before the launcher's render-state gate catches up, so a start can land
+      // mid-turn; it polls (refs don't re-render) and starts once Copilot is idle.
       if (
+        historyLoadedForRef.current !== workflowPermanentId ||
         inFlightRef.current ||
         queuedPromptRef.current ||
-        recoveredTurnOwnerRef.current ||
-        isDemonstrating
+        recoveredTurnOwnerRef.current
       ) {
-        toast({ title: "Wait for Copilot to finish" });
-        noteDemonstrationStartFailed();
+        // A new or switched chat abandons the start instead of carrying it into another conversation.
+        const navEpoch = chatNavEpochRef.current;
+        deferredDemonstrationTimer.current = setTimeout(() => {
+          deferredDemonstrationTimer.current = null;
+          if (chatNavEpochRef.current === navEpoch)
+            latestStartDemonstration.current(options);
+          else noteDemonstrationStartFailed();
+        }, DEFERRED_DEMONSTRATION_POLL_MS);
         return;
       }
+      const { insertion, keepEditor = false } = options;
       void stopSpeech();
       // The Edit layout leaves the Browser pane closed, so a demonstration would
       // otherwise record into a browser the user cannot see or drive. Editor
@@ -9714,14 +9742,17 @@ export function EmberChat({
       startRecording({ insertion });
     },
     [
+      demonstrationUnavailable,
       hasPendingQuestion,
       isDemonstrating,
       liveBrowserSessionId,
+      runOwnsBrowser,
       startRecording,
       stopSpeech,
       workflowPermanentId,
     ],
   );
+  latestStartDemonstration.current = handleStartDemonstration;
   const setStartDemonstration = useRecordingLauncherStore(
     (state) => state.setStartDemonstration,
   );
