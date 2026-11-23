@@ -57,6 +57,7 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/credentials/onepassword/create",
     "POST /v1/credentials/azure_credential/create",
     "POST /v1/credentials/totp",
+    "POST /v1/otp-bound/credentials/totp",
     "POST /api/v1/totp",
     "GET /v1/credentials/totp",
     "PUT /v1/google/oauth/config",
@@ -77,7 +78,7 @@ _SIGNED_TRIGGER_RECEIVER_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/triggers/[^/
 _AD_ATTRIBUTION_WITHDRAWAL_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/ad-attribution/withdraw$")
 _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^POST /(?:api/)?v1/ad-attribution(?:/withdraw)?$"),
-    re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
+    re.compile(r"^(?:POST|PUT) /(?:api/)?v1/(?:otp-bound/)?credentials(?:/.*)?$"),
     re.compile(r"^(?:GET|POST|PUT|DELETE) /(?:api/)?v1/email-forwarding(?:/.*)?$"),
     re.compile(r"^POST /(?:api/)?v1/email/(?:inbound/[^/]+|sns-inbound)$"),
     # Twilio credentials and inbound SMS codes must stay opaque even with malformed bodies.
@@ -99,10 +100,10 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
 # Run routes carry the run's inputs and outputs, so their bodies are logged fail-closed: only ids, status, error
 # detail, timing and run settings keep their values, URLs keep only query names, and every other value is blanked.
 _RUN_PAYLOAD_ENDPOINT_PATTERNS = (
-    re.compile(r"^POST /(?:api/)?v1/run/(?:tasks|agents|workflows)(?:/.*)?$"),
-    re.compile(r"^POST /api/v[12]/tasks$"),
-    re.compile(r"^POST /(?:api/)?v1/workflows/[^/]+/run$"),
-    re.compile(r"^POST /(?:api/)?v1/workflows/runs/[^/]+/(?:retry|continue)$"),
+    re.compile(r"^POST /(?:api/)?v1/(?:otp-bound/)?run/(?:tasks|agents|workflows)(?:/.*)?$"),
+    re.compile(r"^POST /api/v[12]/(?:otp-bound/)?tasks$"),
+    re.compile(r"^POST /(?:api/)?v1/(?:otp-bound/)?workflows/[^/]+/run$"),
+    re.compile(r"^POST /(?:api/)?v1/(?:otp-bound/)?workflows/runs/[^/]+/(?:retry|continue)$"),
     re.compile(r"^POST /(?:api/)?v1/sdk/run_action$"),
     re.compile(r"^POST /(?:api/)?v1/scripts/[^/]+/run$"),
     re.compile(r"^POST /(?:api/)?v1/workflow_run_groups$"),

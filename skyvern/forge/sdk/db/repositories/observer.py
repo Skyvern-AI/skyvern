@@ -253,6 +253,7 @@ class ObserverRepository(BaseRepository):
         proxy_location: ProxyLocationInput = None,
         totp_identifier: str | None = None,
         totp_verification_url: str | None = None,
+        otp_request_id: str | None = None,
         webhook_callback_url: str | None = None,
         extracted_information_schema: dict | list | str | None = None,
         error_code_mapping: dict | None = None,
@@ -267,6 +268,24 @@ class ObserverRepository(BaseRepository):
         if isinstance(workflow_system_prompt, str):
             workflow_system_prompt = sanitize_postgres_text(workflow_system_prompt)
         async with self.Session() as session:
+            if workflow_run_id is not None:
+                owner = (
+                    await session.execute(
+                        select(WorkflowRunModel.organization_id, WorkflowRunModel.otp_request_id).where(
+                            WorkflowRunModel.workflow_run_id == workflow_run_id
+                        )
+                    )
+                ).one_or_none()
+                owner_organization_id = owner.organization_id if owner is not None else None
+                owner_marker = owner.otp_request_id if owner is not None else None
+                if owner_organization_id != organization_id and (
+                    owner_marker is not None or otp_request_id is not None
+                ):
+                    raise ValueError("Strict task-v2 organization does not match its workflow-run owner")
+                if owner_organization_id == organization_id and otp_request_id is None:
+                    otp_request_id = owner_marker
+                elif otp_request_id is not None and otp_request_id != owner_marker:
+                    raise ValueError("Task-v2 OTP request marker does not match its workflow-run owner")
             new_task_v2 = TaskV2Model(
                 workflow_run_id=workflow_run_id,
                 workflow_id=workflow_id,
@@ -276,6 +295,7 @@ class ObserverRepository(BaseRepository):
                 proxy_location=serialize_proxy_location(proxy_location),
                 totp_identifier=totp_identifier,
                 totp_verification_url=totp_verification_url,
+                otp_request_id=otp_request_id,
                 webhook_callback_url=webhook_callback_url,
                 extracted_information_schema=extracted_information_schema,
                 error_code_mapping=error_code_mapping,

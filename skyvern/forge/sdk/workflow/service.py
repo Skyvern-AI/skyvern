@@ -448,6 +448,7 @@ from skyvern.services.script_reviewer import (
 )
 from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.postrun import v3_review_post_run
+from skyvern.services.strict_otp_terminalization import fail_unclaimed_strict_workflow_run_on_error
 from skyvern.services.webhook_delivery import (
     FinalWebhookFinalizer,
     PreparedWorkflowWebhook,
@@ -4309,7 +4310,10 @@ class WorkflowService:
             does not convert.
         :return: The created workflow run.
         """
-        async with app.DATABASE.workflow_runs.Session() as outer_session:
+        async with (
+            fail_unclaimed_strict_workflow_run_on_error() as strict_run,
+            app.DATABASE.workflow_runs.Session() as outer_session,
+        ):
             if workflow is None:
                 workflow = await self.resolve_workflow_for_run(
                     workflow_permanent_id=workflow_permanent_id,
@@ -4328,6 +4332,13 @@ class WorkflowService:
             if reject_empty_workflow and not workflow.workflow_definition.blocks:
                 raise WorkflowHasNoBlocks(workflow_permanent_id=workflow_permanent_id)
             workflow_id = workflow.workflow_id
+            if parent_workflow_run_id is not None and workflow_request.otp_request_id is None:
+                parent_workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    parent_workflow_run_id,
+                    organization_id=organization.organization_id,
+                )
+                if parent_workflow_run is not None:
+                    workflow_request.otp_request_id = parent_workflow_run.otp_request_id
             if workflow_request.proxy_location is None and workflow.proxy_location is not None:
                 workflow_request.proxy_location = workflow.proxy_location
             if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
@@ -4379,6 +4390,40 @@ class WorkflowService:
                     workflow_request.browser_session_id or workflow_request.browser_address
                 ):
                     workflow_request.browser_type = read_browser_type(workflow)
+
+            # Strict OTP runs are admitted only onto the fresh local worker-owned browser lane. Resolve inherited
+            # marker and browser policy first so internal children and workflow defaults cannot persist a guarded
+            # owner that will deterministically fail after dispatch.
+            unsupported_strict_resources: list[str] = []
+            if workflow_request.otp_request_id is not None:
+                strict_starts_fresh = resolve_start_fresh(
+                    workflow_request.start_fresh_browser,
+                    explicit_request_browser_profile_id,
+                )
+                if strict_starts_fresh and explicit_request_browser_profile_id is None:
+                    # The workflow-level profile was copied only for legacy seed selection. Fresh mode outranks
+                    # that default and persists no profile, matching _resolve_run_seed's fresh source/sink policy.
+                    workflow_request.browser_profile_id = None
+                unsupported_strict_resources.extend(
+                    field
+                    for field in ("browser_session_id", "browser_profile_id", "browser_address", "browser_type")
+                    if getattr(workflow_request, field) is not None
+                )
+                if should_acquire_reused_session(
+                    browser_session_id=workflow_request.browser_session_id,
+                    start_fresh_browser=workflow_request.start_fresh_browser,
+                    run_override=workflow_request.reuse_browser_session,
+                    workflow_default=workflow.reuse_browser_session,
+                ):
+                    unsupported_strict_resources.append("reuse_browser_session")
+                if workflow.persist_browser_session and not strict_starts_fresh:
+                    unsupported_strict_resources.append("persist_browser_session")
+            if unsupported_strict_resources:
+                raise SkyvernHTTPException(
+                    "Strict OTP runs require a fresh local worker-owned browser; unsupported resource fields: "
+                    + ", ".join(unsupported_strict_resources),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
 
             # Force ai_fallback=True for adaptive caching (code_version >= 2) runs.
             # Adaptive caching requires AI fallback to self-heal when cached scripts break.
@@ -4437,6 +4482,19 @@ class WorkflowService:
                     )
                     raise
 
+            # Older cloud API processes do not know about otp_request_id, but they already refuse
+            # retrying any run whose tri-state code_gen value is non-null. Persist False on strict
+            # roots as a rollout sentinel so those processes stop before reconstructing an unmarked
+            # retry; current processes recognize this exact shape as an ordinary strict root.
+            effective_code_gen = code_gen
+            if (
+                workflow_request.otp_request_id is not None
+                and parent_workflow_run_id is None
+                and debug_session_id is None
+                and code_gen is None
+            ):
+                effective_code_gen = False
+
             # Create the workflow run and set skyvern context
             workflow_run = await self.create_workflow_run(
                 workflow_request=workflow_request,
@@ -4451,7 +4509,7 @@ class WorkflowService:
                 if workflow_request.max_elapsed_time_minutes is not None
                 else workflow.max_elapsed_time_minutes,
                 debug_session_id=debug_session_id,
-                code_gen=code_gen,
+                code_gen=effective_code_gen,
                 workflow_run_id=workflow_run_id,
                 trigger_type=resolved_trigger_type,
                 workflow_schedule_id=workflow_schedule_id,
@@ -4464,6 +4522,8 @@ class WorkflowService:
                 block_scoped=block_scoped,
                 created_by=created_by,
             )
+            if workflow_run.otp_request_id is not None:
+                strict_run.workflow_run_id = workflow_run.workflow_run_id
             try:
                 await self._apply_initial_run_metadata_tags(
                     workflow_run=workflow_run,
@@ -4492,7 +4552,7 @@ class WorkflowService:
                 max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
                 ai_fallback=workflow_request.ai_fallback,
                 run_with=workflow_request.run_with,
-                code_gen=code_gen,
+                code_gen=effective_code_gen,
             )
             if parent_workflow_run_id is None and retried_from_workflow_run_id is None:
                 try:
@@ -4528,6 +4588,7 @@ class WorkflowService:
                     request_id=request_id,
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
+                    otp_request_id=workflow_run.otp_request_id,
                     root_workflow_run_id=root_workflow_run_id,
                     requested_by=resolved_requested_by,
                     run_id=current_run_id,
@@ -6043,6 +6104,9 @@ class WorkflowService:
         human_interaction_blocks = [block for block in blocks if block.block_type == BlockType.HUMAN_INTERACTION]
 
         if human_interaction_blocks:
+            context = skyvern_context.current()
+            if context is not None and context.otp_request_id is not None:
+                raise SkyvernException("Strict OTP workflow cannot provision a human interaction browser session")
             timeouts = [getattr(block, "timeout_seconds", 60 * 60) for block in human_interaction_blocks]
             timeout_seconds = sum(timeouts) + 60 * 60
 
@@ -13562,6 +13626,7 @@ class WorkflowService:
         error_code: str | None = None,
         created_at_start: datetime | None = None,
         created_at_end: datetime | None = None,
+        project_status_for_reads: bool = False,
     ) -> list[WorkflowRun]:
         workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs(
             organization_id=organization_id,
@@ -13573,6 +13638,7 @@ class WorkflowService:
             error_code=error_code,
             created_at_start=created_at_start,
             created_at_end=created_at_end,
+            project_status_for_reads=project_status_for_reads,
         )
         return await self._attach_latest_attempt_views(workflow_runs)
 
@@ -13602,10 +13668,12 @@ class WorkflowService:
         self,
         organization_id: str,
         status: list[WorkflowRunStatus] | None = None,
+        project_status_for_reads: bool = False,
     ) -> int:
         return await app.DATABASE.workflow_runs.get_workflow_runs_count(
             organization_id=organization_id,
             status=status,
+            project_status_for_reads=project_status_for_reads,
         )
 
     async def get_workflow_runs_for_workflow_permanent_id(
@@ -13621,6 +13689,7 @@ class WorkflowService:
         created_at_start: datetime | None = None,
         created_at_end: datetime | None = None,
         run_tags: Sequence[tuple[str | None, str | None]] | None = None,
+        project_status_for_reads: bool = False,
     ) -> list[WorkflowRun]:
         workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
@@ -13634,6 +13703,7 @@ class WorkflowService:
             created_at_start=created_at_start,
             created_at_end=created_at_end,
             run_tags=run_tags,
+            project_status_for_reads=project_status_for_reads,
         )
         return await self._attach_latest_attempt_views(workflow_runs)
 
@@ -13783,6 +13853,7 @@ class WorkflowService:
                     webhook_callback_url=workflow_request.webhook_callback_url,
                     totp_verification_url=workflow_request.totp_verification_url,
                     totp_identifier=workflow_request.totp_identifier,
+                    otp_request_id=workflow_request.otp_request_id,
                     parent_workflow_run_id=parent_workflow_run_id,
                     max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
                     max_elapsed_time_minutes=max_elapsed_time_minutes,
@@ -13853,6 +13924,7 @@ class WorkflowService:
             webhook_callback_url=workflow_request.webhook_callback_url,
             totp_verification_url=workflow_request.totp_verification_url,
             totp_identifier=workflow_request.totp_identifier,
+            otp_request_id=workflow_request.otp_request_id,
             parent_workflow_run_id=parent_workflow_run_id,
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
             max_elapsed_time_minutes=max_elapsed_time_minutes,
@@ -15091,6 +15163,7 @@ class WorkflowService:
         only_from: Sequence[WorkflowRunStatus] | None = None,
         worker_container_restarted: bool = False,
         require_latest_attempt_number: int | None = None,
+        require_job_id_unset: bool = False,
         _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun | None:
         """:meth:`_update_workflow_run_status` for writers that must lose a race against the
@@ -15107,6 +15180,7 @@ class WorkflowService:
             failure_category=failure_category,
             only_from=only_from,
             require_latest_attempt_number=require_latest_attempt_number,
+            require_job_id_unset=require_job_id_unset,
             **_internal_cancel_proof(workflow_run_id, execution),
         )
         if workflow_run is None:
@@ -15845,6 +15919,7 @@ class WorkflowService:
         only_from: Sequence[WorkflowRunStatus] | None = None,
         worker_container_restarted: bool = False,
         require_latest_attempt_number: int | None = None,
+        require_job_id_unset: bool = False,
         _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun | None:
         """Conditional failure finalize that no-ops when the run has already reached a terminal
@@ -15866,6 +15941,7 @@ class WorkflowService:
             failure_category=failure_category,
             only_from=only_from,
             require_latest_attempt_number=require_latest_attempt_number,
+            require_job_id_unset=require_job_id_unset,
             worker_container_restarted=worker_container_restarted,
             _on_terminal_write=_on_terminal_write,
         )
@@ -17122,7 +17198,7 @@ class WorkflowService:
         response = WorkflowRunResponseBase(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
-            status=workflow_run.status,
+            status=workflow_run.status_for_reads,
             attempt=attempt_view.attempt,
             retry_pending=attempt_view.retry_pending,
             next_attempt_at=attempt_view.next_attempt_at,

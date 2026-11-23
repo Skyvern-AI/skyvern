@@ -69,6 +69,16 @@ class WorkflowRequestBody(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    otp_request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^otpr_[A-Za-z0-9_-]+$",
+        description=(
+            "Explicit request marker for strict run-bound OTP delivery. This field is accepted only "
+            "on the otp-bound run endpoint; omit it to retain legacy behavior."
+        ),
+    )
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
     start_fresh_browser: bool = False
@@ -399,6 +409,7 @@ class WorkflowRun(BaseModel):
     webhook_failure_reason: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    otp_request_id: str | None = Field(default=None, exclude=True)
     failure_reason: str | None = None
     failure_category: list[dict[str, Any]] | None = None
     retried_from_workflow_run_id: str | None = None
@@ -446,6 +457,14 @@ class WorkflowRun(BaseModel):
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
 
+    @field_serializer("status", when_used="json")
+    def _serialize_status_for_reads(self, status: WorkflowRunStatus) -> WorkflowRunStatus:
+        return workflow_run_status_for_reads(
+            status=status,
+            otp_request_id=self.otp_request_id,
+            started_at=self.started_at,
+        )
+
     # Every JSON payload of a run (list and detail routes, webhooks) omits the final match's bookkeeping; in-process
     # readers keep the raw carrier, which the errors[] projection reads.
     @field_serializer("failure_category", when_used="json")
@@ -463,6 +482,14 @@ class WorkflowRun(BaseModel):
         return self.debug_session_id is not None
 
     @property
+    def status_for_reads(self) -> WorkflowRunStatus:
+        return workflow_run_status_for_reads(
+            status=self.status,
+            otp_request_id=self.otp_request_id,
+            started_at=self.started_at,
+        )
+
+    @property
     def row_write_unconfirmed(self) -> bool:
         return self._row_write_unconfirmed
 
@@ -472,6 +499,18 @@ class WorkflowRun(BaseModel):
 
 # Stored when attempts of one run executed different definitions; it never equals a real digest.
 MIXED_RUN_DEFINITION_DIGEST = "mixed"
+
+
+def workflow_run_status_for_reads(
+    *,
+    status: WorkflowRunStatus,
+    otp_request_id: str | None,
+    started_at: datetime | None,
+) -> WorkflowRunStatus:
+    """Project a protected strict dispatch reservation as queued without changing its stored fence."""
+    if status == WorkflowRunStatus.running and otp_request_id is not None and started_at is None:
+        return WorkflowRunStatus.queued
+    return status
 
 
 def workflow_definition_sha256(definition: WorkflowDefinition) -> str:

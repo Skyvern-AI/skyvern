@@ -47,6 +47,7 @@ class TaskV2(BaseModel):
     output: dict[str, Any] | list | str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    otp_request_id: str | None = None
     proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     webhook_failure_reason: str | None = None
@@ -223,6 +224,16 @@ class TaskV2Request(BaseModel):
     webhook_callback_url: WebhookUrl | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    otp_request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^otpr_[A-Za-z0-9_-]+$",
+        description=(
+            "Explicit request marker for strict run-bound OTP delivery. This field is accepted only "
+            "on the otp-bound run endpoint; omit it to retain legacy behavior."
+        ),
+    )
     proxy_location: ProxyLocationInput = None
     publish_workflow: bool = False
     generate_script: bool | None = None

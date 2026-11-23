@@ -795,3 +795,8 @@ async def release_all_display_recorders() -> int:
     if cancelled:
         raise asyncio.CancelledError()
     return released
+
+
+def active_display_recorder_count() -> int:
+    """Return the process-local recorder registry size for terminal lifecycle receipts."""
+    return len(_REGISTRY)

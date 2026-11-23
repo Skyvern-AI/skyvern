@@ -490,6 +490,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         organization_id=organization_id,
                         task_id=task_id,
                         workflow_run_id=workflow_run_id,
+                        otp_request_id=context.otp_request_id,
                         totp_identifier=totp_identifier,
                         totp_verification_url=totp_url,
                         expected_otp_type=OTPType.TOTP,

@@ -50,6 +50,16 @@ class TaskBase(BaseModel):
     )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    otp_request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^otpr_[A-Za-z0-9_-]+$",
+        description=(
+            "Explicit request marker for strict run-bound OTP delivery. This field is accepted only "
+            "on the otp-bound run endpoint; omit it to retain legacy behavior."
+        ),
+    )
     navigation_goal: str | None = Field(
         default=None,
         description="The user's goal for the task.",
@@ -148,7 +158,7 @@ class TaskBase(BaseModel):
 
 
 class TaskRequest(TaskBase):
-    task_type: Literal[TaskType.general, TaskType.validation, TaskType.action] | None = Field(
+    task_type: Literal[TaskType.general, TaskType.validation, TaskType.action] | None = Field(  # type: ignore[valid-type]
         default=TaskType.general,
         description="The type of the task",
         examples=[TaskType.general, TaskType.validation, TaskType.action],

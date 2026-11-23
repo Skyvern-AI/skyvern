@@ -1,3 +1,4 @@
+import asyncio
 import typing as t
 from collections.abc import Awaitable, Callable
 from http import HTTPStatus
@@ -25,6 +26,7 @@ from skyvern.schemas.runs import (
     WorkflowRunResponse,
     read_browser_type,
 )
+from skyvern.services.strict_otp_terminalization import fail_unclaimed_strict_workflow_run
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.real_browser_manager import (
     SelectedBrowserTypeUnsupportedError,
@@ -53,6 +55,7 @@ def workflow_request_body_from_existing_run(
             "webhook_callback_url": workflow_run.webhook_callback_url,
             "totp_verification_url": workflow_run.totp_verification_url,
             "totp_identifier": workflow_run.totp_identifier,
+            "otp_request_id": workflow_run.otp_request_id,
             # A fresh run created under FORCE_BROWSER_SESSION carries a generated PBS on browser_session_id;
             # replaying it into the retry alongside start_fresh_browser trips the mutually-exclusive validator.
             # Fresh intent wins — omit the session id so the retry re-resolves a fresh browser.
@@ -217,16 +220,21 @@ async def _prepare_workflow(
             post_dispatch_effects=post_dispatch_effects,
             run_parameter_values=run_parameter_values,
         )
-        await app.DATABASE.tasks.create_task_run(
-            task_run_type=RunType.workflow_run,
-            organization_id=organization.organization_id,
-            run_id=workflow_run.workflow_run_id,
-            title=workflow.title,
-            status=RunStatus.queued,
-            workflow_permanent_id=workflow_id,
-            parent_workflow_run_id=parent_workflow_run_id,
-            debug_session_id=debug_session_id,
-        )
+        try:
+            await app.DATABASE.tasks.create_task_run(
+                task_run_type=RunType.workflow_run,
+                organization_id=organization.organization_id,
+                run_id=workflow_run.workflow_run_id,
+                title=workflow.title,
+                status=RunStatus.queued,
+                workflow_permanent_id=workflow_id,
+                parent_workflow_run_id=parent_workflow_run_id,
+                debug_session_id=debug_session_id,
+            )
+        except (Exception, asyncio.CancelledError):
+            if workflow_run.otp_request_id is not None:
+                await fail_unclaimed_strict_workflow_run(workflow_run.workflow_run_id)
+            raise
 
     if max_steps:
         LOG.info("Overriding max steps per run", max_steps_override=max_steps)
@@ -321,6 +329,8 @@ async def run_workflow_returning_owned_workflow(
     post_dispatch_effects: list[Callable[[], Awaitable[None]]] = []
     run_parameter_values: dict[str, dict[str, t.Any]] = {}
     request_identity = get_request_principal_state()
+    # Only a run this call created is failed below; an existing run id may belong to another request.
+    strict_run_id: str | None = None
     try:
         workflow: Workflow | None = None
         workflow_run = (
@@ -362,6 +372,8 @@ async def run_workflow_returning_owned_workflow(
                 post_dispatch_effects=post_dispatch_effects,
                 run_parameter_values=run_parameter_values,
             )
+            if workflow_run.otp_request_id is not None:
+                strict_run_id = workflow_run.workflow_run_id
         if workflow_run_id is not None:
             if (
                 workflow_run.workflow_permanent_id != workflow_id
@@ -467,6 +479,10 @@ async def run_workflow_returning_owned_workflow(
                 resolved_workflow_run=workflow_run if hand_off_run else None,
                 run_parameter_values=run_parameter_values.get(workflow_run.workflow_run_id),
             )
+    except (Exception, asyncio.CancelledError):
+        if strict_run_id is not None:
+            await fail_unclaimed_strict_workflow_run(strict_run_id)
+        raise
     finally:
         for effect in post_dispatch_effects:
             with contained_effect("post-dispatch bookkeeping"):
@@ -499,7 +515,7 @@ async def get_workflow_run_response(
     return WorkflowRunResponse(
         run_id=workflow_run_id,
         run_type=RunType.workflow_run,
-        status=RunStatus(workflow_run.status),
+        status=RunStatus(workflow_run.status_for_reads),
         attempt=workflow_run_resp.attempt,
         retry_pending=workflow_run_resp.retry_pending,
         next_attempt_at=workflow_run_resp.next_attempt_at,
@@ -528,6 +544,7 @@ async def get_workflow_run_response(
         run_request=WorkflowRunRequest.model_validate(
             {
                 "workflow_id": workflow_run.workflow_permanent_id,
+                "otp_request_id": workflow_run.otp_request_id,
                 "title": workflow_run_resp.workflow_title,
                 "parameters": workflow_run_resp.parameters,
                 "proxy_location": workflow_run.proxy_location,
