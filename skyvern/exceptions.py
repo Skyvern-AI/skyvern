@@ -924,6 +924,15 @@ class BlockedNavigationDestination(FailedToNavigateToUrl):
         super().__init__(url=url, error_message=f"blocked navigation destination: {reason}")
 
 
+class NavigationStartedDownload(FailedToNavigateToUrl):
+    """The URL is a file: the browser started downloading it instead of loading a page. Every retry
+    would start another copy of the same download, so navigation stops at the first attempt."""
+
+
+class StartUrlDownloadFailed(NavigationStartedDownload):
+    """The file download a start URL began was not saved."""
+
+
 # Leads the error_message below, and so the run's failure_reason. A consumer that only ever sees
 # that string matches on this instead of restating the prose, since the egress-attributable browser
 # error code stays in the message and would otherwise classify the failure as ours.
