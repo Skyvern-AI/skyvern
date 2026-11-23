@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, tzinfo
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypedDict
 from unittest.mock import AsyncMock, Mock
@@ -61,6 +62,7 @@ from skyvern.forge.sdk.workflow.service import (
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.schemas.workflows import BlockStatus, WorkflowRetryPolicy
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
@@ -1591,35 +1593,60 @@ async def test_execute_workflow_rechecks_terminal_winner_before_healthy_writebac
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("capture_kind", ["ordinary", "known", "unknown"])
 async def test_execute_workflow_retries_write_back_when_pre_final_persist_fails(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capture_kind: str
 ) -> None:
     workflow = _execute_workflow()
     completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
     order: list[str] = []
-    persist_calls = {"n": 0}
+    artifact = BrowserArtifacts(browser_session_dir=str(tmp_path))
+    if capture_kind == "known":
+        object.__setattr__(artifact, "_credential_profile_writer", "msedge")
 
     async def persist_side_effect(**_kwargs: object) -> None:
-        persist_calls["n"] += 1
-        if persist_calls["n"] == 1:
+        if capture_kind == "known":
+            order.append("store")
+        elif "store_fail" not in order:
             order.append("store_fail")
             raise RuntimeError("storage down")
-        order.append("store_retry")
+        else:
+            order.append("store_retry")
 
+    async def clean_browser(**_kwargs: object) -> WorkflowBrowserCleanupResult:
+        order.append("teardown")
+        result = _browser_cleanup_result()
+        assert result.browser_state is not None
+        result.browser_state.browser_artifacts = artifact
+        return result
+
+    async def save_capture(saved: BrowserArtifacts) -> None:
+        assert saved is artifact
+        order.append("capture")
+
+    async def finalize(**kwargs: Any) -> SimpleNamespace:
+        order.append("finalize")
+        kwargs["_on_terminal_write"](completed_run)
+        return completed_run
+
+    monkeypatch.setattr(service_module.settings, "TEMP_PATH", str(tmp_path))
     svc = WorkflowService()
     _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
-    _patch_browser_cleanup(monkeypatch, svc, order)
-    monkeypatch.setattr(svc, "_persist_workflow_browser_session_if_needed", AsyncMock(side_effect=persist_side_effect))
-    _patch_finalize(monkeypatch, svc, order, completed_run)
+    monkeypatch.setattr(svc, "_clean_up_workflow_browser", clean_browser)
+    monkeypatch.setattr(svc, "_persist_workflow_browser_session_if_needed", persist_side_effect)
+    monkeypatch.setattr(svc, "_finalize_workflow_run_status", finalize)
     monkeypatch.setattr(svc, "persist_video_data", AsyncMock(side_effect=lambda *a, **k: order.append("video")))
     monkeypatch.setattr(svc, "execute_workflow_webhook", AsyncMock(side_effect=lambda *a, **k: order.append("webhook")))
 
-    result = await _run_execute_workflow(svc)
+    result = await _run_execute_workflow(
+        svc, **({"credential_profile_finalizer": save_capture} if capture_kind != "ordinary" else {})
+    )
 
     assert result is completed_run
-    # Sequential dependents remain blocked until the write-back retry has also completed.
-    assert order == ["teardown", "store_fail", "store_retry", "finalize", "video", "webhook"]
-    assert svc._persist_workflow_browser_session_if_needed.await_count == 2
+    if capture_kind == "known":
+        assert order == ["teardown", "finalize", "capture", "video", "store", "webhook"]
+    else:
+        assert order == ["teardown", "store_fail", "store_retry", "finalize", "video", "webhook"]
 
 
 @pytest.mark.asyncio
