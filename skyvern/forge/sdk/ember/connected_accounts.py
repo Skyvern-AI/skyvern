@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, NotRequired
 
 from typing_extensions import TypedDict
 
@@ -107,3 +107,5 @@ class ConnectionCardPayload(TypedDict):
     scopeProfile: str | None
     requiredScopes: list[str]
     reconnectConnectionId: str | None
+    # Set when the step runs only on a Connected Gmail account, which a Google sign-in account cannot stand in for.
+    connectedGmailOnly: NotRequired[bool]
