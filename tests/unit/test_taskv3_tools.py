@@ -2539,7 +2539,8 @@ async def test_a_credential_is_typed_only_on_its_saved_site_however_the_text_car
         if filled is None:
             with pytest.raises(CodeBlockCredentialReleaseError) as excinfo:
                 await _tool(tools, "type").handler({"selector": "#password", "text": typed})
-            assert "portal-example.com" in str(excinfo.value) and password not in str(excinfo.value)
+            refusal = str(excinfo.value)
+            assert "belongs to https://portal-example.com," in refusal and password not in refusal
         else:
             await _tool(tools, "type").handler({"selector": "#password", "text": typed})
     fills = [call[1]["text"] for call in page.calls if call[0] == "fill"]
