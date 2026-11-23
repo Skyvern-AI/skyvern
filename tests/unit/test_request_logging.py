@@ -76,13 +76,23 @@ def test_onboarding_bodies_are_opaque_even_when_malformed(method: str, path: str
 
 
 @pytest.mark.parametrize(
-    "body", ['{"type":"session.removed","data":{"user":{"email_addresses":[{"email_address":"user@example.com"}]}}}']
+    ("path", "body"),
+    [
+        (
+            "/api/v1/clerk-webhook",
+            '{"type":"session.removed","data":{"user":{"email_addresses":[{"email_address":"user@example.com"}]}}}',
+        ),
+        ("/v1/powerbi/dax-assist/suggest", '{"request":"sales for Jane Doe","query":"EVALUATE Sales"}'),
+        ("/api/v1/powerbi/dax-assist/suggest", '{"request":"sales for Jane Doe","query":"EVALUATE Sales"}'),
+        ("/v1/powerbi/dax-assist/preview", '{"query":"EVALUATE Sales","rows":[{"Name":"Jane Doe"}]}'),
+        ("/api/v1/powerbi/dax-assist/preview/", '{"query":"EVALUATE Sales","rows":[{"Name":"Jane Doe"}]}'),
+    ],
+    ids=["identity_provider_webhook", "dax_suggest", "api_dax_suggest", "dax_preview", "api_dax_preview"],
 )
-def test_identity_provider_webhook_bodies_are_opaque(body: str) -> None:
-    request = Request(
-        {"type": "http", "method": "POST", "path": "/api/v1/clerk-webhook", "headers": [], "query_string": b""}
-    )
+def test_sensitive_post_bodies_are_opaque(path: str, body: str) -> None:
+    request = Request({"type": "http", "method": "POST", "path": path, "headers": [], "query_string": b""})
     assert _sanitize_body(request, body.encode(), "application/json") == REDACTED
+    assert _sanitize_response_body(request, body, "application/json") == REDACTED
 
 
 @pytest.mark.parametrize(
