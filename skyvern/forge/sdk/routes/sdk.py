@@ -258,6 +258,7 @@ async def _run_sdk_action(
                 browser_session_id=browser_session_id,
                 max_screenshot_scrolls=task.max_screenshot_scrolls,
                 workflow_id=workflow.workflow_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_run_is_synthetic=created_workflow_run,
                 is_sdk_inline_action=True,
