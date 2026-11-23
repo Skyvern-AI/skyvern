@@ -25,6 +25,7 @@ from skyvern.forge.sdk.ember.request_policy import (
     schema_output_path_aliases_from_criteria,
 )
 from skyvern.forge.sdk.ember.task_output_envelope import _TASK_ENVELOPE_BLOCK_TYPES, _TASK_OUTPUT_PAYLOAD_FIELDS
+from skyvern.forge.sdk.workflow.response_value_caps import without_non_completed_envelopes
 from skyvern.utils.strings import boundary_delimited_present
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -1043,7 +1044,7 @@ def _accepted_runtime_outputs(
         return []
     accepted_output_keys = {f"{label}_output" for label in accepted_labels}
     return [
-        (label, payload)
+        (label, without_non_completed_envelopes(payload))
         for label, payload in block_outputs.items()
         if label in accepted_labels or label in accepted_output_keys or label in independent_labels
     ]

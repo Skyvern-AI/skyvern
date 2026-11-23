@@ -5461,12 +5461,32 @@ def test_a_declared_goal_path_the_run_left_empty_remains_a_fact_not_an_automatic
     assert satisfied_omissions == []
 
 
-def test_a_top_level_array_goal_path_is_not_dropped_for_having_no_root() -> None:
-    """``$[*].number`` normalizes to ``[].number``, whose root is empty; the path still binds."""
+def _goal_path_envelope(status: str, extracted_information: dict[str, object]) -> dict[str, object]:
+    return {"task_id": f"tsk_{status}", "status": status, "extracted_information": extracted_information}
+
+
+@pytest.mark.parametrize(
+    ("goal_path", "extracted_data", "unmet_path"),
+    [
+        ("$[*].number", {"url": "https://example.test/rows"}, "[].number"),
+        (
+            "$[*].extracted_information.number",
+            [
+                {**_goal_path_envelope("terminated", {"number": "7"}), "failure_reason": "page stopped responding"},
+                {**_goal_path_envelope("completed", {"note": "no number on this row"}), "failure_reason": None},
+            ],
+            "[].extracted_information.number",
+        ),
+    ],
+    ids=["no_root", "met_only_by_a_terminated_envelope"],
+)
+def test_a_top_level_array_goal_path_is_not_dropped_for_having_no_root(
+    goal_path: str, extracted_data: object, unmet_path: str
+) -> None:
     run_id = "wr_array_goal_path"
     ctx = _locator_packet_ctx()
     ctx.code_artifact_metadata = {
-        "collect_rows": {"claimed_outcomes": [{"id": "rows", "goal_value_paths": ["$[*].number"]}]}
+        "collect_rows": {"claimed_outcomes": [{"id": "rows", "goal_value_paths": [goal_path]}]}
     }
     result: dict[str, object] = {
         "ok": True,
@@ -5480,7 +5500,7 @@ def test_a_top_level_array_goal_path_is_not_dropped_for_having_no_root() -> None
                     "label": "collect_rows",
                     "block_type": "code",
                     "status": "completed",
-                    "extracted_data": {"url": "https://example.test/rows"},
+                    "extracted_data": extracted_data,
                 }
             ],
         },
@@ -5498,7 +5518,7 @@ def test_a_top_level_array_goal_path_is_not_dropped_for_having_no_root() -> None
 
     assert empty_data_blocks is False
     assert outcome.verdict == "not_authoritative"
-    assert goal_path_omissions == [{"block_label": "collect_rows", "output_path": "[].number"}]
+    assert goal_path_omissions == [{"block_label": "collect_rows", "output_path": unmet_path}]
     assert outcome.missing_requested_output_facts == []
 
 

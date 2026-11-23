@@ -38,6 +38,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredential,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.tasks import TaskOutput, TaskStatus
 from skyvern.forge.sdk.services import bitwarden as bitwarden_module
 from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import (
@@ -56,6 +57,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ConditionalBlock,
     DownloadToS3Block,
     ExtractionBlock,
+    ForLoopBlock,
     HttpRequestBlock,
     SendEmailBlock,
     WaitBlock,
@@ -70,10 +72,12 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenSensitiveInformationParameter,
     ContextParameter,
     CredentialParameter,
+    OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunParameter
+from skyvern.forge.sdk.workflow.response_value_caps import collect_extracted_information
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
@@ -1907,6 +1911,101 @@ async def test_templates_see_the_failure_categories_from_before_an_output_only_r
     rendered_after = await observe(after)
     assert rendered_after == await observe(before)
     assert after[0]["reason_code"] in rendered_after[0]
+
+
+def _task_envelope(status: TaskStatus, rows: list[int], task_v2: bool = False) -> dict[str, Any]:
+    if task_v2:
+        return {
+            "task_id": f"oc_{status}",
+            "status": str(status),
+            "summary": "Read the table",
+            "extracted_information": {"rows": rows},
+            "failure_reason": None if status == TaskStatus.completed else "Stopped on page two",
+        }
+    return TaskOutput(task_id=f"tsk_{status}", status=status, extracted_information={"rows": rows}).model_dump()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("in_loop", "task_v2"),
+    [(False, False), (True, False), (False, True)],
+    ids=["top_level", "loop_iterations", "task_v2_top_level"],
+)
+async def test_a_non_completed_task_payload_stays_out_of_readers_that_merge_blocks(
+    in_loop: bool, task_v2: bool
+) -> None:
+    completed = _task_envelope(TaskStatus.completed, [9], task_v2)
+    terminated = _task_envelope(TaskStatus.terminated, [1, 2, 3], task_v2)
+    context = _outcome_context()
+    if in_loop:
+        failed_output = make_block_output_parameter("extract_row_output")
+        await context.register_output_parameter_value_post_execution(failed_output, completed)
+        await context.register_output_parameter_value_post_execution(failed_output, terminated)
+        loop_value = [
+            [{"loop_value": index, "output_parameter": failed_output.model_dump(), "output_value": envelope}]
+            for index, envelope in enumerate([completed, terminated])
+        ]
+        await context.register_output_parameter_value_post_execution(
+            make_block_output_parameter("each_row_output"), loop_value
+        )
+        stored_values: list[Any] = [loop_value]
+        expected_snapshot: dict[str, Any] = {
+            "extract_row_output": {
+                "status": terminated["status"],
+                "failure_reason": terminated["failure_reason"],
+                "extracted_information": {"rows": [1, 2, 3]},
+            },
+            "each_row_output": loop_value,
+            "rows": None,
+        }
+    else:
+        failed_output = make_block_output_parameter("extract_b_output")
+        await context.register_output_parameter_value_post_execution(
+            make_block_output_parameter("extract_a_output"), completed
+        )
+        await context.register_output_parameter_value_post_execution(failed_output, terminated)
+        stored_values = [completed, terminated]
+        expected_snapshot = {
+            "extract_a_output": {"rows": [9]},
+            "extract_b_output": {
+                "status": terminated["status"],
+                "failure_reason": terminated["failure_reason"],
+                "extracted_information": {"rows": [1, 2, 3]},
+            },
+            "rows": None,
+        }
+    rows_parameter = ContextParameter(key="rows", description=None, source=failed_output, value=None)
+    context.parameters[rows_parameter.key] = rows_parameter
+    context.values[rows_parameter.key] = None
+    await context.set_parameter_values_for_output_parameter_dependent_blocks(failed_output, terminated)
+
+    async def loop_over(source: OutputParameter | ContextParameter) -> list[Any]:
+        block = ForLoopBlock(label="loop", output_parameter=make_block_output_parameter("loop_output"), loop_blocks=[])
+        block.loop_over = source
+        return await block.get_loop_over_parameter_values(context, "wr", "wrb")
+
+    summary = context.build_workflow_run_summary()
+    observed = {
+        "collected": [item for value in stored_values for item in collect_extracted_information(value)],
+        "summary": (summary["status"], summary["output"]["extracted_information"]),
+        "snapshot": BranchEvaluationContext(workflow_run_context=context).build_llm_safe_context_snapshot(),
+        "loop_over_output": await loop_over(failed_output),
+        "loop_over_context_source": await loop_over(rows_parameter),
+        "context_parameter": context.values["rows"],
+        "record_without_failure_fields": collect_extracted_information(
+            {"task_id": "tsk_text", "status": "failed", "extracted_information": {"rows": [7]}}
+        ),
+    }
+
+    assert observed == {
+        "collected": [{"rows": [9]}],
+        "summary": ("terminated", {} if in_loop else {"rows": [9]}),
+        "snapshot": expected_snapshot,
+        "loop_over_output": [None],
+        "loop_over_context_source": [None],
+        "context_parameter": None,
+        "record_without_failure_fields": [{"rows": [7]}],
+    }
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,7 @@ from skyvern.forge.sdk.ember.workflow_credential_utils import (
     saved_credential_ids,
     workflow_blocks,
 )
+from skyvern.forge.sdk.workflow.response_value_caps import without_non_completed_envelopes
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.secret_scrub import scrub_all_registered_from_text
 from skyvern.webeye.actions.action_types import ActionType
@@ -3285,7 +3286,7 @@ def registered_output_payload_binds_output_path(
 
 
 def _registered_output_value_for_path(item: Mapping[str, object], output_path: str) -> tuple[object | None, bool]:
-    value = item.get("value")
+    value = without_non_completed_envelopes(item.get("value"))
     key = _safe_str(item.get("output_parameter_key"))
     if key == output_path:
         return value, True
@@ -3318,7 +3319,7 @@ def _runtime_output_value_status(values: Sequence[object], verdict: CriterionVer
 
 
 def _value_at_output_path(value: object, output_path: str) -> tuple[object | None, bool]:
-    current = value
+    current = without_non_completed_envelopes(value)
     for segment in [part for part in re.split(r"\.|\[\]", output_path) if part]:
         if isinstance(current, Mapping):
             if segment not in current:

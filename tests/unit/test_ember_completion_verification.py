@@ -142,6 +142,8 @@ from skyvern.forge.sdk.ember.tools.workflow_update import (
     _normalize_code_artifact_metadata,
 )
 from skyvern.forge.sdk.ember.turn_origin import TurnOrigin
+from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.tasks import TaskOutput, TaskStatus
 from tests.unit.ember_test_helpers import (
     DISPATCHED_LOGIN_GATE_HTML,
     DISPATCHED_NAV_ONLY_HTML,
@@ -3530,30 +3532,33 @@ def _backing_for(ctx: EmberContext, criteria: list[CompletionCriterion], run_dat
     )
 
 
-def test_backing_backs_registered_scalar_at_floor_path() -> None:
+@pytest.mark.parametrize(
+    ("value", "block_type", "backed"),
+    [
+        ({"doc_status": "Delivered"}, "CODE", True),
+        (
+            {
+                "task_id": "t1",
+                "status": "completed",
+                "extracted_information": None,
+                "downloaded_files": None,
+                "downloaded_file_urls": None,
+            },
+            next(iter(_TASK_ENVELOPE_BLOCK_TYPES)),
+            False,
+        ),
+    ],
+    ids=["registered_scalar", "metadata_only_envelope"],
+)
+def test_backing_at_floor_path_follows_the_registered_payload(
+    value: dict[str, Any], block_type: str, backed: bool
+) -> None:
     ctx = _backing_ctx('{"doc_status": "Delivered"}')
-    run_data = _registered_output_result({"doc_status": "Delivered"})["data"]
+    run_data = _registered_output_result(value, block_type=block_type)["data"]
 
     backing = _backing_for(ctx, [_marked_output_criterion("output.doc_status")], run_data)
 
-    assert backing == {"c1": True}
-
-
-def test_backing_does_not_back_metadata_only_envelope() -> None:
-    envelope_type = next(iter(_TASK_ENVELOPE_BLOCK_TYPES))
-    ctx = _backing_ctx('{"doc_status": "Delivered"}')
-    envelope = {
-        "task_id": "t1",
-        "status": "completed",
-        "extracted_information": None,
-        "downloaded_files": None,
-        "downloaded_file_urls": None,
-    }
-    run_data = _registered_output_result(envelope, block_type=envelope_type)["data"]
-
-    backing = _backing_for(ctx, [_marked_output_criterion("output.doc_status")], run_data)
-
-    assert backing == {"c1": False}
+    assert backing == {"c1": backed}
 
 
 def _task_envelope_ctx(label: str = "run_task") -> EmberContext:
@@ -3596,22 +3601,107 @@ def _task_envelope_run_data(label: str, extracted_information: dict[str, Any] | 
     }
 
 
-def test_backing_backs_contract_less_task_envelope_extracted_information() -> None:
+@pytest.mark.parametrize(
+    ("extracted_information", "backed"),
+    [({"job_title": "Staff Engineer"}, True), (None, False)],
+    ids=["payload", "metadata_only"],
+)
+def test_backing_of_a_contract_less_task_envelope_follows_its_payload(
+    extracted_information: dict[str, Any] | None, backed: bool
+) -> None:
     ctx = _task_envelope_ctx()
-    run_data = _task_envelope_run_data("run_task", {"job_title": "Staff Engineer"})
+    run_data = _task_envelope_run_data("run_task", extracted_information)
 
     backing = _backing_for(ctx, [_marked_output_criterion("output.job_title")], run_data)
 
-    assert backing == {"c1": True}
+    assert backing == {"c1": backed}
 
 
-def test_backing_does_not_back_metadata_only_task_envelope() -> None:
-    ctx = _task_envelope_ctx()
-    run_data = _task_envelope_run_data("run_task", None)
+@pytest.mark.parametrize(
+    ("status", "in_loop", "downloaded"),
+    [
+        ("completed", False, False),
+        ("terminated", False, False),
+        ("completed", True, False),
+        ("terminated", True, False),
+        ("terminated", False, True),
+    ],
+    ids=["completed", "terminated", "completed_loop", "terminated_loop", "terminated_with_download"],
+)
+def test_a_non_completed_task_envelope_payload_is_not_run_evidence(
+    status: str, in_loop: bool, downloaded: bool
+) -> None:
+    label = "each_row" if in_loop else "run_task"
+    block_type = "for_loop" if in_loop else "task_v2"
+    envelope = TaskOutput(
+        task_id="t1",
+        status=TaskStatus(status),
+        extracted_information={"job_title": "Payload Literal Seven"},
+        downloaded_files=[FileInfo(url="https://files.example.com/statement.pdf", filename="statement.pdf")]
+        if downloaded
+        else None,
+    ).model_dump(mode="json")
+    output: object
+    extracted_data: object
+    if in_loop:
+        sibling = TaskOutput(
+            task_id="t2", status=TaskStatus.completed, extracted_information={"job_title": "Other Row"}
+        ).model_dump(mode="json")
+        output = [
+            [
+                {"loop_value": index, "output_parameter": {"key": "run_task_output"}, "output_value": value}
+                for index, value in enumerate([envelope, sibling])
+            ]
+        ]
+        extracted_data = output
+    else:
+        output = envelope
+        extracted_data = {**envelope, f"{label}_output": envelope}
+    block_status = "completed" if in_loop else status
+    run_data = {
+        "workflow_run_id": "wr_x",
+        "overall_status": "completed",
+        "executed_block_labels": [label],
+        "current_url": "https://example.com/account",
+        "blocks": [
+            {"label": label, "block_type": block_type, "status": block_status, "extracted_data": extracted_data}
+        ],
+        "output": {f"{label}_output": output},
+        "registered_output_parameter_values": [
+            {
+                "workflow_run_id": "wr_x",
+                "output_parameter_id": "op_task",
+                "output_parameter_key": f"{label}_output",
+                "block_label": label,
+                "block_type": block_type,
+                "value": output,
+            }
+        ],
+    }
+    ctx = _task_envelope_ctx(label)
+    criteria = [_marked_output_criterion("output.job_title")]
 
-    backing = _backing_for(ctx, [_marked_output_criterion("output.job_title")], run_data)
+    def holds_literal(value: object) -> bool:
+        return "Payload Literal Seven" in json.dumps(value, default=str)
 
-    assert backing == {"c1": False}
+    snapshot = _build_run_evidence_snapshot(ctx, {"ok": True, "data": run_data})
+    observed = {"evidence_snapshot": holds_literal(snapshot.block_outputs)}
+    if not in_loop:
+        observed["floor_backing"] = _backing_for(ctx, criteria, run_data) == {"c1": True}
+        observed["grounding"] = floor_rekeyed_path_backing(
+            ctx,
+            criteria,
+            {label: output},
+            {label: "runtime_output"},
+            {label: block_type},
+            runtime_envelope_labels={label},
+        ) == {"c1": True}
+    expected = dict.fromkeys(observed, status == "completed")
+    if downloaded:
+        observed["download_registered"] = snapshot.block_outputs[label].get("download_registered")
+        expected["download_registered"] = True
+
+    assert observed == expected
 
 
 def _mixed_authored_and_envelope_ctx() -> EmberContext:
@@ -3816,32 +3906,32 @@ def _emission_result(
     )
 
 
-def test_registered_output_meaningfulness_gate_drops_hollow_envelope() -> None:
-    envelope_type = next(iter(_TASK_ENVELOPE_BLOCK_TYPES))
+@pytest.mark.parametrize(
+    ("value", "block_type", "kept"),
+    [
+        (
+            {
+                "task_id": "t",
+                "status": "completed",
+                "extracted_information": None,
+                "downloaded_files": None,
+                "downloaded_file_urls": None,
+            },
+            next(iter(_TASK_ENVELOPE_BLOCK_TYPES)),
+            None,
+        ),
+        ({"doc_status": "Delivered"}, "CODE", {"doc_status": "Delivered"}),
+    ],
+    ids=["hollow_envelope", "real_scalar"],
+)
+def test_registered_output_meaningfulness_gate(
+    value: dict[str, Any], block_type: str, kept: dict[str, str] | None
+) -> None:
     ctx = _ctx_with_blocks("code")
-    hollow = _registered_output_result(
-        {
-            "task_id": "t",
-            "status": "completed",
-            "extracted_information": None,
-            "downloaded_files": None,
-            "downloaded_file_urls": None,
-        },
-        block_type=envelope_type,
-    )
 
-    snapshot = _build_run_evidence_snapshot(ctx, hollow)
+    snapshot = _build_run_evidence_snapshot(ctx, _registered_output_result(value, block_type=block_type))
 
-    assert "bill_statement" not in snapshot.block_outputs
-
-
-def test_registered_output_meaningfulness_gate_keeps_real_scalar() -> None:
-    ctx = _ctx_with_blocks("code")
-    real = _registered_output_result({"doc_status": "Delivered"})
-
-    snapshot = _build_run_evidence_snapshot(ctx, real)
-
-    assert snapshot.block_outputs.get("bill_statement") == {"doc_status": "Delivered"}
+    assert snapshot.block_outputs.get("bill_statement") == kept
 
 
 def test_requested_output_criteria_do_not_grade_interactive_run() -> None:

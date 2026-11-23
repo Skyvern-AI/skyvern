@@ -6890,55 +6890,82 @@ async def test_execute_task_v3_cap_tripped_loop_error_keeps_provider_category_an
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "reason"),
+    ("status", "reason", "cap_trip", "extracted_output"),
     [
-        ("budget_exhausted", "The run reached its turn budget before the model finished."),
-        ("loop_error", "llm_call_failed: RuntimeError: provider unavailable"),
+        (
+            "budget_exhausted",
+            "The run reached its turn budget before the model finished.",
+            "max_turns (40) reached",
+            {"rows": [3]},
+        ),
+        ("loop_error", "llm_call_failed: RuntimeError: provider unavailable", None, None),
     ],
 )
 async def test_execute_task_v3_verdictless_death_persists_a_failed_decision_row(
-    monkeypatch: pytest.MonkeyPatch, status: str, reason: str
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    reason: str,
+    cap_trip: str | None,
+    extracted_output: dict[str, Any] | None,
 ) -> None:
-    # A death with no agent verdict is exactly the run a click-free block has no step details for:
-    # the terminal decision row is synthesized as a FAILED terminate carrying the outcome reason.
-    from skyvern.forge import agent as agent_mod
-
-    outcome = LoopOutcome(status=status, reason=reason, billable_actions=["click"])
-    _step, task, _loop, _post = await _run_execute_task_v3(
+    # A death with no agent verdict is exactly the run a click-free block has no step details for: the terminal
+    # decision row is synthesized as a FAILED terminate carrying the outcome reason, even when data survived.
+    outcome = LoopOutcome(
+        status=status, reason=reason, cap_trip=cap_trip, billable_actions=["click"], extracted_output=extracted_output
+    )
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
     )
     assert task.status == TaskStatus.failed
-    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert loop_mock.update_task_kwargs.get("extracted_information") == extracted_output
+    persisted = agent_module.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
     assert persisted.action_type == ActionType.TERMINATE
     assert persisted.status == ActionStatus.failed
     assert persisted.reasoning == reason
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_verdictless_death_with_salvaged_output_still_fails_the_decision_row(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("status", "gate_vetoes", "expected_status"),
+    [
+        ("terminated", False, TaskStatus.terminated),
+        ("failed", False, TaskStatus.failed),
+        ("completed", True, TaskStatus.failed),
+    ],
+    ids=["terminated", "failed", "gate_vetoed_completion"],
+)
+async def test_execute_task_v3_keeps_the_raw_redacted_payload_on_every_verdict(
+    monkeypatch: pytest.MonkeyPatch, status: str, gate_vetoes: bool, expected_status: TaskStatus
 ) -> None:
-    # The decision row records whether the agent gave a verdict, not whether data survived: a
-    # cap-tripped death still persists FAILED even though AC-2 carries the staged extraction
-    # through. Coupling the row's status to the salvage would hide these runs from the
-    # failed-decision-row taxonomy the docs point at.
-    from skyvern.forge import agent as agent_mod
-
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run", lambda *_a, **_k: {"482913"}
+    )
     outcome = LoopOutcome(
-        status="budget_exhausted",
-        reason="The run reached its turn budget before the model finished.",
-        cap_trip="max_turns (40) reached",
+        status=status,
+        reason="stopped on the second page",
         billable_actions=["click"],
-        extracted_output={"rows": [3]},
+        extracted_output={"rows": [1, 2, 3], "note": "code 482913"},
     )
+    schema = {
+        "type": "object",
+        "properties": {"rows": {"type": "array"}, "total": {"type": "integer"}},
+        "required": ["total"],
+    }
     _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+        monkeypatch,
+        outcome,
+        completion_gate_vetoes=gate_vetoes,
+        data_extraction_goal="Extract the rows",
+        extracted_information_schema=schema,
     )
-    assert task.status == TaskStatus.failed
-    assert loop_mock.update_task_kwargs.get("extracted_information") == {"rows": [3]}
-    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
-    assert persisted.action_type == ActionType.TERMINATE
-    assert persisted.status == ActionStatus.failed
+    assert task.status == expected_status
+    assert loop_mock.update_task_kwargs.get("extracted_information") == {
+        "rows": [1, 2, 3],
+        "note": f"code {REDACTED_SECRET_PLACEHOLDER}",
+    }
 
 
 @pytest.mark.asyncio
