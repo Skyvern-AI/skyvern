@@ -10949,6 +10949,14 @@ _REPORT_LANDED = "Downloaded: report.csv (1.0 KB)"
         ("justification_hold_not_stacked", ["completed", "terminated"], [None, None], [0], []),
         ("no_verdict_turn_left", ["completed"], [None], [], []),
         ("read_raises", ["completed"], [None], [], []),
+        ("start_url_file_held", ["completed", "completed"], [_REPORT_LANDED, _REPORT_LANDED], [], [0]),
+        ("start_url_last_counted_turn", ["completed", "completed"], [_REPORT_LANDED, _REPORT_LANDED], [], [0]),
+        ("start_url_granted_final_turn", ["completed"], [_REPORT_LANDED], [], [0]),
+        ("start_url_unseen_refusal", ["completed", "completed"], [None, None], [], []),
+        ("start_url_unseen_then_unsaved", ["completed", "completed"], [None, None], [], []),
+        ("start_url_unseen_failed_verdict", ["failed"], [None], [], []),
+        ("start_url_unseen_limit_then_unsaved", ["completed", "completed", "completed"], [None, None, None], [1], []),
+        ("start_url_unseen_then_terminated", ["completed", "terminated"], [None, None], [], []),
     ],
 )
 async def test_a_completed_finish_with_no_file_and_unsaved_downloads_is_handed_back_once(
@@ -10965,31 +10973,65 @@ async def test_a_completed_finish_with_no_file_and_unsaved_downloads_is_handed_b
         reads.append(1)
         if case == "read_raises":
             raise RuntimeError("tally unavailable")
-        return {} if case == "nothing_unsaved" else {"capture_failed": 2}
+        return (
+            {}
+            if case in ("nothing_unsaved", "start_url_unseen_refusal", "start_url_unseen_failed_verdict")
+            else {"capture_failed": 2}
+        )
 
-    activity = None if case not in ("no_verdict_turn_left", "justification_hold_not_stacked") else ActivityRecency()
+    no_turn_left = case in ("no_verdict_turn_left", "start_url_last_counted_turn", "start_url_granted_final_turn")
+    # Turn 1 is spent on an observe, so the finish runs on the final turn the budget grants, with none after it.
+    final_turn = case == "start_url_granted_final_turn"
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    # A refusal recorded before the hand-off reaches no result when the agent's first call is finish; the watch
+    # reads it only when finish attaches it.
+    unseen_facts: DownloadFailureFacts | None = None
+    # The stacking row shows the failed save the unsaved-download hold would otherwise repeat.
+    reason = "capture_failed" if case == "start_url_unseen_then_unsaved" else "file_size_limit"
+    unseen_fact = f"Browser download not saved ({reason}): 1"
+    if case.startswith("start_url_unseen"):
+
+        async def attach() -> None:
+            assert unseen_facts is not None
+            unseen_facts.add(unseen_fact, repeat=True)
+
+        unseen_facts = DownloadFailureFacts(attach=attach)
+    justified = case in ("justification_hold_not_stacked", "start_url_unseen_then_terminated")
+    activity = None if not no_turn_left and not justified else ActivityRecency()
     outcome, _ = await _run(
-        [[("finish", {"status": status, "reason": "the export finished"})] for status in statuses],
+        ([[("observe", {})]] if final_turn else [])
+        + [[("finish", {"status": status, "reason": "the export finished"})] for status in statuses],
         [
+            *([_recording_tool("observe", observe_calls)] if final_turn else []),
             make_finish_tool(
                 download_settle=settle,
                 file_landed_hold=case != "hold_switched_off",
                 unsaved_downloads=unsaved_downloads,
                 activity=activity,
-                justify_stops=case == "justification_hold_not_stacked",
-            )
+                justify_stops=justified,
+                hold_completed_on_landed_file=case.startswith("start_url"),
+                download_facts=unseen_facts,
+            ),
         ],
-        **({"max_turns": 1} if case == "no_verdict_turn_left" else {}),
+        **({"max_turns": 1} if no_turn_left else {}),
         **({"activity": activity} if activity is not None else {}),
     )
 
     results = [str(m["content"]) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
     assert len(results) == len(statuses), results
-    assert outcome.status == statuses[-1]
+    # A start URL's file the agent was never shown cannot make the block completed; with no turn left the budget ends it.
+    assert outcome.status == ("budget_exhausted" if final_turn else statuses[-1])
     assert [i for i, result in enumerate(results) if "capture_failed: 2" in result] == unsaved_held
     assert [i for i, result in enumerate(results) if "these files landed" in result] == landed_held
     for index in unsaved_held:
         assert "no new file has landed" in results[index] and "retry it" in results[index]
+    if unseen_facts is not None and statuses[0] == "completed":
+        # A limit-only unseen hold leaves the unsaved-download hold for a later failed save; neither stacks a third.
+        # Held once for the unseen refusal, never again by the unsaved-download hold.
+        assert "were not shown to you yet" in results[0] and unseen_fact in results[0], results
+        assert "were not shown to you yet" not in results[1], results
+    if case == "start_url_unseen_failed_verdict":
+        assert "were not shown to you yet" not in results[0], results
     if case == "file_landed":
         assert reads == []
 
@@ -16583,6 +16625,7 @@ def _held_fact_count(outcome: Any, handle: str = "c1") -> int:
 @pytest.mark.parametrize("future_turns", [0, 1, 2], ids=["granted-final-turn", "one-turn-left", "two-turns-left"])
 @pytest.mark.parametrize("prefill", [{}, {"accept_download_candidates": []}], ids=["omitted", "empty"])
 @pytest.mark.parametrize("held", ["informed", "unseen", "arriving-in-settle"])
+@pytest.mark.parametrize("start_url", [False, True], ids=["page-download", "start-url-download"])
 @pytest.mark.asyncio
 async def test_a_held_candidate_is_held_once_while_a_verdict_turn_remains(
     tmp_path: Path,
@@ -16591,6 +16634,7 @@ async def test_a_held_candidate_is_held_once_while_a_verdict_turn_remains(
     prefill: dict[str, Any],
     future_turns: int,
     same_batch: bool,
+    start_url: bool,
 ) -> None:
     interceptor = _candidate_interceptor(tmp_path, monkeypatch)
     arriving = [held == "arriving-in-settle"]
@@ -16607,7 +16651,20 @@ async def test_a_held_candidate_is_held_once_while_a_verdict_turn_remains(
     facts = _candidate_facts(interceptor)
     if held == "informed":
         facts.mark_shown(list(interceptor.replay_candidates().values()))
-    finish = make_finish_tool(download_settle=settle, download_facts=facts, activity=activity)
+    if start_url:
+        # The watch's tally read adds each held candidate's fact once, as the start-URL hold's delivery sees it.
+        def refresh() -> None:
+            for fact in interceptor.replay_candidates().values():
+                facts.add(fact, repeat=False)
+
+        facts.refresh = refresh
+    finish = make_finish_tool(
+        download_settle=settle,
+        download_facts=facts,
+        activity=activity,
+        file_landed_hold=start_url,
+        hold_completed_on_landed_file=start_url,
+    )
     verdict = ("finish", {**_OMITTED[1], **prefill})
     script = [[("observe", {})], [verdict, verdict], [verdict]] if same_batch else _observe_then(verdict, verdict)
     tools = [_recording_tool("observe", []), finish]

@@ -10940,19 +10940,26 @@ async def test_a_click_does_not_wait_on_a_request_an_earlier_click_started(tmp_p
 
 @_skip_no_browser
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refused_before_attach", [False, True], ids=["during-block", "start-url-before-hand-off"])
 async def test_a_browser_download_the_interceptor_could_not_save_is_reported(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refused_before_attach: bool
 ) -> None:
     egress = MagicMock()
     egress.authorize_request.return_value = True
     interceptor = CDPDownloadInterceptor(network_egress_monitor=egress, redirect_hop_authorizer=AsyncMock())
     async with _export_page() as page:
         page.context._skyvern_cdp_download_interceptor = interceptor
-        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        # A start URL refused at a limit is recorded before the hand-off, so only the earlier tally reveals it.
+        tally_before = interceptor.download_tally() if refused_before_attach else None
+        if refused_before_attach:
+            monkeypatch.setattr(cdp_download_interceptor, "MAX_DOWNLOAD_FILES_PER_RUN", 0)
+            assert interceptor._new_download_attempt() is None
+        watch = DownloadFailureWatch(_fixed_page_provider(page), tally_before=tally_before)
         tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
-        await _prime(tools)
-        monkeypatch.setattr(cdp_download_interceptor, "MAX_DOWNLOAD_FILES_PER_RUN", 0)
-        assert interceptor._new_download_attempt() is None
+        if not refused_before_attach:
+            await _prime(tools)
+            monkeypatch.setattr(cdp_download_interceptor, "MAX_DOWNLOAD_FILES_PER_RUN", 0)
+            assert interceptor._new_download_attempt() is None
         result = await _tool(tools, "wait").handler({"time_ms": 1})
         watch.close()
 

@@ -153,6 +153,7 @@ from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_time
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
 from skyvern.webeye.cdp_download_interceptor import (
     MAX_FILE_SIZE_BYTES,
+    DownloadTally,
     begin_replay_candidate_hold,
     download_tally_for_context,
     extract_filename,
@@ -26457,6 +26458,7 @@ class DownloadFailureWatch:
         *,
         native_download_attempt: NativeDownloadAttempt | None = None,
         report_failures: bool = True,
+        tally_before: DownloadTally | None = None,
     ) -> None:
         self._report_failures = report_failures
         self.facts = DownloadFailureFacts(
@@ -26481,6 +26483,8 @@ class DownloadFailureWatch:
         self._changed = asyncio.Event()
         self._tally_generation: str | None = None
         self._tally_seen: dict[str, int] = {}
+        # From before the block's start URL when it downloaded, so a save that already failed is still reported.
+        self._tally_before = tally_before
         # A browser that owns its downloads stores each under a generated id; the page's own name, keyed by that id.
         self._page_names: dict[str, str] = {}
         self._naming: set[asyncio.Task[None]] = set()
@@ -26677,7 +26681,12 @@ class DownloadFailureWatch:
                     self._context = context
                     # Inside a run's scope the scope ends this hold, after the task's cleanup rather than at close().
                     self._owns_candidate_mode = self._report_failures and begin_replay_candidate_hold(context)
-                    self._tally_generation = None
+                    if self._tally_before is not None:
+                        self._tally_generation = self._tally_before.generation
+                        self._tally_seen = dict(self._tally_before.unsolicited_failures)
+                        self._tally_before = None
+                    else:
+                        self._tally_generation = None
                     self._read_tally()
                     for event, hook in self._hooks.items():
                         context.on(event, hook)

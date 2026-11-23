@@ -36,6 +36,7 @@ from skyvern.exceptions import (
     FailedToStopLoadingPage,
     MissingBrowserState,
     MissingBrowserStatePage,
+    NavigationStartedDownload,
     UnresolvableNavigationHost,
 )
 from skyvern.forge import app
@@ -66,6 +67,7 @@ from skyvern.webeye.browser_runtime_events import (
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState, PageCrashRecord, is_selectable_page_url
 from skyvern.webeye.cdp_download_interceptor import (
     disable_download_interceptor_for_context,
+    download_urls_for_page,
     has_download_interceptor_for_context,
 )
 from skyvern.webeye.display_recorder import DisplayRecorder, release_display_recorder
@@ -418,6 +420,15 @@ class _MainFrameNavigation:
         self._request_hops = ()
         self.started_at = None
         self._idle.set()
+
+
+def _navigation_started_download(
+    browser_context: BrowserContext | None, page: Page, downloads_before: int, navigation_urls: set[str]
+) -> bool:
+    # Only a download of this navigation's own main-frame request or redirect hop counts, not another response's.
+    # None means no interceptor, before or after a teardown; that is no evidence of a download.
+    downloads = download_urls_for_page(browser_context, page)
+    return downloads is not None and any(url in navigation_urls for url in downloads[downloads_before:])
 
 
 class RealBrowserState(BrowserState):
@@ -1059,6 +1070,19 @@ class RealBrowserState(BrowserState):
             landed_url = response_url if isinstance(response_url, str) else None
             return response
 
+        browser_context = getattr(self, "_browser_context", None)
+        downloads_before = len(download_urls_for_page(browser_context, page) or [])
+        navigation_urls: set[str] = set()
+
+        def _on_request(request: Request) -> None:
+            try:
+                if request.is_navigation_request() and request.frame == page.main_frame:
+                    navigation_urls.add(request.url)
+            except Exception:
+                # A service worker's request has no frame, so Playwright raises instead of returning one.
+                LOG.debug("Navigation request listener skipped a request", exc_info=True)
+
+        page.on("request", _on_request)
         self.begin_navigation()
         try:
             self.last_navigation_status = await navigate_with_retry(
@@ -1068,10 +1092,19 @@ class RealBrowserState(BrowserState):
                 settle=self._wait_for_settle,
                 wait_until=wait_until,
                 stop_retrying=lambda: self.get_browser_connection_loss() is not None,
+                download_started=lambda: _navigation_started_download(
+                    browser_context, page, downloads_before, navigation_urls
+                ),
             )
+        except NavigationStartedDownload:
+            # The server answered with a file, so the address and proxy worked.
+            await self.record_navigation_result(None, url=url)
+            raise
         except Exception as navigation_error:
             await self.record_navigation_result(navigation_error)
             raise
+        finally:
+            page.remove_listener("request", _on_request)
         self.last_navigation_url = landed_url
         await self.record_navigation_result(None, url=url)
         await self._wait_for_challenge_solver(page=page)
