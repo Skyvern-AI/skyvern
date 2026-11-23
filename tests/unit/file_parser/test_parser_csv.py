@@ -64,6 +64,8 @@ _CSV_PARSE_CASES: list[tuple[str, bytes, list[dict[str, str]]]] = [
     # Controls: files the parser already read correctly must not change.
     ("spaces.csv", b"a b\n1 2\n3 4\n", [{"a": "1", "b": "2"}, {"a": "3", "b": "4"}]),
     ("colons.csv", b"a:b\n1:2\n3:4\n", [{"a": "1", "b": "2"}, {"a": "3", "b": "4"}]),
+    ("caret.csv", b"a^b\n1^2\n3^4\n", [{"a": "1", "b": "2"}, {"a": "3", "b": "4"}]),
+    ("tilde.csv", b"a~b\n1~2\n3~4\n", [{"a": "1", "b": "2"}, {"a": "3", "b": "4"}]),
     ("header_only.csv", b"email\n", []),
     ("comma.csv", b"name,email\nAna,ana@x.com\n", [{"name": "Ana", "email": "ana@x.com"}]),
     ("semicolon.csv", b"name;amount\nAna;1,50\n", [{"name": "Ana", "amount": "1,50"}]),
