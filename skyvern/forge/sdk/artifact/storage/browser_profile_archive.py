@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import os
+import stat
 import zipfile
 from typing import Any
 
@@ -35,10 +37,17 @@ def _tree_size(directory: str) -> tuple[int, int]:
     return file_count, total_bytes
 
 
-def write_profile_archive(directory: str, zip_file_path: str, **log_context: Any) -> None:
+def write_profile_archive(
+    directory: str, zip_file_path: str, *, strict_traversal: bool = False, **log_context: Any
+) -> int:
+    def raise_traversal_error(error: OSError) -> None:
+        raise error
+
     archived_files = archived_bytes = excluded_files = excluded_bytes = 0
     with zipfile.ZipFile(zip_file_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for dirpath, dirnames, filenames in os.walk(directory):
+        for dirpath, dirnames, filenames in os.walk(
+            directory, onerror=raise_traversal_error if strict_traversal else None
+        ):
             relative_dir = os.path.relpath(dirpath, directory)
             kept_dirnames = []
             for name in sorted(dirnames):
@@ -53,7 +62,16 @@ def write_profile_archive(directory: str, zip_file_path: str, **log_context: Any
             dirnames[:] = kept_dirnames
             for name in filenames:
                 path = os.path.join(dirpath, name)
-                if os.path.isfile(path):
+                if strict_traversal:
+                    try:
+                        is_regular_file = stat.S_ISREG(os.stat(path).st_mode)
+                    except OSError as exc:
+                        if exc.errno == errno.ENOENT and stat.S_ISLNK(os.lstat(path).st_mode):
+                            continue
+                        raise
+                else:
+                    is_regular_file = os.path.isfile(path)
+                if is_regular_file:
                     archive.write(path, os.path.normpath(os.path.join(relative_dir, name)))
                     archived_files += 1
                     archived_bytes += archive.filelist[-1].file_size
@@ -66,6 +84,7 @@ def write_profile_archive(directory: str, zip_file_path: str, **log_context: Any
         zip_bytes=os.path.getsize(zip_file_path),
         **log_context,
     )
+    return archived_files
 
 
 def extract_profile_archive(zip_bytes: bytes, **log_context: Any) -> str:

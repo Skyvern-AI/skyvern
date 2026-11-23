@@ -237,9 +237,12 @@ class BrowserSessionsRepository(BaseRepository):
         source_browser_type: str | None = None,
         proxy_location: ProxyLocationInput = None,
         proxy_session_id: str | None = None,
+        *,
+        browser_profile_id: str | None = None,
+        session: AsyncSession | None = None,
     ) -> BrowserProfile:
-        async with self.Session() as session:
-            browser_profile_id = generate_browser_profile_id()
+        async with nullcontext(session) if session is not None else self.Session() as connection:
+            browser_profile_id = browser_profile_id or generate_browser_profile_id()
             proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
                 proxy_location=proxy_location,
                 proxy_session_id=proxy_session_id,
@@ -254,9 +257,12 @@ class BrowserSessionsRepository(BaseRepository):
                 proxy_location=serialize_proxy_location(proxy_location),
                 proxy_session_id=proxy_session_id,
             )
-            session.add(browser_profile)
-            await session.commit()
-            await session.refresh(browser_profile)
+            connection.add(browser_profile)
+            if session is None:
+                await connection.commit()
+            else:
+                await connection.flush()
+            await connection.refresh(browser_profile)
             return BrowserProfile.model_validate(browser_profile)
 
     @db_operation("get_or_create_managed_browser_profile")

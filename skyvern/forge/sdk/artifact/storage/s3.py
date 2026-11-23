@@ -392,7 +392,9 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         return await self.async_client.download_file(path, log_exception=False)
 
-    async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
+    async def store_browser_session(
+        self, organization_id: str, workflow_permanent_id: str, directory: str, *, strict_traversal: bool = False
+    ) -> None:
         browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_BROWSER_SESSIONS)
         # make_archive writes base_name + ".zip", a separate file the NamedTemporaryFile cleanup never
@@ -400,7 +402,10 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         with create_named_temporary_file() as temp_zip_file:
             zip_file_path = f"{temp_zip_file.name}.zip"
             try:
-                shutil.make_archive(temp_zip_file.name, "zip", directory)
+                if strict_traversal:
+                    write_profile_archive(directory, zip_file_path, strict_traversal=True)
+                else:
+                    shutil.make_archive(temp_zip_file.name, "zip", directory)
                 LOG.debug(
                     "Storing browser session",
                     organization_id=organization_id,
@@ -433,7 +438,15 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         # failures (AccessDenied, network, etc.) will raise here.
         await self.async_client.delete_file(browser_session_uri, log_exception=True, raise_on_error=True)
 
-    async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
+    async def store_browser_profile(
+        self,
+        organization_id: str,
+        profile_id: str,
+        directory: str,
+        *,
+        confirm_creation: bool = False,
+        strict_traversal: bool = False,
+    ) -> None:
         """Store browser profile to S3."""
         temp_zip_file = create_named_temporary_file()
         # make_archive writes base_name + ".zip", a separate file the NamedTemporaryFile cleanup never
@@ -447,8 +460,13 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         try:
             # Off the event loop: the credential living-profile engine calls this mid-run, where a
             # sync archive of a large profile dir would stall every other coroutine on the worker.
-            await asyncio.to_thread(
-                write_profile_archive, directory, zip_file_path, organization_id=organization_id, profile_id=profile_id
+            archived_files = await asyncio.to_thread(
+                write_profile_archive,
+                directory,
+                zip_file_path,
+                strict_traversal=confirm_creation or strict_traversal,
+                organization_id=organization_id,
+                profile_id=profile_id,
             )
             LOG.debug(
                 "Storing browser profile",
@@ -458,7 +476,14 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
                 profile_uri=profile_uri,
                 storage_class=sc,
             )
-            await self.async_client.upload_file_from_path(profile_uri, zip_file_path, storage_class=sc)
+            if confirm_creation:
+                if not archived_files:
+                    raise ValueError("Cannot create a credential profile from an empty capture")
+                await self.async_client.upload_file_from_path(
+                    profile_uri, zip_file_path, storage_class=sc, raise_exception=True
+                )
+            else:
+                await self.async_client.upload_file_from_path(profile_uri, zip_file_path, storage_class=sc)
         finally:
             if os.path.exists(zip_file_path):
                 os.remove(zip_file_path)
