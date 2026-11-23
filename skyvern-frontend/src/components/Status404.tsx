@@ -17,7 +17,7 @@ function Status404() {
 
   return (
     <div
-      className="relative z-50 flex w-full items-center justify-center bg-background"
+      className="relative flex w-full items-center justify-center bg-background"
       // hack(jdo): 7.5rem is header height; this is a fail, IMO; we should redo root layout CSS
       style={{ height: "calc(100vh - 7.5rem)" }}
     >
