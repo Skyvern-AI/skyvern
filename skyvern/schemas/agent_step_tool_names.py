@@ -45,6 +45,7 @@ CATALOG_TOOL_NAMES = frozenset(
         "gmail__move_email",
         "gmail__read_inbox",
         "gmail__send_email",
+        "google_drive__download_files",
         "google_drive__upload_files",
         "google_sheets__read_rows",
         "google_sheets__write_rows",

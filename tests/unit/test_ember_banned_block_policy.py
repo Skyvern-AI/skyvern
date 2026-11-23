@@ -370,9 +370,31 @@ def test_task_v3_pure_rejects_non_v3_engines(engine: str) -> None:
     assert [violation.code.value for violation in violations] == ["engine_not_skyvern_v3"]
 
 
-@pytest.mark.parametrize("block_type", ["code", "task_v2"])
-def test_task_v3_pure_rejects_unavailable_executor_blocks(block_type: str) -> None:
-    violations = _agent_only_violations(_yaml({"block_type": block_type, "label": "unsafe"}))
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"block_type": "code", "label": "unsafe"},
+        {"block_type": "task_v2", "label": "unsafe"},
+        # A browser-agent block wrapped in an integration action would run with no engine pin.
+        {
+            "block_type": "integration_action",
+            "label": "unsafe",
+            "integration_id": "google_drive",
+            "action_id": "download_files",
+        },
+        {
+            "block_type": "  Integration_Action ",
+            "label": "unsafe",
+            "integration_id": "google_drive",
+            "action_id": "download_files",
+        },
+    ],
+)
+def test_task_v3_pure_rejects_unavailable_executor_blocks(
+    block: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    violations = _agent_only_violations(_yaml(block))
 
     assert [violation.code.value for violation in violations] == ["block_type_unavailable"]
 
