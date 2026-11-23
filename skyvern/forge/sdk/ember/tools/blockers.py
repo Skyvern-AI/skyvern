@@ -20,6 +20,7 @@ from skyvern.forge.sdk.workflow.reached_download_target import (
     generated_file_artifact_ids,
     registered_download_proof_view,
 )
+from skyvern.forge.sdk.workflow.response_value_caps import without_non_completed_envelopes
 from skyvern.schemas.workflows import BlockType
 
 from ._shared import (
@@ -630,7 +631,7 @@ def _analyze_run_blocks(
                 if _is_meaningful_extracted_data(payload):
                     any_data_output = True
             elif _is_code_block_type(block_type):
-                extracted = block.get("extracted_data")
+                extracted = without_non_completed_envelopes(block.get("extracted_data"))
                 goal_value_paths = _goal_value_paths_for_code_block(ember_ctx, block.get("label"))
                 if extracted is None and not goal_value_paths:
                     continue

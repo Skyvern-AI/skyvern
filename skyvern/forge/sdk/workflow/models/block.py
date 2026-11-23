@@ -192,6 +192,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 )
 from skyvern.forge.sdk.api.llm.schema_validator import (
     extraction_shape_matches,
+    json_type_name,
     resolve_schema_type,
     validate_schema,
 )
@@ -374,6 +375,9 @@ from skyvern.forge.sdk.workflow.reached_download_target import (
     block_output_has_registered_download,
     code_is_download_intent,
     without_generated_file_stamp,
+)
+from skyvern.forge.sdk.workflow.response_value_caps import (
+    is_non_completed_envelope,
 )
 from skyvern.forge.sdk.workflow.secret_encryption import (
     SENSITIVE_DESTINATION_FIELDS,
@@ -4154,7 +4158,9 @@ class ForLoopBlock(Block):
                 # If the output parameter is for a TaskBlock, it will be a TaskOutput object. We need to extract the
                 # value from the TaskOutput object's extracted_information field.
                 output_parameter_value = workflow_run_context.get_value(self.loop_over.key)
-                if isinstance(output_parameter_value, dict) and "extracted_information" in output_parameter_value:
+                if is_non_completed_envelope(output_parameter_value):
+                    parameter_value = None
+                elif isinstance(output_parameter_value, dict) and "extracted_information" in output_parameter_value:
                     parameter_value = output_parameter_value["extracted_information"]
                 else:
                     parameter_value = output_parameter_value
@@ -4162,7 +4168,9 @@ class ForLoopBlock(Block):
                 parameter_value = self.loop_over.value
                 if not parameter_value:
                     source_parameter_value = workflow_run_context.get_value(self.loop_over.source.key)
-                    if isinstance(source_parameter_value, dict):
+                    if is_non_completed_envelope(source_parameter_value):
+                        parameter_value = None
+                    elif isinstance(source_parameter_value, dict):
                         if "extracted_information" in source_parameter_value:
                             parameter_value = source_parameter_value["extracted_information"].get(self.loop_over.key)
                         else:
@@ -11596,24 +11604,6 @@ TEXT_PROMPT_RETRIABLE_LLM_EXCEPTIONS: tuple[type[Exception], ...] = (
 TEXT_PROMPT_MAX_ATTEMPTS = 3
 
 
-def _json_type_name(value: Any) -> str:
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, dict):
-        return "object"
-    if isinstance(value, list):
-        return "array"
-    if isinstance(value, str):
-        return "string"
-    if isinstance(value, int):
-        return "integer"
-    if isinstance(value, float):
-        return "number"
-    return type(value).__name__
-
-
 def _schema_type_description(schema_type: Any) -> str:
     if isinstance(schema_type, list):
         return " or ".join(str(t) for t in schema_type)
@@ -11649,7 +11639,7 @@ def _schema_path(error: ValidationError) -> str:
 
 def _format_schema_validation_error(error: ValidationError) -> str:
     path = _schema_path(error)
-    actual_type = _json_type_name(error.instance)
+    actual_type = json_type_name(error.instance)
 
     if error.validator == "type":
         expected_type = _schema_type_description(error.validator_value)
@@ -15190,13 +15180,11 @@ class FileParserBlock(Block):
     @staticmethod
     def _validate_ocr_llm_response(llm_response: Any) -> str | None:
         if not isinstance(llm_response, dict):
-            return (
-                f"OCR response must be a JSON object with extracted_text string; got {_json_type_name(llm_response)}."
-            )
+            return f"OCR response must be a JSON object with extracted_text string; got {json_type_name(llm_response)}."
         if not isinstance(llm_response.get("extracted_text"), str):
             return (
                 "OCR response must include extracted_text as a string; "
-                f"got {_json_type_name(llm_response.get('extracted_text'))}."
+                f"got {json_type_name(llm_response.get('extracted_text'))}."
             )
         return None
 
@@ -16246,7 +16234,7 @@ class FileParserBlock(Block):
                     "FileParserBlock schema validation succeeded",
                     attempt=attempt + 1,
                     recovered_from_failure_class=last_failure_class,
-                    response_root_type=_json_type_name(llm_response),
+                    response_root_type=json_type_name(llm_response),
                     llm_key=telemetry.llm_key,
                     content_tokens=telemetry.content_tokens,
                     content_truncated=telemetry.truncated,
@@ -16265,7 +16253,7 @@ class FileParserBlock(Block):
                 max_attempts=self.schema_validation_max_attempts,
                 will_retry=will_retry,
                 failure_reason=schema_validation_failure,
-                response_root_type=_json_type_name(llm_response),
+                response_root_type=json_type_name(llm_response),
                 llm_key=telemetry.llm_key,
                 content_tokens=telemetry.content_tokens,
                 content_truncated=telemetry.truncated,
@@ -19722,6 +19710,9 @@ class BranchEvaluationContext:
             if key.startswith("prompt_branch_eval_") and key not in ctx.parameters and key not in block_aliases:
                 continue
 
+            if is_non_completed_envelope(value):
+                snapshot[key] = {field: value[field] for field in ("status", "failure_reason", "extracted_information")}
+                continue
             # For block outputs (dicts with extracted_information), only include extracted_information
             if isinstance(value, dict) and "extracted_information" in value:
                 extracted = value.get("extracted_information")
@@ -19734,7 +19725,6 @@ class BranchEvaluationContext:
                     field: item for field, item in value.items() if field not in CONDITIONAL_DEBUG_OUTPUT_FIELDS
                 }
             else:
-                # Include parameter values directly
                 snapshot[key] = value
 
         # `<label>` is registered as a copy of `<label>_output`. Keep one; a copy that differs (keys merged

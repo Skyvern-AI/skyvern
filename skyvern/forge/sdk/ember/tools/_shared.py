@@ -70,6 +70,7 @@ from skyvern.forge.sdk.ember.tracing_setup import ember_span
 from skyvern.forge.sdk.ember.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.ember.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.response_value_caps import without_non_completed_envelopes
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
@@ -274,6 +275,7 @@ def _registered_output_payload_view(value: Any, block_type: str | None) -> Any:
     reach-state task that produced no content as meaningful; non-envelope values (e.g. a
     code block emitting a user schema that happens to carry a ``task_id``) pass through
     unsliced. Registered block types arrive lowercased, so normalize before matching."""
+    value = without_non_completed_envelopes(value)
     if (block_type or "").upper() in _TASK_ENVELOPE_BLOCK_TYPES and isinstance(value, Mapping):
         payload = {field: value.get(field) for field in _TASK_OUTPUT_PAYLOAD_FIELDS}
         payload.update(_workflow_output_parameter_payloads(value))

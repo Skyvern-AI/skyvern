@@ -38,6 +38,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES, LLMCaller
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
+from skyvern.forge.sdk.api.llm.schema_validator import json_type_name
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import RunArm
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
@@ -147,6 +148,7 @@ MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
 # turn, the per-step sizing can bind before the step cap on long forms; the loop's progress-gated token grant
 # may then raise it, never past this ceiling. Turns/tool-calls scale unbounded (they cost loop iterations).
 MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
+MAX_LOGGED_LIST_LENGTHS = 20
 # The token guards charge the prefix re-sent on every call only up to this; 99.5% of v3 tasks' prefixes are below it.
 PREFIX_REF_TOKENS = 20_000
 # Never-extended spend cap on all tokens sent: 30 of 36 token deaths at a 60K+ prefix reach 67 turns under it (6M: 15).
@@ -182,6 +184,14 @@ Rules:
 OPAQUE_URL_GUIDANCE = """
 
 Some URLs in your instructions or the data provided are shown as `opaque_url_xxxxxxxx` instead of the real URL: these are references to URLs from the task, resolved to their real value backend-side. Pass one verbatim - unchanged, unshortened, never invented - as the `file` argument of `file_upload`, the `url` argument of `navigate`, the `value` argument of `select_combobox`, or as text to `type`."""
+
+
+def _extracted_list_lengths(payload: object) -> list[int] | None:
+    if isinstance(payload, list):
+        return [len(payload)]
+    if isinstance(payload, dict):
+        return [len(value) for value in payload.values() if isinstance(value, list)][:MAX_LOGGED_LIST_LENGTHS]
+    return None
 
 
 def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, int]:
@@ -985,6 +995,8 @@ async def run_task_v3_agent_loop(
     LOG.info(
         "taskv3 engine loop finished",
         status=outcome.status,
+        extracted_output_type=json_type_name(outcome.extracted_output),
+        extracted_list_lengths=_extracted_list_lengths(outcome.extracted_output),
         # The per-run home of the guard class that used to be a prefix on the customer-facing reason:
         # one row per run, so "how often did this policy end a run" is a facet, not a string match.
         guard=outcome.guard,

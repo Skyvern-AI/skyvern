@@ -140,6 +140,12 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLM_PROVIDER_ERROR_TYPE,
     LLMResponseMissingActionsError,
 )
+from skyvern.forge.sdk.api.llm.schema_validator import (
+    expected_extraction_root,
+    extraction_shape_matches,
+    json_type_name,
+    validate_and_fill_extraction_result,
+)
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata, uses_only_anthropic_models
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
@@ -3183,10 +3189,6 @@ class ForgeAgent:
         because it must not outspend or under-reach the v1 run it replaces.
         """
         from skyvern.forge.sdk.api.files import get_download_dir, resolve_run_download_id
-        from skyvern.forge.sdk.api.llm.schema_validator import (
-            extraction_shape_matches,
-            validate_and_fill_extraction_result,
-        )
         from skyvern.forge.taskv3.auth_tools import VerificationState, build_auth_tools
         from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
         from skyvern.forge.taskv3.engine import (
@@ -4669,15 +4671,7 @@ class ForgeAgent:
         # step even when the task fails. Canceled runs stay unbilled, matching the step engine.
         if step_status == StepStatus.failed and outcome.billable_actions:
             step_status = StepStatus.completed
-        # A cap-tripped run that still produced extracted_output (a granted final turn that finished,
-        # or a partial the model had staged before the honest budget_exhausted exit) carries it even
-        # when the terminal status isn't `completed` -- AC-2 is that the cap doesn't discard work the
-        # model already had in hand.
-        extracted_information = (
-            outcome.extracted_output
-            if (completed or (outcome.cap_trip is not None and outcome.extracted_output is not None))
-            else None
-        )
+        extracted_information = outcome.extracted_output
         if completed and task.extracted_information_schema is not None and extracted_information is not None:
             # Repair the model's output against the schema (fill missing required fields, drop
             # hallucinated array items), matching the step engine — but only when the output's shape
@@ -4685,9 +4679,15 @@ class ForgeAgent:
             # validate_and_fill replaces it with an all-default stub, which would silently launder a
             # non-conforming extraction into a fake empty success (the very thing the check above
             # refuses); leave a mismatched output raw instead.
-            if extraction_shape_matches(extracted_information, task.extracted_information_schema):
-                extracted_information = validate_and_fill_extraction_result(
-                    extracted_information, task.extracted_information_schema
+            schema = task.extracted_information_schema
+            if extraction_shape_matches(extracted_information, schema):
+                extracted_information = validate_and_fill_extraction_result(extracted_information, schema)
+            else:
+                LOG.info(
+                    "task_v3 extraction shape mismatch",
+                    task_id=task.task_id,
+                    schema_type=expected_extraction_root(schema),
+                    payload_type=json_type_name(extracted_information),
                 )
         if extracted_information is not None and run_secrets:
             # extracted_information is returned product data, not a diagnostic string, so it gets a

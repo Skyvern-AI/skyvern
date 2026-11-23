@@ -69,6 +69,7 @@ from skyvern.forge.sdk.workflow.reached_download_target import (
     generated_file_artifact_ids,
     registered_download_proof_view,
 )
+from skyvern.forge.sdk.workflow.response_value_caps import without_non_completed_envelopes
 
 from ._shared import (
     _TASK_ENVELOPE_BLOCK_TYPES,
@@ -1059,7 +1060,7 @@ def _floor_rekeyed_emission_evidence(
                 block_output_sources[output_key] = "registered_output_parameter"
                 block_types[output_key] = block_type
     for output_key, output_value in _workflow_output_parameter_payloads(run_data.get("output")).items():
-        output_value = registered_download_proof_view(output_value, generated)
+        output_value = registered_download_proof_view(without_non_completed_envelopes(output_value), generated)
         if not _is_meaningful_extracted_data(_registered_output_payload_view(output_value, None)):
             continue
         block_outputs.setdefault(output_key, output_value)
@@ -1136,7 +1137,7 @@ def _build_run_evidence_snapshot(ember_ctx: Any, result: dict[str, Any]) -> RunE
             if not isinstance(block, dict):
                 continue
             label = block.get("label")
-            output = block.get("extracted_data")
+            output = without_non_completed_envelopes(block.get("extracted_data"))
             evidence_output = _completion_evidence_payload(output, generated)
             if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(evidence_output):
                 block_outputs[label] = evidence_output
@@ -1150,14 +1151,15 @@ def _build_run_evidence_snapshot(ember_ctx: Any, result: dict[str, Any]) -> RunE
                 block_outputs[output_key] = output_value
                 block_output_sources[output_key] = "registered_output_parameter"
     for output_key, output_value in _workflow_output_parameter_payloads(data.get("output")).items():
-        output_value = registered_download_proof_view(output_value, generated)
+        output_value = registered_download_proof_view(without_non_completed_envelopes(output_value), generated)
         if not _is_meaningful_extracted_data(_registered_output_payload_view(output_value, None)):
             continue
         block_outputs[output_key] = output_value
         block_output_sources[output_key] = "registered_output_parameter"
     for registered in _registered_output_parameter_payloads(data):
         registered_output_key = registered.get("output_parameter_key")
-        registered_output_value = _completion_evidence_payload(registered.get("value"), generated)
+        registered_value = without_non_completed_envelopes(registered.get("value"))
+        registered_output_value = _completion_evidence_payload(registered_value, generated)
         registered_block_label = registered.get("block_label")
         if isinstance(registered_output_key, str) and registered_output_key:
             registered_output_values[registered_output_key] = registered_output_value
@@ -1171,7 +1173,7 @@ def _build_run_evidence_snapshot(ember_ctx: Any, result: dict[str, Any]) -> RunE
             else:
                 registered_output_values[registered_block_label] = registered_output_value
         if not _is_meaningful_extracted_data(
-            _registered_output_payload_view(registered.get("value"), registered.get("block_type"))
+            _registered_output_payload_view(registered_value, registered.get("block_type"))
         ):
             continue
         if isinstance(registered_output_key, str) and registered_output_key:

@@ -47,7 +47,6 @@ from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import (
     BitwardenConstants,
     BitwardenItemSecret,
@@ -103,6 +102,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.page_derived_templates import RootClass, classify_roots
+from skyvern.forge.sdk.workflow.response_value_caps import is_non_completed_envelope
 from skyvern.schemas.emails import EmailTransport
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.phone_validation import looks_like_phone_identifier, normalize_identifier
@@ -1620,8 +1620,7 @@ class WorkflowRunContext:
                 last_status = str(block_status)
 
             extracted_info = block_output.get("extracted_information")
-            if extracted_info is not None and isinstance(extracted_info, dict):
-                # Merge extracted_information from all blocks together
+            if isinstance(extracted_info, dict) and not is_non_completed_envelope(block_output):
                 merged_extracted_information.update(extracted_info)
 
             downloaded_files = block_output.get("downloaded_files")
@@ -2952,13 +2951,7 @@ class WorkflowRunContext:
                     self.parameters[parameter.key] = parameter
                     self.values[parameter.key] = parameter.value
                     continue
-                # If task isn't completed, we should skip setting the value
-                if (
-                    isinstance(value, dict)
-                    and "extracted_information" in value
-                    and "status" in value
-                    and value["status"] != TaskStatus.completed
-                ):
+                if is_non_completed_envelope(value):
                     continue
                 if isinstance(value, dict) and "errors" in value and value["errors"]:
                     # Is this the correct way to handle errors from task blocks?

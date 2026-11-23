@@ -103,6 +103,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     workflow_definition_sha256,
 )
 from skyvern.forge.sdk.workflow.response_value_caps import (
+    is_non_completed_envelope,
     truncate_oversized_response_text,
     truncate_oversized_response_value,
 )
@@ -3007,9 +3008,16 @@ def _get_extracted_data_from_block_result(
                             workflow_run_block_id=block_result.workflow_run_block_id,
                         )
                         continue
-                    else:
-                        if "extracted_information" in output_value and output_value["extracted_information"]:
-                            inner_loop_output_overall.append(output_value["extracted_information"])
+                    payload = output_value.get("extracted_information")
+                    if not payload:
+                        continue
+                    if is_non_completed_envelope(output_value):
+                        payload = {
+                            "status": output_value["status"],
+                            "failure_reason": output_value["failure_reason"],
+                            "extracted_information": payload,
+                        }
+                    inner_loop_output_overall.append(payload)
                 loop_output_overall.append(inner_loop_output_overall)
             return loop_output_overall if loop_output_overall else None
     elif task_type == "compute":
