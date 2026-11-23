@@ -40,6 +40,8 @@ Everything in Skyvern (agents, runs, credentials, API keys, credits) belongs to 
 
 Your API key authenticates every API, SDK, CLI and MCP request for your organization. Every Admin and Member can open this page, unless your organization enables [role-based access control](#roles) and withholds **API keys: View** from their role.
 
+Skyvern creates the key when your [trial](#your-14-day-trial) starts or when you start a plan. Until your organization adds a card it holds no key, and the app opens **Start your 14-day trial** in place of any other page, **Settings → API keys** and **Settings → Billing** included. Add your card there to start the trial. Rotating, creating or reissuing a key, signing in with the CLI, and signing in from an MCP client are refused with `402` and `Add a card to start your 14-day Skyvern trial at https://app.skyvern.com`. An organization whose trial has ended or whose trial credits are used up is refused the same way, and its message points at Billing to [choose a plan](#plans).
+
 <Steps>
   <Step title="Open API keys">
     Go to **Settings → API keys**. The sidebar shortcut **Integrations → API keys** opens the same page.
