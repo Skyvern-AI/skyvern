@@ -1230,6 +1230,15 @@ async def _drag_pre_hook(
     return None
 
 
+async def _hover_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    await _capture_scout_source_url(ctx)
+    await _capture_scout_pre_action(ctx, params.get("selector"))
+    return None
+
+
 async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, result: dict[str, Any]) -> None:
     """Surface the saved credential the observed page vouches for, if the server can bind one.
 
@@ -2287,6 +2296,51 @@ async def _drag_post_hook(
     return result
 
 
+async def _hover_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    _clear_pending_browser_interaction_observation(ctx)
+    ctx.last_scout_act_observe_outcome = None
+    ctx.last_scout_act_observe_packet = None
+    source_url = _consume_scout_source_url(ctx)
+    pending_role_name = ctx.pending_scout_role_name
+    pending_selector_candidates = ctx.pending_scout_selector_candidates
+    _clear_pending_scout_selector_facts(ctx)
+    if not (result.get("ok") and result.get("data")):
+        return result
+    selector = str(result["data"].get("selector") or "")
+    url, _ = await _resolve_url_title(raw, ctx)
+    _mark_pending_browser_interaction_observation(ctx, tool_name="hover", url=url)
+    result["data"] = {"selector": selector, "url": url}
+    role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
+    if not (role and accessible_name):
+        role, accessible_name = await _resolve_scout_role_name(
+            ctx, selector, allow_browser_read=current_demonstrated_action() is None
+        )
+    _record_scouted_interaction(
+        ctx,
+        tool_name="hover",
+        selector=selector,
+        selector_candidates=pending_selector_candidates,
+        source_url=source_url,
+        result_url=url,
+        role=role,
+        accessible_name=accessible_name,
+    )
+    observation_step, page_evidence = await _register_scout_interaction_observation(
+        ctx, tool_name="hover", selector=selector, source_url=source_url, url=url
+    )
+    _attach_scout_observation_step(ctx, tool_name="hover", selector=selector, observation_step=observation_step)
+    if observation_step is not None:
+        result["observation_step"] = observation_step
+        result["data"]["observation_step"] = observation_step
+    if page_evidence is not None:
+        _attach_scout_page_summary(ctx, result, page_evidence)
+    return result
+
+
 async def _press_key_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -2387,6 +2441,7 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "select_option": "skyvern_select_option",
         "press_key": "skyvern_press_key",
         "drag": "skyvern_drag",
+        "hover": "skyvern_hover",
         "wait_for_either_state": "skyvern_wait_for_either_state",
         # These frame and tab controls already use their user-facing MCP names.
         "skyvern_frame_list": "skyvern_frame_list",
@@ -2951,6 +3006,19 @@ def _build_skyvern_mcp_overlays(
             requires_browser=True,
             pre_hook=_drag_pre_hook,
             post_hook=_drag_post_hook,
+        ),
+        "hover": SchemaOverlay(
+            description=(
+                "Move the pointer over an element and leave it there, such as a menu that opens on hover or a "
+                "control that only appears while the pointer is over its row. `selector` is a CSS selector."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url", "intent"}),
+            param_patches={"timeout": _ACTION_TIMEOUT_PATCH},
+            required_overrides=["selector"],
+            ember_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_hover_pre_hook,
+            post_hook=_hover_post_hook,
         ),
         "wait_for_either_state": SchemaOverlay(
             description=(

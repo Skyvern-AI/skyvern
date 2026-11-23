@@ -520,6 +520,36 @@
   let installedDocument = document;
   let wakeQueued = false;
 
+  // A hover is kept only when it revealed the element the next action lands on; a target a sample saw hidden that no
+  // hover explains gets an in-order gap. ponytail: no gap for a target no sample saw hidden (absent, untracked, clipped
+  // by an ancestor, re-hovered within 200 ms of a click, or on a page of 3,001 to 20,000 controls between settles).
+  const HOVER_TRACKED = `${ACTIONABLE},[tabindex],[aria-haspopup],[aria-expanded]`;
+  const HOVER_SAMPLE_MS = 200;
+  // The page's own reaction to a click or key is not a hover reveal, so sampling waits for it to settle.
+  const HOVER_SETTLE_MS = 300;
+  const HOVER_FOCUS_MS = 500;
+  const HOVER_SAMPLE_LIMIT = 3000;
+  // One baseline per click or key, so a larger page is still checked once.
+  const HOVER_BASELINE_LIMIT = 20000;
+  const HOVER_SAMPLE_KEEP = 8;
+  const HOVER_TRAIL_LIMIT = 40;
+  const HOVER_TRAIL_MS = 10000;
+  const HOVER_REFERENCE_ATTRIBUTES = [
+    "aria-controls",
+    "aria-owns",
+    "aria-describedby",
+  ];
+  let hoverSamples = [];
+  let hoverTrail = [];
+  let lastHoverSampleAt = 0;
+  let lastActivationAt = Date.now();
+  let hoverSettleTimer = null;
+  const sampledShadowRoots = new Set();
+  let pageTooLarge = false;
+  let lastTabAt = 0;
+  let revealCheckSkipPending = false;
+  let pageClipsRight = false;
+
   const eventElement = (event) => {
     const first = event.composedPath && event.composedPath()[0];
     return first && first.nodeType === 1 ? first : event.target;
@@ -665,6 +695,237 @@
     element && element.matches && element.matches("label")
       ? textField(element.control)
       : null;
+  const rendered = (element) => {
+    if (
+      element.checkVisibility
+        ? !element.checkVisibility({
+            checkOpacity: true,
+            checkVisibilityCSS: true,
+          })
+        : isHidden(element)
+    )
+      return false;
+    // A menu parked off-page (left:-9999px, or past the right edge of a page that cannot scroll sideways) or
+    // collapsed to nothing counts as hidden too.
+    const box = element.getBoundingClientRect();
+    return (
+      box.width > 0 &&
+      box.height > 0 &&
+      box.right + globalThis.scrollX > 0 &&
+      box.bottom + globalThis.scrollY > 0 &&
+      !(pageClipsRight && box.left >= document.documentElement.clientWidth)
+    );
+  };
+  const sampleHoverTargets = (
+    limit = HOVER_SAMPLE_LIMIT,
+    { pinned = false, preActivation = false } = {},
+  ) => {
+    lastHoverSampleAt = Date.now();
+    pageClipsRight = [document.documentElement, document.body].some(
+      (element) =>
+        element &&
+        ["hidden", "clip"].includes(getComputedStyle(element).overflowX),
+    );
+    for (const root of sampledShadowRoots) {
+      if (!root.host.isConnected) sampledShadowRoots.delete(root);
+    }
+    const elements = [document, ...sampledShadowRoots].flatMap((root) =>
+      Array.from(root.querySelectorAll(HOVER_TRACKED)),
+    );
+    // A page too large for even the baseline is reported once each time it becomes so, at the user's next action
+    // (not from here: an event from an idle tab would read as the user switching to it).
+    const tooLarge = elements.length > HOVER_BASELINE_LIMIT;
+    if (tooLarge && !pageTooLarge) revealCheckSkipPending = true;
+    pageTooLarge = tooLarge;
+    if (elements.length > limit) return;
+    const seen = new WeakSet();
+    const hidden = new WeakSet();
+    const expanded = new WeakSet();
+    for (const element of elements) {
+      seen.add(element);
+      if (!rendered(element)) hidden.add(element);
+      if (element.getAttribute("aria-expanded") === "true")
+        expanded.add(element);
+    }
+    // The pre-click sample and the settled baseline are what a deep or early hover is judged against, so they stay.
+    const sample = {
+      at: lastHoverSampleAt,
+      seen,
+      hidden,
+      expanded,
+      pinned,
+      preActivation,
+    };
+    hoverSamples = [
+      ...hoverSamples.filter((kept) => kept.pinned),
+      ...hoverSamples
+        .filter((kept) => !kept.pinned)
+        .slice(1 - HOVER_SAMPLE_KEEP),
+      sample,
+    ].sort((left, right) => left.at - right.at);
+  };
+  // A click's own reaction is not a hover reveal, so the settled baseline waits for it; the newest sample held
+  // before the click lets a hover made inside that wait still be credited, but never raises a gap (the click may
+  // have shown the target). Scanning here instead would delay every click and key on a large page.
+  const resetHover = ({ preActivation = false } = {}) => {
+    hoverSamples =
+      preActivation && hoverSamples.length
+        ? [{ ...hoverSamples.at(-1), pinned: true, preActivation: true }]
+        : [];
+    hoverTrail = [];
+    lastActivationAt = Date.now();
+    clearTimeout(hoverSettleTimer);
+    hoverSettleTimer = setTimeout(
+      () => sampleHoverTargets(HOVER_BASELINE_LIMIT, { pinned: true }),
+      HOVER_SETTLE_MS,
+    );
+  };
+  // A trigger opens the target when it names the target's container, or when it turned aria-expanded after the
+  // sample (an accordion already open before the hover says nothing about this target).
+  const opensByAria = (trigger, target, sample) => {
+    for (
+      let element = trigger, depth = 0;
+      element && depth < 2;
+      element = element.parentElement, depth += 1
+    ) {
+      if (element === document.body) break;
+      if (
+        element.getAttribute("aria-expanded") === "true" &&
+        sample.seen.has(element) &&
+        !sample.expanded.has(element)
+      )
+        return true;
+      for (const attribute of HOVER_REFERENCE_ATTRIBUTES) {
+        for (const id of String(element.getAttribute(attribute) || "").split(
+          /\s+/,
+        )) {
+          const referenced = id && document.getElementById(id);
+          if (referenced && referenced.contains(target)) return true;
+        }
+      }
+    }
+    return false;
+  };
+  // A CSS reveal (li:hover > ul) leaves no aria trace, so the trigger must be the only control that was visible in
+  // the smallest region holding both it and the target.
+  const soleVisibleTrigger = (trigger, target, sample) => {
+    let region = trigger.parentElement;
+    while (region && !region.contains(target)) region = region.parentElement;
+    if (
+      !region ||
+      region === document.body ||
+      region === document.documentElement
+    )
+      return false;
+    for (const element of region.querySelectorAll(HOVER_TRACKED)) {
+      if (element.contains(trigger) || trigger.contains(element)) continue;
+      if (sample.seen.has(element) && !sample.hidden.has(element)) return false;
+    }
+    return true;
+  };
+  const revealingHover = (target) => {
+    if (
+      !target ||
+      !target.matches ||
+      !target.matches(HOVER_TRACKED) ||
+      target.getRootNode() !== document
+    )
+      return null;
+    const samples = [...hoverSamples].reverse();
+    const beforeIndex = samples.findIndex(
+      (sample) => !sample.seen.has(target) || sample.hidden.has(target),
+    );
+    if (beforeIndex < 0) return null;
+    const before = samples[beforeIndex];
+    // The first sample that already showed the target bounds when it appeared; a trigger entered later did not show it.
+    const shownAt = beforeIndex > 0 ? samples[beforeIndex - 1].at : Infinity;
+    const absent = !before.seen.has(target);
+    const now = Date.now();
+    for (let index = hoverTrail.length - 1; index >= 0; index -= 1) {
+      const { element, at } = hoverTrail[index];
+      if (now - at > HOVER_TRAIL_MS) break;
+      const trigger =
+        element.isConnected && element.closest
+          ? element.closest(HOVER_TRACKED)
+          : null;
+      if (
+        !trigger ||
+        at > shownAt ||
+        trigger.contains(target) ||
+        target.contains(trigger) ||
+        !before.seen.has(trigger) ||
+        before.hidden.has(trigger)
+      ) {
+        continue;
+      }
+      if (
+        opensByAria(trigger, target, before) ||
+        (!absent && soleVisibleTrigger(trigger, target, before))
+      )
+        return { trigger, before, index };
+    }
+    return null;
+  };
+  // Another item of the target's own list (li beside li) is a control the pointer crossed, not the level that opened it.
+  const siblingItem = (level, target) => {
+    let region = level.parentElement;
+    while (region && !region.contains(target)) region = region.parentElement;
+    if (!region) return true;
+    const branch = (element) => {
+      while (element.parentElement !== region) element = element.parentElement;
+      return element;
+    };
+    return branch(level).tagName === branch(target).tagName;
+  };
+  const hiddenInSample = (target) =>
+    Boolean(target) &&
+    hoverSamples.some(
+      (sample) =>
+        !sample.preActivation &&
+        sample.seen.has(target) &&
+        sample.hidden.has(target),
+    );
+  // A nested menu needs every hover on the way down. A level the samples caught is found by asking what revealed
+  // its trigger in turn; a level entered between samples is a hidden control the pointer crossed after the trigger
+  // that opens the target the same way.
+  const revealingHovers = (target) => {
+    const chain = [];
+    let current = target;
+    for (let depth = 0; depth < 8; depth += 1) {
+      const found = revealingHover(current);
+      if (!found) break;
+      const levels = [found.trigger];
+      const after = hoverTrail.slice(found.index + 1);
+      const reached = after.findIndex(
+        ({ element }) => element.isConnected && current.contains(element),
+      );
+      for (const { element } of reached < 0 ? after : after.slice(0, reached)) {
+        const level =
+          element.isConnected && element.closest
+            ? element.closest(HOVER_TRACKED)
+            : null;
+        if (
+          !level ||
+          levels.includes(level) ||
+          level.contains(current) ||
+          current.contains(level) ||
+          (found.before.seen.has(level) && !found.before.hidden.has(level)) ||
+          !rendered(level)
+        ) {
+          continue;
+        }
+        if (
+          opensByAria(level, current, found.before) ||
+          (!siblingItem(level, current) &&
+            soleVisibleTrigger(level, current, found.before))
+        )
+          levels.push(level);
+      }
+      chain.unshift(...levels.filter((level) => !chain.includes(level)));
+      current = found.trigger;
+    }
+    return chain;
+  };
   const packetFor = (element, selector) => {
     const packet = scoutPreActionPacket(element, selector, "", "", 5000);
     if (textField(element)) {
@@ -917,6 +1178,8 @@
   });
   // Shadow trees are invisible to a document observer, so each open root gets its own.
   const watchRoot = (root) => {
+    // A host detached and re-attached is pruned from sampling meanwhile, so it rejoins before the early return.
+    if (root !== document) sampledShadowRoots.add(root);
     if (watchedRoots.has(root)) return;
     watchedRoots.add(root);
     for (const field of root.querySelectorAll('input[type="password"]')) {
@@ -939,6 +1202,7 @@
     }
   };
   watchRoot(document);
+  resetHover();
   // A shadow root attached after its host was inserted raises no mutation, and a light-DOM button can toggle a
   // password inside it, so every click or Enter/Space looks for new open roots before the page handles it.
   const watchEventRoots = (event) => {
@@ -948,10 +1212,55 @@
     }
     watchShadowRoots(document);
   };
+  add(globalThis, "pointerover", (event) => {
+    if (!event.isTrusted || event.pointerType === "touch") return;
+    const now = Date.now();
+    if (now - lastHoverSampleAt >= HOVER_SAMPLE_MS) {
+      // Inside the settle window the page may still be reacting to the click, so such a sample credits a hover
+      // but never raises a gap on its own.
+      sampleHoverTargets(HOVER_SAMPLE_LIMIT, {
+        preActivation: now - lastActivationAt < HOVER_SETTLE_MS,
+      });
+    }
+    const entered = eventElement(event);
+    if (entered)
+      hoverTrail = [
+        ...hoverTrail.slice(1 - HOVER_TRAIL_LIMIT),
+        { element: entered, at: now },
+      ];
+  });
+  // What revealed the target goes first: its hovers, or a gap when a sample saw it hidden and no hover explains it.
+  const revealFor = (target, unprompted = false) => {
+    let hoverChain = [];
+    let revealUnexplained = false;
+    try {
+      hoverChain = revealingHovers(target);
+      revealUnexplained = !hoverChain.length && hiddenInSample(target);
+    } catch (_error) {
+      // A hover the tap cannot explain must not cost the action it precedes.
+    }
+    // The recorder drops an unprompted event from a tab the user is not in, so the page-size notice waits for a
+    // real action there.
+    const extra = unprompted ? { unprompted: true } : {};
+    return () => {
+      if (revealCheckSkipPending && !unprompted) {
+        revealCheckSkipPending = false;
+        emit("reveal_check_skipped", {});
+      }
+      const hoverStarts = hoverChain.map(snapshot).filter(Boolean);
+      for (const hoverStart of hoverStarts) emit("hover", hoverStart, extra);
+      if (hoverStarts.length) return true;
+      if (!revealUnexplained && !hoverChain.length) return false;
+      emit("reveal_gap", {}, extra);
+      return true;
+    };
+  };
   add(globalThis, "pointerdown", (event) => {
     if (!event.isTrusted) return;
     watchEventRoots(event);
     const raw = eventElement(event);
+    const emitReveal = revealFor(event.button === 0 ? clickElement(raw) : null);
+    resetHover({ preActivation: true });
     const field = textField(raw);
     if (typing && !typing.element.contains(raw)) commitTyping();
     cancelClick();
@@ -963,12 +1272,20 @@
     const select = nativeSelect(raw);
     if (select) {
       selectStart = snapshot(select);
+      emitReveal();
       return;
     }
-    if (field || unsupportedValueField(raw)) return;
+    if (field || unsupportedValueField(raw)) {
+      emitReveal();
+      return;
+    }
     const target = clickElement(raw);
-    if (labelTextField(target)) return;
+    if (labelTextField(target)) {
+      emitReveal();
+      return;
+    }
     clickStart = snapshot(target);
+    const revealed = clickStart ? emitReveal() : false;
     press = {
       element: target,
       start: clickStart,
@@ -994,7 +1311,8 @@
         packet: clickStart.packet,
         target_url: navigationTarget(target),
       };
-      finishWaiter(empty());
+      // A hover before a navigating click leaves with this read, since the page may unload before the next one.
+      finishWaiter(revealed ? drained() : empty());
     }
   });
   add(globalThis, "pointermove", (event) => {
@@ -1099,6 +1417,17 @@
     watchEventRoots(event);
     const target = eventElement(event);
     const field = textField(target);
+    // A revealed control reached without a press (Tab, or a page that focuses it on hover) still needs its hover.
+    // A focus with no Tab or pointer move just before it may be the page's own in a tab the user is not in, so it
+    // is marked for the recorder, which knows the active tab.
+    const lastMove = hoverTrail.length ? hoverTrail.at(-1).at : 0;
+    const unprompted =
+      Date.now() - Math.max(lastTabAt, lastMove) >= HOVER_FOCUS_MS;
+    if (
+      (!typing || typing.element !== field) &&
+      revealFor(clickElement(target), unprompted)()
+    )
+      resetHover({ preActivation: true });
     if (field) {
       startTyping(field);
       return;
@@ -1189,6 +1518,10 @@
   add(globalThis, "keydown", (event) => {
     if (!event.isTrusted || event.repeat) return;
     labelControl = null;
+    // A modifier held for the click (Shift+click) or a Tab to the next control leaves the hover before it standing.
+    if (event.key === "Tab") lastTabAt = Date.now();
+    else if (!["Shift", "Control", "Alt", "Meta"].includes(event.key))
+      resetHover({ preActivation: true });
     if (event.key === "Enter" || event.key === " ") watchEventRoots(event);
     const raw = eventElement(event);
     const target = clickElement(raw);
@@ -1356,6 +1689,7 @@
       if (stopped) return [];
       flush();
       stopped = true;
+      clearTimeout(hoverSettleTimer);
       clearSecretValues();
       passwordTypeObserver.disconnect();
       for (const [target, type, listener] of listeners) {

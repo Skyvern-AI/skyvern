@@ -540,6 +540,10 @@ def _translate_action(
         alias = "drag"
         real_args = model_args = {"source_selector": selector, "target_selector": event["target_selector"]}
         data = dict(real_args)
+    elif kind == "hover" and selector:
+        alias = "hover"
+        real_args = model_args = {"selector": selector}
+        data = {"selector": selector}
     elif kind == "type" and selector:
         value = event.get("value")
         if not isinstance(value, str):
@@ -617,6 +621,20 @@ def _safe_model_visible_url(url: str) -> str:
 def _gap_fact(event: dict[str, Any], reason: str) -> dict[str, str]:
     seq = event.get("seq")
     step = f"Demonstration step {seq}" if isinstance(seq, int) else "A demonstration step"
+    if reason == "reveal_unattributed":
+        return {
+            "role": "user",
+            "content": NUDGE_SENTINEL
+            + f"{step}: the element the next step acts on was seen hidden in an earlier sample of the page and is "
+            "visible at that step; the recorder did not attribute the change to a recorded hover.",
+        }
+    if reason == "reveal_check_skipped":
+        return {
+            "role": "user",
+            "content": NUDGE_SENTINEL
+            + f"{step}: the reveal check was skipped because this page was too large to sample, so a hidden element "
+            "that a hover or other gesture revealed on this page was not checked.",
+        }
     return {
         "role": "user",
         "content": NUDGE_SENTINEL + f"{step} was not recorded because {reason.replace('_', ' ')}.",
