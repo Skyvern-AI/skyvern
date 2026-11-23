@@ -487,7 +487,7 @@ async def test_replay_values_fail_closed_when_secret_screen_is_unavailable(
 
 
 @pytest.mark.asyncio
-async def test_demonstrated_drag_replays_through_the_drag_tool_into_a_drag_to_block(
+async def test_demonstrated_drag_and_hover_replay_through_their_tools_into_code_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cache = _SharedCache()
@@ -505,6 +505,22 @@ async def test_demonstrated_drag_replays_through_the_drag_tool_into_a_drag_to_bl
             "target_packet": {"role_name": {"role": "list", "accessible_name": "Done"}},
         },
         {"kind": "gap", "reason": "freeform_drag", "source_url": "https://example.test/board", "frame": frame},
+        {"kind": "gap", "reason": "reveal_check_skipped", "source_url": "https://example.test/board", "frame": frame},
+        {"kind": "gap", "reason": "reveal_unattributed", "source_url": "https://example.test/board", "frame": frame},
+        {
+            "kind": "hover",
+            "selector": "#products",
+            "source_url": "https://example.test/board",
+            "frame": frame,
+            "packet": {"role_name": {"role": "link", "accessible_name": "Products"}},
+        },
+        {
+            "kind": "click",
+            "selector": "#laptops",
+            "source_url": "https://example.test/board",
+            "frame": frame,
+            "packet": {"role_name": {"role": "link", "accessible_name": "Laptops"}},
+        },
     ]
     cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
         DemonstrationRecord(
@@ -525,9 +541,9 @@ async def test_demonstrated_drag_replays_through_the_drag_tool_into_a_drag_to_bl
     overlays = _build_skyvern_mcp_overlays()
     server = SkyvernOverlayMCPServer(
         transport=MagicMock(),
-        overlays={"drag": overlays["drag"]},
-        alias_map={"drag": aliases["drag"]},
-        allowlist=frozenset({aliases["drag"]}),
+        overlays={name: overlays[name] for name in ("drag", "hover", "click")},
+        alias_map={name: aliases[name] for name in ("drag", "hover", "click")},
+        allowlist=frozenset(aliases[name] for name in ("drag", "hover", "click")),
         context_provider=lambda: ctx,
     )
     server._client = _NoDispatchClient()
@@ -537,13 +553,40 @@ async def test_demonstrated_drag_replays_through_the_drag_tool_into_a_drag_to_bl
 
     calls = [item for item in history if item.get("type") == "function_call"]
     assert [(item["name"], json.loads(item["arguments"])) for item in calls] == [
-        ("drag", {"source_selector": "#card", "target_selector": "#done"})
+        ("drag", {"source_selector": "#card", "target_selector": "#done"}),
+        ("hover", {"selector": "#products"}),
+        ("click", {"selector": "#laptops"}),
     ]
-    assert any("freeform drag" in str(item.get("content")) for item in history if item.get("role") == "user")
+    shape = [item.get("name") or item.get("role") or item.get("type") for item in history]
+    assert shape[:8] == [
+        "drag",
+        "function_call_output",
+        "user",
+        "user",
+        "user",
+        "hover",
+        "function_call_output",
+        "click",
+    ]
+    for step, nudge in zip((2, 3, 4), history[2:5]):
+        assert f"Demonstration step {step}" in str(nudge["content"])
+    assert len({str(nudge["content"]).split(":", 2)[-1] for nudge in history[2:5]}) == 3
+    assert all("was not recorded" not in str(nudge["content"]) for nudge in history[3:5])
     assert recorder_module._event_label(events[0]) == 'Drag "Invoice 42" to "Done"'
+    assert recorder_module._event_label(events[4]) == 'Hover "Products"'
     synthesized = synthesize_code_block(ctx.scout_trajectory)
     assert synthesized is not None
     assert '.drag_to(page.locator("#done"))' in synthesized.code
+    hover_at = synthesized.code.index('page.locator("#products").hover()')
+    assert hover_at < synthesized.code.index('page.locator("#laptops").click(')
+    revealed_field = synthesize_code_block(
+        [
+            {"tool_name": "hover", "selector": "#toggle", "source_url": "https://example.test/shop"},
+            {"tool_name": "type_text", "selector": "#q", "typed_length": 5, "source_url": "https://example.test/shop"},
+        ]
+    )
+    assert revealed_field is not None
+    assert '_scout_entry_target = page.locator("#toggle")' in revealed_field.code
 
 
 @pytest.mark.asyncio
@@ -2220,20 +2263,34 @@ async def test_recorder_persists_each_capture_gap_kind() -> None:
             {"kind": "drag", "ts": 4, "selector": "#card", "target_selector": "#done"},
         ),
         TapEvent(page, "tap", "main", True, "", {"kind": "click_navigation_unconfirmed", "ts": 5, "url": page.url}),
+        TapEvent(page, "tap", "main", True, "", {"kind": "reveal_gap", "ts": 6, "url": page.url}),
+        TapEvent(page, "tap", "main", True, "", {"kind": "reveal_check_skipped", "ts": 7, "url": page.url}),
     ]
 
     for event in events:
         await recorder._record_tap_event(event)
 
-    stored = [json.loads(cache.store[demonstration_event_key("org-1", "demo-1", seq)]) for seq in range(1, 6)]
+    stored = [json.loads(cache.store[demonstration_event_key("org-1", "demo-1", seq)]) for seq in range(1, 8)]
     assert [event["reason"] for event in stored] == [
         "nested_frame",
         "frame_navigation",
         "unsupported_event:unsupported_input",
         "freeform_drag",
         "click_navigation_unconfirmed",
+        "reveal_unattributed",
+        "reveal_check_skipped",
     ]
-    assert stored[-1]["label"] == "Click not recorded"
+    assert [event["label"] for event in stored[-3:]] == [
+        "Click not recorded",
+        "Reveal not attributed",
+        "Reveal check skipped",
+    ]
+    idle = SimpleNamespace(url="https://example.test/idle", is_closed=lambda: False)
+    await recorder._record_tap_event(
+        TapEvent(idle, "tap", "main", True, "", {"kind": "reveal_gap", "ts": 8, "url": idle.url, "unprompted": True})
+    )
+    assert recorder.event_page is page
+    assert demonstration_event_key("org-1", "demo-1", 8) not in cache.store
 
 
 @pytest.mark.asyncio
