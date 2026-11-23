@@ -677,7 +677,9 @@ class WorkflowsRepository(BaseRepository):
             workflows = (await session.scalars(get_workflows_query)).all()
             template_permanent_ids: set[str] = set()
             if workflows and organization_id:
-                template_permanent_ids = await self.get_org_template_permanent_ids(organization_id)
+                template_permanent_ids = await self.get_org_template_permanent_ids(
+                    organization_id, workflow_permanent_ids={workflow_permanent_id}
+                )
 
             return [
                 convert_to_workflow(

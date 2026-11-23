@@ -16442,7 +16442,9 @@ class WorkflowService:
         output_parameters_by_id = {
             output_parameter.output_parameter_id: output_parameter for output_parameter in output_parameters
         }
-        if workflow is not None:
+        if workflow is not None and any(
+            row.output_parameter_id not in output_parameters_by_id for row in workflow_run_output_parameters
+        ):
             for parameter in workflow.workflow_definition.parameters:
                 if isinstance(parameter, OutputParameter):
                     output_parameters_by_id.setdefault(parameter.output_parameter_id, parameter)
