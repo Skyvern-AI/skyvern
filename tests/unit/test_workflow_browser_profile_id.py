@@ -482,6 +482,7 @@ def _make_setup_service(workflow: SimpleNamespace) -> tuple[WorkflowService, Sim
         browser_profile_id=None,
         browser_seed_source=None,
         proxy_location=None,
+        otp_request_id=None,
     )
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]

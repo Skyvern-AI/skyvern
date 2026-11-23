@@ -13,7 +13,12 @@ import pytest_asyncio
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from skyvern.exceptions import BrowserSessionExpired, BrowserSessionStartupTimeout, MissingBrowserAddressError
+from skyvern.exceptions import (
+    BrowserSessionExpired,
+    BrowserSessionStartupTimeout,
+    MissingBrowserAddressError,
+    SkyvernException,
+)
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
@@ -405,7 +410,12 @@ def test_legacy_storage_key_matches_managed_digest_for_keyed_workflow() -> None:
 async def test_auto_create_browser_session_for_human_interaction_loads_managed_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    create_session = AsyncMock(return_value=SimpleNamespace(persistent_browser_session_id="pbs_test"))
+    create_session_calls: list[dict[str, Any]] = []
+
+    async def create_session(**kwargs: Any) -> SimpleNamespace:
+        create_session_calls.append(kwargs)
+        return SimpleNamespace(persistent_browser_session_id="pbs_test")
+
     monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "create_session", create_session)
     human_interaction = SimpleNamespace(block_type=BlockType.HUMAN_INTERACTION, timeout_seconds=60)
     workflow = SimpleNamespace(
@@ -419,18 +429,30 @@ async def test_auto_create_browser_session_for_human_interaction_loads_managed_p
     )
 
     assert browser_session.persistent_browser_session_id == "pbs_test"
-    create_session.assert_awaited_once_with(
-        organization_id="o_test",
-        timeout_minutes=61,
-        browser_profile_id="bp_managed",
-        profile_read_only=False,
-        proxy_location=None,
-        inherit_profile_proxy=True,
-        session_kind=BrowserSessionKind.workflow_run,
-        browser_settings=None,
-        created_for_workflow_run_id=None,
-        workflow_permanent_id="wpid_test",
-    )
+    assert create_session_calls == [
+        {
+            "organization_id": "o_test",
+            "timeout_minutes": 61,
+            "browser_profile_id": "bp_managed",
+            "profile_read_only": False,
+            "proxy_location": None,
+            "inherit_profile_proxy": True,
+            "session_kind": BrowserSessionKind.workflow_run,
+            "browser_settings": None,
+            "created_for_workflow_run_id": None,
+            "workflow_permanent_id": "wpid_test",
+        }
+    ]
+    with (
+        skyvern_context.scoped(SkyvernContext(organization_id="o_test", otp_request_id="otpr_strict")),
+        pytest.raises(SkyvernException, match="human interaction"),
+    ):
+        await WorkflowService().auto_create_browser_session_if_needed(
+            "o_test",
+            workflow,
+            browser_profile_id="bp_managed",
+        )
+    assert len(create_session_calls) == 1
 
 
 @pytest.mark.asyncio

@@ -3600,6 +3600,7 @@ class TestScriptSkyvernPageMagicLink:
                 organization_id="org_1",
                 workflow_run_id="wr_1",
                 task_id="task_1",
+                otp_request_id="otpr_script_magic_link",
             )
         )
         return skyvern_context
@@ -3619,6 +3620,7 @@ class TestScriptSkyvernPageMagicLink:
             ctx.reset()
 
         assert state["polled_with"]["expected_otp_type"] is OTPType.MAGIC_LINK
+        assert state["polled_with"]["otp_request_id"] == "otpr_script_magic_link"
         assert state["polled_with"]["task_url"] == "https://portal.example.com/login"
         assert script_page.page.url == "https://customer.auth0.com/callback"
         assert state["navigations"] == [link]
@@ -4622,14 +4624,28 @@ async def test_polled_script_code_is_registered_so_its_saved_row_is_marked(monke
     monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager, raising=False)
     monkeypatch.setattr(module, "get_actual_value_of_parameter_if_secret", lambda _workflow_run_id, value: value)
     monkeypatch.setattr(module, "render_template", lambda value: value)
-    monkeypatch.setattr(module, "poll_otp_value", AsyncMock(return_value=OTPValue(value="482913", type=OTPType.TOTP)))
+    polled_with: dict[str, object] = {}
+
+    async def poll(**kwargs: object) -> OTPValue:
+        polled_with.update(kwargs)
+        return OTPValue(value="482913", type=OTPType.TOTP)
+
+    monkeypatch.setattr(module, "poll_otp_value", poll)
     script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
     script_page.page = SimpleNamespace()
 
-    with skyvern_context.scoped(SkyvernContext(organization_id="org_1", workflow_run_id="wr_1", task_id="tsk_1")):
+    with skyvern_context.scoped(
+        SkyvernContext(
+            organization_id="org_1",
+            workflow_run_id="wr_1",
+            task_id="tsk_1",
+            otp_request_id="otpr_script_value",
+        )
+    ):
         value = await script_page.get_actual_value("", totp_identifier="inbox@example.com")
         codes = manager.get_one_time_codes_for_run("wr_1")
 
     typed = InputTextAction(element_id="otp", text=value, workflow_run_id="wr_1")
     assert value == "482913"
+    assert polled_with["otp_request_id"] == "otpr_script_value"
     assert skyvern_context.action_for_multi_field_totp_persistence(typed, codes).totp_code_required

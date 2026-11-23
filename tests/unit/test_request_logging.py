@@ -190,7 +190,19 @@ def test_identity_provider_webhook_bodies_are_opaque(body: str) -> None:
                 "/v1/runs/wr_1/retry_webhook",
                 "/v1/internal/runs/wr_1/test-webhook",
                 "/api/v1/prompts/summarize-output",
+                "/v1/otp-bound/run/tasks",
+                "/v1/otp-bound/run/agents/",
+                "/api/v1/otp-bound/tasks",
+                "/api/v2/otp-bound/tasks/",
+                "/api/v1/otp-bound/workflows/wpid_1/run",
+                "/v1/otp-bound/agents/runs/wr_1/retry",
             )
+        ),
+        (
+            "POST",
+            "/v1/otp-bound/run/tasks",
+            '{"url":"https://h.invalid/p?email=jane%40x.invalid","otp_request_id":"sample","prompt":"sample"}',
+            {"url": "https://h.invalid/p?[query:email]", "otp_request_id": REDACTED, "prompt": REDACTED},
         ),
         (
             "POST",
@@ -693,6 +705,8 @@ class TestSanitizeResponseBody:
         [
             ("POST", "/v1/credentials/totp"),
             ("POST", "/v1/credentials/totp/"),
+            ("POST", "/v1/otp-bound/credentials/totp"),
+            ("POST", "/v1/otp-bound/credentials/totp/"),
             ("POST", "/api/v1/totp"),
             ("POST", "/api/v1/totp/"),
             ("GET", "/v1/credentials/totp"),
@@ -840,6 +854,8 @@ class TestSanitizeBody:
         [
             ("POST", "/v1/credentials/totp"),
             ("POST", "/v1/credentials/totp/"),
+            ("POST", "/v1/otp-bound/credentials/totp"),
+            ("POST", "/v1/otp-bound/credentials/totp/"),
             ("POST", "/api/v1/totp"),
             ("POST", "/api/v1/totp/"),
             ("GET", "/v1/credentials/totp"),

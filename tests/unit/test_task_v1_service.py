@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,14 +13,16 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
+from skyvern.forge.sdk.db.exceptions import OTPRequestAlreadyBoundError
 from skyvern.forge.sdk.db.models import TaskGenerationModel
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
-from skyvern.forge.sdk.schemas.tasks import TaskRequest
+from skyvern.forge.sdk.schemas.tasks import TaskRequest, TaskStatus
 from skyvern.forge.sdk.services import request_principal
 from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.schemas.runs import RunEngine
+from skyvern.services import task_v1_service
 from skyvern.services.task_v1_service import InvalidTaskV1ModelError, generate_task, run_task
 
 
@@ -264,7 +267,8 @@ async def test_generate_task_forwards_organization_id_to_cache_lookup(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_run_task_rejects_ui_tars_when_volcengine_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.usefixtures("public_dns")
+async def test_run_task_rejects_or_terminalizes_admission_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENABLE_VOLCENGINE", False)
     create_task_calls: list[object] = []
 
@@ -280,3 +284,138 @@ async def test_run_task_rejects_ui_tars_when_volcengine_disabled(monkeypatch: py
             TaskRequest(url="https://example.com", navigation_goal="go"), organization, engine=RunEngine.ui_tars
         )
     assert create_task_calls == []
+
+    monkeypatch.setattr(
+        app,
+        "agent",
+        SimpleNamespace(
+            create_task=AsyncMock(side_effect=OTPRequestAlreadyBoundError(owner_type="task", owner_id="tsk_owner"))
+        ),
+    )
+    with pytest.raises(HTTPException) as conflict:
+        await run_task(TaskRequest(url="https://example.com", otp_request_id="otpr_retry"), organization)
+    assert conflict.value.status_code == 409
+    assert conflict.value.detail == "otp_request_id is already bound to another run"
+
+    created_task = SimpleNamespace(
+        task_id="tsk_strict_setup",
+        organization_id=organization.organization_id,
+        otp_request_id="otpr_strict_setup",
+    )
+    failed_task = SimpleNamespace(
+        task_id=created_task.task_id,
+        organization_id=organization.organization_id,
+        otp_request_id=created_task.otp_request_id,
+        status=TaskStatus.failed,
+        started_at=None,
+        finished_at=now,
+    )
+    finish_calls: list[dict[str, object]] = []
+    task_run_syncs: list[dict[str, object]] = []
+    task_webhooks: list[dict[str, object]] = []
+
+    async def create_strict_task(*_args: object, **_kwargs: object) -> object:
+        return created_task
+
+    async def fail_engine_resolution(**_kwargs: object) -> RunEngine:
+        raise RuntimeError("engine setup failed")
+
+    async def finish_task(*_args: object, **kwargs: object) -> tuple[object, bool]:
+        finish_calls.append(kwargs)
+        return failed_task, True
+
+    async def sync_task_run(**kwargs: object) -> None:
+        task_run_syncs.append(kwargs)
+
+    async def send_task_webhook(**kwargs: object) -> None:
+        task_webhooks.append(kwargs)
+
+    monkeypatch.setattr(
+        app,
+        "agent",
+        SimpleNamespace(create_task=create_strict_task, execute_task_webhook=send_task_webhook),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_run_engine", fail_engine_resolution)
+    monkeypatch.setattr(app.DATABASE.tasks, "update_task_and_claim_finish", finish_task)
+    monkeypatch.setattr(app.DATABASE.tasks, "sync_task_run_status", sync_task_run)
+
+    with pytest.raises(RuntimeError, match="engine setup failed"):
+        await run_task(
+            TaskRequest(
+                url="https://example.com",
+                navigation_goal="go",
+                otp_request_id=created_task.otp_request_id,
+            ),
+            organization,
+            x_api_key="api-key",
+        )
+
+    assert finish_calls == [
+        {
+            "organization_id": organization.organization_id,
+            "status": TaskStatus.failed,
+            "failure_reason": "Strict OTP task setup failed after admission.",
+            "keep_final_status": True,
+        }
+    ]
+    assert len(task_run_syncs) == 1
+    assert task_webhooks == [{"task": failed_task, "api_key": "api-key"}]
+
+    finish_calls.clear()
+    task_run_syncs.clear()
+    task_webhooks.clear()
+
+    cancellation = asyncio.CancelledError()
+
+    async def cancel_engine_resolution(**_kwargs: object) -> RunEngine:
+        raise cancellation
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_run_engine", cancel_engine_resolution)
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await run_task(
+            TaskRequest(
+                url="https://example.com",
+                navigation_goal="go",
+                otp_request_id=created_task.otp_request_id,
+            ),
+            organization,
+            x_api_key="api-key",
+        )
+
+    assert raised.value is cancellation
+    assert len(finish_calls) == 1
+    assert len(task_run_syncs) == 1
+    assert task_webhooks == [{"task": failed_task, "api_key": "api-key"}]
+
+    finish_calls.clear()
+
+    async def resolve_engine(**_kwargs: object) -> RunEngine:
+        return RunEngine.skyvern_v1
+
+    async def noop(**_kwargs: object) -> None:
+        return None
+
+    async def fail_dispatch(**_kwargs: object) -> None:
+        raise RuntimeError("ambiguous Temporal submission")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_run_engine", resolve_engine)
+    monkeypatch.setattr(app.DATABASE.tasks, "create_task_run", noop)
+    monkeypatch.setattr(task_v1_service.uploaded_file_service, "attach_files_to_run", noop)
+    monkeypatch.setattr(
+        task_v1_service.AsyncExecutorFactory,
+        "get_executor",
+        lambda: SimpleNamespace(execute_task=fail_dispatch),
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous Temporal submission"):
+        await run_task(
+            TaskRequest(
+                url="https://example.com",
+                navigation_goal="go",
+                otp_request_id=created_task.otp_request_id,
+            ),
+            organization,
+        )
+
+    assert finish_calls == []
