@@ -995,6 +995,7 @@ class TestMCPToolOverlayCompleteness:
             "select_option",
             "press_key",
             "drag",
+            "hover",
             "wait_for_either_state",
             "skyvern_frame_list",
             "skyvern_frame_switch",

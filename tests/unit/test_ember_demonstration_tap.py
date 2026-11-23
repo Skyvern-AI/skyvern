@@ -1018,8 +1018,23 @@ async def test_page_tap_click_snapshot_is_bounded_on_large_pages() -> None:
 
 @skip_no_browser
 @pytest.mark.asyncio
-async def test_page_tap_records_element_drags_and_a_gap_per_freehand_stroke() -> None:
-    body = b"""<html><body style="margin:0">
+async def test_page_tap_records_drags_and_only_the_hovers_that_reveal_the_next_click() -> None:
+    body = b"""<html><head><style>
+        .sub, .sub2, .panel, .tray-items { display: none }
+        .menu:hover > .sub, .cat:hover > .sub2, .search:hover .panel, .tray:hover .tray-items { display: block }
+        .off-items { position: absolute; left: -9999px } .off:hover .off-items { left: 0 }
+        a:hover, button:hover { color: red }
+      </style></head><body style="margin:0">
+      <ul><li class="menu"><a id="products" href="#">Products</a>
+        <ul class="sub"><li><a id="laptops" href="#laptops">Laptops</a></li>
+          <li class="cat"><a id="accessories" href="#">Accessories</a>
+            <ul class="sub2"><li><a id="chargers" href="#chargers">Chargers</a></li></ul></li></ul></li></ul>
+      <button id="account" aria-haspopup="menu" aria-expanded="false">Account</button>
+      <a id="about" href="#about">About</a> <a id="help" href="#help">Help</a> <button id="contact">Contact</button>
+      <button id="acc" aria-expanded="true">Section</button>
+      <div class="search"><button id="search-toggle">Search</button><div class="panel"><label id="q-label" for="q">Query</label><input id="q"></div></div>
+      <div class="tray"><div id="tray-label">Tools</div><div class="tray-items"><button id="wrench">Wrench</button></div></div>
+      <div class="off"><span id="off-label">More</span><div class="off-items"><button id="gear">Gear</button></div></div>
       <div id="card" draggable="true" style="width:80px;height:40px">Card</div>
       <div id="lane" style="width:200px;height:80px" ondragover="event.preventDefault()">Done lane</div>
       <button id="handle" style="width:80px;height:40px">Handle</button>
@@ -1051,6 +1066,12 @@ async def test_page_tap_records_element_drags_and_a_gap_per_freehand_stroke() ->
           if (moving && event.clientY > box.top && event.clientY < box.bottom) column.append(document.querySelector('#mover'));
         });
         document.addEventListener('pointerup', () => { moving = false; });
+        const account = document.querySelector('#account');
+        account.addEventListener('mouseenter', () => setTimeout(() => {
+          if (document.querySelector('#account-menu')) return;
+          account.setAttribute('aria-expanded', 'true');
+          document.body.insertAdjacentHTML('beforeend', '<div id="account-menu"><button id="sign-out">Sign out</button></div>');
+        }, 50));
       </script>
     </body></html>"""
     tap: PageTap | None = None
@@ -1116,6 +1137,151 @@ async def test_page_tap_records_element_drags_and_a_gap_per_freehand_stroke() ->
                 ("freeform_drag", "#loose"),
                 ("click", "#after"),
             ]
+            await page.wait_for_timeout(800)
+
+            # A hover is kept only when it revealed the element the next click lands on.
+            await page.hover("#account")
+            await page.wait_for_timeout(600)
+            await page.click("#sign-out")
+            _, portal = await _wait_for_event(tap, kind="click", selector="#sign-out")
+            assert [(event.payload["kind"], event.payload["selector"]) for event in portal] == [
+                ("hover", "#account"),
+                ("click", "#sign-out"),
+            ]
+            await page.wait_for_timeout(800)
+            await page.hover("#about")
+            await page.wait_for_timeout(500)
+            await page.hover("#help")
+            await page.wait_for_timeout(500)
+            await page.click("#contact")
+            await page.wait_for_timeout(800)
+            await page.evaluate("document.body.insertAdjacentHTML('beforeend', '<button id=accept>Accept</button>')")
+            await page.hover("#acc")
+            await page.wait_for_timeout(500)
+            await page.click("#accept")
+            _, incidental = await _wait_for_event(tap, kind="click", selector="#accept")
+            assert [(event.payload["kind"], event.payload["selector"]) for event in incidental] == [
+                ("click", "#contact"),
+                ("click", "#accept"),
+            ]
+            await page.wait_for_timeout(800)
+            # A nested menu keeps every hover on the way down.
+            await page.hover("#products")
+            await page.wait_for_timeout(500)
+            await page.hover("#accessories")
+            await page.wait_for_timeout(500)
+            await page.click("#chargers")
+            _, nested = await _wait_for_event(tap, kind="click", selector="#chargers")
+            assert [(event.payload["kind"], event.payload["selector"]) for event in nested] == [
+                ("hover", "#products"),
+                ("hover", "#accessories"),
+                ("click", "#chargers"),
+            ]
+            await page.wait_for_timeout(800)
+
+            # Scrolling inside the open menu keeps the hover that opened it.
+            await page.hover("#products")
+            await page.wait_for_timeout(500)
+            await page.mouse.wheel(0, 40)
+            await page.wait_for_timeout(500)
+            await page.click("#laptops")
+            _, menu = await _wait_for_event(tap, kind="click", selector="#laptops")
+            assert [(event.payload["kind"], event.payload["selector"]) for event in menu] == [
+                ("hover", "#products"),
+                ("click", "#laptops"),
+            ]
+            await page.wait_for_timeout(800)
+
+            # A field the hover revealed, focused through its label, keeps its hover ahead of the typing.
+            await page.hover("#search-toggle")
+            await page.wait_for_timeout(500)
+            await page.click("#q-label")
+            await page.keyboard.type("abc")
+            await page.keyboard.press("Enter")
+            _, typed = await _wait_for_event(tap, kind="key", selector="#q")
+            assert [(event.payload["kind"], event.payload["selector"]) for event in typed] == [
+                ("hover", "#search-toggle"),
+                ("type", "#q"),
+                ("key", "#q"),
+            ]
+            await page.wait_for_timeout(800)
+
+            # A hidden target no trigger explains (a plain div here) is an in-order gap, never a silent click.
+            await page.hover("#tray-label")
+            await page.wait_for_timeout(500)
+            await page.click("#wrench")
+            _, unexplained = await _wait_for_event(tap, kind="click", selector="#wrench")
+            assert [(event.payload["kind"], event.payload.get("selector")) for event in unexplained] == [
+                ("reveal_gap", None),
+                ("click", "#wrench"),
+            ]
+
+            await page.wait_for_timeout(800)
+
+            # A hover made before the click's page reaction settles is still credited.
+            await page.click("#contact")
+            await page.hover("#products")
+            await page.wait_for_timeout(600)
+            await page.click("#laptops")
+            _, early = await _wait_for_event(tap, kind="click", selector="#laptops")
+            assert [(event.payload["kind"], event.payload["selector"]) for event in early] == [
+                ("click", "#contact"),
+                ("hover", "#products"),
+                ("click", "#laptops"),
+            ]
+            await page.wait_for_timeout(800)
+
+            # A menu parked off-page counts as hidden, so an unexplained reveal of it is a gap too.
+            await page.hover("#off-label")
+            await page.wait_for_timeout(500)
+            await page.click("#gear")
+            _, parked = await _wait_for_event(tap, kind="click", selector="#gear")
+            assert [(event.payload["kind"], event.payload.get("selector")) for event in parked] == [
+                ("reveal_gap", None),
+                ("click", "#gear"),
+            ]
+
+            # A revealed field reached with Tab, not a press, still gets its hover.
+            await page.wait_for_timeout(500)
+            await page.hover("#search-toggle")
+            await page.wait_for_timeout(500)
+            await page.focus("#search-toggle")
+            await page.keyboard.press("Tab")
+            await page.keyboard.type("x")
+            await page.keyboard.press("Enter")
+            _, tabbed = await _wait_for_event(tap, kind="type", selector="#q")
+            assert ("hover", "#search-toggle") in [
+                (event.payload["kind"], event.payload.get("selector")) for event in tabbed
+            ]
+
+            # A page too large to sample says so once each time it becomes so, not on every click.
+            await page.set_content(
+                "<button id=one>One</button><button id=two>Two</button>"
+                + "".join(f"<button>b{i}</button>" for i in range(20001))
+            )
+            await page.wait_for_timeout(800)
+            # Nothing is reported until the user presses: an unprompted event would read as a tab switch.
+            assert all(event.payload["kind"] != "reveal_check_skipped" for event in tap.drain_events())
+            await page.click("#one")
+            await page.wait_for_timeout(800)
+            await page.click("#two")
+            _, large = await _wait_for_event(tap, kind="click", selector="#two")
+            kinds = [event.payload["kind"] for event in large]
+            assert kinds.count("reveal_check_skipped") == 1
+            assert kinds.index("reveal_check_skipped") < kinds.index("click")
+
+            # Once the page shrinks back under the cap, hovers are recorded again without a press in between.
+            await page.evaluate(
+                """document.body.innerHTML = '<style>.m .i{display:none}.m:hover .i{display:block}</style>'
+                + '<div class=m><button id=open>Open</button><div class=i><button id=pick>Pick</button></div></div>'"""
+            )
+            await page.mouse.move(600, 500)
+            await page.wait_for_timeout(300)
+            await page.hover("#open")
+            await page.wait_for_timeout(500)
+            await page.click("#pick")
+            _, shrunk = await _wait_for_event(tap, kind="click", selector="#pick")
+            assert ("hover", "#open") in [(event.payload["kind"], event.payload.get("selector")) for event in shrunk]
             await browser.close()
     finally:
         if tap is not None:
