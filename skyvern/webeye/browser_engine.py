@@ -132,6 +132,7 @@ class BrowserEngineMetadata:
     name: str
     version: str | None = None
     allowed_browser_sources: frozenset[str] | None = None
+    supports_bounded_html: bool = False
 
     def allows(self, browser_source: str | None) -> bool:
         return self.allowed_browser_sources is None or browser_source in self.allowed_browser_sources
@@ -289,6 +290,7 @@ class BrowserEngineSpec:
     # engine binds only base+timeout (the richer families stay empty). Like ``_load_error_types`` it
     # is never called at spec construction, so a spec for an absent engine stays inert until selected.
     _load_rich_error_types: BrowserEngineRichErrorLoader | None = None
+    supports_bounded_html: bool = False
 
     def is_installed(self) -> bool:
         # Validate BOTH loaders under the one installed/unavailable contract: an engine whose base
@@ -323,6 +325,7 @@ class BrowserEngineSpec:
                 name=self.name,
                 version=resolve_engine_version(self.name),
                 allowed_browser_sources=self.allowed_browser_sources,
+                supports_bounded_html=self.supports_bounded_html,
             ),
             selection_reason=selection_reason,
         )
@@ -448,6 +451,7 @@ PLAYWRIGHT_SPEC = BrowserEngineSpec(
     _load_error_types=_stock_error_types,
     allowed_browser_sources=None,
     _load_rich_error_types=_stock_rich_error_types,
+    supports_bounded_html=True,
 )
 
 RUSTWRIGHT_SPEC = BrowserEngineSpec(

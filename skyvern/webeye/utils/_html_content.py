@@ -18,7 +18,9 @@ if TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
-_ADOPTED_OWNER = "_skyvern_adopted_bounded_html"
+_ADOPTED_OWNER = "_bounded_html_owner"
+# JSON escaping can take six bytes per UTF-16 unit, leaving headroom below a 256 MiB receiver.
+CHUNK_THRESHOLD_UTF16_UNITS = 32 * 1024 * 1024
 SLICE_UNITS = 65_536
 SNAPSHOT_JS = """(() => ({
     html: (document.doctype ? new XMLSerializer().serializeToString(document.doctype) : "") +
@@ -39,10 +41,28 @@ def bind_adopted_bounded_html_transport(owner: BrowserState) -> None:
         setattr(owner.browser_context, _ADOPTED_OWNER, ref(owner))
 
 
-async def _read_chunks(session: CDPSession, object_id: str) -> str:
+def _normalize_surrogates(text: str) -> str:
+    # Match the driver's replacement of lone UTF-16 surrogates in native content replies.
+    if re.search(r"[\ud800-\udfff]", text):
+        return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    return text
+
+
+async def _snapshot_value(session: CDPSession, object_id: str, function: str) -> object:
+    reply = await cancellable_driver_call(
+        lambda: session.send(
+            "Runtime.callFunctionOn",
+            {"objectId": object_id, "functionDeclaration": function, "returnByValue": True},
+        )
+    )
+    if reply.get("exceptionDetails"):
+        raise RuntimeError("HTML snapshot evaluation failed")
+    return reply.get("result", {}).get("value")
+
+
+async def _read_chunks(session: CDPSession, object_id: str, total: int) -> str:
     parts: list[str] = []
     offset = 0
-    total = None
     while True:
 
         async def send_slice(offset: int = offset) -> dict:
@@ -67,23 +87,21 @@ async def _read_chunks(session: CDPSession, object_id: str) -> str:
             or type(units) is not int
             or not offset <= end <= min(offset + SLICE_UNITS, units)
             or (end == offset and end != units)
-            or (total is not None and total != units)
+            or total != units
         ):
             raise RuntimeError("Invalid HTML slice bounds")
-        # Match the driver's replacement of lone UTF-16 surrogates in native content replies.
-        if re.search(r"[\ud800-\udfff]", text):
-            text = text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+        text = _normalize_surrogates(text)
         if len(text.encode("utf-16-le")) // 2 != end - offset:
             raise RuntimeError("Invalid HTML slice length")
         parts.append(text)
         if end == units:
             raise_if_cancelled()
             return "".join(parts)
-        offset, total = end, units
+        offset = end
 
 
-async def _bounded_content(page: Page) -> str:
-    group = "skyvern-html-" + secrets.token_hex(16)
+async def _read_sized_content(page: Page) -> str:
+    group = "html-content-" + secrets.token_hex(16)
     attachment = asyncio.create_task(page.context.new_cdp_session(page))
     snapshot: asyncio.Task[dict] | None = None
 
@@ -107,7 +125,7 @@ async def _bounded_content(page: Page) -> str:
         tree = await cancellable_driver_call(lambda: session.send("Page.getFrameTree"))
         frame_id = tree["frameTree"]["frame"]["id"]
         world = await cancellable_driver_call(
-            lambda: session.send("Page.createIsolatedWorld", {"frameId": frame_id, "worldName": "skyvern-html"})
+            lambda: session.send("Page.createIsolatedWorld", {"frameId": frame_id, "worldName": "html-content"})
         )
         snapshot = asyncio.create_task(
             session.send(
@@ -124,7 +142,16 @@ async def _bounded_content(page: Page) -> str:
         object_id = reply.get("result", {}).get("objectId")
         if reply.get("exceptionDetails") or not isinstance(object_id, str) or not object_id:
             raise RuntimeError("HTML snapshot acquisition failed")
-        return await _read_chunks(session, object_id)
+        total = await _snapshot_value(session, object_id, "function() { return this.html.length; }")
+        if type(total) is not int or total < 0:
+            raise RuntimeError("Invalid HTML snapshot length")
+        if total >= CHUNK_THRESHOLD_UTF16_UNITS:
+            return await _read_chunks(session, object_id, total)
+        # Read the sized snapshot itself so a later DOM change cannot enlarge this reply.
+        html = await _snapshot_value(session, object_id, "function() { return this.html; }")
+        if not isinstance(html, str):
+            raise RuntimeError("Invalid HTML snapshot content")
+        return _normalize_surrogates(html)
     finally:
         # Release after the last reply that can allocate a session or object, even if it arrives late.
         pending = snapshot if snapshot is not None else attachment
@@ -143,7 +170,7 @@ async def read_html(target: Page | Frame, selection: BrowserEngineSelection | No
     if selection is None:
         if not isinstance(adopted, ReferenceType):
             return await page.content()
-    elif selection.name not in {"playwright", "patchright"}:
+    elif not selection.metadata.supports_bounded_html:
         return await page.content()
 
     def require_current() -> None:
@@ -159,7 +186,7 @@ async def read_html(target: Page | Frame, selection: BrowserEngineSelection | No
     enabled = await app.AGENT_FUNCTION.html_content_bounded_transport_enabled()
     require_current()
     raise_if_cancelled()
-    source = await _bounded_content(page) if enabled else await page.content()
+    source = await _read_sized_content(page) if enabled else await page.content()
     require_current()
     raise_if_cancelled()
     return source
