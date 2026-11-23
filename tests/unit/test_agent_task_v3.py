@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import itertools
 import json
+import random
 import re
+import string
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
@@ -21,6 +24,7 @@ from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import quote, quote_plus, unquote_plus
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
@@ -42,7 +46,8 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
+from skyvern.forge.sdk.core.escaped_secrets import decoding_stages
+from skyvern.forge.sdk.core.skyvern_context import MODEL_HIDDEN_PLACEHOLDER, EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -53,6 +58,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK
 from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -2467,6 +2473,32 @@ def _make_credential_parameter(key: str) -> CredentialParameter:
     )
 
 
+def _escaped_forms(char: str) -> list[str]:
+    """Ways that HTML, a URL, or a JSON or JavaScript string can write ``char``."""
+    point = ord(char)
+    utf8 = char.encode("utf-8")
+    forms = [
+        char,
+        f"&#{point};",
+        f"&#x{point:x};",
+        f"&#X{point:04X};",
+        "".join(f"%{byte:02x}" for byte in utf8),
+        "".join(f"%{byte:02X}" for byte in utf8),
+        f"\\u{point:04x}",
+    ]
+    if point < 256:
+        forms.append(f"\\x{point:02X}")
+    if not char.isalnum():
+        forms.append("\\" + char)
+    named = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;", "\u00a0": "&nbsp;"}
+    if char in named:
+        forms.append(named[char])
+    if char == " ":
+        forms.append("+")
+        forms += _escaped_forms("\u00a0")
+    return forms
+
+
 def _make_workflow_credential_parameter(key: str) -> WorkflowParameter:
     now = datetime.now(UTC)
     return WorkflowParameter(
@@ -2569,6 +2601,7 @@ async def _run_execute_step_gate(
     recovery_code_progress: CodeProgressRecord | None = None,
     observer: Any = None,
     artifact_manager: ArtifactManager | None = None,
+    confine_credentials: bool = False,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Drive ForgeAgent.execute_step through the v3 dispatch gate and return (mocked _execute_task_v3,
@@ -2611,6 +2644,9 @@ async def _run_execute_step_gate(
             else:
                 mock_app.DATABASE.observer.set_workflow_run_block_engine_by_task_id = AsyncMock()
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+            mock_app.AGENT_FUNCTION.confine_task_credentials_to_saved_sites = MagicMock(
+                return_value=confine_credentials
+            )
             if experimentation_provider is not None:
                 mock_app.EXPERIMENTATION_PROVIDER = experimentation_provider
                 mock_wbe_app.EXPERIMENTATION_PROVIDER = experimentation_provider
@@ -2827,15 +2863,21 @@ async def test_execute_step_hands_the_recovery_code_outline_to_the_v3_run() -> N
 
 
 @pytest.mark.asyncio
-async def test_a_kill_switched_recovery_fails_instead_of_running_on_the_step_engine() -> None:
+@pytest.mark.parametrize("confined_block", [False, True], ids=["recovery", "confined-block"])
+async def test_a_kill_switched_recovery_or_confined_block_fails_instead_of_running_on_the_step_engine(
+    confined_block: bool,
+) -> None:
     provider = MagicMock(spec=BaseExperimentationProvider)
     provider.resolve_feature_flag_strict = AsyncMock(return_value=True)
 
     v3_mock, step_engine_mock = await _run_execute_step_gate(
         engine=agent_module.RunEngine.skyvern_v3,
-        task_block=None,
+        task_block=_make_block(TaskBlock, label="confined_task", engine=agent_module.RunEngine.skyvern_v3)
+        if confined_block
+        else None,
         experimentation_provider=provider,
-        workflow_owned_recovery=True,
+        workflow_owned_recovery=not confined_block,
+        confine_credentials=confined_block,
         workflow_run_id="wr_recovery_kill_switch",
     )
 
@@ -4214,14 +4256,19 @@ async def test_execute_task_v3_zero_credential_params_leaves_active_key_untouche
     assert loop_mock.context.active_credential_parameter_key == "pre_existing_key"
 
 
-def _capture_allowed_credential_keys(monkeypatch: pytest.MonkeyPatch, sink: list[Sequence[str] | None]) -> None:
+def _capture_allowed_credential_keys(
+    monkeypatch: pytest.MonkeyPatch, sink: list[Sequence[str] | None], bound_sink: list[bool] | None = None
+) -> None:
     def capturing_build(
         task: Task,
         page_provider: PageProvider | None = None,
         state: VerificationState | None = None,
         allowed_credential_parameter_keys: Sequence[str] | None = None,
+        bind_credential_codes: bool = False,
     ) -> tuple[list[ToolSpec], str]:
         sink.append(allowed_credential_parameter_keys)
+        if bound_sink is not None:
+            bound_sink.append(bind_credential_codes)
         return [], ""
 
     monkeypatch.setattr("skyvern.forge.taskv3.auth_tools.build_auth_tools", capturing_build)
@@ -4356,22 +4403,35 @@ async def test_recovery_guard_holds_a_vault_login_to_its_items_sites(
 
 
 @pytest.mark.asyncio
-async def test_recovery_guard_is_absent_when_the_credential_has_no_saved_site(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("refuse_siteless", [False, True], ids=["recovery-keeps-working", "confined-refuses"])
+async def test_recovery_guard_for_a_credential_with_no_saved_site(
+    monkeypatch: pytest.MonkeyPatch, refuse_siteless: bool
 ) -> None:
-    # No tested_url means no scope to compare against; the run keeps working and says so in the log
-    # rather than refusing every fill.
+    # No tested_url means no scope to compare against. A recovery keeps working and says so in the log rather
+    # than refusing every fill; a run that confines its credentials refuses the value on every page instead.
     _stub_recovery_run_context(monkeypatch, tested_url=None)
     task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
 
-    assert agent_module.recovery_credential_release_guard(task, ["portal_credential"], enforce_vault_sites=True) is None
+    guard = agent_module.recovery_credential_release_guard(
+        task, ["portal_credential"], enforce_vault_sites=True, refuse_siteless=refuse_siteless
+    )
+
+    if not refuse_siteless:
+        assert guard is None
+        return
+    assert guard is not None
+    armed = guard.matches("s3cret-value")
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(armed[0], "https://portal-example.com/login", operation="taskv3.type")
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_arms_the_release_guard_only_for_a_workflow_owned_recovery(
+async def test_execute_task_v3_arms_the_release_guard_for_a_recovery_or_a_confined_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_recovery_run_context(monkeypatch, tested_url="https://portal-example.com/login")
+    context = _stub_recovery_run_context(monkeypatch, tested_url="https://portal-example.com/login")
+    codes_bound: list[bool] = []
+    _capture_allowed_credential_keys(monkeypatch, [], bound_sink=codes_bound)
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
     _step, _task, recovery_loop, _post = await _run_execute_task_v3(
         monkeypatch,
@@ -4383,7 +4443,9 @@ async def test_execute_task_v3_arms_the_release_guard_only_for_a_workflow_owned_
         extracted_information_schema=None,
         workflow_run_id="wr_test",
     )
-    assert recovery_loop.call_args.kwargs["credential_release_guard"] is not None
+    recovery_guard = recovery_loop.call_args.kwargs["credential_release_guard"]
+    assert recovery_guard is not None
+    assert recovery_guard.literal_matches("s3cret-value") == []
 
     block = _make_block(ActionBlock, parameters=[_make_credential_parameter("portal_credential")])
     _step, _task, block_loop, _post = await _run_execute_task_v3(
@@ -4395,6 +4457,148 @@ async def test_execute_task_v3_arms_the_release_guard_only_for_a_workflow_owned_
         workflow_run_id="wr_test",
     )
     assert block_loop.call_args.kwargs["credential_release_guard"] is None
+
+    # A run that confines its credentials arms the guard for a block too, also in script mode, where a block
+    # lists no parameters: the saved site and a site added to the login take the password, an unrelated one not.
+    # A login saved for no website is refused everywhere, and a vault login is held to its vault item's sites.
+    context.parameters["portal_credential"] = _make_workflow_credential_parameter("portal_credential")
+    context.credential_extra_site_urls["portal_credential"] = ["https://idp-example.org/login"]
+    context.values["portal_credential"]["totp"] = "placeholder_t"
+    context.secrets["placeholder_t"] = "BW_TOTP"
+    context.secrets[context.totp_secret_value_key("placeholder_t")] = "JBSWY3DPEHPK3PXP"
+    markup_password = "pa&ss\"9<w>o'rd"
+    passwords = {"short_credential": "pin7", "markup_credential": markup_password}
+    for key in ("siteless_credential", "vault_credential", "short_credential", "markup_credential"):
+        context.parameters[key] = _make_workflow_credential_parameter(key)
+        context.values[key] = {"password": f"placeholder_{key}"}
+        context.secrets[f"placeholder_{key}"] = passwords.get(key, f"{key}-secret")
+    context.credential_tested_urls["short_credential"] = "https://portal-example.com/login"
+    context.credential_tested_urls["markup_credential"] = "https://portal-example.com/login"
+    # The password as a page shows it: mirrored into a field's value attribute (newer and older Chromium escaping),
+    # printed as text, and echoed in a URL.
+    markup_pages = [
+        '<input type="password" value="pa&amp;ss&quot;9&lt;w&gt;o\'rd">',
+        '<input type="password" value="pa&amp;ss&quot;9<w>o\'rd">',
+        "<p>pa&amp;ss\"9&lt;w&gt;o'rd</p>",
+        "url=https://jobs.portal-example.com/next?p=pa%26ss%229%3Cw%3Eo%27rd",
+    ]
+    context.credential_tested_urls["vault_credential"] = "https://portal-example.com/login"
+    context.bitwarden_login_sites["vault_credential"] = [LoginSite("https://vault-item-example.com", whole_site=True)]
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.confine_task_credentials_to_saved_sites", lambda _task: True
+    )
+    released_to: list[Any] = []
+    hidden_from_model: list[set[str]] = []
+    shown_to_model: list[list[str]] = []
+    run_contexts: list[Any] = []
+
+    def capture(loop_kwargs: dict[str, Any]) -> None:
+        released_to.append(loop_kwargs["credential_release_guard"])
+        current = skyvern_context.current()
+        hidden_from_model.append(set(current.model_hidden_values) if current is not None else set())
+        shown_to_model.append([current.hide_from_model(page) for page in markup_pages] if current is not None else [])
+        run_contexts.append(current)
+
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(ActionBlock, parameters=[]),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        workflow_run_id="wr_test",
+        context_overrides={"script_mode": True},
+        on_loop=capture,
+    )
+    guard = released_to[0]
+    assert guard is not None
+    armed = guard.matches("s3cret-value")
+    for page_url in ("https://accounts.portal-example.com/signin", "https://accounts.idp-example.org/signin"):
+        guard.check_release(armed[0], page_url, operation="taskv3.type", alternatives=armed[1:])
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(armed[0], "https://phisher-signin.net/login", operation="taskv3.type")
+    siteless = guard.matches("siteless_credential-secret")
+    assert siteless
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(siteless[0], "https://accounts.portal-example.com/signin", operation="taskv3.type")
+    vault = guard.matches("vault_credential-secret")
+    guard.check_release(vault[0], "https://login.vault-item-example.com/", operation="taskv3.type")
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(vault[0], "https://accounts.portal-example.com/signin", operation="taskv3.type")
+    # Only the confined block hands out a code made from a credential's seed as that credential's placeholder,
+    # and its passwords, not its usernames, stay out of the model's view.
+    assert codes_bound == [False, False, True]
+    assert "s3cret-value" in hidden_from_model[0] and "demo_business_user" not in hidden_from_model[0]
+    assert len(shown_to_model[0]) == len(markup_pages)
+    for shown in shown_to_model[0]:
+        assert markup_password not in html.unescape(shown) and markup_password not in unquote_plus(shown), shown
+        assert MODEL_HIDDEN_PLACEHOLDER in shown, shown
+    # The class, not a list of forms: each character as itself or with one escape, in any mix, under up to two more
+    # escape layers, never brings a saved password to the model. A password with a backslash or an escape of its own
+    # gets the layers only when written plainly. Text that holds none of them passes unchanged.
+    run_context = run_contexts[0]
+    plain = '<a href="/jobs?q=a%20b&amp;page=2">x &lt; y</a> \\n'
+    assert run_context.hide_from_model(plain) == plain
+    rng = random.Random(20912)
+    alphabet = string.ascii_letters + string.digits + "&\"'<>%+\\/#;=?@! ~\u00e9\u20ac"
+    layers = [html.escape, lambda text: quote(text, safe=""), quote_plus, lambda text: json.dumps(text)[1:-1]]
+    cases = [
+        # Its own '%1C' decodes along with the two JSON layers.
+        ("?Ly%1COvO2/\u00e9", json.dumps(json.dumps("?Ly%1COvO2/\u00e9")[1:-1])[1:-1]),
+        # An outer escape that hides only a reference's ';', or one byte of a character's percent escapes.
+        ("Pass-w0rd!", "&#80\\u003bass-w0rd!"),
+        ("caf\u00e9-w0rd", "caf%C3\\u0025A9-w0rd"),
+    ]
+    for _ in range(300):
+        password = "".join(rng.choice(alphabet) for _ in range(rng.randint(5, 14)))
+        mixed = "".join(rng.choice(_escaped_forms(char)) for char in password)
+        own_escape = "\\" in password or next(decoding_stages(password), None) is not None
+        cases.append((password, mixed))
+        for written in (password, password if own_escape else mixed):
+            for layer in rng.choices(layers, k=rng.randint(0, 2)):
+                written = layer(written)
+            cases.append((password, written))
+    for password, written in cases:
+        run_context.hide_from_model_in_any_escape(password)
+        shown = run_context.hide_from_model(f"<p>before {written} after</p>")
+        assert written not in shown and password not in shown, (password, written, shown)
+    # A space written as a no-break space or its percent escape, and an emoji as an ASCII-escaped JSON surrogate pair,
+    # are masked where they stand, so the model keeps the rest of the text.
+    for password, written in (
+        ("pa ss9word", "pa\u00a0ss9word"),
+        ("pa ss9word", "pa%C2%A0ss9word"),
+        ("p\U0001f600ss-w0rd", json.dumps("p\U0001f600ss-w0rd")[1:-1]),
+    ):
+        run_context.hide_from_model_in_any_escape(password)
+        shown = run_context.hide_from_model(f"<p>before {written} after</p>")
+        assert written not in shown and MODEL_HIDDEN_PLACEHOLDER in shown, (password, written, shown)
+    # Only the confined block's guard also judges a password the model types back as plain text, a short one included,
+    # which stays visible to the model because hiding it as a substring would damage page text.
+    assert guard.literal_matches("s3cret-value") and not guard.literal_matches("demo_business_user")
+    assert guard.literal_matches("pin7") and "pin7" not in hidden_from_model[0]
+
+    # The next block of the run builds its own guard. A code that the sign-in block entered, read off its page and
+    # entered again as plain text, is still refused off the credential's sites and still goes in on them.
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(ActionBlock, parameters=[]),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        workflow_run_id="wr_test",
+        context_overrides={"script_mode": True},
+        on_loop=capture,
+    )
+    assert len(released_to) == 2 and released_to[1] is not None
+    code = generate_totp_code("JBSWY3DPEHPK3PXP")
+    held = released_to[1].literal_matches(f"code {code}")
+    assert held
+    released_to[1].check_release(
+        held[0], "https://accounts.portal-example.com/signin", operation="taskv3.type", alternatives=held[1:]
+    )
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        released_to[1].check_release(
+            held[0], "https://phisher-signin.net/login", operation="taskv3.type", alternatives=held[1:]
+        )
 
 
 @pytest.mark.asyncio
@@ -6453,7 +6657,11 @@ async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeyp
     seen_states: list[Any] = []
 
     def capturing_build(
-        task: Any, page_provider: Any = None, state: Any = None, allowed_credential_parameter_keys: Any = None
+        task: Any,
+        page_provider: Any = None,
+        state: Any = None,
+        allowed_credential_parameter_keys: Any = None,
+        bind_credential_codes: bool = False,
     ) -> tuple[list[Any], str]:
         seen_states.append(state)
         return [], ""
@@ -6482,7 +6690,11 @@ async def test_execute_task_v3_pins_credential_before_building_auth_tools(
     seen_providers: list[Any] = []
 
     def capturing_build(
-        task: Any, page_provider: Any = None, state: Any = None, allowed_credential_parameter_keys: Any = None
+        task: Any,
+        page_provider: Any = None,
+        state: Any = None,
+        allowed_credential_parameter_keys: Any = None,
+        bind_credential_codes: bool = False,
     ) -> tuple[list[Any], str]:
         ctx = skyvern_context.current()
         seen_keys.append(ctx.active_credential_parameter_key if ctx else None)
@@ -6513,7 +6725,11 @@ async def test_execute_task_v3_withholds_the_page_provider_from_auth_tools_when_
     seen_providers: list[Any] = []
 
     def capturing_build(
-        task: Any, page_provider: Any = None, state: Any = None, allowed_credential_parameter_keys: Any = None
+        task: Any,
+        page_provider: Any = None,
+        state: Any = None,
+        allowed_credential_parameter_keys: Any = None,
+        bind_credential_codes: bool = False,
     ) -> tuple[list[Any], str]:
         seen_providers.append(page_provider)
         return [], ""
