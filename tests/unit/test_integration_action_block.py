@@ -70,7 +70,7 @@ def _run_context(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("integration_id", "action_id", "inputs", "inner_class", "pinned", "acts", "read_rows", "described"),
+    ("integration_id", "action_id", "inputs", "inner_class", "pinned", "acts", "read_rows", "described", "nango"),
     [
         (
             "google_sheets",
@@ -81,6 +81,7 @@ def _run_context(monkeypatch: pytest.MonkeyPatch) -> None:
             False,
             True,
             True,
+            False,
         ),
         (
             "google_sheets",
@@ -91,6 +92,7 @@ def _run_context(monkeypatch: pytest.MonkeyPatch) -> None:
             True,
             False,
             True,
+            False,
         ),
         (
             "gmail",
@@ -99,6 +101,7 @@ def _run_context(monkeypatch: pytest.MonkeyPatch) -> None:
             SendEmailBlock,
             "transport",
             True,
+            False,
             False,
             False,
         ),
@@ -111,10 +114,23 @@ def _run_context(monkeypatch: pytest.MonkeyPatch) -> None:
             True,
             False,
             True,
+            False,
         ),
-        ("outlook", "read_inbox", {}, EmailInboxBlock, "email_client", False, False, True),
+        ("outlook", "read_inbox", {}, EmailInboxBlock, "email_client", False, False, True, False),
+        # The account is among the org's Nango connections: it runs as Nango.
+        ("gmail", "read_inbox", {}, EmailInboxBlock, "email_client", False, False, True, True),
+        # The lookup failed: an account of unknown kind runs as neither.
+        ("gmail", "read_inbox", {}, EmailInboxBlock, "email_client", False, False, True, None),
     ],
-    ids=["sheets-read", "sheets-write", "gmail-send", "drive-upload", "outlook-read"],
+    ids=[
+        "sheets-read",
+        "sheets-write",
+        "gmail-send",
+        "drive-upload",
+        "outlook-read",
+        "gmail-read-nango",
+        "gmail-read-lookup-failed",
+    ],
 )
 async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
     monkeypatch: pytest.MonkeyPatch,
@@ -126,12 +142,17 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
     acts: bool,
     read_rows: bool,
     described: bool,
+    nango: bool | None,
 ) -> None:
-    monkeypatch.setattr(
-        Block,
-        "get_workflow_run_context",
-        staticmethod(lambda _: FakeWorkflowRunContext(values={"account": "goac_acct"})),
-    )
+    context = FakeWorkflowRunContext(values={"account": "goac_acct"})
+
+    async def nango_connection_ids(organization_id: str, connection_ids: set[str]) -> set[str]:
+        if nango is None:
+            raise RuntimeError("lookup down")
+        return set(connection_ids) if nango else set()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "nango_connection_ids", nango_connection_ids)
+    monkeypatch.setattr(Block, "get_workflow_run_context", staticmethod(lambda _: context))
     ran: list[Block] = []
 
     async def fail_with_recorded_output(self: Block, *args: Any, **kwargs: Any) -> BlockResult:
@@ -156,6 +177,9 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
     )
 
     result = await block.execute("wr_test", "wrb_test", organization_id="o_test")
+    if nango is None:
+        assert not ran and result.failure_reason == "Skyvern could not check this block's account. Run it again."
+        return
     await block._generate_workflow_run_block_description("wrb_test", "o_test")
 
     [inner] = ran
@@ -175,11 +199,12 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
     assert block.connection_id == "{{ account }}"
     if pinned:
         assert getattr(inner, pinned) == integration_id
+    assert (getattr(inner, "credential_source", None) == "nango") is nango
     # A failure output the wrapped block recorded must not be cleared by the outer block's wrapper.
     assert block._output_recorded_this_execution
     assert connected_account_fields(block.model_dump(), acting_only=True) == (("connection_id",) if acts else ())
-    context = SimpleNamespace(workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[block])))
-    assert block_module._sheets_read_output_keys(context) == (  # type: ignore[arg-type]
+    saved = SimpleNamespace(workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[block])))
+    assert block_module._sheets_read_output_keys(saved) == (  # type: ignore[arg-type]
         {block.output_parameter.key} if read_rows else set()
     )
     # Gmail message contents never reach the description prompt.
@@ -203,28 +228,6 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
         (
             {"integration_id": "outlook", "action_id": "read_inbox", "inputs": {"email_client": "gmail"}},
             "Input 'email_client'",
-        ),
-        (
-            {"integration_id": "powerbi", "action_id": "query", "inputs": {"dataset_id": "d", "query": "EVALUATE t"}},
-            "Power BI: Run DAX query is not supported yet.",
-        ),
-        (
-            {
-                "integration_id": "powerbi",
-                "action_id": "query",
-                "connection_id": None,
-                "inputs": {"dataset_id": "d", "query": "EVALUATE t"},
-            },
-            "Power BI: Run DAX query is not supported yet.",
-        ),
-        (
-            {
-                "integration_id": "gmail",
-                "action_id": "send_email",
-                "connection_id": "ngc_acct",
-                "inputs": {"recipients": ["a@example.invalid"], "subject": "private-value", "body": "private-value"},
-            },
-            "Gmail: Send email with this account is not supported yet.",
         ),
         (
             {"integration_id": "google_drive", "action_id": "move_file", "inputs": {"file_id": "private-value"}},
@@ -257,9 +260,6 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
         "templated-bool",
         "templated-pin",
         "literal-pin",
-        "nango-account",
-        "nango-no-account",
-        "nango-gmail-account",
         "drive-move-missing-destination",
         "drive-move-no-account",
         "drive-move-flag-off",
