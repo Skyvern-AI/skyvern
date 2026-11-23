@@ -24,6 +24,12 @@ import structlog
 from pydantic import AnyHttpUrl, TypeAdapter, ValidationError
 
 from skyvern.config import settings
+from skyvern.forge.sdk.core.escaped_secrets import (
+    ESCAPE_MARKERS,
+    EscapedSecret,
+    escaped_secret,
+    shows_escaped_secret,
+)
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_health import BrowserHealth, BrowserOperation, FrameKind
@@ -472,6 +478,8 @@ MAX_DIALOG_MESSAGE_CHARS = 500
 
 # Visible stand-in for a value scrubbed from the model's view via hide_from_model.
 MODEL_HIDDEN_PLACEHOLDER = "[withheld: sign-in link]"
+# What the model gets instead of a whole text that still shows a hidden password once its escapes are undone.
+MODEL_WITHHELD_ESCAPED_TEXT = "[withheld: this text showed a saved password in an escaped form]"
 
 
 # An apostrophe is legal inside a URL, so it is part of the span; a prose quote is trimmed with the
@@ -841,6 +849,8 @@ class SkyvernContext:
     # output (e.g. a magic sign-in link), as opposed to values the model needs to read (e.g. a TOTP
     # code) that are only scrubbed from artifacts/logs.
     model_hidden_values: set[str] = field(default_factory=builtins.set)
+    # Values also hidden wherever a text writes them with escapes (a saved login's passwords on a confined run).
+    model_hidden_escaped: dict[str, EscapedSecret] = field(default_factory=dict, repr=False)
     # Signed payload URLs the v3 loop minted opaque tokens for (token -> real URL, mirroring
     # OpaqueUrlRefs.refs). Applied to every model-facing tool result by hide_from_model so a resolved
     # ref never re-enters the transcript verbatim. Keyed by membership, never URL shape. Replaced whole
@@ -1269,15 +1279,31 @@ class SkyvernContext:
             if hide_from_model:
                 self.model_hidden_values.add(value)
 
+    def hide_from_model_in_any_escape(self, value: str) -> None:
+        """Hide ``value`` from the model as it is and wherever a text writes it with escapes, and withhold a whole
+        text whose decoding still shows it (`escaped_secrets`)."""
+        self.register_secret_value(value, hide_from_model=True)
+        if value and value not in self.model_hidden_escaped:
+            self.model_hidden_escaped[value] = escaped_secret(value)
+
     def hide_from_model(self, text: str) -> str:
         """Return ``text`` with everything that must not reach the model's view of tool output replaced
         by a model-safe surrogate: first each model_hidden_values entry by MODEL_HIDDEN_PLACEHOLDER
         (longest value first so a substring value can't fragment a longer one), then each known payload
-        signed-URL by its opaque token (by PROVENANCE, not shape). Same object when nothing matches."""
+        signed-URL by its opaque token (by PROVENANCE, not shape), then each escaped form of a
+        model_hidden_escaped value. Same object when nothing matches."""
         for value in sorted(self.model_hidden_values, key=len, reverse=True):
             if value and value in text:
                 text = text.replace(value, MODEL_HIDDEN_PLACEHOLDER)
-        return mask_opaque_urls_in_text(text, self.opaque_url_refs)
+        text = mask_opaque_urls_in_text(text, self.opaque_url_refs)
+        if self.model_hidden_escaped and any(marker in text for marker in ESCAPE_MARKERS):
+            for secret in self.model_hidden_escaped.values():
+                if secret.pattern.search(text):
+                    text = secret.pattern.sub(MODEL_HIDDEN_PLACEHOLDER, text)
+            if shows_escaped_secret(text, self.model_hidden_escaped.values()):
+                LOG.info("Withheld a text whose decoding still shows a hidden value", withheld_chars=len(text))
+                return MODEL_WITHHELD_ESCAPED_TEXT
+        return text
 
     def record_dialog_message(self, dialog_type: str, dialog_message: str) -> None:
         """Buffer a dialog with FIFO cap; identical entries bump a count instead of duplicating."""

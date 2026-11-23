@@ -33,7 +33,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, NoReturn, TypedDict, TypeVar
 from urllib.parse import unquote, urlparse
 
 import structlog
@@ -58,6 +58,7 @@ from skyvern.forge.sdk.services.credentials import (
     is_unresolved_totp_placeholder,
 )
 from skyvern.forge.sdk.workflow.models.credential_release import (
+    CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
     release_target_url,
 )
@@ -91,9 +92,11 @@ from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     BLOCKING_LAYER_DATA_KEY,
     CLICK_DISPATCHED_DATA_KEY,
+    CREDENTIAL_RELEASE_BOUND_GUARD,
     DOWNLOAD_FAILURE_MAX_LINES,
     DROP_TARGET_DATA_KEY,
     FILL_TOOLS,
+    GUARD_END_DATA_KEY,
     NAVIGATION_DEAD_END_STATUSES,
     OPENED_LIST_ERROR_CLASSES,
     PAGE_UNAVAILABLE_ERROR,
@@ -109,6 +112,7 @@ from skyvern.forge.taskv3.loop import (
     CoveredLayerKind,
     DownloadFailureFacts,
     DownloadUntil,
+    GuardEnd,
     LayerCheck,
     SemanticCommitStats,
     ToolHandler,
@@ -1491,18 +1495,31 @@ def _ambiguous_rows_error(
 _MENU_ROW_TEXT_MAX = 200
 
 
+def _hidden_from_model(text: str) -> str:
+    ctx = skyvern_context.current()
+    return ctx.hide_from_model(text) if ctx is not None else text
+
+
 def _model_text(text: object, cap: int) -> str:
     """`text` as the model may see it, at most `cap` chars. Masks hidden values BEFORE the cut, as `_window`
     does: the loop's whole-substring mask cannot match a value the cut split, so its prefix would leak."""
-    shown = str(text)
-    ctx = skyvern_context.current()
-    if ctx is not None:
-        shown = ctx.hide_from_model(shown)
-    return shown[:cap]
+    return _hidden_from_model(str(text))[:cap]
 
 
 # The most of a covering layer's own text a covered refusal quotes.
 _LAYER_TEXT_MAX = 400
+
+
+def _observe_url_field(url: str) -> str:
+    """observe's url= value. Hidden values are masked before the sanitize and the cap, so neither can split one."""
+    # Stripping forgery chars is not truncation: only the cap changes what the URL points at, so
+    # the note is measured against the sanitized length rather than the raw one.
+    sanitized_url = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", _hidden_from_model(url))
+    # Every other cap in this payload names itself; a URL cut mid-query-string looks complete and
+    # is a different, invalid URL.
+    if len(sanitized_url) > OBSERVE_URL_MAX_CHARS:
+        return f"{sanitized_url[:OBSERVE_URL_MAX_CHARS]} (url truncated from {len(sanitized_url)} chars)"
+    return sanitized_url
 
 
 def _without_split_hidden_tail(text: str, tidy: Callable[[str], str] | None = None) -> str:
@@ -10267,7 +10284,9 @@ _NEAR_OWN_TEXT = "(own text)"
 
 def _observe_quoted_field(masked: str, width: int, *, cut_before: bool) -> str:
     """`masked` repr'd at `width`, with what the display cut carried in a clip span. `cut_before` says
-    the page script may already have cut the value at its retain width, so the count is a floor."""
+    the page script may already have cut the value at its retain width, so the count is a floor. Hidden
+    values are masked before the cut and the repr, which the loop's later mask could not see through."""
+    masked = _hidden_from_model(masked)
     shown = repr(masked[:width])
     cut = len(masked) - width
     if cut <= 0 and not cut_before:
@@ -14937,6 +14956,16 @@ ONE_TIME_CODE_PLACEHOLDER_NOT_A_FIELD = (
 TotpCodeAuthorizer = Callable[[str, str], Awaitable[None]]
 TotpPlaceholderResolver = Callable[[str, TotpCodeAuthorizer], Awaitable[str]]
 
+# The credential release refusal that ends the run; refusals count per engine run of one task. It stays below
+# ACTION_LOOP_TERMINATE_AFTER, so a model that repeats one refused call is ended by this verdict, which names the check.
+CREDENTIAL_RELEASE_MAX_REFUSALS = 6
+CREDENTIAL_RELEASE_BOUND_REASON = (
+    f"Stopped: the saved-login check refused {CREDENTIAL_RELEASE_MAX_REFUSALS} attempts to enter a saved login's "
+    "username, password, or one-time code on a page outside the login's saved websites. To allow a website, add it "
+    "to the saved login's websites, or to its vault item's websites when the login is kept in a connected password "
+    "vault."
+)
+
 
 def build_browser_tools(
     page_provider: PageProvider,
@@ -14970,8 +14999,9 @@ def build_browser_tools(
         return opaque_refs.mask(text, cut=cut) if opaque_refs is not None else text
 
     def _masked_echo(value: str) -> str:
-        # Masked before it is cut: a cut minted URL loses the tail the masker recognises it by.
-        masked = _mask_refs(value)
+        # Masked before it is cut: a cut minted URL loses the tail the masker recognises it by, and a cut hidden
+        # value matches nothing in the loop's later mask.
+        masked = _hidden_from_model(_mask_refs(value))
         return masked if len(masked) <= _CHANGED_VALUE_ECHO_MAX else masked[:_CHANGED_VALUE_ECHO_MAX] + "…"
 
     def _observe_retain_width() -> int:
@@ -15004,24 +15034,59 @@ def build_browser_tools(
         except Exception:
             return page.url if page is not None else None
 
+    release_refusals = [0]
+
+    def _confines_secrets() -> bool:
+        return credential_release_guard is not None and credential_release_guard.confined
+
+    def _refuse_release(refusal: CodeBlockCredentialReleaseError) -> NoReturn:
+        # Each refusal reaches the model as this tool's error, for it to decide on. On a confined run the bound-th ends
+        # the run with a verdict that names the guard, so a stuck run does not end as a loop or a spent budget.
+        if not _confines_secrets():
+            raise refusal
+        release_refusals[0] += 1
+        if release_refusals[0] < CREDENTIAL_RELEASE_MAX_REFUSALS:
+            raise refusal
+        raise ToolRefusal(
+            str(refusal),
+            error_class="handler_raised",
+            data={GUARD_END_DATA_KEY: GuardEnd(CREDENTIAL_RELEASE_BOUND_GUARD, CREDENTIAL_RELEASE_BOUND_REASON)},
+        ) from refusal
+
     async def _check_credential_release(
-        resolved: str, *, operation: str, page: Any, selector: str | None, url_is_target: bool
-    ) -> None:
+        resolved: str, *, typed: str, operation: str, page: Any, selector: str | None, url_is_target: bool
+    ) -> bool:
+        """Whether ``resolved`` carries a secret the guard holds; one that may not go to this target raises."""
         if credential_release_guard is None:
-            return
-        armed = credential_release_guard.matches(resolved)
+            return False
+        # A confined run's guard judges the final value for every value it holds, at any length and whatever was
+        # resolved in it; any other guard judges only a value that a placeholder resolved, as before.
+        armed = credential_release_guard.literal_matches(resolved)
+        if resolved != typed:
+            for entry in credential_release_guard.matches(resolved):
+                if entry not in armed:
+                    armed.append(entry)
         if not armed:
-            return
+            return False
         # A URL argument releases the value to the site it names; a field releases it to the
         # document owning the field. A refusal raises and reaches the model as this tool's error.
         target_url: str | None = resolved
         if url_is_target and _reads_from_this_machine(resolved):
-            return
+            return True
         if not url_is_target:
             target_url = await _field_release_url(page, selector)
-        credential_release_guard.check_release(
-            armed[0], target_url, operation=f"taskv3.{operation}", alternatives=armed[1:]
-        )
+        try:
+            credential_release_guard.check_release(
+                armed[0], target_url, operation=f"taskv3.{operation}", alternatives=armed[1:]
+            )
+        except CodeBlockCredentialReleaseError as refusal:
+            _refuse_release(refusal)
+        return True
+
+    def _masks_held_secrets() -> bool:
+        # A confined run keeps its saved login's secrets out of the model's view: text tool output is scrubbed of
+        # them, and a field that receives one is masked, so no screenshot shows it either.
+        return settings.ENABLE_SECRET_VISUAL_MASKING and _confines_secrets()
 
     async def _check_totp_code_release(
         marker: str, code: str, parameter_key: str, *, operation: str, page: Any, selector: str | None
@@ -15036,12 +15101,15 @@ def build_browser_tools(
         # Re-keyed to the code: check_release groups owners by secret value, so marker-valued
         # alternatives would form a second group that must be authorized on its own.
         entries = [dataclasses.replace(entry, secret_value=code) for entry in owned]
-        credential_release_guard.check_release(
-            entries[0],
-            await _field_release_url(page, selector),
-            operation=f"taskv3.{operation}",
-            alternatives=entries[1:],
-        )
+        try:
+            credential_release_guard.check_release(
+                entries[0],
+                await _field_release_url(page, selector),
+                operation=f"taskv3.{operation}",
+                alternatives=entries[1:],
+            )
+        except CodeBlockCredentialReleaseError as refusal:
+            _refuse_release(refusal)
 
     async def _resolve_text(
         text: str,
@@ -15079,7 +15147,10 @@ def build_browser_tools(
                         marker, code, parameter_key, operation=operation, page=page, selector=selector
                     )
 
-                return await resolve_totp_placeholder(text, _authorize)
+                code = await resolve_totp_placeholder(text, _authorize)
+                if selector and _masks_held_secrets():
+                    await apply_secret_visual_mask_to_locator(page.locator(selector).first, timeout=_ACTION_TIMEOUT_MS)
+                return code
             LOG.warning(
                 "taskv3 refused an unresolved one-time-code value",
                 operation=operation,
@@ -15092,14 +15163,13 @@ def build_browser_tools(
             if not is_sentinel:
                 raise ToolRefusal(ONE_TIME_CODE_PLACEHOLDER_NOT_ALONE, error_class="unusable_one_time_code_value")
             raise ToolRefusal(NO_ONE_TIME_CODE_SOURCE, error_class="no_one_time_code_source")
-        if resolved != text:
-            await _check_credential_release(
-                resolved, operation=operation, page=page, selector=selector, url_is_target=url_is_target
-            )
+        carries_held_secret = await _check_credential_release(
+            resolved, typed=text, operation=operation, page=page, selector=selector, url_is_target=url_is_target
+        )
+        if not url_is_target and selector:
             ctx = skyvern_context.current()
-            if (
-                not url_is_target
-                and selector
+            if (carries_held_secret and _masks_held_secrets()) or (
+                resolved != text
                 and settings.ENABLE_SECRET_VISUAL_MASKING
                 and ctx is not None
                 and app.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text(ctx.workflow_run_id, text)
@@ -15710,17 +15780,8 @@ def build_browser_tools(
             }
         await _frame_facts(data, observation, _public_ref)
         # Compact rendering keeps the persistent-conversation prefix small (cost is ~linear in it).
-        raw_url = _mask_refs(str(data.get("url") or ""))
-        # Stripping forgery chars is not truncation: only the cap changes what the URL points at, so
-        # the note is measured against the sanitized length rather than the raw one.
-        sanitized_url = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", raw_url)
-        shown_url = sanitized_url[:OBSERVE_URL_MAX_CHARS]
-        # Every other cap in this payload names itself; a URL cut mid-query-string looks complete and
-        # is a different, invalid URL.
-        url_note = (
-            f" (url truncated from {len(sanitized_url)} chars)" if len(sanitized_url) > OBSERVE_URL_MAX_CHARS else ""
-        )
-        lines = [f"url={shown_url}{url_note} title={data.get('title')!r} ({len(elements)} interactive elements)"]
+        shown_url = _observe_url_field(_mask_refs(str(data.get("url") or "")))
+        lines = [f"url={shown_url} title={data.get('title')!r} ({len(elements)} interactive elements)"]
         # Said either way: observe clicked the page to get this reading, and when that did not work the model would
         # otherwise read the framework's placeholder as the page.
         if observation.semantics is SemanticsActivation.ACTIVATED:
@@ -21718,6 +21779,19 @@ def build_browser_tools(
                     at_end = await _field_evaluate(field, _CARET_TO_END_JS)
                 except Exception:
                     at_end = False
+                # On a confined run the field will hold its old text and the new text together, so a held value is judged
+                # in that whole before any key goes out: after the old text, and also before it when the caret stayed
+                # at the start.
+                held_text = before[0]
+                wholes = (held_text + text,) if at_end else (held_text + text, text + held_text)
+                carries_held_secret = [
+                    await _check_credential_release(
+                        whole, typed=whole, operation="type", page=page, selector=selector, url_is_target=False
+                    )
+                    for whole in (wholes if _confines_secrets() else ())
+                ]
+                if any(carries_held_secret) and _masks_held_secrets():
+                    await apply_secret_visual_mask_to_locator(page.locator(selector).first, timeout=_ACTION_TIMEOUT_MS)
                 if at_end:
                     # page.type() would focus the field again, and a fresh focus puts the caret back at the start.
                     sent = await _type_keys_before_deadline(text, press_end=at_end == "end_key")
