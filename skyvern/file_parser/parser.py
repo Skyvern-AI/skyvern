@@ -42,6 +42,8 @@ DetectionSource = Literal["explicit", "extension", "magic", "fallback"]
 _CSV_SNIFF_LINES = 5
 _CSV_BINARY_PREFIX_BYTES = 4096
 _CSV_UTF_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)
+# Unrestricted, csv.Sniffer picks a letter as the delimiter of a one-column file.
+_CSV_DELIMITERS = ",\t;|:"
 _MAX_CSV_FIELD_SIZE_BYTES = 10 * 1024 * 1024
 _MAX_ZIP_ARCHIVE_BYTES = 512 * 1024 * 1024
 _MAX_ZIP_ENTRIES = 1000
@@ -100,6 +102,9 @@ class ParserResult:
 def _detect_encoding(file_path: Path) -> str:
     with file_path.open("rb") as file:
         raw_data = file.read(65_536)
+    # charset-normalizer reports a UTF-8 BOM file as utf_8, which leaves the BOM in the first header.
+    if raw_data.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
     best_match = from_bytes(raw_data).best()
     if best_match and best_match.encoding:
         return best_match.encoding
@@ -126,7 +131,7 @@ def _sniff_csv_delimiter(file_path: Path) -> tuple[str, str]:
     if not sample.strip():
         raise ParserFailure("File is empty")
     try:
-        delimiter = csv.Sniffer().sniff(sample).delimiter
+        delimiter = csv.Sniffer().sniff(sample, delimiters=_CSV_DELIMITERS).delimiter
     except csv.Error:
         delimiter = "\t" if file_path.name.lower().endswith(".tsv") else ","
     return delimiter, encoding
