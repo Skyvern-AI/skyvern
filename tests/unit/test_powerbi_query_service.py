@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -68,18 +69,33 @@ async def _execute(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "options", "expected"),
+    [
+        (json.dumps(_rows([{"[Name]": "A", "Name": "B"}])).encode(), {}, [{"[Name]": "A", "Name": "B"}]),
+        # A decimal beyond binary-float precision must not be rounded when exact decimals are asked for.
+        (
+            b'{"results": [{"tables": [{"rows": [{"[Amount]": 9007199254740993.25, "[Count]": 9007199254740993}]}]}]}',
+            {"exact_decimals": True},
+            [{"[Amount]": Decimal("9007199254740993.25"), "[Count]": 9007199254740993}],
+        ),
+    ],
+)
 async def test_response_is_audited_before_dispatch_and_preserves_column_labels(
     principal: RequestPrincipal,
     audit_writer: Any,
     audit_events: list[tuple[RequestPrincipal | None, powerbi.PowerBIExecutionAudit]],
+    body: bytes,
+    options: dict[str, Any],
+    expected: list[dict[str, Any]],
 ) -> None:
     async def read_response() -> bytes:
         assert [event.outcome for _, event in audit_events] == ["started"]
-        return json.dumps(_rows([{"[Name]": "A", "Name": "B"}])).encode()
+        return body
 
-    rows = await _execute(principal=principal, audit_writer=audit_writer, response_reader=read_response)
+    rows = await _execute(principal=principal, audit_writer=audit_writer, response_reader=read_response, **options)
 
-    assert rows == [{"[Name]": "A", "Name": "B"}]
+    assert rows == expected
     assert [
         (event.outcome, event.organization_id, event.workflow_run_id, event.workflow_run_block_id, event.connection_id)
         for _, event in audit_events

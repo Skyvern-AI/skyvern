@@ -110,6 +110,18 @@ export type PageSlots = {
     }>
   >;
   brokerCredentialSelector?: React.ComponentType<BrokerCredentialSelectorProps>;
+  powerBIDaxAssist?: React.ComponentType<
+    Readonly<{
+      credentialSource: "native" | "nango" | undefined;
+      connectionId: string;
+      datasetId: string;
+      currentQuery: string;
+      maxRows: number;
+      disabled: boolean;
+      // False when the editor refused the change, so the assist keeps its suggestion.
+      onUse: (query: string) => boolean;
+    }>
+  >;
   connectedGmailFlow?: React.ComponentType<
     Readonly<{ children: (flow: ConnectedGmailFlow) => React.ReactNode }>
   >;

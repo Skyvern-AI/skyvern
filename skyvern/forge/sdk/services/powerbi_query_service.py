@@ -6,6 +6,7 @@ import threading
 import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
@@ -216,9 +217,14 @@ def _parse_rows_payload(payload: object, max_rows: int) -> list[dict[str, Any]]:
     return [{column: row[column] for column in columns} for row in rows]
 
 
-def _parse_rows(body: bytes, max_rows: int) -> list[dict[str, Any]]:
+def _parse_rows(body: bytes, max_rows: int, *, exact_decimals: bool = False) -> list[dict[str, Any]]:
     try:
-        payload = json.loads(body, object_pairs_hook=_json_object, parse_constant=_invalid_json_constant)
+        payload = json.loads(
+            body,
+            object_pairs_hook=_json_object,
+            parse_constant=_invalid_json_constant,
+            parse_float=Decimal if exact_decimals else float,
+        )
     except (UnicodeDecodeError, ValueError):
         raise PowerBIQueryError("invalid_response") from None
     return _parse_rows_payload(payload, max_rows)
@@ -298,6 +304,7 @@ async def execute_audited_powerbi_response(
     response_reader: Callable[[], Awaitable[bytes]],
     audit_writer: AuditWriter,
     max_rows: int = DEFAULT_MAX_ROWS,
+    exact_decimals: bool = False,
 ) -> list[dict[str, Any]]:
     """Audit and validate a bounded Power BI response returned by a trusted Cloud transport."""
     _validate_audit_context(organization_id, workflow_run_id, workflow_run_block_id, connection_id)
@@ -334,7 +341,7 @@ async def execute_audited_powerbi_response(
         _validate_query_inputs(connection_id, dataset_id, query, max_rows)
         if not human_user_id(principal, organization_id):
             raise PowerBIQueryError("principal_unavailable")
-        rows = _parse_rows(await response_reader(), max_rows)
+        rows = _parse_rows(await response_reader(), max_rows, exact_decimals=exact_decimals)
     except asyncio.CancelledError:
         try:
             await record_terminal("cancelled")

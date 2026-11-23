@@ -69,6 +69,11 @@ _SENSITIVE_ENDPOINTS = {
     # Editor-assist bodies carry workflow YAML and code, which can hold secrets.
     "POST /v1/workflow/suggest-goal",
     "POST /v1/workflow/convert-yaml-to-blocks",
+    # Plain-language requests, generated DAX and preview rows are customer content.
+    "POST /v1/powerbi/dax-assist/suggest",
+    "POST /v1/powerbi/dax-assist/preview",
+    "POST /api/v1/powerbi/dax-assist/suggest",
+    "POST /api/v1/powerbi/dax-assist/preview",
     # Payment-provider events carry customer billing details (name, email, address, card metadata).
     "POST /api/v1/stripe_webhook",
     # Identity-provider session events embed the full user record (email, name, linked Google account).
