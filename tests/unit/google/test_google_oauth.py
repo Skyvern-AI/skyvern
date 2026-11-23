@@ -2026,6 +2026,8 @@ def test_google_drive_resumable_session_uri_accepts_googleapis_subdomain() -> No
         "https://user@evil.com/upload",
         "https://user@www.googleapis.com/upload",
         "https://www.googleapis.com:444/upload",
+        "https://evil.example.com/upload",
+        "http://www.googleapis.com/upload",
     ],
 )
 def test_google_drive_resumable_session_uri_rejects_ssrf_variants(session_uri: str) -> None:
@@ -2035,18 +2037,29 @@ def test_google_drive_resumable_session_uri_rejects_ssrf_variants(session_uri: s
     assert exc_info.value.code == "invalid_resumable_session"
 
 
-def test_google_drive_resumable_session_uri_rejects_non_google_host() -> None:
-    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
-        google_drive_service.extract_resumable_session_uri({"location": "https://evil.example.com/upload"})
+@pytest.mark.asyncio
+async def test_google_drive_list_folder_lists_at_most_the_cap_in_one_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    cap = google_drive_service.DRIVE_LIST_FOLDER_MAX_RESULTS
+    page_sizes: list[int] = []
 
-    assert exc_info.value.code == "invalid_resumable_session"
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/drive/v3/files/folder_1":
+            return httpx.Response(
+                200, json={"id": "folder_1", "mimeType": google_drive_service.GOOGLE_FOLDER_MIME_TYPE}
+            )
+        assert request.url.path == "/drive/v3/files"
+        page_size = int(request.url.params["pageSize"])
+        page_sizes.append(page_size)
+        # Like Drive, return at most 1,000 items a page, from a folder that always has more.
+        files = [{"id": f"f{len(page_sizes)}_{i}", "name": "item"} for i in range(min(page_size, 1000))]
+        return httpx.Response(200, json={"files": files, "nextPageToken": f"page_{len(page_sizes)}"})
 
+    _install_google_drive_transport(monkeypatch, handler)
 
-def test_google_drive_resumable_session_uri_rejects_http() -> None:
-    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
-        google_drive_service.extract_resumable_session_uri({"location": "http://www.googleapis.com/upload"})
+    listed = await google_drive_service.list_folder(access_token="token", folder="folder_1", max_results=50_000)
 
-    assert exc_info.value.code == "invalid_resumable_session"
+    assert max(page_sizes) <= cap
+    assert (listed["count"], len(listed["files"]), listed["has_more"]) == (cap, cap, True)
 
 
 def test_google_drive_maps_insufficient_scope_to_reconnect() -> None:
