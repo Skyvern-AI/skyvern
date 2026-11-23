@@ -61,7 +61,9 @@ def _setup_url(entry: IntegrationEntry) -> str | None:
     return f"{settings.SKYVERN_APP_URL.rstrip('/')}{path}" if path else None
 
 
-async def _request_connection(integration_id: str, connection_id: str | None, ctx: EmberContext) -> dict[str, Any]:
+async def _request_connection(
+    integration_id: str, connection_id: str | None, ctx: EmberContext, action_id: str | None = None
+) -> dict[str, Any]:
     user_id = human_user_id(get_request_principal(), ctx.organization_id)
     entry = next(
         (
@@ -75,6 +77,38 @@ async def _request_connection(integration_id: str, connection_id: str | None, ct
         return {
             "ok": False,
             "error": f"No integration has the id `{integration_id}`; use an `id` from list_integrations.",
+        }
+    connected_gmail_only = False
+    if action_id is not None:
+        action = next((action for action in entry.actions if action.id == action_id), None)
+        if action is None:
+            return {
+                "ok": False,
+                "error": f"`{integration_id}` has no action `{action_id}`; use an action `id` from list_integrations.",
+            }
+        # block_inputs pins a fixed block field as a JSON-schema `const`.
+        credential_source = action.inputs.get("properties", {}).get("credential_source") or {}
+        connected_gmail_only = credential_source.get("const") == "nango"
+    # A plain later call for the same entry replaces its card, so it keeps a Connected-Gmail-only card's restriction;
+    # a call naming an action decides for itself.
+    connected_gmail_only = connected_gmail_only or (
+        action_id is None
+        and any(c["integrationId"] == entry.id and c.get("connectedGmailOnly") for c in ctx.connection_cards)
+    )
+    if connected_gmail_only and "nango" not in (entry.additional_credential_backends or []):
+        kept = [c for c in ctx.connection_cards if c["integrationId"] != entry.id]
+        withdrawn = len(kept) < len(ctx.connection_cards)
+        ctx.connection_cards = kept
+        return {
+            "ok": True,
+            "data": {
+                "status": "not_offered",
+                "integration_id": entry.id,
+                "action_id": action_id,
+                "reason": "This action runs only with a Connected Gmail account, and Connected Gmail is not "
+                "available to this organization.",
+                **({"earlier_card_withdrawn": True} if withdrawn else {}),
+            },
         }
     unavailable = {"accounts_unavailable": entry.accounts_unavailable} if entry.accounts_unavailable else {}
     # A not_enabled entry's page shows it as unavailable on this deployment, so it is no way through.
@@ -103,8 +137,11 @@ async def _request_connection(integration_id: str, connection_id: str | None, ct
         connections = await org_connections_by_id(ctx.organization_id, request_user_id(ctx.organization_id))
         target = next((connection for connection in connections if connection.id == connection_id), None)
     # A Google reconnect keeps the row and adds the entry's profile to its grants; Microsoft has no in-place
-    # reconnect from chat.
-    reconnect_in_place = target is not None and target.provider == entry.oauth_provider == "google"
+    # reconnect from chat. A Google sign-in account cannot gain a Connected Gmail action, so it is not reconnected
+    # for one.
+    reconnect_in_place = (
+        not connected_gmail_only and target is not None and target.provider == entry.oauth_provider == "google"
+    )
     card: ConnectionCardPayload = {
         "integrationId": entry.id,
         "integrationName": entry.name,
@@ -113,18 +150,25 @@ async def _request_connection(integration_id: str, connection_id: str | None, ct
         "requiredScopes": list(entry.capability_scopes or required_scopes),
         "reconnectConnectionId": connection_id if reconnect_in_place else None,
     }
+    if connected_gmail_only:
+        card["connectedGmailOnly"] = True
     ctx.connection_cards = [*(c for c in ctx.connection_cards if c["integrationId"] != entry.id), card]
     data: dict[str, Any] = {
         "status": "offered",
         "integration_id": entry.id,
         "provider": entry.oauth_provider,
-        "required_scopes": required_scopes,
         "reconnect_in_place": reconnect_in_place,
-        "accounts": ember_payload(entry)["accounts"],
+        "accounts": _offered_accounts(entry, connected_gmail_only),
     }
+    # Connected Gmail grants its own fixed mailbox access, not the entry's required_scopes.
+    if connected_gmail_only:
+        data["connected_gmail_only"] = True
+    else:
+        data["required_scopes"] = required_scopes
     if connection_id is not None:
         data["connection"] = target.facts() if target is not None else {"connection_id": connection_id, "found": False}
-    elif (own_gmail := _own_connected_gmail(entry)) is not None:
+    adds_gmail_account = connection_id is None or connected_gmail_only
+    if adds_gmail_account and (own_gmail := _own_connected_gmail(entry, connected_gmail_only)) is not None:
         data["connected_gmail_limit"] = {
             "connection_id": own_gmail.connection_id,
             "can_add_another": False,
@@ -135,12 +179,19 @@ async def _request_connection(integration_id: str, connection_id: str | None, ct
     return {"ok": True, "data": data}
 
 
-def _own_connected_gmail(entry: IntegrationEntry) -> IntegrationAccount | None:
+def _offered_accounts(entry: IntegrationEntry, connected_gmail_only: bool) -> list[dict[str, Any]] | None:
+    # A Connected-Gmail-only card offers only Connected Gmail accounts, so the model hears only those.
+    if connected_gmail_only and entry.accounts is not None:
+        return [account.model_dump(exclude_none=True) for account in entry.accounts if account.provider == "nango"]
+    return ember_payload(entry)["accounts"]
+
+
+def _own_connected_gmail(entry: IntegrationEntry, connected_gmail_only: bool) -> IntegrationAccount | None:
     # A visible native Gmail credential keeps native sign-in as the card's flow, and that can add another account.
     if "nango" not in (entry.additional_credential_backends or []):
         return None
     accounts = entry.accounts or []
-    if any(account.provider == "google" for account in accounts):
+    if not connected_gmail_only and any(account.provider == "google" for account in accounts):
         return None
     return next(
         (account for account in accounts if account.provider == "nango" and account.state == STATE_ACTIVE),

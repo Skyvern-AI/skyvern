@@ -109,9 +109,12 @@ function ConnectionCardBody({
   const [switchedToConnectedGmail, setSwitchedToConnectedGmail] =
     useState(false);
   // An existing Connected Gmail account stays a choice even when a native credential makes it no longer the default.
+  // A step that runs only on Connected Gmail always takes that flow, even one that cannot connect: native sign-in would
+  // add an account the step cannot use.
   const gmailFlow =
     connectedGmail?.status === "default" ||
-    (switchedToConnectedGmail && connectedGmail?.canConnect)
+    (switchedToConnectedGmail && connectedGmail?.canConnect) ||
+    card.connectedGmailOnly
       ? connectedGmail
       : undefined;
   const gmailFlowLoading = connectedGmail?.status === "loading";
@@ -135,9 +138,14 @@ function ConnectionCardBody({
     ? true
     : gmailFlow
       ? gmailFlow.canConnect
-      : isGoogle
-        ? canGoogleAuthorize
-        : canMicrosoftAuthorize;
+      : card.connectedGmailOnly
+        ? false
+        : isGoogle
+          ? canGoogleAuthorize
+          : canMicrosoftAuthorize;
+  // An admin whose Connected Gmail flow cannot connect is blocked by the flow, not by their role.
+  const connectedGmailUnavailable =
+    Boolean(card.connectedGmailOnly) && !canAuthorize && canGoogleAuthorize;
   const [isStarting, setIsStarting] = useState(false);
   const [confirmSetAccount, setConfirmSetAccount] = useState(false);
   const [attempt, setAttempt] = useState<AttemptState>("idle");
@@ -217,7 +225,7 @@ function ConnectionCardBody({
           email_address: credential.email_address ?? null,
         }));
   const choices: ConnectedAccountChoice[] = [
-    ...nativeChoices,
+    ...(card.connectedGmailOnly ? [] : nativeChoices),
     ...(connectedGmail?.connections ?? []).map((connection) => ({
       connection_id: connection.connection_id,
       name: connection.name,
@@ -433,7 +441,9 @@ function ConnectionCardBody({
             title={
               canAuthorize
                 ? undefined
-                : "Organization admin access is required."
+                : connectedGmailUnavailable
+                  ? "Connected Gmail is not available right now. Reload the page and try again."
+                  : "Organization admin access is required."
             }
             onClick={() =>
               gmailFlow ? startConnectedGmail() : void startGoogle()
@@ -442,7 +452,9 @@ function ConnectionCardBody({
             {isStarting
               ? "Opening…"
               : !canAuthorize
-                ? "Admin required"
+                ? connectedGmailUnavailable
+                  ? "Unavailable"
+                  : "Admin required"
                 : attempt === "open" || connectedGmail?.busy
                   ? "Waiting for sign-in…"
                   : failure

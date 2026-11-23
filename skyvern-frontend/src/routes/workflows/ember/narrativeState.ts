@@ -544,6 +544,8 @@ export interface ConnectionCard {
   scopeProfile: string | null;
   requiredScopes: string[];
   reconnectConnectionId: string | null;
+  // The step runs only on a Connected Gmail account, so a Google sign-in account is neither offered nor connected.
+  connectedGmailOnly?: boolean;
 }
 
 export function connectionCardKey(card: ConnectionCard): string {
@@ -881,6 +883,7 @@ export function parseConnectionCards(value: unknown): ConnectionCard[] {
         row.reconnectConnectionId.length > 0
           ? row.reconnectConnectionId
           : null,
+      ...(row.connectedGmailOnly === true ? { connectedGmailOnly: true } : {}),
     };
     const key = connectionCardKey(card);
     if (seen.has(key)) continue;

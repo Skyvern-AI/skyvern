@@ -1404,6 +1404,7 @@ async def request_connection_tool(
     ctx: RunContextWrapper,
     integration_id: str,
     connection_id: str | None = None,
+    action_id: str | None = None,
 ) -> str:
     """Show the user how to connect an account to one `list_integrations` entry, named by its `id`.
     A live entry with an `oauth_provider` gets a card in this chat that asks for its `required_scopes`.
@@ -1421,16 +1422,29 @@ async def request_connection_tool(
     With `connection_id`, the card reauthorizes that connection in place when `reconnect_in_place`
     is true: its id stays the same. Otherwise the user connects a new account, which gets a new id.
 
+    `action_id` names one of the entry's `actions`. For an action whose inputs pin `credential_source` to `nango`,
+    the card offers only Connected Gmail accounts and sign-in (`connected_gmail_only` is true) and never reconnects
+    a Google sign-in account in place; `status` is `not_offered` when Connected Gmail is not available to this
+    organization. Such a result has no `required_scopes`, since Connected Gmail grants its own mailbox access. A
+    later call for the same entry with no `action_id` in this turn replaces the card but keeps it Connected Gmail
+    only, and a `not_offered` result that removed an earlier card for the entry says `earlier_card_withdrawn`.
+    Otherwise `action_id` does not change the card. A test run Ember starts cannot use a Connected Gmail account; a
+    saved run can, including one from a schedule or trigger that a person owns.
+
     When `connected_gmail_limit` is present, the user already has their one Connected Gmail account and the card
     cannot add another: say so, and never tell the user a second Gmail account is being added.
     """
     ember_ctx = ctx.context
-    arguments: dict[str, Any] = {"integration_id": integration_id, "connection_id": connection_id}
+    arguments: dict[str, Any] = {
+        "integration_id": integration_id,
+        "connection_id": connection_id,
+        "action_id": action_id,
+    }
     authority_error = _authority_tool_error(ember_ctx, CONNECTION_CARD_TOOL_NAME)
     if authority_error:
         result: dict[str, Any] = {"ok": False, "error": authority_error}
     else:
-        result = await _request_connection(integration_id, connection_id, ember_ctx)
+        result = await _request_connection(integration_id, connection_id, ember_ctx, action_id)
     record_tool_step_result_for_ctx(ember_ctx, CONNECTION_CARD_TOOL_NAME, arguments, result)
     return json.dumps(result)
 
