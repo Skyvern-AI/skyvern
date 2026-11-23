@@ -112,6 +112,7 @@ export type QuestionnairePatchV1 =
       expected_revision: number;
       action: "complete" | "update";
       project_owner?: ProjectOwnerPatchV1;
+      phone_number?: string | null;
     } & QuestionnaireAnswersV1)
   | {
       version: 1;
