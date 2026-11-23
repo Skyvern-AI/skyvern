@@ -3,7 +3,7 @@ from collections.abc import Callable, Coroutine
 from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from fastapi import BackgroundTasks, Request
@@ -52,6 +52,7 @@ from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.runs import RunEngine, RunType
 from skyvern.services import script_service, task_v2_service
 from skyvern.utils.files import initialize_skyvern_state_file
+from skyvern.webeye.browser_artifacts import CredentialProfileFinalizer
 
 LOG = structlog.get_logger()
 
@@ -955,6 +956,9 @@ class BackgroundTaskExecutor(AsyncExecutor):
         )
         # A dispatch lost with the process is recovered by the prepared-attempt sweep, which admits only a
         # queued run and attempt. The write re-reads the run, so it runs even when the lookups failed.
+        credential_profile_finalizer = cast(
+            CredentialProfileFinalizer | None, kwargs.get("credential_profile_options", {}).get("finalizer")
+        )
         if not await queue_initial_attempt(workflow_run_id, attempt_number):
             return
         execution_kwargs: dict[str, Any] = {
@@ -968,6 +972,8 @@ class BackgroundTaskExecutor(AsyncExecutor):
             "attempt_number": attempt_number,
             "claim_initial_attempt": True,
         }
+        if credential_profile_finalizer is not None:
+            execution_kwargs["credential_profile_finalizer"] = credential_profile_finalizer
         self._schedule(background_tasks, self._dispatch_retry_resume, attempt, execution_kwargs)
 
     async def execute_task_v2(

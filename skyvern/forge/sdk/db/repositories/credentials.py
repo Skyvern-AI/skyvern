@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from asyncio import CancelledError
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import suppress
 from datetime import datetime, timezone
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -11,11 +13,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError, NotFoundError
-from skyvern.forge.sdk.db.models import CredentialModel, OrganizationBitwardenCollectionModel, TOTPCodeModel
+from skyvern.forge.sdk.db.models import (
+    CredentialModel,
+    OrganizationBitwardenCollectionModel,
+    TOTPCodeModel,
+)
 from skyvern.forge.sdk.db.repositories.proxy_pin_update import apply_proxy_pin_to_model, normalize_proxy_pin_for_create
-from skyvern.forge.sdk.db.utils import serialize_proxy_location
+from skyvern.forge.sdk.db.utils import deserialize_proxy_location, serialize_proxy_location
 from skyvern.forge.sdk.schemas.credentials import (
     Credential,
     CredentialType,
@@ -37,6 +43,9 @@ from skyvern.utils.phone_validation import (
     phone_identifier_candidates,
 )
 from skyvern.utils.strings import canonical_uuid_or_original, is_uuid
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 
 _UNSET = object()
 
@@ -520,6 +529,82 @@ class CredentialRepository(BaseRepository):
                 )
             ).first()
             return credential.browser_profile_id if credential else None
+
+    @db_operation("claim_temporary_test_login_credential_for_deletion")
+    async def claim_temporary_test_login_credential_for_deletion(
+        self, credential_id: str, organization_id: str
+    ) -> Credential | None:
+        """Soft-delete an eligible credential and return its vault metadata to the cleanup owner."""
+        prefix = "_test_login_"
+        async with self.Session() as session:
+            query = (
+                update(CredentialModel)
+                .where(
+                    CredentialModel.credential_id == credential_id,
+                    CredentialModel.organization_id == organization_id,
+                    CredentialModel.deleted_at.is_(None),
+                    CredentialModel.is_test_login_temporary.is_(True),
+                    CredentialModel.browser_profile_id.is_(None),
+                    func.substr(CredentialModel.name, 1, len(prefix)) == prefix,
+                )
+                .values(deleted_at=naive_utc_now())
+                .returning(CredentialModel)
+            )
+            row = (await session.scalars(query)).one_or_none()
+            credential = Credential.model_validate(row) if row is not None else None
+            await session.commit()
+            return credential
+
+    @db_operation("publish_credential_browser_profile")
+    async def publish_credential_browser_profile(
+        self,
+        browser_sessions: BrowserSessionsRepository,
+        *,
+        credential_id: str,
+        organization_id: str,
+        expected_browser_profile_id: str | None,
+        expected_credential_modified_at: datetime,
+        profile_id: str,
+        source_browser_type: str | None,
+        test_url: str,
+        on_confirmed_precommit_failure: Callable[[], None],
+    ) -> bool:
+        async with self.Session() as session:
+            try:
+                credential = await session.scalar(
+                    update(CredentialModel)
+                    .where(
+                        CredentialModel.credential_id == credential_id,
+                        CredentialModel.organization_id == organization_id,
+                        CredentialModel.deleted_at.is_(None),
+                        CredentialModel.browser_profile_id == expected_browser_profile_id,
+                        CredentialModel.modified_at == to_naive_utc(expected_credential_modified_at),
+                    )
+                    .values(browser_profile_id=profile_id, tested_url=test_url)
+                    .returning(CredentialModel)
+                )
+                if credential is None:
+                    return False
+                _drop_extra_sites_on_tested_site(credential)
+                await browser_sessions.create_browser_profile(
+                    organization_id=organization_id,
+                    name=f"Profile - {credential.name} ({credential_id})",
+                    description=f"Browser profile from credential test for {credential.name}",
+                    source_browser_type=source_browser_type,
+                    proxy_location=deserialize_proxy_location(credential.proxy_location),
+                    proxy_session_id=credential.proxy_session_id,
+                    browser_profile_id=profile_id,
+                    session=session,
+                )
+            except BaseException:
+                # Signal reclamation after rollback and preserve the publication error on cleanup failure.
+                with suppress(Exception, CancelledError):
+                    await session.rollback()
+                    on_confirmed_precommit_failure()
+                raise
+            # Once commit starts, an error or cancellation can leave a durable profile.
+            await session.commit()
+            return True
 
     @db_operation("get_credential")
     async def get_credential(self, credential_id: str, organization_id: str) -> Credential | None:

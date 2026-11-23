@@ -42,7 +42,8 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
+from functools import partial
 from typing import Annotated, Any, NoReturn
 
 import pyotp
@@ -72,12 +73,15 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.agent_functions import OnePasswordTelemetryErrorClass, record_request_audit_event
 from skyvern.forge.sdk.api.files import discard_temp_working_dir
+from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowBuildSource
 from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError
 from skyvern.forge.sdk.db.models import CredentialFolderModel
+from skyvern.forge.sdk.executor.async_executor import CredentialProfileCreation
+from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_PYTHON,
@@ -193,7 +197,7 @@ from skyvern.forge.sdk.services.route_authorization import require_request_actio
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
     CredentialFolder,
     CredentialFolderCreate,
@@ -1305,6 +1309,7 @@ async def test_login(
         status=WorkflowStatus.auto_generated,
     )
 
+    workflow_run: WorkflowRun | None = None
     try:
         # Mark before workflow setup so any member cleanup can only target this test-login row.
         credential = await app.DATABASE.credentials.update_credential(**update_kwargs)
@@ -1335,57 +1340,37 @@ async def test_login(
             created_by=current_user_id,
         )
 
-        await AsyncExecutorFactory.get_executor().execute_workflow(
-            request=None,
+        await _execute_credential_test_workflow(
             background_tasks=background_tasks,
             organization=current_org,
-            workflow_id=workflow_run.workflow_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            workflow_permanent_id=workflow_run.workflow_permanent_id,
-            max_steps_override=None,
-            api_key=None,
-            browser_session_id=None,
-            block_labels=None,
-            block_outputs=None,
-        )
-    except Exception:
-        # Clean up the orphaned temporary credential if workflow setup fails
-        LOG.exception(
-            "Workflow setup failed for test_login, cleaning up temporary credential",
+            workflow_run=workflow_run,
             credential_id=credential_id,
-            organization_id=organization_id,
-        )
-        try:
-            await _delete_temporary_test_login_credential(
-                credential_id=credential_id,
-                organization_id=organization_id,
-                reason="workflow setup error",
-            )
-        except Exception:
-            LOG.warning(
-                "Failed to clean up temporary credential after workflow setup error",
-                credential_id=credential_id,
-                exc_info=True,
-            )
-        raise
-
-    # Always schedule profile creation for test_login — the entire purpose of this
-    # endpoint is to create a temporary credential with a browser profile. This differs
-    # from test_credential, which conditionally checks data.save_browser_profile because
-    # that endpoint tests an existing credential that may or may not need a profile.
-    task = asyncio.create_task(
-        _create_browser_profile_after_workflow(
-            credential_id=credential_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            workflow_id=workflow_run.workflow_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            organization_id=organization_id,
             credential_name=f"_test_login_{data.username}",
             test_url=data.url,
+            save_browser_profile=True,
+            clean_up_temporary_login_on_timeout=True,
+            expected_credential_modified_at=credential.modified_at if isinstance(app.STORAGE, S3Storage) else None,
         )
-    )
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    except Exception:
+        LOG.exception(
+            "Workflow setup or dispatch failed for test_login",
+            credential_id=credential_id,
+            organization_id=organization_id,
+        )
+        if workflow_run is None:
+            try:
+                await _delete_temporary_test_login_credential(
+                    credential_id=credential_id,
+                    organization_id=organization_id,
+                    reason="workflow setup error",
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to clean up temporary credential after workflow setup error",
+                    credential_id=credential_id,
+                    exc_info=True,
+                )
+        raise
 
     LOG.info(
         "Login test started",
@@ -1534,18 +1519,23 @@ async def test_credential(
             created_by=current_user_id,
         )
 
-        await AsyncExecutorFactory.get_executor().execute_workflow(
-            request=None,
+        await _execute_credential_test_workflow(
             background_tasks=background_tasks,
             organization=current_org,
-            workflow_id=workflow_run.workflow_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            workflow_permanent_id=workflow_run.workflow_permanent_id,
-            max_steps_override=None,
-            api_key=None,
-            browser_session_id=None,
-            block_labels=None,
-            block_outputs=None,
+            workflow_run=workflow_run,
+            credential_id=credential_id,
+            credential_name=credential.name,
+            test_url=data.url,
+            save_browser_profile=data.save_browser_profile,
+            existing_browser_profile_id=existing_browser_profile_id,
+            expected_browser_profile_id=credential.browser_profile_id,
+            expected_credential_modified_at=(
+                credential.modified_at
+                if data.save_browser_profile
+                and existing_browser_profile_id is None
+                and isinstance(app.STORAGE, S3Storage)
+                else None
+            ),
         )
     except Exception:
         LOG.exception(
@@ -1554,22 +1544,6 @@ async def test_credential(
             organization_id=organization_id,
         )
         raise
-
-    if data.save_browser_profile:
-        task = asyncio.create_task(
-            _create_browser_profile_after_workflow(
-                credential_id=credential_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-                workflow_id=workflow_run.workflow_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                organization_id=organization_id,
-                credential_name=credential.name,
-                test_url=data.url,
-                existing_browser_profile_id=existing_browser_profile_id,
-            )
-        )
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
 
     LOG.info(
         "Credential test started",
@@ -1828,6 +1802,71 @@ async def cancel_credential_test(
     return CancelTestResponse(status="canceled")
 
 
+async def _execute_credential_test_workflow(
+    *,
+    background_tasks: BackgroundTasks,
+    organization: Organization,
+    workflow_run: WorkflowRun,
+    credential_id: str,
+    credential_name: str,
+    test_url: str,
+    save_browser_profile: bool,
+    clean_up_temporary_login_on_timeout: bool = False,
+    existing_browser_profile_id: str | None = None,
+    expected_browser_profile_id: str | None = None,
+    expected_credential_modified_at: datetime | None = None,
+) -> None:
+    executor = AsyncExecutorFactory.get_executor()
+    execute = executor.execute_workflow
+    if save_browser_profile:
+        task = asyncio.create_task(
+            _create_browser_profile_after_workflow(
+                credential_id=credential_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_id=workflow_run.workflow_id,
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
+                organization_id=organization.organization_id,
+                credential_name=credential_name,
+                test_url=test_url,
+                clean_up_temporary_login_on_timeout=clean_up_temporary_login_on_timeout,
+                existing_browser_profile_id=existing_browser_profile_id,
+                expected_browser_profile_id=expected_browser_profile_id,
+                expected_credential_modified_at=expected_credential_modified_at,
+            )
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        if existing_browser_profile_id is None and isinstance(app.STORAGE, S3Storage):
+            creation = CredentialProfileCreation(
+                credential_id, expected_browser_profile_id, expected_credential_modified_at
+            )
+            if isinstance(executor, BackgroundTaskExecutor):
+                finalizer = partial(
+                    credential_creation_service.finalize_credential_profile_creation,
+                    creation=creation,
+                    organization_id=organization.organization_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    test_url=test_url,
+                )
+                execute = partial(execute, credential_profile_options={"finalizer": finalizer})
+            else:
+                execute = partial(execute, credential_profile_options={"creation": creation})
+
+    await execute(
+        request=None,
+        background_tasks=background_tasks,
+        organization=organization,
+        workflow_id=workflow_run.workflow_id,
+        workflow_run_id=workflow_run.workflow_run_id,
+        workflow_permanent_id=workflow_run.workflow_permanent_id,
+        max_steps_override=None,
+        api_key=None,
+        browser_session_id=None,
+        block_labels=None,
+        block_outputs=None,
+    )
+
+
 async def _create_browser_profile_after_workflow(
     credential_id: str,
     workflow_run_id: str,
@@ -1837,12 +1876,34 @@ async def _create_browser_profile_after_workflow(
     credential_name: str,
     test_url: str,
     existing_browser_profile_id: str | None = None,
+    expected_browser_profile_id: str | None = None,
+    expected_credential_modified_at: datetime | None = None,
+    *,
+    clean_up_temporary_login_on_timeout: bool = False,
 ) -> None:
     """Poll the run and persist the captured session on success: a re-save overwrites
     ``existing_browser_profile_id`` in place, otherwise a new profile is created and linked."""
     max_polls = 120  # ~10 minutes at 5s intervals
     poll_interval = 5
     session_dir: str | None = None
+
+    async def clean_up_temporary_login(reason: str) -> None:
+        if not credential_name.startswith("_test_login_"):
+            return
+        try:
+            await _delete_temporary_test_login_credential(
+                credential_id=credential_id,
+                organization_id=organization_id,
+                reason=reason,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to delete temporary credential after login test",
+                credential_id=credential_id,
+                organization_id=organization_id,
+                reason=reason,
+                exc_info=True,
+            )
 
     try:
         for _ in range(max_polls):
@@ -1869,23 +1930,23 @@ async def _create_browser_profile_after_workflow(
                     workflow_run_id=workflow_run_id,
                     status=status,
                 )
-                # Clean up temporary credentials created by test-login
-                if credential_name.startswith("_test_login_"):
-                    try:
-                        await _delete_temporary_test_login_credential(
-                            credential_id=credential_id,
-                            organization_id=organization_id,
-                            reason="failed test",
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to delete temporary credential after failed test",
-                            credential_id=credential_id,
-                            organization_id=organization_id,
-                            exc_info=True,
-                        )
+                await clean_up_temporary_login("failed test")
                 return
 
+            storage = app.STORAGE
+            if isinstance(storage, S3Storage) and existing_browser_profile_id is None:
+                credential = await app.DATABASE.credentials.get_credential(credential_id, organization_id)
+                if (
+                    credential is None
+                    or credential.browser_profile_id != expected_browser_profile_id
+                    or (
+                        expected_credential_modified_at is not None
+                        and credential.modified_at != expected_credential_modified_at
+                    )
+                ):
+                    return
+
+            max_retries = _SESSION_PERSIST_MAX_RETRIES
             # Session persistence lags the run reaching completed (see clean_up_workflow),
             # so retrieval retries on a budget sized to that lag.
             workflow = await app.DATABASE.workflows.get_workflow(
@@ -1900,7 +1961,6 @@ async def _create_browser_profile_after_workflow(
                     workflow_permanent_id=workflow_permanent_id,
                 )
                 return
-            max_retries = _SESSION_PERSIST_MAX_RETRIES
             for attempt in range(max_retries):
                 session_dir = await retrieve_persisted_workflow_browser_state_dir(
                     organization_id=organization_id,
@@ -1951,6 +2011,19 @@ async def _create_browser_profile_after_workflow(
                 if not reused_existing:
                     target_profile_id = None
 
+            if isinstance(storage, S3Storage) and not reused_existing:
+                await credential_creation_service.save_new_credential_capture(
+                    storage=storage,
+                    creation=CredentialProfileCreation(
+                        credential_id, expected_browser_profile_id, expected_credential_modified_at
+                    ),
+                    organization_id=organization_id,
+                    directory=session_dir,
+                    writer=None,
+                    test_url=test_url,
+                )
+                return
+
             should_update_existing_profile_pin = False
             if not target_profile_id:
                 profile = await app.DATABASE.browser_sessions.create_browser_profile(
@@ -1980,7 +2053,7 @@ async def _create_browser_profile_after_workflow(
                     )
 
             # Overwrites in place when reusing an existing id.
-            await app.STORAGE.store_browser_profile(
+            await storage.store_browser_profile(
                 organization_id=organization_id,
                 profile_id=target_profile_id,
                 directory=session_dir,
@@ -2022,40 +2095,14 @@ async def _create_browser_profile_after_workflow(
             credential_id=credential_id,
             workflow_run_id=workflow_run_id,
         )
-        # Clean up temporary credentials on poll timeout
-        if credential_name.startswith("_test_login_"):
-            try:
-                await _delete_temporary_test_login_credential(
-                    credential_id=credential_id,
-                    organization_id=organization_id,
-                    reason="poll timeout",
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to delete temporary credential after poll timeout",
-                    credential_id=credential_id,
-                    exc_info=True,
-                )
+        if clean_up_temporary_login_on_timeout:
+            await clean_up_temporary_login("workflow polling timeout")
     except Exception:
         LOG.exception(
             "Failed to create browser profile from credential test",
             credential_id=credential_id,
             workflow_run_id=workflow_run_id,
         )
-        # Clean up temporary credentials on unexpected error
-        if credential_name.startswith("_test_login_"):
-            try:
-                await _delete_temporary_test_login_credential(
-                    credential_id=credential_id,
-                    organization_id=organization_id,
-                    reason="profile persistence error",
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to delete temporary credential after error",
-                    credential_id=credential_id,
-                    exc_info=True,
-                )
     finally:
         discard_temp_working_dir(session_dir)
 
@@ -4475,19 +4522,6 @@ async def _delete_temporary_test_login_credential(
     organization_id: str,
     reason: str,
 ) -> None:
-    credential = await app.DATABASE.credentials.get_credential(
-        credential_id=credential_id,
-        organization_id=organization_id,
-    )
-    if not credential or not credential.name.startswith("_test_login_"):
-        return
-
-    vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
-    credential_service = await _get_credential_vault_service(vault_type_override=vault_type)
-    await credential_service.delete_credential(credential)
-    LOG.info(
-        "Deleted temporary credential",
-        credential_id=credential_id,
-        organization_id=organization_id,
-        reason=reason,
+    await credential_creation_service.delete_unlinked_temporary_test_login_credential(
+        credential_id, organization_id, reason=reason
     )
