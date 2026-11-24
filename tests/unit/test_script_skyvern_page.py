@@ -66,6 +66,7 @@ from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess
 from skyvern.webeye.skycdp.facade.page import Frame as CdpFrame
 from skyvern.webeye.utils.page import SkyvernFrame
+from tests.unit._script_page_fakes import AiStub, ScrapedPageStub, build_navigation_page
 from tests.unit._task_block_fakes import run_bound_browser_state
 from tests.unit.conftest import CARD_SECRET_RUN_ID
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -89,10 +90,6 @@ def create_mock_page() -> _PageStub:
     return _PageStub()
 
 
-class _AiStub:
-    pass
-
-
 def _make_script_page(scraped_page, ai) -> ScriptSkyvernPage:
     with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
         return ScriptSkyvernPage(scraped_page=scraped_page, page=create_mock_page(), ai=ai)
@@ -112,11 +109,6 @@ def _selected_engine():
     return selection
 
 
-class _ScrapedPageStub:
-    def __init__(self) -> None:
-        self._browser_state = SimpleNamespace(begin_navigation=MagicMock(), record_navigation_result=AsyncMock())
-
-
 @pytest.fixture(autouse=True)
 def no_cached_action_delay(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "CACHED_ACTION_DELAY_SECONDS", 0)
@@ -124,21 +116,12 @@ def no_cached_action_delay(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def mock_scraped_page():
-    return _ScrapedPageStub()
+    return ScrapedPageStub()
 
 
 @pytest.fixture
 def mock_ai():
-    return _AiStub()
-
-
-def _build_navigation_page(page_type, mock_scraped_page, mock_ai):
-    raw_page = MagicMock(spec=["goto"])
-    raw_page.goto = AsyncMock()
-    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
-        if page_type is ScriptSkyvernPage:
-            return page_type(scraped_page=mock_scraped_page, page=raw_page, ai=mock_ai), raw_page
-        return page_type(page=raw_page, ai=mock_ai), raw_page
+    return AiStub()
 
 
 @pytest.mark.asyncio
@@ -151,7 +134,7 @@ def _build_navigation_page(page_type, mock_scraped_page, mock_ai):
     ],
 )
 async def test_page_navigation_rejects_internal_destination(page_type, url, mock_scraped_page, mock_ai):
-    page, raw_page = _build_navigation_page(page_type, mock_scraped_page, mock_ai)
+    page, raw_page = build_navigation_page(page_type, mock_scraped_page, mock_ai)
 
     with pytest.raises(SkyvernHTTPException):
         await page.goto(url)
@@ -162,7 +145,7 @@ async def test_page_navigation_rejects_internal_destination(page_type, url, mock
 @pytest.mark.asyncio
 @pytest.mark.parametrize("page_type", [SkyvernPage, ScriptSkyvernPage])
 async def test_page_navigation_accepts_public_destination(page_type, mock_scraped_page, mock_ai):
-    page, raw_page = _build_navigation_page(page_type, mock_scraped_page, mock_ai)
+    page, raw_page = build_navigation_page(page_type, mock_scraped_page, mock_ai)
 
     await page.goto("https://93.184.216.34/path")
 
@@ -176,7 +159,7 @@ async def test_page_navigation_accepts_public_destination(page_type, mock_scrape
 
 @pytest.mark.asyncio
 async def test_script_page_reports_deferred_navigation_failure(mock_scraped_page, mock_ai):
-    page, raw_page = _build_navigation_page(ScriptSkyvernPage, mock_scraped_page, mock_ai)
+    page, raw_page = build_navigation_page(ScriptSkyvernPage, mock_scraped_page, mock_ai)
     error = RuntimeError("net::ERR_INVALID_AUTH_CREDENTIALS")
     raw_page.goto = AsyncMock(side_effect=error)
 
@@ -205,7 +188,7 @@ async def test_script_page_stops_retrying_navigation_after_native_browser_loss(
     browser_state, context = run_bound_browser_state("wr_script")
     context._skyvern_cdp_download_interceptor = None
     scraped_page = SimpleNamespace(_browser_state=browser_state)
-    page, raw_page = _build_navigation_page(ScriptSkyvernPage, scraped_page, mock_ai)
+    page, raw_page = build_navigation_page(ScriptSkyvernPage, scraped_page, mock_ai)
 
     async def goto(url: str, **_: object) -> None:
         if seam == "native_close_during_goto":
@@ -3264,7 +3247,7 @@ def _run_bound_script_page(ai: object, locators: dict[str, object]) -> tuple[Scr
 async def test_cached_click_dispatches_nothing_after_native_browser_loss(
     monkeypatch: pytest.MonkeyPatch, seam: str, expected: list[int]
 ) -> None:
-    ai = _AiStub()
+    ai = AiStub()
     ai.ai_click = AsyncMock(return_value="xpath=//button")
     locator = MagicMock()
     locator.first = locator
@@ -3341,7 +3324,7 @@ async def test_cached_click_dispatches_nothing_after_native_browser_loss(
 async def test_fill_from_mapping_stops_at_the_field_after_native_browser_loss(
     browser_lost: bool, mapping: dict[int, str]
 ) -> None:
-    ai = _AiStub()
+    ai = AiStub()
     ai.ai_input_text = AsyncMock(return_value="Noor")
     name, color = MagicMock(), MagicMock(select_option=AsyncMock())
     name.first = name
@@ -3373,7 +3356,7 @@ async def test_fill_from_mapping_stops_at_the_field_after_native_browser_loss(
 async def test_fill_multipage_form_reports_no_pages_after_native_browser_loss(
     monkeypatch: pytest.MonkeyPatch, seam: str
 ) -> None:
-    page, browser_state, browser_context = _run_bound_script_page(_AiStub(), {})
+    page, browser_state, browser_context = _run_bound_script_page(AiStub(), {})
     pages = [[{"selector": f"#{name}", "type": "text", "tag": "input", "label": name}] for name in ("name", "email")]
     extract_form_fields = AsyncMock(side_effect=[pages[0], pages[0], pages[1], pages[1]])
 
