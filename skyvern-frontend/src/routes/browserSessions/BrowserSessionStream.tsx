@@ -10,6 +10,7 @@ import {
 } from "@/routes/streaming/useRecordingMessageChannel";
 import { toast } from "@/components/ui/use-toast";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
+import { BrowserSessionConsole } from "./BrowserSessionConsole";
 import {
   useDemonstrationControl,
   useManualSignInControl,
@@ -115,6 +116,8 @@ interface Props {
   enableUrlInput?: boolean;
   // Passing this hands the window frame to the caller (see InteractiveStreamView).
   onFrameWidthChange?: (width: number | null) => void;
+  // Opt-in: the server still decides per org and role whether the console is available.
+  showConsole?: boolean;
 }
 
 function BrowserSessionStream({
@@ -129,6 +132,7 @@ function BrowserSessionStream({
   forceCdp = false,
   enableUrlInput = false,
   onFrameWidthChange,
+  showConsole = false,
 }: Props) {
   const [clientId] = useState(generateClientId);
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
@@ -290,6 +294,8 @@ function BrowserSessionStream({
     historyNavigate,
     navigateError,
     pasteClipboard,
+    consoleAvailable,
+    evaluateExpression,
   } = useCdpInput({
     clientId,
     inputWsUrl,
@@ -677,7 +683,7 @@ function BrowserSessionStream({
 
   const streamNavigate = demonstrating ? navigateDemonstration : navigate;
   if (isReady) {
-    return (
+    const streamView = (
       <InteractiveStreamView
         streamImgSrc={streamImgSrc}
         streamFormat={streamFormat}
@@ -703,6 +709,18 @@ function BrowserSessionStream({
         onPasteClipboard={controllable ? pasteClipboard : undefined}
         pastedCharacters={pastedCharacters}
       />
+    );
+    if (!showConsole || !consoleAvailable || demonstrating) {
+      return streamView;
+    }
+    return (
+      <div className="flex h-full w-full flex-col">
+        <div className="min-h-0 w-full flex-1">{streamView}</div>
+        <BrowserSessionConsole
+          canRun={userIsControlling}
+          onEvaluate={evaluateExpression}
+        />
+      </div>
     );
   }
 
