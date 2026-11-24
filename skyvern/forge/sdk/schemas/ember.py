@@ -532,6 +532,21 @@ class EmberChatRequest(BaseModel):
             "value can only weaken the recorded claim."
         ),
     )
+    test_proposal_owner_turn_id: str | None = Field(
+        None,
+        description="With 'test_end_to_end', the owner turn of the proposal the client showed when Test was clicked.",
+    )
+    test_proposal_revision: int | None = Field(
+        None,
+        description="With 'test_end_to_end', the revision of the proposal the client showed when Test was clicked.",
+    )
+    test_click_approved: bool = Field(
+        False,
+        description=(
+            "Server-set: true when this Test end-to-end turn runs the exact proposal the client named, so the run may "
+            "use the clicking person's connected accounts. A client-sent value never survives."
+        ),
+    )
     audio_artifact_id: str | None = Field(
         None,
         description="Artifact ID for audio captured while dictating this message.",
@@ -1188,6 +1203,9 @@ class EmberBlockProgressUpdate(BaseModel):
     block_type: str = Field(..., description="Workflow block type (e.g. 'navigation', 'extraction')")
     status: str = Field(
         ..., description="BlockStatus value: running, completed, failed, terminated, timed_out, canceled, skipped"
+    )
+    failure_code: str | None = Field(
+        None, description="On a failed block, the code saying it was refused access to an account rather than failing"
     )
     iteration: int = Field(..., description="Agent loop iteration number this block belongs to")
     timestamp: datetime = Field(..., description="Server timestamp")

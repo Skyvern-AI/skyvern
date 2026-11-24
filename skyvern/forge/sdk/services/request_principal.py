@@ -32,6 +32,10 @@ class AuthKind(StrEnum):
     ui_session_and_bearer = "ui_session_and_bearer"
 
 
+# A person signed in to the app, as opposed to a key acting for them or the organization.
+INTERACTIVE_HUMAN_AUTH_KINDS = frozenset({AuthKind.bearer, AuthKind.ui_session, AuthKind.ui_session_and_bearer})
+
+
 class BearerIdentityStatus(StrEnum):
     verified = "verified"
     no_bearer = "no_bearer"

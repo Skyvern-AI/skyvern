@@ -126,6 +126,8 @@ class TurnOutcome(BaseModel):
     # Hash of the canvas that Test turn submitted; a pick on an unchanged canvas resumes even when the editor never
     # showed the proposal.
     test_proposal_canvas_fingerprint: str | None = None
+    # The person whose Test click approved that turn's exact proposal; only their own pick resumes it approved.
+    test_proposal_click_approver: str | None = None
     output_files: list[DeliveredOutputFile] | None = None
 
     @field_validator("output_policy_reasons", mode="before")

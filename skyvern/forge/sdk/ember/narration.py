@@ -26,6 +26,7 @@ from skyvern.forge.sdk.ember.context import (
     ActivityBucket,
     EmberTestInput,
     NarrativeBlockAttempt,
+    block_failure_code,
     upsert_narrative_block_attempt,
 )
 from skyvern.forge.sdk.ember.output_utils import sanitize_block_label_for_display
@@ -291,6 +292,7 @@ class BlockProgressEvent:
     block_type: str
     status: str
     parent_block_id: str | None = None
+    failure_code: str | None = None
 
 
 _TERMINAL_BLOCK_STATUSES = frozenset({"completed", "failed", "canceled", "terminated", "timed_out", "skipped"})
@@ -298,17 +300,17 @@ _TERMINAL_BLOCK_STATUSES = frozenset({"completed", "failed", "canceled", "termin
 
 def record_block_transitions(
     state: NarratorState,
-    snapshot: list[tuple[str, str, str, str, str | None]],
+    snapshot: list[tuple[str, str, str, str, str | None, str | None]],
     seen_state: dict[str, str],
     iteration: int,
 ) -> list[BlockProgressEvent]:
     events: list[BlockProgressEvent] = []
-    for block_id, label, block_type, status, parent_block_id in snapshot:
+    for block_id, label, block_type, status, parent_block_id, failure_code in snapshot:
         if not block_id or seen_state.get(block_id) == status:
             continue
         seen_state[block_id] = status
         if status == "running" or status in _TERMINAL_BLOCK_STATUSES:
-            events.append(BlockProgressEvent(block_id, label, block_type, status, parent_block_id))
+            events.append(BlockProgressEvent(block_id, label, block_type, status, parent_block_id, failure_code))
     return events
 
 
@@ -354,7 +356,7 @@ async def narrator_poll_tick(
             blocks = None
 
         if blocks is not None:
-            snapshot: list[tuple[str, str, str, str, str | None]] = []
+            snapshot: list[tuple[str, str, str, str, str | None, str | None]] = []
             for block in blocks:
                 if not block.workflow_run_block_id or not block.status:
                     continue
@@ -365,6 +367,7 @@ async def narrator_poll_tick(
                         block.block_type.value,
                         block.status,
                         block.parent_workflow_run_block_id,
+                        block_failure_code(block.status, block.error_codes, block.block_type.value),
                     )
                 )
             # Repository returns DESC by created_at; reverse for chronological order.
@@ -390,6 +393,7 @@ async def narrator_poll_tick(
                         iteration=state.current_iteration,
                         started_at=event_ts_iso if event.status == "running" else None,
                         ended_at=event_ts_iso if event.status in _TERMINAL_BLOCK_STATUSES else None,
+                        failure_code=event.failure_code,
                     )
                 if event.status == "running":
                     state.running_block_label = event.block_label
@@ -407,6 +411,7 @@ async def narrator_poll_tick(
                             block_label=event.block_label,
                             block_type=event.block_type,
                             status=event.status,
+                            failure_code=event.failure_code,
                             iteration=state.current_iteration,
                             timestamp=event_ts,
                         )

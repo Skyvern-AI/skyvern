@@ -147,6 +147,7 @@ from skyvern.forge.sdk.ember.context import (
     EmberTestInput,
     PageObstruction,
     SkippedPrefixBlock,
+    block_failure_code,
     ember_sees_notes,
     upsert_narrative_block_attempt,
 )
@@ -697,6 +698,7 @@ def _reconcile_narrative_block_attempts(ctx: EmberContext, blocks: list[Workflow
             iteration=iteration,
             started_at=started_at,
             ended_at=ended_at,
+            failure_code=block_failure_code(block.status, block.error_codes, block.block_type.value),
         )
         # Both ends of an elapsed must share one source: keep the pair the live poll observed, which is
         # what the user watched, and otherwise take both ends from the row.
@@ -4082,10 +4084,12 @@ async def run_workflow_end_to_end(
     *,
     seed_like_normal_run: bool = False,
     run_every_loop_iteration: bool = False,
+    approved_by_test_click: bool = False,
 ) -> dict[str, Any]:
     """Run every block of a candidate workflow, frontier bypassed, in one browser minted for this run so a
     clean result earns composition credit for the whole chain. ``seed_like_normal_run`` loads the saved
-    profile a normal run would load; otherwise the browser starts blank."""
+    profile a normal run would load; otherwise the browser starts blank. ``approved_by_test_click`` is set only by
+    the server's handling of the user's Test action, never by a model tool."""
     authority_error = _authority_tool_error(ctx, "run_blocks_and_collect_debug")
     if authority_error:
         return {"ok": False, "error": authority_error}
@@ -4140,6 +4144,7 @@ async def run_workflow_end_to_end(
         explicit_blank=True,
         seed_like_normal_run=seed_like_normal_run,
         use_ephemeral_inputs=workflow_yaml is not None,
+        approved_by_test_click=approved_by_test_click,
     )
     recorded_outcome = await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
     finalized = finalize_build_test_result(
@@ -4391,6 +4396,7 @@ async def _run_blocks_and_collect_debug(
     verified_new_exit: FreshExitReceipt | None = None,
     chat_browser_opened_before_retry: bool = False,
     frontier_request: FrontierRequest | None = None,
+    approved_by_test_click: bool = False,
 ) -> dict[str, Any]:
     """With ``new_exit``, run in a browser whose network exit is verified to differ from the most recent build
     test's; the model cannot choose or verify an exit, so the platform supplies it or says why it cannot."""
@@ -4414,6 +4420,7 @@ async def _run_blocks_and_collect_debug(
             verified_new_exit=verified_new_exit,
             chat_browser_opened_before_retry=chat_browser_opened_before_retry,
             frontier_request=frontier_request,
+            approved_by_test_click=approved_by_test_click,
         )
     finally:
         _release_minted_browser_claim(ctx, minted_browser_claim)
@@ -4436,6 +4443,7 @@ async def _run_blocks_with_minted_browser_claim(
     verified_new_exit: FreshExitReceipt | None,
     chat_browser_opened_before_retry: bool,
     frontier_request: FrontierRequest | None,
+    approved_by_test_click: bool,
 ) -> dict[str, Any]:
     new_exit_prior_session_id = ctx.last_run_blocks_browser_session_id
     if new_exit and new_exit_prior_session_id is None:
@@ -4605,6 +4613,7 @@ async def _run_blocks_with_minted_browser_claim(
                 verified_new_exit=verified_new_exit,
                 chat_browser_opened_before_retry=chat_browser_opened_before_retry,
                 frontier_request=frontier_request,
+                approved_by_test_click=approved_by_test_click,
             )
     if origin_output_refusal is not None and selected_output_sources:
         execution.selected_output_sources = {}
@@ -5050,6 +5059,7 @@ async def _run_blocks_with_minted_browser_claim(
                 dispatch_workflow = await app.WORKFLOW_SERVICE.create_ember_dispatch_draft_version(
                     runtime_workflow=runtime_workflow,
                     organization_id=ctx.organization_id,
+                    approved_by=requesting_user_id(ctx.organization_id) if approved_by_test_click else None,
                 )
                 dispatch_draft_workflow_id = dispatch_workflow.workflow_id
             except WorkflowNotFound:
@@ -5180,6 +5190,7 @@ async def _run_blocks_with_minted_browser_claim(
                 verified_new_exit=new_exit_receipt,
                 chat_browser_opened_before_retry=chat_browser_opened_for_run,
                 frontier_request=frontier_request,
+                approved_by_test_click=approved_by_test_click,
             )
 
         execution.dispatched_input_values = copy.deepcopy(data)
@@ -5460,7 +5471,7 @@ async def _run_blocks_with_minted_browser_claim(
         ctx.run_outcome_trace.append(interim_run_start_outcome(interim_run_id))
         ctx.open_step_run_ids.append(interim_run_id)
         await _send_run_started_update(ctx, workflow_run.workflow_run_id)
-        # A test run never gets a Gmail capability, but its blocks must still read why it was refused.
+        # Only a test copy the user's Test click approved gets a Gmail capability; other blocks record why not.
         await app.AGENT_FUNCTION.prepare_gmail_hop_tokens(workflow_run=workflow_run, workflow=snapshot.workflow)
 
         if dispatch_to_worker:
