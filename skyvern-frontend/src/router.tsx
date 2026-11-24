@@ -37,6 +37,7 @@ import { Integrations } from "@/routes/integrations/Integrations";
 import { RecipeComingSoonPage } from "@/routes/recipes/RecipeComingSoonPage";
 import { RecipesPage } from "@/routes/recipes/RecipesPage";
 import { RunRouter } from "@/routes/runs/RunRouter";
+import { WorkflowRunGroupPage } from "@/routes/workflows/workflowRun/WorkflowRunGroupPage";
 import { SchedulesRoute } from "@/routes/schedules/SchedulesRoute";
 import { ScheduleDetailRoute } from "@/routes/schedules/ScheduleDetailRoute";
 import { OidcCallback } from "@/routes/auth/OidcCallback";
@@ -150,6 +151,11 @@ const router = createBrowserRouter([
       {
         path: "runs/:runId/*",
         element: <RunRouter />,
+      },
+      {
+        path: "run-groups/:groupId",
+        element: <PageLayout />,
+        children: [{ index: true, element: <WorkflowRunGroupPage /> }],
       },
       {
         path: "schedules",

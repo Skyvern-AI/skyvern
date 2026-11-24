@@ -96,6 +96,7 @@ class QuestionAnswer(BaseModel):
 ACCOUNT_GROUP_SUBMIT_TOOL_NAME = "run_workflow_for_accounts"
 ACCOUNT_GROUP_STATUS_TOOL_NAME = "get_account_group_status"
 ACCOUNT_GROUP_CANCEL_TOOL_NAME = "cancel_account_group"
+RUN_GROUP_RESULTS_TOOL_NAME = "get_run_group_results"
 SINGLE_RUN_TOOL_NAME = "run_saved_workflow"
 INPUT_GROUP_TOOL_NAME = "run_workflow_for_inputs"
 ASK_USER_TOOL_NAME = "ask_user"

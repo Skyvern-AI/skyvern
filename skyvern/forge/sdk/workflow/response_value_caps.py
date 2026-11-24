@@ -44,6 +44,7 @@ def _response_value_size_bytes(value: Any, log_context: dict[str, Any]) -> int |
 _TRUNCATION_MARKER_RESERVE_BYTES = 512
 
 TRUNCATION_MARKER_KEY = "_truncated"
+TRUNCATION_REASON = "exceeded_max_run_response_value_size"
 
 
 def _truncation_marker(
@@ -56,7 +57,7 @@ def _truncation_marker(
     effective_limit = RUN_RESPONSE_MAX_VALUE_BYTES if limit_bytes is None else limit_bytes
     marker = {
         "truncated": True,
-        "reason": "exceeded_max_run_response_value_size",
+        "reason": TRUNCATION_REASON,
         "original_size_bytes": size_bytes,
         "limit_bytes": effective_limit,
     }

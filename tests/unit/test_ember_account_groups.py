@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
@@ -18,6 +19,7 @@ from pydantic_core import to_json
 from sqlalchemy import delete, func, select, update
 
 from skyvern.config import settings
+from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import SkyvernHTTPException, WorkflowPinnedByRunGroup
 from skyvern.forge import app
 from skyvern.forge.agent_functions import EmberOrganizationUsage
@@ -27,12 +29,14 @@ from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import (
     BrowserProfileModel,
     CredentialModel,
+    OutputParameterModel,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunBlockModel,
     WorkflowRunGroupItemModel,
     WorkflowRunGroupModel,
     WorkflowRunModel,
+    WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
 )
 from skyvern.forge.sdk.ember import agent as agent_module
@@ -50,11 +54,13 @@ from skyvern.forge.sdk.ember.tools.account_groups import (
     AccountGroupRefusal,
     AccountGroupState,
     AccountGroupSubmission,
+    RunGroupResults,
     SingleRunSubmission,
     account_group_status,
     cancel_account_group,
     run_for_accounts,
     run_for_inputs,
+    run_group_results,
     run_saved_workflow,
 )
 from skyvern.forge.sdk.ember.tools.workflow_update import (
@@ -78,8 +84,9 @@ from skyvern.forge.sdk.services.request_principal import (
     RequestPrincipal,
     scoped_api_key_id_from_actor,
 )
+from skyvern.forge.sdk.workflow import response_value_caps
 from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
-from skyvern.forge.sdk.workflow.models.block import TaskBlock
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, CodeBlock, TaskBlock
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import GoogleSheetsReadBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AzureVaultCredentialParameter,
@@ -103,6 +110,7 @@ from skyvern.schemas.workflow_run_groups import (
     WorkflowRunGroupItemState,
     WorkflowRunGroupStatus,
 )
+from skyvern.services import run_service
 from skyvern.services import workflow_run_group_service as group_service
 from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from tests.unit.conftest import (
@@ -604,7 +612,7 @@ def test_withholding_submission_hides_only_the_run_tool(
     )
 
     names = set(surface.ordered_native_names)
-    assert {"get_account_group_status", "cancel_account_group"} <= names
+    assert {"get_account_group_status", "get_run_group_results", "cancel_account_group"} <= names
     assert ("run_workflow_for_accounts" in names) is (withheld_by is None)
 
 
@@ -1078,24 +1086,6 @@ async def test_a_credential_input_with_no_value_runs_without_a_credential_as_run
     assert await _run_count(chat) == before + 1
     parameters = await chat.env.database.workflow_runs.get_workflow_run_parameters(result.workflow_run_id)
     assert not ({parameter.key: value.value for parameter, value in parameters}.get("login") or "").strip()
-
-
-@pytest.mark.parametrize(("supports_single_run_card", "submit_enabled"), [(True, True), (False, True), (True, False)])
-def test_the_single_run_tool_is_offered_only_to_clients_that_render_its_card(
-    monkeypatch: pytest.MonkeyPatch, supports_single_run_card: bool, submit_enabled: bool
-) -> None:
-    monkeypatch.setattr(settings, "EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED", submit_enabled)
-    names = {
-        tool.name
-        for tool in ember_native_tools(
-            supports_question_tool=True,
-            supports_single_run_card=supports_single_run_card,
-            browser_code_available=False,
-            run_tools_available=True,
-        )
-    }
-
-    assert ("run_saved_workflow" in names) is (supports_single_run_card and submit_enabled)
 
 
 @pytest.mark.asyncio
@@ -2578,6 +2568,24 @@ async def test_a_large_input_group_pages_in_submission_order_and_its_results_sta
     assert first.counts is not None and first.counts[WorkflowRunGroupItemOutcome.completed] == 28
     assert sum(first.counts.values()) == 60
 
+    read = _spy_run_reads(monkeypatch)
+    pages: list[RunGroupResults] = []
+    cursor = None
+    with _as_requester(ORG_KEY):
+        while True:
+            page = await run_group_results(chat.ctx, group_id, cursor=cursor)
+            assert isinstance(page, RunGroupResults) and page.rows is not None
+            pages.append(page)
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+    indexed = [row for page in pages for row in page.rows or []]
+    assert [len(page.rows or []) for page in pages] == [25, 25, 10] and pages[0].counts == first.counts
+    assert [row.inputs for row in indexed[:28]] == [{"note": f"n{i}"} for i in range(28)]
+    assert all(row.inputs in ({}, {"note": f"n{row.position}"}) for row in indexed)
+    assert all(row.output is None and row.output_state is None for row in indexed) and read == []
+    assert pages[0].page_url == f"{settings.SKYVERN_APP_URL.rstrip('/')}/run-groups/{group_id}"
+
     cancel = asyncio.create_task(
         cancel_account_group(chat.ctx, tool_call_id="call-cancel", workflow_run_group_id=group_id)
     )
@@ -2608,30 +2616,58 @@ async def test_history_links_an_input_group_whose_record_failed_by_rebuilding_it
 
 
 @pytest.mark.parametrize(
-    ("supports_input_group_card", "supports_account_group_card", "submit_enabled"),
-    [(True, True, True), (False, True, True), (True, False, True), (True, True, False)],
+    ("tool_name", "flag", "enabled", "card_support", "offered"),
+    [
+        ("run_saved_workflow", "EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED", True, {"supports_single_run_card": True}, True),
+        ("run_saved_workflow", "EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED", True, {"supports_single_run_card": False}, False),
+        ("run_saved_workflow", "EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED", False, {"supports_single_run_card": True}, False),
+        (
+            "run_workflow_for_inputs",
+            "WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED",
+            True,
+            {"supports_input_group_card": True, "supports_account_group_card": True},
+            True,
+        ),
+        (
+            "run_workflow_for_inputs",
+            "WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED",
+            True,
+            {"supports_input_group_card": False, "supports_account_group_card": True},
+            False,
+        ),
+        (
+            "run_workflow_for_inputs",
+            "WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED",
+            True,
+            {"supports_input_group_card": True, "supports_account_group_card": False},
+            False,
+        ),
+        (
+            "run_workflow_for_inputs",
+            "WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED",
+            False,
+            {"supports_input_group_card": True, "supports_account_group_card": True},
+            False,
+        ),
+    ],
 )
-def test_the_input_group_tool_is_offered_only_to_clients_that_render_its_card(
+def test_a_run_tool_is_offered_only_to_clients_that_render_its_card(
     monkeypatch: pytest.MonkeyPatch,
-    supports_input_group_card: bool,
-    supports_account_group_card: bool,
-    submit_enabled: bool,
+    tool_name: str,
+    flag: str,
+    enabled: bool,
+    card_support: dict[str, bool],
+    offered: bool,
 ) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED", submit_enabled)
+    monkeypatch.setattr(settings, flag, enabled)
     names = {
         tool.name
         for tool in ember_native_tools(
-            supports_question_tool=True,
-            supports_account_group_card=supports_account_group_card,
-            supports_input_group_card=supports_input_group_card,
-            browser_code_available=False,
-            run_tools_available=True,
+            supports_question_tool=True, browser_code_available=False, run_tools_available=True, **card_support
         )
     }
 
-    assert ("run_workflow_for_inputs" in names) is (
-        supports_input_group_card and supports_account_group_card and submit_enabled
-    )
+    assert (tool_name in names) is offered
 
 
 @pytest.mark.asyncio
@@ -2673,10 +2709,31 @@ async def test_login_group_status_keeps_logins_hidden_from_this_user_out_of_its_
     monkeypatch.setattr(account_groups, "load_credentials", AsyncMock(return_value=[]))
 
     status = await account_group_status(chat.ctx, group_id)
+    with _as_requester(ORG_KEY):
+        results = await run_group_results(chat.ctx, group_id)
+        refused = await run_group_results(chat.ctx, group_id, row_keys=["cred_1"])
 
     assert isinstance(status, AccountGroupState)
     assert status.rows == []
     assert status.counts is not None and sum(status.counts.values()) == 3
+    assert isinstance(results, RunGroupResults) and results.rows == [] and sum(results.counts.values()) == 3
+    assert isinstance(refused, AccountGroupRefusal)
+
+
+async def _results_label_login_rows_with_the_masked_account(chat: Chat, monkeypatch: pytest.MonkeyPatch) -> None:
+    group_id = await _running_group_of_three(chat)
+
+    status = await account_group_status(chat.ctx, group_id)
+    with _as_requester(ORG_KEY):
+        results = await run_group_results(chat.ctx, group_id)
+        named = await run_group_results(chat.ctx, group_id, row_keys=["cred_2"])
+
+    assert isinstance(status, AccountGroupState)
+    assert isinstance(results, RunGroupResults) and results.rows is not None
+    assert [(row.row_key, row.label) for row in results.rows] == [(row.credential_id, row.label) for row in status.rows]
+    assert all(row.label for row in results.rows)
+    assert isinstance(named, RunGroupResults) and named.row_results is not None
+    assert named.row_results[0].label == results.rows[1].label
 
 
 @pytest.mark.asyncio
@@ -2728,3 +2785,351 @@ async def test_an_input_group_cancel_card_lists_unfinished_runs_by_position_with
     kept = await asyncio.wait_for(cancel, 5)
     assert isinstance(kept, AccountGroupState) and kept.cancel_approved is False
     assert kept.counts is not None and sum(kept.counts.values()) == 3
+
+
+async def _input_group(chat: Chat, notes: list[str], finished: int) -> tuple[str, list[str], list[str]]:
+    submitted = await _approve_every_row(chat, _start_rows(chat, [{"note": note} for note in notes], at_once=3))
+    group_id = submitted.workflow_run_group_id
+    assert group_id is not None
+    await _complete_first(chat, group_id, finished)
+    items = await chat.env.database.workflow_run_groups.get_items(group_id)
+    return group_id, [item.item_key for item in items], [item.workflow_run_id for item in items]
+
+
+async def _record_outputs(chat: Chat, output_parameter_id: str, outputs: dict[str, JsonValue]) -> None:
+    async with chat.env.database.Session() as session:
+        session.add_all(
+            WorkflowRunOutputParameterModel(
+                workflow_run_id=run_id, output_parameter_id=output_parameter_id, value=value
+            )
+            for run_id, value in outputs.items()
+        )
+        await session.commit()
+
+
+async def _save_newer_version_ending_in_summary(chat: Chat) -> None:
+    async with chat.env.database.Session() as session:
+        session.add_all(
+            [
+                OutputParameterModel(output_parameter_id="login_id", workflow_id="wf_1", key="login"),
+                OutputParameterModel(output_parameter_id="summary_id", workflow_id="wf_2", key="summary"),
+                WorkflowModel(
+                    workflow_id="wf_2",
+                    workflow_permanent_id=RUN_GROUP_WPID,
+                    organization_id=RUN_GROUP_ORG,
+                    title="Workflow",
+                    version=2,
+                    workflow_definition=run_group_definition(
+                        TaskBlock(
+                            label="summary",
+                            url="https://example.com",
+                            output_parameter=make_block_output_parameter("summary", "wf_2"),
+                        )
+                    ),
+                ),
+            ]
+        )
+        await session.commit()
+
+
+def _spy_run_reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    read: list[str] = []
+    build = run_service.build_workflow_and_run_from_workflow_run_id
+
+    async def spy(organization_id: str, workflow_run_id: str, cap_output_values: bool) -> Any:
+        read.append(workflow_run_id)
+        return await build(organization_id, workflow_run_id, cap_output_values)
+
+    monkeypatch.setattr(run_service, "build_workflow_and_run_from_workflow_run_id", spy)
+    return read
+
+
+async def _set_executed_last_block(chat: Chat, block: BlockTypeVar) -> None:
+    async with chat.env.database.Session() as session:
+        await session.execute(
+            update(WorkflowModel)
+            .where(WorkflowModel.workflow_id == "wf_1")
+            .values(workflow_definition=run_group_definition(block))
+        )
+        await session.commit()
+
+
+async def _results_index_pages_stay_in_budget(chat: Chat, monkeypatch: pytest.MonkeyPatch) -> None:
+    group_id, keys, _ = await _input_group(chat, ["alpha-note", "b" * 900, "gamma-note", "delta-note"], finished=4)
+    monkeypatch.setattr(account_groups, "_RUN_RESULTS_PAGE_CHAR_BUDGET", 600)
+
+    pages: list[RunGroupResults] = []
+    cursor = None
+    with _as_requester(ORG_KEY):
+        while True:
+            page = await run_group_results(chat.ctx, group_id, cursor=cursor)
+            assert isinstance(page, RunGroupResults) and page.rows is not None
+            pages.append(page)
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+
+    assert len(pages) > 1
+    assert all(len(page.model_dump_json(exclude_none=True)) <= 600 for page in pages)
+    rows = [row for page in pages for row in page.rows or []]
+    assert [row.row_key for row in rows] == keys
+    assert (rows[1].inputs, rows[1].inputs_too_large) == (None, True)
+    assert rows[0].inputs == {"note": "alpha-note"}
+
+
+async def _results_refused(chat: Chat, monkeypatch: pytest.MonkeyPatch, case: str) -> None:
+    group_id, keys, run_ids = await _input_group(chat, ["alpha-note", "beta-note"], finished=2)
+    _, other_keys, _ = await _input_group(chat, ["other-note"], finished=1)
+    await _save_newer_version_ending_in_summary(chat)
+    await _record_outputs(chat, "login_id", {run_id: "found alpha" for run_id in run_ids})
+    row_keys: list[str] | None = None
+    cursor = None
+    if case == "foreign_workflow":
+        chat.ctx.workflow_permanent_id = "wpid_other"
+    elif case == "foreign_org":
+        chat.ctx.organization_id = "o_other"
+    elif case in ("run_read_denied", "workflow_read_denied"):
+        denied_action = "workflow.read" if case == "workflow_read_denied" else "workflow_run.read"
+
+        async def deny_read(_: RequestPrincipal, action: str | None, __: BearerIdentityStatus | None) -> None:
+            if action == denied_action:
+                raise HTTPException(status_code=403, detail="Forbidden")
+
+        monkeypatch.setattr(app.AGENT_FUNCTION, "enforce_request_role", deny_read)
+    elif case == "folder_denied":
+        monkeypatch.setattr(
+            app.AGENT_FUNCTION, "enforce_folder_access_for_runs", AsyncMock(side_effect=HTTPException(status_code=403))
+        )
+    elif case.endswith("_for_named_rows"):
+        denied = "enforce_folder_access" if case.startswith("group") else "enforce_folder_access_for_runs"
+        monkeypatch.setattr(app.AGENT_FUNCTION, denied, AsyncMock(side_effect=HTTPException(status_code=403)))
+        row_keys = [keys[0]]
+    elif case == "foreign_row_key":
+        row_keys = [keys[0], "f" * 64]
+    elif case == "other_groups_row_key":
+        row_keys = [keys[0], other_keys[0]]
+    elif case == "foreign_cursor":
+        cursor = "wrg_other:0"
+    elif case == "too_many_row_keys":
+        monkeypatch.setattr(account_groups, "RUN_RESULTS_MAX_ROW_KEYS", 1)
+        row_keys = keys
+    else:
+        cursor, row_keys = f"{group_id}:0", [keys[0]]
+
+    with _as_requester(ORG_KEY):
+        refused = await run_group_results(chat.ctx, group_id, cursor=cursor, row_keys=row_keys)
+
+    assert isinstance(refused, AccountGroupRefusal)
+    dumped = refused.model_dump_json()
+    assert "alpha" not in dumped and run_ids[0] not in dumped
+
+
+async def _results_named_rows(chat: Chat, monkeypatch: pytest.MonkeyPatch) -> None:
+    secret_note = "secret-note-7781"
+    notes = [
+        "alpha-note",
+        secret_note,
+        "zero-note",
+        "silent-note",
+        "removed",
+        "redacted",
+        "capped",
+        "null",
+        "large",
+        "waiting-note",
+        "queued-note",
+    ]
+    group_id, keys, run_ids = await _input_group(chat, notes, finished=9)
+    register_secret_scrub_value(chat.ctx, secret_note)
+    register_secret_scrub_value(chat.ctx, "secret-name-6613")
+    await _save_newer_version_ending_in_summary(chat)
+    await _record_outputs(
+        chat,
+        "login_id",
+        {
+            run_ids[0]: {"people": [{"name": "Ada"}], "offices": []},
+            run_ids[1]: f"saw {secret_note}",
+            run_ids[2]: [],
+            run_ids[4]: SCRUBBED_VALUE,
+            run_ids[5]: REDACTED_SECRET_PLACEHOLDER,
+            run_ids[6]: {"people": [{"name": f"secret-name-6613 {'n' * 400}"} for _ in range(5)]},
+            run_ids[7]: None,
+            run_ids[8]: "x" * 2_000,
+        },
+    )
+    await _record_outputs(chat, "summary_id", {run_ids[3]: "newer version output"})
+    alpha, secret, zero, silent, removed, redacted, capped, null, large, waiting, queued = keys
+    read = _spy_run_reads(monkeypatch)
+
+    with _as_requester(ORG_KEY):
+        named = await run_group_results(
+            chat.ctx, group_id, row_keys=[alpha, zero, alpha, silent, waiting, queued, secret]
+        )
+        with monkeypatch.context() as capped_values:
+            capped_values.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", 1_000)
+            masked = await run_group_results(chat.ctx, group_id, row_keys=[removed, redacted, capped, null])
+
+    assert isinstance(named, RunGroupResults) and named.rows is None and named.row_results is not None
+    assert [row.row_key for row in named.row_results] == [alpha, zero, silent, waiting, queued, secret]
+    assert named.deferred_row_keys == []
+    states = {row.row_key: (row.output_state, row.output) for row in named.row_results}
+    alpha_inputs = named.row_results[0].inputs
+    assert alpha_inputs is not None and alpha_inputs["note"] == "alpha-note"
+    assert states[alpha] == ("recorded", {"login": {"people": [{"name": "Ada"}], "offices": []}})
+    assert states[zero] == ("recorded", {"login": []})
+    assert states[silent] == ("unavailable", None)
+    assert states[waiting] == ("pending", None)
+    assert states[queued] == ("pending", None)
+    assert states[secret][0] == "recorded"
+    assert isinstance(masked, RunGroupResults) and masked.row_results is not None
+    states = {row.row_key: (row.output_state, row.output) for row in masked.row_results}
+    assert states[removed] == ("unavailable", None)
+    assert states[redacted] == ("redacted", {"login": REDACTED_SECRET_PLACEHOLDER})
+    assert states[capped][0] == "truncated" and "n" * 400 in json.dumps(states[capped][1])
+    assert states[null] == ("recorded", {"login": None})
+    dumped = named.model_dump_json() + masked.model_dump_json()
+    assert secret_note not in dumped and "newer version output" not in dumped and "secret-name-6613" not in dumped
+
+    read.clear()
+    monkeypatch.setattr(account_groups, "_RUN_RESULTS_DETAIL_CHAR_BUDGET", 1_200)
+    with _as_requester(ORG_KEY):
+        stopped = await run_group_results(chat.ctx, group_id, row_keys=[alpha, large, zero])
+    assert isinstance(stopped, RunGroupResults) and stopped.row_results is not None
+    assert [row.row_key for row in stopped.row_results] == [alpha]
+    assert stopped.deferred_row_keys == [large, zero] and run_ids[2] not in read
+    assert len(stopped.model_dump_json(exclude_none=True)) <= 1_200
+
+    monkeypatch.setattr(account_groups, "_RUN_RESULTS_DETAIL_CHAR_BUDGET", 1)
+    with _as_requester(ORG_KEY):
+        bounded = await run_group_results(chat.ctx, group_id, row_keys=[large, zero, silent])
+    assert isinstance(bounded, RunGroupResults) and bounded.row_results is not None
+    [first] = bounded.row_results
+    assert (first.row_key, first.workflow_run_id, first.output_state, first.output) == (
+        large,
+        run_ids[8],
+        "too_large",
+        None,
+    )
+    assert bounded.deferred_row_keys == [zero, silent] and bounded.page_path == f"/run-groups/{group_id}"
+
+
+async def _results_unreadable_rows(chat: Chat, monkeypatch: pytest.MonkeyPatch) -> None:
+    group_id, keys, run_ids = await _input_group(chat, ["alpha-note", "beta-note", "gamma-note"], finished=3)
+    await _save_newer_version_ending_in_summary(chat)
+    await _record_outputs(chat, "login_id", {run_id: "found" for run_id in run_ids})
+    read_parameters = app.DATABASE.workflow_runs.get_workflow_run_parameters
+    build = run_service.build_workflow_and_run_from_workflow_run_id
+
+    async def fail_inputs(workflow_run_id: str) -> Any:
+        if workflow_run_id == run_ids[1]:
+            raise RuntimeError("read failed")
+        return await read_parameters(workflow_run_id)
+
+    async def fail_run(organization_id: str, workflow_run_id: str, cap_output_values: bool) -> Any:
+        if workflow_run_id == run_ids[2]:
+            raise RuntimeError("storage timeout")
+        return await build(organization_id, workflow_run_id, cap_output_values)
+
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run_parameters", fail_inputs)
+    monkeypatch.setattr(run_service, "build_workflow_and_run_from_workflow_run_id", fail_run)
+    with _as_requester(ORG_KEY):
+        page = await run_group_results(chat.ctx, group_id)
+        named = await run_group_results(chat.ctx, group_id, row_keys=keys)
+
+    assert isinstance(page, RunGroupResults) and page.rows is not None
+    assert [(row.row_key, row.inputs, row.inputs_unavailable) for row in page.rows] == [
+        (keys[0], {"note": "alpha-note"}, None),
+        (keys[1], None, True),
+        (keys[2], {"note": "gamma-note"}, None),
+    ]
+    assert isinstance(named, RunGroupResults) and named.row_results is not None
+    assert [(row.row_key, row.output_state) for row in named.row_results] == [
+        (keys[0], "recorded"),
+        (keys[1], "unavailable"),
+        (keys[2], "unavailable"),
+    ]
+
+
+async def _results_after_an_in_place_edit(chat: Chat, monkeypatch: pytest.MonkeyPatch) -> None:
+    group_id, keys, run_ids = await _input_group(chat, ["alpha-note"], finished=1)
+    await _record_outputs(chat, "login_id", {run_ids[0]: "found before the edit"})
+    async with chat.env.database.Session() as session:
+        session.add(OutputParameterModel(output_parameter_id="login_id", workflow_id="wf_1", key="login"))
+        await session.execute(
+            update(WorkflowParameterModel)
+            .where(WorkflowParameterModel.key == "note")
+            .values(deleted_at=datetime.now(UTC).replace(tzinfo=None))
+        )
+        await session.commit()
+    await _set_executed_last_block(
+        chat, CodeBlock(label="login", code="result = 1", output_parameter=make_block_output_parameter("login"))
+    )
+
+    with _as_requester(ORG_KEY):
+        page = await run_group_results(chat.ctx, group_id)
+        named = await run_group_results(chat.ctx, group_id, row_keys=keys)
+
+    assert isinstance(page, RunGroupResults) and page.rows is not None
+    assert isinstance(named, RunGroupResults) and named.row_results is not None
+    [row] = named.row_results
+    assert (row.output_state, row.output_unavailable_reason, row.output) == ("unavailable", "definition_changed", None)
+    assert page.rows[0].inputs == {} and row.inputs == {}
+    dumped = page.model_dump_json() + named.model_dump_json()
+    assert "alpha-note" not in dumped and "found before the edit" not in dumped
+
+
+async def _results_after_a_credential_input_became_text(chat: Chat, monkeypatch: pytest.MonkeyPatch) -> None:
+    group_id, keys, _ = await _input_group(chat, ["acct-ran-with-4471"], finished=1)
+    async with chat.env.database.Session() as session:
+        await session.execute(
+            update(WorkflowParameterModel)
+            .where(WorkflowParameterModel.key == "note")
+            .values(workflow_parameter_type="credential_id", deleted_at=datetime.now(UTC).replace(tzinfo=None))
+        )
+        session.add(WorkflowParameterModel(workflow_id="wf_1", key="note", workflow_parameter_type="string"))
+        await session.commit()
+
+    with _as_requester(ORG_KEY):
+        page = await run_group_results(chat.ctx, group_id)
+        named = await run_group_results(chat.ctx, group_id, row_keys=keys)
+
+    assert isinstance(page, RunGroupResults) and page.rows is not None
+    assert isinstance(named, RunGroupResults) and named.row_results is not None
+    assert page.rows[0].inputs == {"note": REDACTED_SECRET_PLACEHOLDER}
+    assert named.row_results[0].inputs == {"note": REDACTED_SECRET_PLACEHOLDER}
+    assert "acct-ran-with-4471" not in page.model_dump_json() + named.model_dump_json()
+
+
+_RESULTS_CASES = {
+    "index_pages_stay_in_budget": _results_index_pages_stay_in_budget,
+    "named_rows": _results_named_rows,
+    "unreadable_rows": _results_unreadable_rows,
+    "in_place_edit_after_the_runs": _results_after_an_in_place_edit,
+    "credential_input_retyped_to_text": _results_after_a_credential_input_became_text,
+    "login_rows_labeled_by_masked_account": _results_label_login_rows_with_the_masked_account,
+}
+_RESULTS_REFUSALS = (
+    "foreign_workflow",
+    "foreign_org",
+    "run_read_denied",
+    "workflow_read_denied",
+    "folder_denied",
+    "group_folder_denied_for_named_rows",
+    "run_folder_denied_for_named_rows",
+    "foreign_row_key",
+    "other_groups_row_key",
+    "foreign_cursor",
+    "too_many_row_keys",
+    "cursor_with_row_keys",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [*_RESULTS_CASES, *_RESULTS_REFUSALS])
+async def test_group_results_disclose_only_this_groups_rows_within_budget(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    if case in _RESULTS_REFUSALS:
+        await _results_refused(chat, monkeypatch, case)
+    else:
+        await _RESULTS_CASES[case](chat, monkeypatch)

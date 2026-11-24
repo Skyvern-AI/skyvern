@@ -983,6 +983,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   [SINGLE_RUN_TOOL]: "Reviewing the run with you",
   [INPUT_GROUP_TOOL]: "Reviewing the runs with you",
   get_account_group_status: "Checking the group runs",
+  get_run_group_results: "Reading the group results",
   cancel_account_group: "Reviewing a cancel with you",
   delete_saved_credentials: "Reviewing a credential deletion with you",
 };
@@ -1049,6 +1050,7 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   [SINGLE_RUN_TOOL]: "run",
   [INPUT_GROUP_TOOL]: "run",
   get_account_group_status: "other",
+  get_run_group_results: "other",
   cancel_account_group: "other",
   delete_saved_credentials: "other",
 };

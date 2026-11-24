@@ -36,6 +36,7 @@ from skyvern.forge.sdk.ember.ask_user import (
     ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
     CREDENTIAL_DELETE_TOOL_NAME,
     INPUT_GROUP_TOOL_NAME,
+    RUN_GROUP_RESULTS_TOOL_NAME,
     SINGLE_RUN_TOOL_NAME,
     AskUserArguments,
     QuestionInput,
@@ -113,6 +114,7 @@ from skyvern.forge.sdk.ember.tools.account_groups import (
     cancel_account_group,
     run_for_accounts,
     run_for_inputs,
+    run_group_results,
     run_saved_workflow,
     single_run_submit_enabled,
 )
@@ -1269,8 +1271,32 @@ async def get_account_group_status_tool(
     """Read each run's id, status and outcome for a group started by run_workflow_for_accounts or
     run_workflow_for_inputs, 25 rows per page in submission order, with counts by outcome for the whole group; pass
     next_offset as offset for the next page. A failed outcome means the run stopped before it could have acted;
-    unknown means it may have acted."""
+    unknown means it may have acted. It reads no inputs or outputs; get_run_group_results reads those."""
     return (await account_group_status(ctx.context, workflow_run_group_id, offset)).model_dump_json(exclude_none=True)
+
+
+@function_tool(failure_error_function=ember_tool_failure, name_override=RUN_GROUP_RESULTS_TOOL_NAME)
+async def get_run_group_results_tool(
+    ctx: ToolContext[EmberContext],
+    workflow_run_group_id: str,
+    cursor: str | None = None,
+    row_keys: list[str] | None = None,
+) -> str:
+    """Read what a group started by run_workflow_for_accounts or run_workflow_for_inputs found. Without row_keys it
+    returns counts by outcome for the whole group, up to 25 rows in submission order (row_key, position,
+    workflow_run_id, outcome, the account's masked label for a login group, and the run's inputs with credentials
+    hidden, no outputs), next_cursor while rows remain (pass it as cursor), and page_url, the group's results page
+    in the app, which shows every row's final output and downloads the whole group as CSV. row_keys (at most 25
+    row_key values from this result, never with cursor) return row_results with the final outputs of the named
+    rows: the recorded output of the workflow's last block. output_state is recorded (null included), pending while
+    the run is
+    unfinished, unavailable when the run kept no value or (output_unavailable_reason definition_changed) when the
+    workflow was edited after the run finished, redacted or truncated when the app masked or cut the value, or
+    too_large when it does not fit; named rows past the size budget are listed in deferred_row_keys. A completed
+    outcome means the run finished, not that it found what was asked; failed means it stopped before it could have
+    acted; unknown means it may have acted."""
+    result = await run_group_results(ctx.context, workflow_run_group_id, cursor, row_keys)
+    return result.model_dump_json(exclude_none=True)
 
 
 @function_tool(failure_error_function=ember_tool_failure, name_override=ACCOUNT_GROUP_CANCEL_TOOL_NAME)
@@ -2560,7 +2586,12 @@ inspect_locator_matches_tool = FunctionTool(
 
 
 ACCOUNT_GROUP_TOOL_NAMES = frozenset(
-    {ACCOUNT_GROUP_SUBMIT_TOOL_NAME, ACCOUNT_GROUP_STATUS_TOOL_NAME, ACCOUNT_GROUP_CANCEL_TOOL_NAME}
+    {
+        ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+        ACCOUNT_GROUP_STATUS_TOOL_NAME,
+        ACCOUNT_GROUP_CANCEL_TOOL_NAME,
+        RUN_GROUP_RESULTS_TOOL_NAME,
+    }
 )
 
 NATIVE_TOOLS = [
@@ -2606,6 +2637,7 @@ NATIVE_TOOLS = [
     run_workflow_for_inputs_tool,
     run_saved_workflow_tool,
     get_account_group_status_tool,
+    get_run_group_results_tool,
     cancel_account_group_tool,
     delete_saved_credentials_tool,
     reply_tool,

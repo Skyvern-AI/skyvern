@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field, JsonValue, ValidationError
 
 from skyvern.config import settings
+from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import InvalidWorkflowParameter, MissingBrowserAddressError, SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AuditEvent
@@ -51,7 +52,15 @@ from skyvern.forge.sdk.ember.tools.credentials import (
     run_credential_gate,
 )
 from skyvern.forge.sdk.ember.tools.mcp_hooks import PENDING_PROPOSAL_FACT, _chat_has_pending_proposal
-from skyvern.forge.sdk.ember.tools.run_execution import _declared_execution_snapshot, _run_credits_used
+from skyvern.forge.sdk.ember.tools.run_execution import (
+    _RUN_RESULTS_DETAIL_CHAR_BUDGET,
+    _RUN_RESULTS_PAGE_CHAR_BUDGET,
+    RUN_RESULTS_MAX_ROW_KEYS,
+    _declared_execution_snapshot,
+    _run_credits_used,
+    parse_run_results_cursor,
+    run_results_cursor,
+)
 from skyvern.forge.sdk.ember.tools.workflow_update import adopt_stored_workflow_candidate
 from skyvern.forge.sdk.ember.workflow_credential_utils import (
     block_credential_ids,
@@ -68,6 +77,7 @@ from skyvern.forge.sdk.schemas.ember import (
     ember_proposal_metadata,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.services.browser_session_artifacts import REDACTED_ARTIFACT, browser_session_artifact_read
 from skyvern.forge.sdk.services.request_principal import (
     RequestPrincipal,
     enforce_principal_role,
@@ -91,6 +101,11 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunStatus,
 )
+from skyvern.forge.sdk.workflow.response_value_caps import (
+    TRUNCATION_MARKER_KEY,
+    TRUNCATION_REASON,
+    truncate_oversized_response_value,
+)
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.workflow_run_groups import (
     WorkflowRunGroupCreateRequest,
@@ -101,7 +116,7 @@ from skyvern.schemas.workflow_run_groups import (
     WorkflowRunGroupStatus,
 )
 from skyvern.schemas.workflows import BlockStatus
-from skyvern.services import workflow_run_group_service, workflow_service
+from skyvern.services import run_service, workflow_run_group_service, workflow_service
 from skyvern.services.organization_log_scope import organization_log_scope
 from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
@@ -109,6 +124,8 @@ from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 LOG = structlog.get_logger()
 
 _T = TypeVar("_T")
+
+_CAP_SEARCH_DEPTH = 8
 
 ACCOUNT_GROUP_MAX_ITEMS = 25
 
@@ -123,8 +140,9 @@ SUBMIT_TOOL_DESCRIPTION = (
     "declines; nothing runs without approval. At most 25 accounts per group. The card shows whether this "
     "saved version has completed cleanly in an earlier group for a selected account, and starts unchecked "
     "any account whose last group run completed, may have acted, or is still running. To retry part of an "
-    "earlier group, propose those accounts again. The result only acknowledges dispatch; use "
-    "get_account_group_status for outcomes."
+    "earlier group, propose those accounts again. The result only acknowledges dispatch; "
+    "get_account_group_status reads each run's outcome, and get_run_group_results reads the group's counts, inputs "
+    "and final outputs."
 )
 
 INPUT_GROUP_TOOL_DESCRIPTION = (
@@ -136,7 +154,8 @@ INPUT_GROUP_TOOL_DESCRIPTION = (
     "many rows one card holds. The user reviews the rows on one card, can remove any, and approves or declines; "
     "nothing runs without approval. The card starts unchecked any row whose last group run completed, may have "
     "acted, or is still running. Runs keep going after your reply. The result only acknowledges dispatch; "
-    "get_account_group_status reads each run's id and outcome, and get_run_results with a run id reads that run."
+    "get_account_group_status reads each run's id and outcome, get_run_group_results reads the group's counts, "
+    "inputs and final outputs, and get_run_results with a run id reads that run's blocks."
 )
 
 SINGLE_RUN_TOOL_DESCRIPTION = (
@@ -225,7 +244,7 @@ _QUOTA_UNREADABLE_NOTE = "The account's credits could not be read just now, so n
 
 _STATUS_NOTE = (
     "Runs execute one after another. Pending and in-progress rows have no result yet; "
-    "use get_account_group_status for outcomes."
+    "get_account_group_status reads outcomes and get_run_group_results reads final outputs."
 )
 
 _INPUT_GROUP_OFF_REFUSAL = (
@@ -237,7 +256,7 @@ _INPUT_GROUP_OFF_REFUSAL = (
 def _row_group_status_note(max_concurrency: int) -> str:
     return (
         f"Up to {max_concurrency} runs execute at a time. Pending and in-progress rows have no result yet; "
-        "use get_account_group_status for outcomes."
+        "get_account_group_status reads outcomes and get_run_group_results reads final outputs."
     )
 
 
@@ -287,6 +306,36 @@ class AccountGroupState(BaseModel):
     counts: dict[WorkflowRunGroupItemOutcome, int] | None = None
     next_offset: int | None = None
     cancel_approved: bool | None = None
+
+
+RunGroupOutputState = Literal["recorded", "pending", "unavailable", "redacted", "truncated", "too_large"]
+
+
+class RunGroupResultRow(BaseModel):
+    row_key: str
+    label: str | None = None
+    position: int
+    workflow_run_id: str
+    outcome: WorkflowRunGroupItemOutcome
+    inputs: dict[str, JsonValue] | None = None
+    inputs_too_large: Literal[True] | None = None
+    inputs_unavailable: Literal[True] | None = None
+    output_state: RunGroupOutputState | None = None
+    output_unavailable_reason: Literal["definition_changed"] | None = None
+    output: dict[str, JsonValue] | None = None
+
+
+class RunGroupResults(BaseModel):
+    ok: Literal[True] = True
+    workflow_run_group_id: str
+    status: WorkflowRunGroupStatus
+    page_path: str
+    page_url: str
+    counts: dict[WorkflowRunGroupItemOutcome, int]
+    rows: list[RunGroupResultRow] | None = None
+    next_cursor: str | None = None
+    row_results: list[RunGroupResultRow] | None = None
+    deferred_row_keys: list[str] | None = None
 
 
 async def _require_run_role() -> None:
@@ -1905,3 +1954,227 @@ async def cancel_account_group(
     except SkyvernHTTPException as e:
         return AccountGroupRefusal(status_code=e.status_code, error=str(e))
     return await _group_state(ctx, group, cancel_approved=True)
+
+
+async def _require_group_read(group: WorkflowRunGroupResponse) -> RequestPrincipal:
+    try:
+        principal = await enforce_principal_role(get_request_principal(), "workflow_run.read")
+        await enforce_principal_role(principal, "workflow.read")
+        await app.AGENT_FUNCTION.enforce_folder_access(
+            principal, "workflow_run.read", {"workflow_run_group_id": group.workflow_run_group_id}
+        )
+        await app.AGENT_FUNCTION.enforce_folder_access_for_runs(
+            principal, "workflow_run.read", [item.workflow_run_id for item in group.items]
+        )
+    except HTTPException as e:
+        if e.status_code != 403:
+            raise AccountGroupRefused("Nothing was read: the read permission could not be checked just now.") from e
+        raise AccountGroupRefused(
+            "Nothing was read: the person in this chat does not have permission to read these runs."
+        ) from e
+    return principal
+
+
+async def _declared_input_keys(group: WorkflowRunGroupResponse) -> frozenset[str]:
+    parameters = await app.WORKFLOW_SERVICE.get_workflow_parameters(workflow_id=group.workflow_id)
+    return frozenset(parameter.key for parameter in parameters if not is_sensitive_workflow_parameter(parameter))
+
+
+# A run's stored inputs keep the parameter types they ran with, so a key an in-place edit removed or retyped is
+# shown only while the current definition still declares it as a non-credential input.
+async def _result_row(
+    ctx: EmberContext, item: WorkflowRunGroupItemResponse, declared: frozenset[str]
+) -> RunGroupResultRow:
+    run_parameters = await app.DATABASE.workflow_runs.get_workflow_run_parameters(item.workflow_run_id)
+    return RunGroupResultRow(
+        row_key=item.key,
+        position=item.position,
+        workflow_run_id=item.workflow_run_id,
+        outcome=item.outcome,
+        inputs={
+            key: truncate_oversized_response_value(value, workflow_run_id=item.workflow_run_id, output_key=key)
+            for key, value in _shown_run_inputs(ctx, run_parameters).items()
+            if key in declared
+        },
+    )
+
+
+def _fit_inputs(row: RunGroupResultRow, budget: int) -> int:
+    chars = len(row.model_dump_json(exclude_none=True))
+    if chars <= budget:
+        return chars
+    row.inputs = None
+    row.inputs_too_large = True
+    return len(row.model_dump_json(exclude_none=True))
+
+
+def _is_capped(value: JsonValue, depth: int = 0) -> bool:
+    if depth > _CAP_SEARCH_DEPTH:
+        return False
+    if isinstance(value, list):
+        return any(_is_capped(item, depth + 1) for item in value)
+    if not isinstance(value, dict):
+        return False
+    is_marker = value.get("truncated") is True and value.get("reason") == TRUNCATION_REASON
+    return is_marker or TRUNCATION_MARKER_KEY in value or any(_is_capped(item, depth + 1) for item in value.values())
+
+
+def _recorded_output_state(value: JsonValue) -> RunGroupOutputState:
+    if value == SCRUBBED_VALUE:
+        return "unavailable"
+    if value in (REDACTED_ARTIFACT, REDACTED_SECRET_PLACEHOLDER):
+        return "redacted"
+    if _is_capped(value):
+        return "truncated"
+    return "recorded"
+
+
+async def _final_output(ctx: EmberContext, principal: RequestPrincipal, row: RunGroupResultRow) -> RunGroupResultRow:
+    if row.outcome in _UNFINISHED_OUTCOMES:
+        row.output_state = "pending"
+        return row
+    row.output_state = "unavailable"
+    with browser_session_artifact_read(principal):
+        run = await run_service.build_workflow_and_run_from_workflow_run_id(
+            ctx.organization_id, row.workflow_run_id, cap_output_values=True
+        )
+    if run.finished_at is not None and run.workflow.modified_at > run.finished_at:
+        row.output_unavailable_reason = "definition_changed"
+        return row
+    blocks = run.workflow.workflow_definition.blocks
+    key = blocks[-1].output_parameter.key if blocks else None
+    if key is None or run.outputs is None or key not in run.outputs:
+        return row
+    value = run.outputs[key]
+    row.output_state = _recorded_output_state(value)
+    if row.output_state != "unavailable":
+        row.output = scrub_secrets_from_structure(ctx, {key: value})
+    return row
+
+
+def _unread_row(item: WorkflowRunGroupItemResponse) -> RunGroupResultRow:
+    return RunGroupResultRow(
+        row_key=item.key,
+        position=item.position,
+        workflow_run_id=item.workflow_run_id,
+        outcome=item.outcome,
+        inputs_unavailable=True,
+    )
+
+
+async def _index_row(
+    ctx: EmberContext, item: WorkflowRunGroupItemResponse, declared: frozenset[str]
+) -> RunGroupResultRow:
+    try:
+        return await _result_row(ctx, item, declared)
+    except Exception:
+        LOG.warning("Could not read a run group row's run", workflow_run_id=item.workflow_run_id, exc_info=True)
+        return _unread_row(item)
+
+
+async def _detail_row(
+    ctx: EmberContext, principal: RequestPrincipal, item: WorkflowRunGroupItemResponse, declared: frozenset[str]
+) -> RunGroupResultRow:
+    try:
+        return await _final_output(ctx, principal, await _result_row(ctx, item, declared))
+    except Exception:
+        LOG.warning("Could not read a run group row's run", workflow_run_id=item.workflow_run_id, exc_info=True)
+        row = _unread_row(item)
+        row.output_state = "unavailable"
+        return row
+
+
+# An input row's label quotes its input values, which the declared-input and scrub rules may hide, so only an
+# account row, whose label is the masked login, carries one.
+def _account_label(labels: dict[str, str], key: str) -> str | None:
+    return None if _ROW_KEY_PATTERN.fullmatch(key) else labels[key]
+
+
+async def run_group_results(
+    ctx: EmberContext,
+    workflow_run_group_id: str,
+    cursor: str | None = None,
+    row_keys: list[str] | None = None,
+) -> RunGroupResults | AccountGroupRefusal:
+    try:
+        if cursor is not None and row_keys is not None:
+            raise AccountGroupRefused("Pass either cursor or row_keys, not both; nothing was read.")
+        if row_keys is not None:
+            row_keys = list(dict.fromkeys(row_keys))
+            if len(row_keys) > RUN_RESULTS_MAX_ROW_KEYS:
+                raise AccountGroupRefused(
+                    f"row_keys holds {len(row_keys)} keys; pass at most {RUN_RESULTS_MAX_ROW_KEYS}. Nothing was read."
+                )
+        group = await _group_for_this_workflow(ctx, workflow_run_group_id)
+        principal = await _require_group_read(group)
+        offset = 0
+        if cursor is not None:
+            parsed = parse_run_results_cursor(cursor)
+            if parsed is None or parsed[0] != group.workflow_run_group_id or parsed[1] >= len(group.items):
+                raise AccountGroupRefused(f"cursor {cursor!r} is not a cursor this tool returned for this group.")
+            offset = parsed[1]
+        visible = await _labels(ctx, group)
+        if row_keys is not None:
+            items = {item.key: item for item in group.items if item.key in visible}
+            if any(key not in items for key in row_keys):
+                raise AccountGroupRefused(
+                    "row_keys must be row_key values this tool listed for this group; nothing was read."
+                )
+    except AccountGroupRefused as e:
+        return AccountGroupRefusal(error=str(e))
+
+    declared = await _declared_input_keys(group)
+    page_path = f"/run-groups/{group.workflow_run_group_id}"
+    result = RunGroupResults(
+        workflow_run_group_id=group.workflow_run_group_id,
+        status=group.status,
+        page_path=page_path,
+        page_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}{page_path}",
+        counts=_outcome_counts(group),
+    )
+    if row_keys is None:
+        result.rows = []
+        # Reserve a cursor's length so the envelope is measured at its largest.
+        result.next_cursor = run_results_cursor(group.workflow_run_group_id, len(group.items))
+        row_budget = _RUN_RESULTS_PAGE_CHAR_BUDGET - len(result.model_dump_json(exclude_none=True))
+        result.next_cursor = None
+        remaining = row_budget
+        for index in range(offset, len(group.items)):
+            item = group.items[index]
+            if item.key not in visible:
+                continue
+            if len(result.rows) == ROW_GROUP_PAGE_SIZE:
+                result.next_cursor = run_results_cursor(group.workflow_run_group_id, index)
+                break
+            row = await _index_row(ctx, item, declared)
+            row.label = _account_label(visible, item.key)
+            chars = _fit_inputs(row, row_budget) + 1
+            if result.rows and chars > remaining:
+                result.next_cursor = run_results_cursor(group.workflow_run_group_id, index)
+                break
+            remaining -= chars
+            result.rows.append(row)
+        return result
+
+    result.row_results = []
+    # Deferred keys are always a suffix of row_keys, so reserving all of them bounds the envelope.
+    result.deferred_row_keys = row_keys
+    remaining = _RUN_RESULTS_DETAIL_CHAR_BUDGET - len(result.model_dump_json(exclude_none=True))
+    result.deferred_row_keys = []
+    for index, key in enumerate(row_keys):
+        if result.row_results and remaining <= 0:
+            result.deferred_row_keys = row_keys[index:]
+            break
+        row = await _detail_row(ctx, principal, items[key], declared)
+        row.label = _account_label(visible, key)
+        chars = len(row.model_dump_json(exclude_none=True)) + 1
+        if result.row_results and chars > remaining:
+            result.deferred_row_keys = row_keys[index:]
+            break
+        if chars > remaining:
+            row.output = None
+            row.output_state = "too_large"
+            chars = _fit_inputs(row, remaining) + 1
+        remaining -= chars
+        result.row_results.append(row)
+    return result
