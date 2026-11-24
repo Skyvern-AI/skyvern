@@ -366,6 +366,8 @@ class S3ObjectStream:
     def __init__(self, response: dict[str, Any], lease: contextlib.AsyncExitStack) -> None:
         self.content_length: int = response["ContentLength"]
         self.etag: str | None = response.get("ETag")
+        self.status: int | None = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        self.content_range: str | None = response.get("ContentRange")
         self._body = response["Body"]
         self._lease = lease
 
@@ -1419,10 +1421,14 @@ class AsyncAWSClient:
             try:
                 client = await lease.enter_async_context(self._s3_client())
                 response = await client.get_object(**params)
+                try:
+                    return S3ObjectStream(response, lease)
+                except BaseException:
+                    response["Body"].close()
+                    raise
             except BaseException:
                 await lease.aclose()
                 raise
-            return S3ObjectStream(response, lease)
 
         return await self._s3_with_retry("download", _op, uri=uri)
 
