@@ -19297,6 +19297,7 @@
           "create_sheet_if_missing": {
             "type": "boolean",
             "title": "Create Sheet If Missing",
+            "description": "Add the tab named by sheet_name to the spreadsheet when it has no tab with that name. The spreadsheet itself must already exist.",
             "default": false
           },
           "parameter_keys": {
