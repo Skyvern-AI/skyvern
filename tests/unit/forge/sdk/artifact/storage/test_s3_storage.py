@@ -27,8 +27,13 @@ from aiobotocore.response import StreamingBody
 from aiohttp import web
 from anyio import CancelScope, to_thread
 from botocore import UNSIGNED
+from botocore.exceptions import ClientError, ConnectTimeoutError, EndpointConnectionError
 from freezegun import freeze_time
+from google.api_core.exceptions import Forbidden, RetryError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ReadTimeout, SSLError
 from structlog.testing import capture_logs
+from urllib3.exceptions import ConnectTimeoutError as Urllib3ConnectTimeoutError
 
 import skyvern.forge.sdk.artifact.storage.base as base_module
 import skyvern.forge.sdk.artifact.storage.s3 as s3_module
@@ -38,17 +43,24 @@ from skyvern.forge.sdk.api.aws import _STREAM_UPLOAD_IO_QUEUE_DEPTH, AsyncAWSCli
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
+from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import ProfilePublicationConflict
+from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.db.id import generate_artifact_id
+from skyvern.forge.sdk.encrypt.files import FILE_MAGIC, ArtifactDecryptionError
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
 from tests.unit.forge.sdk.artifact.storage.test_helpers import (
+    ProfileTransport,
+    artifact_root,
     create_fake_for_ai_suggestion,
     create_fake_step,
     create_fake_task_v2,
     create_fake_thought,
     create_fake_workflow_run_block,
+    install_s3_profile_transport,
 )
 from tests.unit.test_aws_client_ttl import _local_s3
 
@@ -1820,7 +1832,6 @@ async def test_browser_profile_exists_propagates_non_not_found_errors() -> None:
     # Regression: a confirmed not-found returns False, but transient/authz errors must PROPAGATE (not
     # swallow to False) so _managed_browser_profile_has_content's fail-safe treats a flaky read as
     # existing content instead of reseeding a run to fresh and overwriting its saved archive.
-    from botocore.exceptions import ClientError
 
     storage = S3Storage()
     storage.async_client = MagicMock()
@@ -1847,7 +1858,9 @@ async def test_retrieve_browser_profile_extracts_sub_buffer_size_archive(
 
     storage = S3Storage()
     storage.async_client = MagicMock()
-    storage.async_client.download_file = AsyncMock(return_value=zip_bytes)
+    storage.async_client.download_file = AsyncMock(
+        side_effect=lambda uri, **_: None if uri.endswith(".enc") else zip_bytes
+    )
 
     monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
     profile_dir = await storage.retrieve_browser_profile("o", "bp")
@@ -1864,11 +1877,8 @@ _RULESET_BYTES = 4096
 _COOKIES_MEMBER = "Default/Network/Cookies"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("confirm_creation", [False, True])
-@pytest.mark.parametrize(
-    ("member", "dangling", "fault", "strict_error"),
-    [
+def _profile_archive_cases() -> list:
+    capture_cases = [
         pytest.param(_COOKIES_MEMBER, False, None, None, id="readable"),
         pytest.param(_COOKIES_MEMBER, False, "listing", errno.EACCES, id="listing"),
         pytest.param(_COOKIES_MEMBER, False, errno.EACCES, errno.EACCES, id="stat-permission"),
@@ -1884,7 +1894,75 @@ _COOKIES_MEMBER = "Default/Network/Cookies"
         pytest.param("SingletonLock", False, errno.ENOENT, errno.ENOENT, id="regular-lock-enoent"),
         pytest.param("SingletonLock", True, errno.EACCES, errno.EACCES, id="root-link-permission"),
         pytest.param("SingletonLock", True, errno.EIO, errno.EIO, id="root-link-io"),
-    ],
+    ]
+    cases = [
+        pytest.param(confirm, *case.values, backend, None, id=f"{case.id}-{confirm}-{backend}")
+        for backend in ("s3", "azure", "gcs")
+        for case in capture_cases
+        for confirm in (False, True)
+        if backend == "s3" or case.id == "listing"
+    ]
+    common = (
+        "legacy",
+        "legacy-read-migrates",
+        "encrypted",
+        "workflow-session",
+        "failed-upload",
+        "cancelled-upload",
+        "sealed-get-confirm-both",
+        "post-stat-unknown",
+    )
+    shared_faults = (
+        "sealed-get-absent",
+        "sealed-get-present",
+        "sealed-get-unknown",
+        "sealed-get-forbidden",
+        "sealed-get-recheck-forbidden",
+        "sealed-get-recheck-unknown",
+        "post-stat-absent",
+        "post-stat-competing",
+    )
+    transport_faults = {
+        "s3": {
+            "endpoint": ("sealed-get-absent", "sealed-get-stat-forbidden", "post-stat-forbidden"),
+            "connect-timeout": ("sealed-get-present", "post-stat-absent"),
+        },
+        "gcs": {
+            "connection": ("sealed-get-absent", "post-stat-absent"),
+            "read-timeout": ("sealed-get-present", "post-stat-unknown"),
+            "retry-connect": ("sealed-get-absent", "post-stat-absent"),
+            "certificate": ("sealed-get-unclassified", "post-stat-unclassified"),
+            "retry-denied": ("sealed-get-unclassified", "post-stat-unclassified"),
+            "retry-unknown": ("sealed-get-unclassified", "post-stat-unclassified"),
+        },
+    }
+    for backend in ("s3", "azure", "gcs"):
+        scenarios = [(scenario, "") for scenario in (common + (shared_faults if backend == "s3" else ()))]
+        scenarios.extend(
+            (scenario, f":{transport}")
+            for transport, faults in transport_faults.get(backend, {}).items()
+            for scenario in faults
+        )
+        cases.extend(
+            pytest.param(
+                False,
+                _COOKIES_MEMBER,
+                False,
+                None,
+                None,
+                backend,
+                f"{scenario}{transport}",
+                id=f"{scenario}-{backend}{transport.replace(':', '-')}",
+            )
+            for scenario, transport in scenarios
+        )
+    return cases
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("confirm_creation", "member", "dangling", "fault", "strict_error", "backend", "scenario"),
+    _profile_archive_cases(),
 )
 async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_the_archive(
     s3_storage: S3Storage,
@@ -1895,6 +1973,8 @@ async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_t
     dangling: bool,
     fault: str | int | None,
     strict_error: int | None,
+    backend: str,
+    scenario: str | None,
 ) -> None:
     # Each run loads its extensions from a new path, so Chrome indexes a fresh DNR ruleset under a new extension
     # id and never prunes the old ones; archiving them grew one profile to 2.7 GiB extracted.
@@ -1915,7 +1995,6 @@ async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_t
     rules_dir = profile / "Default" / "DNR Extension Rules" / _EXTENSION_ID
     rules_dir.mkdir(parents=True)
     (rules_dir / "ruleset.bin").write_bytes(b"r" * _RULESET_BYTES)
-    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
     if fault == "listing":
         scandir = os.scandir
 
@@ -1938,29 +2017,52 @@ async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_t
 
         monkeypatch.setattr(os, "stat", stat_entry)
 
+    temp = tmp_path / "temp"
+    monkeypatch.setattr(settings, "TEMP_PATH", str(temp))
+    monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", (artifact_root(),))
+    monkeypatch.setattr(settings, "AWS_S3_BUCKET_BROWSER_SESSIONS", TEST_BUCKET)
+    monkeypatch.setattr(settings, "AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS", "test-container")
+    monkeypatch.setattr(settings, "GCS_BUCKET_BROWSER_SESSIONS", TEST_BUCKET)
+    monkeypatch.setattr(settings, "ENABLE_ENCRYPTION", True)
+    assert type(settings).model_fields["SKYVERN_ENCRYPT_BROWSER_PROFILES"].default is False
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
+    storage = {
+        "s3": lambda: s3_storage,
+        "azure": lambda: AzureStorage(account_name="teststorage", account_key="synthetic-test-key"),
+        "gcs": GcsStorage,
+    }[backend]()
+    fake = ProfileTransport()
+    if isinstance(storage, S3Storage):
+        install_s3_profile_transport(storage, fake, monkeypatch)
+    else:
+        monkeypatch.setattr(storage, "async_client", fake)
+
+    upload = storage.async_client.upload_file_from_path
     uploads: list[str] = []
     archived: dict[str, bytes] = {}
 
     async def capture_upload(uri: str, path: str, **kwargs: object) -> None:
         uploads.append(uri)
-        if confirm_creation and not kwargs.get("raise_exception"):
+        if confirm_creation and backend == "s3" and not kwargs.get("raise_exception"):
             return
         with zipfile.ZipFile(path) as archive:
             archived.update({name: archive.read(name) for name in archive.namelist()})
+        await upload(uri, path, **kwargs)
 
-    s3_storage.async_client = MagicMock()
-    s3_storage.async_client.upload_file_from_path = AsyncMock(side_effect=capture_upload)
+    monkeypatch.setattr(storage.async_client, "upload_file_from_path", capture_upload)
 
     if confirm_creation and strict_error is not None:
         with pytest.raises(OSError) as error:
-            await s3_storage.store_browser_profile("o", "bp", str(profile), confirm_creation=True)
+            await storage.store_browser_profile("o", "bp", str(profile), confirm_creation=True)
         assert error.value.errno == strict_error
         assert not uploads
         assert not list((tmp_path / "temp").glob("*.zip"))
         return
 
     with capture_logs() as events:
-        await s3_storage.store_browser_profile("o", "bp", str(profile), confirm_creation=confirm_creation)
+        await storage.store_browser_profile(
+            "o", "bp", str(profile), **({"confirm_creation": True} if confirm_creation else {})
+        )
 
     assert "Local State" in archived
     assert (member in archived) is (not dangling and fault is None)
@@ -1972,7 +2074,248 @@ async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_t
     archived_event = next(event for event in events if event["event"] == "Archived browser profile")
     assert archived_event["excluded_bytes"] == _RULESET_BYTES
     assert archived_event["zip_bytes"] > 0
-    assert not list((tmp_path / "temp").glob("*.zip"))
+    assert not list(temp.glob("*.zip"))
+    if scenario is None:
+        return
+
+    monkeypatch.setattr(storage.async_client, "upload_file_from_path", upload)
+    legacy_uri, legacy = next(iter(fake.objects.items()))
+    assert legacy_uri.endswith("/o/profiles/bp.zip")
+    assert await storage.browser_profile_exists("o", "bp")
+    original_stat = fake.get_object_info
+
+    async def no_metadata(uri: str) -> dict | None:
+        raise AssertionError("Legacy Azure/GCS freshness must not call metadata")
+
+    if backend != "s3":
+        monkeypatch.setattr(fake, "get_object_info", no_metadata)
+    legacy_etag = await storage.get_browser_profile_etag("o", "bp")
+    if backend != "s3":
+        assert legacy_etag is None
+        monkeypatch.setattr(fake, "get_object_info", original_stat)
+    reopened = await storage.retrieve_browser_profile_snapshot("o", "bp", copy=True)
+    assert reopened is not None and not reopened.encrypted
+    assert (Path(reopened.directory) / cookies.relative_to(profile)).read_bytes() == b"cookies"
+    if backend == "s3":
+        assert fake.upload_policies[-1]["StorageClass"] == str(S3StorageClass.ONEZONE_IA)
+    if scenario == "legacy":
+        assert reopened.version is not None
+        assert await storage.get_browser_profile_etag("o", "bp", encrypted=reopened.encrypted) == reopened.version
+        cookies.write_bytes(b"updated legacy profile")
+        await storage.store_browser_profile("o", "bp", str(profile))
+        current = await storage.get_browser_profile_etag("o", "bp", encrypted=reopened.encrypted)
+        assert current is not None and current != reopened.version
+        return
+
+    if scenario == "workflow-session":
+        await storage.store_browser_session("o", "wpid_test", str(profile))
+        archive = next(uri for uri in fake.objects if uri.endswith("/o/wpid_test.zip"))
+        snapshot = await storage.retrieve_browser_session_snapshot("o", "wpid_test")
+        assert snapshot and not snapshot.encrypted
+        await storage.store_browser_session("o", "wpid_test", snapshot.directory, require_encryption=True)
+        assert archive not in fake.objects and fake.objects[archive + ".enc"].startswith(FILE_MAGIC)
+        snapshot = await storage.retrieve_browser_session_snapshot("o", "wpid_test")
+        assert snapshot and snapshot.encrypted
+        assert (Path(snapshot.directory) / _COOKIES_MEMBER).read_bytes() == b"cookies"
+        await storage.delete_browser_session("o", "wpid_test")
+        assert fake.objects.keys() == {legacy_uri}
+        assert await storage.retrieve_browser_session_snapshot("o", "wpid_test") is None
+        return
+
+    sealed_uri = f"{legacy_uri}.enc"
+    if scenario == "legacy-read-migrates":
+        legacy_downloaded = asyncio.Event()
+        resume_download = asyncio.Event()
+        download = fake.download_file
+
+        async def migrating_download(uri: str, **kwargs: object) -> bytes | None:
+            data = await download(uri, **kwargs)
+            if uri == legacy_uri:
+                assert data == legacy
+                legacy_downloaded.set()
+                await resume_download.wait()
+            return data
+
+        monkeypatch.setattr(fake, "download_file", migrating_download)
+        reader = asyncio.create_task(storage.retrieve_browser_profile_snapshot("o", "bp"))
+        try:
+            await asyncio.wait_for(legacy_downloaded.wait(), 5)
+            cookies.write_bytes(b"newer sealed cookies")
+            await storage.store_browser_profile("o", "bp", str(profile), require_encryption=True)
+            assert set(fake.objects) == {sealed_uri}
+            assert fake.objects[sealed_uri].startswith(FILE_MAGIC)
+        finally:
+            resume_download.set()
+            snapshot = await reader
+        assert snapshot and snapshot.encrypted
+        assert snapshot.version == await storage.get_browser_profile_etag("o", "bp", encrypted=True)
+        assert (Path(snapshot.directory) / _COOKIES_MEMBER).read_bytes() == b"newer sealed cookies"
+        return
+
+    scenario, _, sdk_error = scenario.partition(":")
+    endpoint = "https://storage.example.invalid"
+    failures = {
+        "endpoint": EndpointConnectionError(endpoint_url=endpoint),
+        "connect-timeout": ConnectTimeoutError(endpoint_url=endpoint),
+        "connection": RequestsConnectionError("connection lost"),
+        "read-timeout": ReadTimeout("body timed out"),
+        "retry-connect": RetryError("retry exhausted", Urllib3ConnectTimeoutError("connect timed out")),
+        "certificate": SSLError("invalid certificate"),
+        "retry-denied": RetryError("retry exhausted", Forbidden("denied")),
+        "retry-unknown": RetryError("retry exhausted", ValueError("unknown")),
+    }
+
+    def transport_error(message: str) -> Exception:
+        return failures.get(sdk_error, TimeoutError(message))
+
+    if scenario.startswith("sealed-get-"):
+        download = fake.download_file
+        legacy_read = False
+        confirmations = 0
+
+        async def flaky_download(uri: str, **kwargs: object) -> bytes | None:
+            nonlocal legacy_read
+            if uri != sealed_uri:
+                legacy_read = True
+                return await download(uri, **kwargs)
+            if (scenario == "sealed-get-absent" and legacy_read) or (
+                scenario.startswith("sealed-get-recheck-") and not legacy_read
+            ):
+                return await download(uri, **kwargs)
+            if scenario in {"sealed-get-forbidden", "sealed-get-recheck-forbidden"}:
+                raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+            raise transport_error("sealed GET failed")
+
+        async def status(uri: str) -> dict | None:
+            nonlocal confirmations
+            confirmations += 1
+            assert uri == sealed_uri and scenario != "sealed-get-unclassified"
+            if scenario in {"sealed-get-unknown", "sealed-get-recheck-unknown"}:
+                raise TimeoutError("sealed status unavailable")
+            if scenario == "sealed-get-stat-forbidden":
+                raise ClientError({"Error": {"Code": "AccessDenied"}}, "HeadObject")
+            return {"ETag": "exists"} if scenario == "sealed-get-present" else None
+
+        monkeypatch.setattr(fake, "download_file", flaky_download)
+        monkeypatch.setattr(fake, "get_object_info", status)
+        if scenario in {"sealed-get-absent", "sealed-get-confirm-both"}:
+            recovered = await storage.retrieve_browser_profile_snapshot("o", "bp")
+            assert recovered and not recovered.encrypted
+            assert (Path(recovered.directory) / _COOKIES_MEMBER).read_bytes() == b"cookies"
+        else:
+            expected_error = {
+                "sealed-get-forbidden": ClientError,
+                "sealed-get-recheck-forbidden": ClientError,
+                "sealed-get-stat-forbidden": ClientError,
+                "sealed-get-present": type(transport_error("GET")),
+                "sealed-get-unclassified": type(transport_error("GET")),
+                "sealed-get-unknown": TimeoutError,
+                "sealed-get-recheck-unknown": TimeoutError,
+            }[scenario]
+            with pytest.raises(expected_error):
+                await storage.retrieve_browser_profile_snapshot("o", "bp")
+        if scenario == "sealed-get-confirm-both":
+            assert confirmations == 2
+        elif scenario.endswith(("get-forbidden", "recheck-forbidden", "unclassified")):
+            assert confirmations == 0
+        else:
+            assert confirmations == 1
+        assert fake.objects == {legacy_uri: legacy}
+        return
+
+    if scenario.startswith("post-stat-"):
+        stat_attempts = 0
+        uploads_before = len(fake.paths)
+
+        async def status(uri: str) -> dict | None:
+            nonlocal stat_attempts
+            assert uri == sealed_uri  # Plaintext stores may not fetch the legacy header.
+            stat_attempts += 1
+            if stat_attempts == 1:
+                return None
+            assert len(fake.paths) == uploads_before + 1
+            if stat_attempts == 2 or scenario == "post-stat-unknown":
+                raise transport_error("sealed metadata unavailable")
+            if scenario in {"post-stat-competing", "post-stat-forbidden"}:
+                fake.objects[sealed_uri] = b"concurrent seal"
+                if scenario == "post-stat-forbidden":
+                    raise ClientError({"Error": {"Code": "AccessDenied"}}, "HeadObject")
+                return {"ETag": "concurrent"}
+            return None
+
+        async def unexpected_download(uri: str, **kwargs: object) -> None:
+            raise AssertionError("Profile publication must not download the legacy header")
+
+        monkeypatch.setattr(fake, "download_file", unexpected_download)
+        monkeypatch.setattr(fake, "get_object_info", status)
+        if scenario == "post-stat-absent":
+            await storage.store_browser_profile("o", "bp", str(profile))
+            assert fake.objects.keys() == {legacy_uri}
+        else:
+            with pytest.raises(ProfilePublicationConflict):
+                await storage.store_browser_profile("o", "bp", str(profile))
+            if scenario == "post-stat-competing":
+                assert fake.objects == {sealed_uri: b"concurrent seal"}
+            else:
+                with zipfile.ZipFile(io.BytesIO(fake.objects[legacy_uri])) as saved:
+                    assert saved.read(_COOKIES_MEMBER) == b"cookies"
+                assert set(fake.objects) == (
+                    {legacy_uri, sealed_uri} if scenario == "post-stat-forbidden" else {legacy_uri}
+                )
+        assert stat_attempts == (2 if scenario == "post-stat-unclassified" else 3)
+        assert not fake.paths[-1].exists()
+        return
+
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", True)
+    await storage.store_browser_profile("o", "bp", str(profile))
+    seal = fake.objects[sealed_uri]
+    assert seal.startswith(FILE_MAGIC) and not zipfile.is_zipfile(io.BytesIO(seal))
+    assert set(fake.objects) == {sealed_uri}
+    assert await storage.get_browser_profile_etag("o", "bp") != legacy_etag
+
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
+    reopened = await storage.retrieve_browser_profile_snapshot("o", "bp")
+    assert reopened is not None and reopened.encrypted
+    assert await storage.get_browser_profile_etag("o", "bp", encrypted=True) is not None
+    assert (Path(reopened.directory) / cookies.relative_to(profile)).read_bytes() == b"cookies"
+    cookies.write_bytes(b"rotated-cookie-state")
+
+    if scenario == "failed-upload":
+        fake.error = OSError("upload failed")
+        with pytest.raises(OSError, match="upload failed"):
+            await storage.store_browser_profile("o", "bp", str(profile))
+        assert fake.objects == {sealed_uri: seal}
+    elif scenario == "cancelled-upload":
+        fake.pause_upload = True
+        fake.upload_started.clear()
+        task = asyncio.create_task(storage.store_browser_profile("o", "bp", str(profile)))
+        try:
+            await asyncio.wait_for(fake.upload_started.wait(), 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert fake.paths[-1].is_file()
+            assert not task.done()
+        finally:
+            fake.upload_released.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        updated = await storage.retrieve_browser_profile("o", "bp")
+        assert updated is not None
+        assert (Path(updated) / cookies.relative_to(profile)).read_bytes() == b"rotated-cookie-state"
+    else:
+        await storage.store_browser_profile("o", "bp", str(profile))
+        assert set(fake.objects) == {sealed_uri}
+        assert fake.objects[sealed_uri].startswith(FILE_MAGIC)
+        assert fake.objects[sealed_uri] != seal
+        fake.objects[sealed_uri] = fake.objects[sealed_uri][:-1]
+        fake.objects[legacy_uri] = legacy
+        with pytest.raises(ArtifactDecryptionError):
+            await storage.retrieve_browser_profile("o", "bp")
+        await storage.delete_browser_profile("o", "bp", hard_delete=True)
+        assert not fake.objects
+
+    assert all(not path.exists() for path in fake.paths)
+    assert not list(temp.glob("skyvern_profile_archive_*"))
 
 
 @pytest.mark.asyncio
@@ -1990,7 +2333,9 @@ async def test_retrieve_browser_profile_skips_regenerated_extension_rules_alread
     )
     storage = S3Storage()
     storage.async_client = MagicMock()
-    storage.async_client.download_file = AsyncMock(return_value=zip_bytes)
+    storage.async_client.download_file = AsyncMock(
+        side_effect=lambda uri, **_: None if uri.endswith(".enc") else zip_bytes
+    )
     monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
 
     with capture_logs() as events:
@@ -2015,11 +2360,9 @@ async def test_delete_browser_profile_hard_raises_soft_swallows() -> None:
     storage.async_client.delete_file = AsyncMock(side_effect=RuntimeError("s3 down"))
     with pytest.raises(RuntimeError):
         await storage.delete_browser_profile("o", "bp", hard_delete=True)
-    assert storage.async_client.delete_file.await_args.kwargs["raise_on_error"] is True
 
-    storage.async_client.delete_file = AsyncMock()
+    storage.async_client.delete_file = AsyncMock(side_effect=RuntimeError("s3 down"))
     await storage.delete_browser_profile("o", "bp", hard_delete=False)
-    assert storage.async_client.delete_file.await_args.kwargs["raise_on_error"] is False
 
 
 def _share_artifact(artifact_type: ArtifactType, uri: str) -> Artifact:

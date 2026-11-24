@@ -194,7 +194,7 @@ from skyvern.forge.sdk.services.credentials import (
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token, to_status
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal, synthetic_user_id
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
-from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
+from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_snapshot
 from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
@@ -1962,12 +1962,13 @@ async def _create_browser_profile_after_workflow(
                 )
                 return
             for attempt in range(max_retries):
-                session_dir = await retrieve_persisted_workflow_browser_state_dir(
+                snapshot = await retrieve_persisted_workflow_browser_snapshot(
                     organization_id=organization_id,
                     workflow=workflow,
                     workflow_run=workflow_run,
                 )
-                if session_dir:
+                if snapshot is not None:
+                    session_dir = snapshot.directory
                     break
                 if attempt < max_retries - 1:
                     LOG.info(
@@ -2011,6 +2012,7 @@ async def _create_browser_profile_after_workflow(
                 if not reused_existing:
                     target_profile_id = None
 
+            require_encryption = snapshot is not None and snapshot.encrypted
             if isinstance(storage, S3Storage) and not reused_existing:
                 await credential_creation_service.save_new_credential_capture(
                     storage=storage,
@@ -2021,6 +2023,7 @@ async def _create_browser_profile_after_workflow(
                     directory=session_dir,
                     writer=None,
                     test_url=test_url,
+                    require_encryption=require_encryption,
                 )
                 return
 
@@ -2057,6 +2060,7 @@ async def _create_browser_profile_after_workflow(
                 organization_id=organization_id,
                 profile_id=target_profile_id,
                 directory=session_dir,
+                require_encryption=require_encryption,
             )
             if reused_existing:
                 if should_update_existing_profile_pin:

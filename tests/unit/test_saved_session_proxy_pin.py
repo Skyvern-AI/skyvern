@@ -131,7 +131,7 @@ def _profile(
 
 
 def _mock_storage(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_session", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_session_snapshot", AsyncMock(return_value=None))
     monkeypatch.setattr(app.STORAGE, "store_browser_profile", AsyncMock())
 
 

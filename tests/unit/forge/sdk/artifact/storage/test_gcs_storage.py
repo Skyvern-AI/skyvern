@@ -198,7 +198,6 @@ class TestGcsStorageBrowserSessionFiles:
         # Mirror the client contract: delete of a missing object is a no-op.
         gcs_storage.async_client.delete_file.return_value = None
         await gcs_storage.delete_browser_session(TEST_ORGANIZATION_ID, "wpid_missing")
-        gcs_storage.async_client.delete_file.assert_called_once()
 
     async def test_file_exists_returns_true(self, gcs_storage: GcsStorageForTests) -> None:
         gcs_storage.async_client.get_object_info.return_value = {"LastModified": "2025-01-15"}

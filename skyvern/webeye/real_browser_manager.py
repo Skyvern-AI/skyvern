@@ -958,6 +958,7 @@ class RealBrowserManager(BrowserManager):
         runtime_event_context: BrowserRuntimeLogContext | None = None,
         profile_read_only: bool = False,
         timezone_id: str | None = None,
+        profile_export_fork: bool = False,
     ) -> BrowserState:
         requested_at_monotonic = time.monotonic()
         acquisition_context = runtime_event_context or BrowserRuntimeLogContext.for_run(
@@ -1052,6 +1053,7 @@ class RealBrowserManager(BrowserManager):
                         engine_selection=selection,
                         _reconcile_persistent_init_scripts=browser_session_id is not None,
                         **({"timezone_id": timezone_id} if timezone_id is not None else {}),
+                        **({"_profile_export_fork": True} if profile_export_fork else {}),
                     )
                 except BaseException:
                     # start() launched the local Node driver; stop it (time-bounded) so a failed context
@@ -2011,6 +2013,9 @@ class RealBrowserManager(BrowserManager):
                 browser_session_id=browser_session_id,
                 user_browser_type=read_browser_type(workflow_run),
                 timezone_id=launch_timezone_id,
+                profile_export_fork=bool(
+                    launched_session and browser_profile_id and launched_session.generate_browser_profile
+                ),
             )
 
             if browser_session_id:

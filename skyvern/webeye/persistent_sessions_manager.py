@@ -169,7 +169,7 @@ class PersistentSessionsManager(Protocol):
         ...
 
     async def get_observer_browser_state(
-        self, session_id: str, organization_id: str | None = None
+        self, session_id: str, organization_id: str | None = None, *, for_profile_capture: bool = False
     ) -> BrowserState | None:
         """Get the browser state for a session to watch it, never to drive it.
 

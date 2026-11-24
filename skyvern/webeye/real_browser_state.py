@@ -847,6 +847,20 @@ class RealBrowserState(BrowserState):
             if self.external_browser:
                 raise ExternalBrowserUnavailable.lost()
             LOG.info("creating browser context")
+            previous_artifacts = self.browser_artifacts
+            relaunch_profile = None
+            identity = previous_artifacts._local_workflow_profile_identity if previous_artifacts else None
+            if (
+                previous_artifacts is not None
+                and identity
+                and previous_artifacts._local_profile_working_dir
+                and previous_artifacts._local_profile_context_closed
+                and previous_artifacts._local_profile_workflow_pending
+                and (workflow_run_id, organization_id, browser_profile_id or identity[2]) == identity
+                and not (browser_address or browser_session_id or self.profile_read_only)
+            ):
+                browser_profile_id = identity[2]
+                relaunch_profile = previous_artifacts
             context = skyvern_context.current()
             effective_route_policy_url = (
                 browser_context_route_policy_url or self.browser_context_route_policy_url or url
@@ -890,6 +904,7 @@ class RealBrowserState(BrowserState):
                     display_recording_owner_id=display_recording_owner_id,
                     _reconcile_persistent_init_scripts=reconcile_persistent_init_scripts,
                     _sessionless_init_script_registrations=tuple(sessionless_init_script_registrations),
+                    **({"_relaunch_profile": relaunch_profile} if relaunch_profile else {}),
                     **({"timezone_id": self.timezone_id} if self.timezone_id is not None else {}),
                 )
                 self._runtime_event_context = with_acquired_browser_runtime(self._runtime_event_context)
@@ -899,9 +914,12 @@ class RealBrowserState(BrowserState):
             self.browser_context = browser_context
             self.browser_context_route_policy_url = effective_route_policy_url
             self.browser_artifacts = browser_artifacts
-            if self.profile_read_only:
-                # A replaced context may still leave its profile copy behind; delete it with this one.
+            if self.profile_read_only or (previous_artifacts and previous_artifacts._local_profile_working_dir):
                 browser_cleanup = _chain_browser_cleanups(self.browser_cleanup, browser_cleanup)
+            if relaunch_profile is not None:
+                relaunch_profile._local_profile_working_dir = None
+            elif previous_artifacts and previous_artifacts._local_profile_context_closed:
+                previous_artifacts._local_profile_workflow_pending = False
             self.browser_cleanup = browser_cleanup
             self._browser_state_diagnostic = None
             self._ever_connected = True
@@ -1310,7 +1328,8 @@ class RealBrowserState(BrowserState):
                 if not await self.close_current_open_page():
                     LOG.warning("Failed to close the current open page")
                     raise
-                abandoned_cleanup = _chain_browser_cleanups(abandoned_cleanup, self.browser_cleanup)
+                if not (self.profile_read_only or self.browser_artifacts._local_profile_working_dir):
+                    abandoned_cleanup = _chain_browser_cleanups(abandoned_cleanup, self.browser_cleanup)
                 LOG.info(
                     "Navigation failed before a page was ready; drawing another browser",
                     draw=draw,
@@ -1324,7 +1343,8 @@ class RealBrowserState(BrowserState):
             if not await self.close_current_open_page():
                 LOG.warning("Failed to close the current open page, going to skip the browser context validation")
                 return page
-            abandoned_cleanup = self.browser_cleanup
+            if not (self.profile_read_only or self.browser_artifacts._local_profile_working_dir):
+                abandoned_cleanup = self.browser_cleanup
             await fix_state()
             page = await self.__assert_page()
         return page
@@ -2134,8 +2154,12 @@ class RealBrowserState(BrowserState):
                 await self._close_all_other_pages()
                 if self.browser_context is not None:
                     context = self.browser_context
+                    artifacts = self.browser_artifacts
+                    if artifacts._local_profile_workflow_pending and artifacts._local_profile_working_dir:
+                        await persist_session_cookies(context, artifacts._local_profile_working_dir, strict=True)
                     self._expect_runtime_end("context_recreation", context)
                     await context.close()
+                    artifacts._local_profile_context_closed = True
                 self._sessionless_init_script_registrations = []
                 self.browser_context = None
                 await self.set_working_page(None)
@@ -2411,7 +2435,22 @@ class RealBrowserState(BrowserState):
                         BROWSER_CLOSE_TIMEOUT,
                         "whole-display recorder stop",
                     )
-                await self._run_browser_cleanup_bounded()
+                try:
+                    if self.browser_artifacts is not None:
+                        writeback = self.browser_artifacts._profile_writeback
+                        self.browser_artifacts._profile_writeback = None
+                        if (
+                            recording_finalized
+                            and context is not None
+                            and persist_session_state
+                            and writeback is not None
+                        ):
+                            try:
+                                await writeback()
+                            except Exception:
+                                LOG.exception("Failed to write back closed browser profile")
+                finally:
+                    await self._run_browser_cleanup_bounded()
             finally:
                 close_phases_finished = True
                 if not teardown_active and (teardown_settled or not recording_finalized):
@@ -2524,10 +2563,14 @@ class RealBrowserState(BrowserState):
             return
         LOG.info("Closing browser context and its pages")
         if persist_session_state:
-            session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
+            artifacts = self.browser_artifacts
+            session_dir = artifacts.browser_session_dir if artifacts else None
             try:
-                await persist_session_cookies(self.browser_context, session_dir)
+                strict = {"strict": True} if artifacts is not None and artifacts._profile_writeback is not None else {}
+                await persist_session_cookies(self.browser_context, session_dir, **strict)
             except Exception:
+                if artifacts is not None:
+                    artifacts._profile_writeback = None
                 LOG.warning("Failed to persist session cookies during teardown", exc_info=True)
         await self.browser_context.close()
         self._sessionless_init_script_registrations = []
@@ -2535,7 +2578,10 @@ class RealBrowserState(BrowserState):
 
     async def _run_browser_cleanup_bounded(self) -> None:
         cleanup = self.browser_cleanup
-        if cleanup is None or self.browser_context is None:
+        if cleanup is None or (
+            self.browser_context is None
+            and not (self.browser_artifacts and self.browser_artifacts._local_profile_context_closed)
+        ):
             return
         # One-shot: a re-entrant close() must not stop/delete the paid provider twice.
         self.browser_cleanup = None

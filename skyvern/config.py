@@ -1,3 +1,4 @@
+import base64
 import logging
 import os
 import platform
@@ -6,7 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
@@ -81,7 +82,7 @@ class CodeBlockMode(StrEnum):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=_DEFAULT_ENV_FILES, extra="ignore")
+    model_config = SettingsConfigDict(env_file=_DEFAULT_ENV_FILES, extra="ignore", hide_input_in_errors=True)
 
     # settings for experimentation
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
@@ -1121,6 +1122,8 @@ class Settings(BaseSettings):
     ENCRYPTOR_AES_SALT_V2: str | None = None
     ENCRYPTOR_AES_WRITE_VERSION: Literal["v1"] = "v1"
     ENABLE_ENCRYPTION: bool = False
+    SKYVERN_ENCRYPT_BROWSER_PROFILES: bool = False
+    SKYVERN_ARTIFACT_ENCRYPTION_KEYS: tuple[SecretStr, ...] = ()
 
     # Google OAuth settings (used by the Google Sheets connector)
     GOOGLE_OAUTH_CLIENT_ID: str | None = None
@@ -1238,6 +1241,23 @@ class Settings(BaseSettings):
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
+
+    def artifact_encryption_roots(self) -> tuple[bytes, ...]:
+        try:
+            roots = tuple(
+                base64.b64decode(key.get_secret_value(), validate=True) for key in self.SKYVERN_ARTIFACT_ENCRYPTION_KEYS
+            )
+        except ValueError:
+            raise RuntimeError("SKYVERN_ARTIFACT_ENCRYPTION_KEYS must contain base64-encoded 32-byte roots") from None
+        if not roots or any(len(root) != 32 for root in roots):
+            raise RuntimeError("SKYVERN_ARTIFACT_ENCRYPTION_KEYS must contain base64-encoded 32-byte roots")
+        return roots
+
+    @model_validator(mode="after")
+    def _validate_artifact_writer(self) -> "Settings":
+        if self.SKYVERN_ENCRYPT_BROWSER_PROFILES:
+            self.artifact_encryption_roots()
+        return self
 
     @model_validator(mode="after")
     def _resolve_legacy_code_block_settings(self) -> "Settings":

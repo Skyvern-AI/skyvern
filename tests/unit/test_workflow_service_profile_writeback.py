@@ -14,8 +14,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.artifact.storage.base import BrowserProfileSnapshot
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.encrypt.files import FILE_MAGIC
 from skyvern.forge.sdk.schemas.credentials import credential_auto_profile_disabled
 from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -23,6 +27,8 @@ from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_manager import BrowserCleanupResult
 from skyvern.webeye.profile_cookie_merge import BANKED_COOKIES_FILENAME
+from skyvern.webeye.session_cookies import read_persisted_session_cookies
+from tests.unit.forge.sdk.artifact.storage.test_helpers import artifact_root
 
 
 def _make_workflow(persist: bool = True) -> MagicMock:
@@ -60,6 +66,7 @@ def _make_browser_state(applied_browser_profile_id: str | None = None) -> MagicM
     bs.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
     bs.browser_artifacts._seed_load_failed = False
     bs.browser_artifacts._seed_capture_failed = False
+    bs.browser_artifacts._seed_profile_encrypted = False
     bs.browser_artifacts.applied_browser_profile_id = applied_browser_profile_id
     return bs
 
@@ -190,7 +197,7 @@ async def test_legacy_session_persisted_on_completed_run_without_managed_profile
 
     await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
 
-    store_mock.assert_awaited_once_with("o_test", "wpid_test", "/tmp/fake_profile")
+    store_mock.assert_awaited_once_with("o_test", "wpid_test", "/tmp/fake_profile", require_encryption=False)
     app.STORAGE.store_browser_profile.assert_not_awaited()
 
 
@@ -256,7 +263,10 @@ async def test_foreign_managed_profile_not_persisted_on_completed_run(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_missing_managed_profile_falls_back_to_legacy_session(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("policy", ["legacy", "protected-source", "writer-on"])
+async def test_missing_managed_profile_falls_back_to_legacy_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy: str
+) -> None:
     """A managed profile stamped at setup but deleted before finalization must recover, not drop state."""
     from skyvern.forge.sdk.workflow.service import WorkflowService
 
@@ -264,6 +274,19 @@ async def test_missing_managed_profile_falls_back_to_legacy_session(monkeypatch:
     workflow_run = _make_workflow_run(WorkflowRunStatus.completed, browser_profile_id="bp_gone")
     browser_state = _make_browser_state()
     store_mock = _patch_clean_up_deps(monkeypatch, browser_state)
+    if policy != "legacy":
+        monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(tmp_path / "storage"))
+        monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temporary"))
+        monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", (artifact_root(),))
+        monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", policy == "writer-on")
+        source = tmp_path / "working"
+        source.mkdir()
+        (source / "Cookies").write_bytes(b"logged-in")
+        browser_state.browser_artifacts.browser_session_dir = str(source)
+        browser_state.browser_artifacts._seed_profile_encrypted = policy == "protected-source"
+        browser_state.browser_artifacts._local_profile_working_dir = None
+        storage = LocalStorage()
+        monkeypatch.setattr(app, "STORAGE", storage)
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,
         "get_browser_profile",
@@ -276,8 +299,23 @@ async def test_missing_managed_profile_falls_back_to_legacy_session(monkeypatch:
 
     await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
 
-    store_mock.assert_awaited_once_with("o_test", "wpid_test", "/tmp/fake_profile")
-    app.STORAGE.store_browser_profile.assert_not_awaited()
+    if policy == "legacy":
+        store_mock.assert_awaited_once_with("o_test", "wpid_test", "/tmp/fake_profile", require_encryption=False)
+        app.STORAGE.store_browser_profile.assert_not_awaited()
+        return
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
+    sealed = tmp_path / "storage/o_test/wpid_test.zip.enc"
+    assert sealed.read_bytes().startswith(FILE_MAGIC)
+    assert not sealed.with_name("wpid_test").exists()
+    await svc._seed_managed_browser_profile_from_legacy_session(
+        workflow=workflow, organization_id="o_test", rendered_key=None, browser_profile_id="bp_restored"
+    )
+    snapshot = await storage.retrieve_browser_profile_snapshot("o_test", "bp_restored")
+    assert snapshot and snapshot.encrypted and (Path(snapshot.directory) / "Cookies").read_bytes() == b"logged-in"
+    assert not await storage.browser_profile_exists("o_test", "bp_gone")
+    await storage.delete_browser_session("o_test", "wpid_test")
+    assert not sealed.exists()
+    assert await storage.retrieve_browser_session_snapshot("o_test", "wpid_test") is None
 
 
 @pytest.mark.asyncio
@@ -310,7 +348,7 @@ async def test_profile_persisted_to_segmented_key_on_completed_run(monkeypatch: 
     await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
 
     storage_key = build_workflow_browser_session_storage_key("wpid_test", "cred_123")
-    store_mock.assert_awaited_once_with("o_test", storage_key, "/tmp/fake_profile")
+    store_mock.assert_awaited_once_with("o_test", storage_key, "/tmp/fake_profile", require_encryption=False)
 
 
 @pytest.mark.asyncio
@@ -440,7 +478,7 @@ async def test_flag_off_persist_on_writes_managed_profile_byte_for_byte(monkeypa
 
     # The legacy path writes the managed profile (browser_profile_id), NOT the resolved sink.
     app.STORAGE.store_browser_profile.assert_awaited_once_with(
-        "o_test", profile_id="bp_managed", directory="/tmp/fake_profile"
+        "o_test", profile_id="bp_managed", directory="/tmp/fake_profile", require_encryption=False
     )
     store_session_mock.assert_not_awaited()
 
@@ -495,7 +533,7 @@ async def test_engine_on_writes_resolved_sink_profile(monkeypatch: pytest.Monkey
 
     # The sink (bp_sink) is written, NOT the seed (bp_seed); no legacy archive.
     app.STORAGE.store_browser_profile.assert_awaited_once_with(
-        "o_test", profile_id="bp_sink", directory="/tmp/fake_profile"
+        "o_test", profile_id="bp_sink", directory="/tmp/fake_profile", require_encryption=False
     )
     store_session_mock.assert_not_awaited()
 
@@ -640,12 +678,14 @@ async def _save_twice_through_one_lane_browser(
 ) -> AsyncMock:
     stored = {"etag": "etag_boot"}
 
-    async def store_browser_profile(organization_id: str, *, profile_id: str, directory: str) -> None:
+    async def store_browser_profile(
+        organization_id: str, *, profile_id: str, directory: str, require_encryption: bool = False
+    ) -> None:
         stored["etag"] = etag_after_each_write
 
     store = AsyncMock(side_effect=store_browser_profile)
     monkeypatch.setattr(app.STORAGE, "store_browser_profile", store)
-    monkeypatch.setattr(app.STORAGE, "get_browser_profile_etag", AsyncMock(side_effect=lambda *_: stored["etag"]))
+    monkeypatch.setattr(app.STORAGE, "get_browser_profile_etag", AsyncMock(side_effect=lambda *_, **__: stored["etag"]))
     artifacts = BrowserArtifacts(browser_session_dir=str(tmp_path), applied_browser_profile_id="bp_own")
     artifacts.record_seed_profile_state([], "etag_boot")
     lane_browser = SimpleNamespace(
@@ -688,32 +728,124 @@ async def test_lane_run_does_not_overwrite_a_write_interleaved_after_the_previou
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    [
+        pytest.param(False, id="legacy"),
+        pytest.param(True, id="sealed-provenance"),
+        "encrypted-seed-legacy-target",
+        "encrypted-seed-legacy-seal-failure",
+        "encrypted-seed-new-target",
+        "encrypted-seed-new-seal-failure",
+    ],
+)
 async def test_delta_merge_unions_only_changed_cookies_into_current(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: bool | str
 ) -> None:
-    # B2: only the cookies THIS run changed land in the current stored dir (preserving the concurrent write).
-    import json
+    unchanged = {"name": "a", "value": "1", "domain": "x.com", "path": "/"}
+    added = {"name": "b", "value": "2", "domain": "x.com", "path": "/"}
+    bs = _make_browser_state_b2(
+        seed_cookies=[unchanged], seed_etag="e", fresh_login=False, end_state=[unchanged, added]
+    )
+    svc = WorkflowService()
 
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-    from skyvern.webeye.profile_cookie_merge import BANKED_COOKIES_FILENAME
+    if isinstance(mode, bool):
+        retrieve = AsyncMock(return_value=BrowserProfileSnapshot(str(tmp_path), mode))
+        store = AsyncMock()
+        monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile_snapshot", retrieve)
+        monkeypatch.setattr(app.STORAGE, "store_browser_profile", store)
+        wr = _make_workflow_run(WorkflowRunStatus.completed, browser_sink_profile_id="bp")
 
-    seed = [{"name": "a", "value": "1", "domain": "x.com", "path": "/"}]
-    end_state = [
-        {"name": "a", "value": "1", "domain": "x.com", "path": "/"},  # unchanged
-        {"name": "b", "value": "2", "domain": "x.com", "path": "/"},  # this run added
-    ]
-    bs = _make_browser_state_b2(seed_cookies=seed, seed_etag="e", fresh_login=False, end_state=end_state)
-    retrieve = AsyncMock(return_value=str(tmp_path))
-    store = AsyncMock()
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", retrieve)
-    monkeypatch.setattr(app.STORAGE, "store_browser_profile", store)
-    wr = _make_workflow_run(WorkflowRunStatus.completed, browser_sink_profile_id="bp")
+        assert await svc._delta_merge_sink_profile(workflow_run=wr, sink_profile_id="bp", browser_state=bs)
+        store.assert_awaited_once()
+        assert store.await_args.kwargs["directory"] == str(tmp_path)
+        assert store.await_args.kwargs.get("require_encryption", False) is mode
+        banked = json.loads((tmp_path / BANKED_COOKIES_FILENAME).read_text())
+        assert {c["name"] for c in banked} == {"b"}
+        return
 
-    assert await WorkflowService()._delta_merge_sink_profile(workflow_run=wr, sink_profile_id="bp", browser_state=bs)
-    store.assert_awaited_once()
-    assert store.await_args.kwargs["directory"] == str(tmp_path)
-    banked = json.loads((tmp_path / BANKED_COOKIES_FILENAME).read_text())  # type: ignore[operator]
-    assert {c["name"] for c in banked} == {"b"}
+    root = tmp_path / "persisted"
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(root))
+    monkeypatch.setattr(settings, "TEMP_PATH", str(scratch))
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
+    monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", (artifact_root(),))
+    storage = LocalStorage()
+    monkeypatch.setattr(app, "STORAGE", storage)
+    profiles = root / "o_test" / "profiles"
+    seed_path = tmp_path / "seed"
+    seed_path.mkdir()
+    (seed_path / "original-seed").write_text("source login")
+    await storage.store_browser_profile("o_test", "bp_seed", str(seed_path), require_encryption=True)
+    source_archive = profiles / "bp_seed.zip.enc"
+    source_before = source_archive.read_bytes()
+    source = await storage.retrieve_browser_profile_snapshot("o_test", "bp_seed")
+    assert source is not None and source.encrypted
+    bs.browser_artifacts.browser_session_dir = source.directory
+    bs.browser_artifacts._seed_profile_encrypted = source.encrypted
+    bs.browser_artifacts.applied_browser_profile_id = "bp_seed"
+
+    new_target = mode.startswith("encrypted-seed-new-")
+    durable = profiles / "bp_target"
+    target_archive = profiles / "bp_target.zip.enc"
+    existing = {"name": "existing", "value": "kept", "domain": "x.com", "path": "/"}
+    if not new_target:
+        durable.mkdir()
+        (durable / "target-state").write_text("existing target")
+        (durable / BANKED_COOKIES_FILENAME).write_text(json.dumps([existing]))
+
+    wr = _make_workflow_run(
+        WorkflowRunStatus.completed, browser_profile_id="bp_seed", browser_sink_profile_id="bp_target"
+    )
+
+    async def save() -> None:
+        if new_target:
+            # A missing archive has no state to delta-merge. First save uses the normal workflow write.
+            assert not await svc._delta_merge_sink_profile(
+                workflow_run=wr, sink_profile_id="bp_target", browser_state=bs
+            )
+            await svc._persist_run_sink_profile_if_needed(
+                workflow_run=wr,
+                browser_state=bs,
+                close_browser_on_completion=False,
+                effective_workflow_run_status=WorkflowRunStatus.completed,
+            )
+        else:
+            assert await svc._delta_merge_sink_profile(workflow_run=wr, sink_profile_id="bp_target", browser_state=bs)
+
+    working_dirs = set(scratch.iterdir())
+    fail = mode.endswith("-failure")
+    if fail:
+        monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", ())
+        with pytest.raises(RuntimeError, match="SKYVERN_ARTIFACT_ENCRYPTION_KEYS"):
+            await save()
+    else:
+        await save()
+    assert source_archive.read_bytes() == source_before
+    assert set(scratch.iterdir()) == working_dirs
+
+    if fail:
+        assert not target_archive.exists()
+        if new_target:
+            assert not durable.exists()
+        else:
+            assert (durable / "target-state").read_text() == "existing target"
+            assert json.loads((durable / BANKED_COOKIES_FILENAME).read_text()) == [existing]
+        return
+
+    assert target_archive.read_bytes().startswith(FILE_MAGIC)
+    assert not durable.exists()
+    restored = await storage.retrieve_browser_profile_snapshot("o_test", "bp_target")
+    assert restored is not None and restored.encrypted
+    if new_target:
+        assert {"a": "1", "b": "2"} == {
+            cookie["name"]: cookie["value"] for cookie in read_persisted_session_cookies(restored.directory)
+        }
+    else:
+        restored_path = Path(restored.directory)
+        assert (restored_path / "target-state").read_text() == "existing target"
+        assert not (restored_path / "original-seed").exists()
+        assert json.loads((restored_path / BANKED_COOKIES_FILENAME).read_text()) == [existing, added]
 
 
 @pytest.mark.asyncio
@@ -725,7 +857,7 @@ async def test_delta_merge_no_own_changes_leaves_archive_untouched(monkeypatch: 
     bs = _make_browser_state_b2(seed_cookies=seed, seed_etag="e", fresh_login=False, end_state=list(seed))
     retrieve = AsyncMock()
     store = AsyncMock()
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", retrieve)
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile_snapshot", retrieve)
     monkeypatch.setattr(app.STORAGE, "store_browser_profile", store)
     wr = _make_workflow_run(WorkflowRunStatus.completed, browser_sink_profile_id="bp")
 
@@ -763,7 +895,9 @@ async def test_delta_merge_removes_temp_extraction_dir(monkeypatch: pytest.Monke
     end_state = list(seed) + [{"name": "b", "value": "2", "domain": "x.com", "path": "/"}]
     bs = _make_browser_state_b2(seed_cookies=seed, seed_etag="e", fresh_login=False, end_state=end_state)
     temp_dir = make_temp_directory(prefix="sink_merge_test_")
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=temp_dir))
+    monkeypatch.setattr(
+        app.STORAGE, "retrieve_browser_profile_snapshot", AsyncMock(return_value=BrowserProfileSnapshot(temp_dir))
+    )
     monkeypatch.setattr(app.STORAGE, "store_browser_profile", AsyncMock())
     wr = _make_workflow_run(WorkflowRunStatus.completed, browser_sink_profile_id="bp")
 
@@ -829,7 +963,9 @@ async def test_delta_merge_reads_session_sidecar_when_context_closed(
     bs = _make_browser_state_b2(seed_cookies=seed, seed_etag="e", fresh_login=False)
     bs.browser_artifacts.browser_session_dir = str(tmp_path)
     bs.browser_context.cookies = AsyncMock(side_effect=RuntimeError("context closed"))
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=str(tmp_path)))
+    monkeypatch.setattr(
+        app.STORAGE, "retrieve_browser_profile_snapshot", AsyncMock(return_value=BrowserProfileSnapshot(str(tmp_path)))
+    )
     store = AsyncMock()
     monkeypatch.setattr(app.STORAGE, "store_browser_profile", store)
     wr = _make_workflow_run(WorkflowRunStatus.completed, browser_sink_profile_id="bp")

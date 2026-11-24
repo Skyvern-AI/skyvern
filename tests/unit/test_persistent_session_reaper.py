@@ -13,6 +13,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.run_enums import RunType
 from skyvern.webeye import default_persistent_sessions_manager as manager_mod
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.default_persistent_sessions_manager import BrowserSession, DefaultPersistentSessionsManager
 from skyvern.webeye.real_browser_manager import RealBrowserManager, _PersistentSessionLease
 
@@ -638,6 +639,7 @@ def _completed_row(session_id: str, org: str = "org_test") -> MagicMock:
         completed_at=datetime.now(timezone.utc),
         status="completed",
         runnable_id=None,
+        generate_browser_profile=True,
     )
     # Opted in by default so reconcile's export-verdict path is exercised; opt-out tests override this.
     row.should_export_profile.return_value = True
@@ -685,7 +687,9 @@ async def test_reconcile_reclaims_local_state_for_completed_row() -> None:
 
     await manager.reconcile_local_sessions()
 
-    manager._release_local_browser_session.assert_awaited_once_with("org_test", "pbs_done", export_profile=True)
+    manager._release_local_browser_session.assert_awaited_once_with(
+        "org_test", "pbs_done", export_profile=True, generate_browser_profile=True
+    )
 
 
 @pytest.mark.asyncio
@@ -738,7 +742,9 @@ async def test_reconcile_reclaims_completed_row_whose_owning_run_is_dead() -> No
 
     await manager.reconcile_local_sessions()
 
-    manager._release_local_browser_session.assert_awaited_once_with("org_test", "pbs_dead_owner", export_profile=True)
+    manager._release_local_browser_session.assert_awaited_once_with(
+        "org_test", "pbs_dead_owner", export_profile=True, generate_browser_profile=True
+    )
 
 
 @pytest.mark.asyncio
@@ -754,6 +760,7 @@ async def test_reconcile_reclaims_completed_row_with_unresolvable_owner_type() -
         status="completed",
         runnable_id="s_dead",
         runnable_type="script",
+        generate_browser_profile=True,
         should_export_profile=lambda: True,
     )
     manager.database.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=row)
@@ -762,7 +769,7 @@ async def test_reconcile_reclaims_completed_row_with_unresolvable_owner_type() -
     await manager.reconcile_local_sessions()
 
     manager._release_local_browser_session.assert_awaited_once_with(
-        "org_test", "pbs_unresolvable_owner", export_profile=True
+        "org_test", "pbs_unresolvable_owner", export_profile=True, generate_browser_profile=True
     )
 
 
@@ -826,7 +833,9 @@ async def test_reconcile_preserves_local_state_on_db_lookup_error_then_retries()
         return_value=_completed_row("pbs_flaky")
     )
     await manager.reconcile_local_sessions()
-    manager._release_local_browser_session.assert_awaited_once_with("org_test", "pbs_flaky", export_profile=True)
+    manager._release_local_browser_session.assert_awaited_once_with(
+        "org_test", "pbs_flaky", export_profile=True, generate_browser_profile=True
+    )
 
 
 @pytest.mark.asyncio
@@ -863,7 +872,9 @@ async def test_reconcile_handles_mixed_states_independently() -> None:
 
     await manager.reconcile_local_sessions()
 
-    manager._release_local_browser_session.assert_awaited_once_with("org_test", "pbs_done", export_profile=True)
+    manager._release_local_browser_session.assert_awaited_once_with(
+        "org_test", "pbs_done", export_profile=True, generate_browser_profile=True
+    )
     assert "pbs_live" in manager._browser_sessions
 
 
@@ -910,7 +921,8 @@ def _hold_exportable_session(
     browser_state = MagicMock()
     browser_state.close = AsyncMock()
     browser_state.browser_context = MagicMock()
-    browser_state.browser_artifacts = SimpleNamespace(browser_session_dir=f"/tmp/{session_id}", video_artifacts=[])
+    browser_state.profile_read_only = False
+    browser_state.browser_artifacts = BrowserArtifacts(browser_session_dir=f"/tmp/{session_id}")
     manager._browser_sessions[session_id] = BrowserSession(browser_state=browser_state, organization_id=org)
     return browser_state
 

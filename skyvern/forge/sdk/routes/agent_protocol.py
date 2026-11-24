@@ -7141,6 +7141,7 @@ async def reset_workflow_browser_profile(
             await app.STORAGE.delete_browser_profile(
                 organization_id=current_org.organization_id,
                 profile_id=profile.browser_profile_id,
+                hard_delete=True,
             )
             await app.DATABASE.browser_sessions.delete_browser_profile(
                 profile_id=profile.browser_profile_id,

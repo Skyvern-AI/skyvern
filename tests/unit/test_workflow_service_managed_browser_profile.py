@@ -14,6 +14,7 @@ import pytest_asyncio
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from skyvern.config import settings
 from skyvern.exceptions import (
     BrowserSessionExpired,
     BrowserSessionStartupTimeout,
@@ -22,6 +23,12 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.artifact.storage.base import BrowserProfileSnapshot
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
+    ProfilePublicationConflict,
+    ProfilePublicationUnconfirmed,
+)
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -39,6 +46,7 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository
 from skyvern.forge.sdk.db.repositories.workflow_runs import PrepareNextAttemptResult, WorkflowRunDispatchFinalization
+from skyvern.forge.sdk.encrypt.files import ArtifactDecryptionError
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import EXTERNAL_CDP_BROWSER_VENDOR, BrowserSessionCloseReason
 from skyvern.forge.sdk.schemas.tasks import TaskRequest
@@ -66,6 +74,7 @@ from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.forge.sdk.artifact.storage.test_helpers import artifact_root
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -153,7 +162,7 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
 
 def _browser_cleanup_result() -> WorkflowBrowserCleanupResult:
     browser_state = SimpleNamespace(
-        browser_artifacts=SimpleNamespace(browser_session_dir="/tmp/fake_profile"),
+        browser_artifacts=BrowserArtifacts(browser_session_dir="/tmp/fake_profile"),
         browser_context=SimpleNamespace(),
     )
     return WorkflowBrowserCleanupResult(
@@ -258,7 +267,11 @@ async def _run_execute_workflow(svc: WorkflowService, **kwargs: Any) -> SimpleNa
 
 
 def _mock_storage(monkeypatch: pytest.MonkeyPatch, *, legacy_dir: str | None) -> AsyncMock:
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_session", AsyncMock(return_value=legacy_dir))
+    monkeypatch.setattr(
+        app.STORAGE,
+        "retrieve_browser_session_snapshot",
+        AsyncMock(return_value=BrowserProfileSnapshot(legacy_dir) if legacy_dir else None),
+    )
     store = AsyncMock()
     monkeypatch.setattr(app.STORAGE, "store_browser_profile", store)
     return store
@@ -349,32 +362,126 @@ async def test_ensure_managed_browser_profile_seeds_new_profile_from_legacy_arch
         "o_test",
         profile_id="bp_managed",
         directory="/tmp/legacy_session",
+        require_encryption=False,
     )
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "upload",
+        "bad-tag",
+        "missing-root",
+        "protected-read",
+        "conflict",
+        "causal-conflict",
+        "legacy-unconfirmed",
+        "protected-unconfirmed",
+    ],
+)
 async def test_ensure_managed_browser_profile_rolls_back_on_seed_failure(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
 ) -> None:
-    profile = SimpleNamespace(browser_profile_id="bp_managed")
-    monkeypatch.setattr(
-        app.DATABASE.browser_sessions,
-        "get_or_create_managed_browser_profile",
-        AsyncMock(return_value=(profile, True)),
-    )
-    hard_delete = AsyncMock()
-    monkeypatch.setattr(app.DATABASE.browser_sessions, "hard_delete_browser_profile", hard_delete)
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/legacy_session"))
-    monkeypatch.setattr(app.STORAGE, "store_browser_profile", AsyncMock(side_effect=RuntimeError("upload failed")))
+    organization_id, profile_id, workflow_id = "o_test", "bp_managed", "wpid_test"
+    profile = SimpleNamespace(browser_profile_id=profile_id)
+    rows: set[str] = set()
 
-    result = await WorkflowService()._ensure_managed_browser_profile(
-        workflow=_workflow(),
-        workflow_run=_workflow_run(),
-        parameter_values={},
-    )
+    async def create(**_: object) -> tuple[SimpleNamespace, bool]:
+        created = profile_id not in rows
+        rows.add(profile_id)
+        return profile, created
 
-    assert result is None
-    hard_delete.assert_awaited_once_with(profile_id="bp_managed", organization_id="o_test")
+    async def delete(*, profile_id: str, organization_id: str) -> None:
+        rows.remove(profile_id)
+
+    monkeypatch.setattr(app.DATABASE.browser_sessions, "get_or_create_managed_browser_profile", create)
+    monkeypatch.setattr(app.DATABASE.browser_sessions, "hard_delete_browser_profile", delete)
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
+    monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(tmp_path / "archives"))
+    monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", (artifact_root(),))
+    protected_source = failure != "legacy-unconfirmed"
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", protected_source)
+    storage = LocalStorage()
+    source = tmp_path / "workflow-state"
+    source.mkdir()
+    (source / "Cookies").write_bytes(b"recoverable workflow login")
+    await storage.store_browser_session(organization_id, workflow_id, str(source))
+    archive = (
+        tmp_path
+        / "archives"
+        / organization_id
+        / (f"{workflow_id}.zip.enc" if protected_source else f"{workflow_id}/Cookies")
+    )
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
+    monkeypatch.setattr(app, "STORAGE", storage)
+    store = storage.store_browser_profile
+    original_error = PermissionError("protected workflow archive read denied")
+    conflict = ProfilePublicationConflict("competing sealed profile")
+    error: Exception = conflict if failure == "conflict" else OSError("legacy upload had a competing seal")
+    if failure.endswith("-unconfirmed"):
+        error = ProfilePublicationUnconfirmed("seal check timed out")
+    elif failure == "causal-conflict":
+        error.__cause__ = conflict
+
+    if failure == "bad-tag":
+        encrypted = archive.read_bytes()
+        archive.write_bytes(encrypted[:-1] + bytes([encrypted[-1] ^ 1]))
+    elif failure == "missing-root":
+        monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", ())
+    elif failure == "protected-read":
+        stat = storage._profile_stat
+
+        def refuse_protected_read(path: Path) -> object:
+            if path == archive:
+                raise original_error
+            return stat(path)
+
+        monkeypatch.setattr(storage, "_profile_stat", refuse_protected_read)
+    else:
+
+        async def publish(*args: object, **kwargs: object) -> None:
+            if failure == "upload":
+                raise OSError("upload failed")
+            await store(*args, **kwargs)
+            raise error
+
+        monkeypatch.setattr(storage, "store_browser_profile", publish)
+
+    svc = WorkflowService()
+
+    async def resolve() -> str | None:
+        return await svc._ensure_managed_browser_profile(
+            workflow=_workflow(), workflow_run=_workflow_run(), parameter_values={}
+        )
+
+    original = archive.read_bytes()
+    if failure == "upload":
+        assert await resolve() is None
+        assert not rows and not await storage.browser_profile_exists(organization_id, profile_id)
+    elif failure == "legacy-unconfirmed":
+        assert await resolve() is None and rows == {profile_id}
+        saved = await storage.retrieve_browser_profile_snapshot(organization_id, profile_id)
+        assert saved and not saved.encrypted and (Path(saved.directory) / "Cookies").read_bytes() == original
+        assert await resolve() == profile_id
+    elif failure in {"bad-tag", "missing-root", "protected-read"}:
+        exception = PermissionError if failure == "protected-read" else ArtifactDecryptionError
+        # A retry must still consult the saved archive and surface the same failure.
+        for _ in range(2):
+            with pytest.raises(exception) as caught:
+                await resolve()
+            if failure == "protected-read":
+                assert caught.value is original_error
+            assert not rows and not await storage.browser_profile_exists(organization_id, profile_id)
+    else:
+        with pytest.raises(type(error)) as caught:
+            await resolve()
+        assert caught.value is error and rows == {profile_id}
+        winner = await storage.retrieve_browser_profile_snapshot(organization_id, profile_id)
+        assert winner is not None and winner.encrypted
+        assert (Path(winner.directory) / "Cookies").read_bytes() == b"recoverable workflow login"
+        assert await resolve() == profile_id
+    assert archive.read_bytes() == original
 
 
 @pytest.mark.asyncio
@@ -384,8 +491,8 @@ async def test_ensure_managed_browser_profile_does_not_seed_existing_profile(
     profile = SimpleNamespace(browser_profile_id="bp_managed")
     get_or_create = AsyncMock(return_value=(profile, False))
     monkeypatch.setattr(app.DATABASE.browser_sessions, "get_or_create_managed_browser_profile", get_or_create)
-    retrieve = AsyncMock(return_value="/tmp/legacy_session")
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_session", retrieve)
+    retrieve = AsyncMock(return_value=BrowserProfileSnapshot("/tmp/legacy_session"))
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_session_snapshot", retrieve)
     store = AsyncMock()
     monkeypatch.setattr(app.STORAGE, "store_browser_profile", store)
 

@@ -20,6 +20,7 @@ from skyvern.config import settings
 from skyvern.forge import app as forge_app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_app import ForgeApp
+from skyvern.forge.sdk.artifact.storage.base import BrowserProfileSnapshot
 from skyvern.forge.sdk.credential_site_policy import MAX_EXTRA_SITE_URLS, MAX_SITE_URL_LENGTH
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError
@@ -771,7 +772,11 @@ async def test_browser_profile_resave_proxy_pin(
             )
         ),
     )
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/session"))
+    monkeypatch.setattr(
+        forge_app.STORAGE,
+        "retrieve_browser_session_snapshot",
+        AsyncMock(return_value=BrowserProfileSnapshot("/tmp/session")),
+    )
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
     monkeypatch.setattr(
         forge_app.DATABASE.credentials,
@@ -806,13 +811,14 @@ async def test_browser_profile_resave_proxy_pin(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("encrypted", [False, True])
 async def test_credential_browser_profile_save_reads_managed_profile_blob(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, encrypted: bool
 ) -> None:
     create_browser_profile = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_created"))
     update_credential = AsyncMock(return_value=SimpleNamespace())
     store_browser_profile = AsyncMock()
-    retrieve_profile = AsyncMock(return_value="/tmp/managed_profile")
+    retrieve_profile = AsyncMock(return_value=BrowserProfileSnapshot("/tmp/managed_profile", encrypted))
     retrieve_session = AsyncMock()
 
     monkeypatch.setattr(
@@ -837,8 +843,8 @@ async def test_credential_browser_profile_save_reads_managed_profile_blob(
         "get_browser_profile",
         AsyncMock(return_value=SimpleNamespace(is_managed=True, workflow_permanent_id="wpid_123")),
     )
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_profile", retrieve_profile)
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", retrieve_session)
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_profile_snapshot", retrieve_profile)
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session_snapshot", retrieve_session)
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
     monkeypatch.setattr(
         forge_app.DATABASE.credentials,
@@ -864,6 +870,7 @@ async def test_credential_browser_profile_save_reads_managed_profile_blob(
         organization_id="org_123",
         profile_id="bp_created",
         directory="/tmp/managed_profile",
+        require_encryption=encrypted,
     )
     update_credential.assert_awaited_once()
 
@@ -876,7 +883,7 @@ async def test_credential_browser_profile_save_falls_back_to_legacy_archive_for_
     update_credential = AsyncMock(return_value=SimpleNamespace())
     store_browser_profile = AsyncMock()
     retrieve_profile = AsyncMock(return_value=None)
-    retrieve_session = AsyncMock(return_value="/tmp/legacy_session")
+    retrieve_session = AsyncMock(return_value=BrowserProfileSnapshot("/tmp/legacy_session"))
     get_storage_key = AsyncMock(return_value="wpid_123")
 
     monkeypatch.setattr(
@@ -902,8 +909,8 @@ async def test_credential_browser_profile_save_falls_back_to_legacy_archive_for_
         AsyncMock(return_value=SimpleNamespace(is_managed=True, workflow_permanent_id="wpid_123")),
     )
     monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_browser_session_storage_key", get_storage_key)
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_profile", retrieve_profile)
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", retrieve_session)
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_profile_snapshot", retrieve_profile)
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session_snapshot", retrieve_session)
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
     monkeypatch.setattr(
         forge_app.DATABASE.credentials,
@@ -929,6 +936,7 @@ async def test_credential_browser_profile_save_falls_back_to_legacy_archive_for_
         organization_id="org_123",
         profile_id="bp_created",
         directory="/tmp/legacy_session",
+        require_encryption=False,
     )
 
 

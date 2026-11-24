@@ -6,11 +6,12 @@ import os
 import re
 import socket
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlparse, urlsplit, urlunparse, urlunsplit
 
 import structlog
-from playwright.async_api import Browser, Playwright
+from playwright.async_api import Browser, BrowserContext, Error, Playwright
 
 from skyvern.config import settings
 from skyvern.exceptions import CdpConnectionConfigurationError
@@ -20,6 +21,27 @@ from skyvern.webeye.cdp_credentials import LIVE_VIEW_PATH_SEGMENT, marked_creden
 
 LOG = structlog.get_logger()
 DEFAULT_CDP_CONNECT_TIMEOUT_MS = 30_000
+
+
+async def read_cdp_context_id(context: BrowserContext) -> str | None:
+    """Read the browser's own identity for this context, which survives tab changes."""
+    page = next(iter(context.pages), None)
+    if page is None:
+        return None
+    try:
+        async with asyncio.timeout(2):
+            session = await context.new_cdp_session(page)
+            try:
+                result = await session.send("Target.getTargetInfo")
+            finally:
+                with suppress(Error, TimeoutError):
+                    await asyncio.wait_for(session.detach(), timeout=1)
+    except (Error, TimeoutError):
+        return None
+    info = result.get("targetInfo")
+    identity = info.get("browserContextId") if isinstance(info, dict) else None
+    return identity if isinstance(identity, str) and identity else None
+
 
 _CDP_DISCOVERY_ERROR_RE = re.compile(
     r"Unexpected status (?P<status>\d+) when connecting to (?P<url>https?://\S+/json/version/?)"

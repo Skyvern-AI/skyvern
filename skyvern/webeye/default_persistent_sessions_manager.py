@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from math import floor
 from pathlib import Path
 from typing import Any, cast
@@ -28,6 +29,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_get_json
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -42,6 +44,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSessionStatus,
     PersistentBrowserType,
     assert_runnable_owner,
+    export_profile_storage_id,
     is_external_cdp_session,
     is_final_status,
     lost_external_browser_error,
@@ -128,8 +131,10 @@ async def _probe_local_cdp_address(cdp_port: int) -> str | None:
 
 
 async def _discard_browser_state(browser_state: BrowserState, cdp_port: int | None) -> None:
+    if artifacts := browser_state.browser_artifacts:
+        artifacts._local_profile_workflow_pending = False
     try:
-        await browser_state.close()
+        await browser_state.close(persist_session_state=False)
     finally:
         if cdp_port is not None:
             _release_cdp_port(cdp_port)
@@ -706,7 +711,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         return cached.browser_state if cached is not None else None
 
     async def get_observer_browser_state(
-        self, session_id: str, organization_id: str | None = None
+        self, session_id: str, organization_id: str | None = None, *, for_profile_capture: bool = False
     ) -> BrowserState | None:
         """The state this process already drives, so watching it adopts nothing."""
         return await self.get_browser_state(session_id, organization_id)
@@ -915,8 +920,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_profile_id=session.browser_profile_id,
+                browser_session_id=session_id,
                 profile_read_only=session.profile_read_only,
                 cdp_port=cdp_port,
+                profile_export_fork=bool(session.browser_profile_id and session.generate_browser_profile),
                 timezone_id=requested_timezone_id(session.browser_settings),
                 runtime_event_context=BrowserRuntimeLogContext(
                     browser_session_id=session_id,
@@ -1263,7 +1270,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         return True
 
     async def _release_local_browser_session(
-        self, organization_id: str, browser_session_id: str, *, export_profile: bool | None = None
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        *,
+        export_profile: bool | None = None,
+        generate_browser_profile: bool = True,
     ) -> bool:
         """Tear down and drop this process's in-memory BrowserState for a session WITHOUT completing
         the shared DB row. Returns True iff a locally-held state was released.
@@ -1304,9 +1316,14 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             organization_id=organization_id,
             session_id=browser_session_id,
         )
-        # Export session profile before closing (so it can be used to create browser profiles)
+        # Saved-profile replacement waits for clean teardown. A fresh remote session export can run now.
         browser_artifacts = browser_session.browser_state.browser_artifacts
-        if export_profile is not False and browser_artifacts and browser_artifacts.browser_session_dir:
+        if (
+            export_profile is not False
+            and not browser_session.browser_state.profile_read_only
+            and browser_artifacts.browser_session_dir
+            and not browser_artifacts._seed_load_failed
+        ):
             # Export-eligible paths snapshot session cookies before store_browser_profile copies
             # the dir; the later close() persist runs after this export, too late to land in the
             # archive. export_profile=False intentionally skips both the cookie snapshot and the
@@ -1333,6 +1350,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                         browser_session_id, organization_id
                     )
                     should_export = persisted_session is None or persisted_session.should_export_profile()
+                    generate_browser_profile = persisted_session is None or persisted_session.generate_browser_profile
                 except Exception:
                     LOG.warning(
                         "Failed to read browser session opt-in flag; exporting profile to be safe",
@@ -1347,16 +1365,30 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 should_export = export_profile
             if should_export:
                 try:
-                    await app.STORAGE.store_browser_profile(
+                    seed_id = browser_artifacts.applied_browser_profile_id
+                    destination_id = export_profile_storage_id(
+                        session_id=browser_session_id,
+                        browser_profile_id=seed_id if isinstance(app.STORAGE, LocalStorage) else None,
+                        generate_browser_profile=generate_browser_profile,
+                    )
+                    save = partial(
+                        app.STORAGE.store_browser_profile,
                         organization_id=organization_id,
-                        profile_id=browser_session_id,
+                        profile_id=destination_id,
                         directory=browser_artifacts.browser_session_dir,
+                        require_encryption=browser_artifacts._seed_profile_encrypted,
                     )
-                    LOG.info(
-                        "Exported browser session profile",
-                        browser_session_id=browser_session_id,
-                        organization_id=organization_id,
-                    )
+                    if destination_id == seed_id:
+                        # A writable durable legacy profile already receives the browser's changes in place.
+                        browser_artifacts._profile_writeback = browser_artifacts._local_profile_reuse_save
+                    elif browser_artifacts._local_profile_working_dir or (
+                        seed_id
+                        and not generate_browser_profile
+                        and (browser_artifacts._seed_profile_encrypted or settings.SKYVERN_ENCRYPT_BROWSER_PROFILES)
+                    ):
+                        browser_artifacts._profile_writeback = save
+                    else:
+                        await save()
                 except Exception:
                     LOG.exception(
                         "Failed to export browser session profile",
@@ -1693,7 +1725,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 # soft-delete race between reconcile's read and a second in-release read.
                 should_export_profile = db_session is not None and db_session.should_export_profile()
                 await self._release_local_browser_session(
-                    organization_id, session_id, export_profile=should_export_profile
+                    organization_id,
+                    session_id,
+                    export_profile=should_export_profile,
+                    generate_browser_profile=db_session is None or db_session.generate_browser_profile,
                 )
             except Exception:
                 LOG.exception(

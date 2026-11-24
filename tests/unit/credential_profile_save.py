@@ -69,6 +69,12 @@ class ProfileArchiveTransport:
 
         return {"Body": SimpleNamespace(read=read)}
 
+    async def head_object(self, Bucket: str, Key: str) -> dict[str, int]:
+        data = self.objects.get((Bucket, Key))
+        if data is None:
+            raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
+        return {"ContentLength": len(data)}
+
     async def delete_object(self, Bucket: str, Key: str, **_options: object) -> dict[str, object]:
         self.objects.pop((Bucket, Key), None)
         return {}

@@ -1,9 +1,9 @@
 import asyncio
 import os
-import shutil
 import uuid
 from collections.abc import AsyncIterator, Awaitable
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, BinaryIO, TypeVar
 
 import structlog
@@ -14,10 +14,8 @@ from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
-    create_named_temporary_file,
     get_download_dir,
     get_skyvern_temp_dir,
-    unzip_bytes_to_temp_directory,
     wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.api.gcp import STORAGE_CLASS_STANDARD, GcsUri
@@ -27,6 +25,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     SENSITIVE_SHARE_URL_EXPIRY_HOURS,
     BaseStorage,
+    BrowserProfileSnapshot,
     StoredObjectVersion,
     StreamingArtifactStorage,
     _file_infos_from_artifacts,
@@ -38,7 +37,14 @@ from skyvern.forge.sdk.artifact.storage.base import (
     presign_with_sensitive_cap,
     resolve_download_attempt_fail_open,
 )
-from skyvern.forge.sdk.artifact.storage.browser_profile_archive import extract_profile_archive, write_profile_archive
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
+    WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+    find_profile_object,
+    profile_archive_uris,
+    retrieve_remote_profile,
+    store_remote_profile,
+    workflow_session_archive_uris,
+)
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
     RUN_RECORDING_PATH_SEGMENT,
@@ -273,118 +279,122 @@ class GcsStorage(BaseStorage, StreamingArtifactStorage):
         path = f"gs://{settings.GCS_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         return await self.async_client.download_file(path, log_exception=False)
 
-    async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
-        browser_session_uri = (
-            f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
-        )
+    @staticmethod
+    def _workflow_session_uris(organization_id: str, storage_key: str) -> tuple[str, str]:
+        base = f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}"
+        return workflow_session_archive_uris(base, organization_id, storage_key)
+
+    async def store_browser_session(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        directory: str,
+        *,
+        require_encryption: bool = False,
+        strict_traversal: bool = False,
+    ) -> None:
         storage_class = await self._get_storage_class_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
-        # make_archive writes base_name + ".zip", a separate file the NamedTemporaryFile cleanup never
-        # removes, so name it up front and remove it even when archiving or upload fails.
-        with create_named_temporary_file() as temp_zip_file:
-            zip_file_path = f"{temp_zip_file.name}.zip"
-            try:
-                shutil.make_archive(temp_zip_file.name, "zip", directory)
-                LOG.debug(
-                    "Storing browser session",
-                    organization_id=organization_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                    zip_file_path=zip_file_path,
-                    browser_session_uri=browser_session_uri,
-                    storage_class=storage_class,
-                    tags=tags,
-                )
-                await self.async_client.upload_file_from_path(
-                    browser_session_uri, zip_file_path, storage_class=storage_class, tags=tags
-                )
-            finally:
-                if os.path.exists(zip_file_path):
-                    os.remove(zip_file_path)
+        await store_remote_profile(
+            self._workflow_session_uris(organization_id, workflow_permanent_id),
+            organization_id,
+            workflow_permanent_id,
+            directory,
+            stat=self.async_client.get_object_info,
+            upload=partial(self.async_client.upload_file_from_path, storage_class=storage_class, tags=tags),
+            delete=self.async_client.delete_file,
+            require_encryption=require_encryption,
+            strict_traversal=strict_traversal,
+            purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+        )
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
-        browser_session_uri = (
-            f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
+        snapshot = await self.retrieve_browser_session_snapshot(organization_id, workflow_permanent_id)
+        return snapshot.directory if snapshot is not None else None
+
+    async def retrieve_browser_session_snapshot(
+        self, organization_id: str, workflow_permanent_id: str
+    ) -> BrowserProfileSnapshot | None:
+        return await retrieve_remote_profile(
+            self._workflow_session_uris(organization_id, workflow_permanent_id),
+            organization_id,
+            workflow_permanent_id,
+            download=self.async_client.download_file,
+            stat=self.async_client.get_object_info,
+            purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
         )
-        downloaded_zip_bytes = await self.async_client.download_file(browser_session_uri, log_exception=True)
-        if not downloaded_zip_bytes:
-            return None
-        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_session_")
 
     async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
-        browser_session_uri = (
-            f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
-        )
-        LOG.info(
-            "Deleting persisted browser session",
-            organization_id=organization_id,
-            workflow_permanent_id=workflow_permanent_id,
-            browser_session_uri=browser_session_uri,
-        )
-        await self.async_client.delete_file(browser_session_uri)
+        for uri in self._workflow_session_uris(organization_id, workflow_permanent_id):
+            await self.async_client.delete_file(uri)
 
-    async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
-        """Store browser profile to GCS."""
-        temp_zip_file = create_named_temporary_file()
-        zip_file_path = f"{temp_zip_file.name}.zip"
-        write_profile_archive(directory, zip_file_path, organization_id=organization_id, profile_id=profile_id)
-        profile_uri = (
-            f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
-        )
+    @staticmethod
+    def _profile_uris(organization_id: str, profile_id: str) -> tuple[str, str]:
+        base = f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}"
+        return profile_archive_uris(base, organization_id, profile_id)
+
+    async def store_browser_profile(
+        self,
+        organization_id: str,
+        profile_id: str,
+        directory: str,
+        *,
+        require_encryption: bool = False,
+        confirm_creation: bool = False,
+        strict_traversal: bool = False,
+    ) -> None:
         storage_class = await self._get_storage_class_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
-        LOG.debug(
-            "Storing browser profile",
-            organization_id=organization_id,
-            profile_id=profile_id,
-            zip_file_path=zip_file_path,
-            profile_uri=profile_uri,
-            storage_class=storage_class,
-            tags=tags,
+
+        await store_remote_profile(
+            self._profile_uris(organization_id, profile_id),
+            organization_id,
+            profile_id,
+            directory,
+            stat=self.async_client.get_object_info,
+            upload=partial(self.async_client.upload_file_from_path, storage_class=storage_class, tags=tags),
+            delete=self.async_client.delete_file,
+            require_encryption=require_encryption,
+            strict_traversal=strict_traversal,
+            confirm_creation=confirm_creation,
         )
-        try:
-            await self.async_client.upload_file_from_path(
-                profile_uri, zip_file_path, storage_class=storage_class, tags=tags
-            )
-        finally:
-            # make_archive writes temp_zip_file.name + ".zip", a separate file the NamedTemporaryFile
-            # cleanup never removes; drop it so successful profile banks don't leak zips into TEMP_PATH.
-            if os.path.exists(zip_file_path):
-                os.remove(zip_file_path)
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
-        """Retrieve browser profile from GCS."""
-        profile_uri = (
-            f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        snapshot = await self.retrieve_browser_profile_snapshot(organization_id, profile_id)
+        return snapshot.directory if snapshot is not None else None
+
+    async def retrieve_browser_profile_snapshot(
+        self, organization_id: str, profile_id: str, *, copy: bool = False
+    ) -> BrowserProfileSnapshot | None:
+        return await retrieve_remote_profile(
+            self._profile_uris(organization_id, profile_id),
+            organization_id,
+            profile_id,
+            download=self.async_client.download_file,
+            stat=self.async_client.get_object_info,
         )
-        downloaded_zip_bytes = await self.async_client.download_file(profile_uri, log_exception=True)
-        if not downloaded_zip_bytes:
-            return None
-        return extract_profile_archive(downloaded_zip_bytes, organization_id=organization_id, profile_id=profile_id)
+
+    async def _saved_profile_info(self, organization_id: str, profile_id: str) -> dict | None:
+        uri, sealed_uri = self._profile_uris(organization_id, profile_id)
+        saved, _ = await find_profile_object(uri, sealed_uri, self.async_client.get_object_info)
+        return saved
 
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
-        """Non-destructive existence check via object metadata — avoids downloading the whole archive."""
-        profile_uri = (
-            f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
-        )
-        # Not-found returns None (-> False); transient/authz errors propagate so the has-content
-        # fail-safe treats a flaky read as existing content instead of reseeding a run to fresh and
-        # overwriting its saved archive.
-        return await self.async_client.get_object_info(profile_uri) is not None
+        return await self._saved_profile_info(organization_id, profile_id) is not None
+
+    async def get_browser_profile_etag(
+        self, organization_id: str, profile_id: str, *, encrypted: bool | None = None
+    ) -> str | None:
+        if encrypted is None and not settings.SKYVERN_ENCRYPT_BROWSER_PROFILES:
+            return None
+        info = await self._saved_profile_info(organization_id, profile_id)
+        version = info.get("Generation") if info is not None else None
+        return str(version) if version is not None else None
 
     async def delete_browser_profile(self, organization_id: str, profile_id: str, hard_delete: bool = False) -> None:
-        """Delete a browser profile from GCS. hard_delete does a terminal object delete (full erasure while
-        the bucket has no object versioning/soft-delete). It does NOT purge old generations — if versioning
-        is enabled, expire noncurrent generations via a GCS lifecycle rule. Delete failures propagate."""
-        profile_uri = (
-            f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
-        )
-        LOG.info(
-            "Deleting browser profile",
-            organization_id=organization_id,
-            profile_id=profile_id,
-            profile_uri=profile_uri,
-        )
-        await self.async_client.delete_file(profile_uri)
+        # Erase legacy first so a failed deletion cannot expose stale plaintext as the current profile.
+        for uri in self._profile_uris(organization_id, profile_id):
+            await self.async_client.delete_file(uri)
 
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str

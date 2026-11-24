@@ -166,6 +166,7 @@ async def save_new_credential_capture(
     directory: str,
     writer: str | None,
     test_url: str,
+    require_encryption: bool = False,
 ) -> None:
     credential_id = creation.credential_id
     credential = await app.DATABASE.credentials.get_credential(credential_id, organization_id)
@@ -180,7 +181,9 @@ async def save_new_credential_capture(
         return
 
     profile_id = generate_browser_profile_id()
-    await storage.store_browser_profile(organization_id, profile_id, directory, confirm_creation=True)
+    await storage.store_browser_profile(
+        organization_id, profile_id, directory, confirm_creation=True, require_encryption=require_encryption
+    )
     rolled_back = False
 
     def confirm_precommit_rollback() -> None:
