@@ -51,7 +51,7 @@ async def test_page_tap_frame_scan_logs_an_error_and_continues(monkeypatch: pyte
         await tap.poll_new_frames()
 
     assert scan.await_count == 2
-    assert any(entry["event"] == "copilot_demonstration_frame_scan_failed" for entry in logs)
+    assert any(entry["event"] == "ember_demonstration_frame_scan_failed" for entry in logs)
 
 
 async def _wait_for_event(

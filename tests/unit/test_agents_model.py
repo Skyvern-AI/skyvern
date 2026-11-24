@@ -1348,7 +1348,7 @@ def test_a_scope_slower_than_the_threshold_logs_itself_once(monkeypatch: pytest.
         with pending_operation("mcp.call_tool:run_block"):
             pass
 
-    slow = [entry for entry in logs if entry.get("event") == "copilot_pending_operation_slow"]
+    slow = [entry for entry in logs if entry.get("event") == "ember_pending_operation_slow"]
     assert len(slow) == 1
     assert slow[0]["pending_operation"] == "mcp.call_tool:run_block"
     assert isinstance(slow[0]["pending_operation_started_monotonic"], float)
@@ -1373,7 +1373,7 @@ def test_a_fingerprint_carries_the_turn_identifiers_that_join_it_to_its_request(
         with pending_operation("mcp.call_tool:run_block"):
             fields = pending_operation_fields()
 
-    slow = [entry for entry in logs if entry.get("event") == "copilot_pending_operation_slow"]
+    slow = [entry for entry in logs if entry.get("event") == "ember_pending_operation_slow"]
     assert len(slow) == 1
     for key, value in (
         ("workflow_permanent_id", "wpid_1"),
@@ -1494,7 +1494,7 @@ def test_a_scope_spanning_the_whole_iteration_does_not_emit_the_slow_line(
         with pending_operation("turn.stream", span=True):
             pass
 
-    assert [entry for entry in logs if entry.get("event") == "copilot_pending_operation_slow"] == []
+    assert [entry for entry in logs if entry.get("event") == "ember_pending_operation_slow"] == []
 
 
 @pytest.mark.asyncio

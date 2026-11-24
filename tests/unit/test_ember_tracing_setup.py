@@ -480,16 +480,16 @@ class TestPatchAgentSpanAttributes:
 
         token = _ember_model_name.set("gpt-4o")
         try:
-            span_data = AgentSpanData(name="workflow-copilot", handoffs=[], tools=[], output_type="str")
+            span_data = AgentSpanData(name="ember", handoffs=[], tools=[], output_type="str")
             attrs = _oai_mod.attributes_from_span_data(span_data, "Agent run: {name!r}")
         finally:
             _ember_model_name.reset(token)
 
-        assert attrs["gen_ai.agent.name"] == "workflow-copilot"
+        assert attrs["gen_ai.agent.name"] == "ember"
         assert attrs["gen_ai.operation.name"] == "invoke_agent"
         assert attrs["gen_ai.provider.name"] == "openai"
         assert attrs["gen_ai.request.model"] == "gpt-4o"
-        assert attrs["name"] == "workflow-copilot"
+        assert attrs["name"] == "ember"
 
     def test_patch_sets_otel_span_name_on_create_span(self) -> None:
         import logfire._internal.integrations.openai_agents as _oai_mod
@@ -512,14 +512,14 @@ class TestPatchAgentSpanAttributes:
         _patch_agent_span_attributes()
 
         span_data = AgentSpanData(
-            name="workflow-copilot",
+            name="ember",
             handoffs=[],
             tools=[],
             output_type="str",
         )
         _oai_mod.LogfireTraceProviderWrapper.create_span(MagicMock(), span_data)
 
-        assert mock_logfire_span._span_name == "invoke_agent workflow-copilot"
+        assert mock_logfire_span._span_name == "invoke_agent ember"
 
     def test_patch_adds_raw_cache_usage_aliases_and_call_metadata(
         self,

@@ -3269,7 +3269,7 @@ workflow_definition:
         assert packet["downloads"] == [{"artifact_id": "artifact_1"}]
         assert packet["screenshot"] == {"present": True, "provenance": "data.screenshot_base64"}
         assert packet["unfinished_items"] == [{"kind": "unverified_block", "label": "read_total"}]
-        assert sum(log.get("event") == "copilot diagnosis repair contract shadow" for log in logs) == 3
+        assert sum(log.get("event") == "ember diagnosis repair contract shadow" for log in logs) == 3
 
     def test_packet_falls_back_to_turn_start_persistence_readback_not_submitted_yaml(self) -> None:
         ctx = _ctx(
@@ -5606,7 +5606,7 @@ class TestCredentialRefusalReachesAgent:
                 turn_id="turn-1",
             )
 
-        policy_event = next(log for log in logs if log["event"] == "copilot_authoring_capability_resolved")
+        policy_event = next(log for log in logs if log["event"] == "ember_authoring_capability_resolved")
 
         assert build_context.call_args.kwargs["workflow_yaml"] == restored_yaml
         assert result.user_response == "ok"
@@ -6583,7 +6583,7 @@ class TestRunBlocksCredentialApproval:
 
         assert recorded is None
         assert [frame for frame in ctx.stream.sent if isinstance(frame, EmberRunOutcomeUpdate)] == []
-        assert "copilot_run_outcome_recorded" not in [call.args[0] for call in log.info.call_args_list if call.args]
+        assert "ember_run_outcome_recorded" not in [call.args[0] for call in log.info.call_args_list if call.args]
         assert ctx.latest_recorded_build_test_outcome is prior_build_outcome
         assert ctx.run_outcome_trace == [prior_outcome]
         assert (ctx.last_test_ok, ctx.last_test_run_started) == (False, False)
@@ -8243,8 +8243,8 @@ class TestEmberConfig:
                     output_guardrails=[],
                 )
 
-        assert not any(entry.get("event") == "Copilot agent model attempt failed" for entry in logs)
-        stopped = [entry for entry in logs if entry.get("event") == "Copilot agent model attempt stopped"]
+        assert not any(entry.get("event") == "Ember agent model attempt failed" for entry in logs)
+        stopped = [entry for entry in logs if entry.get("event") == "Ember agent model attempt stopped"]
         assert len(stopped) == 1
         assert stopped[0]["attempt_outcome"] == "terminal"
         assert stopped[0]["error_type"] == type(terminal_error).__name__
@@ -8552,7 +8552,7 @@ class TestEmberConfig:
         attempt_logs = [
             entry
             for entry in logs
-            if entry.get("event") in {"Copilot agent model attempt failed", "Copilot agent model attempt succeeded"}
+            if entry.get("event") in {"Ember agent model attempt failed", "Ember agent model attempt succeeded"}
         ]
         assert [entry["attempt_outcome"] for entry in attempt_logs] == [
             "empty_completion",
@@ -10233,7 +10233,7 @@ def test_the_authoring_turn_summary_diffs_the_turn_start_draft_not_the_last_writ
     with capture_logs() as logs:
         agent_module._log_authoring_turn_summary(ctx)
 
-    summary = next(entry for entry in logs if entry["event"] == "copilot_authoring_turn_summary")
+    summary = next(entry for entry in logs if entry["event"] == "ember_authoring_turn_summary")
     assert summary["introduced_code_blocks"] == ["fetch"]
     assert summary["introduced_agent_blocks"] == {}
 
@@ -10261,5 +10261,5 @@ def test_the_authoring_turn_summary_reads_a_draft_the_inline_path_published() ->
     with capture_logs() as logs:
         agent_module._log_authoring_turn_summary(ctx)
 
-    summary = next(entry for entry in logs if entry["event"] == "copilot_authoring_turn_summary")
+    summary = next(entry for entry in logs if entry["event"] == "ember_authoring_turn_summary")
     assert summary["introduced_code_blocks"] == ["fetch"]

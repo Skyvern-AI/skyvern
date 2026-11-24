@@ -312,7 +312,7 @@ async def test_a_delete_slower_than_its_timeout_reports_failed_and_still_finishe
         chat.vault.gate.set()
         while steps := set(routes._DETACHED_CREDENTIAL_DELETE_TASKS):
             await asyncio.wait_for(asyncio.gather(*steps), 5)
-    late = [entry for entry in logs if entry["event"] == "copilot_credential_deletion_late_outcome"]
+    late = [entry for entry in logs if entry["event"] == "ember_credential_deletion_late_outcome"]
     assert [(entry["credential_id"], entry["outcome"]) for entry in late] == [("cred_1", "deleted")]
     assert await _surviving(chat) == {"cred_2", "cred_3", "cred_foreign"}
     audit.assert_awaited_once_with(RUN_GROUP_ORG, "credential.delete", "credential", "cred_1")
@@ -344,7 +344,7 @@ async def test_a_credential_removed_elsewhere_after_its_delete_timed_out_logs_a_
         gate.set()
         while steps := set(routes._DETACHED_CREDENTIAL_DELETE_TASKS):
             await asyncio.wait_for(asyncio.gather(*steps, return_exceptions=True), 5)
-    late = [entry for entry in logs if entry["event"] == "copilot_credential_deletion_late_outcome"]
+    late = [entry for entry in logs if entry["event"] == "ember_credential_deletion_late_outcome"]
     assert [(entry["credential_id"], entry["outcome"]) for entry in late] == [("cred_1", "not_found")]
     assert chat.vault.deleted == []
 

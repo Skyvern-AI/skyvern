@@ -418,7 +418,7 @@ class TestMcpBrowserContextBridge:
         ctx = _make_ctx()
         # Read before the call: a completed resolve that finds nothing attachable retires the id.
         supplied_session_id = ctx.browser_session_id
-        with pytest.raises(RuntimeError, match="No browser context for copilot session") as exc_info:
+        with pytest.raises(RuntimeError, match="No browser context for ember session") as exc_info:
             async with mcp_browser_context(ctx):
                 pytest.fail("should not enter body")
 

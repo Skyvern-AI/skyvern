@@ -492,7 +492,7 @@ async def test_signing_in_survives_a_reload_and_done_resumes_the_same_call_with_
     assert ctx.request_policy.credential_pause_signed_in_profile_id == "bp_signed_in"
     assert ctx.request_policy.credential_pause_signed_in_site == "portal.example.com"
     assert ctx.request_policy.resolved_credentials == []
-    assert any(entry["event"] == "copilot_credential_pause_signed_in" for entry in logs)
+    assert any(entry["event"] == "ember_credential_pause_signed_in" for entry in logs)
 
 
 @both_recovery_headers

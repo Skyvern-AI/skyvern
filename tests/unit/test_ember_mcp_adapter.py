@@ -263,8 +263,8 @@ def test_a_withheld_result_keeps_its_disposition_across_rescrubs_and_logs_once(s
     assert (withheld_outcome.ok, withheld_outcome.payload_omitted, withheld_outcome.error_kind) == (False, True, "tool")
     assert "signed-in page text" not in json.dumps([first, projected, second])
     assert (str(size) in json.dumps(second)) is not size_is_registered
-    assert [log["event"] for log in logs if log["event"] == "copilot_model_facing_result_withheld"] == [
-        "copilot_model_facing_result_withheld"
+    assert [log["event"] for log in logs if log["event"] == "ember_model_facing_result_withheld"] == [
+        "ember_model_facing_result_withheld"
     ]
 
 
@@ -743,7 +743,7 @@ def _timing_records(captured: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _browser_outcome_records(captured: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [record for record in captured if record.get("event") == "copilot_browser_call_outcome"]
+    return [record for record in captured if record.get("event") == "ember_browser_call_outcome"]
 
 
 @pytest.mark.asyncio
@@ -2372,7 +2372,7 @@ class TestBrowserSessionContinuity:
         assert first == second == "reestablished"
         assert calls == [None]
         assert ctx.browser_session_id == "pbs_replacement"
-        records = [record for record in captured if record.get("event") == "copilot_browser_session_continuity_loss"]
+        records = [record for record in captured if record.get("event") == "ember_browser_session_continuity_loss"]
         assert records[0]["session_id"] == "pbs_lost"
         assert all(record["error_code"] == "SESSION_EXPIRED" for record in records)
         assert [record["continuity_disposition"] for record in records] == ["detected", "reestablished"]
@@ -2684,7 +2684,7 @@ class TestBrowserSessionContinuity:
         assert ctx.browser_session_id == "pbs_lost"
         assert ctx.browser_session_replacements == {}
         assert "could not be determined" in _surfaced_error(result, call_path)
-        continuity = [record for record in logs if record.get("event") == "copilot_browser_session_continuity_loss"]
+        continuity = [record for record in logs if record.get("event") == "ember_browser_session_continuity_loss"]
         assert continuity == []
         timing = _timing_records(logs)
         assert len(timing) == 1
@@ -4058,8 +4058,8 @@ class _HangingClient:
 @pytest.mark.parametrize(
     ("api_key", "event", "detail"),
     [
-        pytest.param(None, "copilot_mcp_server_lifecycle_failed", "exc_info", id="error"),
-        pytest.param("sk-test", "copilot_mcp_server_lifecycle_cancelled", "elapsed_seconds", id="connect_timeout"),
+        pytest.param(None, "ember_mcp_server_lifecycle_failed", "exc_info", id="error"),
+        pytest.param("sk-test", "ember_mcp_server_lifecycle_cancelled", "elapsed_seconds", id="connect_timeout"),
     ],
 )
 async def test_an_mcp_server_that_fails_to_connect_logs_why(

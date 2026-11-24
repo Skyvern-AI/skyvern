@@ -10375,7 +10375,7 @@ def test_judgment_truth_condition_confirms_login_gate_from_independent_packet() 
     assert verdicts[0].reason_code == "evidence_confirms"
     assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
     assert verdicts[0].evidence_source == "independent_page_evidence"
-    assert logs[-1]["event"] == "copilot_judgment_evidence_verdict"
+    assert logs[-1]["event"] == "ember_judgment_evidence_verdict"
     assert logs[-1]["predicate"] == "login_gate_blocks_target"
     assert logs[-1]["packet_label"] == _POST_RUN_PAGE_OBSERVATION_LABEL
     assert logs[-1]["verdict"] == "evidence_confirms"
@@ -10427,7 +10427,7 @@ def test_bound_gated_submit_login_packet_wins_over_self_emitted_judgment() -> No
     assert verdicts[0].evidence_source == "independent_page_evidence"
     assert verdicts[0].self_emitted_judgment_not_independent is False
     assert any(
-        log["event"] == "copilot_judgment_evidence_verdict" and log["verdict"] == "evidence_confirms" for log in logs
+        log["event"] == "ember_judgment_evidence_verdict" and log["verdict"] == "evidence_confirms" for log in logs
     )
 
 
@@ -10511,7 +10511,7 @@ def test_value_less_emitted_false_judgment_is_refuted_by_login_gate_packet() -> 
     assert verdicts[0].evidence_source == "independent_page_evidence"
     assert verdicts[0].has_exact_value is False
     assert any(
-        log["event"] == "copilot_judgment_evidence_verdict"
+        log["event"] == "ember_judgment_evidence_verdict"
         and log["predicate"] == "login_gate_blocks_target"
         and log["packet_label"] == _POST_RUN_PAGE_OBSERVATION_LABEL
         and log["verdict"] == "evidence_contradicts"
@@ -10563,7 +10563,7 @@ def test_producer_declared_value_less_judgment_reaches_packet_verdict() -> None:
     assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
     assert verdicts[0].evidence_source == "independent_page_evidence"
     assert any(
-        log["event"] == "copilot_judgment_evidence_verdict"
+        log["event"] == "ember_judgment_evidence_verdict"
         and log["predicate"] == "login_gate_blocks_target"
         and log["packet_label"] == _POST_RUN_PAGE_OBSERVATION_LABEL
         and log["verdict"] == "evidence_confirms"
@@ -10614,7 +10614,7 @@ def test_producer_declared_truth_condition_without_metadata_source_reaches_packe
     assert verdicts[0].has_exact_value is False
     assert verdicts[0].evidence_source == "independent_page_evidence"
     assert any(
-        log["event"] == "copilot_judgment_evidence_verdict"
+        log["event"] == "ember_judgment_evidence_verdict"
         and log["predicate"] == "login_gate_blocks_target"
         and log["origin"] == "producer_metadata"
         for log in logs
@@ -10673,7 +10673,7 @@ async def test_definition_level_judgment_output_reaches_independent_packet_grade
     assert verification.verdicts[0].reason_code == "evidence_confirms"
     assert verification.verdicts[0].evidence_source == "independent_page_evidence"
     assert any(
-        log["event"] == "copilot_judgment_evidence_verdict" and log["verdict"] == "evidence_confirms" for log in logs
+        log["event"] == "ember_judgment_evidence_verdict" and log["verdict"] == "evidence_confirms" for log in logs
     )
 
 
@@ -10718,7 +10718,7 @@ async def test_authored_output_fallback_preserves_staged_judgment_truth_conditio
     assert verdict.grounding_mode == "judgment_boolean"
     assert verdict.evidence_source == "independent_page_evidence"
     assert any(
-        log["event"] == "copilot_judgment_evidence_verdict"
+        log["event"] == "ember_judgment_evidence_verdict"
         and log["predicate"] == "login_gate_blocks_target"
         and log["origin"] == "producer_metadata"
         for log in logs
@@ -10764,7 +10764,7 @@ async def test_authored_output_fallback_recovers_path_declared_judgment_truth_co
     assert verdict.grounding_mode == "judgment_boolean"
     assert verdict.evidence_source == "independent_page_evidence"
     assert any(
-        log["event"] == "copilot_judgment_evidence_verdict"
+        log["event"] == "ember_judgment_evidence_verdict"
         and log["predicate"] == "login_gate_blocks_target"
         and log["origin"] == "producer_metadata"
         for log in logs
@@ -10832,7 +10832,7 @@ async def test_authored_output_duplicate_path_judgment_row_reaches_packet_grader
     assert verdict.grounding_mode == "judgment_boolean"
     assert verdict.evidence_source == "independent_page_evidence"
     assert any(
-        log["event"] == "copilot_judgment_evidence_verdict"
+        log["event"] == "ember_judgment_evidence_verdict"
         and log["predicate"] == "login_gate_blocks_target"
         and log["verdict"] == "evidence_contradicts"
         for log in logs
@@ -10919,7 +10919,7 @@ async def test_dispatched_chain_login_gate_packet_confirms_judgment_boolean(
     assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
     assert verdicts[0].evidence_source == "independent_page_evidence"
     assert any(
-        log["event"] == "copilot_judgment_evidence_verdict"
+        log["event"] == "ember_judgment_evidence_verdict"
         and log["predicate"] == "login_gate_blocks_target"
         and log["packet_label"] == _POST_RUN_PAGE_OBSERVATION_LABEL
         and log["verdict"] == "evidence_confirms"
@@ -10947,7 +10947,7 @@ async def test_dispatched_chain_result_container_packet_contradicts_login_gate(
     assert verdicts[0].evidence_source == "independent_page_evidence"
     assert all(verdict.reason_code != "structurally_abstained" for verdict in verdicts)
     assert any(
-        log["event"] == "copilot_judgment_evidence_verdict"
+        log["event"] == "ember_judgment_evidence_verdict"
         and log["predicate"] == "login_gate_blocks_target"
         and log["verdict"] == "evidence_contradicts"
         for log in logs

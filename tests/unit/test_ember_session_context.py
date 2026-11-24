@@ -1,4 +1,4 @@
-"""Tests for the bind_copilot_session_id context manager and copilot.session_id span stamping."""
+"""Tests for the bind_copilot_session_id context manager and ember.session_id span stamping."""
 
 from __future__ import annotations
 
@@ -104,19 +104,19 @@ class TestEnrichLlmSpan:
         span = MagicMock()
         with skyvern_context.scoped(SkyvernContext(copilot_session_id="chat_xyz")):
             _call_enrich(span)
-        span.set_attribute.assert_any_call("copilot.session_id", "chat_xyz")
+        span.set_attribute.assert_any_call("ember.session_id", "chat_xyz")
 
     def test_no_attribute_when_context_has_no_session_id(self) -> None:
         span = MagicMock()
         with skyvern_context.scoped(SkyvernContext(copilot_session_id=None)):
             _call_enrich(span)
-        assert "copilot.session_id" not in _set_attribute_keys(span)
+        assert "ember.session_id" not in _set_attribute_keys(span)
 
     def test_no_attribute_when_no_ambient_context(self) -> None:
         span = MagicMock()
         skyvern_context.reset()
         _call_enrich(span)
-        assert "copilot.session_id" not in _set_attribute_keys(span)
+        assert "ember.session_id" not in _set_attribute_keys(span)
 
 
 class _FakeAgentSpanData:
@@ -192,7 +192,7 @@ class TestPatchedSpanAttributes:
         patched = _install_patch(monkeypatch)
         with skyvern_context.scoped(SkyvernContext(copilot_session_id="chat_xyz")):
             attrs = patched(span_data_factory(), msg_template)
-        assert attrs["copilot.session_id"] == "chat_xyz"
+        assert attrs["ember.session_id"] == "chat_xyz"
 
     def test_no_attribute_when_context_has_no_session_id(self, monkeypatch: Any) -> None:
         patched = _install_patch(monkeypatch)
@@ -200,12 +200,12 @@ class TestPatchedSpanAttributes:
             attrs_agent = patched(_FakeAgentSpanData(), "Agent run: {name!r}")
             attrs_gen = patched(_FakeGenerationSpanData(), "Generation")
             attrs_fn = patched(_FakeFunctionSpanData(), "Function call")
-        assert "copilot.session_id" not in attrs_agent
-        assert "copilot.session_id" not in attrs_gen
-        assert "copilot.session_id" not in attrs_fn
+        assert "ember.session_id" not in attrs_agent
+        assert "ember.session_id" not in attrs_gen
+        assert "ember.session_id" not in attrs_fn
 
     def test_no_attribute_when_no_ambient_context(self, monkeypatch: Any) -> None:
         patched = _install_patch(monkeypatch)
         skyvern_context.reset()
         attrs = patched(_FakeAgentSpanData(), "Agent run: {name!r}")
-        assert "copilot.session_id" not in attrs
+        assert "ember.session_id" not in attrs

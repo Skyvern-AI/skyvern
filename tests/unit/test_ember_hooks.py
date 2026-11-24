@@ -218,7 +218,7 @@ async def test_on_tool_end_logs_ember_turn_identifiers() -> None:
     with capture_logs() as logs:
         await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("navigate_browser"), output)
 
-    completed = next(log for log in logs if log["event"] == "copilot tool completed")
+    completed = next(log for log in logs if log["event"] == "ember tool completed")
     assert completed["workflow_permanent_id"] == "wpid_example"
     assert completed["turn_id"] == "turn_example"
     assert completed["workflow_copilot_chat_id"] == "chat_example"
@@ -513,9 +513,7 @@ async def test_on_tool_end_swallows_unserializable_output() -> None:
     # activity entry was dropped. That is the acceptable trade for observability.
     assert ctx.tool_activity == []
     assert ctx.tool_calls_this_turn == 1
-    warning = next(
-        log for log in logs if log["event"] == "CopilotRunHooks.on_tool_end recording failed, skipping entry"
-    )
+    warning = next(log for log in logs if log["event"] == "EmberRunHooks.on_tool_end recording failed, skipping entry")
     assert warning["workflow_permanent_id"] == "wpid_example"
     assert warning["turn_id"] == "turn_example"
     assert warning["workflow_copilot_chat_id"] == "chat_example"
@@ -3080,7 +3078,7 @@ class TestScoutedInteractionCapture:
 
         assert result["data"]["observed_effects"]["challenge_raised"] is True
         assert result["data"]["challenge_vendor"] == "turnstile"
-        signal = next(entry for entry in logs if entry.get("event") == "copilot_observed_challenge_signal")
+        signal = next(entry for entry in logs if entry.get("event") == "ember_observed_challenge_signal")
         for retained in (result["data"], ctx.scout_trajectory[-1], ctx.scouted_interactions[-1], signal):
             assert fragment not in json.dumps(retained)
 
@@ -3134,7 +3132,7 @@ class TestScoutedInteractionCapture:
                 ctx,
             )
 
-        signal = next(entry for entry in logs if entry.get("event") == "copilot_observed_challenge_signal")
+        signal = next(entry for entry in logs if entry.get("event") == "ember_observed_challenge_signal")
         assert "session_token" not in json.dumps(signal)
         assert "abc123" not in json.dumps(signal)
         assert signal["page_origin"] == "https://records.example.test/"

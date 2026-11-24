@@ -640,9 +640,9 @@ class TestViolationBatchIsDurablyRecoverable:
         assert result.error is not None
         attrs = _record_and_flush(result.violations, result.offending_labels)
 
-        assert attrs["copilot.code_artifact_violations"] == result.violations
-        assert attrs["copilot.code_artifact_violation_count"] == len(result.violations)
-        assert attrs["copilot.code_artifact_violation_block_labels"] == ["credential_login", "credential_vault"]
+        assert attrs["ember.code_artifact_violations"] == result.violations
+        assert attrs["ember.code_artifact_violation_count"] == len(result.violations)
+        assert attrs["ember.code_artifact_violation_block_labels"] == ["credential_login", "credential_vault"]
         # Every numbered line from the batched error survives as its own element.
         numbered = [line.split(". ", 1)[1] for line in result.error.splitlines() if re.match(r"^\d+\.", line)]
         assert numbered == result.violations
@@ -656,9 +656,9 @@ class TestViolationBatchIsDurablyRecoverable:
         assert result.offending_labels == []
         assert all(secret not in violation for violation in result.violations)
         attrs = _record_and_flush(result.violations, result.offending_labels)
-        assert attrs["copilot.code_artifact_violation_count"] == len(result.violations)
-        assert attrs["copilot.code_artifact_violation_block_labels"] == []
-        assert all(secret not in violation for violation in attrs["copilot.code_artifact_violations"])
+        assert attrs["ember.code_artifact_violation_count"] == len(result.violations)
+        assert attrs["ember.code_artifact_violation_block_labels"] == []
+        assert all(secret not in violation for violation in attrs["ember.code_artifact_violations"])
 
     def test_span_keeps_violations_the_backend_log_summary_truncates_away(self) -> None:
         yaml = _two_code_block_yaml("credential_login", "credential_vault")
@@ -670,15 +670,15 @@ class TestViolationBatchIsDurablyRecoverable:
         assert len(result.violations) > 1
         attrs = _record_and_flush(result.violations, result.offending_labels)
         # The bounded summary loses all but the first violation; the span keeps them all.
-        assert attrs["copilot.code_artifact_violations"][-1] not in bounded
-        assert len(attrs["copilot.code_artifact_violations"]) == len(result.violations)
+        assert attrs["ember.code_artifact_violations"][-1] not in bounded
+        assert len(attrs["ember.code_artifact_violations"]) == len(result.violations)
 
     def test_empty_batch_is_a_noop(self) -> None:
         ctx = type("Ctx", (), {})()
         record_code_artifact_violations(ctx, [], [])
         span = _FakeSpan()
         finalize_outcome_verification_trace(ctx, span)
-        assert "copilot.code_artifact_violations" not in span.attrs
+        assert "ember.code_artifact_violations" not in span.attrs
 
     def test_latest_batch_wins_on_retry(self) -> None:
         ctx = type("Ctx", (), {})()
@@ -686,9 +686,9 @@ class TestViolationBatchIsDurablyRecoverable:
         record_code_artifact_violations(ctx, ["only_one"], ["b"])
         span = _FakeSpan()
         finalize_outcome_verification_trace(ctx, span)
-        assert span.attrs["copilot.code_artifact_violations"] == ["only_one"]
-        assert span.attrs["copilot.code_artifact_violation_count"] == 1
-        assert span.attrs["copilot.code_artifact_violation_block_labels"] == ["b"]
+        assert span.attrs["ember.code_artifact_violations"] == ["only_one"]
+        assert span.attrs["ember.code_artifact_violation_count"] == 1
+        assert span.attrs["ember.code_artifact_violation_block_labels"] == ["b"]
 
 
 def _download_intent_metadata(label: str) -> dict:

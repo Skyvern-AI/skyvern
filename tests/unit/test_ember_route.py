@@ -3111,7 +3111,7 @@ async def test_flag_on_pre_agent_failure_persists_recoverable_reply(
     with capture_logs() as logs:
         await handler(ember_stream)
 
-    outcome_logs = [log for log in logs if log["event"] == "Copilot turn outcome"]
+    outcome_logs = [log for log in logs if log["event"] == "Ember turn outcome"]
     assert len(outcome_logs) == 1
     assert outcome_logs[0]["route_exit"] == "error"
 
@@ -8002,7 +8002,7 @@ async def test_in_flight_turn_serves_the_latest_draft_until_the_turn_answers(sql
         ):
             await asyncio.wait_for(emit_workflow_draft(stream, ctx, _make_ember_workflow("Hung", _NOW)), 5)
         assert stream.send.await_args.args[0].workflow["title"] == "Hung"
-        assert [entry["event"] for entry in logs] == ["copilot_pending_turn_draft_save_failed"]
+        assert [entry["event"] for entry in logs] == ["ember_pending_turn_draft_save_failed"]
         assert (await in_flight() or {}).get("latest_draft") == frame["workflow"]
 
         await repo.create_ember_chat_message(

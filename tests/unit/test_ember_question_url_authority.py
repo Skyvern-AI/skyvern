@@ -330,7 +330,7 @@ async def test_question_source_reaches_fill_boundary_without_weakening_origin_gu
 
     assert error is None
     assert grant is not None
-    event = next(log for log in logs if log.get("event") == "copilot credential fill grant")
+    event = next(log for log in logs if log.get("event") == "ember credential fill grant")
     assert event["source_kind"] == "question_response"
     assert event["source_interaction_id"] == "interaction-1"
     assert "source_user_message" not in event

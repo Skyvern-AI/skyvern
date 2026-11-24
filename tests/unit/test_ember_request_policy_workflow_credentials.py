@@ -797,7 +797,7 @@ def test_recording_the_proposal_leaves_the_countability_fingerprint_in_the_log_s
     with capture_logs() as logs:
         record_ask_turn(credential)
 
-    recorded = [entry for entry in logs if entry["event"] == "copilot_credential_proposal_recorded"]
+    recorded = [entry for entry in logs if entry["event"] == "ember_credential_proposal_recorded"]
     assert len(recorded) == 1
     assert recorded[0]["credential_id"] == credential.credential_id
     assert recorded[0]["origin_arm"] == expected_origin_arm
@@ -819,7 +819,7 @@ async def test_hydrating_the_proposal_leaves_the_countability_fingerprint_in_the
             global_llm_context=_ask_turn_context(credential) or "",
         )
 
-    hydrated = [entry for entry in logs if entry["event"] == "copilot_credential_proposal_hydrated"]
+    hydrated = [entry for entry in logs if entry["event"] == "ember_credential_proposal_hydrated"]
     assert len(hydrated) == 1
     assert hydrated[0]["credential_id"] == credential.credential_id
     assert hydrated[0]["origin_arm"] == "live_page_admitted"

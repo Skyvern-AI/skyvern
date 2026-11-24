@@ -14423,7 +14423,7 @@ async def test_every_covered_row_carries_the_branch_the_control_count_and_the_la
     dropped and a probe that named the hit element itself, where there is nothing to dismiss."""
 
     async def covered(args: dict[str, Any]) -> ToolResult:
-        record_covered_layer("named", controls=0, layer_kind="hit_fallback")
+        record_covered_layer("named", controls=0, layer_kind="hit_fallback", after_wait=True)
         return ToolResult.error('#a is covered by "May"', error_class="covered")
 
     async def other_error(args: dict[str, Any]) -> ToolResult:
@@ -14446,6 +14446,7 @@ async def test_every_covered_row_carries_the_branch_the_control_count_and_the_la
     assert by_tool["click"]["covered_branch"] == "named"
     assert by_tool["click"]["covered_controls"] == 0
     assert by_tool["click"]["covered_layer_kind"] == "hit_fallback"
+    assert by_tool["click"]["covered_after_wait"] is True
     # A row that refused for another reason carries none of the three -- absent, not a fabricated
     # value: a groupBy on covered_branch must show the covered rows and nothing else.
     assert "covered_branch" not in by_tool["hover"]
@@ -14464,6 +14465,7 @@ async def test_every_covered_row_carries_the_branch_the_control_count_and_the_la
     rows = {e["tool"]: e for e in logs if e["event"] == "taskv3 tool call finished"}
     assert rows["click"]["covered_branch"] == "unnamed"
     assert rows["click"]["covered_layer_kind"] == "unnamed"
+    assert "covered_after_wait" not in rows["click"]
     assert "covered_branch" not in rows["hover"]
 
     # A covered refusal built somewhere other than the message helper records nothing, and must then

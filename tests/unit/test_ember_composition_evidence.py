@@ -2123,7 +2123,7 @@ def test_normalize_block_observation_refs_warns_on_unexpected_container_type() -
         assert normalize_block_observation_refs("add_to_cart:2") == {}
 
     warning.assert_called_once_with(
-        "copilot_block_observation_refs_unexpected_type_ignored",
+        "ember_block_observation_refs_unexpected_type_ignored",
         value_type="str",
     )
 
@@ -2150,7 +2150,7 @@ def test_parse_structured_evidence_warns_on_unknown_size_compaction_category() -
         "omissions": [{"category": "navigation_targets", "omitted_count": 2, "unit": "entries"}],
     }
     warning.assert_called_once_with(
-        "copilot_structured_size_compaction_unknown_category_ignored",
+        "ember_structured_size_compaction_unknown_category_ignored",
         category="future_category",
     )
 

@@ -824,7 +824,7 @@ def test_aggressive_prune_logs_content_free_pair_validity_telemetry() -> None:
     with capture_logs() as logs:
         aggressive_prune(history)
 
-    event = next(entry for entry in logs if entry["event"] == "copilot_aggressive_prune_pair_validity")
+    event = next(entry for entry in logs if entry["event"] == "ember_aggressive_prune_pair_validity")
     assert event["retained_tail"] == [
         "function_call",
         "function_call_output",
@@ -1441,7 +1441,7 @@ def test_an_unread_output_over_the_cap_is_still_head_cut_and_logged_with_its_too
         pruned = _cap_tool_outputs(items)
 
     assert pruned[2]["output"].endswith("\n... [truncated]")
-    event = next(entry for entry in logs if entry["event"] == "copilot_recent_tool_output_truncated")
+    event = next(entry for entry in logs if entry["event"] == "ember_recent_tool_output_truncated")
     assert event["tool_name"] == ["get_run_results"]
 
 
@@ -1538,7 +1538,7 @@ def _deadline_ctx() -> EmberContext:
 
 
 def _deadline_events(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [entry for entry in logs if entry.get("event") == "copilot_turn_deadline_expired"]
+    return [entry for entry in logs if entry.get("event") == "ember_turn_deadline_expired"]
 
 
 def test_deadline_fingerprint_carries_elapsed_iteration_and_phase() -> None:
@@ -1847,7 +1847,7 @@ def test_aggressive_prune_keeps_a_loaded_skill_whole_and_paired(filler_after: in
     assert pruned.index(skill[0]) + 1 == pruned.index(skill[1]) == pruned.index(skill[2]) - 1
     assert _orphaned_tool_result_ids(pruned) == []
     assert len(_call_ids(pruned, "function_call")) == len(set(_call_ids(pruned, "function_call")))
-    validity = [log for log in logs if log["event"] == "copilot_aggressive_prune_pair_validity"]
+    validity = [log for log in logs if log["event"] == "ember_aggressive_prune_pair_validity"]
     assert validity[0]["retained_skill_pairs"] == (0 if filler_after == 2 else 1)
 
 

@@ -470,7 +470,7 @@ class TestModelInputBudget:
             result = ember_call_model_input_filter(_mk_input_data(items))
         outputs = [it for it in result.input if it.get("type") == "function_call_output"]
         assert outputs[0]["output"].endswith(_TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX)
-        truncated = [entry for entry in logs if entry["event"] == "copilot_recent_tool_output_truncated"]
+        truncated = [entry for entry in logs if entry["event"] == "ember_recent_tool_output_truncated"]
         assert [entry["tool_name"] for entry in truncated] == [["get_run_results"]]
 
     def test_emergency_truncation_logs_distinct_event_with_count(self) -> None:
@@ -487,7 +487,7 @@ class TestModelInputBudget:
         tight_filter = make_ember_call_model_input_filter(token_budget=200)
         with structlog.testing.capture_logs() as logs:
             tight_filter(_mk_input_data(items))
-        emergency = [entry for entry in logs if entry["event"] == "copilot_tool_output_emergency_truncated"]
+        emergency = [entry for entry in logs if entry["event"] == "ember_tool_output_emergency_truncated"]
         assert [entry["cap"] for entry in emergency] == [2000, 300]
         assert all(entry["truncated_count"] >= 2 for entry in emergency)
 
@@ -533,7 +533,7 @@ class TestModelInputBudget:
         soft_filter = make_ember_call_model_input_filter(token_budget=800)
         with structlog.testing.capture_logs() as logs:
             result = soft_filter(_mk_input_data(items))
-        emergency = [entry for entry in logs if entry["event"] == "copilot_tool_output_emergency_truncated"]
+        emergency = [entry for entry in logs if entry["event"] == "ember_tool_output_emergency_truncated"]
         assert [entry["cap"] for entry in emergency] == [2000]
         outputs = [it for it in result.input if it.get("type") == "function_call_output"]
         assert 2000 <= len(outputs[0]["output"]) <= 2020
@@ -1205,7 +1205,7 @@ async def test_signature_only_claude_thinking_does_not_use_up_the_model_input_bu
         return page_text
 
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
-    agent = Agent(name="workflow-copilot", model="anthropic/claude-sonnet-5-5", tools=[read_page])
+    agent = Agent(name="ember", model="anthropic/claude-sonnet-5-5", tools=[read_page])
     run_config = RunConfig(
         model_provider=SkyvernLitellmProvider(prefix_anchors=stable_prefix_anchors),
         tracing_disabled=True,
@@ -1256,7 +1256,7 @@ def test_a_loaded_skill_survives_every_budget_rung_whole_and_paired() -> None:
     with capture_logs() as logs:
         result = make_ember_call_model_input_filter(token_budget=200)(_mk_input_data(items))
 
-    assert {"copilot_tool_output_emergency_truncated", "copilot_aggressive_prune_pair_validity"} <= {
+    assert {"ember_tool_output_emergency_truncated", "ember_aggressive_prune_pair_validity"} <= {
         entry["event"] for entry in logs
     }
     sent = list(result.input)

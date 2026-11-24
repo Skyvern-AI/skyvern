@@ -304,7 +304,7 @@ def _normalize_and_save_check(workflow_yaml: str) -> tuple[WorkflowCreateYAMLReq
     WorkflowService().validate_workflow_block_graph(
         convert_workflow_definition(request.workflow_definition, workflow_id="wf_test")
     )
-    assert len([entry for entry in logs if entry["event"] == "Copilot dropped link to unknown block"]) == len(
+    assert len([entry for entry in logs if entry["event"] == "Ember dropped link to unknown block"]) == len(
         dropped_links
     )
     return request, dropped_links

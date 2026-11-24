@@ -2524,7 +2524,7 @@ def test_codeblock_failure_result_carries_same_run_page_facts_for_both_execution
     assert repair_context.observed_after_workflow_run is True
 
 
-_SOURCE_MISMATCH_EVENT = "copilot_post_run_evidence_source_mismatch_refused"
+_SOURCE_MISMATCH_EVENT = "ember_post_run_evidence_source_mismatch_refused"
 
 
 def _stale_login_page_evidence() -> dict[str, object]:
@@ -3049,7 +3049,7 @@ async def test_post_run_current_page_inspect_is_sourced_from_the_run_session(
     assert ctx.post_run_page_observation_workflow_run_id == "wr_failed"
     assert result["reached_via"] == "post_run"
     assert ctx.browser_session_id == "scout_session"
-    assert not any(entry.get("event") == "copilot_post_run_evidence_source_mismatch_refused" for entry in logs)
+    assert not any(entry.get("event") == "ember_post_run_evidence_source_mismatch_refused" for entry in logs)
 
 
 @pytest.mark.asyncio

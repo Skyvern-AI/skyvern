@@ -1,4 +1,4 @@
-"""Tests for the copilot.turn span wrapper around run_copilot_agent."""
+"""Tests for the ember.turn span wrapper around run_copilot_agent."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def _user_message(content: str) -> EmberChatHistoryMessage:
 async def _stub_build_request_policy_with_child_span(*_args: Any, **_kwargs: Any) -> RequestPolicy:
     """Open an OTel child span so the test can assert parentage. The request policy no longer ends the
     turn early, so patched_request_policy_trust_floor also stubs the agent loop."""
-    tracer = otel_trace.get_tracer("test.copilot.turn")
+    tracer = otel_trace.get_tracer("test.ember.turn")
     with tracer.start_as_current_span("test.req_policy_child"):
         pass
     return RequestPolicy(
@@ -106,7 +106,7 @@ async def test_ember_turn_span_parents_inner_spans(
 
     assert result is not None
     spans = span_exporter.get_finished_spans()
-    turn_span = _find_span(spans, "copilot.turn")
+    turn_span = _find_span(spans, "ember.turn")
     child_span = _find_span(spans, "test.req_policy_child")
 
     assert child_span.parent is not None
@@ -114,12 +114,12 @@ async def test_ember_turn_span_parents_inner_spans(
 
     attrs = dict(turn_span.attributes or {})
     assert attrs.get("skyvern.span.role") == "wrapper"
-    assert attrs.get("copilot.session_id") == "chat_abc"
+    assert attrs.get("ember.session_id") == "chat_abc"
     assert attrs.get("workflow_permanent_id") == "wpid_xyz"
     # Zero-based: one prior user msg in history → this turn is index 1.
-    assert attrs.get("copilot.turn_index") == 1
-    assert "copilot.user_message_preview" not in attrs
-    assert attrs.get("copilot.user_message_length") == len(chat_request.message)
+    assert attrs.get("ember.turn_index") == 1
+    assert "ember.user_message_preview" not in attrs
+    assert attrs.get("ember.user_message_length") == len(chat_request.message)
 
 
 @pytest.mark.asyncio
@@ -235,8 +235,8 @@ async def test_ember_turn_span_uses_explicit_turn_index(
         turn_index=42,
     )
 
-    turn_span = _find_span(span_exporter.get_finished_spans(), "copilot.turn")
-    assert dict(turn_span.attributes or {}).get("copilot.turn_index") == 42
+    turn_span = _find_span(span_exporter.get_finished_spans(), "ember.turn")
+    assert dict(turn_span.attributes or {}).get("ember.turn_index") == 42
 
 
 @pytest.mark.asyncio
@@ -255,9 +255,9 @@ async def test_ember_turn_span_omits_session_id_when_missing(
         llm_api_handler=None,
     )
 
-    turn_span = _find_span(span_exporter.get_finished_spans(), "copilot.turn")
+    turn_span = _find_span(span_exporter.get_finished_spans(), "ember.turn")
     attrs = dict(turn_span.attributes or {})
-    assert "copilot.session_id" not in attrs
+    assert "ember.session_id" not in attrs
 
 
 @pytest.mark.asyncio
@@ -277,10 +277,10 @@ async def test_ember_turn_span_ingress_telemetry_is_content_free(
         llm_api_handler=None,
     )
 
-    turn_span = _find_span(span_exporter.get_finished_spans(), "copilot.turn")
+    turn_span = _find_span(span_exporter.get_finished_spans(), "ember.turn")
     attrs = dict(turn_span.attributes or {})
-    assert "copilot.user_message_preview" not in attrs
-    assert attrs.get("copilot.user_message_length") == len(long_msg)
+    assert "ember.user_message_preview" not in attrs
+    assert attrs.get("ember.user_message_length") == len(long_msg)
 
 
 @pytest.mark.asyncio
@@ -302,13 +302,13 @@ async def test_outer_turn_recovery_records_error_attrs_on_turn_span(
 
     assert result.updated_workflow is None
     assert "reference cpe_" in result.user_response
-    turn_span = _find_span(span_exporter.get_finished_spans(), "copilot.turn")
+    turn_span = _find_span(span_exporter.get_finished_spans(), "ember.turn")
     attrs = dict(turn_span.attributes or {})
-    assert attrs.get("copilot.error_recovered") is True
-    assert attrs.get("copilot.error_failure_kind") == "unknown"
-    assert attrs.get("copilot.error_exception_type") == "RuntimeError"
-    assert attrs.get("copilot.error_reply_proposal_disposition") == result.proposal_disposition
-    assert attrs.get("copilot.error_workflow_modified") is False
+    assert attrs.get("ember.error_recovered") is True
+    assert attrs.get("ember.error_failure_kind") == "unknown"
+    assert attrs.get("ember.error_exception_type") == "RuntimeError"
+    assert attrs.get("ember.error_reply_proposal_disposition") == result.proposal_disposition
+    assert attrs.get("ember.error_workflow_modified") is False
 
 
 @pytest.mark.asyncio

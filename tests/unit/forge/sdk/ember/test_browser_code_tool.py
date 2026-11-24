@@ -2120,7 +2120,7 @@ async def test_a_cell_that_stages_no_frame_withdraws_the_earlier_cell_frame(
     assert result["ok"] is True and result["value"] == {"observed": True}
     assert pending_screenshot_message(ctx) is None
     assert ctx.pending_frame_lease is None
-    [line] = [line for line in logs if line["event"] == "copilot_browser_code_cell_frame"]
+    [line] = [line for line in logs if line["event"] == "ember_browser_code_cell_frame"]
     assert (line["reason"], line["withdrawn_capture_id"]) == (reason, first_frame.capture_id)
 
 

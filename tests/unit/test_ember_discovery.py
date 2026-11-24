@@ -632,7 +632,7 @@ async def test_dense_inspect_packet_sheds_only_select_options_before_recent_tool
     assert result["ok"] is True
     assert len(serialized) < _RECENT_TOOL_OUTPUT_CHAR_CAP
     assert pruned[0]["output"] == serialized
-    assert not any(entry["event"] == "copilot_recent_tool_output_truncated" for entry in logs)
+    assert not any(entry["event"] == "ember_recent_tool_output_truncated" for entry in logs)
     assert result["observation_step"] == 0
     assert result["resolved_login_credential_id"] == "cred_saved_login"
     assert result["resolved_login_credential_name"] == "Saved login"

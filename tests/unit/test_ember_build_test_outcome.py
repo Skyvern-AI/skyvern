@@ -6127,7 +6127,7 @@ async def _next_model_response(ctx: EmberContext) -> None:
 
 
 def _bind_lost_logs(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [entry for entry in logs if entry["event"] == "copilot candidate run bind lost"]
+    return [entry for entry in logs if entry["event"] == "ember candidate run bind lost"]
 
 
 @pytest.mark.asyncio
@@ -6233,7 +6233,7 @@ async def test_candidate_run_bind_and_publish_stay_refused_while_an_accept_claim
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("reason", "event"),
-    [("bytes_changed", "copilot candidate run bind lost"), ("unexpected_error", "copilot candidate run bind failed")],
+    [("bytes_changed", "ember candidate run bind lost"), ("unexpected_error", "ember candidate run bind failed")],
 )
 async def test_candidate_run_bind_refusal_logs_its_reason_and_dispatches_nothing(
     monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, reason: str, event: str
@@ -6252,7 +6252,7 @@ async def test_candidate_run_bind_refusal_logs_its_reason_and_dispatches_nothing
     assert result["data"] == {"run_dispatched": False, "proposal_bind_refused": True}
     assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
     assert ctx.pending_test_inputs == {}
-    bind_logs = [entry for entry in logs if entry["event"].startswith("copilot candidate run bind")]
+    bind_logs = [entry for entry in logs if entry["event"].startswith("ember candidate run bind")]
     assert [(entry["event"], entry["reason"]) for entry in bind_logs] == [(event, reason)]
     assert (await _stored_candidate(repo, chat_id))[1].workflow_run_id is None
 
@@ -6312,7 +6312,7 @@ async def test_stale_proposal_token_conflict_recovers_so_the_next_call_succeeds(
         first = await test_or_edit()
 
     assert (first["ok"], first["conflict_reason"], first["adoption"]) == (False, *expected)
-    conflict_events = {"copilot candidate run bind lost", "copilot_candidate_publication_conflict"}
+    conflict_events = {"ember candidate run bind lost", "ember_candidate_publication_conflict"}
     assert [(entry["reason"], entry["adoption"]) for entry in logs if entry["event"] in conflict_events] == [expected]
     assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
     if concurrent == "publish":
