@@ -1376,19 +1376,31 @@ class AsyncAWSClient:
             if raise_exception:
                 raise e
 
-    async def download_file(self, uri: str, log_exception: bool = True) -> bytes | None:
+    async def download_file(
+        self,
+        uri: str,
+        log_exception: bool = True,
+        *,
+        raise_on_error: bool = False,
+        on_version: Callable[[str], None] | None = None,
+    ) -> bytes | None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/get_object.html
         async def _op() -> bytes:
             async with self._s3_client() as client:
                 parsed_uri = S3Uri(uri)
                 response = await client.get_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
-                return await response["Body"].read()
+                data = await response["Body"].read()
+                if on_version is not None and (etag := response.get("ETag")):
+                    on_version(etag)
+                return data
 
         try:
             return await self._s3_with_retry("download", _op, uri=uri)
         except Exception as e:
             if log_exception:
                 self.log_download_failure(e, uri)
+            if raise_on_error and not self._is_not_found_error(e):
+                raise
             return None
 
     def log_download_failure(self, error: Exception, uri: str) -> None:
@@ -1748,6 +1760,15 @@ class AsyncAWSClient:
                 raise
             finally:
                 client.meta.events.unregister(event_name, record_attempt)
+
+
+async def s3_object_info_if_exists(client: AsyncAWSClient, uri: str) -> dict | None:
+    try:
+        return await client.get_object_info(uri)
+    except ClientError as exc:
+        if client._is_not_found_error(exc):
+            return None
+        raise
 
 
 class S3Uri:

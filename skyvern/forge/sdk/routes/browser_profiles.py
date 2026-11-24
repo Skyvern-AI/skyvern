@@ -22,6 +22,8 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import discard_temp_working_dir, make_temp_directory
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import ProfilePublicationConflict, settle_profile_io
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.credential_site_policy import same_release_scope
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON,
@@ -51,7 +53,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.request_principal import get_request_principal
-from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
+from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_snapshot
 from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -61,6 +63,7 @@ from skyvern.webeye.browser_profile_utils import (
     ROOT_STORE_COMPONENT_DIRS,
     valid_operator_profile_generation,
 )
+from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.profile_cookie_merge import cookies_for_login_urls, sanitize_cookies, write_signin_cookies
 
 try:
@@ -772,14 +775,25 @@ async def _hard_delete_created_profile_after_store_failure(
     *,
     organization_id: str,
     browser_profile_id: str,
+    failure: BaseException | None = None,
 ) -> bool:
+    if failure is not None:
+        if isinstance(failure, ProfilePublicationConflict) or isinstance(failure.__cause__, ProfilePublicationConflict):
+            return False
+        try:
+            await app.STORAGE.delete_browser_profile(organization_id, browser_profile_id, hard_delete=True)
+        except Exception:
+            LOG.exception(
+                "Could not remove browser profile artifacts during rollback", browser_profile_id=browser_profile_id
+            )
+            return False
     try:
         await app.DATABASE.browser_sessions.hard_delete_browser_profile(
             browser_profile_id, organization_id=organization_id
         )
     except Exception:
         LOG.exception(
-            "Failed to roll back browser profile after storage failure",
+            "Failed to roll back created browser profile",
             organization_id=organization_id,
             browser_profile_id=browser_profile_id,
         )
@@ -795,6 +809,7 @@ async def _create_empty_profile(
     proxy_location: ProxyLocationInput = None,
     proxy_session_id: str | None = None,
     seed_cookies: list[dict] | None = None,
+    require_encryption: bool = False,
 ) -> BrowserProfile:
     # Seed before inserting so local setup failures never reserve a profile name.
     profile_dir = _create_empty_browser_profile_directory()
@@ -817,12 +832,16 @@ async def _create_empty_profile(
                 organization_id=organization_id,
                 profile_id=profile.browser_profile_id,
                 directory=profile_dir,
+                require_encryption=require_encryption,
             )
         # BaseException: a caller's timeout cancels mid-store, and the row must not outlive its files.
-        except BaseException:
-            rolled_back = await _hard_delete_created_profile_after_store_failure(
-                organization_id=organization_id,
-                browser_profile_id=profile.browser_profile_id,
+        except BaseException as exc:
+            rolled_back = await settle_profile_io(
+                _hard_delete_created_profile_after_store_failure(
+                    organization_id=organization_id,
+                    browser_profile_id=profile.browser_profile_id,
+                    failure=exc,
+                )
             )
             LOG.error(
                 "Failed to store empty browser profile artifacts",
@@ -862,16 +881,18 @@ async def create_profile_from_running_session(
         raise BrowserSessionNotFound(browser_session_id)
     _refuse_profile_from_external_session(browser_session)
     browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_observer_browser_state(
-        browser_session_id, organization_id
+        browser_session_id, organization_id, for_profile_capture=True
     )
-    if browser_state is None or browser_state.browser_context is None:
+    context = browser_state.browser_context if browser_state is not None else None
+    if browser_state is None or context is None:
         raise RuntimeError(f"The live browser for {browser_session_id} is not reachable")
+    require_encryption = browser_state.browser_artifacts.capture_requires_encryption(context)
     try:
         page = await browser_state.get_working_page(prune_excess_pages=False)
-        candidates = [*login_urls, page.url] if page is not None else list(login_urls)
+        candidates = [*login_urls, page.url] if page is not None and page.context is context else login_urls
         # Only the site the card names: an identity provider's or another tab's cookies never ride along.
         hosts = [url for url in candidates if login_urls and same_release_scope(url, login_urls[0])]
-        cookies = sanitize_cookies(cookies_for_login_urls(await browser_state.browser_context.cookies(), hosts))
+        cookies = sanitize_cookies(cookies_for_login_urls(await context.cookies(), hosts))
     finally:
         await app.PERSISTENT_SESSIONS_MANAGER.release_observer_browser_state(browser_session_id, browser_state)
     if not cookies:
@@ -893,6 +914,7 @@ async def create_profile_from_running_session(
                 proxy_location=proxy_location,
                 proxy_session_id=proxy_session_id,
                 seed_cookies=cookies,
+                require_encryption=require_encryption,
             )
             break
         except HTTPException as exc:
@@ -1082,6 +1104,10 @@ async def _create_profile_from_session_locked(
     # Read the storage id the session actually exported to: reuse writes back to its bp_, but a fallback
     # (saved profile failed to load) exported under the session id, so resolve from the loaded profile.
     loaded_profile_id = browser_session.browser_profile_id if browser_session.browser_profile_loaded else None
+    if isinstance(app.PERSISTENT_SESSIONS_MANAGER, DefaultPersistentSessionsManager) and not isinstance(
+        app.STORAGE, LocalStorage
+    ):
+        loaded_profile_id = None  # The default manager exports remote profiles under the session ID.
     # Non-None only for a pure-reuse session; it drives the terminal "archive unavailable" error below.
     reused_profile_id = loaded_profile_id if not browser_session.generate_browser_profile else None
     source_profile_id = export_profile_storage_id(
@@ -1089,7 +1115,7 @@ async def _create_profile_from_session_locked(
         browser_profile_id=loaded_profile_id,
         generate_browser_profile=browser_session.generate_browser_profile,
     )
-    session_dir = await app.STORAGE.retrieve_browser_profile(
+    snapshot = await app.STORAGE.retrieve_browser_profile_snapshot(
         organization_id=organization_id,
         profile_id=source_profile_id,
     )
@@ -1099,7 +1125,7 @@ async def _create_profile_from_session_locked(
     # id waits for it. A pure-reuse session reads its bp_ archive as it stood before the session, because teardown
     # writes the session's changes back over that archive later.
     if (
-        not session_dir
+        snapshot is None
         and browser_session.close_requested_at is not None
         and browser_session.completed_at is None
         and browser_session.should_export_profile()
@@ -1113,11 +1139,11 @@ async def _create_profile_from_session_locked(
         )
         archive_wait_seconds = round(time.monotonic() - wait_started, 3)
         if wait_outcome == "found":
-            session_dir = await app.STORAGE.retrieve_browser_profile(
+            snapshot = await app.STORAGE.retrieve_browser_profile_snapshot(
                 organization_id=organization_id,
                 profile_id=source_profile_id,
             )
-    if not session_dir:
+    if snapshot is None:
         # An opted-out session never uploads an archive, so retrying can't help — fail fast with a
         # distinct message the client can tell apart from the transient "upload not finished yet" case.
         if not browser_session.should_export_profile():
@@ -1184,6 +1210,7 @@ async def _create_profile_from_session_locked(
             ),
         )
 
+    session_dir = snapshot.directory
     source_browser_type = browser_session.browser_type.value if browser_session.browser_type else None
     if (
         proxy_session_id is None
@@ -1211,11 +1238,13 @@ async def _create_profile_from_session_locked(
                 organization_id=organization_id,
                 profile_id=profile.browser_profile_id,
                 directory=session_dir,
+                require_encryption=snapshot.encrypted,
             )
-        except Exception:
-            rolled_back = await _hard_delete_created_profile_after_store_failure(
-                organization_id=organization_id,
-                browser_profile_id=profile.browser_profile_id,
+        except (Exception, asyncio.CancelledError) as exc:
+            rolled_back = await settle_profile_io(
+                _hard_delete_created_profile_after_store_failure(
+                    organization_id=organization_id, browser_profile_id=profile.browser_profile_id, failure=exc
+                )
             )
             LOG.error(
                 "Failed to store browser profile artifacts",
@@ -1243,7 +1272,7 @@ async def _create_profile_from_session_locked(
             exc_info=True,
         )
 
-    # The promote copied the session's own export (profiles/{pbs_session}.zip) into the new bp_, so
+    # The promote copied the session's own export into the new bp_, so
     # reap that source now that it's redundant. Keyed on the session id, never a reused bp_ profile.
     # Best-effort: only after a successful promote, and a reap failure must not fail the request.
     try:
@@ -1322,20 +1351,20 @@ async def _create_profile_from_workflow_run(
     # Poll for a short grace period so that immediate profile-creation requests
     # succeed without forcing clients to implement retry loops.
     poll_attempts = 30  # ~30 s max wait
-    session_dir: str | None = None
+    snapshot = None
     for attempt in range(poll_attempts):
-        session_dir = await retrieve_persisted_workflow_browser_state_dir(
+        snapshot = await retrieve_persisted_workflow_browser_snapshot(
             organization_id=organization_id,
             workflow=workflow,
             workflow_run=workflow_run,
         )
-        if session_dir:
+        if snapshot is not None:
             break  # session found
         # Avoid busy-waiting; sleep 1 s between attempts (non-blocking asyncio sleep)
         if attempt < poll_attempts - 1:
             await asyncio.sleep(1)
 
-    if not session_dir:
+    if snapshot is None:
         LOG.warning(
             "Workflow run has no persisted session after waiting",
             organization_id=organization_id,
@@ -1362,7 +1391,8 @@ async def _create_profile_from_workflow_run(
             await app.STORAGE.store_browser_profile(
                 organization_id=organization_id,
                 profile_id=profile.browser_profile_id,
-                directory=session_dir,
+                directory=snapshot.directory,
+                require_encryption=snapshot.encrypted,
             )
             LOG.info(
                 "Created browser profile from workflow run",
@@ -1370,10 +1400,11 @@ async def _create_profile_from_workflow_run(
                 browser_profile_id=profile.browser_profile_id,
                 workflow_run_id=workflow_run_id,
             )
-        except Exception:
-            rolled_back = await _hard_delete_created_profile_after_store_failure(
-                organization_id=organization_id,
-                browser_profile_id=profile.browser_profile_id,
+        except (Exception, asyncio.CancelledError) as exc:
+            rolled_back = await settle_profile_io(
+                _hard_delete_created_profile_after_store_failure(
+                    organization_id=organization_id, browser_profile_id=profile.browser_profile_id, failure=exc
+                )
             )
             LOG.error(
                 "Failed to store browser profile artifacts",
@@ -1385,6 +1416,6 @@ async def _create_profile_from_workflow_run(
             )
             raise
     finally:
-        discard_temp_working_dir(session_dir)
+        discard_temp_working_dir(snapshot.directory)
 
     return profile

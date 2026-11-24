@@ -46,6 +46,7 @@ class BrowserState(Protocol):
     browser_context_route_policy_url: str | None
     browser_artifacts: BrowserArtifacts
     browser_cleanup: BrowserCleanupFunc
+    profile_read_only: bool
     pw: Playwright
     # The per-run pinned engine (or None for states built outside the per-run engine seam), so
     # recovery code can classify driver-native errors against THIS run's selected engine.

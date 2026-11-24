@@ -106,9 +106,15 @@ from skyvern.forge.final_failure_diagnostic import (
     final_har_user_errors,
 )
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import is_temp_working_dir, resolve_run_download_id
+from skyvern.forge.sdk.api.files import discard_temp_working_dir, is_temp_working_dir, resolve_run_download_id
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
 from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_artifacts, artifact_filename_from_uri
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
+    ProfilePublicationConflict,
+    ProfilePublicationUnconfirmed,
+)
+from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import (
     ResponseComparison,
@@ -5513,27 +5519,14 @@ class WorkflowService:
         # loading a different credential's saved state onto this one, the exact bug this segment
         # exists to prevent. Skip seeding; the profile just starts empty and accumulates normally.
         if created and not credential_segment:
-            try:
-                await self._seed_managed_browser_profile_from_legacy_session(
-                    workflow=workflow,
-                    organization_id=workflow_run.organization_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    rendered_key=rendered_key,
-                    browser_profile_id=profile.browser_profile_id,
-                )
-            except Exception:
-                # Roll back the empty row so the next run re-attempts creation + seed;
-                # this run degrades to the legacy session path instead of failing setup.
-                LOG.warning(
-                    "Failed to seed managed browser profile from legacy session; rolling back and using legacy path",
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    browser_profile_id=profile.browser_profile_id,
-                    exc_info=True,
-                )
-                await app.DATABASE.browser_sessions.hard_delete_browser_profile(
-                    profile_id=profile.browser_profile_id,
-                    organization_id=workflow_run.organization_id,
-                )
+            seeded = await self._seed_managed_browser_profile_from_legacy_session(
+                workflow=workflow,
+                organization_id=workflow_run.organization_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                rendered_key=rendered_key,
+                browser_profile_id=profile.browser_profile_id,
+            )
+            if not seeded:
                 return None
 
         await self._reconcile_managed_browser_profile_proxy_pin(
@@ -5775,25 +5768,70 @@ class WorkflowService:
         rendered_key: str | None,
         browser_profile_id: str,
         workflow_run_id: str | None = None,
-    ) -> None:
+    ) -> bool:
         # Lazy migration: carry a workflow's accumulated Save & Reuse login state onto its new
         # managed profile the first time we create it, so the next run starts logged in. The OSS
         # launch path has no legacy-archive fallback, so this copy must happen here, not at launch.
         storage_key = build_workflow_browser_session_storage_key(workflow.workflow_permanent_id, rendered_key)
-        legacy_session_dir = await app.STORAGE.retrieve_browser_session(organization_id, storage_key)
-        if not legacy_session_dir:
-            return
-        await app.STORAGE.store_browser_profile(
-            organization_id,
-            profile_id=browser_profile_id,
-            directory=legacy_session_dir,
-        )
+        snapshot = None
+        try:
+            snapshot = await app.STORAGE.retrieve_browser_session_snapshot(organization_id, storage_key)
+            if snapshot is None:
+                return True
+            await app.STORAGE.store_browser_profile(
+                organization_id,
+                profile_id=browser_profile_id,
+                directory=snapshot.directory,
+                require_encryption=snapshot.encrypted,
+            )
+        except Exception as exc:
+            publication = exc if isinstance(exc, ProfilePublicationConflict) else exc.__cause__
+            if isinstance(publication, ProfilePublicationConflict):
+                if (
+                    isinstance(publication, ProfilePublicationUnconfirmed)
+                    and snapshot is not None
+                    and not snapshot.encrypted
+                ):
+                    LOG.warning(
+                        "Managed seed publication is unconfirmed; retaining it and using legacy session",
+                        workflow_run_id=workflow_run_id,
+                        browser_profile_id=browser_profile_id,
+                    )
+                    return False
+                raise
+            try:
+                await app.DATABASE.browser_sessions.hard_delete_browser_profile(
+                    profile_id=browser_profile_id, organization_id=organization_id
+                )
+            except Exception:
+                if snapshot is not None:
+                    raise
+                LOG.exception(
+                    "Could not roll back managed profile after archive read failed",
+                    browser_profile_id=browser_profile_id,
+                )
+            if snapshot is None:
+                # Keep a retry from treating this unreadable archive as a successfully seeded profile.
+                raise
+            LOG.warning(
+                "Failed to seed managed browser profile from legacy session; rolled back and using legacy path",
+                workflow_run_id=workflow_run_id,
+                browser_profile_id=browser_profile_id,
+                exc_info=True,
+            )
+            return False
+        finally:
+            if snapshot is not None and (
+                snapshot.encrypted or snapshot.legacy_local_copy or settings.SKYVERN_ENCRYPT_BROWSER_PROFILES
+            ):
+                discard_temp_working_dir(snapshot.directory)
         LOG.info(
             "Seeded managed browser profile from legacy session archive",
             workflow_run_id=workflow_run_id,
             browser_profile_id=browser_profile_id,
             browser_session_storage_key=storage_key,
         )
+        return True
 
     async def _render_workflow_browser_profile_key(
         self,
@@ -17425,6 +17463,8 @@ class WorkflowService:
             browser_state and workflow.persist_browser_session and browser_state.browser_artifacts.browser_session_dir
         ):
             return
+        if browser_state.browser_artifacts._seed_load_failed:
+            return
 
         if effective_workflow_run_status != WorkflowRunStatus.completed:
             LOG.info(
@@ -17455,12 +17495,13 @@ class WorkflowService:
                 )
             storage = app.STORAGE
             store_profile = storage.store_browser_profile
-            if first_credential_save and isinstance(storage, S3Storage):
+            if first_credential_save and isinstance(storage, (S3Storage, AzureStorage, GcsStorage)):
                 store_profile = partial(storage.store_browser_profile, strict_traversal=True)
             await store_profile(
                 workflow_run.organization_id,
                 profile_id=browser_profile.browser_profile_id,
                 directory=browser_state.browser_artifacts.browser_session_dir,
+                require_encryption=browser_state.browser_artifacts._seed_profile_encrypted,
             )
             LOG.info(
                 "Persisted managed browser profile for workflow run",
@@ -17490,13 +17531,14 @@ class WorkflowService:
                 )
             storage = app.STORAGE
             store_session = storage.store_browser_session
-            if first_credential_save and isinstance(storage, S3Storage):
+            if first_credential_save and isinstance(storage, (S3Storage, AzureStorage, GcsStorage)):
                 # This archive can become a new credential profile. Reject incomplete source captures.
                 store_session = partial(storage.store_browser_session, strict_traversal=True)
             await store_session(
                 workflow_run.organization_id,
                 browser_session_storage_key,
                 browser_state.browser_artifacts.browser_session_dir,
+                require_encryption=browser_state.browser_artifacts._seed_profile_encrypted,
             )
             LOG.info(
                 "Persisted browser session for workflow run",
@@ -17617,12 +17659,13 @@ class WorkflowService:
             )
         storage = app.STORAGE
         store_profile = storage.store_browser_profile
-        if first_credential_save and isinstance(storage, S3Storage):
+        if first_credential_save and isinstance(storage, (S3Storage, AzureStorage, GcsStorage)):
             store_profile = partial(storage.store_browser_profile, strict_traversal=True)
         await store_profile(
             workflow_run.organization_id,
             profile_id=sink_profile_id,
             directory=browser_state.browser_artifacts.browser_session_dir,
+            require_encryption=browser_state.browser_artifacts._seed_profile_encrypted,
         )
         LOG.info(
             "Persisted resolved sink browser profile for workflow run",
@@ -17645,7 +17688,11 @@ class WorkflowService:
         seed_etag = artifacts._seed_profile_etag
         if seed_etag is None:
             return False
-        current_etag = await app.STORAGE.get_browser_profile_etag(workflow_run.organization_id, sink_profile_id)
+        current_etag = await app.STORAGE.get_browser_profile_etag(
+            workflow_run.organization_id,
+            sink_profile_id,
+            encrypted=artifacts._seed_profile_encrypted,
+        )
         return current_etag is not None and current_etag != seed_etag
 
     async def _delta_merge_sink_profile(
@@ -17654,7 +17701,8 @@ class WorkflowService:
         """B2 freshness guard, part 2: contribute only the cookies THIS run changed (end-state vs our seed
         snapshot) into the profile's CURRENT stored state, preserving the concurrent write. Returns True
         when the merge handled the write-back (caller skips the full write); False to fall back to it."""
-        seed_cookies = browser_state.browser_artifacts._seed_cookie_snapshot
+        artifacts = browser_state.browser_artifacts
+        seed_cookies = artifacts._seed_cookie_snapshot
         if seed_cookies is None:
             return False
         browser_context = browser_state.browser_context
@@ -17684,20 +17732,25 @@ class WorkflowService:
                 browser_profile_id=sink_profile_id,
             )
             return True
-        current_dir = await app.STORAGE.retrieve_browser_profile(workflow_run.organization_id, sink_profile_id)
-        if not current_dir:
+        storage = app.STORAGE
+        snapshot = await storage.retrieve_browser_profile_snapshot(
+            workflow_run.organization_id, sink_profile_id, copy=artifacts._seed_profile_encrypted
+        )
+        if snapshot is None:
             return False
+        current_dir = snapshot.directory
         try:
             # base_values = our seed → per-key three-way so a fresher concurrent write to the same
             # cookie key survives instead of being clobbered by our (stale) delta value.
             union_cookies_into_profile_dir(delta, current_dir, base_values=seed_cookie_values(seed_cookies))
-            await app.STORAGE.store_browser_profile(
+            await storage.store_browser_profile(
                 workflow_run.organization_id,
                 profile_id=sink_profile_id,
                 directory=current_dir,
+                require_encryption=artifacts._seed_profile_encrypted or snapshot.encrypted,
             )
         finally:
-            # retrieve_browser_profile extracts a cookie-bearing archive into TEMP_PATH; drop it so a
+            # retrieve_browser_profile_snapshot extracts a cookie-bearing archive into TEMP_PATH; drop it so a
             # conflicting merge doesn't leak a full profile onto worker disk. Guard against LocalStorage,
             # which returns the LIVE profile dir (outside TEMP_PATH) — never delete that.
             if is_temp_working_dir(current_dir):
@@ -18035,6 +18088,10 @@ class WorkflowService:
                 elif not policy_run:
                     await self.execute_workflow_webhook(workflow_run, api_key, finalizer="worker_cleanup")
         finally:
+            if browser_state is not None and (artifacts := browser_state.browser_artifacts)._local_profile_working_dir:
+                artifacts._local_profile_workflow_pending = False
+                if close_browser_on_completion or artifacts._local_profile_context_closed:
+                    discard_temp_working_dir(artifacts._local_profile_working_dir)
             # Run contexts hold parameters/secrets/outputs and are keyed per
             # run; without eviction they accumulate for the process lifetime.
             if cleanup_context := skyvern_context.current():

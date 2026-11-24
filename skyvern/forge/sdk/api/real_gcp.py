@@ -219,15 +219,24 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
         await asyncio.to_thread(_do)
         return uri
 
-    async def download_file(self, uri: str, log_exception: bool = True, length: int | None = None) -> bytes | None:
+    async def download_file(
+        self,
+        uri: str,
+        log_exception: bool = True,
+        length: int | None = None,
+        *,
+        raise_on_error: bool = False,
+        on_version: Callable[[str], None] | None = None,
+    ) -> bytes | None:
         """The whole object, or only its first ``length`` bytes."""
 
         def _do() -> bytes | None:
             try:
                 blob = self._get_blob(uri)
-                if length is None:
-                    return blob.download_as_bytes()
-                return blob.download_as_bytes(start=0, end=length - 1)
+                data = blob.download_as_bytes() if length is None else blob.download_as_bytes(start=0, end=length - 1)
+                if on_version is not None and (generation := blob.generation) is not None:
+                    on_version(str(generation))
+                return data
             except NotFound:
                 if log_exception:
                     LOG.warning("GCS object not found", uri=uri)
@@ -235,6 +244,8 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
             except Exception:
                 if log_exception:
                     LOG.exception("Failed to download from GCS", uri=uri)
+                if raise_on_error:
+                    raise
                 return None
 
         return await asyncio.to_thread(_do)
