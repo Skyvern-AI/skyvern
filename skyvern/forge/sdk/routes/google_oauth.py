@@ -205,7 +205,9 @@ async def google_oauth_authorize(
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
-    return GoogleOAuthAuthorizeResponse(authorize_url=start.authorize_url, state=start.state)
+    return GoogleOAuthAuthorizeResponse(
+        authorize_url=start.authorize_url, state=start.state, credential_id=start.credential_id
+    )
 
 
 @google_oauth_router.post("/oauth/callback")
