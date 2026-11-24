@@ -1,3 +1,4 @@
+import gzip
 import os
 import socket
 import tempfile
@@ -12,6 +13,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from skyvern.exceptions import BlockedHost, HttpException
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.core.aiohttp_helper import (
     SSRFGuardedResolver,
     aiohttp_delete,
@@ -19,6 +21,7 @@ from skyvern.forge.sdk.core.aiohttp_helper import (
     aiohttp_post,
     aiohttp_request,
 )
+from skyvern.forge.sdk.core.http_request_authorization import GuardedHTTPHopResponse
 from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS, validate_fetch_url
 
 
@@ -631,38 +634,89 @@ async def test_aiohttp_request_response_json_decoding() -> None:
     assert body["users"][0]["name"] == "Alice"
 
 
+DEEPLY_NESTED_JSON = "[" * 30000 + "]" * 30000
+RESPONSE_SIZE_LIMIT_BODIES: dict[str, tuple[bytes, str]] = {
+    "/latin1-json": ('{"name": "caf\u00e9"}'.encode("iso-8859-1"), "application/json; charset=iso-8859-1"),
+    "/mislabelled-json": ('{"name": "caf\u00e9"}'.encode(), "application/json; charset=iso-8859-1"),
+    "/bom-json": ('{"name": "caf\u00e9"}'.encode("utf-8-sig"), "application/json; charset=utf-8"),
+    "/utf16be-json": ('{"id": "123"}\n'.encode("utf-16-be"), "application/json; charset=utf-16-be"),
+    "/deep-json": (DEEPLY_NESTED_JSON.encode(), "application/json"),
+}
+
+
 @pytest.mark.asyncio
-async def test_aiohttp_request_response_text_decoding() -> None:
-    """Test decoding non-JSON response (returns str)"""
-    mock_response = AsyncMock()
-    mock_response.status = 200
-    mock_response.headers = {"Content-Type": "text/html; charset=utf-8"}
-    # Simulate JSON parsing failure, return text
-    mock_response.json = AsyncMock(
-        side_effect=aiohttp.ContentTypeError(
-            request_info=MagicMock(),
-            history=(),
-            message="Attempt to decode JSON with unexpected mimetype: text/html",
+@pytest.mark.parametrize(
+    ("route", "response_size_limit_enabled", "use_relay", "read_body", "expected"),
+    [
+        pytest.param("/compressed?sig=private-value", True, False, True, HttpException, id="compressed-on"),
+        pytest.param("/compressed", False, False, True, "a" * (2 * 1024 * 1024), id="compressed-off"),
+        pytest.param("/compressed", True, False, False, None, id="compressed-unread-on"),
+        pytest.param("/compressed", False, False, False, None, id="compressed-unread-off"),
+        pytest.param("/latin1-json", True, False, True, {"name": "caf\u00e9"}, id="latin1-json-on"),
+        pytest.param("/latin1-json", False, False, True, {"name": "caf\u00e9"}, id="latin1-json-off"),
+        pytest.param("/latin1-json", False, True, True, '{"name": "caf\u00e9"}', id="latin1-json-relay-off"),
+        pytest.param("/mislabelled-json", True, False, True, {"name": "caf\u00c3\u00a9"}, id="mislabelled-json-on"),
+        pytest.param("/mislabelled-json", False, False, True, {"name": "caf\u00c3\u00a9"}, id="mislabelled-json-off"),
+        pytest.param("/mislabelled-json", False, True, True, {"name": "caf\u00e9"}, id="mislabelled-json-relay-off"),
+        pytest.param("/bom-json", True, False, True, {"name": "caf\u00e9"}, id="bom-json-on"),
+        pytest.param("/bom-json", False, False, True, '\ufeff{"name": "caf\u00e9"}', id="bom-json-off"),
+        pytest.param("/bom-json", False, True, True, {"name": "caf\u00e9"}, id="bom-json-relay-off"),
+        pytest.param("/utf16be-json", True, False, True, {"id": "123"}, id="utf16be-json-on"),
+        pytest.param("/deep-json", True, False, True, DEEPLY_NESTED_JSON, id="deep-json-on"),
+        pytest.param("/deep-json", False, False, True, DEEPLY_NESTED_JSON, id="deep-json-off"),
+    ],
+)
+async def test_aiohttp_request_response_size_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+    response_size_limit_enabled: bool,
+    use_relay: bool,
+    read_body: bool,
+    expected: object,
+) -> None:
+    allow_loopback_redirect_targets(monkeypatch)
+
+    async def flag_enabled(feature_name: str, _distinct_id: str, properties: dict | None = None) -> bool:
+        return response_size_limit_enabled and feature_name == "OUTBOUND_RESPONSE_SIZE_LIMIT"
+
+    monkeypatch.setattr(forge_app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", flag_enabled)
+
+    async def relay_hop(**_kwargs: object) -> GuardedHTTPHopResponse:
+        body, content_type = RESPONSE_SIZE_LIMIT_BODIES[route]
+        return GuardedHTTPHopResponse(status_code=200, headers={"Content-Type": content_type}, body=body)
+
+    monkeypatch.setattr(forge_app.AGENT_FUNCTION, "relay_http_request_hop", relay_hop)
+
+    async def compressed(_request: web.Request) -> web.Response:
+        return web.Response(
+            body=gzip.compress(b"a" * (2 * 1024 * 1024)),
+            headers={"Content-Type": "text/plain; charset=utf-8", "Content-Encoding": "gzip"},
         )
-    )
-    mock_response.text = AsyncMock(return_value="<html><body>Hello World</body></html>")
 
-    mock_session = MagicMock()
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
-    mock_session.request = MagicMock(return_value=mock_response)
-    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-    mock_response.__aexit__ = AsyncMock(return_value=None)
+    async def stored_body(request: web.Request) -> web.Response:
+        body, content_type = RESPONSE_SIZE_LIMIT_BODIES[request.path]
+        return web.Response(body=body, headers={"Content-Type": content_type})
 
-    with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
-        status, headers, body = await aiohttp_request(
-            method="GET",
-            url="https://example.com/page",
-        )
-
-    assert status == 200
-    assert isinstance(body, str)
-    assert body == "<html><body>Hello World</body></html>"
+    app = web.Application()
+    app.router.add_get("/compressed", compressed)
+    for path in RESPONSE_SIZE_LIMIT_BODIES:
+        app.router.add_get(path, stored_body)
+    server = TestServer(app, host="localhost")
+    await server.start_server()
+    url = f"{server.make_url('/')}".rstrip("/") + route
+    try:
+        if expected is HttpException:
+            with pytest.raises(HttpException) as exc_info:
+                await aiohttp_request("GET", url, response_limit_bytes=64 * 1024)
+            assert "private-value" not in str(exc_info.value)
+        else:
+            status, _headers, body = await aiohttp_request(
+                "GET", url, response_limit_bytes=64 * 1024, use_controlled_egress=use_relay, read_body=read_body
+            )
+            assert status == 200
+            assert body == expected
+    finally:
+        await server.close()
 
 
 @pytest.mark.asyncio

@@ -158,6 +158,7 @@ class CustomCredentialVaultService(CredentialVaultService):
             item_id = await client.create_credential(
                 name=data.name,
                 credential=data.credential,
+                organization_id=organization_id,
             )
 
             # Create record in Skyvern database
@@ -178,7 +179,7 @@ class CustomCredentialVaultService(CredentialVaultService):
                     item_id=item_id,
                 )
                 try:
-                    await client.delete_credential(item_id)
+                    await client.delete_credential(item_id, organization_id=organization_id)
                 except Exception as cleanup_error:
                     LOG.error(
                         "Failed to clean up orphaned external credential",
@@ -236,6 +237,7 @@ class CustomCredentialVaultService(CredentialVaultService):
             new_item_id = await client.create_credential(
                 name=data.name,
                 credential=credential_data,
+                organization_id=credential.organization_id,
             )
 
             # Update DB record to point to the new vault item
@@ -252,7 +254,7 @@ class CustomCredentialVaultService(CredentialVaultService):
                     new_item_id=new_item_id,
                 )
                 await self._reclaim_orphaned_vault_item(
-                    delete=lambda: client.delete_credential(new_item_id),
+                    delete=lambda: client.delete_credential(new_item_id, organization_id=credential.organization_id),
                     organization_id=credential.organization_id,
                     item_id=new_item_id,
                     vault_type=CredentialVaultType.CUSTOM,
@@ -297,7 +299,7 @@ class CustomCredentialVaultService(CredentialVaultService):
             else:
                 assert organization_id is not None
                 client = await self._get_client_for_organization(organization_id)
-            await client.delete_credential(item_id)
+            await client.delete_credential(item_id, organization_id=organization_id)
             LOG.info(
                 "Successfully deleted credential item from custom vault in background",
                 organization_id=organization_id,
@@ -332,7 +334,7 @@ class CustomCredentialVaultService(CredentialVaultService):
             client = await self._get_client_for_organization(credential.organization_id)
 
             # Delete from external API first
-            await client.delete_credential(credential.item_id)
+            await client.delete_credential(credential.item_id, organization_id=credential.organization_id)
 
             # Delete from Skyvern database after successful external deletion
             await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
@@ -378,6 +380,7 @@ class CustomCredentialVaultService(CredentialVaultService):
             credential_item = await client.get_credential(
                 credential_id=db_credential.item_id,
                 name=db_credential.name,
+                organization_id=db_credential.organization_id,
             )
 
             LOG.info(

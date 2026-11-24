@@ -1,4 +1,5 @@
 import asyncio
+import codecs
 import ipaddress
 import json
 import os
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.core.http_request_authorization import GuardedHTTPHopResp
 from skyvern.utils.url_validators import (
     MAX_SAFE_REDIRECTS,
     SAFE_REDIRECT_STATUS_CODES,
+    redact_url_for_display,
     resolve_fetch_host_ips,
     validate_fetch_url_with_resolved_ips,
     validate_redirect_url_with_resolved_ips,
@@ -30,6 +32,7 @@ from skyvern.utils.url_validators import (
 LOG = structlog.get_logger()
 DEFAULT_REQUEST_TIMEOUT = 30
 DEFAULT_GUARDED_HTTP_RESPONSE_LIMIT_BYTES = 100 * 1024 * 1024
+OUTBOUND_RESPONSE_SIZE_LIMIT_FLAG = "OUTBOUND_RESPONSE_SIZE_LIMIT"
 _SAFE_CROSS_ORIGIN_REDIRECT_HEADERS = frozenset({"accept", "accept-language", "user-agent"})
 
 
@@ -169,6 +172,60 @@ def ssrf_guarded_tcp_connector(resolver: SSRFGuardedResolver | None = None) -> a
     return aiohttp.TCPConnector(resolver=resolver or SSRFGuardedResolver(), use_dns_cache=False)
 
 
+async def outbound_response_size_limit_enabled(organization_id: str | None) -> bool:
+    # Org-scoped so every request from one org resolves the same way; calls without an org share one distinct_id.
+    try:
+        return (
+            await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                OUTBOUND_RESPONSE_SIZE_LIMIT_FLAG,
+                organization_id or OUTBOUND_RESPONSE_SIZE_LIMIT_FLAG,
+                properties={"organization_id": organization_id} if organization_id else None,
+            )
+            is True
+        )
+    except Exception:
+        LOG.warning("Failed to resolve outbound response size limit flag; leaving it off", exc_info=True)
+        return False
+
+
+async def read_response_body_limited(response: aiohttp.ClientResponse, limit_bytes: int, url: str) -> bytes:
+    # response.content yields decoded bytes, so a compressed body is counted at its expanded size.
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        body.extend(chunk)
+        if len(body) > limit_bytes:
+            raise HttpException(
+                413, redact_url_for_display(url) or "[redacted]", "Response body exceeds its size limit"
+            )
+    return bytes(body)
+
+
+def declared_charset(content_type: str) -> str | None:
+    charset = parse_mimetype(content_type).parameters.get("charset")
+    if not charset:
+        return None
+    try:
+        return codecs.lookup(charset).name
+    except LookupError:
+        return None
+
+
+def decode_bounded_response_body(content_type: str, body: bytes) -> Any:
+    charset = declared_charset(content_type)
+    mimetype = parse_mimetype(content_type)
+    if mimetype.type == "application" and (mimetype.subtype == "json" or mimetype.suffix == "json"):
+        try:
+            # Decode before stripping: byte-level strip corrupts UTF-16/32. Without a charset, json.loads
+            # detects the encoding and a BOM from the bytes; with one, utf-8-sig drops a UTF-8 BOM.
+            document = body.decode("utf-8-sig" if charset == "utf-8" else charset) if charset else body
+            if not document.strip():
+                return None
+            return json.loads(document)
+        except (ValueError, RecursionError):
+            pass
+    return body.decode(charset or "utf-8", errors="replace")
+
+
 async def aiohttp_request(
     method: str,
     url: str,
@@ -184,6 +241,8 @@ async def aiohttp_request(
     proxy: str | None = None,
     authorize_redirect: Callable[[str], bool] | None = None,
     use_controlled_egress: bool = False,
+    response_limit_bytes: int = DEFAULT_GUARDED_HTTP_RESPONSE_LIMIT_BYTES,
+    read_body: bool = True,
 ) -> tuple[int, dict[str, str], Any]:
     """
     Generic HTTP request function that supports all HTTP methods.
@@ -192,7 +251,7 @@ async def aiohttp_request(
         method: HTTP method (GET, POST, etc.)
         url: Request URL
         headers: Request headers
-        organization_id: Organization used to resolve managed egress routing
+        organization_id: Organization used to resolve managed egress routing and the size limit flag cohort
         data: Request body data (dict for form data, or other types)
         json_data: JSON data to send (takes precedence over data)
         files: Dictionary mapping field names to file paths for multipart file uploads
@@ -203,6 +262,9 @@ async def aiohttp_request(
         authorize_redirect: Refuses a redirect (rather than following it) when it returns False for
             the next URL; the caller decides which destinations the request's contents may reach
         use_controlled_egress: Route each validated hop through the deployment's controlled relay
+        response_limit_bytes: Most body bytes accepted; the relay always applies it, the direct path only
+            when the size limit flag is on
+        read_body: When False, skip reading the body on the direct path and return None for it
 
     Returns:
         Tuple of (status_code, response_headers, response_body)
@@ -335,7 +397,7 @@ async def aiohttp_request(
                     files=files,
                     cookies=request_cookies,
                     timeout_seconds=timeout,
-                    response_limit_bytes=DEFAULT_GUARDED_HTTP_RESPONSE_LIMIT_BYTES,
+                    response_limit_bytes=response_limit_bytes,
                     resolved_ips=lambda: resolver.pinned_ips_for_url(current_url),
                 )
                 if relay_response is not None:
@@ -354,6 +416,17 @@ async def aiohttp_request(
                     continue
 
                 response_headers = dict(response.headers)
+
+                if not read_body:
+                    return response.status, response_headers, None
+
+                if await outbound_response_size_limit_enabled(organization_id):
+                    limited_body = await read_response_body_limited(response, response_limit_bytes, current_url)
+                    return (
+                        response.status,
+                        response_headers,
+                        decode_bounded_response_body(response.headers.get("Content-Type", ""), limited_body),
+                    )
 
                 try:
                     response_body = await response.json()

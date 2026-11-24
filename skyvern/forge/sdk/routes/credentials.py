@@ -4480,6 +4480,7 @@ async def test_custom_credential_service_connection(
             url=validated_url,
             headers={"Authorization": f"Bearer {api_token}"},
             timeout=10,
+            read_body=False,
         )
 
         if 200 <= status_code < 300:

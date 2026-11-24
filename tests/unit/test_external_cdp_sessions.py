@@ -2,6 +2,7 @@ import asyncio
 import json
 import socket
 import threading
+import urllib.parse
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+import websockets
 from sqlalchemy import update
 from structlog.testing import capture_logs
 
@@ -448,12 +450,17 @@ async def test_a_trickling_discovery_reply_is_cut_off_at_the_deadline(monkeypatc
     assert websocket_url == f"ws://discovery.example.test:{port}/devtools/browser/fallback"
     assert len(requests) == 1
 
+    monkeypatch.delattr("websockets.asyncio.client.connect_http_proxy", raising=False)
+    monkeypatch.delattr("websockets.asyncio.client.connect_socks_proxy", raising=False)
+    monkeypatch.delattr("websockets.uri.get_proxy", raising=False)
+    monkeypatch.delattr("websockets.uri.parse_proxy", raising=False)
     proxy_requests: list[bytes] = []
     proxied_requests: list[bytes] = []
 
     async def proxied_discovery(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        proxied_requests.append(await reader.readuntil(b"\r\n\r\n"))
-        if len(proxied_requests) == 1:
+        request = await reader.readuntil(b"\r\n\r\n")
+        proxied_requests.append(request)
+        if b"GET /oversized/json/version " not in request:
             writer.write(_json_reply({"webSocketDebuggerUrl": "ws://localhost/devtools/browser/proxied"}))
             writer.close()
             return
@@ -466,10 +473,33 @@ async def test_a_trickling_discovery_reply_is_cut_off_at_the_deadline(monkeypatc
     proxied_port = proxied_server.sockets[0].getsockname()[1]
 
     async def proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        proxy_requests.append(await reader.readuntil(b"\r\n\r\n"))
-        upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", proxied_port)
-        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await writer.drain()
+        request = await reader.readuntil(b"\r\n\r\n")
+        proxy_requests.append(request)
+        tunneling = request.startswith(b"CONNECT ")
+        if tunneling:
+            authority = request.split(b" ", 2)[1]
+            target_host, raw_target_port = authority.rsplit(b":", 1)
+            if target_host != b"127.0.0.1":
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                return
+            upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", int(raw_target_port))
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+        else:
+            request_line, request_headers = request.split(b"\r\n", 1)
+            method, absolute_target, version = request_line.split(b" ", 2)
+            target = urllib.parse.urlsplit(absolute_target.decode())
+            if target.hostname != "proxy-only.example.test":
+                writer.write(b"HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                return
+            resource = urllib.parse.urlunsplit(("", "", target.path or "/", target.query, "")).encode()
+            upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", proxied_port)
+            upstream_writer.write(b" ".join((method, resource, version)) + b"\r\n" + request_headers)
+            await upstream_writer.drain()
 
         async def forward(source: asyncio.StreamReader, sink: asyncio.StreamWriter) -> None:
             try:
@@ -481,23 +511,53 @@ async def test_a_trickling_discovery_reply_is_cut_off_at_the_deadline(monkeypatc
             finally:
                 sink.close()
 
-        await asyncio.gather(forward(reader, upstream_writer), forward(upstream_reader, writer))
+        if tunneling:
+            await asyncio.gather(forward(reader, upstream_writer), forward(upstream_reader, writer))
+        else:
+            await forward(upstream_reader, writer)
 
     proxy_server = await asyncio.start_server(proxy, "127.0.0.1", 0)
-    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy_server.sockets[0].getsockname()[1]}")
+    http_proxy = f"http://127.0.0.1:{proxy_server.sockets[0].getsockname()[1]}"
+    monkeypatch.setenv("http_proxy", http_proxy)
     monkeypatch.setenv("no_proxy", "")
-    try:
-        proxied_websocket_url = await resolve_websocket_url(
+    with pytest.raises(CdpDiscoveryError) as rejected:
+        await resolve_websocket_url(
             f"http://proxy-only.example.test:{proxied_port}",
             timeout_ms=2_000,
             resolved_ips=("192.0.2.1",),
         )
+    assert isinstance(rejected.value.__cause__, websockets.exceptions.InvalidHandshake)
+    assert cast(Any, rejected.value.__cause__).response.status_code == 502
+    try:
+        forward_websocket_url = await resolve_websocket_url(
+            f"http://proxy-only.example.test:{proxied_port}",
+            timeout_ms=2_000,
+        )
+        proxied_websocket_url = await resolve_websocket_url(
+            f"http://proxy-only.example.test:{proxied_port}",
+            timeout_ms=2_000,
+            resolved_ips=("192.0.2.1", "127.0.0.1"),
+        )
+        for scheme, resolved_ips in (
+            ("socks5", ("192.0.2.1",)),
+            ("socks5h", None),
+        ):
+            monkeypatch.setenv("http_proxy", f"{scheme}://127.0.0.1:1080")
+            with pytest.raises(CdpDiscoveryError) as rejected_socks:
+                await resolve_websocket_url(
+                    f"http://proxy-only.example.test:{proxied_port}",
+                    timeout_ms=2_000,
+                    resolved_ips=resolved_ips,
+                )
+            assert isinstance(rejected_socks.value.__cause__, websockets.exceptions.InvalidHandshake)
+            assert "SOCKS proxies are not supported" in str(rejected_socks.value.__cause__)
+        monkeypatch.setenv("http_proxy", http_proxy)
         oversized_started = loop.time()
         with pytest.raises(CdpDiscoveryError, match="ValueError"):
             await resolve_websocket_url(
-                f"http://proxy-only.example.test:{proxied_port}",
+                f"http://proxy-only.example.test:{proxied_port}/oversized",
                 timeout_ms=2_000,
-                resolved_ips=("192.0.2.1",),
+                resolved_ips=("192.0.2.1", "127.0.0.1"),
             )
         oversized_elapsed = loop.time() - oversized_started
     finally:
@@ -506,10 +566,20 @@ async def test_a_trickling_discovery_reply_is_cut_off_at_the_deadline(monkeypatc
         await proxy_server.wait_closed()
         await proxied_server.wait_closed()
 
-    assert proxy_requests[0].startswith(f"CONNECT 192.0.2.1:{proxied_port} HTTP/1.1\r\n".encode())
+    request_lines = [request.split(b"\r\n", 1)[0] for request in proxy_requests]
+    assert f"GET http://proxy-only.example.test:{proxied_port}/json/version HTTP/1.1".encode() in request_lines
+    assert f"CONNECT 192.0.2.1:{proxied_port} HTTP/1.1".encode() in request_lines
+    assert f"CONNECT 127.0.0.1:{proxied_port} HTTP/1.1".encode() in request_lines
+    assert all(
+        f"Host: proxy-only.example.test:{proxied_port}\r\n".encode() in request
+        for request in proxy_requests
+        if request.startswith(b"GET ")
+    )
+    assert all(f"Host: proxy-only.example.test:{proxied_port}\r\n".encode() in request for request in proxied_requests)
+    assert forward_websocket_url == f"ws://proxy-only.example.test:{proxied_port}/devtools/browser/proxied"
     assert proxied_websocket_url == f"ws://proxy-only.example.test:{proxied_port}/devtools/browser/proxied"
     assert oversized_elapsed < 1
-    assert len(proxied_requests) == 2
+    assert len(proxied_requests) == 3
 
 
 @pytest.mark.asyncio
