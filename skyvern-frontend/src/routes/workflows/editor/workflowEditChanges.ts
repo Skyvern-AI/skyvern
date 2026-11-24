@@ -8,7 +8,7 @@ import type { AppNode } from "./nodes";
 // save payload, so a write that only moves one of these is not an edit: the
 // studio hides the editor pane with display:none, which re-measures every
 // loop/conditional header and would otherwise mark an untouched workflow
-// unsaved (SKY-13875).
+// unsaved (SKY-13875). A remounted header also rewrites its unchanged height.
 const LAYOUT_MEASUREMENT_DATA_KEYS = new Set(["_headerHeight"]);
 
 type UnknownRecord = Record<string, unknown>;
@@ -17,17 +17,12 @@ function onlyLayoutMeasurementsDiffer(
   previous: UnknownRecord,
   next: UnknownRecord,
 ): boolean {
-  let measurementChanged = false;
   for (const key of new Set([...Object.keys(previous), ...Object.keys(next)])) {
-    if (previous[key] === next[key]) {
-      continue;
-    }
-    if (!LAYOUT_MEASUREMENT_DATA_KEYS.has(key)) {
+    if (previous[key] !== next[key] && !LAYOUT_MEASUREMENT_DATA_KEYS.has(key)) {
       return false;
     }
-    measurementChanged = true;
   }
-  return measurementChanged;
+  return true;
 }
 
 // `updateNodeData` reaches `onNodesChange` as a whole-node `replace`, the same
