@@ -15,7 +15,8 @@ type ConnectedAccountChoiceCardProps = {
   selectedConnectionId: string | null;
   disabled: boolean;
   onSelect: (connectionId: string) => void;
-  // The provider or integration the accounts belong to, as in "Choose an Outlook account".
+  // The provider or integration the accounts belong to, as in "Choose an Outlook account". Unset for a list that
+  // can mix providers.
   accountKind?: string;
   // Set when the chat docks this picker above the composer instead of in the transcript.
   tray?: AttentionTrayPresentation;
@@ -30,11 +31,15 @@ export function ConnectedAccountChoiceCard({
   selectedConnectionId,
   disabled,
   onSelect,
-  accountKind = "Google",
+  accountKind,
   tray,
 }: ConnectedAccountChoiceCardProps) {
-  const chooseTitle = `Choose ${withArticle(accountKind)} account`;
-  const groupLabel = `Connected ${accountKind} accounts`;
+  const chooseTitle = accountKind
+    ? `Choose ${withArticle(accountKind)} account`
+    : "Choose an account";
+  const groupLabel = accountKind
+    ? `Connected ${accountKind} accounts`
+    : "Connected accounts";
   // Only active rows send a choice; an inactive one is a link to reconnect it.
   const keyed = tray
     ? choices
@@ -158,7 +163,7 @@ export function ConnectedAccountChoiceMarker() {
   return (
     <AttentionMarker
       icon={<Link2Icon aria-hidden className="size-3.5 shrink-0" />}
-      title="Copilot needs a Google account"
+      title="Copilot needs an account"
     />
   );
 }

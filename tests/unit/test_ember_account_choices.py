@@ -2470,16 +2470,24 @@ async def test_a_listing_admits_an_account_only_where_the_block_reads_through_it
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("run_value", "message", "admitted"),
+    ("run_parameters", "default", "message", "admitted"),
     [
-        (DRIVE_ACCOUNT_ID, "test it", False),
-        (DRIVE_ACCOUNT_ID, f"send it from {DRIVE_ACCOUNT_ID}", True),
-        ("goac_matches_no_connection", "test it", True),
+        ({"acct": DRIVE_ACCOUNT_ID}, None, "test it", False),
+        ({"acct": DRIVE_ACCOUNT_ID}, None, f"send it from {DRIVE_ACCOUNT_ID}", True),
+        ({"acct": "goac_matches_no_connection"}, None, "test it", True),
+        (None, DRIVE_ACCOUNT_ID, "test it", False),
+        (None, DRIVE_ACCOUNT_ID, f"send it from {DRIVE_ACCOUNT_ID}", True),
+        # Dispatch binds a parameter's default when the run sends it as null.
+        ({"acct": None}, DRIVE_ACCOUNT_ID, "test it", False),
     ],
-    ids=["listed", "cited", "no_connection"],
+    ids=["listed", "cited", "no_connection", "listed_default", "cited_default", "null_falls_back_to_default"],
 )
 async def test_an_account_an_agent_step_can_read_is_admitted_only_as_acting(
-    monkeypatch: pytest.MonkeyPatch, run_value: str, message: str, admitted: bool
+    monkeypatch: pytest.MonkeyPatch,
+    run_parameters: dict[str, str | None] | None,
+    default: str | None,
+    message: str,
+    admitted: bool,
 ) -> None:
     agent = {
         "label": "agent",
@@ -2488,10 +2496,15 @@ async def test_an_account_an_agent_step_can_read_is_admitted_only_as_acting(
         "tools": ["http_request"],
         "parameter_keys": ["acct"],
     }
-    definition = {"parameters": [{"key": "acct", "parameter_type": "workflow"}], "blocks": [agent]}
+    parameter = {"key": "acct", "parameter_type": "workflow", "default_value": default}
+    definition = {"parameters": [parameter], "blocks": [agent]}
 
     result = await _gate(
-        monkeypatch, definition, listed=[DRIVE_ACCOUNT_ID], message=message, run_parameters={"acct": run_value}
+        monkeypatch,
+        definition,
+        listed=[DRIVE_ACCOUNT_ID],
+        message=message,
+        run_parameters=run_parameters,
     )
 
     assert (result.blocker is None and result.error is None) is admitted

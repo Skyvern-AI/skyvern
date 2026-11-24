@@ -593,6 +593,8 @@ def build_authorize_url(
 class GoogleAuthorizationStart:
     authorize_url: str
     state: str
+    # The row this consent creates or reconnects; the callback promotes this same id.
+    credential_id: str
 
 
 async def start_authorization(
@@ -707,7 +709,7 @@ async def start_authorization(
         client_config=resolved_config.config,
     )
 
-    return GoogleAuthorizationStart(authorize_url=authorize_url, state=state)
+    return GoogleAuthorizationStart(authorize_url=authorize_url, state=state, credential_id=credential_id)
 
 
 async def promote_pending_credential(

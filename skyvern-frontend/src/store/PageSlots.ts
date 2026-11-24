@@ -58,15 +58,16 @@ export type ConnectedGmailFlow = Readonly<{
   busy: boolean;
   // A message to show for a failed attempt; a cancelled sign-in has none.
   failure: string | null;
-  // Active connections, named as the Integrations page names them.
+  // Active connections: the user's name for one, or the Connected Gmail name, beside its masked account.
   connections: ReadonlyArray<
     Readonly<{
       connection_id: string;
       name: string;
-      // The masked account, set when a user-chosen name leads.
       email_address?: string | null;
     }>
   >;
+  // The connection this flow's own sign-in finished with; one added anywhere else never appears here.
+  completedConnectionId?: string | null;
   start: () => void;
 }>;
 

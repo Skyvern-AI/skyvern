@@ -518,7 +518,11 @@ class EmberChatRequest(BaseModel):
     )
     message: str = Field(..., description="The message that user sends")
     selected_connected_account_id: str | None = Field(
-        None, description="Google account explicitly selected in the chat picker; validated against this organization."
+        None,
+        description=(
+            "Connected account the user picked in the chat, on an account card or by finishing sign-in on a "
+            "connection card; validated against this organization."
+        ),
     )
     selected_connected_account_from_pending_proposal: bool = Field(
         False,

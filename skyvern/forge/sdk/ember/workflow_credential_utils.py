@@ -259,7 +259,8 @@ def agent_step_account_text(
     run_parameters: Mapping[str, Any] | None = None,
 ) -> str | None:
     """Text an executing agent step can take an account id from: its prompt, what a bare `{{ key }}` in the prompt
-    resolves to, and every run value, which the step can read. None when no agent step runs."""
+    resolves to, every run value, and the default of each workflow parameter the run leaves unset or null, which
+    dispatch binds. None when no agent step runs."""
     prompts = [
         str(block.get("prompt") or "")
         for block in workflow_blocks(parsed, selected_labels=selected_labels)
@@ -267,9 +268,19 @@ def agent_step_account_text(
     ]
     if not prompts:
         return None
+    run_values = run_parameters or {}
     values = _literal_parameter_values(parsed, run_parameters)
     resolved = [values[key] for prompt in prompts for key in _BARE_TEMPLATE_RE.findall(prompt) if key in values]
-    return "\n".join([*prompts, *resolved, json.dumps(run_parameters or {}, default=str)])
+    defaults = {
+        key: parameter["default_value"]
+        for parameter in declared_parameters(parsed)
+        if isinstance(parameter, dict)
+        and str(parameter.get("parameter_type") or "").lower() == ParameterType.WORKFLOW
+        and isinstance(key := parameter.get("key"), str)
+        and run_values.get(key) is None
+        and parameter.get("default_value") is not None
+    }
+    return "\n".join([*prompts, *resolved, json.dumps(run_values, default=str), json.dumps(defaults, default=str)])
 
 
 def workflow_connection_ids(workflow_yaml: str, *, acting_only: bool = False) -> list[str]:

@@ -144,6 +144,9 @@ class CreateGoogleOAuthAuthorizeRequest(BaseModel):
 class GoogleOAuthAuthorizeResponse(BaseModel):
     authorize_url: str
     state: str
+    credential_id: str = Field(
+        ..., description="The connection this sign-in creates or reconnects; only it can be this attempt's result."
+    )
 
 
 class CreateGoogleOAuthCallbackRequest(BaseModel):

@@ -117,6 +117,7 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
+  ConnectedAccountChoice,
   EmberAttachedFile,
   EmberCancelRequest,
   EmberProposalMetadata,
@@ -944,9 +945,12 @@ function AttachmentChip({
   );
 }
 
+const CONNECTION_ID_PATTERN = /^(goac|moac|ngc)_[A-Za-z0-9]+$/;
+
 function connectedAccountSelectionReceipt(
   messages: ChatMessage[],
   index: number,
+  cardAccounts: Readonly<Record<string, ConnectedAccountChoice>>,
 ): string | null {
   const message = messages[index];
   const prior = previousAskingMessage(messages, index);
@@ -962,14 +966,18 @@ function connectedAccountSelectionReceipt(
     (choice) => choice.connection_id === message.content,
   );
   if (selected) {
-    return `Selected ${bidiIsolate(selected.name)} — ${connectedAccountChoiceLabel(selected, choices)}`;
+    return `Selected ${bidiIsolate(selected.name)} (${connectedAccountChoiceLabel(selected, choices)})`;
   }
-  // A connection card lists accounts made after its turn ended, which no stored choice set holds.
+  // A connection card lists accounts made after its turn ended, which no stored choice set holds; the card names
+  // the one it shows as picked.
   if (
     prior.narrative.connectionCards.length > 0 &&
-    /^(goac|moac|ngc)_[A-Za-z0-9]+$/.test(message.content)
+    CONNECTION_ID_PATTERN.test(message.content)
   ) {
-    return `Selected connection …${message.content.slice(-8)}`;
+    const shown = cardAccounts[message.content];
+    return shown
+      ? `Selected ${bidiIsolate(shown.name)}${shown.email_address ? ` (${shown.email_address})` : ""}`
+      : `Selected connection …${message.content.slice(-8)}`;
   }
   return null;
 }
@@ -2089,6 +2097,20 @@ export function EmberChat({
     connectedAccountChoicePendingTurnId,
     setConnectedAccountChoicePendingTurnId,
   ] = useState<string | null>(null);
+  const [cardAccounts, setCardAccounts] = useState<
+    Readonly<Record<string, ConnectedAccountChoice>>
+  >({});
+  const rememberCardAccount = useCallback(
+    (choice: ConnectedAccountChoice) =>
+      setCardAccounts((known) => {
+        const prior = known[choice.connection_id];
+        return prior?.name === choice.name &&
+          prior.email_address === choice.email_address
+          ? known
+          : { ...known, [choice.connection_id]: choice };
+      }),
+    [],
+  );
   // Synchronous mirror of queuedPrompt (like inFlightRef) so a same-tick double
   // submit can't queue twice and orphan the first message. Set via updateQueuedPrompt.
   const queuedPromptRef = useRef<QueuedPrompt | null>(null);
@@ -7962,7 +7984,7 @@ export function EmberChat({
     });
   }
   if (trayAccountChoice) {
-    attentionQueue.push({ kind: "account", upNext: "Choose a Google account" });
+    attentionQueue.push({ kind: "account", upNext: "Choose an account" });
   }
   if (demonstrationCredentialFrame) {
     attentionQueue.push({
@@ -11475,11 +11497,14 @@ export function EmberChat({
                         <ConnectionCard
                           key={connectionCardKey(card)}
                           card={card}
+                          turnId={turnId}
+                          postedAt={message.timestamp}
                           selectedConnectionId={
                             adjacentMessage?.sender === "user"
                               ? adjacentMessage.content
                               : null
                           }
+                          onSelectionShown={rememberCardAccount}
                           disabled={
                             !isLastMessage ||
                             isLoading ||
@@ -11613,6 +11638,7 @@ export function EmberChat({
                 const selectionReceipt = connectedAccountSelectionReceipt(
                   messages,
                   index,
+                  cardAccounts,
                 );
                 const messageDemonstrationItems =
                   message.demonstrationItems ??
