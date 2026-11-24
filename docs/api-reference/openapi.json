@@ -7102,63 +7102,32 @@
         "summary": "Extract a job application posting",
         "description": "Start a workflow run that extracts structured details from a job posting.",
         "operationId": "extract_job_application_v1_recipes_jobs_extract_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "properties": {
-                  "webhook_url": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "format": "uri",
-                    "title": "Webhook Url",
-                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
-                    "examples": [
-                      "https://my-site.com/webhook"
-                    ]
-                  },
-                  "proxy_location": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/components/schemas/ProxyLocation"
-                      },
-                      {
-                        "$ref": "#/components/schemas/GeoTarget"
-                      },
-                      {
-                        "additionalProperties": true,
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Proxy Location",
-                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
-                  },
-                  "job_url": {
-                    "type": "string",
-                    "format": "uri",
-                    "title": "Job Url"
-                  }
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "x-max-steps-override",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
                 },
-                "additionalProperties": false,
-                "type": "object",
-                "required": [
-                  "job_url"
-                ],
-                "title": "JobRecipeExtractRequest"
-              }
-            }
-          },
-          "required": true
-        },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Maximum steps each task in the run may take. Overrides the organization limit.",
+              "title": "X-Max-Steps-Override"
+            },
+            "description": "Maximum steps each task in the run may take. Overrides the organization limit."
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successfully started job application extraction",
@@ -7186,26 +7155,13 @@
             "description": "Workflow launch failed"
           }
         },
-        "security": [
-          {
-            "ApiKeyAuth": []
-          }
-        ],
-        "x-fern-sdk-method-name": "extract_job_application"
-      }
-    },
-    "/v1/recipes/jobs/apply": {
-      "post": {
-        "tags": [
-          "Recipes"
-        ],
-        "summary": "Apply to a job",
-        "description": "Start a workflow run that applies to a job with a résumé and optional credentials.",
-        "operationId": "apply_to_job_v1_recipes_jobs_apply_post",
+        "x-fern-sdk-method-name": "extract_job_application",
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
+                "additionalProperties": false,
                 "properties": {
                   "webhook_url": {
                     "anyOf": [
@@ -7216,12 +7172,12 @@
                         "type": "null"
                       }
                     ],
-                    "format": "uri",
-                    "title": "Webhook Url",
                     "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
                     "examples": [
                       "https://my-site.com/webhook"
-                    ]
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url"
                   },
                   "proxy_location": {
                     "anyOf": [
@@ -7239,22 +7195,155 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Proxy Location",
-                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL.",
+                    "title": "Proxy Location"
                   },
                   "job_url": {
-                    "type": "string",
                     "format": "uri",
-                    "title": "Job Url"
+                    "title": "Job Url",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "job_url"
+                ],
+                "title": "JobRecipeExtractRequest",
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/recipes/jobs/apply": {
+      "post": {
+        "tags": [
+          "Recipes"
+        ],
+        "summary": "Apply to a job",
+        "description": "Start a workflow run that applies to a job with a résumé and optional credentials.",
+        "operationId": "apply_to_job_v1_recipes_jobs_apply_post",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "x-max-steps-override",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Maximum steps each task in the run may take. Overrides the organization limit.",
+              "title": "X-Max-Steps-Override"
+            },
+            "description": "Maximum steps each task in the run may take. Overrides the organization limit."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully started job application",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRecipeRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid multipart structure"
+          },
+          "402": {
+            "description": "Insufficient credits or required billing state"
+          },
+          "403": {
+            "description": "Unauthorized or insufficient organization permission"
+          },
+          "413": {
+            "description": "Résumé file exceeds the upload limit"
+          },
+          "422": {
+            "description": "Invalid apply request"
+          },
+          "429": {
+            "description": "Workflow submission rate limit exceeded"
+          },
+          "500": {
+            "description": "Upload or workflow launch failed"
+          },
+          "502": {
+            "description": "Credential service failed"
+          },
+          "503": {
+            "description": "Saved credential check is temporarily unavailable"
+          }
+        },
+        "x-fern-sdk-method-name": "apply_to_job",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url"
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL.",
+                    "title": "Proxy Location"
+                  },
+                  "job_url": {
+                    "format": "uri",
+                    "title": "Job Url",
+                    "type": "string"
                   },
                   "custom_prompt": {
-                    "type": "string",
-                    "title": "Custom Prompt"
+                    "title": "Custom Prompt",
+                    "type": "string"
                   },
                   "resume_url": {
-                    "type": "string",
                     "format": "uri",
-                    "title": "Resume Url"
+                    "title": "Resume Url",
+                    "type": "string"
                   },
                   "other_information": {
                     "title": "Other Information"
@@ -7268,9 +7357,9 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Terminate Criterion",
+                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient.",
                     "description": "Condition that stops Apply. Omit to use the recipe default; null or empty text disables it.",
-                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient."
+                    "title": "Terminate Criterion"
                   },
                   "error_code_mapping": {
                     "anyOf": [
@@ -7284,17 +7373,17 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Error Code Mapping",
-                    "description": "Error codes and descriptions. Omit for the recipe default; null or {} disables mapping. A supplied mapping replaces the default independently of terminate_criterion.",
                     "default": {
                       "job_expired": "The requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications."
-                    }
+                    },
+                    "description": "Error codes and descriptions. Omit for the recipe default; null or {} disables mapping. A supplied mapping replaces the default independently of terminate_criterion.",
+                    "title": "Error Code Mapping"
                   },
                   "username": {
                     "anyOf": [
                       {
-                        "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "type": "string"
                       },
                       {
                         "type": "null"
@@ -7338,43 +7427,44 @@
                   "credential_id": {
                     "anyOf": [
                       {
-                        "type": "string",
-                        "pattern": "^cred_[A-Za-z0-9_-]{1,64}$"
+                        "pattern": "^cred_[A-Za-z0-9_-]{1,64}$",
+                        "type": "string"
                       },
                       {
                         "type": "null"
                       }
                     ],
-                    "title": "Credential Id",
-                    "description": "ID of a password credential saved in your organization, such as one an earlier Apply call saved with persist_credentials. Use it in place of username, password, and persist_credentials. The job_url must be on a website saved on the credential (its tested_url or one of its extra_site_urls). Before the run types the credential's password, or a one-time code made from it, it checks that the receiving page is on one of those websites. Change a credential's saved websites in the Skyvern app's credential editor."
+                    "description": "ID of a password credential saved in your organization, such as one an earlier Apply call saved with persist_credentials. Use it in place of username, password, and persist_credentials. The job_url must be on a website saved on the credential (its tested_url or one of its extra_site_urls). Before the run types the credential's password, or a one-time code made from it, it checks that the receiving page is on one of those websites. Change a credential's saved websites in the Skyvern app's credential editor.",
+                    "title": "Credential Id"
                   }
                 },
-                "additionalProperties": false,
-                "type": "object",
                 "required": [
                   "job_url",
                   "custom_prompt",
                   "resume_url"
                 ],
-                "title": "JobRecipeApplyJSONRequest"
+                "title": "JobRecipeApplyJSONRequest",
+                "type": "object"
               }
             },
             "multipart/form-data": {
               "schema": {
+                "additionalProperties": false,
+                "description": "OpenAPI representation of the text and file parts accepted by Apply.",
                 "properties": {
                   "job_url": {
-                    "type": "string",
                     "format": "uri",
-                    "title": "Job Url"
+                    "title": "Job Url",
+                    "type": "string"
                   },
                   "custom_prompt": {
-                    "type": "string",
-                    "title": "Custom Prompt"
+                    "title": "Custom Prompt",
+                    "type": "string"
                   },
                   "resume_file": {
-                    "type": "string",
                     "format": "binary",
-                    "title": "Resume File"
+                    "title": "Resume File",
+                    "type": "string"
                   },
                   "webhook_url": {
                     "anyOf": [
@@ -7385,9 +7475,9 @@
                         "type": "null"
                       }
                     ],
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
                     "format": "uri",
-                    "title": "Webhook Url",
-                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details."
+                    "title": "Webhook Url"
                   },
                   "proxy_location": {
                     "anyOf": [
@@ -7398,8 +7488,8 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Proxy Location",
-                    "description": "A ProxyLocation name such as RESIDENTIAL_GB, or JSON text for a GeoTarget or custom proxy object. Omit it or send blank text to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                    "description": "A ProxyLocation name such as RESIDENTIAL_GB, or JSON text for a GeoTarget or custom proxy object. Omit it or send blank text to use the default; Skyvern Cloud then uses RESIDENTIAL.",
+                    "title": "Proxy Location"
                   },
                   "other_information": {
                     "anyOf": [
@@ -7421,9 +7511,9 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Terminate Criterion",
+                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient.",
                     "description": "Condition that stops Apply. Omit for the recipe default; empty text disables it.",
-                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient."
+                    "title": "Terminate Criterion"
                   },
                   "error_code_mapping": {
                     "anyOf": [
@@ -7434,15 +7524,15 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Error Code Mapping",
+                    "default": "{\"job_expired\": \"The requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications.\"}",
                     "description": "JSON text containing an object of error codes and descriptions. Omit for the recipe default; JSON null or {} disables mapping. A supplied mapping replaces the default independently of terminate_criterion.",
-                    "default": "{\"job_expired\": \"The requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications.\"}"
+                    "title": "Error Code Mapping"
                   },
                   "username": {
                     "anyOf": [
                       {
-                        "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "type": "string"
                       },
                       {
                         "type": "null"
@@ -7464,8 +7554,8 @@
                   "persist_credentials": {
                     "anyOf": [
                       {
-                        "type": "string",
-                        "pattern": "^true$"
+                        "pattern": "^true$",
+                        "type": "string"
                       },
                       {
                         "type": "null"
@@ -7487,76 +7577,28 @@
                   "credential_id": {
                     "anyOf": [
                       {
-                        "type": "string",
-                        "pattern": "^cred_[A-Za-z0-9_-]{1,64}$"
+                        "pattern": "^cred_[A-Za-z0-9_-]{1,64}$",
+                        "type": "string"
                       },
                       {
                         "type": "null"
                       }
                     ],
-                    "title": "Credential Id",
-                    "description": "ID of a password credential saved in your organization, such as one an earlier Apply call saved with persist_credentials. Use it in place of username, password, and persist_credentials. The job_url must be on a website saved on the credential (its tested_url or one of its extra_site_urls). Before the run types the credential's password, or a one-time code made from it, it checks that the receiving page is on one of those websites. Change a credential's saved websites in the Skyvern app's credential editor."
+                    "description": "ID of a password credential saved in your organization, such as one an earlier Apply call saved with persist_credentials. Use it in place of username, password, and persist_credentials. The job_url must be on a website saved on the credential (its tested_url or one of its extra_site_urls). Before the run types the credential's password, or a one-time code made from it, it checks that the receiving page is on one of those websites. Change a credential's saved websites in the Skyvern app's credential editor.",
+                    "title": "Credential Id"
                   }
                 },
-                "additionalProperties": false,
-                "type": "object",
                 "required": [
                   "job_url",
                   "custom_prompt",
                   "resume_file"
                 ],
                 "title": "JobRecipeApplyMultipartRequest",
-                "description": "OpenAPI representation of the text and file parts accepted by Apply."
+                "type": "object"
               }
             }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successfully started job application",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/JobRecipeRunResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid multipart structure"
-          },
-          "402": {
-            "description": "Insufficient credits or required billing state"
-          },
-          "403": {
-            "description": "Unauthorized or insufficient organization permission"
-          },
-          "413": {
-            "description": "Résumé file exceeds the upload limit"
-          },
-          "422": {
-            "description": "Invalid apply request"
-          },
-          "429": {
-            "description": "Workflow submission rate limit exceeded"
-          },
-          "500": {
-            "description": "Upload or workflow launch failed"
-          },
-          "502": {
-            "description": "Credential service failed"
-          },
-          "503": {
-            "description": "Saved credential check is temporarily unavailable"
           }
-        },
-        "security": [
-          {
-            "ApiKeyAuth": []
-          }
-        ],
-        "x-fern-sdk-method-name": "apply_to_job"
+        }
       }
     },
     "/v1/recipes/jobs/runs": {
