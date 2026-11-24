@@ -1,14 +1,19 @@
 import asyncio
 import io
 import os
+import re
 import shutil
+import threading
 import uuid
 import zipfile
+from contextlib import aclosing
 from datetime import datetime, timezone
 from typing import BinaryIO, cast
 
 import structlog
 import zstandard as zstd
+from anyio import CancelScope, CapacityLimiter, to_thread
+from anyio.lowlevel import RunVar
 from botocore.exceptions import ClientError
 
 from skyvern.config import settings
@@ -49,6 +54,7 @@ from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_PATH_SEGMENT,
     sync_run_recording_clips,
 )
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import settle
 from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -62,6 +68,165 @@ LOG = structlog.get_logger()
 
 
 S3_ZSTD_COMPRESSED_SUFFIX = ".zst"
+_ZIP_READ_BLOCK_BYTES = 1024 * 1024
+_ZIP_TAIL_BYTES = 8 * 1024
+_ZIP_LOCAL_HEADER_MAX_BYTES = 30 + 2 * 65535
+_ZIP_THREAD_LIMITER: RunVar[CapacityLimiter] = RunVar("s3_zip_thread_limiter")
+_STRONG_ETAG = re.compile(r'"[^"\r\n]*"')
+
+
+def _archive_thread_limiter() -> CapacityLimiter:
+    limiter = _ZIP_THREAD_LIMITER.get(None)
+    if limiter is None:
+        limiter = CapacityLimiter(40)
+        _ZIP_THREAD_LIMITER.set(limiter)
+    return limiter
+
+
+class _ArchiveReadError(Exception):
+    pass
+
+
+class _S3ZipReader(io.RawIOBase):
+    def __init__(self, client: AsyncAWSClient, uri: str, size: int, etag: str) -> None:
+        super().__init__()
+        self._client = client
+        self._uri = uri
+        self._size = size
+        self._etag = etag
+        self._position = 0
+        self._tail_start = max(0, size - _ZIP_TAIL_BYTES)
+        self._tail: bytes | None = None
+        self._member_start = self._member_end = 0
+        self._block_start = 0
+        self._block = b""
+        self._loop = asyncio.get_running_loop()
+        self._stop = threading.Event()
+        self._started = threading.Event()
+        self._active_read: asyncio.Task | None = None
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_CUR:
+            offset += self._position
+        elif whence == io.SEEK_END:
+            offset += self._size
+        elif whence != io.SEEK_SET:
+            raise ValueError("invalid seek origin")
+        if offset < 0:
+            raise OSError("seek before start of archive")
+        self._position = offset
+        return offset
+
+    def read(self, size: int = -1) -> bytes:
+        if self._stop.is_set():
+            raise asyncio.CancelledError
+        stop = self._size if size < 0 else min(self._size, self._position + size)
+        result = io.BytesIO()
+        while self._position < stop:
+            start = self._position
+            if start >= self._tail_start:
+                # The ordinary central directory and footer often fit in one suffix read.
+                if self._tail is None:
+                    self._tail = self._read_from_worker(self._tail_start, self._size - 1)
+                end = stop
+                result.write(self._tail[start - self._tail_start : end - self._tail_start])
+            elif self._member_start <= start < self._member_end:
+                block_end = self._block_start + len(self._block)
+                if not self._block_start <= start < block_end:
+                    block_end = min(start + _ZIP_READ_BLOCK_BYTES, self._member_end, self._tail_start)
+                    # Release the previous input block before fetching its replacement.
+                    self._block = b""
+                    self._block = self._read_from_worker(start, block_end - 1)
+                    self._block_start = start
+                end = min(stop, block_end)
+                result.write(self._block[start - self._block_start : end - self._block_start])
+            else:
+                end = min(stop, start + _ZIP_READ_BLOCK_BYTES, self._tail_start)
+                result.write(self._read_from_worker(start, end - 1))
+            self._position = end
+        return result.getvalue()
+
+    def _read_from_worker(self, start: int, end: int) -> bytes:
+        return asyncio.run_coroutine_threadsafe(self._fetch_range(start, end), self._loop).result()
+
+    async def _fetch_range(self, start: int, end: int) -> bytes:
+        if self._stop.is_set():
+            raise asyncio.CancelledError
+        self._active_read = asyncio.current_task()
+        expected = end - start + 1
+        try:
+            stream = await self._client.open_download_stream(self._uri, byte_range=(start, end), if_match=self._etag)
+            async with aclosing(stream):
+                if (
+                    stream.status != 206
+                    or stream.content_range != f"bytes {start}-{end}/{self._size}"
+                    or stream.content_length != expected
+                    or stream.etag != self._etag
+                ):
+                    raise _ArchiveReadError("Unexpected archive range response metadata")
+                data = bytearray()
+                async for chunk in stream.iter_chunks(64 * 1024):
+                    if len(data) + len(chunk) > expected:
+                        raise _ArchiveReadError("Archive range exceeded its declared length")
+                    data.extend(chunk)
+                if len(data) != expected:
+                    raise _ArchiveReadError("Incomplete archive range")
+                return bytes(data)
+        except Exception as exc:
+            raise _ArchiveReadError from exc
+        finally:
+            self._active_read = None
+
+    def _extract_member(self, name: str) -> bytes:
+        self._started.set()
+        if self._stop.is_set():
+            raise asyncio.CancelledError
+        with self, zipfile.ZipFile(self) as archive, io.BytesIO() as output:
+            entry = archive.getinfo(name)
+            self._member_start = entry.header_offset
+            next_header = min(
+                (item.header_offset for item in archive.infolist() if item.header_offset > entry.header_offset),
+                default=archive.start_dir,
+            )
+            # Local filenames and extra fields each have a 16-bit length. The local extra field can differ from entry.extra.
+            self._member_end = min(
+                self._size,
+                archive.start_dir,
+                next_header,
+                entry.header_offset + entry.compress_size + _ZIP_LOCAL_HEADER_MAX_BYTES,
+            )
+            with archive.open(entry) as member:
+                while not self._stop.is_set():
+                    chunk = member.read(_ZIP_READ_BLOCK_BYTES)
+                    if not chunk:
+                        return output.getvalue()
+                    output.write(chunk)
+        raise asyncio.CancelledError
+
+    async def extract(self, name: str) -> bytes:
+        # ZIP workers wait on S3. Keep that queue separate from other AnyIO work and asyncio DNS.
+        worker = asyncio.create_task(to_thread.run_sync(self._extract_member, name, limiter=_archive_thread_limiter()))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            self._stop.set()
+            if not self._started.is_set():
+                # Cancel a waiter on the thread limiter without delaying behind unrelated reads.
+                worker.cancel()
+            elif self._active_read is not None:
+                self._active_read.cancel()
+            with CancelScope(shield=True):
+                await settle(worker)
+            raise
 
 
 def _safe_get_file_size(path: str) -> int | None:
@@ -263,25 +428,41 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             self.async_client.log_download_failure(e, artifact.uri)
             return None
 
+    async def _retrieve_zip_member(self, uri: str, bundle_key: str) -> bytes | None:
+        try:
+            info = await self.async_client.get_object_info(uri)
+            size, etag = info.get("ContentLength"), info.get("ETag")
+            if size == 0:
+                return b""
+            if not isinstance(size, int) or size < 0 or not isinstance(etag, str) or not _STRONG_ETAG.fullmatch(etag):
+                raise _ArchiveReadError("Archive size or strong ETag unavailable")
+        except Exception as exc:
+            raise _ArchiveReadError from exc
+        return await _S3ZipReader(self.async_client, uri, size, etag).extract(bundle_key)
+
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
-        data = await self.async_client.download_file(artifact.uri)
-        # Decompress zstd-compressed files (HAR only)
-        if data and artifact.uri.endswith(S3_ZSTD_COMPRESSED_SUFFIX):
-            dctx = zstd.ZstdDecompressor()
-            data = dctx.decompress(data)
-        # Extract a named entry from a ZIP archive (STEP_ARCHIVE / TASK_ARCHIVE)
-        if data and artifact.bundle_key:
-            try:
+        compressed = artifact.uri.endswith(S3_ZSTD_COMPRESSED_SUFFIX)
+        try:
+            if artifact.bundle_key and not compressed:
+                return await self._retrieve_zip_member(artifact.uri, artifact.bundle_key)
+            data = await self.async_client.download_file(artifact.uri)
+            if data and compressed:
+                data = zstd.ZstdDecompressor().decompress(data)
+            if data and artifact.bundle_key:
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     return zf.read(artifact.bundle_key)
-            except (KeyError, zipfile.BadZipFile):
-                LOG.warning(
-                    "Failed to extract entry from archive",
-                    bundle_key=artifact.bundle_key,
-                    artifact_id=artifact.artifact_id,
-                )
-                return None
-        return data
+            return data
+        except (KeyError, zipfile.BadZipFile):
+            LOG.warning(
+                "Failed to extract entry from archive",
+                bundle_key=artifact.bundle_key,
+                artifact_id=artifact.artifact_id,
+            )
+            return None
+        except _ArchiveReadError as exc:
+            cause = exc.__cause__
+            self.async_client.log_download_failure(cause if isinstance(cause, Exception) else exc, artifact.uri)
+            return None
 
     async def check_archived_uris(self, uris: list[str]) -> dict[str, bool]:
         if not uris:

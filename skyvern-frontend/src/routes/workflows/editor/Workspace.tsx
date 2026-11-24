@@ -1610,6 +1610,11 @@ function Workspace({
       setTimeout(() => {
         // Get the latest nodes and edges (including visibility changes)
         const currentNodes = getNodes() as Array<AppNode>;
+        // Read-only comparison canvases also fire this event while the main canvas is
+        // unmounted; writing back the empty store would remount it with no nodes.
+        if (currentNodes.length === 0) {
+          return;
+        }
         const currentEdges = getEdges();
 
         const layoutedElements = layout(currentNodes, currentEdges, blockLabel);
