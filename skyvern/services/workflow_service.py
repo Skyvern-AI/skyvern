@@ -26,7 +26,10 @@ from skyvern.schemas.runs import (
     WorkflowRunResponse,
     read_browser_type,
 )
-from skyvern.services.strict_otp_terminalization import fail_unclaimed_strict_workflow_run
+from skyvern.services.strict_otp_terminalization import (
+    fail_unclaimed_strict_workflow_run,
+    fail_unclaimed_strict_workflow_run_on_error,
+)
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.real_browser_manager import (
     SelectedBrowserTypeUnsupportedError,
@@ -181,8 +184,12 @@ async def _prepare_workflow(
         raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_id)
 
     # One ambient session keeps the version lookup in the same transaction as the run insert, as it
-    # was when setup_workflow_run resolved the version itself, and one connection across setup's commits.
-    async with app.DATABASE.workflow_runs.Session.pinned():
+    # was when setup_workflow_run resolved the version itself, and one connection across setup's commits. The strict
+    # guard sits outside it so a cancel landing on the pinned scope's exit still fails the run.
+    async with (
+        fail_unclaimed_strict_workflow_run_on_error() as strict_run,
+        app.DATABASE.workflow_runs.Session.pinned(),
+    ):
         workflow = await app.WORKFLOW_SERVICE.resolve_workflow_for_run(
             workflow_permanent_id=workflow_id,
             organization=organization,
@@ -220,21 +227,18 @@ async def _prepare_workflow(
             post_dispatch_effects=post_dispatch_effects,
             run_parameter_values=run_parameter_values,
         )
-        try:
-            await app.DATABASE.tasks.create_task_run(
-                task_run_type=RunType.workflow_run,
-                organization_id=organization.organization_id,
-                run_id=workflow_run.workflow_run_id,
-                title=workflow.title,
-                status=RunStatus.queued,
-                workflow_permanent_id=workflow_id,
-                parent_workflow_run_id=parent_workflow_run_id,
-                debug_session_id=debug_session_id,
-            )
-        except (Exception, asyncio.CancelledError):
-            if workflow_run.otp_request_id is not None:
-                await fail_unclaimed_strict_workflow_run(workflow_run.workflow_run_id)
-            raise
+        if workflow_run.otp_request_id is not None:
+            strict_run.workflow_run_id = workflow_run.workflow_run_id
+        await app.DATABASE.tasks.create_task_run(
+            task_run_type=RunType.workflow_run,
+            organization_id=organization.organization_id,
+            run_id=workflow_run.workflow_run_id,
+            title=workflow.title,
+            status=RunStatus.queued,
+            workflow_permanent_id=workflow_id,
+            parent_workflow_run_id=parent_workflow_run_id,
+            debug_session_id=debug_session_id,
+        )
 
     if max_steps:
         LOG.info("Overriding max steps per run", max_steps_override=max_steps)

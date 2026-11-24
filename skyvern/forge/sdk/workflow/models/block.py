@@ -191,6 +191,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMResponseFormat,
     InvalidLLMResponseType,
     LLMProviderErrorRetryableTask,
+    cause_type_name,
 )
 from skyvern.forge.sdk.api.llm.schema_validator import (
     extraction_shape_matches,
@@ -11918,8 +11919,7 @@ def _content_free_ocr_error(error: BaseException) -> str:
     if isinstance(error, _OcrPageValidationError):
         return str(error)
     description = type(error).__name__
-    if error.__cause__ is not None:
-        cause_name = type(error.__cause__).__name__
+    if (cause_name := cause_type_name(error)) is not None:
         description += f" caused by {cause_name}"
         if "RateLimit" in cause_name:
             description += ", an LLM rate limit"

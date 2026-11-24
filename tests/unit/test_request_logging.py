@@ -205,7 +205,7 @@ def test_sensitive_post_bodies_are_opaque(path: str, body: str) -> None:
                 "/api/v1/otp-bound/tasks",
                 "/api/v2/otp-bound/tasks/",
                 "/api/v1/otp-bound/workflows/wpid_1/run",
-                "/v1/otp-bound/agents/runs/wr_1/retry",
+                "/v1/otp-bound/workflows/runs/wr_1/retry",
             )
         ),
         (

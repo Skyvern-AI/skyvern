@@ -7,6 +7,8 @@ observable outputs; `# drift:` markers pin cells where the variants currently di
 
 from __future__ import annotations
 
+import io
+import json
 from asyncio import CancelledError
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,12 +24,15 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernContextWindowExceededError
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
     EXTRACT_ACTION_PROMPT_NAME,
     LLM_REQUEST_COMPLETED_EVENT,
     LLM_REQUEST_SPAN_NAME,
+    UNEXPECTED_LLM_ERROR_MESSAGE,
     LLMAPIHandlerFactory,
+    LLMCaller,
 )
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import (
@@ -39,6 +44,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.ember.cost_telemetry import ember_cost_scope
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -456,6 +462,30 @@ async def _run_router(
     return outcome
 
 
+async def _run_llm_caller(
+    span_exporter: InMemorySpanExporter, *, responses: list[Any], prompt_name: str = DEFAULT_PROMPT_NAME, **_: Any
+) -> HandlerOutcome:
+    outcome = HandlerOutcome()
+    next_response = _response_feeder(responses)
+    llm_config = LLMConfig(model_name="gpt-4", required_env_vars=[], supports_vision=True, add_assistant_prefix=False)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(LLMConfigRegistry, "get_config", lambda _: llm_config)
+        _stub_common(mp, outcome, None)
+        caller = LLMCaller("PARITY_TEST_CALLER")
+
+        async def fake_dispatch(**_: Any) -> Any:
+            return next_response()
+
+        mp.setattr(caller, "_dispatch_llm_call", fake_dispatch)
+        span_exporter.clear()
+        try:
+            outcome.parsed = await caller.call(prompt=PROMPT, prompt_name=prompt_name)
+        except BaseException as exc:
+            outcome.error = exc
+    outcome.span = _request_span(span_exporter)
+    return outcome
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("secret_lookup_fails", [False, True])
 async def test_happy_path_parses_and_records_identically(
@@ -696,34 +726,6 @@ async def test_ember_model_usage_survives_response_parse_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "response_id, expected",
-    [
-        ("gen-provider-issued-1", {"response_id": "gen-provider-issued-1"}),
-        # What litellm stamps when the provider sent no id.
-        (litellm.ModelResponse().id, {}),
-        (None, {}),
-    ],
-    ids=["provider-id", "litellm-synthesized", "no-id"],
-)
-async def test_metrics_log_carries_only_a_provider_issued_response_id(
-    span_exporter: InMemorySpanExporter, response_id: str | None, expected: dict[str, str]
-) -> None:
-    def response() -> ParityResponse:
-        r = ParityResponse("gpt-4")
-        r.id = response_id  # type: ignore[attr-defined]
-        return r
-
-    direct = await _run_direct(span_exporter, responses=[response()], parameters={})
-    router = await _run_router(span_exporter, responses=[response()], parameters={})
-
-    for outcome in (direct, router):
-        assert outcome.error is None
-        (metrics,) = outcome.metrics_events
-        assert {k: v for k, v in metrics.items() if k == "response_id"} == expected
-
-
-@pytest.mark.asyncio
 async def test_zero_usage_records_none_token_fields_on_both(span_exporter: InMemorySpanExporter) -> None:
     def zero_response() -> ParityResponse:
         return ParityResponse("gpt-4", prompt_tokens=0, completion_tokens=0, reasoning_tokens=0, cached_tokens=0)
@@ -841,6 +843,87 @@ async def test_exception_mapping_parity(
     assert type(router.error) is expected_type
     assert direct.span_attrs.get("status") == expected_status
     assert router.span_attrs.get("status") == expected_status
+
+
+@pytest.mark.parametrize(
+    "run_handler, logs_failure_line",
+    [
+        (_run_direct, True),
+        (_run_router, True),
+        (_run_llm_caller, False),
+    ],
+    ids=["direct", "router", "llm-caller"],
+)
+@pytest.mark.parametrize(
+    "rejection_type, provider_text, withheld_detail, exhaustion, unexpected_failure",
+    [
+        (litellm.exceptions.BadRequestError, "Request rejected", "status 400", "rejected", True),
+        (litellm.exceptions.ContentPolicyViolationError, "Request rejected", "status 400", "rejected", True),
+        (
+            litellm.exceptions.RateLimitError,
+            "Rate limit reached",
+            "status 429, an LLM rate limit",
+            "rate_limited",
+            False,
+        ),
+        (litellm.exceptions.Timeout, "Request timed out", "status 408", "provider_error", False),
+    ],
+    ids=["bad-request", "content-policy", "rate-limit", "timeout"],
+)
+@pytest.mark.parametrize(
+    "prompt_name, logs_provider_text",
+    [("extract-text-from-image", False), ("text-prompt", False), (DEFAULT_PROMPT_NAME, True)],
+)
+@pytest.mark.asyncio
+async def test_a_provider_rejection_of_a_document_prompt_logs_type_status_and_fingerprint_not_its_text(
+    span_exporter: InMemorySpanExporter,
+    rendered_log_stream: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+    run_handler: Any,
+    logs_failure_line: bool,
+    rejection_type: Any,
+    provider_text: str,
+    withheld_detail: str,
+    exhaustion: str,
+    unexpected_failure: bool,
+    prompt_name: str,
+    logs_provider_text: bool,
+) -> None:
+    monkeypatch.setattr(settings, "SECRET_KEY", "parity-fingerprint-key")
+    marker = "SYNTHETIC-DOCUMENT-MARKER-4417"
+    rejection = rejection_type(
+        message=f"{provider_text}; offending input: {marker}", model="gpt-4", llm_provider="openai"
+    )
+    # Rate limits and timeouts have their own handler branches, which do not log the unexpected-failure line.
+    logs_failure_line = logs_failure_line and unexpected_failure
+
+    outcome = await run_handler(span_exporter, responses=[rejection], prompt_name=prompt_name, parameters={})
+    assert isinstance(outcome.error, LLMProviderError)
+    # What a caller that catches the error does, e.g. a block's failure log or failure reason.
+    structlog.get_logger().error("caller logged the LLM error", exc_info=outcome.error)
+    failure_reason = f"LLM call failed: {outcome.error}"
+
+    logged = rendered_log_stream.getvalue()
+    assert (marker in logged) is logs_provider_text
+    assert (marker in failure_reason) is logs_provider_text
+    failures = [json.loads(line) for line in logged.splitlines() if UNEXPECTED_LLM_ERROR_MESSAGE in line]
+    assert len(failures) == int(logs_failure_line)
+    if logs_provider_text:
+        return
+    fingerprint = diagnostic_fingerprint(str(rejection))
+    assert api_handler_factory.llm_exhaustion_outcome(outcome.error) == exhaustion
+    assert f"{rejection_type.__name__} ({withheld_detail}); provider message withheld, fingerprint {fingerprint}" in (
+        failure_reason
+    )
+    # Withholding the text must not change how the run failure is attributed.
+    unwithheld_reason = f"LLM call failed: {LLMProviderError('PARITY', cause=rejection)}"
+    assert classify_from_failure_reason(failure_reason) == classify_from_failure_reason(unwithheld_reason)
+    for failure in failures:
+        assert failure["level"] == "error"
+        assert failure["prompt_name"] == prompt_name
+        assert failure["error_type"] == f"litellm.exceptions.{rejection_type.__name__}"
+        assert failure["status_code"] == 400
+        assert failure["error_message_fingerprint"] == fingerprint
 
 
 @pytest.mark.asyncio

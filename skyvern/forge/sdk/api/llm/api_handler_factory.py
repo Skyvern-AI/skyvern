@@ -2,16 +2,17 @@ import asyncio
 import copy
 import dataclasses
 import functools
+import inspect
 import json
 import re
 import time
 import warnings
 from asyncio import CancelledError
-from collections.abc import Collection
+from collections.abc import Awaitable, Callable, Collection
 from contextvars import ContextVar, Token
 from json import JSONDecodeError
 from types import MappingProxyType
-from typing import Any, AsyncIterator, Literal, Protocol, TypeVar, runtime_checkable
+from typing import Any, AsyncIterator, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 import litellm
 import structlog
@@ -52,6 +53,8 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMOutputTruncatedError,
     LLMProviderError,
     LLMProviderErrorRetryableTask,
+    WithheldProviderError,
+    withhold_provider_text,
 )
 from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
@@ -74,10 +77,16 @@ from skyvern.forge.sdk.api.llm.utils import (
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import is_manual_like_workflow_run_trigger_type
 from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_schema_variant
-from skyvern.forge.sdk.forge_log import _generated_log_value, _model_log_value, is_generated_log_field
+from skyvern.forge.sdk.forge_log import (
+    _generated_log_value,
+    _model_log_value,
+    exception_log_fields,
+    is_generated_log_field,
+)
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -133,7 +142,12 @@ _NOT_LLM_EXHAUSTION: tuple[type[BaseException], ...] = (
     InvalidLLMResponseFormat,
     InvalidLLMConfigError,
 )
-_STATUS_CODED_LLM_ERRORS = (APIStatusError, AnthropicAPIStatusError, litellm.exceptions.APIError)
+_STATUS_CODED_LLM_ERRORS = (
+    APIStatusError,
+    AnthropicAPIStatusError,
+    litellm.exceptions.APIError,
+    WithheldProviderError,
+)
 # A dead upstream can answer HTTP 200 with an empty body, which surfaces as a JSONDecodeError.
 _LLM_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
     APIConnectionError,
@@ -389,6 +403,53 @@ VISION_FALLBACK_PROMPT_NAMES = {
     "ui-tars-system-prompt",
     *VISION_REQUIRED_PROMPT_NAMES,
 }
+# Prompts that carry a document's content: OCR of a page image, parsed file text, a PDF to split or fill,
+# and the text prompt block that workflows hand parsed file text to.
+DOCUMENT_CONTENT_PROMPT_NAMES = frozenset(
+    {
+        "extract-information-from-file-text",
+        "extract-text-from-image",
+        "pdf-fill-field-mapping",
+        "pdf-fill-flat-placement",
+        "split-pdf",
+        "text-prompt",
+    }
+)
+UNEXPECTED_LLM_ERROR_MESSAGE = "LLM request failed unexpectedly"
+
+
+def _log_unexpected_llm_error(error: Exception, prompt_name: str | None, /, **fields: Any) -> None:
+    if prompt_name not in DOCUMENT_CONTENT_PROMPT_NAMES:
+        LOG.exception(UNEXPECTED_LLM_ERROR_MESSAGE, **fields)
+        return
+    # A provider rejection can quote the document it was sent, so neither its message nor its traceback is logged.
+    status_code = getattr(error, "status_code", None)
+    LOG.error(
+        UNEXPECTED_LLM_ERROR_MESSAGE,
+        **fields,
+        **exception_log_fields(error),
+        status_code=status_code if isinstance(status_code, int) else None,
+        error_message_fingerprint=diagnostic_fingerprint(str(error)),
+    )
+
+
+_AsyncHandler = TypeVar("_AsyncHandler", bound=Callable[..., Awaitable[Any]])
+
+
+def _withholds_document_provider_text(handler: _AsyncHandler) -> _AsyncHandler:
+    signature = inspect.signature(handler)
+
+    @functools.wraps(handler)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await handler(*args, **kwargs)
+        except LLMProviderError as error:
+            if signature.bind_partial(*args, **kwargs).arguments.get("prompt_name") in DOCUMENT_CONTENT_PROMPT_NAMES:
+                withhold_provider_text(error)
+            raise
+
+    return cast(_AsyncHandler, wrapper)
+
 
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
 EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
@@ -2090,6 +2151,7 @@ class LLMAPIHandlerFactory:
             fallback_groups = list(llm_config.fallback_model_group)
 
         @traced(name=LLM_REQUEST_SPAN_NAME, tags=[llm_key])
+        @_withholds_document_provider_text
         async def llm_api_handler_with_router_and_fallback(
             prompt: str,
             prompt_name: str,
@@ -2660,8 +2722,9 @@ class LLMAPIHandlerFactory:
                 except Exception as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "error")
-                    LOG.exception(
-                        "LLM request failed unexpectedly",
+                    _log_unexpected_llm_error(
+                        e,
+                        prompt_name,
                         llm_key=llm_key,
                         model=main_model_group,
                         prompt_name=prompt_name,
@@ -2971,6 +3034,7 @@ class LLMAPIHandlerFactory:
             return handler
 
         @traced(name=LLM_REQUEST_SPAN_NAME, tags=[llm_key])
+        @_withholds_document_provider_text
         async def llm_api_handler(
             prompt: str,
             prompt_name: str,
@@ -3351,8 +3415,9 @@ class LLMAPIHandlerFactory:
                 except Exception as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "error")
-                    LOG.exception(
-                        "LLM request failed unexpectedly",
+                    _log_unexpected_llm_error(
+                        e,
+                        prompt_name,
                         llm_key=llm_key,
                         model=model_name,
                         prompt_name=prompt_name,
@@ -3948,6 +4013,7 @@ class LLMCaller:
         )
 
     @traced(name=LLM_REQUEST_SPAN_NAME)
+    @_withholds_document_provider_text
     async def call(
         self,
         prompt: str | None = None,
@@ -4260,7 +4326,7 @@ class LLMCaller:
                 raise
             except Exception as e:
                 _llm_span.set_attribute("status", "error")
-                LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
+                _log_unexpected_llm_error(e, prompt_name, llm_key=self.llm_key)
                 if not caller_owns_exhaustion_receipt:
                     self.emit_retry_chain_exhausted(e, prompt_name)
                 raise LLMProviderError(self.llm_key, cause=e) from e

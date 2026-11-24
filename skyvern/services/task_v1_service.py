@@ -1,6 +1,5 @@
 import asyncio
 import hashlib
-from collections.abc import Awaitable, Callable
 from typing import Any
 
 import structlog
@@ -27,6 +26,7 @@ from skyvern.forge.sdk.services import request_principal
 from skyvern.schemas.runs import RunEngine, RunStatus, RunType
 from skyvern.services import uploaded_file_service
 from skyvern.services.strict_otp_terminalization import fail_unclaimed_strict_task
+from skyvern.utils.deferred_cleanup import finish_cleanup_deferring_cancellation
 from skyvern.utils.url_validators import validate_fetch_url
 
 LOG = structlog.get_logger()
@@ -36,18 +36,6 @@ _STRICT_OTP_ADMISSION_FAILURE_REASON = "Strict OTP task setup failed after admis
 
 class InvalidTaskV1ModelError(ValueError):
     pass
-
-
-async def _await_admission_cleanup_deferring_cancellation(cleanup: Callable[[], Awaitable[None]]) -> None:
-    cleanup_task = asyncio.ensure_future(cleanup())
-    while True:
-        try:
-            await asyncio.shield(cleanup_task)
-            return
-        except asyncio.CancelledError:
-            if cleanup_task.done():
-                await cleanup_task
-                return
 
 
 async def _validate_task_v1_model_for_org(organization: Organization, model: dict[str, Any] | None) -> None:
@@ -205,41 +193,38 @@ async def run_task(
         )
     except (Exception, asyncio.CancelledError):
         if created_task.otp_request_id is not None:
-            try:
 
-                async def finalize_admission_failure() -> None:
-                    failed_task, finish_claimed = await app.DATABASE.tasks.update_task_and_claim_finish(
-                        created_task.task_id,
-                        organization_id=organization.organization_id,
-                        status=TaskStatus.failed,
-                        failure_reason=_STRICT_OTP_ADMISSION_FAILURE_REASON,
-                        keep_final_status=True,
-                    )
-                    if finish_claimed:
-                        await app.DATABASE.tasks.sync_task_run_status(
-                            organization_id=organization.organization_id,
-                            run_id=created_task.task_id,
-                            status=RunStatus.failed,
-                            started_at=failed_task.started_at,
-                            finished_at=failed_task.finished_at,
-                        )
-                        signing_key = x_api_key
-                        if signing_key is None:
-                            api_key = await app.DATABASE.organizations.get_valid_org_auth_token(
-                                organization.organization_id,
-                                OrganizationAuthTokenType.api.value,
-                            )
-                            signing_key = api_key.token if api_key is not None else None
-                        await app.agent.execute_task_webhook(task=failed_task, api_key=signing_key)
-
-                await _await_admission_cleanup_deferring_cancellation(finalize_admission_failure)
-            except (Exception, asyncio.CancelledError):
-                LOG.warning(
-                    "Failed to finalize strict OTP task after admission error",
+            async def finalize_admission_failure() -> None:
+                failed_task, finish_claimed = await app.DATABASE.tasks.update_task_and_claim_finish(
+                    created_task.task_id,
                     organization_id=organization.organization_id,
-                    task_id=created_task.task_id,
-                    exc_info=True,
+                    status=TaskStatus.failed,
+                    failure_reason=_STRICT_OTP_ADMISSION_FAILURE_REASON,
+                    keep_final_status=True,
                 )
+                if finish_claimed:
+                    await app.DATABASE.tasks.sync_task_run_status(
+                        organization_id=organization.organization_id,
+                        run_id=created_task.task_id,
+                        status=RunStatus.failed,
+                        started_at=failed_task.started_at,
+                        finished_at=failed_task.finished_at,
+                    )
+                    signing_key = x_api_key
+                    if signing_key is None:
+                        api_key = await app.DATABASE.organizations.get_valid_org_auth_token(
+                            organization.organization_id,
+                            OrganizationAuthTokenType.api.value,
+                        )
+                        signing_key = api_key.token if api_key is not None else None
+                    await app.agent.execute_task_webhook(task=failed_task, api_key=signing_key)
+
+            await finish_cleanup_deferring_cancellation(
+                finalize_admission_failure,
+                failure_message="Failed to finalize strict OTP task after admission error",
+                organization_id=organization.organization_id,
+                task_id=created_task.task_id,
+            )
         raise
     try:
         await AsyncExecutorFactory.get_executor().execute_task(
