@@ -488,6 +488,9 @@ export interface CreateGoogleOAuthAuthorizeRequest {
 export interface GoogleOAuthAuthorizeResponse {
   authorize_url: string;
   state: string;
+  // The connection this sign-in creates or reconnects. Absent from an older server, which leaves the attempt
+  // unattributed.
+  credential_id?: string;
 }
 
 export interface CreateGoogleOAuthCallbackRequest {
