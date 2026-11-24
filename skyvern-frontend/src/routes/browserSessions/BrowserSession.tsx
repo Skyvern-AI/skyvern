@@ -393,6 +393,7 @@ function BrowserSession() {
                 enableUrlInput={true}
                 forceCdp={vncFailed}
                 onFrameWidthChange={setPreviewWidth}
+                showConsole={true}
               />
             )}
             {canViewLive && streamMode === "vnc" && (
