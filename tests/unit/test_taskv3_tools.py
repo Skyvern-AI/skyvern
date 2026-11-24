@@ -58,6 +58,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.escaped_secrets import decoding_stages
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.services import credentials as credentials_module
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import _recorded_task_nav_error_codes
 from skyvern.forge.sdk.workflow.models.credential_release import (
@@ -2363,6 +2364,7 @@ class _MaskRecordingPage(_FakePage):
     yet rendered mounts only once something waits for it."""
 
     rendered = True
+    input_type = "text"
 
     def locator(self, selector: str) -> SimpleNamespace:
         page = self
@@ -2370,7 +2372,9 @@ class _MaskRecordingPage(_FakePage):
         async def wait_for(**_kwargs: Any) -> None:
             page.rendered = True
 
-        async def evaluate(js: str, *_args: Any, **_kwargs: Any) -> None:
+        async def evaluate(js: str, *_args: Any, **_kwargs: Any) -> bool | None:
+            if "data-skyvern-secret-mask" not in js and '"password"' in js:
+                return page.input_type == "password"
             if "data-skyvern-secret-mask" not in js:
                 raise AttributeError("only the secret visual mask is faked")
             if not page.rendered:
@@ -2381,22 +2385,55 @@ class _MaskRecordingPage(_FakePage):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("field", "masked"), [("card_cvv", True), ("card_holder_name", False)])
-async def test_type_masks_a_vault_card_field_before_writing_it(
-    card_secret_run: dict[str, str], field: str, masked: bool
+@pytest.mark.parametrize(
+    ("value", "mask_secrets", "input_type", "masked"),
+    [
+        pytest.param("card_cvv", False, "text", True, id="card-data-without-mask-secrets"),
+        pytest.param("card_holder_name", False, "text", False, id="credential-without-mask-secrets"),
+        pytest.param("card_holder_name", True, "text", True, id="credential-with-mask-secrets"),
+        pytest.param("card_holder_name", True, "password", False, id="credential-in-a-password-box"),
+        pytest.param("secret_parameter", False, "text", False, id="secret-parameter-without-mask-secrets"),
+        pytest.param("secret_parameter", True, "text", True, id="secret-parameter-with-mask-secrets"),
+        pytest.param("totp", False, "text", False, id="totp-without-mask-secrets"),
+        pytest.param("totp", True, "text", True, id="totp-with-mask-secrets"),
+        pytest.param("totp", True, "password", False, id="totp-in-a-password-box"),
+        pytest.param("one_time_code", False, "text", False, id="delivered-code-without-mask-secrets"),
+        pytest.param("one_time_code", True, "text", True, id="delivered-code-with-mask-secrets"),
+        pytest.param("one_time_code", True, "password", False, id="delivered-code-in-a-password-box"),
+        pytest.param("plain", True, "text", False, id="plain-text-with-mask-secrets"),
+    ],
+)
+async def test_type_masks_a_secret_field_before_writing_it(
+    card_secret_run: dict[str, str], value: str, mask_secrets: bool, input_type: str, masked: bool
 ) -> None:
-    # v3 writes without the action handler, so a card number or CVV it types is masked here whatever the
-    # workflow's Mask Secrets setting, or the run's screenshots and recording keep it legible (SKY-19351).
+    # v3 writes without the action handler, so it masks a field itself before typing a secret into it: card data
+    # always, and under Mask Secrets every value the step engine masks, minus password boxes.
+    run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[CARD_SECRET_RUN_ID]
+    run_context.mask_secrets = mask_secrets
+    texts = {
+        **card_secret_run,
+        "secret_parameter": run_context.register_secret_value("sk-test-parameter-value"),
+        "totp": run_context.register_secret_value(BitwardenConstants.TOTP),
+        "one_time_code": "482913",
+        "plain": "Springfield",
+    }
     page = _MaskRecordingPage()
+    page.input_type = input_type
     task = SimpleNamespace(workflow_run_id=CARD_SECRET_RUN_ID)
+
+    async def resolve_totp(_text: str, _authorize: Any) -> str:
+        return "731904"
+
     tools = build_browser_tools(
         _fixed_page_provider(page),
         resolve_typed_text=lambda text: get_actual_value_of_parameter_if_secret_with_task(task, text),
+        resolve_totp_placeholder=resolve_totp,
     )
-    with skyvern_context.scoped(SkyvernContext(workflow_run_id=CARD_SECRET_RUN_ID)):
-        await _tool(tools, "type").handler({"selector": "#cvc", "text": card_secret_run[field]})
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=CARD_SECRET_RUN_ID, runtime_secret_values={"482913"})):
+        await _tool(tools, "type").handler({"selector": "#field", "text": texts[value]})
 
     kinds = [call[0] for call in page.calls]
+    assert "fill" in kinds
     assert ("mask" in kinds) is masked
     if masked:
         assert kinds.index("mask") < kinds.index("fill")
@@ -18480,13 +18517,24 @@ async def test_type_into_one_character_boxes_is_ok_only_when_every_box_reads_bac
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_type_a_code_from_a_middle_box_says_which_boxes_it_wrote_and_that_the_earlier_ones_were_not() -> None:
+@pytest.mark.parametrize("delivered", [False, True], ids=["typed-code", "delivered-code-under-mask-secrets"])
+async def test_type_a_code_from_a_middle_box_says_which_boxes_it_wrote_and_that_the_earlier_ones_were_not(
+    card_secret_run: dict[str, str], delivered: bool
+) -> None:
+    # Under Mask Secrets a delivered code is masked in every box it is written to, as the step engine masks each box.
+    app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[CARD_SECRET_RUN_ID].mask_secrets = True
+    run = SkyvernContext(workflow_run_id=CARD_SECRET_RUN_ID, runtime_secret_values={"4829"} if delivered else set())
     async with _content_page(f"<div>{_plain_boxes(6)}</div>") as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "type").handler({"selector": '[aria-label="Code character 3"]', "text": "4829"})
+        with skyvern_context.scoped(run):
+            r = await _tool(tools, "type").handler({"selector": '[aria-label="Code character 3"]', "text": "4829"})
         assert r.status == "ok", r.content
         assert "boxes 3..6 of the 6-box" in r.content and "not written" in r.content, r.content
         assert await page.eval_on_selector_all(".box", "els => els.map((e) => e.value)") == ["", "", "4", "8", "2", "9"]
+        masked = await page.eval_on_selector_all(
+            ".box", "els => els.map((e) => e.getAttribute('data-skyvern-secret-mask') === 'true')"
+        )
+        assert masked == [False, False] + [delivered] * 4
 
 
 @_skip_no_browser
