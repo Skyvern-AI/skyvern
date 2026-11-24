@@ -13,6 +13,8 @@ type StreamPresenterProps = {
   // Only the CDP transport carries the page URL; VNC is pixels-only and never
   // calls this.
   onUrlChange?: (url: string) => void;
+  // CDP only: the console runs over the CDP input channel, which VNC does not open.
+  showConsole?: boolean;
   onStreamStateChange?: StreamStateChangeHandler;
   onActivity?: () => void;
 };
@@ -26,6 +28,7 @@ export function StreamPresenter({
   showControlButtons = false,
   enableUrlInput = false,
   onUrlChange,
+  showConsole = false,
   onStreamStateChange,
   onActivity,
 }: StreamPresenterProps) {
@@ -45,6 +48,7 @@ export function StreamPresenter({
           showControlButtons={showControlButtons}
           enableUrlInput={enableUrlInput}
           onUrlChange={onUrlChange}
+          showConsole={showConsole}
           onStreamStateChange={onStreamStateChange}
           onActivity={onActivity}
           centered
