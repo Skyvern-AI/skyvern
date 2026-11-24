@@ -2991,6 +2991,7 @@ function Workspace({
                           // to type into and a session resting on about:blank has
                           // no way out (SKY-13705).
                           enableUrlInput={true}
+                          showConsole={true}
                           onReadyChange={handleLiveBrowserReadyChange}
                         />
                       ) : (

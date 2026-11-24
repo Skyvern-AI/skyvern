@@ -82,6 +82,7 @@ export function StudioBrowserStream({
         // resting on about:blank has no way out (SKY-13705).
         enableUrlInput={true}
         onUrlChange={handleUrlChange}
+        showConsole={true}
         onStreamStateChange={setDebugStreamState}
         onActivity={handleActivity}
       />
