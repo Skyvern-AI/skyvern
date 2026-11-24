@@ -143,7 +143,7 @@ async def test_a_host_header_is_turned_into_a_uri_rewrite_plus_connection_routin
     assert "Host" not in (plan.headers or {})
 
     from skyvern import cdp_transport as websocket_transport
-    from skyvern.cdp_transport import open_first_pinned_websocket
+    from skyvern.cdp_transport import open_first_pinned_stream, open_first_pinned_websocket
 
     tls_name = "tls.example.test"
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -187,7 +187,8 @@ async def test_a_host_header_is_turned_into_a_uri_rewrite_plus_connection_routin
     async def proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request = await reader.readuntil(b"\r\n\r\n")
         seen_connect.append(request.split(b"\r\n", 1)[0].decode())
-        upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", tls_port)
+        target_port = int(request.split(b" ", 2)[1].rsplit(b":", 1)[1])
+        upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", target_port)
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
 
@@ -201,17 +202,60 @@ async def test_a_host_header_is_turned_into_a_uri_rewrite_plus_connection_routin
 
         await asyncio.gather(forward(reader, upstream_writer), forward(upstream_reader, writer))
 
-    async with websockets.serve(echo, "127.0.0.1", 0, ssl=tls_context, process_request=capture_host) as tls_server:
+    async def raw_tls(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.read()
+        writer.close()
+
+    poisoned_reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+
+    async def forward_poisoned(source: asyncio.StreamReader, sink: asyncio.StreamWriter) -> None:
+        try:
+            while chunk := await source.read(65536):
+                sink.write(chunk)
+                await sink.drain()
+        except ConnectionError:
+            pass
+        finally:
+            sink.close()
+
+    async def poisoned_connect_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        request = await reader.readuntil(b"\r\n\r\n")
+        target_port = int(request.split(b" ", 2)[1].rsplit(b":", 1)[1])
+        upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", target_port)
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n" + poisoned_reply)
+        await writer.drain()
+        await asyncio.gather(forward_poisoned(reader, upstream_writer), forward_poisoned(upstream_reader, writer))
+
+    async def reasonless_auth_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 407\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    async def malformed_connect_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"not-http\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    raw_tls_server = await asyncio.start_server(raw_tls, "127.0.0.1", 0, ssl=tls_context)
+    async with (
+        raw_tls_server,
+        websockets.serve(echo, "127.0.0.1", 0, ssl=tls_context, process_request=capture_host) as tls_server,
+    ):
         tls_port = tls_server.sockets[0].getsockname()[1]
+        raw_tls_port = raw_tls_server.sockets[0].getsockname()[1]
         proxy_server = await asyncio.start_server(proxy, "127.0.0.1", 0)
         async with proxy_server:
             proxy_port = proxy_server.sockets[0].getsockname()[1]
             monkeypatch.setenv("SSL_CERT_FILE", str(certificate_path))
             monkeypatch.setattr(websocket_transport, "_CONNECT_SUPPORTS_PROXY", proxy_supported)
+            monkeypatch.setenv("wss_proxy", f"http://127.0.0.1:{proxy_port}")
             if proxy_supported:
-                monkeypatch.setenv("wss_proxy", f"http://127.0.0.1:{proxy_port}")
-            else:
-                monkeypatch.delenv("wss_proxy", raising=False)
+                monkeypatch.delattr("websockets.asyncio.client.connect_http_proxy", raising=False)
+                monkeypatch.delattr("websockets.asyncio.client.connect_socks_proxy", raising=False)
+                monkeypatch.delattr("websockets.uri.get_proxy", raising=False)
+                monkeypatch.delattr("websockets.uri.parse_proxy", raising=False)
             monkeypatch.setenv("no_proxy", "")
             connection = await open_first_pinned_websocket(
                 f"wss://{tls_name}:{tls_port}/devtools/browser/fake",
@@ -223,8 +267,63 @@ async def test_a_host_header_is_turned_into_a_uri_rewrite_plus_connection_routin
             )
             await connection.close()
 
-    assert seen_connect == ([f"CONNECT 127.0.0.1:{tls_port} HTTP/1.1"] if proxy_supported else [])
-    assert seen_sni == [tls_name]
+            if proxy_supported:
+                _reader, writer = await open_first_pinned_stream(
+                    connect_hosts=("127.0.0.1",),
+                    connect_port=raw_tls_port,
+                    secure=True,
+                    server_hostname=tls_name,
+                    deadline=asyncio.get_running_loop().time() + 4,
+                    proxy=f"http://127.0.0.1:{proxy_port}",
+                )
+                writer.close()
+                await writer.wait_closed()
+
+            poisoned_connect_server = await asyncio.start_server(poisoned_connect_proxy, "127.0.0.1", 0)
+            async with poisoned_connect_server:
+                with pytest.raises(
+                    websockets.exceptions.InvalidHandshake, match="proxy sent data before TLS negotiation"
+                ):
+                    await open_first_pinned_stream(
+                        connect_hosts=("127.0.0.1",),
+                        connect_port=raw_tls_port,
+                        secure=True,
+                        server_hostname=tls_name,
+                        deadline=asyncio.get_running_loop().time() + 4,
+                        proxy=f"http://127.0.0.1:{poisoned_connect_server.sockets[0].getsockname()[1]}",
+                    )
+
+            reasonless_auth_server = await asyncio.start_server(reasonless_auth_proxy, "127.0.0.1", 0)
+            malformed_connect_server = await asyncio.start_server(malformed_connect_proxy, "127.0.0.1", 0)
+            async with reasonless_auth_server, malformed_connect_server:
+                with pytest.raises(websockets.exceptions.InvalidHandshake) as auth_exc:
+                    await open_first_pinned_stream(
+                        connect_hosts=("127.0.0.1",),
+                        connect_port=raw_tls_port,
+                        secure=False,
+                        server_hostname=None,
+                        deadline=asyncio.get_running_loop().time() + 4,
+                        proxy=f"http://127.0.0.1:{reasonless_auth_server.sockets[0].getsockname()[1]}",
+                    )
+                assert auth_exc.value.response.status_code == 407  # type: ignore[attr-defined]
+
+                with pytest.raises(websockets.exceptions.InvalidHandshake):
+                    await open_first_pinned_stream(
+                        connect_hosts=("127.0.0.1",),
+                        connect_port=raw_tls_port,
+                        secure=False,
+                        server_hostname=None,
+                        deadline=asyncio.get_running_loop().time() + 4,
+                        proxy=f"http://127.0.0.1:{malformed_connect_server.sockets[0].getsockname()[1]}",
+                    )
+
+            with pytest.raises(websockets.exceptions.InvalidHandshake, match="SOCKS proxies are not supported"):
+                websocket_transport._proxy_parts("socks5://127.0.0.1:1080")
+
+    assert seen_connect == [f"CONNECT 127.0.0.1:{tls_port} HTTP/1.1"] + (
+        [f"CONNECT 127.0.0.1:{raw_tls_port} HTTP/1.1"] if proxy_supported else []
+    )
+    assert seen_sni == [tls_name] * (2 if proxy_supported else 1)
     assert seen_hosts == ["localhost"]
 
     release_candidates = asyncio.Event()

@@ -12,13 +12,14 @@ import pytest
 import websockets
 from playwright._impl._errors import Error as PWError
 from playwright._impl._errors import TimeoutError as PWTimeoutError
-from websockets.exceptions import InvalidMessage, InvalidStatus
+from websockets.exceptions import InvalidHandshake, InvalidMessage, InvalidStatus
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost
 from skyvern.webeye import browser_acquisition_sample as sample_mod
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserCdpAcquisitionError, BrowserCdpConnectionError
+from skyvern.webeye.cdp_discovery import CdpDiscoveryError
 from skyvern.webeye.cdp_retry import (
     _connect_over_relay,
     _is_retryable_pinned_connect_error,
@@ -304,6 +305,43 @@ class TestRetryBehavior:
 
         assert handshake_result == "handshake-browser"
         assert handshake_connects == 2
+
+        discovery_attempts = 0
+        discovery_statuses = [503, None]
+
+        async def proxy_discovery(
+            endpoint_url: str,
+            *,
+            timeout_ms: float,
+            resolved_ips: tuple[str, ...] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> str:
+            nonlocal discovery_attempts
+            discovery_attempts += 1
+            status = discovery_statuses.pop(0)
+            if status is not None:
+                cause = InvalidHandshake()
+                cast(Any, cause).response = MagicMock(status_code=status)
+                error = CdpDiscoveryError("synthetic proxy rejection")
+                error.__cause__ = cause
+                raise error
+            return "wss://proxy-retry.example.test/devtools/browser/fake"
+
+        _set_budget(monkeypatch, attempts=2, backoff=[0])
+        monkeypatch.setattr("skyvern.webeye.cdp_retry.resolve_websocket_url", proxy_discovery)
+        monkeypatch.setattr("skyvern.webeye.cdp_retry.open_first_pinned_websocket", AsyncMock(return_value=object()))
+        pw.chromium.connect_over_cdp = AsyncMock(return_value="proxy-browser")
+
+        proxy_result = await connect_over_cdp_with_retry(pw, "https://proxy-retry.example.test")
+
+        assert proxy_result == "proxy-browser"
+        assert discovery_attempts == 2
+
+        discovery_attempts = 0
+        discovery_statuses[:] = [407, 407]
+        with pytest.raises(CdpDiscoveryError, match="synthetic proxy rejection"):
+            await connect_over_cdp_with_retry(pw, "https://proxy-retry.example.test")
+        assert discovery_attempts == 1
 
         async def echo(connection: websockets.ServerConnection) -> None:
             async for message in connection:
