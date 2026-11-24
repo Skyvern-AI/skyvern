@@ -15,9 +15,14 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { visitWorkflowBlocks } from "@/routes/workflows/workflowBlockUtils";
 
 import { humanizeBlockLabel } from "../blockLabel";
-import { everyTestBlockExecuted, hasFailedTestBlock } from "../emberPhases";
+import {
+  everyTestBlockExecuted,
+  failedOnlyOnRefusedAccess,
+  hasFailedTestBlock,
+} from "../emberPhases";
 import {
   isBuildTestConnectFailureState,
   TurnNarrativeState,
@@ -114,6 +119,27 @@ const END_TO_END_REAL_ACTIONS =
   "Testing end-to-end performs real actions on the site, so it can submit forms, " +
   "place orders, or send messages for real.";
 
+// Read from the staged proposal, which every gate has, so the Test confirmation names the account on each of them.
+// eslint-disable-next-line react-refresh/only-export-components
+export function proposalUsesConnectedGmail(
+  proposedWorkflow: WorkflowApiResponse | null,
+): boolean {
+  let found = false;
+  visitWorkflowBlocks(
+    proposedWorkflow?.workflow_definition?.blocks ?? [],
+    (block) => {
+      // The steps a Test click approves Connected Gmail for; a saved Gmail app action runs as integration_action.
+      found =
+        block.block_type === "send_email" ||
+        block.block_type === "email_inbox" ||
+        (block.block_type === "integration_action" &&
+          block.integration_id === "gmail");
+      return found ? false : undefined;
+    },
+  );
+  return found;
+}
+
 const PENDING_CHANGE_LIMIT = 4;
 
 // Even with the compact tier, Reject beside the more menu needs ~215px; narrower rows move Reject
@@ -170,6 +196,8 @@ const GATE_STATUS: Record<
 
 interface ReviewGateCardProps {
   turn?: TurnNarrativeState;
+  // The staged proposal has a step that can use a Connected Gmail account, which a Test click approves once.
+  usesConnectedGmail?: boolean;
   pending: boolean;
   verdict: ReviewGateVerdict;
   settled?: ReviewGateSettled;
@@ -382,7 +410,11 @@ function appliedNotesPill(
 ) {
   const notes: { text: string; tone: PillTone }[] = [];
   if (turn && hasFailedTestBlock(turn)) {
-    notes.push({ text: "Test failed", tone: "amber" });
+    notes.push(
+      failedOnlyOnRefusedAccess(turn)
+        ? { text: "Couldn't test", tone: "neutral" }
+        : { text: "Test failed", tone: "amber" },
+    );
   }
   const warnings = turn?.review?.duplicateWrites.length ?? 0;
   if (warnings > 0) {
@@ -520,6 +552,7 @@ function ResolvedReviewCard({
 
 export function ReviewGateCard({
   turn,
+  usesConnectedGmail = false,
   pending,
   verdict,
   settled = null,
@@ -622,6 +655,8 @@ export function ReviewGateCard({
   const unsavedProfilePick =
     startFailureCause === "unsaved_browser_profile_pick";
   const testFailed = !tested && Boolean(turn && hasFailedTestBlock(turn));
+  const testRefused =
+    testFailed && turn !== undefined && failedOnlyOnRefusedAccess(turn);
   const showActions = actionsShown && hasProposal;
   const connectFailure = isBuildTestConnectFailureState(startFailureCause);
   const canTest =
@@ -629,11 +664,13 @@ export function ReviewGateCard({
   const testLabel = connectFailure
     ? "Retry in a fresh session"
     : "Test end-to-end";
-  // The two cases where running end-to-end is the next step rather than an option: every block ran
-  // on its own but never together, or the test could not start a browser at all.
+  // The cases where running end-to-end is the next step rather than an option: every block ran on its own but
+  // never together, the test could not start a browser at all, or Copilot's own test was refused an account
+  // that the user's Test click can approve.
   const offerTestInBody =
     canTest &&
     (connectFailure ||
+      testRefused ||
       (verdict === "untested" &&
         turn !== undefined &&
         everyTestBlockExecuted(turn) &&
@@ -759,7 +796,9 @@ export function ReviewGateCard({
         )}
         wrapTitle
         right={
-          !verdict ? null : testFailed ? (
+          !verdict ? null : testRefused ? (
+            <CardPill tone="neutral">Couldn&apos;t test</CardPill>
+          ) : testFailed ? (
             <CardPill tone="amber">Test failed</CardPill>
           ) : verdict === "tested" ? (
             <CardPill tone="green">Tested</CardPill>
@@ -782,7 +821,9 @@ export function ReviewGateCard({
               <span className="text-muted-foreground">
                 {connectFailure
                   ? null
-                  : "Each step was tested on its own, but not together yet. "}
+                  : testRefused
+                    ? "This test wasn't allowed to use your connected account. "
+                    : "Each step was tested on its own, but not together yet. "}
                 <button
                   ref={bodyTestRef}
                   type="button"
@@ -792,6 +833,7 @@ export function ReviewGateCard({
                 >
                   {testLabel}
                 </button>
+                {testRefused ? " runs it once with your account." : null}
               </span>
             </GutterRow>
           ) : null}
@@ -859,6 +901,9 @@ export function ReviewGateCard({
                 <>
                   <p className="pb-2 text-xs leading-snug text-foreground dark:text-slate-200">
                     {END_TO_END_REAL_ACTIONS}
+                    {usesConnectedGmail
+                      ? " If a step uses your Connected Gmail account, this run can use it, once."
+                      : null}
                   </p>
                   <div className="flex items-center gap-2">
                     <Button

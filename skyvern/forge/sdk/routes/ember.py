@@ -282,7 +282,12 @@ from skyvern.forge.sdk.services.credential.credential_creation_service import (
     store_new_credential,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
-from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal, human_user_id
+from skyvern.forge.sdk.services.request_principal import (
+    INTERACTIVE_HUMAN_AUTH_KINDS,
+    enforce_principal_role,
+    get_request_principal,
+    human_user_id,
+)
 from skyvern.forge.sdk.services.route_authorization import (
     EMBER_MANAGE_ACTION,
     EMBER_UPDATE_ACTION,
@@ -1299,6 +1304,7 @@ def _record_offered_test_proposal(
             "test_proposal_revision": metadata.revision,
             "test_proposal_workflow_run_id": metadata.workflow_run_id,
             "test_proposal_canvas_fingerprint": canvas_fingerprint,
+            "test_proposal_click_approver": _test_click_approver(chat_request),
         }
     )
 
@@ -2560,6 +2566,39 @@ def _apply_test_end_to_end_action(
     chat_request.selected_connected_account_from_pending_proposal = derived_account_id is not None
 
 
+def _test_click_approver(chat_request: EmberChatRequest) -> str | None:
+    principal = get_request_principal()
+    return principal.user_id if chat_request.test_click_approved and principal is not None else None
+
+
+def _stamp_test_click_approval(
+    chat_request: EmberChatRequest, proposal: dict[str, Any], account_pick_test: AccountPickTestResume | None
+) -> None:
+    """Approve the Test only for a signed-in person and the exact proposal the client named; a resumed pick inherits
+    its Test's approval only when the person who clicked is the one picking. A key caller, MCP included, never
+    approves, so its test copy records nobody."""
+    principal = get_request_principal()
+    if account_pick_test is not None:
+        expected = (
+            (account_pick_test.proposal_owner_turn_id, account_pick_test.proposal_revision)
+            if account_pick_test.click_approver is not None
+            and principal is not None
+            and account_pick_test.click_approver == principal.user_id
+            else (None, None)
+        )
+        chat_request.test_proposal_owner_turn_id, chat_request.test_proposal_revision = expected
+    metadata = ember_proposal_metadata(proposal)
+    chat_request.test_click_approved = (
+        principal is not None
+        and principal.auth_kind in INTERACTIVE_HUMAN_AUTH_KINDS
+        and metadata is not None
+        and chat_request.test_proposal_owner_turn_id is not None
+        and chat_request.test_proposal_revision is not None
+        and (metadata.owner_turn_id, metadata.revision)
+        == (chat_request.test_proposal_owner_turn_id, chat_request.test_proposal_revision)
+    )
+
+
 def _account_pick_test_promotion(
     prior_turn_outcome: TurnOutcome | None,
     chat_request: EmberChatRequest,
@@ -3170,6 +3209,7 @@ async def _new_ember_chat_post(
             # Provenance is server-owned on every turn, so a client-sent value can never label a
             # human pick as server-derived; only the action below sets it true.
             chat_request.selected_connected_account_from_pending_proposal = False
+            chat_request.test_click_approved = False
 
             if chat_request.product_action == "test_end_to_end":
                 if validated_proposal is None:
@@ -3177,6 +3217,7 @@ async def _new_ember_chat_post(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="No pending proposal to test end to end.",
                     )
+                _stamp_test_click_approval(chat_request, validated_proposal, account_pick_test)
                 _apply_test_end_to_end_action(
                     chat_request, validated_proposal[EMBER_PROPOSAL_YAML_KEY], write_receipt=account_pick_test is None
                 )

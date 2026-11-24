@@ -2426,6 +2426,8 @@ def _narrative_turn_core(ctx: EmberContext) -> TurnNarrativePayload:
             block_entry["outcomeRole"] = attempt["outcomeRole"]
         if "outcomeReason" in attempt:
             block_entry["outcomeReason"] = attempt["outcomeReason"]
+        if "failureCode" in attempt:
+            block_entry["failureCode"] = attempt["failureCode"]
         skipped_before = skipped_before_by_attempt_id.get(attempt["workflowRunBlockId"])
         if skipped_before:
             block_entry["skippedBefore"] = list(skipped_before)
@@ -2634,6 +2636,7 @@ async def _run_end_to_end_test_turn(
     ctx: EmberContext,
     *,
     workflow_yaml: str,
+    approved_by_test_click: bool = False,
 ) -> list[dict[str, str]]:
     started_at = datetime.now(UTC)
     # The run streams block progress only when the turn has a narrator; the model's stream has not created one yet.
@@ -2644,7 +2647,9 @@ async def _run_end_to_end_test_turn(
     except Exception as emit_err:  # noqa: BLE001 - narrative emission is best-effort; the run still starts.
         LOG.warning("ember_test_end_to_end_design_start_emit_failed", error=str(emit_err))
     try:
-        result = await run_workflow_end_to_end(ctx, workflow_yaml, seed_like_normal_run=True)
+        result = await run_workflow_end_to_end(
+            ctx, workflow_yaml, seed_like_normal_run=True, approved_by_test_click=approved_by_test_click
+        )
     except Exception as exc:
         LOG.warning(
             "ember_test_end_to_end_run_failed_before_result",
@@ -5805,7 +5810,15 @@ async def _run_ember_turn_impl(
 
     direct_test_handoff = None
     if chat_request.product_action == "test_end_to_end":
-        direct_test_handoff = await _run_end_to_end_test_turn(ctx, workflow_yaml=chat_request.workflow_yaml or "")
+        # A Test click approves only the proposal the client named, and only while it is still the restored one.
+        direct_test_handoff = await _run_end_to_end_test_turn(
+            ctx,
+            workflow_yaml=chat_request.workflow_yaml or "",
+            approved_by_test_click=chat_request.test_click_approved
+            and ctx.proposal_owner_turn_id is not None
+            and (ctx.proposal_owner_turn_id, ctx.proposal_revision)
+            == (chat_request.test_proposal_owner_turn_id, chat_request.test_proposal_revision),
+        )
 
     model_name, run_config, llm_key, supports_vision = resolve_model_config(
         llm_api_handler,

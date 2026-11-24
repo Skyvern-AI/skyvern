@@ -12518,6 +12518,7 @@ class WorkflowService:
         generate_script_on_terminal: bool = False,
         created_by: str | None = None,
         edited_by: str | None = None,
+        edited_for: str | None | object = _UNSET,
         build_source: WorkflowBuildSource | None = None,
         workflow_id: str | None = None,
         encrypt_secrets: bool = True,
@@ -12568,6 +12569,7 @@ class WorkflowService:
                 generate_script_on_terminal=generate_script_on_terminal,
                 created_by=created_by,
                 edited_by=edited_by,
+                edited_for=edited_for,
                 build_source=build_source,
                 workflow_id=workflow_id,
             )
@@ -18949,6 +18951,7 @@ class WorkflowService:
         *,
         runtime_workflow: Workflow,
         organization_id: str,
+        approved_by: str | None = None,
     ) -> Workflow:
         """Persist ``runtime_workflow`` (the copilot's wrapped test definition) as a real new
         workflow version that the dispatched run resolves by ``run.workflow_id``.
@@ -18960,7 +18963,8 @@ class WorkflowService:
         the global parameter PKs, and the shared ctx.staged_workflow / runtime_workflow object
         must not be mutated). The returned (reloaded) version carries the regenerated ids; the
         caller maps post-run output values against it. The version is marked with the copilot_test creator
-        and is soft-deleted by the caller once the run reaches a terminal state.
+        and is soft-deleted by the caller once the run reaches a terminal state. Its ``edited_for`` is
+        ``approved_by``, the person whose Test click approved this copy for its one run, and None otherwise.
         """
 
         async def next_version() -> int:
@@ -18996,6 +19000,7 @@ class WorkflowService:
                 status=WorkflowStatus.auto_generated,
                 created_by=EMBER_TEST_WORKFLOW_CREATOR,
                 edited_by=EMBER_RUN_CREATOR,
+                edited_for=approved_by,
                 build_source=WorkflowBuildSource.ember,
                 description=runtime_workflow.description,
                 proxy_location=runtime_workflow.proxy_location,

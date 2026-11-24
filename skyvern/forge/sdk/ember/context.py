@@ -17,6 +17,7 @@ import structlog
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 from typing_extensions import NotRequired, TypedDict
 
+from skyvern.constants import EMBER_TEST_RUN_UNSUPPORTED_CODE
 from skyvern.forge.sdk.agents.skills import EMBER_SKILLS_AGENT, SkillSession
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.ember.agent_context import AgentContext
@@ -173,6 +174,7 @@ class NarrativeBlock(TypedDict):
     outcomeReason: NotRequired[str]
     outcomeRole: NotRequired[RunOutcomeRole]
     skippedBefore: NotRequired[list[SkippedPrefixBlock]]
+    failureCode: NotRequired[str]
 
 
 # A loop body mints fresh run-block ids every iteration, so the identity-keyed archive
@@ -193,6 +195,22 @@ class NarrativeBlockAttempt(TypedDict):
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
     outcomeRole: NotRequired[RunOutcomeRole]
+    failureCode: NotRequired[str]
+
+
+# A failed block carrying one of these was refused access to an account, so the review card says it could not test.
+ACCESS_REFUSAL_ERROR_CODES = frozenset({EMBER_TEST_RUN_UNSUPPORTED_CODE})
+
+
+# Only the platform's Gmail blocks write the refusal code (a saved Gmail app action runs as integration_action); an
+# author can declare any code on other blocks.
+_ACCESS_REFUSAL_BLOCK_TYPES = frozenset({"send_email", "email_inbox", "integration_action"})
+
+
+def block_failure_code(status: str | None, error_codes: Iterable[str], block_type: str) -> str | None:
+    if status != "failed" or block_type not in _ACCESS_REFUSAL_BLOCK_TYPES:
+        return None
+    return next((code for code in error_codes if code in ACCESS_REFUSAL_ERROR_CODES), None)
 
 
 def skipped_prefix_anchor(archive: dict[str, NarrativeBlockAttempt], workflow_run_id: str) -> str | None:
@@ -215,6 +233,7 @@ def upsert_narrative_block_attempt(
     started_at: str | None,
     ended_at: str | None,
     parent_workflow_run_block_id: str | None = None,
+    failure_code: str | None = None,
 ) -> NarrativeBlockAttempt:
     attempt = archive.get(workflow_run_block_id)
     if attempt is None:
@@ -230,6 +249,8 @@ def upsert_narrative_block_attempt(
         }
         if parent_workflow_run_block_id:
             attempt["parentWorkflowRunBlockId"] = parent_workflow_run_block_id
+        if failure_code:
+            attempt["failureCode"] = failure_code
         archive[workflow_run_block_id] = attempt
         while len(archive) > MAX_NARRATIVE_BLOCK_ATTEMPTS:
             del archive[next(iter(archive))]
@@ -241,6 +262,10 @@ def upsert_narrative_block_attempt(
     attempt["label"] = label or attempt["label"]
     attempt["blockType"] = block_type or attempt["blockType"]
     attempt["rawStatus"] = status
+    if failure_code:
+        attempt["failureCode"] = failure_code
+    else:
+        attempt.pop("failureCode", None)
     attempt["lastSeenIteration"] = iteration
     if attempt["startedAt"] is None and started_at is not None:
         attempt["startedAt"] = started_at

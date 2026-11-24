@@ -4081,6 +4081,7 @@ async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeyp
         explicit_blank: bool = False,
         seed_like_normal_run: bool = False,
         use_ephemeral_inputs: bool = True,
+        approved_by_test_click: bool = False,
     ) -> dict[str, Any]:
         captured["requested"] = list(params["block_labels"])
         captured["has_staged_proposal"] = ctx.has_staged_proposal
@@ -4272,7 +4273,7 @@ workflow_definition:
     assert "sensitive-target" not in handoff[1]["output"]
     assert "customer-secret" not in handoff[1]["output"]
     assert "Every step completed" not in handoff[1]["output"]
-    run.assert_awaited_once_with(ctx, workflow_yaml, seed_like_normal_run=True)
+    run.assert_awaited_once_with(ctx, workflow_yaml, seed_like_normal_run=True, approved_by_test_click=False)
 
 
 @pytest.mark.asyncio
@@ -4344,7 +4345,9 @@ async def test_test_end_to_end_run_gets_its_own_row_carrying_its_input_sources(
     sent_before_run: list[EmberStreamMessageType] = []
     narrated_run: list[bool] = []
 
-    async def _dispatch(ctx: EmberContext, workflow_yaml: str, *, seed_like_normal_run: bool) -> dict[str, Any]:
+    async def _dispatch(
+        ctx: EmberContext, workflow_yaml: str, *, seed_like_normal_run: bool, approved_by_test_click: bool
+    ) -> dict[str, Any]:
         sent_before_run.extend(frame.type for frame in stream.sent)
         narrated_run.append(ctx.narrator_state is not None)
         ctx.pending_test_inputs["wr_button"] = copy.deepcopy(sources)
@@ -5234,7 +5237,9 @@ async def test_completed_test_result_handoff_uses_ordinary_acting_agent_surface(
         call_model_input_filter=make_ember_call_model_input_filter(DEFAULT_TOKEN_BUDGET),
     )
 
-    async def fake_run(ctx: EmberContext, actual_workflow_yaml: str, *, seed_like_normal_run: bool) -> dict[str, Any]:
+    async def fake_run(
+        ctx: EmberContext, actual_workflow_yaml: str, *, seed_like_normal_run: bool, approved_by_test_click: bool
+    ) -> dict[str, Any]:
         assert actual_workflow_yaml == workflow_yaml
         definition = _wf_def(("inspect_result", "code", {"code": 'return {"count": 3}'}))
         ctx.last_workflow = _FakeWorkflow(definition)

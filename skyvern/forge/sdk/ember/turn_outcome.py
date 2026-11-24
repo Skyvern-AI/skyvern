@@ -46,6 +46,7 @@ class AccountPickTestResume:
     proposal_workflow_run_id: str | None
     connection_id: str
     picker_canvas_fingerprint: str | None = None
+    click_approver: str | None = None
 
 
 def account_pick_test_resume(
@@ -63,6 +64,7 @@ def account_pick_test_resume(
         outcome.test_proposal_workflow_run_id,
         pick,
         outcome.test_proposal_canvas_fingerprint,
+        outcome.test_proposal_click_approver,
     )
 
 
@@ -72,6 +74,7 @@ class CarriedAccountChoiceFields(TypedDict, total=False):
     test_proposal_revision: int | None
     test_proposal_workflow_run_id: str | None
     test_proposal_canvas_fingerprint: str | None
+    test_proposal_click_approver: str | None
 
 
 def carried_account_choice_fields(prior_turn_outcome: TurnOutcome | None) -> CarriedAccountChoiceFields:
@@ -83,6 +86,7 @@ def carried_account_choice_fields(prior_turn_outcome: TurnOutcome | None) -> Car
         "test_proposal_revision": prior_turn_outcome.test_proposal_revision,
         "test_proposal_workflow_run_id": prior_turn_outcome.test_proposal_workflow_run_id,
         "test_proposal_canvas_fingerprint": prior_turn_outcome.test_proposal_canvas_fingerprint,
+        "test_proposal_click_approver": prior_turn_outcome.test_proposal_click_approver,
     }
 
 

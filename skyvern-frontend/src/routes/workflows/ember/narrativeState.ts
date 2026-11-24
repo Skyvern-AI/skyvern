@@ -335,6 +335,8 @@ export interface BlockState {
   outcome?: BlockOutcome;
   outcomeReason?: string;
   outcomeRole?: RunOutcomeRole;
+  // On a failed block, the backend's code for a refusal of access (see ACCESS_REFUSED_FAILURE_CODES).
+  failureCode?: string;
   // Requested blocks the run did not execute, shown before this, the run's first card.
   skippedBefore?: SkippedPrefixBlock[];
   lastSeenIteration: number;
@@ -1649,6 +1651,7 @@ export function applyNarrativeEvent(
         outcome: previousBlock?.outcome,
         outcomeReason: previousBlock?.outcomeReason,
         outcomeRole: previousBlock?.outcomeRole,
+        failureCode: event.failure_code ?? undefined,
         skippedBefore: previousBlock?.skippedBefore ?? pendingSkipped,
         recordedActions: previousBlock?.recordedActions,
         recordedActionsAt: previousBlock?.recordedActionsAt,
@@ -2246,6 +2249,8 @@ export function hydrateNarrativeFromPayload(
         outcomeRole,
         outcomeReason:
           typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
+        failureCode:
+          typeof obj.failureCode === "string" ? obj.failureCode : undefined,
         skippedBefore: parseSkippedPrefix(obj.skippedBefore),
         state: ((): BlockState["state"] => {
           const s = obj.state;

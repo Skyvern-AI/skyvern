@@ -122,7 +122,10 @@ class EmailInboxBlock(Block):
             failure_reason=failure_reason,
             output_parameter_value=output_parameter_value,
             error_codes=error_codes,
-            can_continue_after_failure=False if error_codes else None,
+            # Only an uncertain organize must stop the run; a refusal code is reported but keeps the block's setting.
+            can_continue_after_failure=False
+            if error_codes and GMAIL_ORGANIZE_UNCERTAIN_ERROR_CODE in error_codes
+            else None,
             status=BlockStatus.failed,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
@@ -686,5 +689,7 @@ class EmailInboxBlock(Block):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
             output_parameter_value=error_data,
-            error_codes=[exc.code] if exc.code == GMAIL_ORGANIZE_UNCERTAIN_ERROR_CODE else None,
+            error_codes=[exc.code]
+            if exc.code in (GMAIL_ORGANIZE_UNCERTAIN_ERROR_CODE, EMBER_TEST_RUN_UNSUPPORTED_CODE)
+            else None,
         )

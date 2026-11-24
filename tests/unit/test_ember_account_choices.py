@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from collections.abc import Callable
 from datetime import datetime
@@ -75,6 +76,7 @@ from skyvern.forge.sdk.schemas.ember_turn_outcome import (
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, microsoft_oauth_service
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.workflow.models.agent_step_tools import ACCOUNT_TOOL_NAMES
 from skyvern.forge.sdk.workflow.models.block import WorkflowTriggerBlock
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -1775,8 +1777,10 @@ def _stored_test_proposal(owner_turn_id: str, revision: int, workflow_run_id: st
     ],
 )
 def test_end_to_end_picker_token_names_only_the_turns_own_proposal(
-    result_token: tuple[str, int], disposition: str, minted: bool
+    monkeypatch: pytest.MonkeyPatch, result_token: tuple[str, int], disposition: str, minted: bool
 ) -> None:
+    clicker = RequestPrincipal("org-1", AuthKind.bearer, "user_clicker", "org:member")
+    monkeypatch.setattr(ember_route, "get_request_principal", lambda: clicker)
     agent_result = AgentResult(
         user_response="Choose one of the connected accounts below so I can run the workflow.",
         updated_workflow=None,
@@ -1794,19 +1798,47 @@ def test_end_to_end_picker_token_names_only_the_turns_own_proposal(
         message="",
         workflow_yaml=EMPTY_WORKFLOW_YAML,
         product_action="test_end_to_end",
+        test_click_approved=True,
     )
+    stored = _stored_test_proposal("turn-test", 2, "wr_offered")
 
     ember_route._record_offered_test_proposal(
-        chat_request,
-        SimpleNamespace(proposed_workflow=_stored_test_proposal("turn-test", 2, "wr_offered")),
-        agent_result,
-        None,
+        chat_request, SimpleNamespace(proposed_workflow=stored), agent_result, None
     )
 
     assert agent_result.turn_outcome is not None
-    assert account_pick_test_resume(agent_result.turn_outcome, PROPOSAL_BOUND_ACCOUNT_ID, None) == (
-        AccountPickTestResume("turn-test", 2, "wr_offered", PROPOSAL_BOUND_ACCOUNT_ID) if minted else None
+    resume = account_pick_test_resume(agent_result.turn_outcome, PROPOSAL_BOUND_ACCOUNT_ID, None)
+    assert resume == (
+        AccountPickTestResume("turn-test", 2, "wr_offered", PROPOSAL_BOUND_ACCOUNT_ID, click_approver="user_clicker")
+        if minted
+        else None
     )
+    if resume is not None:
+        # A pick resumes the Test approved only when the person who clicked it is the one picking, whatever the pick
+        # request claims; another member answering the shared chat's picker does not inherit the click.
+        for click_approver, approved in (("user_clicker", True), (None, False), ("user_other", False)):
+            pick_request = chat_request.model_copy(
+                update={
+                    "test_click_approved": True,
+                    "test_proposal_owner_turn_id": None,
+                    "test_proposal_revision": None,
+                }
+            )
+            ember_route._stamp_test_click_approval(
+                pick_request, stored, dataclasses.replace(resume, click_approver=click_approver)
+            )
+            assert pick_request.test_click_approved is approved
+        # A Test the route did not approve (a key caller, or a stale or missing pair) records no approver, so even the
+        # same person's later pick resumes it unapproved.
+        unapproved_result = dataclasses.replace(agent_result)
+        ember_route._record_offered_test_proposal(
+            chat_request.model_copy(update={"test_click_approved": False}),
+            SimpleNamespace(proposed_workflow=stored),
+            unapproved_result,
+            None,
+        )
+        assert unapproved_result.turn_outcome is not None
+        assert unapproved_result.turn_outcome.test_proposal_click_approver is None
 
 
 def _ctx_with_denial(policy: request_policy_module.RequestPolicy, refs: list[str]) -> tuple[EmberContext, object]:

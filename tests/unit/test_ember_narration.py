@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from skyvern.constants import EMBER_TEST_RUN_UNSUPPORTED_CODE
 from skyvern.forge import app
 from skyvern.forge.sdk.ember.narration import (
     MAX_DESIGN_ACTIVITY_ENTRIES,
@@ -21,7 +22,19 @@ from tests.unit.ember_test_helpers import FakeEmberStream, handback_ctx, termina
 
 
 @pytest.mark.asyncio
-async def test_pending_block_progress_and_archive_without_narrator() -> None:
+@pytest.mark.parametrize(
+    ("terminal", "block_type", "error_codes", "failure_code"),
+    [
+        ("completed", BlockType.CODE, [], None),
+        # Only a Gmail block (a saved Gmail app action runs as integration_action) carries the refusal to the card.
+        ("failed", BlockType.INTEGRATION_ACTION, [EMBER_TEST_RUN_UNSUPPORTED_CODE], EMBER_TEST_RUN_UNSUPPORTED_CODE),
+        ("failed", BlockType.TASK, [EMBER_TEST_RUN_UNSUPPORTED_CODE], None),
+        ("failed", BlockType.INTEGRATION_ACTION, [], None),
+    ],
+)
+async def test_pending_block_progress_and_archive_without_narrator(
+    terminal: str, block_type: BlockType, error_codes: list[str], failure_code: str | None
+) -> None:
     state = NarratorState(current_iteration=7)
     stream = FakeEmberStream()
     archive = {}
@@ -34,13 +47,14 @@ async def test_pending_block_progress_and_archive_without_narrator() -> None:
             SimpleNamespace(
                 workflow_run_block_id="wrb_1",
                 label="booking",
-                block_type=BlockType.CODE,
+                block_type=block_type,
                 status=status,
                 parent_workflow_run_block_id="wrb_step",
+                error_codes=error_codes,
             )
         ]
 
-    for index, current in enumerate(("running", "completed")):
+    for index, current in enumerate(("running", terminal)):
         status = current
         await narrator_poll_tick(
             state,
@@ -56,7 +70,9 @@ async def test_pending_block_progress_and_archive_without_narrator() -> None:
         assert stream.sent[index].status == current
         assert stream.sent[index].iteration == 7
         assert stream.sent[index].parent_workflow_run_block_id == "wrb_step"
-    assert archive["wrb_1"]["rawStatus"] == "completed"
+    assert stream.sent[1].failure_code == failure_code
+    assert archive["wrb_1"]["rawStatus"] == terminal
+    assert archive["wrb_1"].get("failureCode") == failure_code
     assert archive["wrb_1"]["parentWorkflowRunBlockId"] == "wrb_step"
     assert archive["wrb_1"]["startedAt"] is not None
     assert archive["wrb_1"]["endedAt"] is not None

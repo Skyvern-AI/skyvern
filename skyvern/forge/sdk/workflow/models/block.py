@@ -102,6 +102,7 @@ from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     BROWSER_DOWNLOADING_SUFFIX,
     EMBER_RUN_CREATOR,
+    EMBER_TEST_RUN_UNSUPPORTED_CODE,
     FILE_PARSE_STEP_TIMEOUT_SECONDS,
     FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS,
     GET_DOWNLOADED_FILES_TIMEOUT,
@@ -13990,11 +13991,13 @@ class _GmailSendRefused(Exception):
         error_code: GmailSendErrorCode,
         failure_reason: str | None = None,
         render_failure: dict[str, Any] | None = None,
+        block_error_codes: list[str] | None = None,
     ) -> None:
         super().__init__(error_code.value)
         self.error_code = error_code
         self.failure_reason = failure_reason or GMAIL_SEND_FAILURE_MESSAGES[error_code]
         self.render_failure = render_failure
+        self.block_error_codes = block_error_codes
 
 
 def _gmail_template_refusal(exc: Exception, redact: Callable[[str], str]) -> _GmailSendRefused:
@@ -14586,7 +14589,9 @@ class SendEmailBlock(Block):
                 )
             if refusal == GmailHopRefusal.ember_test_run:
                 raise _GmailSendRefused(
-                    GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_EMBER_TEST_RUN_REASON} Nothing was sent."
+                    GmailSendErrorCode.CONFIGURATION,
+                    f"{CONNECTED_ACCOUNT_EMBER_TEST_RUN_REASON} Nothing was sent.",
+                    block_error_codes=[EMBER_TEST_RUN_UNSUPPORTED_CODE],
                 )
             if refusal == GmailHopRefusal.run_not_supported or (
                 refusal is None and await _is_unsupported_connected_account_run(workflow_run_id, organization_id)
@@ -14808,6 +14813,7 @@ class SendEmailBlock(Block):
         replayed = False
         refusal_reason: str | None = None
         render_failure: dict[str, Any] | None = None
+        block_error_codes: list[str] | None = None
         try:
             if not organization_id:
                 raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
@@ -14818,6 +14824,7 @@ class SendEmailBlock(Block):
             result = GmailSendResult(GmailSendOutcome.FAILED, error_code=refusal.error_code)
             refusal_reason = refusal.failure_reason
             render_failure = refusal.render_failure
+            block_error_codes = refusal.block_error_codes
         except _GmailSendStateUnreadable:
             result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
         except Exception as exc:
@@ -14864,6 +14871,7 @@ class SendEmailBlock(Block):
             status=BlockStatus.completed if accepted else BlockStatus.failed,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            error_codes=block_error_codes,
         )
 
     async def execute(

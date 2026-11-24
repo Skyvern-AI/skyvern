@@ -334,6 +334,7 @@ class WorkflowsRepository(BaseRepository):
         folder_id: str | None = None,
         created_by: str | None = None,
         edited_by: str | None = None,
+        edited_for: str | None | object = _UNSET,
         build_source: WorkflowBuildSource | None = None,
         workflow_id: str | None = None,
     ) -> Workflow:
@@ -383,7 +384,11 @@ class WorkflowsRepository(BaseRepository):
                 folder_id=folder_id,
                 created_by=created_by,
                 edited_by=edited_by,
-                edited_for=_ember_edited_for(organization_id, edited_by),
+                edited_for=(
+                    _ember_edited_for(organization_id, edited_by)
+                    if edited_for is _UNSET
+                    else cast(str | None, edited_for)
+                ),
                 build_source=build_source,
             )
             if workflow_permanent_id:

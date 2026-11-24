@@ -880,6 +880,8 @@ export interface EmberBlockProgressUpdate {
   block_label: string;
   block_type: string;
   status: string;
+  // On a failed block, the code saying it was refused access to an account.
+  failure_code?: string | null;
   iteration: number;
   timestamp: string;
 }
