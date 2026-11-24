@@ -101,4 +101,4 @@ def attach_tool_surface_to_pending_capture(tools: list[Any]) -> None:
             serialized = app.AGENT_FUNCTION.redact_codeblock_parameter_values(serialized, parameters)
         pending.path.write_text(serialized if isinstance(serialized, str) else "")
     except Exception:  # noqa: BLE001 - optional capture evidence must never block the model call
-        LOG.warning("Failed to attach tool surface to Copilot model-input capture")
+        LOG.warning("Failed to attach tool surface to Ember model-input capture")

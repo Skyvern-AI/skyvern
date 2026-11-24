@@ -1846,7 +1846,7 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                         mode="json", exclude_none=True
                     )
                 except Exception:
-                    LOG.exception("copilot build test packet projection failed")
+                    LOG.exception("ember build test packet projection failed")
                     data.pop(BUILD_TEST_PACKET_KEY, None)
                     data["build_test_packet_omitted"] = "The internal packet projection failed."
                 else:

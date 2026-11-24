@@ -120,7 +120,7 @@ async def _run_ladder(ctx: AgentContext, page: Page, session_id: str) -> dict[st
     except TimeoutError:
         return {**unsolved, "timed_out": True, "detail": f"The solver did not finish in {SOLVE_CEILING_SECONDS}s."}
     except Exception:
-        LOG.warning("copilot solve_page_challenge solver failed", exc_info=True)
+        LOG.warning("ember solve_page_challenge solver failed", exc_info=True)
         return {**unsolved, "solver_failed": True, "detail": "The solver failed with an internal error."}
     if challenge.check_incomplete:
         outcome, detail = "check_incomplete", challenge.facts(_SOLVER_SUBJECT)
@@ -155,7 +155,7 @@ async def _read_image(ctx: AgentContext, page: Page, session_id: str, image: str
     except TimeoutError:
         return {**unsolved, "timed_out": True, "detail": f"The image was not read in {SOLVE_CEILING_SECONDS}s."}
     except Exception:
-        LOG.warning("copilot solve_page_challenge image read failed", exc_info=True)
+        LOG.warning("ember solve_page_challenge image read failed", exc_info=True)
         return {**unsolved, "solver_failed": True, "detail": "Reading the image failed with an internal error."}
     return {"ok": True, "outcome": "typed", "detail": _IMAGE_OUTCOME_TEXT["typed"]}
 

@@ -73,7 +73,7 @@ def _emergency_truncate_all(items: list[Any], cap: int) -> list[Any]:
     truncated = {i for i, (old, new) in enumerate(zip(items, truncated_items)) if new is not old}
     if truncated:
         LOG.warning(
-            "copilot_tool_output_emergency_truncated",
+            "ember_tool_output_emergency_truncated",
             truncated_count=len(truncated),
             unread_count=len(truncated & unread_tool_output_indices(items)),
             cap=cap,
@@ -203,7 +203,7 @@ def ember_call_model_input_filter(data: CallModelData[Any]) -> ModelInputData:
 
 
 def _log_tool_pair_repair(moved: int, size_delta: int) -> None:
-    LOG.info("copilot_tool_pair_repaired", moved=moved, size_delta=size_delta)
+    LOG.info("ember_tool_pair_repaired", moved=moved, size_delta=size_delta)
 
 
 def _run_context(data: CallModelData[Any]) -> Any:
@@ -243,7 +243,7 @@ def _ember_call_model_input_filter(data: CallModelData[Any], *, token_budget: in
                 ctx.pending_frame_lease = None
                 screenshot_msg = None
                 LOG.info(
-                    "copilot_frame_lease_invalidated",
+                    "ember_frame_lease_invalidated",
                     capture_id=entry.capture_id,
                     input_fingerprint=fingerprint[:12],
                 )
@@ -271,7 +271,7 @@ def _ember_call_model_input_filter(data: CallModelData[Any], *, token_budget: in
             else:
                 TOOL_WINDOW_SUMMARIZED.set(summarized)
         if screenshot_msg is not sharp_msg:
-            LOG.info("copilot_sharp_frame_over_budget")
+            LOG.info("ember_sharp_frame_over_budget")
         LOG.info(
             "Injecting screenshot user message",
             count=len(screenshot_msg["content"]) - 1,
@@ -370,7 +370,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
             redaction_parameters=parameters,
         )
     except Exception:
-        LOG.warning("Failed to dump copilot model input")
+        LOG.warning("Failed to dump ember model input")
 
 
 def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budget: int) -> ModelInputData:
@@ -408,7 +408,7 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
     if stripped != items:
         items = stripped
         est = estimate_tokens(items)
-        LOG.warning("copilot_attached_images_dropped_for_budget", tokens=est)
+        LOG.warning("ember_attached_images_dropped_for_budget", tokens=est)
         if est <= token_budget:
             return ModelInputData(input=items, instructions=instructions)
 
@@ -418,7 +418,7 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
     if deferred_tools:
         est = estimate_tokens(items)
         LOG.warning(
-            "copilot_unread_tool_outputs_deferred_for_budget",
+            "ember_unread_tool_outputs_deferred_for_budget",
             deferred_count=len(deferred_tools),
             tool_name=sorted(set(deferred_tools)),
             tokens=est,

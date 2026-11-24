@@ -62,7 +62,7 @@ def stash_turn_halt_from_blocker_signal(ctx: Any, signal: object, *, source: str
     halt = turn_halt_from_blocker_signal(signal, source=source)
     if halt is not None:
         ctx.turn_halt = halt
-        LOG.info("copilot turn halt stashed", **turn_halt_to_trace_data(halt))
+        LOG.info("ember turn halt stashed", **turn_halt_to_trace_data(halt))
     return halt
 
 
@@ -75,7 +75,7 @@ def stash_build_test_superseded_halt(ctx: Any, *, workflow_run_id: str | None) -
         run_refs={"workflow_run_id": workflow_run_id},
     )
     ctx.turn_halt = halt
-    LOG.info("copilot turn halt stashed", **turn_halt_to_trace_data(halt))
+    LOG.info("ember turn halt stashed", **turn_halt_to_trace_data(halt))
     return halt
 
 

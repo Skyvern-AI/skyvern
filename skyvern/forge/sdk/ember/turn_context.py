@@ -335,7 +335,7 @@ class TurnContextAssembler:
         )
 
         LOG.info(
-            "assembled copilot turn context packet",
+            "assembled ember turn context packet",
             **{f"turn_context_{key}": value for key, value in packet.to_trace_data().items()},
         )
         return packet

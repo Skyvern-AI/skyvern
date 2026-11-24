@@ -89,7 +89,7 @@ async def publish_ember_runtime_secret_values(
         await app.CACHE.set(_cache_key(organization_id, workflow_run_id), stored, ex=_CACHE_TTL_SECONDS)
     except Exception:
         LOG.warning(
-            "Copilot origin-run runtime secrets could not be handed off",
+            "Ember origin-run runtime secrets could not be handed off",
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
             exc_info=True,
@@ -135,7 +135,7 @@ async def consume_ember_runtime_secret_values(
             return set(decoded["values"])
     except Exception:
         LOG.warning(
-            "Copilot origin-run runtime secret handoff could not be consumed",
+            "Ember origin-run runtime secret handoff could not be consumed",
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
             exc_info=True,

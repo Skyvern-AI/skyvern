@@ -380,7 +380,7 @@ async def get_debug_session_viewer_state(
         )
     except Exception:
         LOG.warning(
-            "Failed to read active Copilot run session",
+            "Failed to read active Ember run session",
             organization_id=current_org.organization_id,
             workflow_permanent_id=workflow_permanent_id,
             debug_browser_session_id=debug_session.browser_session_id,

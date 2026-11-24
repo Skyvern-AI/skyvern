@@ -330,7 +330,7 @@ def stash_blocker_signal(ctx: _BlockerSignalCtx, signal: EmberToolBlockerSignal)
     elif stashed and isinstance(existing, EmberToolBlockerSignal):
         extra["replaced_reason_code"] = existing.internal_reason_code
         extra["replaced_blocker_kind"] = existing.blocker_kind
-    LOG.info("copilot tool blocker signal", **extra, **to_trace_data(signal))
+    LOG.info("ember tool blocker signal", **extra, **to_trace_data(signal))
     return build_llm_tool_error_payload(signal)
 
 

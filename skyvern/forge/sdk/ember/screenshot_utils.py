@@ -284,14 +284,14 @@ def enqueue_screenshot(
     try:
         entry = resize_screenshot_b64(b64_png, provenance=provenance, captured_at=captured_at)
     except Exception:
-        LOG.warning("Failed to resize copilot screenshot", exc_info=True)
+        LOG.warning("Failed to resize ember screenshot", exc_info=True)
         return False
     pending = getattr(ctx, "pending_screenshots", None)
     if not isinstance(pending, list):
         return False
     if pending and isinstance(pending[0], ScreenshotEntry) and pending[0].captured_at > entry.captured_at:
         LOG.info(
-            "copilot_older_screenshot_rejected",
+            "ember_older_screenshot_rejected",
             source_tool=entry.provenance.source_tool,
             pending_source_tool=pending[0].provenance.source_tool,
         )
@@ -355,7 +355,7 @@ def withdraw_superseded_run_result_frame(ctx: CarriesRunResultFrames, run_id: st
     entry = pending.pop(0)
     _release_lease_held_by(ctx, entry)
     LOG.info(
-        "copilot_superseded_run_frame_withdrawn",
+        "ember_superseded_run_frame_withdrawn",
         capture_event_id=entry.capture_event_id,
         frame_workflow_run_id=provenance.workflow_run_id,
         superseding_workflow_run_id=run_id,
@@ -376,7 +376,7 @@ def consume_screenshot_artifact(result: dict[str, Any]) -> bytes | None:
     try:
         return artifact.read_bytes()
     except (OSError, ValueError):
-        LOG.info("Copilot screenshot artifact could not be read")
+        LOG.info("Ember screenshot artifact could not be read")
         return None
     finally:
         with contextlib.suppress(OSError, ValueError):

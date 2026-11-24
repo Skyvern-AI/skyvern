@@ -666,7 +666,7 @@ def _record_browser_call_outcome(
 ) -> None:
     with contained_effect("record browser call outcome", tool_name=outcome.raw_tool_name):
         LOG.info(
-            "copilot_browser_call_outcome",
+            "ember_browser_call_outcome",
             tool_name=outcome.raw_tool_name,
             call_path=call_path,
             dispatched=outcome.dispatched,
@@ -1135,7 +1135,7 @@ def _redaction_withheld_result(
             original_chars = None
     if not rewithheld:
         LOG.warning(
-            "copilot_model_facing_result_withheld",
+            "ember_model_facing_result_withheld",
             tool_name=tool_name,
             reason=reason,
             original_chars=original_chars,
@@ -1192,7 +1192,7 @@ def _set_aside_screenshot_image(
     def drop(field: str, reason: str, value: str) -> None:
         if log_drops:
             LOG.warning(
-                "copilot_screenshot_image_dropped", tool_name=tool_name, field=field, reason=reason, length=len(value)
+                "ember_screenshot_image_dropped", tool_name=tool_name, field=field, reason=reason, length=len(value)
             )
 
     inline_image = data.get("data")
@@ -1527,7 +1527,7 @@ async def _session_reached_its_fixed_deadline(organization_id: str, session_id: 
     reached = False
     # Contained, comparison included: this only names a cause, and nothing about resolving it --
     # including a manager that answers with something uncomparable -- may stop the replacement.
-    with contained_effect("resolve copilot browser session end reason", session_id=session_id):
+    with contained_effect("resolve ember browser session end reason", session_id=session_id):
         remaining_seconds = await app.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline(
             session_id, organization_id
         )
@@ -1678,7 +1678,7 @@ def _emit_continuity_event(
     # The payload is built inside the guard too: this emit sits ahead of the recovery
     # call, so a failure anywhere in it -- not just in the sink -- would leave
     # ensure_browser_session uncalled and the disposition unrecorded.
-    with contained_effect("emit copilot session continuity event", session_id=lost_session_id):
+    with contained_effect("emit ember session continuity event", session_id=lost_session_id):
         workflow_run_id = (
             ctx.sdk_action_workflow_run_ids_by_browser_session.get((ctx.organization_id, lost_session_id))
             or ctx.last_run_blocks_workflow_run_id
@@ -1697,10 +1697,10 @@ def _emit_continuity_event(
         }
         log = LOG.info if disposition == "reestablished" else LOG.warning
         try:
-            log("copilot_browser_session_continuity_loss", **fields)
+            log("ember_browser_session_continuity_loss", **fields)
         except Exception:
             _FALLBACK_LOGGER.warning(
-                "copilot_browser_session_continuity_loss session_id=%s disposition=%s",
+                "ember_browser_session_continuity_loss session_id=%s disposition=%s",
                 lost_session_id,
                 disposition,
             )
@@ -1957,13 +1957,13 @@ def _reporting_lifecycle_failure(phase: Literal["connect", "cleanup"]) -> Iterat
     except asyncio.CancelledError:
         # The manager's lifecycle timeout reaches the server as a cancellation.
         LOG.warning(
-            "copilot_mcp_server_lifecycle_cancelled",
+            "ember_mcp_server_lifecycle_cancelled",
             phase=phase,
             elapsed_seconds=round(time.monotonic() - started, 1),
         )
         raise
     except Exception:
-        LOG.exception("copilot_mcp_server_lifecycle_failed", phase=phase)
+        LOG.exception("ember_mcp_server_lifecycle_failed", phase=phase)
         raise
 
 
@@ -2182,7 +2182,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             if overlay.pre_hook is not None:
                 refusal = await overlay.pre_hook(arguments, ember_ctx)
                 if refusal is not None:
-                    LOG.info("copilot_demonstration_replay_refused", tool=tool_name)
+                    LOG.info("ember_demonstration_replay_refused", tool=tool_name)
                     stamp_user_actor()
                     projected_refusal = scrub_model_facing_tool_result(ember_ctx, refusal, tool_name=mcp_name)
                     projected_refusal = _scrub_stamped_tool_result(

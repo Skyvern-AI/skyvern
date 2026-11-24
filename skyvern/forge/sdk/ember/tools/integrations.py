@@ -272,7 +272,7 @@ async def _bounded_sheet_open(organization_id: str, connection_id: str, spreadsh
         return _SheetOpenAttempt("error", reason="timeout")
     except Exception as error:
         LOG.warning(
-            "copilot_read_google_sheet_open_failed",
+            "ember_read_google_sheet_open_failed",
             organization_id=organization_id,
             connection_id=connection_id,
             exc_info=True,

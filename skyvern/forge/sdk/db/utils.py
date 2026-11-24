@@ -463,7 +463,7 @@ def convert_to_ember_chat_message(
 ) -> EmberChatMessageSchema:
     if debug_enabled:
         LOG.debug(
-            "Converting WorkflowCopilotChatMessage to WorkflowCopilotChatMessageSchema",
+            "Converting EmberChatMessage to EmberChatMessageSchema",
             workflow_copilot_chat_message_id=message_model.ember_chat_message_id,
         )
     raw_outcome = message_model.turn_outcome

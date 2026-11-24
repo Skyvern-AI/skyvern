@@ -392,7 +392,7 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
 
-_EMBER_TURN_SPAN_NAME = "copilot.turn"
+_EMBER_TURN_SPAN_NAME = "ember.turn"
 EMBER_BLOCKER_RENDERER_REASON_CODE = "copilot_blocker_renderer"
 _EMPTY_REVIEW_BASELINE_YAML = "workflow_definition:\n  parameters: []\n  blocks: []\n"
 
@@ -427,12 +427,12 @@ def _ember_turn_span(
     tracer = otel_trace.get_tracer("skyvern")
     with traced_span(tracer, _EMBER_TURN_SPAN_NAME) as span:
         span.set_attribute("skyvern.span.role", "wrapper")
-        span.set_attribute("copilot.turn_index", _derive_turn_index(chat_history, turn_index))
+        span.set_attribute("ember.turn_index", _derive_turn_index(chat_history, turn_index))
         if turn_id is not None:
-            span.set_attribute("copilot.turn_id", turn_id)
-        span.set_attribute("copilot.user_message_length", len(chat_request.message or ""))
+            span.set_attribute("ember.turn_id", turn_id)
+        span.set_attribute("ember.user_message_length", len(chat_request.message or ""))
         if chat_request.workflow_copilot_chat_id:
-            span.set_attribute("copilot.session_id", chat_request.workflow_copilot_chat_id)
+            span.set_attribute("ember.session_id", chat_request.workflow_copilot_chat_id)
         if chat_request.workflow_permanent_id:
             span.set_attribute("workflow_permanent_id", chat_request.workflow_permanent_id)
         apply_context_attrs(span)
@@ -446,7 +446,7 @@ def _log_authoring_turn_summary(ctx: EmberContext | None) -> None:
 
     try:
         LOG.info(
-            "copilot_authoring_turn_summary",
+            "ember_authoring_turn_summary",
             code_blocks=ctx.authoring_capability.code_blocks,
             agent_blocks=ctx.authoring_capability.agent_blocks,
             workflow_permanent_id=ctx.workflow_permanent_id,
@@ -461,7 +461,7 @@ def _log_authoring_turn_summary(ctx: EmberContext | None) -> None:
             ),
         )
     except Exception:  # noqa: BLE001 - a measurement must never fail a turn on its way out
-        LOG.warning("Failed to log the copilot authoring turn summary", exc_info=True)
+        LOG.warning("Failed to log the ember authoring turn summary", exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -532,7 +532,7 @@ async def _resolve_live_browser_session_id(
         )
     except Exception as exc:
         LOG.warning(
-            "Copilot browser session ownership lookup failed; falling back to auto-create",
+            "Ember browser session ownership lookup failed; falling back to auto-create",
             organization_id=organization_id,
             requested_session_id=requested,
             error_type=type(exc).__name__,
@@ -544,14 +544,14 @@ async def _resolve_live_browser_session_id(
     # An await added between these two checks would make that handler fail open.
     if debug_session is None:
         LOG.warning(
-            "Copilot received an unknown browser_session_id; ignoring",
+            "Ember received an unknown browser_session_id; ignoring",
             organization_id=organization_id,
             requested_session_id=requested,
         )
         return None
     if debug_session.workflow_permanent_id != chat_request.workflow_permanent_id:
         LOG.warning(
-            "Copilot browser_session_id is bound to a different workflow; ignoring",
+            "Ember browser_session_id is bound to a different workflow; ignoring",
             organization_id=organization_id,
             requested_session_id=requested,
             expected_wpid=chat_request.workflow_permanent_id,
@@ -567,7 +567,7 @@ async def _resolve_live_browser_session_id(
             registered_liveness = await _registered_browser_state_liveness(requested, organization_id, ctx)
         if registered_liveness == BrowserProbeOutcome.could_not_determine:
             LOG.warning(
-                "Copilot browser session health signal unavailable; keeping the supplied session",
+                "Ember browser session health signal unavailable; keeping the supplied session",
                 organization_id=organization_id,
                 requested_session_id=requested,
             )
@@ -580,7 +580,7 @@ async def _resolve_live_browser_session_id(
             or (not has_live_browser and not has_registered_browser_state)
         ):
             LOG.warning(
-                "Copilot live browser session is not yet usable; falling back to auto-create",
+                "Ember live browser session is not yet usable; falling back to auto-create",
                 organization_id=organization_id,
                 requested_session_id=requested,
                 status=persistent.status if persistent else None,
@@ -590,14 +590,14 @@ async def _resolve_live_browser_session_id(
             return None
 
         LOG.info(
-            "Copilot reusing live browser session",
+            "Ember reusing live browser session",
             organization_id=organization_id,
             session_id=requested,
         )
         return requested
     except Exception as exc:
         LOG.warning(
-            "Copilot browser session liveness lookup failed; keeping the supplied session",
+            "Ember browser session liveness lookup failed; keeping the supplied session",
             organization_id=organization_id,
             requested_session_id=requested,
             error_type=type(exc).__name__,
@@ -741,7 +741,7 @@ async def _unseen_ember_test_packets(
                     workflow_permanent_id=ctx.workflow_permanent_id,
                 )
             except Exception:
-                LOG.warning("copilot_unseen_test_lookup_failed", test_run_id=run_id, exc_info=True)
+                LOG.warning("ember_unseen_test_lookup_failed", test_run_id=run_id, exc_info=True)
                 continue
         if binding.run is None or not _test_outcome_unseen(messages, run_id, binding.run.finished_at):
             continue
@@ -926,7 +926,7 @@ def _log_requested_output_producer_floor(rekeyed_paths: tuple[str, ...]) -> None
     if not rekeyed_paths:
         return
     LOG.info(
-        "copilot requested-output producer floor",
+        "ember requested-output producer floor",
         requested_output_floor_rekeyed_paths=list(rekeyed_paths),
         requested_output_floor_rekeyed_count=len(rekeyed_paths),
     )
@@ -958,7 +958,7 @@ def _reconcile_completion_criteria_on_context(
     )
     ctx.completion_criteria_turn_state = build_turn_state(snapshot, decision)
     record_criteria_lifecycle(ctx, decision.to_trace_data())
-    LOG.info("copilot completion criteria reconciled", **decision.to_trace_data())
+    LOG.info("ember completion criteria reconciled", **decision.to_trace_data())
     floored_criteria, floor_rekeyed_paths = apply_requested_output_producer_floor(decision.criteria)
     if decision.action == "adopt_stored" or floor_rekeyed_paths:
         policy.completion_criteria = list(floored_criteria)
@@ -1213,7 +1213,7 @@ def _code_authoring_repair_context_prompt(ctx: EmberContext | None) -> str:
     if not isinstance(repair_context, CodeAuthoringRepairContext):
         return ""
     LOG.info(
-        "copilot code authoring repair context rendered",
+        "ember code authoring repair context rendered",
         reason_code=repair_context.reason_code,
         block_label=repair_context.block_label,
         unresolved_names=repair_context.unresolved_names,
@@ -1449,7 +1449,7 @@ def _recorded_build_test_outcome_prompt(ctx: EmberContext | None) -> str:
     if not isinstance(outcome, RecordedBuildTestOutcome):
         return ""
     LOG.info(
-        "copilot recorded build-test outcome rendered",
+        "ember recorded build-test outcome rendered",
         phase=outcome.phase,
         reason_code=outcome.reason_code,
         structural_key=outcome.structural_key,
@@ -1620,7 +1620,7 @@ def _recorded_build_test_outcome_prompt(ctx: EmberContext | None) -> str:
         scaffold_lines = observed_value_extraction_scaffold_lines(rendered_values, output_paths)
         lines.extend(scaffold_lines)
         LOG.info(
-            "copilot_observed_value_scaffold_surfaced",
+            "ember_observed_value_scaffold_surfaced",
             excerpt_len=len(rendered_values),
             output_path_count=len(output_paths),
             scaffold_line_count=len(scaffold_lines),
@@ -2160,7 +2160,7 @@ def _make_agent_result(
             turn_outcome = turn_outcome.model_copy(update={"output_files": output_files})
     if ctx is not None and _is_saved_workflow(ctx, kwargs.get("updated_workflow")):
         LOG.warning(
-            "copilot dropped saved workflow offered as a proposal",
+            "ember dropped saved workflow offered as a proposal",
             workflow_permanent_id=ctx.workflow_permanent_id,
             proposal_disposition=kwargs.get("proposal_disposition"),
         )
@@ -2537,7 +2537,7 @@ def _kept_unchanged_labels(ctx: EmberContext, proposal_yaml: str, fields: tuple[
 
 def _log_output_policy_parity(ctx: EmberContext, *, has_workflow_proposal: bool, workflow_attempted: bool) -> None:
     LOG.info(
-        "copilot.output_policy_parity",
+        "ember.output_policy_parity",
         has_workflow_proposal=has_workflow_proposal,
         workflow_attempted=workflow_attempted,
         **ctx.genuine_attempt_parity_fields(),
@@ -2642,12 +2642,12 @@ async def _run_end_to_end_test_turn(
         if not await ctx.stream.is_disconnected():
             await maybe_emit_design_start(ctx.stream, ctx)
     except Exception as emit_err:  # noqa: BLE001 - narrative emission is best-effort; the run still starts.
-        LOG.warning("copilot_test_end_to_end_design_start_emit_failed", error=str(emit_err))
+        LOG.warning("ember_test_end_to_end_design_start_emit_failed", error=str(emit_err))
     try:
         result = await run_workflow_end_to_end(ctx, workflow_yaml, seed_like_normal_run=True)
     except Exception as exc:
         LOG.warning(
-            "copilot_test_end_to_end_run_failed_before_result",
+            "ember_test_end_to_end_run_failed_before_result",
             workflow_permanent_id=ctx.workflow_permanent_id,
             turn_id=ctx.turn_id,
             error=str(exc),
@@ -2748,9 +2748,9 @@ async def _run_end_to_end_test_turn(
     try:
         await emit_test_end_to_end_activity(ctx.stream, ctx, call_id=call_id, started_at=started_at, result=sanitized)
     except Exception as emit_err:  # noqa: BLE001 - narrative emission is best-effort; the model handoff still runs.
-        LOG.warning("copilot_test_end_to_end_activity_emit_failed", error=str(emit_err))
+        LOG.warning("ember_test_end_to_end_activity_emit_failed", error=str(emit_err))
     LOG.info(
-        "copilot_test_end_to_end_turn_finished",
+        "ember_test_end_to_end_turn_finished",
         workflow_permanent_id=ctx.workflow_permanent_id,
         turn_id=ctx.turn_id,
         executed_block_labels=ctx.last_executed_block_labels,
@@ -2787,7 +2787,7 @@ async def _build_goal_satisfied_exit_result(
         try:
             await flush_goal_satisfied_tool_result(ctx.stream, ctx)
         except Exception as flush_err:
-            LOG.warning("copilot_goal_satisfied_tool_result_flush_failed", error=str(flush_err))
+            LOG.warning("ember_goal_satisfied_tool_result_flush_failed", error=str(flush_err))
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     # A run that produced the value is deliverable whether or not the chain was re-run from cold;
     # re-running a proven prefix to earn the claim costs a login and teaches the turn nothing.
@@ -2981,7 +2981,7 @@ def _render_blocker_reply(
         assert_clean_user_facing_text(user_response, blocked_tool=signal.blocked_tool)
     except ValueError as exc:
         LOG.warning(
-            "copilot blocker renderer template leaked; falling back",
+            "ember blocker renderer template leaked; falling back",
             error=str(exc),
             exit_site=exit_site,
             **blocker_signal_to_trace_data(signal),
@@ -2995,7 +2995,7 @@ try:
     assert_clean_user_facing_text(_FALLBACK_BLOCKER_REPLY)
 except ValueError as _fallback_validation_error:
     LOG.error(
-        "copilot _FALLBACK_BLOCKER_REPLY tripped the leak deny list at module load",
+        "ember _FALLBACK_BLOCKER_REPLY tripped the leak deny list at module load",
         error=str(_fallback_validation_error),
     )
 
@@ -3039,7 +3039,7 @@ def _verified_terminal_preserve_result(ctx: EmberContext, result: AgentResult, *
     if not verdict.allowed:
         return None
     LOG.info(
-        "copilot verified outcome preserved tested proposal over blocker",
+        "ember verified outcome preserved tested proposal over blocker",
         exit_site=exit_site,
         workflow_permanent_id=ctx.workflow_permanent_id,
     )
@@ -3115,7 +3115,7 @@ def _finalize_result_with_blocker_override(
     final_verdict = rendered_verdict
     if not rendered_verdict.allowed:
         LOG.warning(
-            "copilot blocker renderer output failed output policy; falling back",
+            "ember blocker renderer output failed output policy; falling back",
             output_policy_reasons=[code.value for code in rendered_verdict.reason_codes],
             exit_site=exit_site,
             **blocker_signal_to_trace_data(local_signal),
@@ -3134,7 +3134,7 @@ def _finalize_result_with_blocker_override(
         )
         if not final_verdict.allowed:
             LOG.error(
-                "copilot blocker fallback reply failed output policy; suppressing proposal",
+                "ember blocker fallback reply failed output policy; suppressing proposal",
                 fallback_reasons=[code.value for code in final_verdict.reason_codes],
                 exit_site=exit_site,
                 **blocker_signal_to_trace_data(local_signal),
@@ -3162,7 +3162,7 @@ def _finalize_result_with_blocker_override(
         )
 
     LOG.info(
-        "copilot blocker renderer finalization shim fired",
+        "ember blocker renderer finalization shim fired",
         exit_site=exit_site,
         **blocker_signal_to_trace_data(local_signal),
     )
@@ -3379,7 +3379,7 @@ def _build_wip_exit_result(
     def _guard(text: str) -> tuple[str, TurnOutcome]:
         if contains_internal_machinery_leak(text):
             LOG.warning(
-                "copilot terminal output invariant replaced leaked text",
+                "ember terminal output invariant replaced leaked text",
                 terminal_reason=effective_terminal,
             )
             text = _observed_facts_halt_reply(ctx)
@@ -3664,7 +3664,7 @@ def _record_budget_drain_exhausted(ctx: EmberContext) -> None:
     ctx.ember_max_turns_exceeded = True
     start_monotonic = ctx.ember_run_start_monotonic
     LOG.warning(
-        "copilot_max_turns_exceeded",
+        "ember_max_turns_exceeded",
         limit=ctx.ember_config.max_turns if ctx.ember_config is not None else DEFAULT_MAX_TURNS,
         iteration=ctx.enforcement_pass_count,
         elapsed_seconds=round(_elapsed_run_seconds(ctx, start_monotonic), 3) if start_monotonic is not None else 0.0,
@@ -3694,7 +3694,7 @@ def _build_unexpected_error_exit_result(
         terminal_reason=UNEXPECTED_ERROR_TERMINAL_REASON,
     )
     LOG.warning(
-        "Copilot unexpected error translated to recoverable reply",
+        "Ember unexpected error translated to recoverable reply",
         failure_kind=failure.failure_kind,
         internal_error_id=failure.internal_error_id,
         exception_type=failure.exception_type,
@@ -3707,13 +3707,13 @@ def _build_unexpected_error_exit_result(
         last_test_ok=getattr(ctx, "last_test_ok", None),
     )
     current_span = span or otel_trace.get_current_span()
-    current_span.set_attribute("copilot.error_recovered", True)
-    current_span.set_attribute("copilot.error_failure_kind", failure.failure_kind)
-    current_span.set_attribute("copilot.error_id", failure.internal_error_id)
+    current_span.set_attribute("ember.error_recovered", True)
+    current_span.set_attribute("ember.error_failure_kind", failure.failure_kind)
+    current_span.set_attribute("ember.error_id", failure.internal_error_id)
     if failure.exception_type:
-        current_span.set_attribute("copilot.error_exception_type", failure.exception_type)
-    current_span.set_attribute("copilot.error_reply_proposal_disposition", result.proposal_disposition)
-    current_span.set_attribute("copilot.error_workflow_modified", failure.workflow_modified)
+        current_span.set_attribute("ember.error_exception_type", failure.exception_type)
+    current_span.set_attribute("ember.error_reply_proposal_disposition", result.proposal_disposition)
+    current_span.set_attribute("ember.error_workflow_modified", failure.workflow_modified)
     return result
 
 
@@ -3790,7 +3790,7 @@ async def _resolve_wrapped_exception_exit_result(
         raise_if_turn_halt(ctx, verified=outcome_fully_verified(ctx))
     except EmberTurnHalt as halt_exc:
         LOG.info(
-            "Copilot run stopped after typed turn halt from wrapped exception",
+            "Ember run stopped after typed turn halt from wrapped exception",
             workflow_permanent_id=workflow_permanent_id,
             error_type=error_type,
             **turn_halt_to_trace_data(halt_exc.halt),
@@ -3799,7 +3799,7 @@ async def _resolve_wrapped_exception_exit_result(
     turn_halt = ctx.turn_halt
     if isinstance(turn_halt, TurnHalt):
         LOG.info(
-            "Copilot run stopped after typed turn halt from wrapped exception",
+            "Ember run stopped after typed turn halt from wrapped exception",
             workflow_permanent_id=workflow_permanent_id,
             error_type=error_type,
             **turn_halt_to_trace_data(turn_halt),
@@ -3809,13 +3809,13 @@ async def _resolve_wrapped_exception_exit_result(
         # The Agents SDK can wrap exceptions raised from hooks; keep this
         # fallback so a verified-goal stop is not rendered as a generic error.
         LOG.info(
-            "Copilot run stopped after verified goal satisfaction from wrapped exception",
+            "Ember run stopped after verified goal satisfaction from wrapped exception",
             workflow_permanent_id=workflow_permanent_id,
             workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
             error_type=error_type,
         )
         return await _build_goal_satisfied_exit_result(ctx, global_llm_context)
-    LOG.error("Copilot agent error", error=str(error), exc_info=True)
+    LOG.error("Ember agent error", error=str(error), exc_info=True)
     return _build_unexpected_error_exit_result(ctx, global_llm_context, error=error)
 
 
@@ -3842,7 +3842,7 @@ async def _verified_connected_account_choices(
         visible = await org_connections_by_id(organization_id, request_user_id(organization_id))
     except Exception:
         LOG.warning(
-            "copilot_connected_account_choice_lookup_failed",
+            "ember_connected_account_choice_lookup_failed",
             organization_id=organization_id,
             exc_info=True,
         )
@@ -3911,12 +3911,12 @@ async def _translate_to_agent_result(
     if resp_type not in EMBER_RESPONSE_TYPES:
         resp_type = "REPLY"
     if resp_type == "REPLACE_WORKFLOW" and (final_reply or budget_drain):
-        LOG.warning("copilot final reply suppressed inline workflow replacement")
+        LOG.warning("ember final reply suppressed inline workflow replacement")
         user_response = _with_inline_reject_note(user_response, FINAL_REPLY_UNAPPLIED_CHANGE_NOTE)
         resp_type = "REPLY"
     if resp_type == "ASK_QUESTION":
         LOG.info(
-            "copilot_ask_subject",
+            "ember_ask_subject",
             subject=coerce_ask_subject(action_data.get("ask_subject")),
             refs=parsed_ask_refs(action_data.get("refs")),
         )
@@ -3939,7 +3939,7 @@ async def _translate_to_agent_result(
         user_response = rendered_reply
         resp_type = rendered_resp_type
         LOG.info(
-            "copilot blocker renderer inline override",
+            "ember blocker renderer inline override",
             **blocker_signal_to_trace_data(local_blocker_signal),
         )
 
@@ -3948,10 +3948,10 @@ async def _translate_to_agent_result(
     dropped_notes_note: str | None = None
 
     if resp_type == "REPLACE_WORKFLOW" and ctx.eval_mode == EmberEvalMode.BROWSER_ABLATION:
-        LOG.warning("copilot browser ablation suppressed inline workflow replacement")
+        LOG.warning("ember browser ablation suppressed inline workflow replacement")
         resp_type = "REPLY"
     if resp_type == "REPLACE_WORKFLOW" and ctx.turn_origin == TurnOrigin.code_block_ai_fallback:
-        LOG.warning("copilot suppressed inline REPLACE_WORKFLOW on an AI fallback turn")
+        LOG.warning("ember suppressed inline REPLACE_WORKFLOW on an AI fallback turn")
         user_response = _with_inline_reject_note(
             user_response,
             "The code block AI fallback cannot update workflow definitions; retrying in read-only recovery mode.",
@@ -4021,7 +4021,7 @@ async def _translate_to_agent_result(
                 ctx.last_test_ok = None
             if composition_page_evidence_missing(ctx, workflow_yaml):
                 LOG.info(
-                    "copilot inline composition page evidence finding",
+                    "ember inline composition page evidence finding",
                     workflow_permanent_id=ctx.workflow_permanent_id,
                     target_url=workflow_target_url(workflow_yaml),
                 )
@@ -4106,7 +4106,7 @@ async def _translate_to_agent_result(
                 # Nothing was stored, so the prior candidate stays on ctx and the reply says so
                 # rather than presenting a draft the next turn cannot find.
                 LOG.info(
-                    "copilot_inline_replace_candidate_publication_conflict",
+                    "ember_inline_replace_candidate_publication_conflict",
                     workflow_permanent_id=ctx.workflow_permanent_id,
                     reason=publication_conflict.reason,
                     error=str(publication_conflict),
@@ -4142,7 +4142,7 @@ async def _translate_to_agent_result(
                         await maybe_emit_design_end(ctx.stream, ctx)
                         await emit_workflow_draft(ctx.stream, ctx, last_workflow, include_workflow=False)
                     except Exception as emit_err:  # noqa: BLE001 - narrative emission is best-effort after durable custody.
-                        LOG.warning("copilot_narrative_inline_replace_emit_failed", error=str(emit_err))
+                        LOG.warning("ember_narrative_inline_replace_emit_failed", error=str(emit_err))
                     ctx.design_start_emitted = False
                     ctx.design_end_emitted = False
 
@@ -4240,7 +4240,7 @@ async def _translate_to_agent_result(
     )
     trace_data.update(output_policy_diagnostics)
     LOG.info(
-        "copilot output policy final verdict",
+        "ember output policy final verdict",
         **trace_data,
     )
     if not output_policy_verdict.allowed:
@@ -4440,7 +4440,7 @@ def _dump_model_attempt_packet(
                 json.dump(payload, packet_file, indent=2, sort_keys=True)
                 packet_file.write("\n")
     except Exception:
-        LOG.warning("Copilot model attempt capture failed", exc_info=True)
+        LOG.warning("Ember model attempt capture failed", exc_info=True)
 
 
 def _build_empty_completion_exit_result(
@@ -4548,7 +4548,7 @@ async def _run_agent_loop_with_surface(
     )
     ctx.discovery_mcp_server = mcp_server
     agent = Agent(
-        name="workflow-copilot",
+        name="ember",
         instructions=system_prompt,
         tools=native_tools,
         mcp_servers=[mcp_server],
@@ -4654,7 +4654,7 @@ async def _run_agent_loop_with_surface(
                 )
                 if isinstance(exc, routine_terminal_exceptions):
                     LOG.info(
-                        "Copilot agent model attempt stopped",
+                        "Ember agent model attempt stopped",
                         workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
                         llm_key=llm_key,
                         final_reply=final_reply,
@@ -4664,7 +4664,7 @@ async def _run_agent_loop_with_surface(
                     )
                 else:
                     LOG.warning(
-                        "Copilot agent model attempt failed",
+                        "Ember agent model attempt failed",
                         workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
                         llm_key=llm_key,
                         final_reply=final_reply,
@@ -4674,7 +4674,7 @@ async def _run_agent_loop_with_surface(
                     )
                 raise
             LOG.info(
-                "Copilot agent model attempt succeeded",
+                "Ember agent model attempt succeeded",
                 workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
                 llm_key=llm_key,
                 final_reply=final_reply,
@@ -4917,7 +4917,7 @@ def _build_ember_input_guardrails(
             }
         else:
             trace_data = {"surface": "agent_input", "blocked": False, "policy_present": False}
-        LOG.info("copilot request policy input guardrail verdict", **trace_data)
+        LOG.info("ember request policy input guardrail verdict", **trace_data)
         return GuardrailFunctionOutputCls(output_info=trace_data, tripwire_triggered=blocked)
 
     return [
@@ -4937,7 +4937,7 @@ def _build_ember_output_guardrails(
     def ember_output_policy_guardrail(context: Any, _agent: Any, agent_output: Any) -> Any:
         ctx = getattr(context, "context", None)
         if not isinstance(ctx, EmberContext):
-            LOG.warning("copilot output guardrail missing CopilotContext", context_type=type(ctx).__name__)
+            LOG.warning("ember output guardrail missing EmberContext", context_type=type(ctx).__name__)
             verdict = OutputPolicyVerdict(
                 allowed=False,
                 reason_codes=[OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING],
@@ -4957,13 +4957,13 @@ def _build_ember_output_guardrails(
             response_type=response_type,
         )
         trace_data.update(diagnostics)
-        LOG.info("copilot output policy guardrail verdict", **trace_data)
+        LOG.info("ember output policy guardrail verdict", **trace_data)
         return GuardrailFunctionOutputCls(output_info=trace_data, tripwire_triggered=not verdict.allowed)
 
     return [
         OutputGuardrailCls(
             guardrail_function=ember_output_policy_guardrail,
-            name="copilot_output_policy_guardrail",
+            name="ember_output_policy_guardrail",
         )
     ]
 
@@ -5041,9 +5041,9 @@ def _build_output_policy_blocked_result(
         "output-policy blocked final output: " + ", ".join(reason.value for reason in output_policy_reasons)
     )
     LOG.warning(
-        "copilot output policy blocked final output",
-        log_code="copilot_output_policy_block",
-        **{"copilot.output_policy_reasons": [reason.value for reason in output_policy_reasons]},
+        "ember output policy blocked final output",
+        log_code="ember_output_policy_block",
+        **{"ember.output_policy_reasons": [reason.value for reason in output_policy_reasons]},
     )
     add_saved_draft_copy = False
     fallback_user_response: str | None = None
@@ -5105,7 +5105,7 @@ def _build_output_policy_blocked_result(
         )
         if not composed_verdict.allowed:
             LOG.warning(
-                "copilot output-policy recorded-evidence fallback failed output policy; using generic fallback",
+                "ember output-policy recorded-evidence fallback failed output policy; using generic fallback",
                 output_policy_reasons=[code.value for code in composed_verdict.reason_codes],
             )
             final_user_response, output_policy_outcome = apply_repeated_reply_guard(
@@ -5257,7 +5257,7 @@ async def run_ember_agent(
                 raise
             except Exception as exc:
                 LOG.error(
-                    "Copilot turn unhandled error",
+                    "Ember turn unhandled error",
                     error_type=type(exc).__name__,
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
@@ -5331,7 +5331,7 @@ async def run_ember_agent(
         raise
     except Exception as exc:
         LOG.error(
-            "Copilot turn unhandled error",
+            "Ember turn unhandled error",
             error_type=type(exc).__name__,
             workflow_permanent_id=chat_request.workflow_permanent_id,
             workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
@@ -5578,7 +5578,7 @@ async def _run_ember_turn_impl(
     reusable_origin_inputs_text = _reusable_origin_inputs_text(last_run_seed_id, await reusable_origin_input_keys(ctx))
 
     LOG.info(
-        "copilot_authoring_capability_resolved",
+        "ember_authoring_capability_resolved",
         code_blocks=ctx.authoring_capability.code_blocks,
         agent_blocks=ctx.authoring_capability.agent_blocks,
         agent_step=ctx.authoring_capability.agent_step,
@@ -5629,7 +5629,7 @@ async def _run_ember_turn_impl(
     # Do not also attach it to the main Agent; the SDK would invoke it again and
     # duplicate policy telemetry.
     request_policy_guardrail_result = await request_policy_guardrails[0].run(
-        Agent(name="workflow-copilot-input-guardrail", instructions=""),
+        Agent(name="ember-input-guardrail", instructions=""),
         chat_request.message,
         RunContextWrapper(context=ctx),
     )
@@ -5655,7 +5655,7 @@ async def _run_ember_turn_impl(
     try:
         await emit_turn_start(stream, ctx)
     except Exception as emit_err:
-        LOG.warning("copilot_narrative_turn_start_emit_failed", error=str(emit_err))
+        LOG.warning("ember_narrative_turn_start_emit_failed", error=str(emit_err))
     copilot_test_packets = await _unseen_ember_test_packets(
         ctx,
         messages=safe_prior_user_messages,
@@ -5733,7 +5733,7 @@ async def _run_ember_turn_impl(
         if context_parse_failed:
             # A seed the model never sees must not still win the ladder, or the turn resolves
             # seeded while reasoning unseeded. Re-resolve as if no seed had been supplied.
-            LOG.warning("copilot_eval_entrypoint_seed_skipped", reason="unparsed_structured_context")
+            LOG.warning("ember_eval_entrypoint_seed_skipped", reason="unparsed_structured_context")
             ctx.resolved_discovery_entrypoint_url = resolve_turn_entrypoint_url(
                 eval_entrypoint_url=None,
                 in_turn_entrypoint=in_turn_entrypoint,
@@ -5760,7 +5760,7 @@ async def _run_ember_turn_impl(
     if chat_request.product_action == "test_end_to_end" and ctx.staged_workflow is None:
         # Without this gate the route-time proposal bytes would be staged, and the run would be created and then
         # refused at bind.
-        LOG.info("copilot_pending_proposal_test_refused", reason="proposal_not_restored")
+        LOG.info("ember_pending_proposal_test_refused", reason="proposal_not_restored")
         return _build_pending_proposal_test_refusal_result(ctx, global_llm_context, chat_request.workflow_yaml)
     account_pick_test = (
         account_pick_test_resume(prior_turn_outcome, chat_request.message, chat_request.selected_connected_account_id)
@@ -5776,7 +5776,7 @@ async def _run_ember_turn_impl(
         account_pick_test.proposal_revision,
         account_pick_test.proposal_workflow_run_id,
     ):
-        LOG.info("copilot_pending_proposal_test_refused", reason="offered_proposal_changed")
+        LOG.info("ember_pending_proposal_test_refused", reason="offered_proposal_changed")
         return _build_pending_proposal_test_refusal_result(
             ctx,
             global_llm_context,
@@ -5787,7 +5787,7 @@ async def _run_ember_turn_impl(
     if account_pick_test is not None and (
         request_policy is None or request_policy.selected_connected_account_id != account_pick_test.connection_id
     ):
-        LOG.info("copilot_pending_proposal_test_refused", reason="picked_account_not_active")
+        LOG.info("ember_pending_proposal_test_refused", reason="picked_account_not_active")
         return _build_pending_proposal_test_refusal_result(
             ctx,
             global_llm_context,
@@ -5972,7 +5972,7 @@ async def _run_ember_turn_impl(
     ctx.eval_native_tool_names = surface.ordered_native_names
     ctx.eval_mcp_tool_names = surface.ordered_mcp_names
     LOG.info(
-        "copilot_tool_surface_resolved",
+        "ember_tool_surface_resolved",
         tool_surface_identity=surface.identity.value,
         tool_surface_sha256=surface.sha256,
         eval_mode=eval_mode.value if eval_mode is not None else None,
@@ -6074,7 +6074,7 @@ async def _run_ember_turn_impl(
             initial_input.extend(direct_test_handoff)
 
     LOG.info(
-        "Starting copilot agent loop",
+        "Starting ember agent loop",
         workflow_permanent_id=chat_request.workflow_permanent_id,
         user_message_len=len(user_message),
         llm_key=llm_key,
@@ -6083,7 +6083,7 @@ async def _run_ember_turn_impl(
     trace_context: Any = contextlib.nullcontext()
     if is_tracing_enabled():
         trace_context = trace(
-            workflow_name="Copilot workflow",
+            workflow_name="Ember workflow",
             group_id=chat_request.workflow_copilot_chat_id,
             metadata={
                 "workflow_permanent_id": chat_request.workflow_permanent_id,
@@ -6146,7 +6146,7 @@ async def _run_ember_turn_impl(
         # flagged label. A second hit refuses.
         if _output_policy_verdict_from_guardrail_exception(exc).reason_codes != [OutputPolicyReason.RAW_SECRET_LEAK]:
             return _output_policy_blocked(exc)
-        LOG.info("copilot_raw_secret_reply_reasked")
+        LOG.info("ember_raw_secret_reply_reasked")
         try:
             _, _, withheld_reply = _final_output_policy_reply(exc.guardrail_result.agent_output)
             reply = await _run_attempt(
@@ -6166,12 +6166,12 @@ async def _run_ember_turn_impl(
                 final_reply=True,
             )
         except asyncio.CancelledError:
-            LOG.info("Copilot run cancelled")
+            LOG.info("Ember run cancelled")
             return _build_cancelled_exit_result(ctx, global_llm_context)
         except OutputGuardrailTripwireTriggered as reask_exc:
             return _output_policy_blocked(reask_exc)
         except Exception as reask_error:
-            LOG.warning("copilot_raw_secret_reply_reask_failed", error_type=type(reask_error).__name__)
+            LOG.warning("ember_raw_secret_reply_reask_failed", error_type=type(reask_error).__name__)
             return _output_policy_blocked(exc)
 
     async def _reply_after_budget_expiry() -> AgentResult:
@@ -6200,12 +6200,12 @@ async def _run_ember_turn_impl(
                 final_reply=True,
             )
         except asyncio.CancelledError:
-            LOG.info("Copilot run cancelled")
+            LOG.info("Ember run cancelled")
             return _build_cancelled_exit_result(ctx, global_llm_context)
         except OutputGuardrailTripwireTriggered as reply_exc:
             return _output_policy_blocked(reply_exc)
         except Exception as reply_error:
-            LOG.warning("copilot_budget_expiry_reply_failed", error_type=type(reply_error).__name__)
+            LOG.warning("ember_budget_expiry_reply_failed", error_type=type(reply_error).__name__)
             return _build_budget_expiry_exit_result(ctx, global_llm_context)
 
     # The model the turn is running on; a budget-expiry reply after a fallback must not go back to the
@@ -6225,7 +6225,7 @@ async def _run_ember_turn_impl(
                     if fallback_llm_key is None or not _is_retriable_llm_error(primary_error):
                         raise
                     LOG.warning(
-                        "Copilot agent model attempt failed; retrying fallback model",
+                        "Ember agent model attempt failed; retrying fallback model",
                         workflow_permanent_id=chat_request.workflow_permanent_id,
                         primary_llm_key=llm_key,
                         fallback_llm_key=fallback_llm_key,
@@ -6274,14 +6274,14 @@ async def _run_ember_turn_impl(
                             ),
                         )
                     except Exception as emit_err:
-                        LOG.warning("copilot_narrative_inline_replace_emit_failed", error=str(emit_err))
+                        LOG.warning("ember_narrative_inline_replace_emit_failed", error=str(emit_err))
                     ctx.design_start_emitted = False
                     ctx.design_end_emitted = False
                 return agent_result
             except asyncio.CancelledError:
                 # Re-raising would leave the route with ``agent_result is None``
                 # and skip its ``workflow_was_persisted`` rollback decision.
-                LOG.info("Copilot run cancelled")
+                LOG.info("Ember run cancelled")
                 return _build_cancelled_exit_result(ctx, global_llm_context)
             except InputGuardrailTripwireTriggered:
                 return _build_request_policy_clarification_result(
@@ -6294,7 +6294,7 @@ async def _run_ember_turn_impl(
                 return await _reask_after_withheld_secret_reply(exc)
             except EmberTurnHalt as exc:
                 LOG.info(
-                    "Copilot run stopped after typed turn halt",
+                    "Ember run stopped after typed turn halt",
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                     **turn_halt_to_trace_data(exc.halt),
                 )
@@ -6337,13 +6337,13 @@ async def _run_ember_turn_impl(
                         final_reply=True,
                     )
                 except asyncio.CancelledError:
-                    LOG.info("Copilot run cancelled")
+                    LOG.info("Ember run cancelled")
                     return _build_cancelled_exit_result(ctx, global_llm_context)
                 except OutputGuardrailTripwireTriggered as exc:
                     return _output_policy_blocked(exc)
                 except Exception as reply_error:
                     LOG.warning(
-                        "Copilot final reply after empty completion failed",
+                        "Ember final reply after empty completion failed",
                         reply_llm_key=reply_llm_key,
                         error_type=type(reply_error).__name__,
                         error=str(reply_error),
@@ -6351,7 +6351,7 @@ async def _run_ember_turn_impl(
                     return _build_empty_completion_exit_result(ctx, global_llm_context)
             except EmberUnrecoverableToolError as exc:
                 LOG.warning(
-                    "Copilot run halted on unrecoverable tool error",
+                    "Ember run halted on unrecoverable tool error",
                     tool_name=exc.tool_name,
                     error_message=exc.error_message,
                     organization_id=organization_id,
@@ -6359,7 +6359,7 @@ async def _run_ember_turn_impl(
                 return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc)
             except EmberNonRetriableNavError as exc:
                 LOG.warning(
-                    "Copilot run halted on non-retriable navigation error",
+                    "Ember run halted on non-retriable navigation error",
                     url=exc.url,
                     error_message=exc.error_message,
                     organization_id=organization_id,
@@ -6375,7 +6375,7 @@ async def _run_ember_turn_impl(
             record_gate_decision(ctx, gate_fields)
             goal_satisfied = gate_fields["gate_satisfied"]
         except Exception:
-            LOG.error("Copilot agent error", error=str(e), exc_info=True)
+            LOG.error("Ember agent error", error=str(e), exc_info=True)
             return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
         return await _resolve_wrapped_exception_exit_result(
             ctx,

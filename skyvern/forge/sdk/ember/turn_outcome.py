@@ -139,7 +139,7 @@ def apply_repeated_reply_guard(
     inherited = list(blocked_signatures)
     original_signature = compute_signature(final_text)
     if inherited and original_signature in inherited:
-        LOG.info("copilot_repeated_reply_observed", normalized_reply_signature=original_signature)
+        LOG.info("ember_repeated_reply_observed", normalized_reply_signature=original_signature)
     return final_text, build_turn_outcome(
         final_text,
         response_kind=attempted_kind,

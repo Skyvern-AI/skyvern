@@ -1117,7 +1117,7 @@ def _anchored_plan(
                 ]
             ctx.frontier_requires_own_browser = True
             LOG.info(
-                "copilot_frontier_start_requires_own_browser",
+                "ember_frontier_start_requires_own_browser",
                 frontier_start_label=frontier_start_label,
                 labels_to_execute=labels_to_execute,
             )
@@ -1345,7 +1345,7 @@ def _cross_version_block_shapes(definition: WorkflowDefinition, workflow_id: str
     try:
         normalized = ember_round_trip_definition(definition, workflow_id=workflow_id)
     except Exception as exc:
-        LOG.info("copilot_frontier_origin_producer_shape_unavailable", error_type=type(exc).__name__)
+        LOG.info("ember_frontier_origin_producer_shape_unavailable", error_type=type(exc).__name__)
         return None
     return {
         label: _producer_shape(_canonical_block_config(block)) for label, block in _blocks_by_label(normalized).items()
@@ -1743,7 +1743,7 @@ def inputs_only_read_by_deleted_block(label: str, stored_yaml: str, saved: Workf
         return sorted(candidates - keys_named_in(json.dumps(scan), candidates))
     except Exception as exc:  # noqa: BLE001 - an advisory scan must never fail the write it reports on.
         # No exc_info: a validation error quotes workflow values, which can include input defaults.
-        LOG.warning("copilot_deleted_block_input_scan_failed", error_type=type(exc).__name__)
+        LOG.warning("ember_deleted_block_input_scan_failed", error_type=type(exc).__name__)
         return []
 
 
@@ -1881,7 +1881,7 @@ def origin_definition_refusal(
 def logged_origin_refusal(
     detail: OriginOutputRefusalDetail, *, source: OutputSourceKind | None = None
 ) -> OriginOutputRefusalDetail:
-    LOG.info("copilot_frontier_origin_output_refused", **detail.as_payload(), **({"source": source} if source else {}))
+    LOG.info("ember_frontier_origin_output_refused", **detail.as_payload(), **({"source": source} if source else {}))
     return detail
 
 

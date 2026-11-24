@@ -115,7 +115,7 @@ class EmberRunHooks(RunHooksBase):
             self._ctx.open_step_run_ids.clear()
         except Exception:
             LOG.warning(
-                "CopilotRunHooks.on_llm_start counting failed",
+                "EmberRunHooks.on_llm_start counting failed",
                 **_ember_log_fields(self._ctx),
             )
 
@@ -136,7 +136,7 @@ class EmberRunHooks(RunHooksBase):
                 arm_credential_pause_gate(self._ctx)
         except Exception:
             LOG.warning(
-                "CopilotRunHooks.on_llm_end response accounting failed",
+                "EmberRunHooks.on_llm_end response accounting failed",
                 **_ember_log_fields(self._ctx),
             )
 
@@ -145,7 +145,7 @@ class EmberRunHooks(RunHooksBase):
             self._ctx.enforcement_pass_count += 1
         except Exception:
             LOG.warning(
-                "CopilotRunHooks.on_agent_start counting failed",
+                "EmberRunHooks.on_agent_start counting failed",
                 **_ember_log_fields(self._ctx),
             )
 
@@ -183,7 +183,7 @@ class EmberRunHooks(RunHooksBase):
 
             activity_entry: dict[str, Any] = {"tool": tool_name, "summary": summary}
             LOG.info(
-                "copilot tool completed",
+                "ember tool completed",
                 tool_name=tool_name,
                 ok=parsed.get("ok"),
                 summary=summary,
@@ -253,7 +253,7 @@ class EmberRunHooks(RunHooksBase):
             self._ctx.tool_activity.append(activity_entry)
         except Exception:
             LOG.warning(
-                "CopilotRunHooks.on_tool_end recording failed, skipping entry",
+                "EmberRunHooks.on_tool_end recording failed, skipping entry",
                 tool=getattr(tool, "name", None),
                 **_ember_log_fields(self._ctx),
             )
@@ -270,7 +270,7 @@ class EmberRunHooks(RunHooksBase):
             # The run record satisfying the ask is the model's cue to wrap up, not the
             # harness's cue to end the loop and speak for it.
             LOG.info(
-                "copilot tool satisfied goal; model composes the reply",
+                "ember tool satisfied goal; model composes the reply",
                 tool_name=tool_name,
                 workflow_run_id=(parsed.get("data") or {}).get("workflow_run_id")
                 if isinstance(parsed.get("data"), dict)

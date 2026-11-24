@@ -132,12 +132,12 @@ def _record_unrecoverable_tool_error_contract(ctx: EmberContext, tool_name: str,
     ctx.last_test_failure_reason = reason
     trace_data = contract.to_trace_data()
     LOG.warning(
-        "Copilot unrecoverable tool error stop",
+        "Ember unrecoverable tool error stop",
         tool_name=tool_name,
         error_reason=reason,
         **{f"diagnosis_repair_{key}": value for key, value in trace_data.items()},
     )
-    with ember_span("copilot_unrecoverable_tool_error", data={"tool_name": tool_name, **trace_data}):
+    with ember_span("ember_unrecoverable_tool_error", data={"tool_name": tool_name, **trace_data}):
         pass
 
 

@@ -3861,7 +3861,7 @@ async def _validated_pending_workflow_proposal(
         metadata is None or metadata.workflow_run_id != required_workflow_run_id
     ):
         LOG.info(
-            "copilot_pending_proposal_restore_rejected",
+            "ember_pending_proposal_restore_rejected",
             reason="associated_run_mismatch",
             workflow_permanent_id=ctx.workflow_permanent_id,
             required_workflow_run_id=required_workflow_run_id,
@@ -3876,7 +3876,7 @@ async def _validated_pending_workflow_proposal(
         )
         if canonical is None or not proposal_workflow_fingerprint_matches(canonical, metadata.canonical_fingerprint):
             LOG.info(
-                "copilot_pending_proposal_restore_rejected",
+                "ember_pending_proposal_restore_rejected",
                 reason="canonical_fingerprint_mismatch",
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 expected_canonical_fingerprint=metadata.canonical_fingerprint,
@@ -3901,7 +3901,7 @@ async def _validated_pending_workflow_proposal(
         inherited_code_version=canonical.code_version if canonical is not None else None,
     ):
         LOG.info(
-            "copilot_pending_proposal_restore_rejected",
+            "ember_pending_proposal_restore_rejected",
             reason="canvas_custody_mismatch",
             workflow_permanent_id=ctx.workflow_permanent_id,
         )
@@ -4098,7 +4098,7 @@ async def restore_pending_workflow_proposal(
     elif metadata is not None:
         ctx.settings_diverged_proposal_token = (metadata.owner_turn_id, metadata.revision)
         LOG.info(
-            "copilot_pending_proposal_settings_diverged",
+            "ember_pending_proposal_settings_diverged",
             workflow_permanent_id=ctx.workflow_permanent_id,
             proposal_owner_turn_id=metadata.owner_turn_id,
             proposal_revision=metadata.revision,
@@ -4138,7 +4138,7 @@ async def prior_draft_settings_match_stored_candidate(ctx: EmberContext) -> bool
             ctx.private_workflow_settings, safe_load_no_dates(stored_yaml), saved
         )
     except Exception:
-        LOG.warning("copilot_prior_draft_settings_check_failed", exc_info=True)
+        LOG.warning("ember_prior_draft_settings_check_failed", exc_info=True)
         return None
     return own == turn
 
@@ -4181,7 +4181,7 @@ async def adopt_stored_workflow_candidate(ctx: EmberContext) -> ProposalAdoption
                 outcome = "adopted"
     except Exception:
         LOG.warning(
-            "copilot_stored_candidate_adoption_read_failed",
+            "ember_stored_candidate_adoption_read_failed",
             workflow_permanent_id=ctx.workflow_permanent_id,
             exc_info=True,
         )
@@ -4242,7 +4242,7 @@ def _unseen_adoption_edit_refusal(ctx: EmberContext) -> dict[str, Any] | None:
     if adoption is None:
         return None
     LOG.info(
-        "copilot_candidate_publication_conflict",
+        "ember_candidate_publication_conflict",
         workflow_permanent_id=ctx.workflow_permanent_id,
         reason="token_changed",
         adoption=adoption,
@@ -4366,9 +4366,7 @@ def record_canonical_workflow_unavailable(
         facts["candidate_published"] = False
         facts["detail"] = CANONICAL_WORKFLOW_UNAVAILABLE_ERROR
     ctx.canonical_workflow_unavailable = facts
-    LOG.info(
-        "copilot_canonical_workflow_unavailable", workflow_permanent_id=error.workflow_permanent_id, refused=refused
-    )
+    LOG.info("ember_canonical_workflow_unavailable", workflow_permanent_id=error.workflow_permanent_id, refused=refused)
     return facts
 
 
@@ -4593,7 +4591,7 @@ async def _update_workflow(
     misbinding_findings = _credential_id_misbinding_findings(workflow_yaml)
     if misbinding_findings:
         LOG.info(
-            "copilot credential id misbinding finding",
+            "ember credential id misbinding finding",
             organization_id=ctx.organization_id,
             workflow_id=ctx.workflow_id,
             findings=misbinding_findings,
@@ -4726,7 +4724,7 @@ async def _update_workflow(
                     stale_owner_turn_id, stale_revision = ctx.proposal_owner_turn_id, ctx.proposal_revision
                     adoption = await adopt_stored_workflow_candidate(ctx)
                     LOG.info(
-                        "copilot_candidate_publication_conflict",
+                        "ember_candidate_publication_conflict",
                         workflow_permanent_id=ctx.workflow_permanent_id,
                         proposal_owner_turn_id=stale_owner_turn_id,
                         proposal_revision=stale_revision,
@@ -4790,7 +4788,7 @@ async def _update_workflow(
         try:
             dropped_next_block_links = _normalize_ember_yaml_with_dropped_links(workflow_yaml)[1]
         except Exception as normalize_err:  # noqa: BLE001 - normalization can raise validation and constructor errors.
-            LOG.warning("copilot_dropped_next_block_links_failed", error=str(normalize_err))
+            LOG.warning("ember_dropped_next_block_links_failed", error=str(normalize_err))
             dropped_next_block_links = []
         written_diffs: list[CodeWriteDiff] = []
         if isinstance(ctx, EmberContext):
@@ -4810,7 +4808,7 @@ async def _update_workflow(
                     stashed = ctx.pending_code_write_diffs.get(originating_call_id, [])
                     ctx.pending_code_write_diffs[originating_call_id] = [*stashed, *written_diffs]
             except Exception as diff_err:
-                LOG.warning("copilot_code_write_diff_failed", error=str(diff_err))
+                LOG.warning("ember_code_write_diff_failed", error=str(diff_err))
         if isinstance(ctx, EmberContext) and ctx.stream is not None:
             try:
                 await maybe_emit_design_end(ctx.stream, ctx)
@@ -4824,7 +4822,7 @@ async def _update_workflow(
                     tool_call_id=originating_call_id,
                 )
             except Exception as emit_err:
-                LOG.warning("copilot_narrative_workflow_draft_emit_failed", error=str(emit_err))
+                LOG.warning("ember_narrative_workflow_draft_emit_failed", error=str(emit_err))
         disposition = persistence_disposition(ctx)
         disposition_message = _PERSISTENCE_MESSAGES[disposition]
         data: dict[str, Any] = {
@@ -4872,7 +4870,7 @@ async def _update_workflow(
             )
         if stored_code or stored_code_withheld:
             LOG.info(
-                "copilot write returned stored code",
+                "ember write returned stored code",
                 returned_chars={label: len(code) for label, code in stored_code.items()},
                 withheld_labels=stored_code_withheld,
                 rewritten_labels=stored_code_rewritten,
@@ -4882,12 +4880,12 @@ async def _update_workflow(
         try:
             advisory_labels = _advisory_labels_by_diagnostic(changed_code_blocks, workflow_yaml)
         except Exception as advisory_err:
-            LOG.warning("copilot_advisory_code_block_diagnostics_failed", error=str(advisory_err))
+            LOG.warning("ember_advisory_code_block_diagnostics_failed", error=str(advisory_err))
             advisory_labels = {}
         try:
             scanner_labels = await _scanner_advisory_labels_by_message(changed_code_blocks, ctx.organization_id)
         except Exception as scanner_err:
-            LOG.warning("copilot_scanner_advisory_diagnostics_failed", error=str(scanner_err))
+            LOG.warning("ember_scanner_advisory_diagnostics_failed", error=str(scanner_err))
             scanner_labels = {}
         findings = _author_time_findings(
             schema_incompatibility=schema_incompatibility_finding,

@@ -140,7 +140,7 @@ _ACTIVE_MCP_BROWSER_CONTEXT: ContextVar[_ActiveMcpBrowserContext | None] = Conte
 class EmberBrowserSessionUnavailable(RuntimeError):
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
-        super().__init__("No browser context for copilot session")
+        super().__init__("No browser context for ember session")
 
 
 class EmberBrowserGenerationRetired(RuntimeError):
@@ -801,7 +801,7 @@ async def release_browser_driver_quietly(
     if still_attached > 0:
         _ATTACHED_TURNS_PER_SESSION[attached.session_id] = (still_attached, latest_browser_state)
         LOG.info(
-            "copilot_browser_driver_released",
+            "ember_browser_driver_released",
             session_id=attached.session_id,
             had_cached_driver=False,
             concurrent_turns_still_attached=still_attached,
@@ -855,7 +855,7 @@ async def release_browser_driver_quietly(
             raise
         return
     LOG.info(
-        "copilot_browser_driver_released",
+        "ember_browser_driver_released",
         session_id=attached.session_id,
         had_cached_driver=had_cached_driver,
     )
@@ -960,7 +960,7 @@ async def _mcp_browser_context_impl(
             # to LLM- or user-visible output -- but log it for operators.
             retiring = attachability == BrowserProbeOutcome.positively_unreachable
             LOG.warning(
-                "No browser context for copilot session",
+                "No browser context for ember session",
                 session_id=browser_session_id,
                 organization_id=ctx.organization_id,
                 attachability=attachability.value,
@@ -1366,7 +1366,7 @@ async def begin_turn_browser_renewal(ctx: AgentContext, session_id: str) -> None
         await app.BROWSER_MANAGER.begin_session_activity_renewal(session_id)
     except Exception:
         LOG.warning(
-            "Failed to start activity renewal for a copilot browser session",
+            "Failed to start activity renewal for an ember browser session",
             browser_session_id=session_id,
             organization_id=ctx.organization_id,
             exc_info=True,
@@ -1531,7 +1531,7 @@ async def _provision_browser_session(
             sc.run_id = ctx.browser_session_id
 
         LOG.info(
-            "Auto-created browser session for copilot",
+            "Auto-created browser session for ember",
             session_id=ctx.browser_session_id,
         )
         return None
@@ -1635,7 +1635,7 @@ async def _prestart_build_test_browser(
             )
         except Exception:
             LOG.warning(
-                "copilot_build_test_browser_prestart_failed",
+                "ember_build_test_browser_prestart_failed",
                 prestart_browser_session_id=prestart_ctx.browser_session_id,
                 exc_info=True,
             )
@@ -1648,12 +1648,12 @@ async def _prestart_build_test_browser(
         return None
     if failure is not None or session_id is None:
         LOG.info(
-            "copilot_build_test_browser_prestart_failed",
+            "ember_build_test_browser_prestart_failed",
             state=failure.state if failure is not None else None,
             prestart_browser_session_id=session_id,
         )
         return None
-    LOG.info("copilot_build_test_browser_prestarted", prestart_browser_session_id=session_id)
+    LOG.info("ember_build_test_browser_prestarted", prestart_browser_session_id=session_id)
     return PrestartedBrowser(session_id=session_id, ready_monotonic=time.monotonic())
 
 
@@ -1690,7 +1690,7 @@ def _start_prestart_discard(ctx: AgentContext, started: asyncio.Task[PrestartedB
         if prestarted is not None:
             session_id = prestarted.session_id
             await _close_build_test_prestart(ctx, session_id, reason=BrowserSessionCloseReason.aborted)
-        LOG.info("copilot_build_test_browser_prestart_discarded", reason=reason, prestart_browser_session_id=session_id)
+        LOG.info("ember_build_test_browser_prestart_discarded", reason=reason, prestart_browser_session_id=session_id)
 
     cleanup = asyncio.ensure_future(_discard())
     _DETACHED_TASKS.add(cleanup)
@@ -1712,7 +1712,7 @@ async def claim_build_test_prestart(ctx: AgentContext, proxy_location: ProxyLoca
         prestarted = await asyncio.shield(prestart.task)
         if prestarted is None:
             LOG.info(
-                "copilot_build_test_browser_prestart_discarded", reason="start_failed", prestart_browser_session_id=None
+                "ember_build_test_browser_prestart_discarded", reason="start_failed", prestart_browser_session_id=None
             )
             return None
         try:
@@ -1738,7 +1738,7 @@ async def claim_build_test_prestart(ctx: AgentContext, proxy_location: ProxyLoca
         # A start cancelled by turn end surfaces here through the shield; the test itself was not cancelled.
         if prestart.task.cancelled() and current is not None and not current.cancelling():
             LOG.info(
-                "copilot_build_test_browser_prestart_discarded", reason="turn_ended", prestart_browser_session_id=None
+                "ember_build_test_browser_prestart_discarded", reason="turn_ended", prestart_browser_session_id=None
             )
             return None
         # The pre-start is already off ctx, so without this a later failed test could start a second one.
@@ -1746,7 +1746,7 @@ async def claim_build_test_prestart(ctx: AgentContext, proxy_location: ProxyLoca
         raise
     except Exception:
         LOG.warning(
-            "copilot_build_test_browser_prestart_claim_failed",
+            "ember_build_test_browser_prestart_claim_failed",
             prestart_browser_session_id=prestarted.session_id if prestarted is not None else None,
             exc_info=True,
         )
@@ -1756,7 +1756,7 @@ async def claim_build_test_prestart(ctx: AgentContext, proxy_location: ProxyLoca
         _start_prestart_discard(ctx, prestart.task, "unavailable")
         return None
     LOG.info(
-        "copilot_build_test_browser_prestart_claimed",
+        "ember_build_test_browser_prestart_claimed",
         prestart_browser_session_id=prestarted.session_id,
         idle_seconds=round(max(0.0, time.monotonic() - prestarted.ready_monotonic), 1),
     )
@@ -1788,7 +1788,7 @@ def _record_browser_session_replacement(
     ctx.browser_session_continuity_deadline_expired = False
     ctx.browser_session_continuity_acquisition_failure = None
     LOG.info(
-        "Copilot replaced its browser session",
+        "Ember replaced its browser session",
         old_session_id=replacement.old_session_id,
         new_session_id=replacement.new_session_id,
         old_closed=replacement.old_closed,
@@ -2082,7 +2082,7 @@ async def _build_test_session_occupancy_stop(
 
     def _stop(reason: str) -> BuildTestConnectFailure:
         LOG.info(
-            "copilot_build_test_session_occupied",
+            "ember_build_test_session_occupied",
             session_id=session_id,
             organization_id=ctx.organization_id,
             occupier_runnable_id=holder_id,
@@ -2129,7 +2129,7 @@ async def _build_test_session_occupancy_stop(
         )
     except Exception:
         LOG.warning(
-            "copilot_build_test_supersede_cancel_failed",
+            "ember_build_test_supersede_cancel_failed",
             session_id=session_id,
             organization_id=ctx.organization_id,
             superseded_workflow_run_id=holder_id,
@@ -2148,7 +2148,7 @@ async def _build_test_session_occupancy_stop(
             workflow_run_id=holder_id,
         )
     LOG.info(
-        "copilot_build_test_session_superseded",
+        "ember_build_test_session_superseded",
         session_id=session_id,
         organization_id=ctx.organization_id,
         superseded_workflow_run_id=holder_id,

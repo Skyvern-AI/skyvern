@@ -369,7 +369,7 @@ def _mark_ember_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: in
     if already_marked:
         return
     LOG.warning(
-        "copilot_turn_deadline_expired",
+        "ember_turn_deadline_expired",
         elapsed_seconds=round(elapsed_seconds, 3),
         iteration=iteration,
         **pending_operation_fields(),
@@ -391,14 +391,14 @@ def _record_ember_cancellation(ctx: Any, start_time: float, iteration: int) -> N
         elapsed = _elapsed_run_seconds(ctx, start_time)
         ctx.ember_turn_cancelled_iteration = iteration
         LOG.warning(
-            "copilot_turn_cancelled",
+            "ember_turn_cancelled",
             elapsed_seconds=round(elapsed, 3),
             iteration=iteration,
             deadline_exceeded=ctx.ember_total_timeout_exceeded is True,
             **pending_operation_fields(),
         )
     except Exception:
-        LOG.exception("Failed to record a copilot turn cancellation", iteration=iteration)
+        LOG.exception("Failed to record an ember turn cancellation", iteration=iteration)
 
 
 class EmberNonRetriableNavError(Exception):
@@ -1085,7 +1085,7 @@ def _summarize_tool_arguments(args_json: str) -> str:
 
 def log_recent_tool_output_truncation(truncated_count: int, largest_original_chars: int, tool_names: list[str]) -> None:
     LOG.warning(
-        "copilot_recent_tool_output_truncated",
+        "ember_recent_tool_output_truncated",
         truncated_count=truncated_count,
         cap=_RECENT_TOOL_OUTPUT_CHAR_CAP,
         largest_original_chars=largest_original_chars,
@@ -1356,7 +1356,7 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
             seen_call_ids.add(call_id)
 
     LOG.info(
-        "copilot_aggressive_prune_pair_validity",
+        "ember_aggressive_prune_pair_validity",
         retained_tail=[_item_field(item, "type") for item in retained_tail],
         retained_skill_pairs=len(whole_call_ids),
         orphaned_output_dropped=orphaned_output_dropped,
@@ -1640,7 +1640,7 @@ async def _unrun_call_outputs(agent: Agent, ctx: EmberContext) -> dict[str, str]
     outputs = unrun_call_outputs(calls, offered)
     if outputs is not None:
         LOG.warning(
-            "copilot_unknown_tool_call",
+            "ember_unknown_tool_call",
             tool_names=sorted({call.name for call in calls if call.name not in offered}),
             call_count=len(calls),
         )
@@ -1752,7 +1752,7 @@ async def _run_budget_drain(
     )
     state.begin_drain()
     LOG.info(
-        "copilot_budget_drain_started",
+        "ember_budget_drain_started",
         source=state.source,
         drain_fingerprint=state.drain_fingerprint,
         staged_draft_id=state.staged_draft_id,
@@ -1798,7 +1798,7 @@ async def run_final_reply_drain(
 ) -> RunResultStreaming:
     state = ctx.budget_expiry_state
     expiry_snapshot = (state.source, state.hard_backstop_reached, ctx.ember_total_timeout_exceeded)
-    LOG.info("copilot_final_reply_drain_started", budget_expiry_source=state.source)
+    LOG.info("ember_final_reply_drain_started", budget_expiry_source=state.source)
     # Only `reply` is offered: any other call is rejected before its input checks run, and gets a result.
     reply_only = agent.clone(tools=[tool for tool in agent.tools if tool.name == REPLY_TOOL_NAME], mcp_servers=[])
     try:
@@ -1817,7 +1817,7 @@ async def run_final_reply_drain(
     except EmberTotalTimeoutError:
         # The hard backstop marks the turn budget-expired; this call is not a budget drain.
         state.source, state.hard_backstop_reached, ctx.ember_total_timeout_exceeded = expiry_snapshot
-        LOG.warning("copilot_final_reply_drain_turn_deadline_rolled_back")
+        LOG.warning("ember_final_reply_drain_turn_deadline_rolled_back")
         raise
 
 
@@ -1918,7 +1918,7 @@ def _requested_output_paths_for_ctx(ctx: AgentContext) -> set[str]:
         ctx.pre_run_gated_output_warning_fingerprint = warning_fingerprint
         if unregisterable:
             LOG.warning(
-                "copilot_pre_run_gated_output_criterion_without_path",
+                "ember_pre_run_gated_output_criterion_without_path",
                 count=len(unregisterable),
                 criterion_ids=[criterion.id for criterion in unregisterable],
                 outcomes=[criterion.outcome[:80] for criterion in unregisterable],
@@ -2074,7 +2074,7 @@ def record_scouted_output_coverage(
     else:
         provenance = "lexical"
     LOG.info(
-        "copilot_scouted_output_coverage_credited",
+        "ember_scouted_output_coverage_credited",
         newly_covered_paths=sorted(newly_covered),
         provenance=provenance,
         value_grounded_paths=sorted(value_grounded),
@@ -2297,7 +2297,7 @@ def record_reached_terminal_action_observation(ctx: AgentContext) -> None:
     if not newly_observed:
         return
     ctx.scout_observed_terminal_criterion_ids.update(newly_observed)
-    LOG.info("copilot_reached_terminal_action_observed", criterion_ids=sorted(newly_observed))
+    LOG.info("ember_reached_terminal_action_observed", criterion_ids=sorted(newly_observed))
 
 
 def _request_expects_unreached_terminal_action(ctx: AgentContext) -> bool:

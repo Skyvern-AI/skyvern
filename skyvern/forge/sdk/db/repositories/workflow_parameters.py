@@ -245,7 +245,7 @@ def _decode_completion_criteria_set(
             )
     except Exception:
         LOG.warning(
-            "copilot completion criteria set decode raised; treating row as unknown shape",
+            "ember completion criteria set decode raised; treating row as unknown shape",
             completion_criteria_set_id=row.completion_criteria_set_id,
             goal_epoch=row.goal_epoch,
             exc_info=True,
@@ -1403,7 +1403,7 @@ class WorkflowParametersRepository(BaseRepository):
             item.interaction_id for item in entry.question_interactions if credential_deletion_lease_expired(item, now)
         ]
         if expired:
-            LOG.warning("copilot_credential_deletion_lease_expired", interaction_ids=expired)
+            LOG.warning("ember_credential_deletion_lease_expired", interaction_ids=expired)
             entry.question_interactions = [
                 fail_unrecorded_credential_deletion(item) if item.interaction_id in expired else item
                 for item in entry.question_interactions
@@ -1791,7 +1791,7 @@ class WorkflowParametersRepository(BaseRepository):
         expired = [item.interaction_id for item in interactions if credential_deletion_lease_expired(item, now)]
         if not expired:
             return interactions
-        LOG.warning("copilot_credential_deletion_lease_expired", interaction_ids=expired)
+        LOG.warning("ember_credential_deletion_lease_expired", interaction_ids=expired)
         settled = {
             interaction_id: await self._settle_credential_deletion(
                 organization_id, chat_id, interaction_id, fail_unrecorded_credential_deletion
@@ -1818,7 +1818,7 @@ class WorkflowParametersRepository(BaseRepository):
                     raise
                 item = stored
             if item.status != "pending":
-                LOG.warning("copilot_credential_deletion_settled_after_resolution", interaction_id=interaction_id)
+                LOG.warning("ember_credential_deletion_settled_after_resolution", interaction_id=interaction_id)
                 return item
             resolved = settle(item)
             if entry is not None:
@@ -2484,7 +2484,7 @@ class WorkflowParametersRepository(BaseRepository):
                     message.attached_files = updated_attachments
             if found_file_ids != set(file_ids):
                 LOG.warning(
-                    "Could not persist every overlength Copilot video attachment",
+                    "Could not persist every overlength Ember video attachment",
                     missing_file_ids=sorted(set(file_ids) - found_file_ids),
                 )
             await session.commit()
@@ -2528,7 +2528,7 @@ class WorkflowParametersRepository(BaseRepository):
                     message.attached_files = updated_attachments
             if found_file_ids != set(artifacts):
                 LOG.warning(
-                    "Could not persist every Copilot video evidence artifact",
+                    "Could not persist every Ember video evidence artifact",
                     missing_file_ids=sorted(set(artifacts) - found_file_ids),
                 )
             await session.commit()

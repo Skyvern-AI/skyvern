@@ -109,7 +109,7 @@ def ensure_tracing_initialized() -> None:
         try:
             import logfire
         except ModuleNotFoundError:
-            LOG.warning("Copilot tracing requested but logfire is not installed")
+            LOG.warning("Ember tracing requested but logfire is not installed")
             _clear_sdk_trace_processors()
             _TRACING_INITIALIZED = True
             return
@@ -124,14 +124,14 @@ def ensure_tracing_initialized() -> None:
         except ImportError as exc:
             # `instrument_openai_agents` imports the optional `agents` SDK at call time;
             # self-hosted installs without it still need to boot under EMBER_TRACING_ENABLED.
-            LOG.warning("Copilot tracing requested but openai-agents SDK not installed", error=repr(exc))
+            LOG.warning("Ember tracing requested but openai-agents SDK not installed", error=repr(exc))
         _patch_agent_span_attributes()
         # Logfire instruments via OpenTelemetry independently of the SDK's
         # built-in trace processors.  Clear the default OpenAI exporter so it
         # doesn't attempt to send traces (fails with 403 for ZDR orgs).
         _clear_sdk_trace_processors()
         _TRACING_INITIALIZED = True
-        LOG.info("Initialized copilot tracing", exporter="logfire")
+        LOG.info("Initialized ember tracing", exporter="logfire")
 
 
 def _usage_field(obj: Any, *keys: str) -> Any:
@@ -346,13 +346,13 @@ def _patch_agent_span_attributes() -> None:
                             # the raw value rather than emitting unredacted input to the
                             # trace backend.
                             attrs["input"] = "[redacted: serialization error]"
-                            LOG.warning("Copilot tool-call input redaction failed", error=repr(exc))
+                            LOG.warning("Ember tool-call input redaction failed", error=repr(exc))
                 if attrs.get("name") == SAVE_ORG_SKILL_TOOL_NAME and "output" in attrs:
                     attrs["output"] = _SKILL_WRITE_TEXT_WITHHELD
             ctx = skyvern_context.current()
             if ctx is not None and ctx.copilot_session_id is not None:
                 if isinstance(span_data, (AgentSpanData, GenerationSpanData, FunctionSpanData)):
-                    attrs["copilot.session_id"] = ctx.copilot_session_id
+                    attrs["ember.session_id"] = ctx.copilot_session_id
             return attrs
 
         _oai_mod.attributes_from_span_data = _patched

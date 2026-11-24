@@ -194,11 +194,11 @@ def _record_discovery_resolution_on_ctx(ctx: Any, result: Mapping[str, Any]) -> 
         current_span = otel_trace.get_current_span()
         if ctx.resolved_discovery_entrypoint_url is not None:
             current_span.set_attribute(
-                "copilot.discovery_candidate_url",
+                "ember.discovery_candidate_url",
                 _redact_discovery_url_for_log(ctx.resolved_discovery_entrypoint_url),
             )
         if ctx.resolved_discovery_failure_reason is not None:
-            current_span.set_attribute("copilot.discovery_failure_reason", ctx.resolved_discovery_failure_reason)
+            current_span.set_attribute("ember.discovery_failure_reason", ctx.resolved_discovery_failure_reason)
     except Exception:
         LOG.debug("Unable to set discovery resolution span attributes", exc_info=True)
 

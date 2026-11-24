@@ -348,7 +348,7 @@ async def narrator_poll_tick(
         try:
             blocks = await fetch_block_statuses()
         except Exception:
-            LOG.debug("copilot narrator block-status fetch failed", exc_info=True)
+            LOG.debug("ember narrator block-status fetch failed", exc_info=True)
             blocks = None
 
         if blocks is not None:
@@ -410,7 +410,7 @@ async def narrator_poll_tick(
                         )
                     )
                 except Exception:
-                    LOG.debug("copilot block_progress send failed", exc_info=True)
+                    LOG.debug("ember block_progress send failed", exc_info=True)
 
     return NarratorPollTickResult(
         prior_block_ts=next_prior_block_ts,

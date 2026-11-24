@@ -161,7 +161,7 @@ async def _store_chat_screenshot(organization_id: str, chat_id: str, frame: Chat
     try:
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([upload_key])
     except BaseException:
-        LOG.warning("copilot_chat_screenshot_upload_incomplete", artifact_id=artifact_id)
+        LOG.warning("ember_chat_screenshot_upload_incomplete", artifact_id=artifact_id)
         raise
     return artifact_id
 
@@ -193,13 +193,13 @@ async def _drain_chat_screenshots(stream: EventSourceStream, ctx: EmberContext, 
                         )
                 except Exception as exc:
                     LOG.warning(
-                        "copilot_chat_screenshot_failed",
+                        "ember_chat_screenshot_failed",
                         workflow_copilot_chat_id=chat_id,
                         error_type=type(exc).__name__,
                         error=str(exc),
                     )
     except TimeoutError:
-        LOG.warning("copilot_chat_screenshot_save_timed_out", workflow_copilot_chat_id=chat_id, frames=len(frames))
+        LOG.warning("ember_chat_screenshot_save_timed_out", workflow_copilot_chat_id=chat_id, frames=len(frames))
 
 
 # Substring match over the unparsed argument buffer, covering JSON `"label": "x"` keys and YAML `label: x`
@@ -315,7 +315,7 @@ class _CodegenProgressTracker:
             finished_state = self._calls.pop(output_index, None) if output_index is not None else None
             if finished_state is not None:
                 LOG.info(
-                    "copilot_codegen_progress_summary",
+                    "ember_codegen_progress_summary",
                     tool_name=finished_state.tool_name,
                     n_deltas=finished_state.n_deltas,
                     chars=finished_state.chars,
@@ -334,7 +334,7 @@ class _CodegenProgressTracker:
         try:
             await maybe_emit_design_start(stream, ctx)
         except Exception as emit_err:
-            LOG.warning("copilot_narrative_design_start_emit_failed", error=str(emit_err))
+            LOG.warning("ember_narrative_design_start_emit_failed", error=str(emit_err))
 
         # Advance the throttle gate regardless of connection outcome: otherwise a
         # permanently disconnected client leaves last_emit_monotonic frozen and every
@@ -355,7 +355,7 @@ class _CodegenProgressTracker:
                 )
             )
         except Exception as emit_err:
-            LOG.warning("copilot_codegen_progress_emit_failed", error=str(emit_err))
+            LOG.warning("ember_codegen_progress_emit_failed", error=str(emit_err))
 
 
 def _code_repair_progress_text(parsed: dict[str, Any]) -> str | None:
@@ -425,7 +425,7 @@ async def stream_to_sse(
                 try:
                     await maybe_emit_design_start(stream, ctx)
                 except Exception as emit_err:
-                    LOG.warning("copilot_narrative_design_start_emit_failed", error=str(emit_err))
+                    LOG.warning("ember_narrative_design_start_emit_failed", error=str(emit_err))
 
             if event.name == "tool_called":
                 ctx.model_call_streamed_tool_call = True
@@ -973,7 +973,7 @@ async def _capture_actor_dispatch(
         filename = hashlib.sha256(presentation.call_id.encode()).hexdigest() + ".json"
         (directory / filename).write_text(json.dumps(record, indent=2, ensure_ascii=False))
     except Exception:
-        LOG.warning("copilot_actor_dispatch_capture_failed", turn_id=ctx.turn_id)
+        LOG.warning("ember_actor_dispatch_capture_failed", turn_id=ctx.turn_id)
 
 
 def _get_raw_field(raw: Any, key: str) -> Any:
@@ -1199,7 +1199,7 @@ async def emit_workflow_draft(
         try:
             workflow_dump = workflow.model_dump(mode="json")
         except Exception as dump_err:
-            LOG.warning("copilot_workflow_draft_serialization_failed", error=str(dump_err))
+            LOG.warning("ember_workflow_draft_serialization_failed", error=str(dump_err))
     drafted_at = datetime.now(timezone.utc)
     await stream.send(
         EmberWorkflowDraftUpdate(
@@ -1225,4 +1225,4 @@ async def emit_workflow_draft(
                     drafted_at=drafted_at,
                 )
         except Exception:
-            LOG.warning("copilot_pending_turn_draft_save_failed", turn_id=ctx.turn_id, exc_info=True)
+            LOG.warning("ember_pending_turn_draft_save_failed", turn_id=ctx.turn_id, exc_info=True)

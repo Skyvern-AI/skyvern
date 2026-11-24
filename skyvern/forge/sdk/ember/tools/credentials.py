@@ -259,7 +259,7 @@ async def canonicalize_named_connection_bindings(
         )
     except Exception:
         LOG.warning(
-            "copilot_connection_canonicalization_lookup_failed", organization_id=ctx.organization_id, exc_info=True
+            "ember_connection_canonicalization_lookup_failed", organization_id=ctx.organization_id, exc_info=True
         )
         connections = None
     known_ids = {connection.id for connection in connections or []}
@@ -303,7 +303,7 @@ async def canonicalize_named_connection_bindings(
     if changed:
         workflow_yaml = dump_workflow_yaml(parsed)
         LOG.info(
-            "copilot_connection_name_canonicalized",
+            "ember_connection_name_canonicalized",
             organization_id=ctx.organization_id,
             connection_ids=[fact["connection_id"] for fact in facts if fact["canonicalized"]],
         )
@@ -352,7 +352,7 @@ async def resolve_google_sheet_tabs_from_gid(
             if connection.active
         }
     except Exception:
-        LOG.warning("copilot_google_sheet_tab_lookup_failed", organization_id=ctx.organization_id, exc_info=True)
+        LOG.warning("ember_google_sheet_tab_lookup_failed", organization_id=ctx.organization_id, exc_info=True)
         active_ids = None
 
     # Reading tab titles discloses spreadsheet metadata, so it needs the same turn approval dispatch requires.
@@ -409,7 +409,7 @@ async def resolve_google_sheet_tabs_from_gid(
                 raise RuntimeError("tab lookup already failed for this spreadsheet")
         except Exception:
             LOG.warning(
-                "copilot_google_sheet_tab_lookup_failed",
+                "ember_google_sheet_tab_lookup_failed",
                 organization_id=ctx.organization_id,
                 connection_id=credential_id,
                 exc_info=True,
@@ -428,7 +428,7 @@ async def resolve_google_sheet_tabs_from_gid(
     if changed:
         workflow_yaml = dump_workflow_yaml(parsed)
         LOG.info(
-            "copilot_google_sheet_tab_resolved_from_gid",
+            "ember_google_sheet_tab_resolved_from_gid",
             organization_id=ctx.organization_id,
             labels=[fact["label"] for fact in facts if fact["resolved"]],
         )
@@ -591,7 +591,7 @@ async def admitted_connection_ids(
     except IncompleteConnectionRead as incomplete:
         connections, complete = incomplete.connections, False
     except Exception:
-        LOG.warning("copilot_connection_authority_lookup_failed", organization_id=organization_id, exc_info=True)
+        LOG.warning("ember_connection_authority_lookup_failed", organization_id=organization_id, exc_info=True)
         return set()
     active = {connection.id: connection for connection in connections if connection.active}
     return {
@@ -722,7 +722,7 @@ async def connected_account_choices(
     try:
         connections = await org_connections_by_id(organization_id, request_user_id(organization_id))
     except Exception:
-        LOG.warning("copilot_connected_account_recovery_lookup_failed", organization_id=organization_id, exc_info=True)
+        LOG.warning("ember_connected_account_recovery_lookup_failed", organization_id=organization_id, exc_info=True)
         return None
     blocked = set(blocked_ids)
     naming = [block for block in blocks if blocked & set(block_connection_refs(block))]
@@ -770,7 +770,7 @@ async def _triggered_agent_tool_names(
                 workflow_permanent_id=target, organization_id=organization_id
             )
         except Exception:
-            LOG.warning("copilot_triggered_workflow_read_failed", workflow_permanent_id=target, exc_info=True)
+            LOG.warning("ember_triggered_workflow_read_failed", workflow_permanent_id=target, exc_info=True)
             workflow = None
         if workflow is None:
             return tools | ACTING_ACCOUNT_TOOL_NAMES
@@ -1176,7 +1176,7 @@ async def _credential_ids_validation_error(credential_ids: list[str], ctx: Agent
         )
     except Exception:
         LOG.warning(
-            "Copilot tool failed to validate credential IDs",
+            "Ember tool failed to validate credential IDs",
             organization_id=ctx.organization_id,
             credential_ids=credential_ids,
             exc_info=True,
@@ -1358,7 +1358,7 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
     # does not implement a second English policy language beside the agent.
     if typed_resume_arm is None and reference not in grounded and (matches or not literal_reference):
         LOG.info(
-            "copilot_credential_reference_not_literal",
+            "ember_credential_reference_not_literal",
             reference_is_saved_credential=bool(matches),
             named_credential_id_count=len(policy.current_turn_named_credential_ids),
             auto_bound_credential_id_count=len(policy.auto_bound_credentials),
@@ -1384,7 +1384,7 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
             withdrawn = policy.record_named_login_not_found()
             data["page_login_binding"] = "off_for_this_turn"
             data["withdrawn_credential_ids"] = withdrawn
-            LOG.info("copilot_named_login_not_found", withdrawn_credential_ids=withdrawn)
+            LOG.info("ember_named_login_not_found", withdrawn_credential_ids=withdrawn)
         return {"ok": False, "data": data}
 
     credential = matches[0]
@@ -1408,7 +1408,7 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
         # set after this point, so deciding here would read it before the answer landed.
         policy.carry_cited_credential_ids.add(credential.credential_id)
     LOG.info(
-        "copilot_credential_reference_resolved",
+        "ember_credential_reference_resolved",
         credential_id=credential.credential_id,
         pass_arm=typed_resume_arm or "literal_in_current_user_turn",
     )

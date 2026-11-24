@@ -9357,7 +9357,7 @@ class WorkflowService:
 
             if getattr(workflow_run, "copilot_session_id", None):
                 with contained_effect(
-                    "publish Copilot origin-run runtime secrets",
+                    "publish Ember origin-run runtime secrets",
                     workflow_run_id=workflow_run.workflow_run_id,
                 ):
                     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(

@@ -316,7 +316,7 @@ def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
         left_parsed = urlparse(left)
         right_parsed = urlparse(right)
     except Exception as exc:
-        LOG.debug("copilot_same_page_url_parse_failed", left=left, right=right, error=str(exc))
+        LOG.debug("ember_same_page_url_parse_failed", left=left, right=right, error=str(exc))
         return False
     left_url = left_parsed._replace(fragment="").geturl().rstrip("/")
     right_url = right_parsed._replace(fragment="").geturl().rstrip("/")
@@ -552,7 +552,7 @@ async def _fallback_page_info(
     try:
         title = await asyncio.wait_for(_read(), timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS)
     except TimeoutError:
-        LOG.info("copilot page title read timed out", session_id=session_id, page_url=url)
+        LOG.info("ember page title read timed out", session_id=session_id, page_url=url)
     except Exception:
         pass
     # A document committed during title() would pair one document's url with another's title.
@@ -847,7 +847,7 @@ def _append_flow_evidence(ember_ctx: Any, evidence: dict[str, Any], *, reached_v
     if len(trajectory) > _MAX_FLOW_EVIDENCE:
         overflow_entry_count = len(trajectory) - _MAX_FLOW_EVIDENCE
         LOG.warning(
-            "copilot_flow_evidence_evicted",
+            "ember_flow_evidence_evicted",
             overflow_entry_count=overflow_entry_count,
             max_flow_evidence=_MAX_FLOW_EVIDENCE,
             retained_window_size=_MAX_FLOW_EVIDENCE,
@@ -1029,7 +1029,7 @@ async def _composition_get_structured_evidence_result(
             # hostile __str__ before the guarded read below could contain it.
             detail = _bounded_evidence_error_detail(exc)
             LOG.warning(
-                "copilot_composition_structured_extract_failed",
+                "ember_composition_structured_extract_failed",
                 error_type=type(exc).__name__,
                 detail_present=bool(detail),
             )
@@ -1045,7 +1045,7 @@ async def _composition_get_structured_evidence_result(
         return None, "structured page evidence was omitted at the MCP boundary"
     if not result.get("ok"):
         LOG.warning(
-            "copilot_composition_structured_extract_rejected",
+            "ember_composition_structured_extract_rejected",
             result_is_mapping=True,
             error_present=bool(result.get("error")),
         )
@@ -1138,7 +1138,7 @@ async def on_working_page(
             # unclassified one is named by type, and its text stays in the log.
             detail = (str(exc).rstrip(".") if isinstance(exc, BrowserAutomationError) else "") or type(exc).__name__
             LOG.warning(
-                "copilot native browser tool could not enter its browser",
+                "ember native browser tool could not enter its browser",
                 tool_name=tool_name,
                 browser_session_id=ctx.browser_session_id,
                 error_type=type(exc).__name__,

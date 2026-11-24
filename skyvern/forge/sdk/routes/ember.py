@@ -582,7 +582,7 @@ def _capture_ember_code_mode_opt_out(
         )
     except Exception:
         LOG.warning(
-            "Failed to capture copilot code mode opt-out event",
+            "Failed to capture ember code mode opt-out event",
             workflow_copilot_chat_id=workflow_copilot_chat_id,
             organization_id=organization_id,
             exc_info=True,
@@ -651,9 +651,7 @@ async def _ember_control_allowed(organization_id: str, starter_user_id: str | No
             get_request_principal(), organization_id, starter_user_id, control
         )
     except Exception:
-        LOG.warning(
-            "Copilot turn control check failed", organization_id=organization_id, control=control, exc_info=True
-        )
+        LOG.warning("Ember turn control check failed", organization_id=organization_id, control=control, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Copilot could not check whether you can do this. Retry shortly.",
@@ -692,7 +690,7 @@ async def _ember_turns_without_control(
                     get_request_principal(), organization_id, turn.starter_user_id, control
                 )
             except Exception:
-                LOG.warning("Copilot turn control check failed", organization_id=organization_id, exc_info=True)
+                LOG.warning("Ember turn control check failed", organization_id=organization_id, exc_info=True)
                 allowed = False
             allowed_by_starter[turn.starter_user_id] = allowed
         if not allowed_by_starter[turn.starter_user_id]:
@@ -721,7 +719,7 @@ async def _cancel_already_requested(cache: BaseCache | None, organization_id: st
     try:
         return bool(await cache.get(_ember_cancel_key(organization_id, cancel_token)))
     except Exception:
-        LOG.debug("Copilot cancel flag read failed; treating the turn as live", exc_info=True)
+        LOG.debug("Ember cancel flag read failed; treating the turn as live", exc_info=True)
         return False
 
 
@@ -823,12 +821,12 @@ async def _watch_for_cancel(
         try:
             flag = await cache.get(key)
         except Exception:
-            LOG.debug("Copilot cancel-watcher get failed; will retry", exc_info=True)
+            LOG.debug("Ember cancel-watcher get failed; will retry", exc_info=True)
             continue
         if flag:
             source = _coerce_cancel_source(flag)
             LOG.info(
-                "Copilot cancel signal observed; cancelling handler task",
+                "Ember cancel signal observed; cancelling handler task",
                 cancel_token=cancel_token,
                 organization_id=organization_id,
                 cancel_source=source,
@@ -853,12 +851,12 @@ async def _stop_older_live_turns(
         if not entry.cancel_token:
             continue
         key = _ember_cancel_key(organization_id, entry.cancel_token)
-        with contained_effect("copilot older-turn stop", workflow_copilot_chat_id=chat.workflow_copilot_chat_id):
+        with contained_effect("ember older-turn stop", workflow_copilot_chat_id=chat.workflow_copilot_chat_id):
             # A Stop click may already have written its gesture; keep it.
             if not await cache.get(key):
                 await cache.set(key, "superseded", ex=EMBER_CANCEL_TTL)
                 LOG.info(
-                    "copilot_turn_superseded",
+                    "ember_turn_superseded",
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                     turn_id=turn_id,
                     superseded_turn_id=entry.turn_id,
@@ -928,7 +926,7 @@ async def _ensure_terminal_frame(
     if already_emitted:
         return
     LOG.warning(
-        "Copilot turn ended without terminal frame",
+        "Ember turn ended without terminal frame",
         organization_id=organization_id,
         workflow_permanent_id=workflow_permanent_id,
         workflow_copilot_chat_id=workflow_copilot_chat_id,
@@ -948,7 +946,7 @@ async def _ensure_terminal_frame(
         )
     except BaseException:
         LOG.debug(
-            "Copilot fallback terminal frame send failed",
+            "Ember fallback terminal frame send failed",
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
             workflow_copilot_chat_id=workflow_copilot_chat_id,
@@ -1028,13 +1026,13 @@ def _record_recoverable_failure_span_attrs(
     proposal_disposition: ProposalDisposition,
 ) -> None:
     current_span = otel_trace.get_current_span()
-    current_span.set_attribute("copilot.error_recovered", True)
-    current_span.set_attribute("copilot.error_failure_kind", failure.failure_kind)
-    current_span.set_attribute("copilot.error_id", failure.internal_error_id)
+    current_span.set_attribute("ember.error_recovered", True)
+    current_span.set_attribute("ember.error_failure_kind", failure.failure_kind)
+    current_span.set_attribute("ember.error_id", failure.internal_error_id)
     if failure.exception_type:
-        current_span.set_attribute("copilot.error_exception_type", failure.exception_type)
-    current_span.set_attribute("copilot.error_workflow_modified", failure.workflow_modified)
-    current_span.set_attribute("copilot.error_reply_proposal_disposition", proposal_disposition)
+        current_span.set_attribute("ember.error_exception_type", failure.exception_type)
+    current_span.set_attribute("ember.error_workflow_modified", failure.workflow_modified)
+    current_span.set_attribute("ember.error_reply_proposal_disposition", proposal_disposition)
 
 
 def _http_exception_failure_kind(exc: HTTPException) -> EmberFailureKind | None:
@@ -1136,7 +1134,7 @@ async def _clear_proposed_workflow(chat: Any) -> None:
             # The row moved on: whatever holds it now is newer than the proposal being cleared,
             # and clearing is not worth failing the turn the user is waiting on.
             LOG.info(
-                "copilot_candidate_clear_conflict",
+                "ember_candidate_clear_conflict",
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             )
             return
@@ -1151,7 +1149,7 @@ async def _clear_proposed_workflow(chat: Any) -> None:
             # The branch above was chosen from an in-memory read; the row gained an owned
             # candidate since, and that candidate is newer than the one being cleared.
             LOG.info(
-                "copilot_candidate_clear_conflict",
+                "ember_candidate_clear_conflict",
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 branch="untyped",
             )
@@ -1388,7 +1386,7 @@ async def _persist_proposed_workflow_state(
                 # Losing this race means the stored candidate is already someone else's and is
                 # already correct. The turn gives up its claim and still delivers its reply.
                 LOG.info(
-                    "copilot_candidate_enrich_conflict",
+                    "ember_candidate_enrich_conflict",
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                     proposal_owner_turn_id=agent_result.proposal_owner_turn_id,
                     proposal_revision=agent_result.proposal_revision,
@@ -1406,7 +1404,7 @@ async def _persist_proposed_workflow_state(
                 )
                 if canonical is None:
                     LOG.warning(
-                        "copilot_candidate_publication_skipped_missing_canonical_workflow",
+                        "ember_candidate_publication_skipped_missing_canonical_workflow",
                         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                         workflow_permanent_id=chat.workflow_permanent_id,
                     )
@@ -1450,7 +1448,7 @@ async def _persist_proposed_workflow_state(
                 )
             except EmberProposalConflictError:
                 LOG.info(
-                    "copilot_candidate_publication_conflict",
+                    "ember_candidate_publication_conflict",
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 )
                 _discard_superseded_proposal(agent_result)
@@ -1645,7 +1643,7 @@ async def _persist_turn_messages(
     existing = await _assistant_row_for_turn(chat, turn_id) if turn_id is not None else None
     if existing is not None:
         LOG.info(
-            "Copilot turn already has an assistant row; skipping duplicate persist",
+            "Ember turn already has an assistant row; skipping duplicate persist",
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             turn_id=turn_id,
         )
@@ -2119,7 +2117,7 @@ async def _finalise_normal_turn(
         try:
             await _restore_workflow_definition(_rollback_target(original_workflow, agent_result), organization_id)
         except Exception:
-            LOG.warning("copilot restore failed in _finalise_normal_turn", exc_info=True)
+            LOG.warning("ember restore failed in _finalise_normal_turn", exc_info=True)
             restore_failed = True
 
     if not await _proposal_ownership_is_current(chat, agent_result):
@@ -2136,11 +2134,11 @@ async def _finalise_normal_turn(
     )
     if holding_run_id is not None:
         LOG.info(
-            "copilot auto-accept deferred while a run of the saved version is unfinished",
+            "ember auto-accept deferred while a run of the saved version is unfinished",
             auto_accept_deferred_reason="workflow_run_unfinished",
             holding_workflow_run_id=holding_run_id,
         )
-        otel_trace.get_current_span().set_attribute("copilot.auto_accept_deferred_reason", "workflow_run_unfinished")
+        otel_trace.get_current_span().set_attribute("ember.auto_accept_deferred_reason", "workflow_run_unfinished")
         agent_result.proposal_disposition = "review_tested"
         deferred = (
             _AUTO_ACCEPT_DEFERRED_FOR_UNFINISHED_RUN.format(workflow_run_id=holding_run_id)
@@ -2172,11 +2170,11 @@ async def _finalise_normal_turn(
             # Nothing landed, so there is nothing to roll back. The draft waits for a manual Accept, which
             # saves a new version and leaves the running group's version alone.
             LOG.info(
-                "copilot auto-accept deferred while a workflow run group runs this version",
+                "ember auto-accept deferred while a workflow run group runs this version",
                 auto_accept_deferred_reason="workflow_run_group_running",
             )
             otel_trace.get_current_span().set_attribute(
-                "copilot.auto_accept_deferred_reason", "workflow_run_group_running"
+                "ember.auto_accept_deferred_reason", "workflow_run_group_running"
             )
             agent_result.proposal_disposition = "review_tested"
             agent_result.user_response = f"{user_response}\n\n{_AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP}"
@@ -2187,17 +2185,17 @@ async def _finalise_normal_turn(
             # The folder check runs before any write, so nothing landed; keep the draft for review instead of
             # failing the turn, so the user can edit out the hidden reference.
             LOG.info(
-                "copilot auto-accept deferred by folder access",
+                "ember auto-accept deferred by folder access",
                 auto_accept_deferred_reason="workflow_folder_access",
             )
-            otel_trace.get_current_span().set_attribute("copilot.auto_accept_deferred_reason", "workflow_folder_access")
+            otel_trace.get_current_span().set_attribute("ember.auto_accept_deferred_reason", "workflow_folder_access")
             agent_result.proposal_disposition = "review_tested"
             agent_result.user_response = f"{user_response}\n\n{_AUTO_ACCEPT_DEFERRED_FOR_FOLDER_ACCESS}"
             user_response = agent_result.user_response
         except Exception:
             # Undo any mid-turn degraded write so a failed commit fails the turn
             # atomically instead of leaving canonical on a partial intermediate.
-            LOG.warning("copilot auto-accept commit failed; rolling back canonical", exc_info=True)
+            LOG.warning("ember auto-accept commit failed; rolling back canonical", exc_info=True)
             with contextlib.suppress(Exception):
                 await _restore_workflow_definition(_rollback_target(original_workflow, agent_result), organization_id)
             raise
@@ -2581,12 +2579,12 @@ def _account_pick_test_promotion(
         resume.proposal_owner_turn_id,
         resume.proposal_revision,
     ):
-        LOG.info("copilot_account_pick_test_refused", reason="offered_proposal_changed")
+        LOG.info("ember_account_pick_test_refused", reason="offered_proposal_changed")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ACCOUNT_PICK_PROPOSAL_CHANGED_REPLY)
     if metadata.workflow_run_id != resume.proposal_workflow_run_id:
         # A run was bound to the proposal after the picker was offered, so a re-pick on a carried picker must not
         # start another.
-        LOG.info("copilot_account_pick_test_not_resumed", reason="run_bound_since_picker")
+        LOG.info("ember_account_pick_test_not_resumed", reason="run_bound_since_picker")
         return None
     proposal_yaml = proposed_workflow.get(EMBER_PROPOSAL_YAML_KEY)
     if not isinstance(proposal_yaml, str) or resume.connection_id not in workflow_connection_ids(proposal_yaml):
@@ -2611,10 +2609,10 @@ def _account_pick_test_promotion(
             == resume.picker_canvas_fingerprint
         )
     ):
-        LOG.info("copilot_account_pick_test_not_resumed", reason="canvas_edited_since_picker")
+        LOG.info("ember_account_pick_test_not_resumed", reason="canvas_edited_since_picker")
         return None
     LOG.info(
-        "copilot_account_pick_test_resumed",
+        "ember_account_pick_test_resumed",
         proposal_owner_turn_id=resume.proposal_owner_turn_id,
         proposal_revision=resume.proposal_revision,
     )
@@ -2688,7 +2686,7 @@ def _ensure_ember_workflow_yaml(
             persisted_workflow_yaml = workflow_to_authoring_yaml(original_workflow)
         if persisted_workflow_yaml:
             LOG.warning(
-                "Copilot agent chat request had no workflow blocks; using persisted workflow YAML",
+                "Ember agent chat request had no workflow blocks; using persisted workflow YAML",
                 workflow_permanent_id=chat_request.workflow_permanent_id,
                 workflow_id=original_workflow.workflow_id,
                 submitted_workflow_yaml_length=len(chat_request.workflow_yaml or ""),
@@ -2725,7 +2723,7 @@ async def _new_ember_chat_post(
     async def stream_handler(raw_stream: EventSourceStream) -> None:
         stream = _FirstEventTimingStream(raw_stream, request_started_at, include_eval_cost=eval_cost_enabled)
         LOG.info(
-            "Workflow copilot agent chat request",
+            "Ember agent chat request",
             workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
             workflow_permanent_id=chat_request.workflow_permanent_id,
             workflow_run_id=chat_request.workflow_run_id,
@@ -2808,7 +2806,7 @@ async def _new_ember_chat_post(
             owned = await _claim_turn_finalisation(chat, turn_id)
             if not owned:
                 LOG.info(
-                    "Copilot turn finished after reconcile claimed it; leaving its interrupted row final",
+                    "Ember turn finished after reconcile claimed it; leaving its interrupted row final",
                     organization_id=organization.organization_id,
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                     turn_id=turn_id,
@@ -2826,7 +2824,7 @@ async def _new_ember_chat_post(
             try:
                 return await turn_still_owned()
             except Exception:
-                LOG.warning("Could not claim the copilot turn's finalisation", turn_id=turn_id, exc_info=True)
+                LOG.warning("Could not claim the ember turn's finalisation", turn_id=turn_id, exc_info=True)
                 return False
 
         def tracked_write(write: Coroutine[Any, Any, _T]) -> Awaitable[_T]:
@@ -2849,7 +2847,7 @@ async def _new_ember_chat_post(
             route_exit = "error"
             failure_kind_for_log = failure.failure_kind
             LOG.exception(
-                "Workflow copilot could not persist this turn's terminal row",
+                "Ember could not persist this turn's terminal row",
                 organization_id=organization.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat is not None else None,
                 diagnosed_failure_kind=failure.failure_kind,
@@ -3222,7 +3220,7 @@ async def _new_ember_chat_post(
             if not api_key:
                 failure_kind_for_log = "configuration"
                 LOG.warning(
-                    "Copilot cannot resolve an org API token; refusing to start the agent",
+                    "Ember cannot resolve an org API token; refusing to start the agent",
                     organization_id=organization.organization_id,
                     workflow_permanent_id=chat.workflow_permanent_id,
                 )
@@ -3320,7 +3318,7 @@ async def _new_ember_chat_post(
                 turn_id_for_log = exc.turn_id
                 terminal_frame_emitted = True
                 LOG.info(
-                    "Copilot duplicate turn rejected",
+                    "Ember duplicate turn rejected",
                     organization_id=organization.organization_id,
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
@@ -3492,7 +3490,7 @@ async def _new_ember_chat_post(
                     return
                 capture_code_mode_opt_out_after_persist()
                 LOG.info(
-                    "Workflow copilot agent turn cancelled",
+                    "Ember agent turn cancelled",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                     turn_id=turn_id,
@@ -3535,8 +3533,8 @@ async def _new_ember_chat_post(
                 await _recover_from_route_exception(
                     rejection,
                     restore_log_context="demonstration replay handler",
-                    translated_log_message="Demonstration replay refusal translated to recoverable workflow copilot reply",
-                    none_chat_log_message="Demonstration replay refused after the Copilot turn started",
+                    translated_log_message="Demonstration replay refusal translated to recoverable Ember reply",
+                    none_chat_log_message="Demonstration replay refused after the Ember turn started",
                     none_chat_user_message=rejection.detail,
                     failure_kind="server",
                 )
@@ -3544,7 +3542,7 @@ async def _new_ember_chat_post(
             route_exit = "refused"
             terminal_frame_emitted = True
             LOG.warning(
-                "Copilot demonstration replay claim refused",
+                "Ember demonstration replay claim refused",
                 status_code=rejection.status_code,
                 organization_id=organization.organization_id,
                 workflow_copilot_chat_id=(
@@ -3565,7 +3563,7 @@ async def _new_ember_chat_post(
             failure_kind_for_log = _http_exception_failure_kind(exc)
             http_exception_log = LOG.error if exc.status_code >= 500 else LOG.warning
             http_exception_log(
-                "Copilot turn failed with HTTPException",
+                "Ember turn failed with HTTPException",
                 status_code=exc.status_code,
                 detail=exc.detail,
                 organization_id=organization.organization_id,
@@ -3608,8 +3606,8 @@ async def _new_ember_chat_post(
             await _recover_from_route_exception(
                 exc,
                 restore_log_context="LLMProviderError handler",
-                translated_log_message="LLM provider error translated to recoverable workflow copilot reply",
-                none_chat_log_message="LLM provider error (workflow copilot)",
+                translated_log_message="LLM provider error translated to recoverable Ember reply",
+                none_chat_log_message="LLM provider error (Ember)",
                 none_chat_user_message="Failed to process your request. Please try again.",
                 failure_kind="provider",
             )
@@ -3670,7 +3668,7 @@ async def _new_ember_chat_post(
                     return
                 terminal_frame_emitted = True
                 LOG.info(
-                    "Workflow copilot agent cancelled by user before returning a result",
+                    "Ember agent cancelled by user before returning a result",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                     turn_id=turn_id,
@@ -3684,7 +3682,7 @@ async def _new_ember_chat_post(
                 # its shielded write owns this turn's row and wins; if it dies before
                 # committing, the pending turn is left for reconcile-on-read to recover.
                 LOG.info(
-                    "Workflow copilot agent task cancelled (operational or post-finalisation)",
+                    "Ember agent task cancelled (operational or post-finalisation)",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                     turn_id=turn_id,
@@ -3725,8 +3723,8 @@ async def _new_ember_chat_post(
             await _recover_from_route_exception(
                 exc,
                 restore_log_context="generic-error handler",
-                translated_log_message="Unexpected workflow copilot error translated to recoverable reply",
-                none_chat_log_message="Unexpected error in workflow copilot",
+                translated_log_message="Unexpected Ember error translated to recoverable reply",
+                none_chat_log_message="Unexpected error in Ember",
                 none_chat_user_message="An error occurred. Please try again.",
                 failure_kind="server",
             )
@@ -3746,9 +3744,9 @@ async def _new_ember_chat_post(
                 try:
                     await finalisation_fence.aclose()
                 except Exception:
-                    with contained_effect("copilot turn finalisation lock release failure", turn_id=turn_id):
+                    with contained_effect("ember turn finalisation lock release failure", turn_id=turn_id):
                         LOG.warning(
-                            "Could not release the copilot turn finalisation lock", turn_id=turn_id, exc_info=True
+                            "Could not release the ember turn finalisation lock", turn_id=turn_id, exc_info=True
                         )
                 if cancel_watcher is not None and not cancel_watcher.done():
                     cancel_watcher.cancel()
@@ -3776,9 +3774,9 @@ async def _new_ember_chat_post(
                 if cancelled_while_waiting:
                     raise asyncio.CancelledError
             finally:
-                with contained_effect("copilot turn outcome log"):
+                with contained_effect("ember turn outcome log"):
                     LOG.info(
-                        "Copilot turn outcome",
+                        "Ember turn outcome",
                         organization_id=organization.organization_id,
                         workflow_permanent_id=chat_request.workflow_permanent_id,
                         workflow_copilot_chat_id=(
@@ -4005,7 +4003,7 @@ async def ember_chat_audio(
     try:
         audio_bytes = await file.read(max_upload_bytes + 1)
     except Exception as exc:
-        LOG.exception("Failed to read workflow copilot dictation audio upload")
+        LOG.exception("Failed to read ember dictation audio upload")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to read audio file"
         ) from exc
@@ -4042,7 +4040,7 @@ async def ember_chat_audio(
     )
 
     LOG.info(
-        "Workflow copilot dictation audio upload",
+        "Ember dictation audio upload",
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization.organization_id,
@@ -4265,7 +4263,7 @@ async def _recover_interrupted_ember_turn(
         # Answering the turn here would strand canonical on the half-written draft
         # while history claims it was recovered; leave the marker for a later read.
         LOG.warning(
-            "Canonical restore failed while recovering an interrupted copilot turn",
+            "Canonical restore failed while recovering an interrupted ember turn",
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             turn_id=entry.turn_id,
             exc_info=True,
@@ -4290,7 +4288,7 @@ async def _recover_interrupted_ember_turn(
         executed_block_fingerprints={},
     )
     LOG.info(
-        "Recovered an interrupted copilot turn on read",
+        "Recovered an interrupted ember turn on read",
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
         turn_id=entry.turn_id,
     )
@@ -4357,7 +4355,7 @@ async def _reconcile_interrupted_ember_turns(chat: EmberChat, organization_id: s
             await _recover_interrupted_ember_turn(chat, organization_id, entry)
         except Exception:
             LOG.warning(
-                "Failed to recover an interrupted copilot turn",
+                "Failed to recover an interrupted ember turn",
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 turn_id=entry.turn_id,
                 exc_info=True,
@@ -4684,7 +4682,7 @@ async def ember_chat_history(
         try:
             may_read_runs = await app.AGENT_FUNCTION.role_allows(get_request_principal(), "workflow_run.read")
         except Exception:
-            LOG.warning("Copilot run read check failed", organization_id=organization.organization_id, exc_info=True)
+            LOG.warning("Ember run read check failed", organization_id=organization.organization_id, exc_info=True)
             may_read_runs = False
         if not may_read_runs:
             visible_questions = [
@@ -4851,7 +4849,7 @@ def _settled_credential_delete(credential_id: str, deletion: asyncio.Task[None])
         return CredentialDeleteOutcome(credential_id=credential_id, outcome="not_found")
     status_code = error.status_code if isinstance(error, HTTPException) else None
     LOG.warning(
-        "copilot_credential_deletion_failed",
+        "ember_credential_deletion_failed",
         credential_id=credential_id,
         error_type=type(error).__name__,
         status_code=status_code,
@@ -4861,7 +4859,7 @@ def _settled_credential_delete(credential_id: str, deletion: asyncio.Task[None])
 
 def _log_late_credential_delete(credential_id: str, deletion: asyncio.Task[None]) -> None:
     outcome = _settled_credential_delete(credential_id, deletion).outcome
-    LOG.warning("copilot_credential_deletion_late_outcome", credential_id=credential_id, outcome=outcome)
+    LOG.warning("ember_credential_deletion_late_outcome", credential_id=credential_id, outcome=outcome)
 
 
 async def _run_post_delete_hooks(hooks: BackgroundTasks) -> None:
@@ -4869,7 +4867,7 @@ async def _run_post_delete_hooks(hooks: BackgroundTasks) -> None:
         await hooks()
     except Exception:
         with contained_effect("credential deletion post-delete hook failure"):
-            LOG.warning("copilot_credential_deletion_post_delete_hooks_failed", exc_info=True)
+            LOG.warning("ember_credential_deletion_post_delete_hooks_failed", exc_info=True)
 
 
 async def _delete_one_credential(organization_id: str, credential_id: str) -> CredentialDeleteOutcome:
@@ -4888,7 +4886,7 @@ async def _delete_one_credential(organization_id: str, credential_id: str) -> Cr
     except Exception as exc:
         if not deletion.done():
             LOG.warning(
-                "copilot_credential_deletion_timed_out", credential_id=credential_id, error_type=type(exc).__name__
+                "ember_credential_deletion_timed_out", credential_id=credential_id, error_type=type(exc).__name__
             )
             deletion.add_done_callback(lambda finished: _log_late_credential_delete(credential_id, finished))
             return CredentialDeleteOutcome(credential_id=credential_id, outcome="failed")
@@ -4906,7 +4904,7 @@ async def _run_claimed_credential_deletion(
 
     outcomes = list(await asyncio.gather(*(delete(credential_id) for credential_id in credential_ids)))
     LOG.info(
-        "copilot_credential_deletion_finished",
+        "ember_credential_deletion_finished",
         interaction_id=interaction_id,
         outcomes={item.credential_id: item.outcome for item in outcomes},
     )
@@ -4921,12 +4919,12 @@ async def _record_credential_deletion(
         try:
             return await repo.record_ember_credential_deletion(organization_id, chat_id, interaction_id, outcomes)
         except Exception:
-            LOG.warning("copilot_credential_deletion_record_retry", interaction_id=interaction_id, exc_info=True)
+            LOG.warning("ember_credential_deletion_record_retry", interaction_id=interaction_id, exc_info=True)
             await asyncio.sleep(CREDENTIAL_DELETE_RECORD_RETRY_DELAY.total_seconds())
     try:
         return await repo.record_ember_credential_deletion(organization_id, chat_id, interaction_id, outcomes)
     except Exception:
-        LOG.warning("copilot_credential_deletion_record_failed", interaction_id=interaction_id, exc_info=True)
+        LOG.warning("ember_credential_deletion_record_failed", interaction_id=interaction_id, exc_info=True)
     # If the database itself is down this raises too, and the claim's lease resolves it later.
     return await repo.fail_ember_credential_deletion(organization_id, chat_id, interaction_id)
 
@@ -5044,7 +5042,7 @@ async def ember_steer(
         )
         recorded = await record(screened) or screened
     # Without the doorbell the turn never reads the message; the client then sends it as the next turn.
-    with contained_effect("copilot steer doorbell", workflow_copilot_chat_id=chat.workflow_copilot_chat_id):
+    with contained_effect("ember steer doorbell", workflow_copilot_chat_id=chat.workflow_copilot_chat_id):
         await app.CACHE.set(
             ember_steer_key(organization.organization_id, steer_request.cancel_token),
             recorded.steer_id,
@@ -5096,7 +5094,7 @@ async def ember_message_feedback(
         )
     except Exception:
         LOG.warning(
-            "Failed to capture copilot message feedback event",
+            "Failed to capture ember message feedback event",
             workflow_copilot_chat_id=message.workflow_copilot_chat_id,
             organization_id=organization.organization_id,
             exc_info=True,
@@ -5142,7 +5140,7 @@ async def ember_cancel(
         if cancelled_questions:
             return
         LOG.warning(
-            "Workflow copilot cancel attempted without cache",
+            "Ember cancel attempted without cache",
             organization_id=organization.organization_id,
         )
         raise HTTPException(
@@ -5189,7 +5187,7 @@ async def _resolve_manual_sign_in(
             )
     except Exception:
         save_failed = True
-        LOG.warning("copilot_credential_pause_sign_in_save_failed", exc_info=True)
+        LOG.warning("ember_credential_pause_sign_in_save_failed", exc_info=True)
     if not await finish_manual_sign_in(cache, claim=claim, signed_in=signed_in, **pause_ids):
         if signed_in is not None:
             await _hard_delete_created_profile_after_store_failure(
@@ -5336,7 +5334,7 @@ async def _credential_site_question(
         vault_sites = await vault_login_sites(credential)
     except Exception:
         # An unreadable vault entry asks nothing; the pause then admits or refuses the pick by its own checks.
-        LOG.info("copilot_credential_site_question_unavailable", credential_id=credential.credential_id, exc_info=True)
+        LOG.info("ember_credential_site_question_unavailable", credential_id=credential.credential_id, exc_info=True)
         return None
     try:
         question = await ask_credential_site(cache, credential=credential, vault_sites=vault_sites, **pause_ids)
@@ -5345,7 +5343,7 @@ async def _credential_site_question(
     if question is None:
         return None
     LOG.info(
-        "copilot_credential_site_question",
+        "ember_credential_site_question",
         credential_id=credential.credential_id,
         site=question.site,
         saved_sites=question.saved_sites,
@@ -5386,7 +5384,7 @@ async def _write_credential_site(
             else:
                 outcome = "written"
     except Exception:
-        LOG.warning("copilot_credential_site_change_write_failed", outcome=outcome, exc_info=True)
+        LOG.warning("ember_credential_site_change_write_failed", outcome=outcome, exc_info=True)
     if outcome != "refused":
         await record_request_audit_event(
             organization_id,
@@ -5438,9 +5436,7 @@ async def _change_credential_site(
     except Exception:
         if outcome == "refused":
             raise
-        LOG.warning(
-            "copilot_credential_site_change_finish_failed", credential_id=credential.credential_id, exc_info=True
-        )
+        LOG.warning("ember_credential_site_change_finish_failed", credential_id=credential.credential_id, exc_info=True)
         connected = False
     if outcome == "refused":
         raise HTTPException(
@@ -5448,7 +5444,7 @@ async def _change_credential_site(
             detail="This login's sites changed since the card asked. Pick it again.",
         )
     LOG.info(
-        "copilot_credential_site_changed",
+        "ember_credential_site_changed",
         credential_id=credential.credential_id,
         action=claim.answer.action,
         site_a=claim.answer.site_a or None,
@@ -5765,7 +5761,7 @@ async def _find_generated_credential(
 
 def _log_late_create(stored: asyncio.Future[Credential]) -> None:
     if not stored.cancelled() and stored.exception() is None:
-        LOG.warning("copilot_credential_generation_late_create", credential_id=stored.result().credential_id)
+        LOG.warning("ember_credential_generation_late_create", credential_id=stored.result().credential_id)
 
 
 _DETACHED_CREDENTIAL_CREATES: set[asyncio.Task[None]] = set()
@@ -5793,7 +5789,7 @@ async def _create_generated_credential(
     try:
         await hooks()
     except Exception:
-        LOG.warning("copilot_credential_generation_post_save_hooks_failed", exc_info=True)
+        LOG.warning("ember_credential_generation_post_save_hooks_failed", exc_info=True)
 
 
 # Every wait leaves the claim the same margin to finish in that the manual sign-in save does.
@@ -5858,7 +5854,7 @@ async def ember_credential_generate(
         )
     except Exception as exc:
         outcome = "rejected"
-        LOG.warning("copilot_credential_generation_rejected", error_type=type(exc).__name__)
+        LOG.warning("ember_credential_generation_rejected", error_type=type(exc).__name__)
     else:
         # A vault create cancelled midway can skip its own cleanup, so a timeout stops waiting but lets it finish.
         stored: asyncio.Future[Credential] = asyncio.get_running_loop().create_future()
@@ -5875,9 +5871,9 @@ async def ember_credential_generate(
             vault_error = exc.__cause__ if isinstance(exc, HTTPException) else None
             if isinstance(vault_error, VaultHttpException) and 400 <= vault_error.status_code < 500:
                 outcome = "rejected"
-                LOG.warning("copilot_credential_generation_rejected", vault_status=vault_error.status_code)
+                LOG.warning("ember_credential_generation_rejected", vault_status=vault_error.status_code)
             else:
-                LOG.warning("copilot_credential_generation_unconfirmed", error_type=type(exc).__name__)
+                LOG.warning("ember_credential_generation_unconfirmed", error_type=type(exc).__name__)
         if credential_id is None and outcome == "unknown":
             stored.add_done_callback(_log_late_create)
             try:
@@ -5886,8 +5882,8 @@ async def ember_credential_generate(
                     _claim_seconds_left(claim.deadline),
                 )
             except Exception:
-                LOG.warning("copilot_credential_generation_readback_failed", exc_info=True)
-            LOG.info("copilot_credential_generation_readback", credential_id=credential_id)
+                LOG.warning("ember_credential_generation_readback_failed", exc_info=True)
+            LOG.info("ember_credential_generation_readback", credential_id=credential_id)
     try:
         deadline = await finish_credential_generation(
             cache, claim=claim, credential_id=credential_id, outcome=outcome, **pause_ids
@@ -5895,10 +5891,10 @@ async def ember_credential_generate(
     except Exception:
         if credential_id is None:
             raise
-        LOG.warning("copilot_credential_generation_finish_failed", credential_id=credential_id, exc_info=True)
+        LOG.warning("ember_credential_generation_finish_failed", credential_id=credential_id, exc_info=True)
         deadline = None
     if credential_id is not None:
-        LOG.info("copilot_credential_generation_created", credential_id=credential_id, connected=bool(deadline))
+        LOG.info("ember_credential_generation_created", credential_id=credential_id, connected=bool(deadline))
         return EmberCredentialGenerateResult(
             result="connected" if deadline else "created_not_connected",
             credential_id=credential_id,
@@ -5944,7 +5940,7 @@ async def ember_clear_proposed_workflow(
     except EmberProposalConflictError:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal changed; reload required")
     LOG.info(
-        "Copilot proposal rejected",
+        "Ember proposal rejected",
         organization_id=organization.organization_id,
         workflow_permanent_id=cleared_chat.workflow_permanent_id,
         workflow_copilot_chat_id=clear_request.workflow_copilot_chat_id,
@@ -6112,7 +6108,7 @@ async def ember_suggest_goal(
     except Exception as exc:
         # A provider traceback can quote the prompt, which carries the block's code.
         LOG.warning(
-            "copilot_goal_suggestion_failed",
+            "ember_goal_suggestion_failed",
             organization_id=organization.organization_id,
             exception_type=type(exc).__name__,
         )

@@ -1274,7 +1274,7 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
         )
     except Exception:
         LOG.warning(
-            "copilot credential live-page admission",
+            "ember credential live-page admission",
             outcome="resolver_error",
             seam="page_observation",
         )
@@ -1989,7 +1989,7 @@ def _record_scouted_read(
     # inspection to the requested output. Report what owning the output by declaration alone would
     # bind, so the cost of that rule is known before it decides anything.
     LOG.info(
-        "copilot_scouted_read_attribution",
+        "ember_scouted_read_attribution",
         declared=bool(declared_output_path),
         attributed_by="declaration" if declared_output_path == output_path else "elimination",
         bound_output_path_present=bool(output_path),
@@ -2078,7 +2078,7 @@ async def _evaluate_post_hook(
     )
     if recorded is not None:
         LOG.info(
-            "copilot_scouted_read_recorded",
+            "ember_scouted_read_recorded",
             read_result_present=bool(recorded.get("read_result_shape")),
             read_output_path_present=bool(recorded.get("read_output_path")),
             witnessed_value_kept=bool(recorded.get("read_result_value")),
@@ -2089,14 +2089,14 @@ async def _evaluate_post_hook(
             data["claimed_output_without_a_single_value"] = claimed_path
             data["requested_output_designation_capability"] = requested_output_designation_capability([claimed_path])
             LOG.info(
-                "copilot_scouted_read_claimed_output_without_value",
+                "ember_scouted_read_claimed_output_without_value",
                 read_output_path_present=bool(claimed_path),
                 read_result_present=bool(recorded.get("read_result_shape")),
             )
     unread_requested = _unread_requested_output_paths(ctx)
     if unread_requested:
         data["requested_outputs_still_unread"] = unread_requested
-        LOG.info("copilot_requested_output_unread_after_read", unread_count=len(unread_requested))
+        LOG.info("ember_requested_output_unread_after_read", unread_count=len(unread_requested))
     if _ember_authoring_capability(ctx).code_blocks and _code_only_has_target_page_evidence(data):
         ctx.code_only_target_page_evidence_seen = True
     await _attach_evaluate_page_facts(ctx, result, url=url)

@@ -333,7 +333,7 @@ async def _replay_events(
 
     action_count = len(events)
     LOG.info(
-        "copilot_demonstration_replayed",
+        "ember_demonstration_replayed",
         action_count=action_count,
         sensitive_count=sensitive_count,
         credential_fill_count=credential_fill_count,
@@ -442,7 +442,7 @@ async def _persist_demonstration(
             },
         )
     except Exception:
-        LOG.warning("Copilot demonstration recording persistence failed", turn_id=ctx.turn_id, exc_info=True)
+        LOG.warning("Ember demonstration recording persistence failed", turn_id=ctx.turn_id, exc_info=True)
 
 
 async def _claim_replay(cache: BaseCache, ctx: EmberContext, demonstration_id: str) -> DemonstrationRecord:
@@ -450,7 +450,7 @@ async def _claim_replay(cache: BaseCache, ctx: EmberContext, demonstration_id: s
     async with cache.get_lock(demonstration_lock_key(ctx.organization_id, demonstration_id)):
         record = decode_demonstration_record(await cache.get(record_key))
         if record is None or record.workflow_permanent_id != ctx.workflow_permanent_id:
-            LOG.info("copilot_demonstration_replay_skipped", reason="unavailable")
+            LOG.info("ember_demonstration_replay_skipped", reason="unavailable")
             raise DemonstrationRejection(HTTPStatus.NOT_FOUND, "Unknown demonstration")
         await store_settled_demonstration(cache, ctx.organization_id, demonstration_id, record)
         if record.status in {"recording", "stopping"}:

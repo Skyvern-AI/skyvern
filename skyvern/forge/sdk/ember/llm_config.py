@@ -69,7 +69,7 @@ async def resolve_main_ember_handler(workflow_permanent_id: str | None, organiza
                 EMBER_PROMPT_TYPE, workflow_permanent_id, organization_id
             )
         except Exception as exc:
-            LOG.warning("main copilot PostHog lookup failed, falling back", error=str(exc))
+            LOG.warning("main ember PostHog lookup failed, falling back", error=str(exc))
             posthog_handler = None
         if posthog_handler is not None:
             return posthog_handler
@@ -86,7 +86,7 @@ async def resolve_ember_handler(workflow_permanent_id: str | None, organization_
                 EMBER_PROMPT_TYPE, workflow_permanent_id, organization_id
             )
         except Exception as exc:
-            LOG.warning("workflow copilot PostHog lookup failed, falling back", error=str(exc))
+            LOG.warning("ember PostHog lookup failed, falling back", error=str(exc))
             posthog_handler = None
         if posthog_handler is not None:
             return posthog_handler
@@ -103,7 +103,7 @@ async def resolve_fast_ember_handler(workflow_permanent_id: str | None, organiza
                 EMBER_FAST_PROMPT_TYPE, workflow_permanent_id, organization_id
             )
         except Exception as exc:
-            LOG.warning("fast copilot PostHog lookup failed, falling back", error=str(exc))
+            LOG.warning("fast ember PostHog lookup failed, falling back", error=str(exc))
             posthog_handler = None
         if posthog_handler is not None:
             return posthog_handler
