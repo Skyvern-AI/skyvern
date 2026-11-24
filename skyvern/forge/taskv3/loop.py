@@ -679,6 +679,66 @@ def _is_browser_gone(exc: BaseException) -> bool:
     return isinstance(exc, (MissingBrowserState, MissingBrowserStatePage))
 
 
+# The driver's actionability lines, as its own source logs them. Only these constants ever reach the model, never a
+# call-log line itself: every other line can quote page markup, locator text or the value being typed.
+_DRIVER_REASONS = (
+    "element is not visible",
+    "element is not enabled",
+    "element is not stable",
+    "element is not editable",
+    "element is outside of the viewport",
+    "element was detached from the DOM",
+    "did not find some options",
+    "option being selected is not enabled",
+)
+_RAISED_ERROR_CHARS = 1000
+_IN_FLIGHT_REASON = "the driver had started the action when the timeout came, so it may have gone through"
+_ACTION_DONE_REASON = "the action was performed, and the timeout came after it"
+_ECHOES_BEFORE_INPUT = ('fill("', 'elementHandle.type("')
+_DRAG_PRESS_HALF = ("performing move and down action", "move and down action done")
+
+
+def _raised_error_text(exc: BaseException, message: str) -> str:
+    head, driver_error, call_log = message.partition("\nCall log:")
+    if driver_error:
+        # A driver message's later lines can list page markup (a strict-mode violation lists every match).
+        head = head.partition("\n")[0]
+    text = f"tool_error: {type(exc).__name__}: {head.rstrip()[:_RAISED_ERROR_CHARS]}"
+    # Both progress sentences speak of the timeout; a driver error that failed outright (an unknown key) states neither.
+    timed_out = _is_driver_timeout(exc)
+    last_reason = None
+    for line in call_log.split("\n"):
+        # The driver indents and prefixes every entry; any other line continues a typed value it echoed, line breaks
+        # and all.
+        if not line.startswith("  "):
+            continue
+        line = line.lstrip()
+        count, times, rest = line.partition(" × ")
+        if times and count.isdigit():
+            entry = rest
+        elif line.startswith("- "):
+            entry = line[2:]
+        else:
+            continue
+        if entry.startswith(_ECHOES_BEFORE_INPUT):
+            # fill echoes before its actionability wait and type before focus, so neither says any text went in.
+            continue
+        # Last wins, but each phase supersedes what an earlier retry logged: a cleared blocker is stale once the press
+        # may have been sent.
+        if entry in _DRAG_PRESS_HALF:
+            # Only the press half of a drag; the drop has not run.
+            last_reason = None
+        elif entry.startswith('elementHandle.press("') or entry.startswith("performing "):
+            last_reason = _IN_FLIGHT_REASON if timed_out else None
+        elif entry.endswith("intercepts pointer events"):
+            last_reason = "another element intercepts pointer events"
+        elif entry.endswith(" action done"):
+            last_reason = _ACTION_DONE_REASON if timed_out else None
+        elif listed := next((r for r in _DRIVER_REASONS if entry.startswith(r)), None):
+            last_reason = listed
+    return f"{text} The driver last reported: {last_reason}." if last_reason else text
+
+
 def mark_is_filler(mark: Any) -> bool:
     # look() numbers marks from 1, so 0 addresses nothing: it is an upstream filling the optional slot,
     # not the model addressing by mark. `to_openai_tool` sets the `strict` key that provokes that, so
@@ -6180,8 +6240,10 @@ async def run_agent_tool_loop(
                         )
                         browser_gone = _is_browser_gone(exc)
                         raised_class = _raised_error_class(exc)
+                        # Scrub before cutting, or a hidden value spanning a line break leaves its first half behind.
+                        message = dispatch_ctx.hide_from_model(str(exc)) if dispatch_ctx is not None else str(exc)
                         result = with_request_record_of(
-                            ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
+                            ToolResult.error(_raised_error_text(exc, message), error_class=raised_class)
                         )
             tool_duration_seconds = time.monotonic() - tool_started_at
             st.tool_seconds += tool_duration_seconds
