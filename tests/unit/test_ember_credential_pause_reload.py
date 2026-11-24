@@ -10,6 +10,8 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
+from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.ember import agent as agent_module
 from skyvern.forge.sdk.ember import credential_pause as pauses
 from skyvern.forge.sdk.ember.config import EmberConfig
@@ -638,7 +640,8 @@ async def test_a_card_after_a_settled_sign_in_restores_alone_and_only_its_own_to
 
 
 @pytest.mark.asyncio
-async def test_a_done_whose_pause_ended_while_saving_discards_the_profile(sqlite_engine, monkeypatch):
+@pytest.mark.parametrize("delete_fails", [False, True], ids=["delete-succeeds", "delete-fails"])
+async def test_a_done_whose_pause_ended_while_saving_discards_the_profile(sqlite_engine, monkeypatch, delete_fails):
     _, client, ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch)
     cache = _FakeCache()
     monkeypatch.setattr(app, "CACHE", cache)
@@ -646,17 +649,27 @@ async def test_a_done_whose_pause_ended_while_saving_discards_the_profile(sqlite
     emitted = _sign_in_card_context(ctx, recovery=True)
     invocation: asyncio.Task | None = None
 
+    profiles = BrowserSessionsRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "browser_sessions", profiles)
+    profile = await profiles.create_browser_profile("org", "Sign-in", browser_profile_id="bp_signed_in")
+    profile_key = ("org", profile.browser_profile_id)
+    stored_profiles = {profile_key}
+    delete_attempts: list[tuple[str, str, bool]] = []
+
     async def save_while_the_turn_is_cancelled(**_kwargs):
         assert invocation is not None
         invocation.cancel()
         await asyncio.gather(invocation, return_exceptions=True)
-        return _signed_in_profile(), 2
+        return profile, 2
+
+    async def delete_browser_profile(organization_id: str, profile_id: str, *, hard_delete: bool) -> None:
+        delete_attempts.append((organization_id, profile_id, hard_delete))
+        if delete_fails:
+            raise OSError("synthetic object deletion failure")
+        stored_profiles.discard((organization_id, profile_id))
 
     monkeypatch.setattr(routes, "create_profile_from_running_session", save_while_the_turn_is_cancelled)
-    hard_delete = AsyncMock(return_value=True)
-    monkeypatch.setattr(routes, "_hard_delete_created_profile_after_store_failure", hard_delete)
-    storage = SimpleNamespace(delete_browser_profile=AsyncMock())
-    monkeypatch.setattr(app, "STORAGE", storage)
+    monkeypatch.setattr(app, "STORAGE", SimpleNamespace(delete_browser_profile=delete_browser_profile))
     client._transport.app.add_api_route("/credential-response", routes.ember_credential_response, methods=["POST"])
     async with client:
         invocation = asyncio.create_task(_request_credential("https://portal.example.com/login", "Login", ctx))
@@ -673,10 +686,9 @@ async def test_a_done_whose_pause_ended_while_saving_discards_the_profile(sqlite
         )
 
     assert done.status_code == 409
-    hard_delete.assert_awaited_once_with(organization_id="org", browser_profile_id="bp_signed_in")
-    storage.delete_browser_profile.assert_awaited_once_with(
-        organization_id="org", profile_id="bp_signed_in", hard_delete=True
-    )
+    assert await profiles.get_browser_profile(profile.browser_profile_id, "org", include_deleted=True) is None
+    assert delete_attempts == [(*profile_key, True)]
+    assert stored_profiles == ({profile_key} if delete_fails else set())
     response_key = pauses.credential_response_cache_key("org", card.workflow_copilot_chat_id, card.turn_id)
     assert response_key not in cache.store
 

@@ -10,6 +10,7 @@ auto-stamp.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,7 +21,11 @@ import structlog
 from playwright.async_api import BrowserContext, Locator, Page
 
 from skyvern.config import settings
+from skyvern.exceptions import UnknownErrorWhileCreatingBrowserContext
+from skyvern.forge.sdk.artifact.storage.base import BaseStorage, BrowserProfileSnapshot
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.encrypt.files import ArtifactDecryptionError
+from skyvern.forge.sdk.streaming.registries import DeferredCloseParams, _run_stream_finalizer
 from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
 from skyvern.webeye import browser_factory as factory_module
 from skyvern.webeye import display_recorder as dr
@@ -28,7 +33,10 @@ from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.profile_cookie_merge import write_signin_cookies
+from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.session_cookies import SESSION_COOKIES_FILENAME, read_persisted_session_cookies
 from tests.unit._chrome_profile_fixtures import history_row_counts, write_profile_with_prior_download
+from tests.unit.forge.sdk.artifact.storage.test_helpers import artifact_root
 
 
 @pytest.mark.asyncio
@@ -121,7 +129,7 @@ async def test_ordinary_local_creator_leaves_marker_false(monkeypatch: pytest.Mo
     assert artifacts.needs_cdp_frame_publisher is False
 
 
-def _factory_harness(monkeypatch: pytest.MonkeyPatch) -> None:
+def _factory_harness(monkeypatch: pytest.MonkeyPatch, *, storage: BaseStorage | None = None) -> None:
     monkeypatch.setattr(factory_module, "restore_session_cookies", AsyncMock())
     monkeypatch.setattr(factory_module, "restore_banked_cookies", AsyncMock())
     monkeypatch.setattr(factory_module, "set_browser_console_log", lambda **_: None)
@@ -139,10 +147,13 @@ def _factory_harness(monkeypatch: pytest.MonkeyPatch) -> None:
         def on_browser_context_abandoned(self, browser_context: Any) -> None:
             return None
 
-    class _FakeApp:
-        AGENT_FUNCTION = _FakeAgentFunction()
-
-    monkeypatch.setattr(factory_module, "app", _FakeApp())
+    monkeypatch.setattr(
+        factory_module,
+        "app",
+        SimpleNamespace(
+            AGENT_FUNCTION=_FakeAgentFunction(), STORAGE=storage if storage is not None else MagicMock(spec=BaseStorage)
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -304,7 +315,11 @@ async def test_headless_chromium_stamps_applied_browser_profile_id(
 ) -> None:
     from skyvern.forge import app
 
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=str(tmp_path / "profile")))
+    monkeypatch.setattr(
+        app.STORAGE,
+        "retrieve_browser_profile_snapshot",
+        AsyncMock(return_value=BrowserProfileSnapshot(str(tmp_path / "profile"))),
+    )
     monkeypatch.setattr(BrowserContextFactory, "update_chromium_browser_preferences", MagicMock())
     monkeypatch.setattr(
         BrowserContextFactory,
@@ -323,7 +338,7 @@ async def test_headless_chromium_stamps_applied_browser_profile_id(
     assert artifacts.applied_browser_profile_id == "bp_test"
 
     # Storage miss: the creator falls back to a temp dir and the field stays None.
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile_snapshot", AsyncMock(return_value=None))
     monkeypatch.setattr(factory_module, "make_run_temp_directory", lambda **_: str(tmp_path / "fresh"))
     _, artifacts_no_profile, _ = await factory_module._create_headless_chromium(
         playwright,
@@ -334,20 +349,40 @@ async def test_headless_chromium_stamps_applied_browser_profile_id(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize(
+    ("read_only", "case"),
+    [
+        pytest.param(False, "legacy", id="legacy-writable"),
+        pytest.param(True, "legacy", id="legacy-read-only"),
+        pytest.param(False, "headless", id="encrypted-headless"),
+        pytest.param(False, "headful", id="encrypted-headful"),
+        pytest.param(True, "headless", id="encrypted-read-only"),
+        pytest.param(False, "launch-failure", id="encrypted-launch-fallback"),
+        pytest.param(False, "restore-failure", id="encrypted-restore-failure"),
+        pytest.param(False, "close-failure", id="encrypted-unclean-close"),
+        pytest.param(False, "workflow", id="encrypted-workflow-owned-save"),
+        pytest.param(False, "relaunch", id="encrypted-workflow-relaunch"),
+        pytest.param(False, "relaunch-empty", id="encrypted-workflow-relaunch-empty-jar"),
+        pytest.param(False, "relaunch-failure", id="encrypted-workflow-relaunch-failure"),
+        pytest.param(False, "relaunch-cancel", id="encrypted-workflow-relaunch-cancelled"),
+        pytest.param(False, "stream", id="encrypted-stream-deferred-close"),
+        pytest.param(False, "session", id="encrypted-persistent-owner"),
+    ],
+)
 async def test_headless_chromium_runs_only_a_read_only_profile_on_a_copy(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, read_only: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, read_only: bool, case: str
 ) -> None:
-    from skyvern.forge import app
-
     monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(tmp_path / "sessions"))
     monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
+    if case != "legacy":
+        await _assert_encrypted_profile_close(monkeypatch, tmp_path, read_only, case)
+        return
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
     stored = tmp_path / "sessions" / "o_test" / "profiles" / "bp_test"
     (stored / "Default").mkdir(parents=True)
     (stored / "Default" / "Cookies").write_text("session=saved")
     storage = LocalStorage()
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", storage.retrieve_browser_profile)
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile_copy", storage.retrieve_browser_profile_copy)
+    monkeypatch.setattr(factory_module.app, "STORAGE", storage)
     monkeypatch.setattr(BrowserContextFactory, "update_chromium_browser_preferences", MagicMock())
     monkeypatch.setattr(
         BrowserContextFactory,
@@ -358,7 +393,7 @@ async def test_headless_chromium_runs_only_a_read_only_profile_on_a_copy(
     playwright = MagicMock()
     playwright.chromium.launch_persistent_context = AsyncMock(return_value=MagicMock())
 
-    _, artifacts, cleanup = await factory_module._create_headless_chromium(
+    context, artifacts, cleanup = await factory_module._create_headless_chromium(
         playwright,
         browser_profile_id="bp_test",
         organization_id="o_test",
@@ -366,6 +401,7 @@ async def test_headless_chromium_runs_only_a_read_only_profile_on_a_copy(
     )
 
     assert artifacts.applied_browser_profile_id == "bp_test"
+    assert not artifacts.capture_requires_encryption(context)
     browser_dir = Path(str(artifacts.browser_session_dir))
     assert (browser_dir.resolve() == stored.resolve()) is not read_only
     assert (browser_dir / "Default" / "Cookies").read_text() == "session=saved"
@@ -373,6 +409,193 @@ async def test_headless_chromium_runs_only_a_read_only_profile_on_a_copy(
         await cleanup()
     assert browser_dir.exists() is not read_only
     assert (stored / "Default" / "Cookies").read_text() == "session=saved"
+
+
+async def _assert_encrypted_profile_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, read_only: bool, case: str
+) -> None:
+    restore_session_cookies = factory_module.restore_session_cookies
+    storage = LocalStorage()
+    _factory_harness(monkeypatch, storage=storage)
+    monkeypatch.setattr(factory_module, "restore_session_cookies", restore_session_cookies)
+    monkeypatch.setattr(factory_module, "prepare_local_display_recording", AsyncMock())
+    monkeypatch.setattr(settings, "BROWSER_TYPE", "chromium-headful" if case == "headful" else "chromium-headless")
+    monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", (artifact_root(),))
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", True)
+    source = tmp_path / "source"
+    (source / "Default").mkdir(parents=True)
+    (source / "Default" / "Preferences").write_text("{}")
+    session_cookie = {"name": "session", "value": "before", "domain": "fixture.invalid", "path": "/", "expires": -1}
+    (source / SESSION_COOKIES_FILENAME).write_text(json.dumps([session_cookie]))
+    await storage.store_browser_profile("o_test", "bp_test", str(source))
+    (sealed,) = (tmp_path / "sessions" / "o_test" / "profiles").iterdir()
+    original = sealed.read_bytes()
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
+
+    playwright = _stub_local_launch(monkeypatch, tmp_path)
+    playwright.stop = AsyncMock()
+    context = MagicMock()
+    jar: list[dict] = []
+    context.add_cookies = AsyncMock(side_effect=jar.extend)
+    context.cookies = AsyncMock(side_effect=lambda: list(jar))
+    launched_path: Path | None = None
+    launches: list[Path] = []
+    previous_browser_closed = False
+    replacement_started = asyncio.Event()
+
+    async def launch(**kwargs: Any) -> Any:
+        nonlocal launched_path
+        launched_path = Path(kwargs["user_data_dir"])
+        launches.append(launched_path)
+        if len(launches) > 1 and case.startswith("relaunch"):
+            assert previous_browser_closed
+            assert (launched_path / "Default" / "Local Storage" / "fixture").read_text() == "live localStorage"
+            assert not jar  # A new browser context starts without the predecessor's in-memory cookie jar.
+            replacement_started.set()
+            if len(launches) == 2 and case == "relaunch-failure":
+                raise RuntimeError("replacement launch failed")
+            if len(launches) == 2 and case == "relaunch-cancel":
+                await asyncio.Future()
+            return replacement_context
+        if case == "launch-failure" and (launched_path / SESSION_COOKIES_FILENAME).exists():
+            raise RuntimeError("unable to open database file")
+        return context
+
+    async def close() -> None:
+        nonlocal previous_browser_closed
+        if case.startswith("relaunch"):
+            previous_browser_closed = True
+            jar.clear()
+        if case == "close-failure":
+            raise RuntimeError("close failed")
+        assert launched_path is not None
+        (launched_path / "browser-close-flush").write_text("closed")
+
+    context.close = AsyncMock(side_effect=close)
+    replacement_context = MagicMock()
+    replacement_context.pages = []
+    replacement_context.add_cookies = context.add_cookies
+    replacement_context.cookies = context.cookies
+    replacement_context.close = AsyncMock()
+    replacement_context.new_page = AsyncMock(return_value=MagicMock())
+    playwright.chromium.launch_persistent_context = AsyncMock(side_effect=launch)
+    kwargs = {"browser_profile_id": "bp_test", "organization_id": "o_test", "profile_read_only": read_only}
+    if case == "restore-failure":
+        sealed.write_bytes(original[:-1])
+        with pytest.raises(UnknownErrorWhileCreatingBrowserContext) as error:
+            await BrowserContextFactory.create_browser_context(playwright, **kwargs)
+        assert isinstance(error.value.__cause__, ArtifactDecryptionError)
+        assert launched_path is None and sealed.read_bytes() == original[:-1]
+        return
+
+    context, artifacts, cleanup = await BrowserContextFactory.create_browser_context(
+        playwright,
+        workflow_run_id="wr_test" if case in {"workflow", "stream"} or case.startswith("relaunch") else None,
+        browser_session_id="pbs_test" if case == "session" else None,
+        **kwargs,
+    )
+    assert launched_path is not None
+    assert artifacts.capture_requires_encryption(context) is (case != "launch-failure")
+    if case != "launch-failure":
+        assert jar == [session_cookie]
+    rotated = {**session_cookie, "value": "rotated"}
+    jar[:] = [rotated]
+    state = RealBrowserState(
+        pw=playwright, browser_context=context, browser_artifacts=artifacts, browser_cleanup=cleanup
+    )
+    if case.startswith("relaunch"):
+        from skyvern.forge.sdk.workflow import service as workflow_service
+
+        monkeypatch.setattr(workflow_service, "app", SimpleNamespace(STORAGE=storage))
+
+        local_state = launched_path / "Default" / "Local Storage" / "fixture"
+        local_state.parent.mkdir()
+        local_state.write_text("live localStorage")
+        if case == "relaunch-empty":
+            jar.clear()
+        expected_jar = list(jar)
+        artifacts.record_seed_profile_state([session_cookie], "original-etag")
+        artifacts._run_performed_fresh_login = True
+        original_cleanup = state.browser_cleanup
+        assert await state.close_current_open_page()
+        assert read_persisted_session_cookies(str(launched_path)) == expected_jar
+
+        async def replace() -> None:
+            await state.check_and_fix_state(workflow_run_id="wr_test", **kwargs_for_relaunch)
+
+        kwargs_for_relaunch = {"browser_profile_id": "bp_test", "organization_id": "o_test"}
+        if case == "relaunch-failure":
+            with pytest.raises(UnknownErrorWhileCreatingBrowserContext):
+                await replace()
+        elif case == "relaunch-cancel":
+            task = asyncio.create_task(replace())
+            await asyncio.wait_for(replacement_started.wait(), 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        if case in {"relaunch-failure", "relaunch-cancel"}:
+            assert state.browser_artifacts is artifacts and state.browser_cleanup is original_cleanup
+            assert artifacts._local_profile_working_dir == str(launched_path)
+            assert launched_path.exists() and sealed.read_bytes() == original
+        await replace()
+        assert all(path == launches[0] for path in launches)
+        assert jar == expected_jar
+        active = state.browser_artifacts
+        assert active is not artifacts and artifacts._local_profile_working_dir is None
+        assert active._seed_profile_encrypted and active._seed_profile_etag == "original-etag"
+        assert active.capture_requires_encryption(replacement_context)
+        assert active._capture_profile_seed == (replacement_context, True)
+        assert active._seed_cookie_snapshot == [session_cookie] and active._run_performed_fresh_login
+        assert active._local_profile_workflow_pending and not active._local_profile_context_closed
+        assert sealed.read_bytes() == original
+        assert await state.close()
+        assert active._local_profile_context_closed and launched_path.exists()
+        # Run the normal sink writer after browser close, as workflow cleanup does.
+        run = SimpleNamespace(
+            workflow_run_id="wr_test",
+            organization_id="o_test",
+            browser_sink_profile_id="bp_test",
+            browser_profile_id="bp_test",
+            browser_seed_source="picked",
+        )
+        from skyvern.forge.sdk.db.enums import WorkflowRunStatus
+
+        await workflow_service.WorkflowService()._persist_run_sink_profile_if_needed(
+            workflow_run=run,
+            browser_state=state,
+            close_browser_on_completion=True,
+            effective_workflow_run_status=WorkflowRunStatus.completed,
+            first_credential_save=False,
+        )
+        saved = await storage.retrieve_browser_profile_snapshot("o_test", "bp_test")
+        assert saved and saved.encrypted
+        assert read_persisted_session_cookies(saved.directory) == expected_jar
+        assert (Path(saved.directory) / local_state.relative_to(launched_path)).read_text() == "live localStorage"
+        return
+    if case == "stream":
+        from skyvern.forge import app
+
+        await state.close(close_browser_on_completion=False)
+        assert launched_path.exists()
+        artifacts._local_profile_workflow_pending = False
+        pages = {"wr_test": state}
+        monkeypatch.setattr(app, "BROWSER_MANAGER", SimpleNamespace(pages=pages, evict_page=pages.pop))
+        await _run_stream_finalizer("wr_test", DeferredCloseParams(True, None))
+    else:
+        await state.close()
+
+    saved = await storage.retrieve_browser_profile("o_test", "bp_test")
+    assert saved is not None
+    if read_only or case in {"close-failure", "launch-failure", "workflow", "stream", "session"}:
+        assert sealed.read_bytes() == original
+        assert read_persisted_session_cookies(saved) == [session_cookie]
+    else:
+        assert read_persisted_session_cookies(saved) == [rotated]
+        assert (Path(saved) / "browser-close-flush").read_text() == "closed"
+    if case not in {"launch-failure", "workflow"}:
+        assert not launched_path.exists()
+    if case == "workflow":
+        assert (launched_path / "browser-close-flush").exists()
 
 
 @pytest.mark.asyncio
@@ -559,7 +782,9 @@ async def test_saved_profile_launch_drops_prior_downloads_and_keeps_login_state(
 
     profile = tmp_path / "profile"
     write_profile_with_prior_download(profile)
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=str(profile)))
+    monkeypatch.setattr(
+        app.STORAGE, "retrieve_browser_profile_snapshot", AsyncMock(return_value=BrowserProfileSnapshot(str(profile)))
+    )
     playwright = _stub_local_launch(monkeypatch, tmp_path)
 
     await getattr(factory_module, creator_name)(playwright, browser_profile_id="bp_test", organization_id="o_test")
@@ -577,7 +802,7 @@ async def test_fresh_profile_launch_leaves_the_temp_profile_untouched(
 
     fresh = tmp_path / "fresh"
     write_profile_with_prior_download(fresh)
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile_snapshot", AsyncMock(return_value=None))
     monkeypatch.setattr(factory_module, "make_run_temp_directory", lambda **_: str(fresh))
     playwright = _stub_local_launch(monkeypatch, tmp_path)
 
@@ -596,7 +821,9 @@ async def test_saved_profile_with_unreadable_history_still_launches(
     profile = tmp_path / "profile"
     write_profile_with_prior_download(profile)
     (profile / "Default" / "History").write_bytes(b"not a sqlite database")
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=str(profile)))
+    monkeypatch.setattr(
+        app.STORAGE, "retrieve_browser_profile_snapshot", AsyncMock(return_value=BrowserProfileSnapshot(str(profile)))
+    )
     playwright = _stub_local_launch(monkeypatch, tmp_path)
 
     _, artifacts, _ = await factory_module._create_headless_chromium(

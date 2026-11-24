@@ -35,6 +35,7 @@ from skyvern.schemas.workflows import (
     CredentialParameterYAML,
     WorkflowDefinitionYAML,
 )
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 
@@ -1203,7 +1204,7 @@ async def test_clean_up_workflow_preserves_body_success_without_retrying_finally
     persist_browser_session = AsyncMock()
     service._persist_workflow_browser_session_if_needed = persist_browser_session  # type: ignore[method-assign]
     browser_cleanup_result = SimpleNamespace(
-        browser_state=object(),
+        browser_state=SimpleNamespace(browser_artifacts=BrowserArtifacts()),
         tasks=[],
         all_workflow_task_ids=[],
         child_workflow_run_ids=[],
