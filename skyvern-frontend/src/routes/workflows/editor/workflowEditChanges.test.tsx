@@ -93,15 +93,19 @@ function sawDataWrite() {
 
 // A loop/conditional header writes its measured height back into node data, so
 // it reaches onNodesChange as a `replace` exactly like a real edit. Closing the
-// studio's editor pane re-measures every header (SKY-13875).
-test("a header measurement does not mark the workflow dirty", async () => {
-  renderHarness({ _headerHeight: 240 });
+// studio's editor pane re-measures every header (SKY-13875), and a remounted
+// canvas rewrites the height it already had (SKY-21446).
+test.each([240, 180])(
+  "a header measurement of %i does not mark the workflow dirty",
+  async (height) => {
+    renderHarness({ _headerHeight: height });
 
-  // Wait for the write to actually reach React Flow so the assertion below
-  // can't pass just because nothing happened yet.
-  await waitFor(() => expect(sawDataWrite()).toBe(true));
-  expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
-});
+    // Wait for the write to actually reach React Flow so the assertion below
+    // can't pass just because nothing happened yet.
+    await waitFor(() => expect(sawDataWrite()).toBe(true));
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+  },
+);
 
 test("editing block data does mark the workflow dirty", async () => {
   renderHarness({ loopValue: "renamed_items" });
