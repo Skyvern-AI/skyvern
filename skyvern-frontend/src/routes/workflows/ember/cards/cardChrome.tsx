@@ -5,7 +5,7 @@ import { cn } from "@/util/utils";
 
 import { ICON_COLUMN } from "./cardLayout";
 
-export type PillTone = "green" | "amber" | "sky";
+export type PillTone = "green" | "amber" | "sky" | "neutral";
 
 const PILL_TONE_CLASSES: Record<PillTone, string> = {
   green:
@@ -13,6 +13,8 @@ const PILL_TONE_CLASSES: Record<PillTone, string> = {
   amber:
     "border-amber-500/30 bg-amber-500/15 text-amber-700 dark:text-amber-300",
   sky: "border-sky-500/30 bg-sky-500/15 text-sky-700 dark:text-sky-300",
+  neutral:
+    "border-slate-500/30 bg-slate-500/10 text-slate-600 dark:text-slate-300",
 };
 
 export function CardPill({

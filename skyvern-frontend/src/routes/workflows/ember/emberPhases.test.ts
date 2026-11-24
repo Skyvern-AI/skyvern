@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { AUTHORING_TOOLS, RUN_TOOLS, showPhaseChecklist } from "./emberPhases";
 import {
+  AUTHORING_TOOLS,
+  RUN_TOOLS,
+  failedOnlyOnRefusedAccess,
+  showPhaseChecklist,
+} from "./emberPhases";
+import {
+  BlockState,
   EMPTY_NARRATIVE,
   TurnNarrativeState,
   toolActivityDisplayLabel,
@@ -97,5 +103,56 @@ describe("showPhaseChecklist", () => {
 
   it("true for any live (non-terminal) turn once design has started", () => {
     expect(showPhaseChecklist(turn({ terminal: null }))).toBe(true);
+  });
+});
+
+describe("failedOnlyOnRefusedAccess", () => {
+  const block = (
+    workflowRunBlockId: string,
+    label: string,
+    failureCode?: string,
+    parentWorkflowRunBlockId?: string,
+  ): BlockState => ({
+    workflowRunBlockId,
+    parentWorkflowRunBlockId,
+    label,
+    blockType: "task",
+    state: "failed",
+    failureCode,
+    lastSeenIteration: 0,
+    activity: [],
+    startedAt: null,
+    endedAt: null,
+  });
+  const REFUSED = "copilot_test_run_unsupported";
+
+  it.each([
+    ["a refused top-level block", [block("b1", "gmail", REFUSED)], true],
+    [
+      "a loop whose only failed child was refused",
+      [block("l1", "loop"), block("b1", "gmail", REFUSED, "l1")],
+      true,
+    ],
+    [
+      "a loop with one refused child and one real failure",
+      [
+        block("l1", "loop"),
+        block("b1", "gmail", REFUSED, "l1"),
+        block("b2", "extract", undefined, "l1"),
+      ],
+      false,
+    ],
+    [
+      "a refused block beside a real top-level failure",
+      [block("b1", "gmail", REFUSED), block("b2", "extract")],
+      false,
+    ],
+    [
+      "a failed block with no code and no children",
+      [block("b1", "extract")],
+      false,
+    ],
+  ])("%s", (_, blocks, expected) => {
+    expect(failedOnlyOnRefusedAccess(turn({ blocks }))).toBe(expected);
   });
 });

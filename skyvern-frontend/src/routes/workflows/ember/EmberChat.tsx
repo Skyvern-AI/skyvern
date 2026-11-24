@@ -257,6 +257,7 @@ import {
   ReviewGateCard,
   getPendingReviewGateVerdict,
   getReviewGateVerdict,
+  proposalUsesConnectedGmail,
 } from "./cards/ReviewGateCard";
 import { TURN_ROW_INSET } from "./cards/cardLayout";
 import { CardFooter, CardHeader, EmberCard } from "./cards/cardChrome";
@@ -1794,6 +1795,10 @@ export function EmberChat({
   const [workPlan, setWorkPlan] = useState<string[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
+  const proposalUsesGmail = useMemo(
+    () => proposalUsesConnectedGmail(proposedWorkflow),
+    [proposedWorkflow],
+  );
   const [pendingProposalMetadata, setPendingProposalMetadataState] =
     useState<EmberProposalMetadata | null>(null);
   // Written with the state, not after a commit: an Accept resuming from its await reads it to
@@ -9194,6 +9199,15 @@ export function EmberChat({
             idempotency_key: options.idempotencyKey ?? null,
             target_block_label: targetBlockLabel,
             product_action: productAction?.action ?? null,
+            // Names the proposal the review card showed; the server approves the Test only for that one.
+            test_proposal_owner_turn_id:
+              productAction?.action === "test_end_to_end"
+                ? (stagedProposalMetadata.current?.owner_turn_id ?? null)
+                : null,
+            test_proposal_revision:
+              productAction?.action === "test_end_to_end"
+                ? (stagedProposalMetadata.current?.revision ?? null)
+                : null,
             demonstration_id:
               productAction?.action === "demonstrate"
                 ? productAction.demonstrationId
@@ -11562,6 +11576,7 @@ export function EmberChat({
                           ) : null}
                           <ReviewGateCard
                             docEditorEnabled={docEditorEnabled}
+                            usesConnectedGmail={proposalUsesGmail}
                             turn={message.narrative}
                             pending={index === gateIndex && gateHasSubject}
                             verdict={
@@ -11681,6 +11696,7 @@ export function EmberChat({
                           {isGateOwnerOrLast || acceptedReceiptHere ? (
                             <ReviewGateCard
                               docEditorEnabled={docEditorEnabled}
+                              usesConnectedGmail={proposalUsesGmail}
                               pending={isGateOwnerOrLast}
                               verdict={
                                 isGateOwnerOrLast
@@ -11789,6 +11805,7 @@ export function EmberChat({
                 ) : null}
                 <ReviewGateCard
                   docEditorEnabled={docEditorEnabled}
+                  usesConnectedGmail={proposalUsesGmail}
                   pending={!detachedReceiptShown}
                   verdict={
                     detachedReceiptShown
