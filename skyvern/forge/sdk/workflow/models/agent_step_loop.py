@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import uuid
@@ -38,7 +39,7 @@ from pydantic import JsonValue, ValidationError
 
 from skyvern.config import settings
 from skyvern.constants import EMBER_RUN_CREATOR
-from skyvern.exceptions import WorkflowRunNotFound
+from skyvern.exceptions import ScrapingFailed, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.agents.skills import (
     EVERYONE_SKILL_LABEL,
@@ -121,6 +122,7 @@ _MAX_TRAIL_ARGUMENT_CHARS = 4_000
 _MAX_TRAIL_BLOCK_CHARS = 64_000
 _MAX_TRAIL_BYTES = 512 * 1024
 _TRAIL_WRITE_SECONDS = 2
+_PAGE_TITLE_SECONDS = 2
 _MASK = "*****"
 _Fact = str | list[dict[str, str]]
 _OPAQUE_TOKEN = re.compile(rf"{_TOKEN_PREFIX}[0-9a-f]{{8}}")
@@ -753,11 +755,14 @@ def _run_tool(
             return f"Arguments are not valid JSON ({e})."
         try:
             state.run_context.reject_platform_smtp_references(written)
-            report = {"status": "completed", "output": await run(state, **written), "error": None}
+            if name in _PAGE_COMMANDS:
+                report = await _page_report(state, name, run, written)
+            else:
+                report = {"status": "completed", "output": await run(state, **written), "error": None}
         except InvalidWorkflowDefinition:
             raise
         except Exception as e:
-            report = {"status": "failed", "output": None, "error": f"{type(e).__name__}: {e}"}
+            report = {"status": "failed", "output": None, "error": _error_text(e)}
         _record_call(state, describe(written)[1] if describe else written, tool=name, status=report["status"])
         # A read_run_data window is already masked text cut from a longer result.
         if name == "read_run_data" and report["status"] == "completed":
@@ -776,6 +781,53 @@ def _run_tool(
         on_invoke_tool=_in_turn(state, invoke, describe),
         strict_json_schema=False,
     )
+
+
+def _error_text(e: Exception) -> str:
+    text = f"{type(e).__name__}: {e}"
+    return f"{text} {e.reason}" if isinstance(e, ScrapingFailed) and e.reason else text
+
+
+async def _page_report(
+    state: _RunState, name: str, run: Callable[..., Awaitable[Any]], written: dict[str, JsonValue]
+) -> dict[str, JsonValue]:
+    # A call the command can't take never reaches the page, so a page left from an earlier command isn't its page.
+    try:
+        inspect.signature(run).bind(state, **written)
+    except TypeError as e:
+        return {"status": "failed", "output": None, "error": _error_text(e)}
+    status = "completed"
+    output: JsonValue = None
+    error: str | None = None
+    scrape_url: str | None = None
+    try:
+        if name == "page_extract":
+            output, scrape_url = await run(state, **written)
+        else:
+            await run(state, **written)
+    except InvalidWorkflowDefinition:
+        raise
+    except Exception as e:
+        status, error = "failed", _error_text(e)
+    report: dict[str, JsonValue] = {"status": status}
+    if name == "page_extract" and status == "completed":
+        if scrape_url is not None:
+            report["url"] = scrape_url
+    elif state.page is not None:
+        report["url"] = state.page.page.url
+        if name != "page_extract" and (title := await _page_title(state, state.page)) is not None:
+            report["title"] = title
+    return {**report, "output": output, "error": error}
+
+
+async def _page_title(state: _RunState, page: ScriptSkyvernPage) -> str | None:
+    # The browser defers page evaluation while a main-frame navigation is pending, so a hung goto would hang this too.
+    try:
+        async with asyncio.timeout(_PAGE_TITLE_SECONDS):
+            return await page.page.title()
+    except Exception:
+        LOG.warning("Could not read the page title after a page command", label=state.label, exc_info=True)
+        return None
 
 
 async def _read_run_data(state: _RunState, name: str | None = None) -> object:
@@ -860,9 +912,10 @@ async def _run_page(state: _RunState) -> AsyncIterator[ScriptSkyvernPage]:
     )
     try:
         if state.page is not None:
+            page, state.page = state.page, None
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(state.workflow_run_id)
-            if browser_state is None or await browser_state.get_working_page() is not state.page.page:
-                state.page = None
+            if browser_state is not None and await browser_state.get_working_page() is page.page:
+                state.page = page
         if state.page is None:
             state.page = await ScriptSkyvernPage.create(browser_session_id=state.browser_session_id)
         yield state.page
@@ -870,27 +923,24 @@ async def _run_page(state: _RunState) -> AsyncIterator[ScriptSkyvernPage]:
         context.task_id, context.step_id, context.workflow_run_block_id = previous
 
 
-async def _page_goto(state: _RunState, url: str) -> dict[str, str]:
+async def _page_goto(state: _RunState, url: str) -> None:
     async with _run_page(state) as page:
-        await page.goto(_template_literal(url))
-        return {"url": page.page.url}
+        await page.goto(_template_literal(url), max_retries=1)
 
 
-async def _page_click(state: _RunState, prompt: str) -> dict[str, str]:
+async def _page_click(state: _RunState, prompt: str) -> None:
     async with _run_page(state) as page:
         await page.click(prompt=prompt, ai="proactive")
-        return {"url": page.page.url}
 
 
-async def _page_fill(state: _RunState, prompt: str, value: str) -> dict[str, str]:
+async def _page_fill(state: _RunState, prompt: str, value: str) -> None:
     async with _run_page(state) as page:
         await page.fill(prompt=prompt, value=value, ai="proactive")
-        return {"url": page.page.url}
 
 
 async def _page_extract(
     state: _RunState, prompt: str, schema: dict[str, Any] | None = None
-) -> dict[str, Any] | list | str | None:
+) -> tuple[JsonValue, str | None]:
     # The page's AI has no block label, so an omitted system prompt resolves to the run-wide one.
     opt_out: dict[str, str | None] = (
         {"system_prompt": None}
@@ -900,7 +950,20 @@ async def _page_extract(
         else {}
     )
     async with _run_page(state) as page:
-        return await page.extract(prompt=_template_literal(prompt), schema=schema, **opt_out)
+        value = await page.extract(prompt=_template_literal(prompt), schema=schema, **opt_out)
+        return value, _scrape_url(state, page)
+
+
+def _scrape_url(state: _RunState, page: ScriptSkyvernPage) -> str | None:
+    # Imported here for the same import cycle as ScriptSkyvernPage in _run_page.
+    from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
+
+    # The extract re-scrapes into its page AI's scraped_page and gives that scrape's URL to its model.
+    ai = page.page_ai
+    if isinstance(ai, RealSkyvernPageAi):
+        return ai.scraped_page.url
+    LOG.warning("Page extract ran without a scraping page AI", label=state.label, ai=type(ai).__name__)
+    return None
 
 
 _TEXT = {"type": "string"}
@@ -911,6 +974,7 @@ _RUN_TOOLS: tuple[tuple[str, dict[str, Any], list[str], Callable[..., Awaitable[
     ("page_fill", {"prompt": _TEXT, "value": _TEXT}, ["prompt", "value"], _page_fill),
     ("page_extract", {"prompt": _TEXT, "schema": {"type": "object"}}, ["prompt"], _page_extract),
 )
+_PAGE_COMMANDS = frozenset(name for name, *_ in _RUN_TOOLS) - {"read_run_data"}
 if {name for name, *_ in _RUN_TOOLS} != set(RUN_TOOL_DESCRIPTIONS) - {LOAD_SKILL_TOOL_NAME}:
     raise RuntimeError("_RUN_TOOLS and RUN_TOOL_DESCRIPTIONS must name the same tools.")
 
@@ -1228,11 +1292,15 @@ async def _run_child_block(
             report, child_block_id = await _execute_child(child, written, state)
             if page_url is not None:
                 facts["page_url_at_start"] = page_url
+            # The note stays off the call's tool_calls entry, which names the child's row that already holds it.
+            note: dict[str, str] = {}
             if tool.nested_agent:
                 files = (written.get("files") or []) if "files" in tool.fields else None
-                facts.update(await _child_action_facts(state, child_block_id, files))
+                action_facts, finish_reason = await _child_action_facts(state, child_block_id, files, report["status"])
+                facts.update(action_facts)
+                note = {"finish_reason": finish_reason} if finish_reason else {}
             # Ahead of output, so the window that cuts a long output keeps them.
-            report = {"status": report["status"], **facts, **report}
+            report = {"status": report["status"], **facts, **note, **report}
             if (
                 report["status"] == BlockStatus.completed
                 and state.run_context.has_value(output_parameter.key)
@@ -1291,24 +1359,30 @@ async def _page_url_at_start(state: _RunState) -> str | None:
 
 
 async def _child_action_facts(
-    state: _RunState, workflow_run_block_id: str | None, files: list[str] | None
-) -> dict[str, _Fact]:
+    state: _RunState, workflow_run_block_id: str | None, files: list[str] | None, status: BlockStatus
+) -> tuple[dict[str, _Fact], str | None]:
+    if workflow_run_block_id is None:
+        return {}, None
     try:
-        if workflow_run_block_id is None:
-            return {}
         run_block = await app.DATABASE.observer.get_workflow_run_block(
             workflow_run_block_id, organization_id=state.organization_id
         )
-        if run_block.task_id is None:
-            return {}
+    except Exception:
+        LOG.warning("Could not read a nested agent's block", label=state.label, exc_info=True)
+        return {}, None
+    # A failed or terminated child's note is its failure_reason, which the result already gives as error.
+    finish_reason = run_block.finish_reason if status == BlockStatus.completed else None
+    if run_block.task_id is None:
+        return {}, finish_reason
+    try:
         actions = await app.DATABASE.tasks.get_task_actions_hydrated(
             run_block.task_id, organization_id=state.organization_id
         )
         facts: dict[str, _Fact] = {} if files is None else {"upload_attempts": _upload_attempts(state, actions, files)}
-        return facts | _recorded_actions(actions)
+        return facts | _recorded_actions(actions), finish_reason
     except Exception:
         LOG.warning("Could not read a nested agent's actions", label=state.label, exc_info=True)
-        return {}
+        return {}, finish_reason
 
 
 def _upload_attempts(state: _RunState, actions: list[Action], files: list[str]) -> list[dict[str, str]]:

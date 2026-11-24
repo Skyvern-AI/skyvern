@@ -32,6 +32,7 @@ from agents.tool_context import ToolContext
 from jsonschema import Draft202012Validator
 from litellm.types.utils import ModelResponse as LitellmResponse
 from openai.types.responses import ResponseFunctionToolCall
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import JsonValue, ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -39,8 +40,9 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.core.script_generations import real_skyvern_page_ai
-from skyvern.core.script_generations.real_skyvern_page_ai import _render_template_with_label
+from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi, _render_template_with_label
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
+from skyvern.exceptions import ScrapingFailedBlankPage
 from skyvern.forge import app
 from skyvern.forge.sdk.agents.skills import (
     EVERYONE_SKILL_LABEL,
@@ -119,6 +121,7 @@ from skyvern.webeye.actions.actions import (
     GotoUrlAction,
     UploadFileAction,
 )
+from tests.unit._script_page_fakes import ScrapedPageStub, build_navigation_page
 from tests.unit.conftest import make_block_output_parameter
 from tests.unit.ember_test_helpers import (
     RecordingSkills,
@@ -250,13 +253,22 @@ def billing_hook(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     return hook
 
 
-@pytest.fixture
-def page(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    page = SimpleNamespace(
-        page=SimpleNamespace(url="https://example.com/"), extract=AsyncMock(return_value="extracted")
-    )
+def _page_ai(scraped_url: str) -> RealSkyvernPageAi:
+    ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
+    ai.scraped_page = SimpleNamespace(url=scraped_url)
+    return ai
 
-    async def create(browser_session_id: str | None = None) -> SimpleNamespace:
+
+@pytest.fixture
+def page(monkeypatch: pytest.MonkeyPatch) -> ScriptSkyvernPage:
+    page, raw_page = build_navigation_page(ScriptSkyvernPage, ScrapedPageStub(), _page_ai("https://example.com/"))
+    assert isinstance(page, ScriptSkyvernPage)
+    raw_page.url = "https://example.com/"
+    page.extract = AsyncMock(return_value="extracted")
+    page.click = AsyncMock()
+    page.fill = AsyncMock()
+
+    async def create(browser_session_id: str | None = None) -> ScriptSkyvernPage:
         return page
 
     monkeypatch.setattr(ScriptSkyvernPage, "create", create)
@@ -1511,17 +1523,21 @@ def _token(url: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_a_nested_agent_result_gives_page_url_at_start_each_upload_attempt_and_its_recorded_actions(
+async def test_a_nested_agent_result_gives_page_url_at_start_upload_attempts_recorded_actions_and_closing_note(
     monkeypatch: pytest.MonkeyPatch, database: AgentDB
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
     context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
-    context.parameters |= {"fax_file": _file_parameter("fax_file"), "notes_file": _file_parameter("notes_file")}
+    context.parameters |= {
+        "fax_file": _file_parameter("fax_file"),
+        "notes_file": _file_parameter("notes_file"),
+        "login_credential": _credential_parameter(),
+    }
     context.values |= {"fax_file": FAX_URL, "notes_file": NOTES_URL}
     working_page = SimpleNamespace(url="about:blank")
-    # The fourth call's page read and action read both fail; the taskless child makes no action read.
+    # The fourth call's page read and action read both fail; the taskless children make no action read.
     browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(side_effect=[working_page] * 3 + [RuntimeError("page closed")] + [working_page] * 7),
+        get_working_page=AsyncMock(side_effect=[working_page] * 3 + [RuntimeError("page closed")] + [working_page] * 8),
         take_fullpage_screenshot=AsyncMock(return_value=None),
     )
     monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *_, **__: browser_state)
@@ -1542,13 +1558,15 @@ async def test_a_nested_agent_result_gives_page_url_at_start_each_upload_attempt
         _clicked(f"{SECRET} {'x' * 250}"),
     ]
     item_a = {"item": "Physical item A", "price": "48.00"}
-    # Each child: its action rows (None gives it no task), its status, its output, and the page it leaves.
-    children: list[tuple[list[Action] | None, BlockStatus, dict[str, Any] | None, str]] = [
+    applied = f"Already applied on 16.11 with {SECRET}, so nothing was sent."
+    # Each child: its action rows (None gives it no task), its status, its output, the page it leaves and its note.
+    children: list[tuple[list[Action] | None, BlockStatus, dict[str, Any] | None, str, str | None]] = [
         (
             uploads((_token(FAX_URL), ActionStatus.completed), (NOTES_URL, ActionStatus.completed)),
             BlockStatus.completed,
             None,
             "https://agent:pw@example.com/upload?session_id=sK8pL2nQ5vR9xT3mW6yZ1aBc#done",
+            None,
         ),
         (
             uploads(
@@ -1559,27 +1577,34 @@ async def test_a_nested_agent_result_gives_page_url_at_start_each_upload_attempt
             BlockStatus.completed,
             {"downloaded_file_urls": [DOWNLOADED_URL]},
             MALFORMED_URL,
+            "",
         ),
-        (uploads((_token(DOWNLOADED_URL), ActionStatus.completed)), BlockStatus.timed_out, None, FORM_URL),
-        (uploads((_token(FAX_URL), ActionStatus.completed)), BlockStatus.completed, None, FORM_URL),
-        (_shopped("Physical item A"), BlockStatus.completed, item_a, FORM_URL),
-        (_shopped("Physical item B"), BlockStatus.completed, item_a, FORM_URL),
-        (long_rows, BlockStatus.completed, item_a, FORM_URL),
-        ([], BlockStatus.completed, item_a, FORM_URL),
+        (uploads((_token(DOWNLOADED_URL), ActionStatus.completed)), BlockStatus.timed_out, None, FORM_URL, None),
+        (uploads((_token(FAX_URL), ActionStatus.completed)), BlockStatus.completed, None, FORM_URL, "Uploaded."),
+        (_shopped("Physical item A"), BlockStatus.completed, item_a, FORM_URL, None),
+        (_shopped("Physical item B"), BlockStatus.completed, item_a, FORM_URL, None),
+        (long_rows, BlockStatus.completed, item_a, FORM_URL, applied),
+        ([], BlockStatus.failed, item_a, FORM_URL, "Could not find the item."),
         (
             [_clicked("Physical item A"), _clicked("Physical item B", description=None)],
             BlockStatus.completed,
             item_a,
             FORM_URL,
+            None,
         ),
-        (None, BlockStatus.completed, item_a, FORM_URL),
-        (_shopped("Physical item D"), BlockStatus.completed, item_a, FORM_URL),
+        (None, BlockStatus.completed, item_a, FORM_URL, None),
+        (_shopped("Physical item D"), BlockStatus.completed, item_a, FORM_URL, "Saved statement.pdf."),
+        (None, BlockStatus.completed, None, FORM_URL, "Signed in as the portal admin."),
     ]
 
     async def nested_agent(
         block: BaseTaskBlock, workflow_run_id: str, workflow_run_block_id: str, **_: object
     ) -> BlockResult:
-        rows, status, output, page_after = children.pop(0)
+        rows, status, output, page_after, note = children.pop(0)
+        if note is not None:
+            await database.observer.update_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id, organization_id=ORG, finish_reason=note
+            )
         if rows is not None:
             await _child_task(database, workflow_run_block_id, rows)
             await _child_task(database, None, [_clicked("Physical item C")])
@@ -1622,15 +1647,22 @@ async def test_a_nested_agent_result_gives_page_url_at_start_each_upload_attempt
                     call_id="download",
                 )
             ],
+            [scripted_call("login", {"credential": "login_credential", "url": FORM_URL}, call_id="login")],
             [scripted_call("read_run_data", {"name": "agent_task_5"}, call_id="reread_a")],
             [scripted_call("read_run_data", {"name": "agent_task_7"}, call_id="reread_long")],
             VALID_FINISH,
         ]
     )
 
-    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["browser_task", "file_download"])
+    result, _ = await _run_agent_block(
+        monkeypatch,
+        LUNA_MEDIUM,
+        model,
+        tools=["browser_task", "file_download", "login"],
+        parameter_keys=["login_credential"],
+    )
 
-    calls = (*upload_calls, *action_calls, "download")
+    calls = (*upload_calls, *action_calls, "download", "login")
     texts = {call: tool_outputs_for(model.inputs[-1][1], call)[0] for call in (*calls, "reread_a", "reread_long")}
     reports = {call: json.loads(text) for call, text in texts.items()}
     facts = [
@@ -1682,6 +1714,23 @@ async def test_a_nested_agent_result_gives_page_url_at_start_each_upload_attempt
         {"action": f'Clicked the "***** {"x" * 250}" link', "status": "completed"},
     ]
     assert reports["none"]["recorded_actions"] == []
+    assert list(reports["long"]) == [
+        "status",
+        "page_url_at_start",
+        "upload_attempts",
+        "recorded_actions",
+        "finish_reason",
+        "output",
+        "error",
+    ]
+    notes = {call: reports[call]["finish_reason"] for call in calls if "finish_reason" in reports[call]}
+    assert notes == {
+        "broken": "Uploaded.",
+        "long": "Already applied on 16.11 with *****, so nothing was sent.",
+        "download": "Saved statement.pdf.",
+        "login": "Signed in as the portal admin.",
+    }
+    assert [reports[call]["status"] for call in ("none", "login")] == ["failed", "completed"]
     assert [call for call in calls if "recorded_actions" in reports[call]] == ["a", "b", "long", "none", "download"]
     assert children == []
     assert result.status == BlockStatus.completed
@@ -1690,6 +1739,8 @@ async def test_a_nested_agent_result_gives_page_url_at_start_each_upload_attempt
     assert [call["status"] for call in tool_calls[:4]] == ["completed", "completed", "timed_out", "completed"]
     assert [{key: call[key] for key in facts[0] if key in call} for call in tool_calls[:4]] == facts
     assert [call.get("recorded_actions") for call in tool_calls[4:6]] == [a["recorded_actions"], b["recorded_actions"]]
+    assert [call["status"] for call in tool_calls[: len(calls)]] == [reports[call]["status"] for call in calls]
+    assert not [call for call in tool_calls if "finish_reason" in call]
     block_output = json.dumps(result.output_parameter_value)
     url_leaks = (FAX_URL, DECOY_URL, DOWNLOADED_URL, "agent:pw", "9f8e7d6c5b4a3210", "sK8pL2nQ5vR9", "abc123")
     assert not [leak for leak in url_leaks if leak in block_output]
@@ -1765,7 +1816,7 @@ EMAIL = {"sender": "agent@example.com", "subject": "Report", "body": "Done."}
 @pytest.mark.parametrize("scope_platform_smtp", [False, True])
 @pytest.mark.parametrize("alias", [False, True])
 async def test_static_platform_email_and_unrelated_agent_run_without_exposing_smtp(
-    monkeypatch: pytest.MonkeyPatch, database: AgentDB, page: SimpleNamespace, scope_platform_smtp: bool, alias: bool
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, page: ScriptSkyvernPage, scope_platform_smtp: bool, alias: bool
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
     monkeypatch.setattr(
@@ -2191,7 +2242,7 @@ async def test_agent_email_child_cannot_use_platform_smtp_as_its_body(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ignore", [False, True])
 async def test_the_agent_and_what_it_runs_follow_the_workflow_system_prompt_unless_the_block_opts_out(
-    monkeypatch: pytest.MonkeyPatch, database: AgentDB, page: SimpleNamespace, ignore: bool
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, page: ScriptSkyvernPage, ignore: bool
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
     run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
@@ -2355,6 +2406,7 @@ async def test_bad_read_run_data_reads_fail_within_the_cap_and_a_cut_page_result
 
     class Page:
         page = SimpleNamespace(url="https://example.com/")
+        page_ai = _page_ai("https://example.com/")
 
         async def extract(self, prompt: str, schema: dict[str, Any] | None = None) -> str:
             return "p" * 30_000
@@ -2395,28 +2447,73 @@ async def test_bad_read_run_data_reads_fail_within_the_cap_and_a_cut_page_result
     assert len(unknown) < 20_100
     assert "read_run_data(" not in unknown[20_000:]
     (page,) = tool_outputs_for(model.inputs[3][1], "page")
-    page_total = len(json.dumps({"status": "completed", "output": "p" * 30_000, "error": None}))
+    page_total = len(
+        json.dumps({"status": "completed", "url": "https://example.com/", "output": "p" * 30_000, "error": None})
+    )
     assert str(page_total) in page[20_000:]
     assert "read_run_data(" not in page
 
 
 @pytest.mark.asyncio
-async def test_page_commands_run_under_one_agent_task_and_reach_page_ai_as_written(
-    monkeypatch: pytest.MonkeyPatch, database: AgentDB, page: SimpleNamespace
+async def test_page_commands_run_under_one_agent_task_reach_page_ai_as_written_and_report_their_page(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, page: ScriptSkyvernPage
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    monkeypatch.setattr(agent_step_loop, "_PAGE_TITLE_SECONDS", 0.01)
+    raw_page = cast(MagicMock, page.page)
+    raw_page.title = AsyncMock(return_value="Index of /")
+    navigations: list[str] = []
+    scraped_url = "https://93.184.216.34/service-area/"
     bound: list[tuple[str | None, str | None]] = []
+    working_page_errors: list[Exception] = []
+
+    async def get_working_page() -> MagicMock:
+        if working_page_errors:
+            raise working_page_errors.pop()
+        return raw_page
+
+    monkeypatch.setattr(
+        app.BROWSER_MANAGER,
+        "get_for_workflow_run",
+        lambda *_, **__: SimpleNamespace(get_working_page=get_working_page),
+    )
+
+    async def navigate(url: str, **_: object) -> None:
+        navigations.append(url)
+        if url == "https://93.184.216.35/":
+            raise PlaywrightTimeoutError("Timeout 60000ms exceeded.")
+        raw_page.url = url
+
+    async def title_never_returns() -> str:
+        await asyncio.Event().wait()
+        return ""
+
+    async def click(**_: object) -> None:
+        raw_page.title = title_never_returns
 
     async def extract(prompt: str, schema: dict[str, Any] | None = None) -> str:
         context = skyvern_context.ensure_context()
         bound.append((context.task_id, context.step_id))
+        if "the blank page" in prompt:
+            raw_page.url = "about:blank"
+            working_page_errors.append(RuntimeError("page closed"))
+            raise ScrapingFailedBlankPage()
+        page.page_ai.scraped_page = SimpleNamespace(url=scraped_url)
         return _render_template_with_label(prompt)
 
-    page.extract.side_effect = extract
+    raw_page.goto = navigate
+    cast(AsyncMock, page.click).side_effect = click
+    cast(AsyncMock, page.extract).side_effect = extract
     model = _ScriptedModel(
         [
+            [scripted_call("page_goto", {"url": "https://93.184.216.34/"}, call_id="goto")],
+            [scripted_call("page_click", {}, call_id="missing")],
+            [scripted_call("page_goto", {"url": "https://93.184.216.35/"}, call_id="hung")],
+            [scripted_call("page_click", {"prompt": "Next"}, call_id="click")],
             [scripted_call("page_extract", {"prompt": "Echo {{ api_token }}"}, call_id="template")],
             [scripted_call("page_extract", {"prompt": "api_token"}, call_id="key")],
+            [scripted_call("page_extract", {"prompt": "the blank page"}, call_id="blank")],
+            [scripted_call("page_fill", {"prompt": "Name", "value": "Ada"}, call_id="stale")],
             [scripted_call("finish", {"answer": "done"}, call_id="finish")],
         ]
     )
@@ -2426,12 +2523,50 @@ async def test_page_commands_run_under_one_agent_task_and_reach_page_ai_as_writt
 
     assert result.status == BlockStatus.completed
     assert [_tool_output(model, call_id) for call_id in ("template", "key")] == ["Echo {{ api_token }}", "api_token"]
+    reports = {
+        call_id: json.loads(tool_outputs_for(model.inputs[-1][1], call_id)[0])
+        for call_id in ("goto", "missing", "hung", "click", "template", "blank", "stale")
+    }
+    assert [list(report) for report in reports.values()] == [
+        ["status", "url", "title", "output", "error"],
+        ["status", "output", "error"],
+        ["status", "url", "title", "output", "error"],
+        ["status", "url", "output", "error"],
+        ["status", "url", "output", "error"],
+        ["status", "url", "output", "error"],
+        ["status", "output", "error"],
+    ]
+    assert reports["goto"] == {
+        "status": "completed",
+        "url": "https://93.184.216.34/",
+        "title": "Index of /",
+        "output": None,
+        "error": None,
+    }
+    assert navigations == ["https://93.184.216.34/", "https://93.184.216.35/"]
+    assert (reports["hung"]["status"], reports["hung"]["error"]) == (
+        "failed",
+        "TimeoutError: Timeout 60000ms exceeded.",
+    )
+    assert reports["click"] == {"status": "completed", "url": "https://93.184.216.34/", "output": None, "error": None}
+    assert (reports["template"]["url"], reports["template"]["output"]) == (scraped_url, "Echo {{ api_token }}")
+    assert reports["blank"] == {
+        "status": "failed",
+        "url": "about:blank",
+        "output": None,
+        "error": "ScrapingFailedBlankPage: Scraping failed. It's a blank page. Please ensure there is a non-blank page "
+        "for Skyvern to work with.",
+    }
+    assert (reports["missing"]["status"], reports["stale"]) == (
+        "failed",
+        {"status": "failed", "output": None, "error": "RuntimeError: page closed"},
+    )
     (agent_row,) = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
     assert agent_row.task_id
     task = await database.tasks.get_task(agent_row.task_id, organization_id=ORG)
     (step,) = await database.tasks.get_task_steps(agent_row.task_id, organization_id=ORG)
     assert task is not None and (task.status, step.status) == (TaskStatus.completed, StepStatus.completed)
-    assert bound == [(task.task_id, step.step_id)] * 2
+    assert bound == [(task.task_id, step.step_id)] * 3
     assert (context.task_id, context.step_id) == (None, None)
 
 
@@ -2676,7 +2811,7 @@ def _record_tool_call_writes(
 
 @pytest.mark.asyncio
 async def test_each_call_is_written_to_tool_calls_while_it_runs_and_after_it_finishes_in_run_order(
-    monkeypatch: pytest.MonkeyPatch, database: AgentDB, page: SimpleNamespace, billing_hook: AsyncMock
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, page: ScriptSkyvernPage, billing_hook: AsyncMock
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
     app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].parameters["login_credential"] = _credential_parameter()
