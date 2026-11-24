@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import http.client
+import io
 import ipaddress
 import json
 import socket
@@ -10,6 +11,7 @@ import ssl
 import threading
 import time
 import urllib.request
+from collections.abc import Mapping
 from contextlib import suppress
 from queue import Empty, Queue
 from socket import SHUT_RDWR
@@ -17,10 +19,9 @@ from typing import Any
 from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
 
 from websockets.datastructures import Headers
-from websockets.http11 import Response
-from websockets.streams import StreamReader as SansIOStreamReader
+from websockets.exceptions import InvalidHandshake
 
-from skyvern.cdp_transport import open_first_pinned_stream
+from skyvern.cdp_transport import open_first_pinned_stream, use_first_pinned_stream
 
 DISCOVERY_MAX_BYTES = 64 * 1024
 _DISCOVERY_DEADLINE_MESSAGE = "CDP discovery exceeded its deadline"
@@ -158,27 +159,25 @@ def _environment_proxy(parts: SplitResult) -> str | None:
     return proxy
 
 
-async def _read_proxy_response(reader: asyncio.StreamReader) -> Response:
-    source = SansIOStreamReader()
-    parser = Response.parse(source.read_line, source.read_exact, source.read_to_eof, include_body=False)
-    next(parser)
-    source.feed_data(await reader.readuntil(b"\r\n\r\n"))
-    source.feed_eof()
+async def _read_proxy_response(reader: asyncio.StreamReader) -> tuple[int, bytes]:
+    head = await reader.readuntil(b"\r\n\r\n")
+    status_line, raw_headers = head.split(b"\r\n", 1)
     try:
-        next(parser)
-    except StopIteration as complete:
-        response = complete.value
-    else:
-        raise ValueError("CDP discovery returned incomplete headers")
-    body = await _read_proxy_body(reader, response)
-    return Response(response.status_code, response.reason_phrase, response.headers, body)
+        version, raw_status, _reason = status_line.split(b" ", 2)
+        if version not in (b"HTTP/1.0", b"HTTP/1.1") or len(raw_status) != 3:
+            raise ValueError
+        status_code = int(raw_status)
+        headers = http.client.parse_headers(io.BytesIO(raw_headers))
+    except (IndexError, ValueError) as exc:
+        raise ValueError("CDP discovery returned invalid headers") from exc
+    return status_code, await _read_proxy_body(reader, status_code, headers)
 
 
-async def _read_proxy_body(reader: asyncio.StreamReader, response: Response) -> bytes:
-    if 100 <= response.status_code < 200 or response.status_code in (204, 304):
+async def _read_proxy_body(reader: asyncio.StreamReader, status_code: int, headers: http.client.HTTPMessage) -> bytes:
+    if 100 <= status_code < 200 or status_code in (204, 304):
         return b""
-    if coding := response.headers.get("Transfer-Encoding"):
-        if coding != "chunked":
+    if coding := headers.get("Transfer-Encoding"):
+        if coding.lower() != "chunked":
             raise ValueError("CDP discovery returned unsupported transfer encoding")
         body = bytearray()
         while True:
@@ -193,7 +192,7 @@ async def _read_proxy_body(reader: asyncio.StreamReader, response: Response) -> 
             if chunk[-2:] != b"\r\n":
                 raise ValueError("CDP discovery returned an invalid chunk")
             body.extend(chunk[:-2])
-    if raw_length := response.headers.get("Content-Length"):
+    if raw_length := headers.get("Content-Length"):
         length = int(raw_length)
         if not 0 <= length <= DISCOVERY_MAX_BYTES:
             raise ValueError("CDP discovery response exceeded its size limit")
@@ -218,6 +217,47 @@ async def _fetch_discovery_through_proxy(
     hostname = parts.hostname or ""
     port = parts.port or (443 if parts.scheme == "https" else 80)
     deadline = asyncio.get_running_loop().time() + timeout
+    request_headers = dict(headers or {})
+    if not any(key.lower() == "host" for key in request_headers):
+        request_headers["Host"] = parts.netloc.rpartition("@")[2]
+    if not any(key.lower() == "connection" for key in request_headers):
+        request_headers["Connection"] = "close"
+    if parts.username is not None and not any(key.lower() == "authorization" for key in request_headers):
+        credentials = f"{unquote(parts.username)}:{unquote(parts.password or '')}".encode()
+        request_headers["Authorization"] = f"Basic {base64.b64encode(credentials).decode()}"
+    resource = urlunsplit(("", "", parts.path or "/", parts.query, ""))
+
+    async def request(
+        connect_host: str,
+        proxy_headers: Mapping[str, str],
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        forward: bool,
+    ) -> dict[str, Any]:
+        wire_resource = resource
+        if forward:
+            authority = f"[{connect_host}]:{port}" if ":" in connect_host else f"{connect_host}:{port}"
+            wire_resource = urlunsplit((parts.scheme, authority, parts.path or "/", parts.query, ""))
+        wire_headers = Headers({**request_headers, **proxy_headers})
+        async with asyncio.timeout_at(deadline):
+            writer.write(f"GET {wire_resource} HTTP/1.1\r\n".encode() + wire_headers.serialize())
+            await writer.drain()
+            status_code, body = await _read_proxy_response(reader)
+            if status_code != 200:
+                raise ValueError(f"CDP discovery returned HTTP {status_code}")
+            return dict(json.loads(body))
+
+    proxy_scheme = urlsplit(proxy_url).scheme.lower()
+    if parts.scheme == "http" and proxy_scheme in ("http", "https") and resolved_ips is None:
+        return await use_first_pinned_stream(
+            connect_hosts=resolved_ips or (hostname,),
+            connect_port=port,
+            deadline=deadline,
+            proxy=proxy_url,
+            use=lambda host, proxy_headers, reader, writer: request(host, proxy_headers, reader, writer, forward=True),
+        )
+
     try:
         reader, writer = await open_first_pinned_stream(
             connect_hosts=resolved_ips or (hostname,),
@@ -227,29 +267,13 @@ async def _fetch_discovery_through_proxy(
             deadline=deadline,
             proxy=proxy_url,
         )
-    except (OSError, TimeoutError):
+    except (OSError, TimeoutError, InvalidHandshake):
         raise
     except Exception as exc:
         raise OSError("discovery proxy connection failed") from exc
 
     try:
-        request_headers = dict(headers or {})
-        if not any(key.lower() == "host" for key in request_headers):
-            request_headers["Host"] = parts.netloc.rpartition("@")[2]
-        if not any(key.lower() == "connection" for key in request_headers):
-            request_headers["Connection"] = "close"
-        if parts.username is not None and not any(key.lower() == "authorization" for key in request_headers):
-            credentials = f"{unquote(parts.username)}:{unquote(parts.password or '')}".encode()
-            request_headers["Authorization"] = f"Basic {base64.b64encode(credentials).decode()}"
-        resource = urlunsplit(("", "", parts.path or "/", parts.query, ""))
-        wire_headers = Headers(request_headers)
-        async with asyncio.timeout_at(deadline):
-            writer.write(f"GET {resource} HTTP/1.1\r\n".encode() + wire_headers.serialize())
-            await writer.drain()
-            response = await _read_proxy_response(reader)
-            if response.status_code != 200:
-                raise ValueError(f"CDP discovery returned HTTP {response.status_code}")
-            payload = dict(json.loads(response.body))
+        payload = await request("", {}, reader, writer, forward=False)
     except BaseException:
         writer.transport.abort()
         raise

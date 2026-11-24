@@ -72,6 +72,19 @@ def _is_retryable_pinned_connect_error(exc: Exception) -> bool:
     return isinstance(exc, EOFError) or (isinstance(exc, InvalidHandshake) and isinstance(exc.__cause__, EOFError))
 
 
+def _is_retryable_discovery_error(exc: Exception) -> bool:
+    if not isinstance(exc, CdpDiscoveryError):
+        return False
+    cause = exc.__cause__
+    if isinstance(cause, (OSError, HTTPException)):
+        return True
+    if not isinstance(cause, InvalidHandshake):
+        return False
+    response = getattr(cause, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return isinstance(status_code, int) and 500 <= status_code < 600
+
+
 def _has_transport_substring(exc: BaseException) -> bool:
     return any(s in str(exc).lower() for s in _CDP_CONNECTION_ERROR_SUBSTR_FALLBACK)
 
@@ -336,9 +349,7 @@ async def connect_over_cdp_with_retry(
             if isinstance(e, BlockedHost) and not is_resolution_error:
                 raise
             is_cdp_error = is_cdp_connection_error(e, selection)
-            is_discovery_connection_error = isinstance(e, CdpDiscoveryError) and isinstance(
-                e.__cause__, (OSError, HTTPException)
-            )
+            is_discovery_connection_error = _is_retryable_discovery_error(e)
             is_retryable_error = is_resolution_error or is_cdp_error or is_discovery_connection_error
             if not is_retryable_error or attempt == max_attempts:
                 if not is_retryable_error and connect_started and _is_selected_engine_error(e, selection):
