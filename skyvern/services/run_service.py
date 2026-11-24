@@ -17,7 +17,7 @@ from skyvern.forge.sdk.services.browser_session_artifacts import (
     browser_session_artifact_read_scope,
 )
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus, WorkflowRunWithWorkflowResponse
 from skyvern.forge.sdk.workflow.response_value_caps import (
     truncate_oversized_response_text,
     truncate_oversized_response_value,
@@ -49,6 +49,42 @@ T = TypeVar("T")
 Ts = TypeVarTuple("Ts")
 
 _IN_FLIGHT: dict[tuple[Hashable, ...], asyncio.Task[Any]] = {}
+
+
+async def build_workflow_and_run_from_workflow_run_id(
+    organization_id: str, workflow_run_id: str, cap_output_values: bool
+) -> WorkflowRunWithWorkflowResponse:
+    async with app.DATABASE.Session.reading():
+        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            filter_deleted=False,
+        )
+
+        workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            include_cost=True,
+            allow_deleted=True,
+            cap_output_values=cap_output_values,
+        )
+
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
+        runnable_id=workflow_run_id,
+        organization_id=organization_id,
+    )
+    workflow_run_status_api_response = workflow_run_status_response.model_dump(by_alias=True)
+    browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
+    workflow_run_status_api_response["browser_session_id"] = browser_session_id or workflow_run_status_api_response.get(
+        "browser_session_id"
+    )
+
+    workflow_run_status_api_response["workflow"] = workflow
+
+    response = WorkflowRunWithWorkflowResponse.model_validate(workflow_run_status_api_response)
+
+    return response
 
 
 async def coalesce_in_flight(build: Callable[[*Ts], Coroutine[Any, Any, T]], *args: *Ts) -> T:

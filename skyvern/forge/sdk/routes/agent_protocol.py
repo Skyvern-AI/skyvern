@@ -6601,7 +6601,7 @@ async def get_workflow_and_run_from_workflow_run_id(
         raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="Your role can't read this agent.")
     with browser_session_artifact_read(get_request_principal()):
         response = await run_service.coalesce_in_flight(
-            _build_workflow_and_run_from_workflow_run_id,
+            run_service.build_workflow_and_run_from_workflow_run_id,
             current_org.organization_id,
             workflow_run_id,
             caps_run_response_values(x_user_agent),
@@ -6610,42 +6610,6 @@ async def get_workflow_and_run_from_workflow_run_id(
     await _redact_browser_session_addresses([response], current_org.organization_id)
     await _redact_inaccessible_workflow_credential_ids([response.workflow])
     response = response.model_copy(update={"workflow": mask_workflow_for_api(response.workflow)})
-    return response
-
-
-async def _build_workflow_and_run_from_workflow_run_id(
-    organization_id: str, workflow_run_id: str, cap_output_values: bool
-) -> WorkflowRunWithWorkflowResponse:
-    async with app.DATABASE.Session.reading():
-        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            filter_deleted=False,
-        )
-
-        workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            include_cost=True,
-            allow_deleted=True,
-            cap_output_values=cap_output_values,
-        )
-
-    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
-        runnable_id=workflow_run_id,
-        organization_id=organization_id,
-    )
-    workflow_run_status_api_response = workflow_run_status_response.model_dump(by_alias=True)
-    browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
-    workflow_run_status_api_response["browser_session_id"] = browser_session_id or workflow_run_status_api_response.get(
-        "browser_session_id"
-    )
-
-    workflow_run_status_api_response["workflow"] = workflow
-
-    response = WorkflowRunWithWorkflowResponse.model_validate(workflow_run_status_api_response)
-
     return response
 
 
