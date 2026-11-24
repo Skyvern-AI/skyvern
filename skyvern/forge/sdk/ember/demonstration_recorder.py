@@ -90,7 +90,7 @@ def demonstration_cache() -> BaseCache | None:
 @functools.cache
 def _log_process_demonstration_cache() -> None:
     LOG.warning(
-        "Copilot demonstrations use this process's memory; set WEB_CONCURRENCY if the server runs several processes"
+        "Ember demonstrations use this process's memory; set WEB_CONCURRENCY if the server runs several processes"
     )
 
 
@@ -694,7 +694,7 @@ class DemonstrationRecorder:
     async def run(self) -> None:
         record = await load_demonstration_record(self.cache, self.organization_id, self.demonstration_id)
         action_count = record.event_count if record is not None else 0
-        LOG.info("copilot_demonstration_started", resumed=self.resumed)
+        LOG.info("ember_demonstration_started", resumed=self.resumed)
         reason: DemonstrationStopReason = "browser_gone"
         next_refresh = time.monotonic() + DEMONSTRATION_OWNER_REFRESH_SECONDS
         try:
@@ -723,7 +723,7 @@ class DemonstrationRecorder:
                 await self.tap.set_intercept_file_chooser_dialog(True)
                 self.intercepting_file_chooser = True
             except Exception:
-                LOG.warning("copilot_demonstration_file_chooser_intercept_failed", exc_info=True)
+                LOG.warning("ember_demonstration_file_chooser_intercept_failed", exc_info=True)
             await self.stream.send(
                 {
                     "type": "demonstration_started",
@@ -854,7 +854,7 @@ class DemonstrationRecorder:
         if not event.is_main_frame:
             path = await self.tap.frame_path(event) if self.tap is not None else None
             if path is None or len(path) > 1:
-                LOG.info("copilot_demonstration_nested_frame_unsupported")
+                LOG.info("ember_demonstration_nested_frame_unsupported")
                 await self._record_gap_event(event, frame, "nested_frame")
                 return
             frame["path"] = path
@@ -1153,7 +1153,7 @@ class DemonstrationRecorder:
         scrubbed = scrub_secrets_from_structure(self.recording_ctx, result)
         if not isinstance(scrubbed, dict) or scrubbed.get("ok") is not True:
             LOG.info(
-                "copilot_demonstration_credential_fill_failed",
+                "ember_demonstration_credential_fill_failed",
                 field=field,
                 in_frame=not frame.get("is_main"),
                 error=scrubbed.get("error") if isinstance(scrubbed, dict) else None,
@@ -1262,7 +1262,7 @@ class DemonstrationRecorder:
                     data = await app.STORAGE.download_managed_file(uploaded.storage_uri, self.organization_id)
             except Exception:
                 # A failed read is the same outcome as a failed attach: the request stays open for a retry.
-                LOG.warning("copilot_demonstration_upload_read_failed", exc_info=True)
+                LOG.warning("ember_demonstration_upload_read_failed", exc_info=True)
             attached = (
                 uploaded is not None
                 and data is not None
@@ -1307,7 +1307,7 @@ class DemonstrationRecorder:
         try:
             await uploaded_file_service.delete_uploaded_file(file_id=file_id, organization_id=self.organization_id)
         except Exception:
-            LOG.warning("copilot_demonstration_upload_discard_failed", exc_info=True)
+            LOG.warning("ember_demonstration_upload_discard_failed", exc_info=True)
 
     async def _notice(self, message: str, *, level: Literal["info", "error"] = "info") -> None:
         await self.stream.send({"type": "demonstration_notice", "message": message, "level": level})
@@ -1386,7 +1386,7 @@ class DemonstrationRecorder:
             }
         )
         LOG.info(
-            "copilot_demonstration_stopped",
+            "ember_demonstration_stopped",
             reason=reason,
             action_count=action_count,
             sensitive_count=self.sensitive_count,

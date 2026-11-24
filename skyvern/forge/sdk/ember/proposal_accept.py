@@ -132,7 +132,7 @@ async def accept_ember_proposal(
     def refused(status_code: int, detail: str, reason: str | None = None) -> HTTPException:
         # The response body is opaque in request logs, so this line is where the refusal reason survives.
         LOG.info(
-            "Copilot proposal accept refused",
+            "Ember proposal accept refused",
             organization_id=organization.organization_id,
             workflow_permanent_id=chat.workflow_permanent_id,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
@@ -221,7 +221,7 @@ async def accept_ember_proposal(
         live_title = _accepted_workflow_title(yaml_request.title, canonical, metadata)
         if live_title != yaml_request.title:
             LOG.info(
-                "copilot_accept_title_refreshed",
+                "ember_accept_title_refreshed",
                 workflow_permanent_id=chat.workflow_permanent_id,
                 frozen_title=yaml_request.title,
             )
@@ -280,7 +280,7 @@ async def accept_ember_proposal(
             break
         except Exception as e:
             LOG.warning(
-                "Failed to clear copilot proposal after applying it; new workflow version was created",
+                "Failed to clear ember proposal after applying it; new workflow version was created",
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 new_workflow_id=new_workflow.workflow_id,
                 attempt=attempt + 1,
@@ -325,7 +325,7 @@ async def accept_ember_proposal(
             )
 
     LOG.info(
-        "Copilot proposal accepted",
+        "Ember proposal accepted",
         organization_id=organization.organization_id,
         workflow_permanent_id=chat.workflow_permanent_id,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,

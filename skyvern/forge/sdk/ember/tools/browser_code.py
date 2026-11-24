@@ -342,7 +342,7 @@ def _cell_payload(cell: BrowserCodeCellResult) -> dict[str, Any]:
     if cell.ok and cell.value is not None:
         rendered = json.dumps(cell.value, default=str)
         if len(rendered) > MAX_VALUE_CHARS:
-            LOG.info("copilot_browser_code_value_truncated", value_chars=len(rendered), limit_chars=MAX_VALUE_CHARS)
+            LOG.info("ember_browser_code_value_truncated", value_chars=len(rendered), limit_chars=MAX_VALUE_CHARS)
             payload["value"] = rendered[:MAX_VALUE_CHARS]
             payload["value_truncated"] = (
                 f"value was cut at {MAX_VALUE_CHARS} characters; return a smaller value or print a summary"
@@ -394,7 +394,7 @@ async def _discard_session(host: BrowserCodeHost) -> None:
     session = host.session
     if session is None:
         return
-    LOG.info("Copilot browser code session closing", browser_code_session_id=session.session_id)
+    LOG.info("Ember browser code session closing", browser_code_session_id=session.session_id)
     try:
         await session.close()
     except asyncio.CancelledError:
@@ -402,7 +402,7 @@ async def _discard_session(host: BrowserCodeHost) -> None:
         raise
     except Exception:
         LOG.warning(
-            "Failed to close the copilot browser code session",
+            "Failed to close the ember browser code session",
             browser_code_session_id=session.session_id,
             exc_info=True,
         )
@@ -449,7 +449,7 @@ async def _session_for_page(
         )
         host.session = session
         LOG.info(
-            "Copilot browser code session opened",
+            "Ember browser code session opened",
             browser_code_session_id=session.session_id,
             organization_id=ember_ctx.organization_id,
             workflow_permanent_id=ember_ctx.workflow_permanent_id,
@@ -814,7 +814,7 @@ async def _stage_cell_frame(
         with contained_effect("record browser-code cell frame", tool_name=TOOL_NAME):
             entry = pending_screenshot_entry(ember_ctx) if staged else None
             LOG.info(
-                "copilot_browser_code_cell_frame",
+                "ember_browser_code_cell_frame",
                 staged=staged,
                 reason=reason,
                 tool_call_id=capturing_tool_call_id(),

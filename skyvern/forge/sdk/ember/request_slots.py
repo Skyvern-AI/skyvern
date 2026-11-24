@@ -488,7 +488,7 @@ def canonicalize_request_slots(
     if unanswered:
         # Reported, not refused: refusing costs the whole slot contract and every criterion in it,
         # where the only thing proven is that the producer stayed silent on a detected field.
-        LOG.info("copilot_request_slot_candidates_unanswered", unanswered=unanswered)
+        LOG.info("ember_request_slot_candidates_unanswered", unanswered=unanswered)
 
     digest = request_slot_request_digest(request)
     canonical_slots: list[CanonicalRequestSlotV1] = []

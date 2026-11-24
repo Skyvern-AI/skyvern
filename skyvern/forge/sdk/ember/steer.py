@@ -37,7 +37,7 @@ async def _unhandled_doorbell(ctx: EmberContext, cancel_token: str) -> str | Non
     try:
         steer_id = await app.CACHE.get(ember_steer_key(ctx.organization_id, cancel_token))
     except Exception:
-        LOG.debug("Copilot steer doorbell read failed", exc_info=True)
+        LOG.debug("Ember steer doorbell read failed", exc_info=True)
         return None
     if isinstance(steer_id, bytes):
         steer_id = steer_id.decode()
@@ -69,7 +69,7 @@ async def watch_for_steer(result: RunResultStreaming, ctx: object) -> None:
                     ember_ctx.organization_id, chat_id, ember_ctx.turn_id
                 )
             except Exception:
-                LOG.debug("Copilot steer record read failed; will retry", exc_info=True)
+                LOG.debug("Ember steer record read failed; will retry", exc_info=True)
                 continue
             # The doorbell is keyed by cancel token, so it can name a message this turn never recorded.
             if steer_id not in waiting:
@@ -77,7 +77,7 @@ async def watch_for_steer(result: RunResultStreaming, ctx: object) -> None:
                 continue
             requested = True
             LOG.info(
-                "copilot_steer_requested",
+                "ember_steer_requested",
                 steer_id=steer_id,
                 turn_id=ember_ctx.turn_id,
                 model_call_in_flight=ember_ctx.model_call_in_flight,
@@ -118,7 +118,7 @@ async def take_steer_input(ctx: object) -> list[dict[str, Any]]:
         if ember_ctx.request_policy is not None:
             ember_ctx.request_policy.project_steer_message(steer)
     LOG.info(
-        "copilot_steer_delivered",
+        "ember_steer_delivered",
         turn_id=ember_ctx.turn_id,
         steer_ids=[steer.steer_id for steer in steers],
     )

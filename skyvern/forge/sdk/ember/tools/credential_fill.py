@@ -430,7 +430,7 @@ async def _read_vault_named_sites(ember_ctx: AgentContext, credential_id: str) -
     except Exception:
         # Not cached: a vault read that failed once says nothing about where the credential belongs,
         # and caching the empty answer would refuse every later fill this turn for a transient fault.
-        LOG.info("copilot could not read the vault entry's sites", credential_id=credential_id, exc_info=True)
+        LOG.info("ember could not read the vault entry's sites", credential_id=credential_id, exc_info=True)
         return None
     if item is None:
         ember_ctx.vault_login_uris_by_credential_id[credential_id] = []
@@ -487,7 +487,7 @@ def _log_fill_grant(
     elif isinstance(source, DemonstrationNavigationSiteURLSource):
         source_fields = {"source_kind": source.kind}
     LOG.info(
-        "copilot credential fill grant",
+        "ember credential fill grant",
         route=route,
         page_origin=loggable_origin(url),
         credential_id=credential_id,
@@ -614,7 +614,7 @@ async def _update_ask_target(
 
 def _log_credential_card_unavailable(ember_ctx: EmberContext, config: EmberConfig | None) -> None:
     LOG.info(
-        "copilot_credential_card_unavailable",
+        "ember_credential_card_unavailable",
         flag_enabled=config is not None and config.credential_pause_enabled,
         client_supports=ember_ctx.client_supports_credential_pause,
         shared_cache=getattr(getattr(app, "CACHE", None), "is_shared", False),
@@ -1447,7 +1447,7 @@ async def _submit_after_credential_fill(
             error_text = scrub_secrets_from_text(ember_ctx, _scrub_secret_from_text(str(exc), secret_value))
     if not clicked:
         LOG.info(
-            "copilot fill_credential_field submit click failed",
+            "ember fill_credential_field submit click failed",
             selector=probe.selector,
         )
         return _CredentialSubmitOutcome(
@@ -1529,7 +1529,7 @@ async def _fill_credential_field_impl_serial(
         return finish({"ok": False, "error": "Credential not accessible."})
     if policy_error or origin_grant is None:
         LOG.info(
-            "copilot fill_credential_field rejected tool-side",
+            "ember fill_credential_field rejected tool-side",
             credential_id=credential_id,
             field=field,
             organization_id=ember_ctx.organization_id,
@@ -1616,7 +1616,7 @@ async def _fill_credential_field_impl_serial(
     except Exception as exc:
         error_text = scrub_secrets_from_text(ember_ctx, _scrub_secret_from_text(str(exc), value))
         LOG.info(
-            "copilot fill_credential_field fill failed",
+            "ember fill_credential_field fill failed",
             selector=selector,
             credential_id=credential_id,
             field=field,
@@ -1657,7 +1657,7 @@ async def _fill_credential_field_impl_serial(
         source_page = source_parts[1] if source_parts else None
         if landed_page and source_page and landed_page != source_page:
             LOG.info(
-                "copilot fill_credential_field field cleared by a navigation, treating the fill as landed",
+                "ember fill_credential_field field cleared by a navigation, treating the fill as landed",
                 selector=selector,
                 credential_id=credential_id,
                 field=field,
@@ -1665,7 +1665,7 @@ async def _fill_credential_field_impl_serial(
             landing_failure = None
             landing_inferred_from_navigation = True
     LOG.info(
-        "copilot fill_credential_field readback outcome",
+        "ember fill_credential_field readback outcome",
         selector=selector,
         credential_id=credential_id,
         field=field,
@@ -1832,7 +1832,7 @@ async def _fill_credential_field_impl_serial(
         observation_step=observation_step,
     )
     LOG.info(
-        "copilot fill_credential_field filled a saved credential field",
+        "ember fill_credential_field filled a saved credential field",
         selector=selector,
         credential_id=credential_id,
         field=field,

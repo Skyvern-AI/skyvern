@@ -297,7 +297,7 @@ class PageTap:
                 },
             )
         except Exception:
-            LOG.info("copilot_demonstration_file_input_call_failed", exc_info=True)
+            LOG.info("ember_demonstration_file_input_call_failed", exc_info=True)
             return None
         return result.get("result", {}).get("value")
 
@@ -408,7 +408,7 @@ class PageTap:
         entry_id = _entry_id(entry) if entry is not None else ""
         if entry is None or not entry_id or entry_id in seen:
             LOG.debug(
-                "copilot_demonstration_navigation_entry_unmatched",
+                "ember_demonstration_navigation_entry_unmatched",
                 session_key=session_key,
                 navigation_seq=navigation_seq,
                 latest_navigation_seq=state["main_frame_navigations"],
@@ -513,7 +513,7 @@ class PageTap:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOG.exception("copilot_demonstration_frame_scan_failed")
+                LOG.exception("ember_demonstration_frame_scan_failed")
 
     async def _poll_frame(self, session_key: str, frame_id: str) -> None:
         while not self._stopped:

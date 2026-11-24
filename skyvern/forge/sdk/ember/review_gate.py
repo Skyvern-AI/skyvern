@@ -418,7 +418,7 @@ def _comparison_documents(
         )
     except Exception as exc:  # noqa: BLE001 - the card falls back to the written YAML rather than failing the turn.
         # No exc_info: a validation error quotes workflow values, which can include input defaults.
-        LOG.warning("copilot_review_canonical_comparison_failed", error_type=type(exc).__name__)
+        LOG.warning("ember_review_canonical_comparison_failed", error_type=type(exc).__name__)
         return persisted, staged
     for raw, canonical in ((persisted, canonical_persisted), (staged, canonical_staged)):
         raw_index, canonical_index = _labeled_blocks(raw), _labeled_blocks(canonical)

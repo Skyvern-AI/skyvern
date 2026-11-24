@@ -234,7 +234,7 @@ async def load_video_attachment_evidence(
                             )
                         durations.append((attached_file.file_id, duration_seconds))
                     LOG.info(
-                        "Prepared Copilot video attachment evidence",
+                        "Prepared Ember video attachment evidence",
                         file_id=attached_file.file_id,
                         duration_seconds=duration_seconds,
                         candidate_frame_count=len(candidate_frames),
@@ -243,7 +243,7 @@ async def load_video_attachment_evidence(
                     file_complete = True
                 except Exception:
                     LOG.warning(
-                        "Could not prepare Copilot video attachment",
+                        "Could not prepare Ember video attachment",
                         file_id=attached_file.file_id,
                         exc_info=True,
                     )
@@ -252,9 +252,9 @@ async def load_video_attachment_evidence(
                         try:
                             os.unlink(local_path)
                         except OSError:
-                            with contained_effect("log Copilot video attachment cleanup failure"):
+                            with contained_effect("log Ember video attachment cleanup failure"):
                                 LOG.debug(
-                                    "Failed to clean up Copilot video attachment",
+                                    "Failed to clean up Ember video attachment",
                                     file_id=attached_file.file_id,
                                     exc_info=True,
                                 )
@@ -263,7 +263,7 @@ async def load_video_attachment_evidence(
                     unavailable_filenames.append(attached_file.filename)
     except TimeoutError:
         LOG.warning(
-            "Copilot video attachment preprocessing timed out",
+            "Ember video attachment preprocessing timed out",
             timeout_seconds=VIDEO_ATTACHMENT_PROCESSING_TIMEOUT_SECONDS,
         )
         frame_file_ids = set(selected_frames_by_file_id)
@@ -371,7 +371,7 @@ async def load_image_attachment_evidence(
                     )
                 except Exception:
                     LOG.warning(
-                        "Could not prepare Copilot image attachment", file_id=attached_file.file_id, exc_info=True
+                        "Could not prepare Ember image attachment", file_id=attached_file.file_id, exc_info=True
                     )
                     reasons[attached_file.file_id] = reason
                 finally:
@@ -379,15 +379,15 @@ async def load_image_attachment_evidence(
                         try:
                             os.unlink(local_path)
                         except OSError:
-                            with contained_effect("log Copilot image attachment cleanup failure"):
+                            with contained_effect("log Ember image attachment cleanup failure"):
                                 LOG.debug(
-                                    "Failed to clean up Copilot image attachment",
+                                    "Failed to clean up Ember image attachment",
                                     file_id=attached_file.file_id,
                                     exc_info=True,
                                 )
     except TimeoutError:
         LOG.warning(
-            "Copilot image attachment preprocessing timed out",
+            "Ember image attachment preprocessing timed out",
             timeout_seconds=VIDEO_ATTACHMENT_PROCESSING_TIMEOUT_SECONDS,
         )
     done = {frame.file_id for frame in frames} | set(reasons)
@@ -480,10 +480,10 @@ async def create_video_evidence_artifacts(
                         ),
                     )
                 except Exception:
-                    LOG.warning("Could not create Copilot video evidence artifact", file_id=file_id, exc_info=True)
+                    LOG.warning("Could not create Ember video evidence artifact", file_id=file_id, exc_info=True)
                     unavailable_ids.add(file_id)
     except TimeoutError:
-        LOG.warning("Copilot video perception timed out", timeout_seconds=VIDEO_PERCEPTION_TIMEOUT_SECONDS)
+        LOG.warning("Ember video perception timed out", timeout_seconds=VIDEO_PERCEPTION_TIMEOUT_SECONDS)
         unavailable_ids.update(set(frames_by_file) - set(artifacts))
     return artifacts, frozenset(unavailable_ids)
 
@@ -511,7 +511,7 @@ async def screen_video_frames_for_ember(
     if not frames_by_file:
         return VideoScreenVerdict()
     if handler is None:
-        LOG.warning("Copilot video secret safety unavailable", reason="missing_handler")
+        LOG.warning("Ember video secret safety unavailable", reason="missing_handler")
         return VideoScreenVerdict(undecidable_file_ids=frozenset(frames_by_file))
 
     async def screen_chunk(chunk: Sequence[VideoAttachmentFrame]) -> bool | None:
@@ -519,7 +519,7 @@ async def screen_video_frames_for_ember(
         try:
             screenshots = [base64.b64decode(frame.jpeg_base64, validate=True) for frame in chunk]
         except (ValueError, TypeError):
-            LOG.warning("Copilot video secret safety unavailable", reason="invalid_frame", file_id=file_id)
+            LOG.warning("Ember video secret safety unavailable", reason="invalid_frame", file_id=file_id)
             return None
         try:
             raw_result = await handler(
@@ -534,7 +534,7 @@ async def screen_video_frames_for_ember(
             )
         except Exception as exc:  # noqa: BLE001 - every provider failure must fail this safety screen closed
             LOG.warning(
-                "Copilot video secret safety unavailable",
+                "Ember video secret safety unavailable",
                 reason="provider_error",
                 error_type=type(exc).__name__,
                 file_id=file_id,
@@ -542,7 +542,7 @@ async def screen_video_frames_for_ember(
             return None
         chunk_unsafe_ids = raw_result.get("unsafe_file_ids") if isinstance(raw_result, Mapping) else None
         if not isinstance(chunk_unsafe_ids, list) or any(item != file_id for item in chunk_unsafe_ids):
-            LOG.warning("Copilot video secret safety unavailable", reason="malformed_output", file_id=file_id)
+            LOG.warning("Ember video secret safety unavailable", reason="malformed_output", file_id=file_id)
             return None
         return bool(chunk_unsafe_ids)
 
@@ -555,7 +555,7 @@ async def screen_video_frames_for_ember(
         async with asyncio.timeout(settings.EMBER_RAW_SECRET_SAFETY_TIMEOUT_SECONDS):
             chunk_results = await asyncio.gather(*(screen_chunk(chunk) for chunk in chunks))
     except TimeoutError:
-        LOG.warning("Copilot video secret safety unavailable", reason="timeout")
+        LOG.warning("Ember video secret safety unavailable", reason="timeout")
         return VideoScreenVerdict(undecidable_file_ids=frozenset(frames_by_file))
     unsafe: set[str] = set()
     undecidable: set[str] = set()

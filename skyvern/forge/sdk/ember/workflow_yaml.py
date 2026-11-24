@@ -169,7 +169,7 @@ def resolve_extra_http_headers(
     headers = _resolve_extra_http_headers(request, inherited_headers)
     if ember and "extra_http_headers" in request.model_fields_set:
         if headers and SECRET_HEADER_MASK in headers.values():
-            LOG.debug("Merging masked copilot headers", field_name="extra_http_headers")
+            LOG.debug("Merging masked ember headers", field_name="extra_http_headers")
         return merge_masked_headers(headers, inherited_headers)
     return headers
 
@@ -324,7 +324,7 @@ def _break_cycles(
         block = label_to_block[current]
         target = block.next_block_label
         if target in visited:
-            LOG.warning("Copilot produced circular block chain, breaking cycle", cycle_target=target, broken_at=current)
+            LOG.warning("Ember produced circular block chain, breaking cycle", cycle_target=target, broken_at=current)
             block.next_block_label = None
             return True
         current = target
@@ -443,9 +443,7 @@ def _drop_unknown_next_block_labels(blocks: list[BlockYAML]) -> list[tuple[Block
                     dropped.append((block, index, branch.next_block_label))
                     branch.next_block_label = None
     for block, branch_index, target in dropped:
-        LOG.warning(
-            "Copilot dropped link to unknown block", block=block.label, target=target, branch_index=branch_index
-        )
+        LOG.warning("Ember dropped link to unknown block", block=block.label, target=target, branch_index=branch_index)
     return dropped
 
 
@@ -482,7 +480,7 @@ def _stitch_next_block_label_chain(blocks: list[BlockYAML], *, list_ordered: boo
     seen_labels: set[str] = set()
     for block in blocks:
         if block.label in seen_labels:
-            LOG.warning("Copilot produced duplicate block label", label=block.label)
+            LOG.warning("Ember produced duplicate block label", label=block.label)
         seen_labels.add(block.label)
 
     label_to_block: dict[str, BlockYAML] = {block.label: block for block in blocks}
@@ -510,7 +508,7 @@ def _stitch_next_block_label_chain(blocks: list[BlockYAML], *, list_ordered: boo
     orphaned_labels = all_labels - reachable - branch_only
     if orphaned_labels:
         LOG.warning(
-            "Copilot produced disconnected workflow blocks, repairing chain",
+            "Ember produced disconnected workflow blocks, repairing chain",
             orphaned_labels=sorted(orphaned_labels),
             reachable_labels=sorted(reachable),
         )
@@ -713,7 +711,7 @@ def redact_credentials_in_workflow_yaml(
     workflow_yaml = workflow_yaml.replace(marker, REDACTED_SECRET_PLACEHOLDER)
     if redacted_count:
         LOG.error(
-            "copilot redacted a raw credential value at the workflow write seam",
+            "ember redacted a raw credential value at the workflow write seam",
             workflow_permanent_id=workflow_permanent_id,
             redacted_occurrences=redacted_count,
         )

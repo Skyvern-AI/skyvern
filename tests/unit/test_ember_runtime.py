@@ -480,9 +480,9 @@ async def test_a_test_cancelled_while_waiting_on_the_prestart_discards_it(monkey
             with pytest.raises(asyncio.CancelledError):
                 await claim
             release.set()
-            await _wait_until(lambda: any(e["event"] == "copilot_build_test_browser_prestart_discarded" for e in logs))
+            await _wait_until(lambda: any(e["event"] == "ember_build_test_browser_prestart_discarded" for e in logs))
 
-        discard = next(e for e in logs if e["event"] == "copilot_build_test_browser_prestart_discarded")
+        discard = next(e for e in logs if e["event"] == "ember_build_test_browser_prestart_discarded")
         assert (discard["reason"], discard["prestart_browser_session_id"]) == ("cancelled", "pbs_fresh")
         manager.close_session.assert_awaited_once_with("org_1", "pbs_fresh", reason=BrowserSessionCloseReason.aborted)
         assert ctx.build_test_prestart is None
@@ -548,14 +548,14 @@ async def test_turn_end_cancels_a_prestart_still_waiting_for_its_browser_to_boot
                 await asyncio.wait_for(prestart.task, timeout=5)
             if discarded:
                 await _wait_until(
-                    lambda: any(e["event"] == "copilot_build_test_browser_prestart_discarded" for e in logs)
+                    lambda: any(e["event"] == "ember_build_test_browser_prestart_discarded" for e in logs)
                 )
 
         assert prestart.task.cancelled() and ctx.pending_build_test_prestarts == {}
         assert ("org_1", "pbs_fresh") in [c.args for c in manager.close_session.await_args_list]
         assert not [e for e in logs if e["event"] == "Failed to auto-create browser session"]
         if discarded:
-            discard = next(e for e in logs if e["event"] == "copilot_build_test_browser_prestart_discarded")
+            discard = next(e for e in logs if e["event"] == "ember_build_test_browser_prestart_discarded")
             assert discard["reason"] == "seeded"
             assert discard["prestart_browser_session_id"] == "pbs_fresh"
         assert ctx.browser_session_id == "pbs_failed_test"
@@ -2890,7 +2890,7 @@ async def test_every_turn_exit_releases_its_borrowed_browser_unclosed_after_rene
         only_if_unleased=True,
     )
     manager.close_session.assert_not_awaited()
-    released = [log for log in logs if log["event"] == "copilot_browser_driver_released"]
+    released = [log for log in logs if log["event"] == "ember_browser_driver_released"]
     assert [(log["session_id"], log["had_cached_driver"]) for log in released] == [("pbs_turn", True)]
     assert result is not None
     assert result.turn_outcome.terminal_reason == _TURN_EXIT_TERMINAL_REASONS[exit_path]
@@ -3021,7 +3021,7 @@ async def test_a_cancel_during_prior_run_hydration_still_releases_the_driver_it_
         only_if_unleased=True,
     )
     manager.close_session.assert_not_awaited()
-    released = [log for log in logs if log["event"] == "copilot_browser_driver_released"]
+    released = [log for log in logs if log["event"] == "ember_browser_driver_released"]
     assert [(log["session_id"], log["had_cached_driver"]) for log in released] == [("pbs_origin_run", True)]
     assert runtime._ATTACHED_TURNS_PER_SESSION == {}
 
@@ -3080,7 +3080,7 @@ async def test_a_failed_release_does_not_replace_the_turns_own_terminal(
             browser_state=MagicMock(),
         )
 
-    assert [log for log in logs if log["event"] == "copilot_browser_driver_released"] == []
+    assert [log for log in logs if log["event"] == "ember_browser_driver_released"] == []
     assert raised is None
     assert result is not None
     assert result.turn_outcome.terminal_reason == _TURN_EXIT_TERMINAL_REASONS[exit_path]
@@ -3625,7 +3625,7 @@ async def test_a_release_refused_for_the_turns_own_unwinding_operation_waits_it_
 
     assert result is not None and result.turn_outcome.terminal_reason == "cancel"
     assert runtime._ATTACHED_TURNS_PER_SESSION == {}
-    released = [log["had_cached_driver"] for log in logs if log["event"] == "copilot_browser_driver_released"]
+    released = [log["had_cached_driver"] for log in logs if log["event"] == "ember_browser_driver_released"]
     assert released == [True]
 
 

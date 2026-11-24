@@ -974,7 +974,7 @@ def _bind_independent_post_run_page_evidence(
     )
     block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] = "independent_page_evidence"
     LOG.info(
-        "copilot_post_run_page_evidence_snapshot_binding",
+        "ember_post_run_page_evidence_snapshot_binding",
         workflow_run_id=run_id,
         packet_label=_POST_RUN_PAGE_OBSERVATION_LABEL,
         evidence_source="independent_page_evidence",
@@ -1744,7 +1744,7 @@ def _emit_completion_verification_trace(ember_ctx: Any, completion_verification:
         "evidence_block_present": _current_workflow_has_evidence_block(ember_ctx),
     }
     LOG.info(
-        "copilot completion verification",
+        "ember completion verification",
         **{f"completion_verification_{key}": value for key, value in trace_data.items()},
     )
     with ember_span("completion_verification", data=trace_data):

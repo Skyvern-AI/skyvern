@@ -2140,7 +2140,7 @@ class Block(BaseModel, abc.ABC):
             return copilot_authored is True
         except Exception:
             LOG.warning(
-                "Copilot-lineage lookup failed; failing closed",
+                "Ember-lineage lookup failed; failing closed",
                 workflow_permanent_id=workflow.workflow_permanent_id,
             )
             return None

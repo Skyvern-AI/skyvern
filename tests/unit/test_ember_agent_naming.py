@@ -203,7 +203,7 @@ async def test_default_agent_is_renamed_and_the_client_told(
     assert ctx.stream.titles() == [DERIVED_TITLE]
     assert GOAL in title_llm.await_args.kwargs["prompt"]
     assert f"{agent_naming._TITLE_MAX_CHARS} characters" in title_llm.await_args.kwargs["prompt"]
-    assert [log["stream_not_closed"] for log in logs if log["event"] == "copilot_agent_named"] == [stream_open]
+    assert [log["stream_not_closed"] for log in logs if log["event"] == "ember_agent_named"] == [stream_open]
 
 
 def test_the_request_stays_inside_the_fence_when_it_forges_the_delimiters() -> None:
@@ -346,7 +346,7 @@ async def test_a_title_call_timeout_is_logged_as_skipped(
 
     assert written is None
     assert (await _row(repo)).title == "New Agent"
-    assert [log["reason"] for log in logs if log["event"] == "copilot_agent_naming_skipped"] == ["timeout"]
+    assert [log["reason"] for log in logs if log["event"] == "ember_agent_naming_skipped"] == ["timeout"]
 
 
 @pytest.mark.asyncio
@@ -360,7 +360,7 @@ async def test_a_provider_failure_is_logged_without_the_prompt(
     with capture_logs() as logs:
         assert await name_agent(ctx, _policy()) is None
 
-    failures = [log for log in logs if log["event"] == "copilot_agent_title_derivation_failed"]
+    failures = [log for log in logs if log["event"] == "ember_agent_title_derivation_failed"]
     assert [log["exception_type"] for log in failures] == ["RuntimeError"]
     assert all("exc_info" not in log for log in failures)
     assert (await _row(repo)).title == "New Agent"

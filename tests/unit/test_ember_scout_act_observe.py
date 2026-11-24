@@ -1219,7 +1219,7 @@ class TestActObserveCoverageCredit:
         assert ctx.scout_observation_contract is not None
         assert scout_observation_bound_paths(ctx.scout_observation_contract) == _ZERO_OVERLAP_BOUND_PATHS
         assert ctx.scouted_output_covered_paths == _ZERO_OVERLAP_BOUND_PATHS
-        credited = next(entry for entry in logs if entry["event"] == "copilot_scouted_output_coverage_credited")
+        credited = next(entry for entry in logs if entry["event"] == "ember_scouted_output_coverage_credited")
         assert credited["provenance"] == "value_grounded"
         assert sorted(credited["value_grounded_paths"]) == sorted(_ZERO_OVERLAP_BOUND_PATHS)
 
@@ -1239,7 +1239,7 @@ class TestActObserveCoverageCredit:
             record_scouted_output_coverage(
                 ctx, _zero_overlap_kv_packet(), contract=ctx.scout_observation_contract, include_lexical=False
             )
-        assert not any(entry["event"] == "copilot_scouted_output_coverage_credited" for entry in logs)
+        assert not any(entry["event"] == "ember_scouted_output_coverage_credited" for entry in logs)
         assert ctx.scouted_output_covered_paths == _ZERO_OVERLAP_BOUND_PATHS
 
     @pytest.mark.asyncio
@@ -1260,7 +1260,7 @@ class TestActObserveCoverageCredit:
         assert page_evidence is None
         assert ctx.scout_observation_contract is None
         assert ctx.scouted_output_covered_paths == set()
-        assert not any(entry["event"] == "copilot_scouted_output_coverage_credited" for entry in logs)
+        assert not any(entry["event"] == "ember_scouted_output_coverage_credited" for entry in logs)
 
 
 class TestActObserveDegrade:
@@ -1785,7 +1785,7 @@ class TestActObserveRecaptureSettle:
         with capture_logs() as logs:
             await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
 
-        probe = next(entry for entry in logs if entry["event"] == "copilot_scout_act_observe")
+        probe = next(entry for entry in logs if entry["event"] == "ember_scout_act_observe")
         assert probe["result_container_count"] == 0
         assert probe["key_value_relation_count"] == 1
 
@@ -2170,7 +2170,7 @@ class TestTerminalActionObservationStampSeam:
                 accessible_name="Find Address",
             )
         assert ctx.scout_observed_terminal_criterion_ids == {"start_service_request"}
-        assert [log for log in logs if log["event"] == "copilot_reached_terminal_action_observed"]
+        assert [log for log in logs if log["event"] == "ember_reached_terminal_action_observed"]
 
     def test_an_interaction_records_the_browser_it_was_demonstrated_in(self) -> None:
         # Untagged, a commit demonstrated on the page a run failed on is indistinguishable from one
@@ -2270,7 +2270,7 @@ class TestTerminalActionObservationStampSeam:
                 credential_name="mock-portal-login-totp",
             )
         assert ctx.scout_trajectory[-1]["credential_field"] == "totp"
-        capture = next(log for log in logs if log["event"] == "copilot_scout_interaction_captured")
+        capture = next(log for log in logs if log["event"] == "ember_scout_interaction_captured")
         assert capture["credential_field"] == "totp"
         assert capture["credential_id"] == "cred_1"
 

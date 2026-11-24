@@ -438,7 +438,7 @@ async def pending_credential_requests(
         try:
             raw = await cache.get(credential_pause_active_key(organization_id, chat_id, turn_id))
         except Exception:
-            LOG.warning("Failed to recover Copilot credential pause", exc_info=True)
+            LOG.warning("Failed to recover Ember credential pause", exc_info=True)
             raise
         record = _decode_active_pause(raw)
         if (
@@ -476,7 +476,7 @@ async def credential_pause_is_active(organization_id: str, chat_id: str, turn_id
     try:
         record = _decode_active_pause(await cache.get(credential_pause_active_key(organization_id, chat_id, turn_id)))
     except Exception:
-        LOG.warning("Failed to inspect Copilot credential pause", exc_info=True)
+        LOG.warning("Failed to inspect Ember credential pause", exc_info=True)
         return None
     live_until = record.live_until() if record is not None else None
     return bool(live_until is not None and datetime.now(UTC) < live_until)
@@ -643,12 +643,12 @@ async def _lead_site_question(
         asked_pair = _site_question_for(credential, site_url, await vault_login_sites(credential))
     except Exception:
         # The card then opens as a plain picker, and a pick of this login still asks.
-        LOG.info("copilot_credential_lead_site_question_unavailable", credential_id=credential_id, exc_info=True)
+        LOG.info("ember_credential_lead_site_question_unavailable", credential_id=credential_id, exc_info=True)
         return None
     if asked_pair is not None:
         question = asked_pair[0]
         LOG.info(
-            "copilot_credential_site_question",
+            "ember_credential_site_question",
             credential_id=credential_id,
             site=question.site,
             saved_sites=question.saved_sites,
@@ -1134,7 +1134,7 @@ def apply_connected_credential_to_policy(ctx: EmberContext, policy: RequestPolic
     policy.credential_pause_connected_credential_ids.add(credential.credential_id)
     admitted_url = _bind_connected_credential_origin(policy, credential)
     LOG.info(
-        "copilot_credential_pause_connected",
+        "ember_credential_pause_connected",
         credential_id=credential.credential_id,
         bound_origin=loggable_origin(admitted_url) if admitted_url else None,
     )
@@ -1160,7 +1160,7 @@ def _apply_signed_in_profile_to_policy(ctx: Any, policy: RequestPolicy, signed_i
     ctx.test_after_update_done = False
     policy.allow_run_blocks = True
     LOG.info(
-        "copilot_credential_pause_signed_in",
+        "ember_credential_pause_signed_in",
         browser_profile_id=signed_in.browser_profile_id,
         site=signed_in.site,
         cookie_count=signed_in.cookie_count,
@@ -1662,7 +1662,7 @@ async def _run_credential_pause(
         # The update card grants no authority: the credential keeps its origin and the request policy is
         # unchanged. It has no picker, so an answer naming another credential is not this update.
         if credential.credential_id != update_credential_id:
-            LOG.warning("copilot_credential_update_answer_names_another_credential")
+            LOG.warning("ember_credential_update_answer_names_another_credential")
             return None
         await answered("connected", credential)
         return resolution
@@ -1767,7 +1767,7 @@ async def await_pending_credential_pause(ctx: Any) -> None:
     try:
         await asyncio.wait_for(settled.wait(), bound)
     except TimeoutError:
-        LOG.warning("copilot_credential_gate_wait_timed_out")
+        LOG.warning("ember_credential_gate_wait_timed_out")
         settled.set()
 
 

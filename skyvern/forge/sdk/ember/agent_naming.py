@@ -93,23 +93,23 @@ async def name_agent(ctx: EmberContext, policy: RequestPolicy) -> str | None:
         except WorkflowNotFound:
             persisted = None
         if persisted is not None and persisted.title not in DEFAULT_WORKFLOW_TITLES:
-            LOG.info("copilot_agent_naming_skipped", workflow_permanent_id=ctx.workflow_permanent_id, reason="named")
+            LOG.info("ember_agent_naming_skipped", workflow_permanent_id=ctx.workflow_permanent_id, reason="named")
             return None
         try:
             title = await derive_agent_title(ctx.organization_id, policy.canonical_user_message)
         except TimeoutError:
-            LOG.info("copilot_agent_naming_skipped", workflow_permanent_id=ctx.workflow_permanent_id, reason="timeout")
+            LOG.info("ember_agent_naming_skipped", workflow_permanent_id=ctx.workflow_permanent_id, reason="timeout")
             return None
         except Exception as exc:
             # A provider traceback can quote the prompt, which carries the in-URL secret case.
             LOG.warning(
-                "copilot_agent_title_derivation_failed",
+                "ember_agent_title_derivation_failed",
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 exception_type=type(exc).__name__,
             )
             return None
         if not title:
-            LOG.info("copilot_agent_naming_skipped", workflow_permanent_id=ctx.workflow_permanent_id, reason="no_title")
+            LOG.info("ember_agent_naming_skipped", workflow_permanent_id=ctx.workflow_permanent_id, reason="no_title")
             return None
         renamed = await app.DATABASE.workflows.rename_workflow_if_still_default(
             workflow_id=ctx.workflow_id,
@@ -119,13 +119,13 @@ async def name_agent(ctx: EmberContext, policy: RequestPolicy) -> str | None:
         )
         if not renamed:
             LOG.info(
-                "copilot_agent_naming_skipped",
+                "ember_agent_naming_skipped",
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 reason="not_default_or_superseded",
             )
             return None
     except Exception:
-        LOG.warning("copilot_agent_naming_failed", workflow_permanent_id=ctx.workflow_permanent_id, exc_info=True)
+        LOG.warning("ember_agent_naming_failed", workflow_permanent_id=ctx.workflow_permanent_id, exc_info=True)
         return None
     # The row is renamed from here on, so the title is returned even when the client never hears of it.
     ctx.agent_named_title = title
@@ -135,11 +135,9 @@ async def name_agent(ctx: EmberContext, policy: RequestPolicy) -> str | None:
             stream_not_closed = await emit_title_update(ctx.stream, ctx, title)
         except Exception:
             LOG.warning(
-                "copilot_agent_title_update_failed", workflow_permanent_id=ctx.workflow_permanent_id, exc_info=True
+                "ember_agent_title_update_failed", workflow_permanent_id=ctx.workflow_permanent_id, exc_info=True
             )
-    LOG.info(
-        "copilot_agent_named", workflow_permanent_id=ctx.workflow_permanent_id, stream_not_closed=stream_not_closed
-    )
+    LOG.info("ember_agent_named", workflow_permanent_id=ctx.workflow_permanent_id, stream_not_closed=stream_not_closed)
     return title
 
 
@@ -147,7 +145,7 @@ def schedule_agent_naming(ctx: EmberContext, policy: RequestPolicy, product_acti
     try:
         reason = _naming_withheld_reason(ctx, policy, product_action)
         if reason is not None:
-            LOG.info("copilot_agent_naming_skipped", workflow_permanent_id=ctx.workflow_permanent_id, reason=reason)
+            LOG.info("ember_agent_naming_skipped", workflow_permanent_id=ctx.workflow_permanent_id, reason=reason)
             return
         # Deliberately not cancelled at turn end: the persisted title is still worth landing after
         # the stream closes, and a reload shows it.
@@ -155,6 +153,4 @@ def schedule_agent_naming(ctx: EmberContext, policy: RequestPolicy, product_acti
         _NAMING_TASKS.add(task)
         task.add_done_callback(_NAMING_TASKS.discard)
     except Exception:
-        LOG.warning(
-            "copilot_agent_naming_launch_failed", workflow_permanent_id=ctx.workflow_permanent_id, exc_info=True
-        )
+        LOG.warning("ember_agent_naming_launch_failed", workflow_permanent_id=ctx.workflow_permanent_id, exc_info=True)

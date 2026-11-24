@@ -837,7 +837,7 @@ async def _witness_unresolved_requested_targets(
     summary = captured.summary or {}
     witnesses, dropped = _witnesses_from_visual_summary(summary, owned_labels, unresolved)
     LOG.info(
-        "copilot_composition_requested_values_seen",
+        "ember_composition_requested_values_seen",
         unresolved_target_count=len(unresolved),
         pair_count=len(summary.get("requested_values") or []),
         witness_count=len(witnesses),
@@ -853,16 +853,16 @@ async def _witness_unresolved_requested_targets(
         witnessed_values=tuple(witness.value for witness in witnesses),
     )
     if witnessed_evidence is None:
-        LOG.info("copilot_composition_value_witness_extract_failed", error_present=bool(witness_error))
+        LOG.info("ember_composition_value_witness_extract_failed", error_present=bool(witness_error))
         return evidence
     merged = _merge_visual_summary_capture(witnessed_evidence, captured)
     records = await _value_witness_records(ember_ctx, merged, witnesses)
     if not records:
-        LOG.info("copilot_composition_value_witness_records_dropped", witness_count=len(witnesses))
+        LOG.info("ember_composition_value_witness_records_dropped", witness_count=len(witnesses))
         return evidence
     # The replacement has to clear the same gate the retry loop cleared for the packet it displaces.
     if not _composition_capture_settled(merged):
-        LOG.info("copilot_composition_value_witness_replacement_unsettled", witness_count=len(witnesses))
+        LOG.info("ember_composition_value_witness_replacement_unsettled", witness_count=len(witnesses))
         return evidence
     merged["value_witnesses"] = records
     return merged
@@ -1114,7 +1114,7 @@ def store_post_run_page_evidence(
     if CHALLENGE_FRAMES_KEY not in stamped:
         stamped = stamp_challenge_frame_fact(stamped, None)
     LOG.info(
-        "copilot_post_run_page_evidence_sourced",
+        "ember_post_run_page_evidence_sourced",
         run_id=run_id,
         source_browser_session_id=source_browser_session_id,
         run_browser_session_id=run_browser_session_id,
@@ -1218,7 +1218,7 @@ def _record_value_witnesses(
             # designation probe for the path the read actually answered.
             bound_output_path = str(recorded.get("read_output_path") or "") if recorded is not None else ""
             LOG.info(
-                "copilot_composition_value_witness_recorded",
+                "ember_composition_value_witness_recorded",
                 recorded=recorded is not None,
                 declared_output_path_present=bool(output_path),
                 bound_to_declared_path=bool(output_path) and bound_output_path == output_path,
@@ -1466,7 +1466,7 @@ async def _inspect_page_for_composition_under_custody(
     )
     observation_step = _append_flow_evidence(ember_ctx, evidence, reached_via=reached_via)
     if observation_step is None:
-        LOG.warning("copilot_flow_evidence_append_failed_no_trajectory")
+        LOG.warning("ember_flow_evidence_append_failed_no_trajectory")
     _record_value_witnesses(
         ember_ctx,
         evidence,

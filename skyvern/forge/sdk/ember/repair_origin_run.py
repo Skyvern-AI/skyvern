@@ -465,7 +465,7 @@ async def browser_session_settings(
     try:
         session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(session_id, organization_id)
     except Exception as exc:  # noqa: BLE001 - unavailable observations are unproven, never authored defaults.
-        LOG.info("copilot_output_session_settings_unavailable", error_type=type(exc).__name__)
+        LOG.info("ember_output_session_settings_unavailable", error_type=type(exc).__name__)
         return None
     if (
         not isinstance(session, PersistentBrowserSession)
@@ -568,7 +568,7 @@ async def _load_origin_outputs(
     except Exception as exc:
         # No exc_info: a row that fails to parse is quoted in its own exception message.
         LOG.warning(
-            "copilot_repair_origin_outputs_unavailable",
+            "ember_repair_origin_outputs_unavailable",
             workflow_run_id=workflow_run_id,
             error_type=type(exc).__name__,
         )
@@ -591,7 +591,7 @@ async def _load_named_output_source(
         )
     except Exception as exc:
         LOG.warning(
-            "copilot_named_output_source_unavailable", workflow_run_id=workflow_run_id, error_type=type(exc).__name__
+            "ember_named_output_source_unavailable", workflow_run_id=workflow_run_id, error_type=type(exc).__name__
         )
         return RefusedOutputSource(workflow_run_id, OriginOutputRefusal.OUTPUT_UNAVAILABLE)
     loaded = await _load_origin_outputs(
@@ -617,7 +617,7 @@ async def use_named_output_source(ctx: RepairTurnContext, workflow_run_id: str |
         return
     named = await _load_named_output_source(ctx, workflow_run_id)
     LOG.info(
-        "copilot_named_output_source",
+        "ember_named_output_source",
         workflow_run_id=workflow_run_id,
         refusal=named.reason.value if isinstance(named, RefusedOutputSource) else None,
         output_labels=sorted(named.snapshot.outputs) if isinstance(named, CompletedOutputSource) else [],
@@ -644,7 +644,7 @@ async def seed_repair_origin_run(ctx: RepairTurnContext, *, workflow_run_id: str
     except Exception:
         # An inherited fact is worth less than the turn: an unreadable run leaves the binding unset
         # so the turn reports an unavailable target instead of failing before it starts.
-        LOG.warning("copilot_repair_origin_lookup_failed", requested_workflow_run_id=workflow_run_id, exc_info=True)
+        LOG.warning("ember_repair_origin_lookup_failed", requested_workflow_run_id=workflow_run_id, exc_info=True)
         binding = _refused(RepairOriginRefusal.LOOKUP_FAILED)
     if binding.usable:
         ctx.last_run_blocks_workflow_run_id = binding.workflow_run_id
@@ -664,7 +664,7 @@ async def seed_repair_origin_run(ctx: RepairTurnContext, *, workflow_run_id: str
         except Exception as exc:
             # No exc_info: a value that fails to parse is quoted in its own exception message.
             LOG.warning(
-                "copilot_repair_origin_input_values_unavailable",
+                "ember_repair_origin_input_values_unavailable",
                 workflow_run_id=workflow_run_id,
                 error_type=type(exc).__name__,
             )
@@ -686,7 +686,7 @@ async def seed_repair_origin_run(ctx: RepairTurnContext, *, workflow_run_id: str
     )
     origin_outputs = ctx.repair_origin_outputs
     LOG.info(
-        "copilot_repair_origin_binding",
+        "ember_repair_origin_binding",
         requested_workflow_run_id=workflow_run_id,
         seeded=binding.usable,
         refusal=binding.refusal.value if binding.refusal else None,

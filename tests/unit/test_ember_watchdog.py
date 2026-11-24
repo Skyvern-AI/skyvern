@@ -1087,7 +1087,7 @@ async def test_a_loop_iteration_that_ended_on_a_failed_block_stops_the_test(
     assert summary == "Stopped the test after row 1 failed; 118 of 120 rows did not run."
     assert contains_internal_machinery_leak(summary) is False
     assert_clean_user_facing_text(summary)
-    stops = [log for log in logs if log["event"] == "copilot_test_stopped_at_failed_iteration"]
+    stops = [log for log in logs if log["event"] == "ember_test_stopped_at_failed_iteration"]
     assert [
         (s["loop_label"], s["failed_iteration_index"], s["iterations_started"], s["loop_length"]) for s in stops
     ] == [("each_row", 0, 2, 120)]

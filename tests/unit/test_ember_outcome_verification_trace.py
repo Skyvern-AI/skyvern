@@ -1,4 +1,4 @@
-"""Unit tests for copilot.turn outcome-verification telemetry."""
+"""Unit tests for ember.turn outcome-verification telemetry."""
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ def test_record_completion_verification_logs_abstention_fingerprint() -> None:
     with capture_logs() as logs:
         record_completion_verification(ctx, _abstention_engaged_result(), workflow_run_id="wr_test_run")
 
-    events = [log for log in logs if log["event"] == "copilot.completion.plain_outcome_no_evidence_abstention"]
+    events = [log for log in logs if log["event"] == "ember.completion.plain_outcome_no_evidence_abstention"]
     assert len(events) == 1
     event = events[0]
     assert event["workflow_run_id"] == "wr_test_run"
@@ -103,7 +103,7 @@ def test_record_completion_verification_skips_fingerprint_log_when_not_engaged()
     with capture_logs() as logs:
         record_completion_verification(ctx, _evaluated_result(), workflow_run_id="wr_test_run")
 
-    assert all(log["event"] != "copilot.completion.plain_outcome_no_evidence_abstention" for log in logs)
+    assert all(log["event"] != "ember.completion.plain_outcome_no_evidence_abstention" for log in logs)
 
 
 def test_record_completion_verification_populates_evaluated_block() -> None:
@@ -180,7 +180,7 @@ def test_finalize_is_best_effort_when_source_raises() -> None:
             raise RuntimeError("boom")
 
     ctx = SimpleNamespace(workflow_verification_evidence=Exploding())
-    with otel_trace.get_tracer("test.finalize").start_as_current_span("copilot.turn") as span:
+    with otel_trace.get_tracer("test.finalize").start_as_current_span("ember.turn") as span:
         finalize_outcome_verification_trace(ctx, span)  # must not raise
 
 
@@ -193,10 +193,10 @@ async def test_finalize_lands_fields_on_finished_turn_span(span_exporter: Any) -
     record_gate_decision(ctx, {"gate_satisfied": True, "gate_last_full_workflow_test_ok": True})
     record_completion_verification(ctx, _evaluated_result())
 
-    with otel_trace.get_tracer("test.finalize").start_as_current_span("copilot.turn") as span:
+    with otel_trace.get_tracer("test.finalize").start_as_current_span("ember.turn") as span:
         finalize_outcome_verification_trace(ctx, span)
 
-    finished = [s for s in span_exporter.get_finished_spans() if s.name == "copilot.turn"]
+    finished = [s for s in span_exporter.get_finished_spans() if s.name == "ember.turn"]
     assert len(finished) == 1
     attrs = dict(finished[0].attributes or {})
     assert attrs["gate_satisfied"] is True
@@ -248,7 +248,7 @@ async def test_run_ember_agent_finalizes_false_gate_on_turn_span(
         llm_api_handler=None,
     )
 
-    turn_spans = [s for s in span_exporter.get_finished_spans() if s.name == "copilot.turn"]
+    turn_spans = [s for s in span_exporter.get_finished_spans() if s.name == "ember.turn"]
     assert len(turn_spans) == 1
     attrs = dict(turn_spans[0].attributes or {})
     assert attrs["gate_satisfied"] is False

@@ -3176,7 +3176,7 @@ async def test_origin_recovery_declines_when_the_card_cannot_be_shown(monkeypatc
     with capture_logs() as logs:
         result = await _ask(ctx, f"{_IDP_ORIGIN}/login")
 
-    assert "copilot_credential_card_unavailable" in {entry["event"] for entry in logs}
+    assert "ember_credential_card_unavailable" in {entry["event"] for entry in logs}
     ctx.stream.send.assert_not_awaited()
     assert ctx.credential_pause_used is True
     _assert_declined(ctx, result, "unavailable")
@@ -4165,7 +4165,7 @@ async def test_registration_generate_failure_with_no_readback_match_reopens_the_
         await asyncio.sleep(0.3)
     assert vault.stored == (1 if failure == "timeout" else 0)
     assert vault.hooks_run == (["cred_late"] if failure == "timeout" else [])
-    late_creates = [log["credential_id"] for log in logs if log["event"] == "copilot_credential_generation_late_create"]
+    late_creates = [log["credential_id"] for log in logs if log["event"] == "ember_credential_generation_late_create"]
     assert late_creates == (["cred_late"] if failure == "timeout" else [])
     for password in vault.passwords:
         assert password not in json.dumps(logs, default=str)
@@ -4501,7 +4501,7 @@ async def test_registration_password_quoted_by_a_vault_error_is_scrubbed_from_re
     rendered = rendered_logs.getvalue()
     assert result.result == "unknown"
     assert "vault create failed" in rendered
-    assert "copilot_credential_generation_readback_failed" in rendered
+    assert "ember_credential_generation_readback_failed" in rendered
     assert "in an unexpected shape" in rendered
     assert "Traceback" in rendered
     assert password not in rendered
@@ -4819,7 +4819,7 @@ async def test_adding_the_recovery_site_keeps_the_first_and_later_turns_fill_on_
         "https://portal.example.com",
         _SITE_B_ORIGIN,
     )
-    [changed] = [line for line in logs if line["event"] == "copilot_credential_site_changed"]
+    [changed] = [line for line in logs if line["event"] == "ember_credential_site_changed"]
     assert (changed["action"], changed["site_a"], changed["site_b"]) == (
         "add",
         "https://portal.example.com",

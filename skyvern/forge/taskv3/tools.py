@@ -777,7 +777,12 @@ async def _positional_note(
     return "\n".join(lines), {"matches": matches, "listed": len(rows), "picks": picks}
 
 
-def _inert_target_error(selector: str) -> ToolResult:
+def _driver_interception_lines(exc: BaseException) -> list[str]:
+    # The call log quotes page markup, so only a line that ends the way the driver's own interception line does counts.
+    return [line for line in str(exc).split("\n") if line.strip().endswith("intercepts pointer events")]
+
+
+def _inert_target_error(selector: str, intercepted: bool = False) -> ToolResult:
     # Distinct from the unreachable error, which sends the model to whatever reveals a collapsed
     # section: a template is not a section, has no opener of its own, and the live control (if there
     # is one) is a different element with a different selector. Distinct from the covered error for
@@ -789,6 +794,13 @@ def _inert_target_error(selector: str) -> ToolResult:
     # categorical "nothing is blocking you" would turn this into a way to dismiss a genuine blocker),
     # and not that it will stay hidden -- a pending fetch can reveal it with no trigger at all, so the
     # shapes are named as the usual ones rather than as an exhaustive pair.
+    if intercepted:
+        return ToolResult.error(
+            f"{selector} is not rendered now: it is inside a display:none subtree. During the driver's wait it was "
+            "rendered, and another element intercepted pointer events at its position. Re-observe and act on what "
+            "the page renders.",
+            error_class="inert",
+        )
     return ToolResult.error(
         f"{selector} is not rendered — it matched inside a display:none subtree. An element with no box "
         "cannot be obstructed, so THIS failure is not evidence of a layer over it; whether something "
@@ -6504,6 +6516,35 @@ _TARGET_LABEL_TOOL_NAMES = frozenset(
 )
 
 
+def _scroll_report(
+    selector: str, before: dict[str, float] | None, after: dict[str, float] | None, viewport: tuple[int, int] | None
+) -> str:
+    if after is None:
+        return f"{selector} has no box after the scroll"
+    at = f"x={round(after['x'])}, y={round(after['y'])}"
+    was = f"x={round(before['x'])}, y={round(before['y'])}" if before is not None else None
+    moved = was != at
+    change = f"moved from {was} to {at}" if was else f"appeared at {at}"
+    if viewport is None:
+        return f"scrolled {selector}: its box {change}" if moved else f"{selector} did not move: its box is at {at}"
+    width, height = viewport
+    size = f"{width}x{height}"
+    # A zero-width or zero-height box (the usual hidden native radio) still sits at a point, so it counts as 1 px.
+    overlaps = (
+        after["x"] < width
+        and after["y"] < height
+        and after["x"] + max(after["width"], 1) > 0
+        and after["y"] + max(after["height"], 1) > 0
+    )
+    if overlaps:
+        if moved:
+            return f"scrolled {selector}: its box {change} and overlaps the {size} viewport"
+        return f"{selector} did not move: its box at {at} overlaps the {size} viewport"
+    return (
+        f"{selector} is outside the {size} viewport after the scroll: its box {change if moved else f'stayed at {at}'}"
+    )
+
+
 _REACH_PROBE_NEEDED_JS = (
     r"""(arg) => {
   const _q = """
@@ -6520,7 +6561,7 @@ _REACH_PROBE_NEEDED_JS = (
   //
   // The class reports WHICH case produced the decision, because one boolean collapses seven distinct
   // conditions -- not found, shadow-rooted, zero-area, self, non-target, null hit, and a throw inside
-  // the rect block -- into four classes. Telemetry only: no branch here reads it.
+  // the rect block -- into four classes. The click reads only `non_target`, to take a cover reading before it acts.
   //
   // `non_target` is named for what it measures -- the centre point hit something that is not the
   // target -- and NOT for occlusion. A row clipped out of its own scroll container lands here with
@@ -6582,6 +6623,16 @@ _INERT_TARGET_PROBE_JS = (
     }
   } catch (e) { /* a claim the climb could not establish is not made */ }
   return false;
+}"""
+)
+
+_SHOWN_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const el = _q.find(arg.sel);
+  return !!el && el.checkVisibility({ opacityProperty: true, visibilityProperty: true });
 }"""
 )
 
@@ -6847,8 +6898,10 @@ _TYPE_TARGET_PROBE_JS = (
     + _PAINT_VISIBLE_JS
     + _OWN_LABEL_HIT_JS
     + r"""
+  // The click's reading before it acts: it must not move the layout, nor clear a catcher an earlier result named.
+  const COVER_ONLY = false;
   try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
-  try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
+  if (!COVER_ONLY) try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
 """
     + _TARGET_READONLY_JS
     + r"""  const RETEST_SCROLLABLE_CLIP = false;
@@ -6871,7 +6924,7 @@ _TYPE_TARGET_PROBE_JS = (
   // read as unoccluded -- which is most fields on a real form. Playwright scrolls before it clicks,
   // so scrolling here asks about the same layout the click is about to meet.
   const inView = r.top >= 0 && r.left >= 0 && r.bottom <= innerHeight && r.right <= innerWidth;
-  if (!inView) {
+  if (!inView && !COVER_ONLY) {
     // 'instant' matters: scrollIntoView inherits CSS scroll-behavior, and a page with smooth
     // scrolling animates over hundreds of ms while the rect below is read synchronously -- the
     // element is still off-screen, elementFromPoint returns null, and the probe reports nothing.
@@ -6993,7 +7046,7 @@ _TYPE_TARGET_PROBE_JS = (
   // A viewport-pinned cover (fixed bar, sticky header) clears only by moving the FIELD out from under
   // it -- centring, the same retry Playwright's click makes. A static cover is true at any scroll.
   // Not when the field's own popup is open (aria-expanded): a scroll would close what it just opened.
-  if (hitResult.blocked && isPinned(hitResult.top, true) && !ownPopupOpen) {
+  if (hitResult.blocked && isPinned(hitResult.top, true) && !ownPopupOpen && !COVER_ONLY) {
     try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { /* keep the rect */ }
     out.scrolled = true;
     const r2 = el.getBoundingClientRect();
@@ -7716,7 +7769,7 @@ _TYPE_TARGET_PROBE_JS = (
     + json.dumps(_INTERACTIVE_HIT_SEL)
     + r""";
     if (related(layer, el) && ![hit, hitResult.top].some((n) => n && n.closest && n.closest(activates))) {
-      try { hit.setAttribute('data-tv3-catcher', '1'); out.occluder.ownContainer = true; } catch (e) { /* best-effort */ }
+      try { if (!COVER_ONLY) hit.setAttribute('data-tv3-catcher', '1'); out.occluder.ownContainer = true; } catch (e) { /* best-effort */ }
     }
     // Whether a PERSON would see this layer at all. A leftover consent backdrop still intercepts the
     // pointer (elementFromPoint returned it) but can paint nothing -- fully transparent, no visible
@@ -7733,6 +7786,7 @@ _TYPE_TARGET_PROBE_JS = (
 _TYPING_REACH_PROBE_JS = _TYPE_TARGET_PROBE_JS.replace(
     "const RETEST_SCROLLABLE_CLIP = false;", "const RETEST_SCROLLABLE_CLIP = true;"
 ).replace("const LAYER_IDENTITY = false;", "const LAYER_IDENTITY = true;")
+_CLICK_COVER_PROBE_JS = _TYPE_TARGET_PROBE_JS.replace("const COVER_ONLY = false;", "const COVER_ONLY = true;")
 
 # The probe's readonly reading alone. Unlike the probe it scrolls nothing and re-mints no cover markers, so it can
 # be repeated without invalidating the markers the probe's verdict names.
@@ -10283,8 +10337,8 @@ OBSERVE_DISPLAY_WIDTHS = {
 # call so the longest payload-minted URL fits whole after the widest display window.
 OBSERVE_RETAIN_WIDTH_MIN = 2000
 OBSERVE_FIELD_DISPLAY_MAX = max(OBSERVE_DISPLAY_WIDTHS.values())
-# A clipped field carries its clip in-band between NULs until the line is final. repr escapes every
-# control character, so page bytes can never contain one, and a line's identity can drop the span.
+# A clipped field carries its clip in-band between NULs until the line is final, and so does a hidden toggle's note
+# that follows the scroll position. repr escapes every control character, so page bytes can never contain one.
 _OBSERVE_CLIP_SPAN_RE = re.compile("\x00([^\x00]*)\x00")
 # A slot name is printed bare inside near=[slot:text, ...], so only name characters survive.
 _NEAR_SLOT_STRIP_RE = re.compile(r"[^\w.-]")
@@ -10324,8 +10378,9 @@ def _near_suffix(near: object, field: Callable[[str, int], str]) -> str:
 
 def _observe_line_identity(line: str) -> str:
     # Two lines that differ only in how much their clipped text ran on print nothing the model can
-    # tell apart, so they are still the same line.
-    return _OBSERVE_CLIP_SPAN_RE.sub("", line)
+    # tell apart, so they are still the same line. A note that follows the scroll position stays as a constant, so a
+    # hidden toggle is still apart from a lookalike without one.
+    return _OBSERVE_CLIP_SPAN_RE.sub(lambda m: " [hidden-native: *]" if m.group(1).startswith(" [") else "", line)
 
 
 def _observe_render_clips(line: str) -> str:
@@ -10333,8 +10388,9 @@ def _observe_render_clips(line: str) -> str:
 
 
 def _observe_render_clip_spans(text: str) -> tuple[str, list[list[int]]]:
-    """`text` with each clip span rendered as its marker, and where each marker landed. The markers are
-    an annotation for the model, not page content, so the loop folds exactly these spans out."""
+    """`text` with each clip span rendered as its marker (a clip count, or a note that follows the scroll position),
+    and where each marker landed. The markers are an annotation for the model, not page content, so the loop folds
+    exactly these spans out."""
     out: list[str] = []
     spans: list[list[int]] = []
     length = 0
@@ -10342,7 +10398,8 @@ def _observe_render_clip_spans(text: str) -> tuple[str, list[list[int]]]:
     for match in _OBSERVE_CLIP_SPAN_RE.finditer(text):
         out.append(text[last : match.start()])
         length += match.start() - last
-        marker = f" …[+{match.group(1)} chars]"
+        held = match.group(1)
+        marker = held if held.startswith(" [") else f" …[+{held} chars]"
         out.append(marker)
         spans.append([length, length + len(marker)])
         length += len(marker)
@@ -11203,7 +11260,7 @@ async (__tv3TextArgs) => {
     const pick = """
     + _OWN_LABEL_PICK_JS
     + r""";
-    return (el) => pick(el, nativeLabelsOf(el));
+    return (el) => { const labels = nativeLabelsOf(el); const p = pick(el, labels); return p && !p.held ? labels[p.index] : null; };
   })();
   const _fadedAncestry = """
     + _FADED_ANCESTRY_JS
@@ -12495,8 +12552,15 @@ async (__tv3TextArgs) => {
     if (to) rec.to = to.slice(0, _RETAIN_WIDTH);
     if (hidden) rec.hidden = true;
     if (hidden && (el.type === 'checkbox' || el.type === 'radio')) {
-      // click picks its label the same way and refuses one under a faded ancestry, so the promise is printed only where it delivers.
-      try { const pick = _ownLabelPick(el); if (pick && !pick.held && !_fadedAncestry(el)) rec.labelDelivers = true; } catch (e) { /* none */ }
+      // Promised only for a label inside the viewport now: whether a scroll brings an off-screen one in is measured by
+      // click's own scroll, so observe reports only where it is.
+      try {
+        const lb = _ownLabelPick(el);
+        if (lb && !_fadedAncestry(el)) {
+          if (_outsideViewport(_bcr.call(lb))) rec.labelOffscreen = true;
+          else rec.labelDelivers = true;
+        }
+      } catch (e) { /* none */ }
     }
     if (removedBy) rec.a11yRemoved = removedBy;
     // A widget role is what the element IS -- a <div role="switch"> renders as a bare div otherwise,
@@ -16080,7 +16144,16 @@ def build_browser_tools(
                     extra += " [hidden-native: styled proxy; file_upload works on it directly]"
                 elif e.get("tag") == "select":
                     extra += " [hidden-native: styled proxy; select_option acts on it directly]"
-                elif e.get("type") in ("checkbox", "radio") and not e.get("labelDelivers"):
+                elif e.get("type") in ("checkbox", "radio") and (e.get("labelDelivers") or e.get("labelOffscreen")):
+                    # Which note shows follows the scroll position, not the page, so it is wrapped like a clip count
+                    # for the loop's stall digest to fold out.
+                    note = (
+                        "click acts on it directly"
+                        if e.get("labelDelivers")
+                        else "click tries its label, which is outside the viewport now"
+                    )
+                    extra += f"\x00 [hidden-native: styled proxy; {note}]\x00"
+                elif e.get("type") in ("checkbox", "radio"):
                     extra += " [hidden-native: styled proxy]"
                 else:
                     extra += " [hidden-native: styled proxy; click acts on it directly]"
@@ -17103,7 +17176,9 @@ def build_browser_tools(
             return "invisible"
         return "named"
 
-    def _record_covered(occluder: dict[str, Any] | None, branch: CoveredBranch, *, controls: list[str]) -> None:
+    def _record_covered(
+        occluder: dict[str, Any] | None, branch: CoveredBranch, *, controls: list[str], after_wait: bool = False
+    ) -> None:
         # The ghost-cover branch returns before the probe names an element, so it reports no kind at
         # all; that absence IS `unnamed`, not a missing reading. `clipper` is the clipped branch's
         # own kind: its container is not a layer, but whether one was NAMED splits that branch into a
@@ -17113,7 +17188,25 @@ def build_browser_tools(
         # `controls` is the list the message will name, which is why it is passed in rather than
         # recomputed here: the INVISIBLE message omits controls on purpose, and it stays truthful only
         # because the probe sets `invisible` solely on a layer that had none to name.
-        record_covered_layer(branch, controls=len(controls), layer_kind=layer_kind)
+        record_covered_layer(branch, controls=len(controls), layer_kind=layer_kind, after_wait=after_wait)
+
+    def _named_layer_text(occluder: dict[str, Any], parts: list[str]) -> tuple[str, str, str]:
+        """A named layer's description, its controls list, and the note for when it has none."""
+        name = str(occluder.get("name") or "").strip()
+        layer_selector = occluder.get("selector")
+        layer_desc = f'"{name}"' if name else "a layer"
+        if layer_selector:
+            layer_desc = f"{layer_desc} ({layer_selector})"
+        controls_desc = "; ".join(parts) if parts else "none named"
+        if occluder.get("truncated"):
+            controls_desc += "; more controls exist (re-observe to see the rest)"
+        none_found = (
+            "It is a frame, and the probe does not read inside frames"
+            if occluder.get("frame")
+            else "The probe found no named controls on it; one without a label (an icon or an ×) would show "
+            f"in get_html of {layer_selector or 'the layer'}"
+        )
+        return layer_desc, controls_desc, none_found
 
     def _covered_error(
         selector: str, occluder: dict[str, Any] | None = None, *, verb: str = "typed into"
@@ -17122,10 +17215,9 @@ def build_browser_tools(
         name = str((occluder or {}).get("name") or "").strip()
         layer_selector = (occluder or {}).get("selector")
         challenge_frame = str((occluder or {}).get("challengeFrame") or "").strip()
-        # Recorded from here, above every return, because this helper is the single place every
-        # message is built: one call covers click, both typing paths and the two re-raises, and a
-        # branch added below cannot slip out un-recorded. The layer's NAME is deliberately not
-        # recorded -- it is page text, and these names carry personal data.
+        # Recorded above every return, so a branch added below cannot slip out un-recorded; the click's result for a
+        # target hidden during the wait records its own. The layer's NAME is not recorded: it is page text, and these
+        # names carry personal data.
         parts = _named_controls(occluder)
         branch = _covered_branch(occluder)
         said = _layer_text_clause(occluder, layer_selector) if branch == "named" else ""
@@ -17192,14 +17284,7 @@ def build_browser_tools(
                 "Dismiss whatever covers it (a dialog, an overlay, a cookie banner), then re-observe.",
                 error_class="covered",
             )
-        layer_desc = f'"{name}"' if name else "a layer"
-        if layer_selector:
-            layer_desc = f"{layer_desc} ({layer_selector})"
-        controls_desc = "; ".join(parts) if parts else "none named"
-        if (occluder or {}).get("truncated"):
-            controls_desc += "; more controls exist (re-observe to see the rest)"
-        is_frame = bool((occluder or {}).get("frame"))
-        frame_note = "It is a frame, and the probe does not read inside frames"
+        layer_desc, controls_desc, none_found = _named_layer_text(occluder or {}, parts)
         if branch == "challenge":
             return ToolResult.error(
                 f"{selector} is covered by {layer_desc}, which contains a challenge frame "
@@ -17230,12 +17315,6 @@ def build_browser_tools(
         # A layer that is quoted is reported, not prescribed for: its text may be the page answering the last action,
         # which closing it and retrying the same field does not address.
         if said and not parts:
-            none_found = (
-                frame_note
-                if is_frame
-                else "The probe found no named controls on it; one without a label (an icon or an ×) would show "
-                f"in get_html of {layer_selector or 'the layer'}"
-            )
             return ToolResult.error(
                 f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} {none_found}.",
                 data=blocker,
@@ -17252,8 +17331,8 @@ def build_browser_tools(
             # The probe names controls by tag, role, pointer cursor and inline onclick; a close wired by a script
             # listener is none of those, so an empty list is no evidence the layer has no way out.
             none_found = (
-                frame_note
-                if is_frame
+                none_found
+                if (occluder or {}).get("frame")
                 else "The probe found no named controls on it, but it may still have an unlabeled close (an icon or "
                 f"an ×): read get_html of {layer_selector or 'the layer'} to find it, close the layer, then retry "
                 f"{selector}"
@@ -17512,7 +17591,11 @@ def build_browser_tools(
                 if handle is not None:
                     with contextlib.suppress(Exception):
                         await handle.dispose()
-        return _inert_target_error(acted) if probe is not None and await _target_is_inert(probe) else None
+        if probe is None or not await _target_is_inert(probe):
+            return None
+        # The driver logs an interception only for a target it found visible, enabled and stable.
+        intercepted = not is_post_dispatch_click_timeout(exc) and bool(_driver_interception_lines(exc))
+        return _inert_target_error(acted, intercepted=intercepted)
 
     async def _typing_target(page: Any, selector: str) -> str:
         """The element a type call acts on: the one its selector names, or the control a named shadow host mirrors."""
@@ -18069,8 +18152,9 @@ def build_browser_tools(
         # between them, so re-asking the executor per probe would only buy round trips.
         pre_click_arg = await _probe_arg(page, selector)
         # Only a target that can have its own label over it (a component's slotted label, or a sibling
-        # <label for=id>) pays the extra round trip; any other light-DOM click keeps its single one.
+        # <label for=id>), or whose centre hit another element, pays the extra round trip.
         reach_pre = None
+        cover_pre = None
         try:
             # Timed at the production call site rather than on a bench: a local page.evaluate bounds
             # only the browser-side half. The FIRST reading per realm also pays isolated-world
@@ -18094,7 +18178,10 @@ def build_browser_tools(
                     raised=raised,
                 )
             if _reach_probe_needed(reach_verdict):
-                reach_pre = await _probe_evaluate(page, _TYPE_TARGET_PROBE_JS, selector, pre_click_arg)
+                reach_pre = cover_pre = await _probe_evaluate(page, _TYPE_TARGET_PROBE_JS, selector, pre_click_arg)
+            elif _reach_hit_class(reach_verdict) == "non_target":
+                # Kept out of reach_pre, so it changes no dispatch decision.
+                cover_pre = await _probe_evaluate(page, _CLICK_COVER_PROBE_JS, selector, pre_click_arg)
         except Exception:
             reach_pre = None
         enable_deadline = time.monotonic() + _DISABLED_CLICK_GRACE_SECONDS
@@ -18119,11 +18206,11 @@ def build_browser_tools(
                 return await _disabled_click_refusal(_current_page(), selector)
             await asyncio.sleep(0.1)
             try:
-                reach_pre = await _probe_evaluate(
+                reach_pre = cover_pre = await _probe_evaluate(
                     page, _TYPE_TARGET_PROBE_JS, selector, await _probe_arg(page, selector)
                 )
             except Exception:
-                reach_pre = None
+                reach_pre = cover_pre = None
             if isinstance(reach_pre, dict) and not reach_pre.get("exists"):
                 # Only a marker cannot come back without a re-observe; a CSS selector may match a
                 # remount, which Playwright's own wait on the click below still finds.
@@ -18336,6 +18423,36 @@ def build_browser_tools(
                         data={"page_state_changed": True},
                         error_class="stale_selector",
                     )
+                # A target the page hid during the wait has no box left to hit-test, so the layer named is the one the
+                # reading before the click marked, and only when the driver's own interception line quotes that marker.
+                occluder_pre = (
+                    cover_pre.get("occluder")
+                    if isinstance(cover_pre, dict) and cover_pre.get("occluded") and not cover_pre.get("ownLabel")
+                    else None
+                )
+                if (
+                    isinstance(occluder_pre, dict)
+                    and occluder_pre.get("layerKind") == "qualified"
+                    and is_driver_timeout_error(e)
+                    and not is_post_dispatch_click_timeout(e)
+                    and any('data-tv3-cover="1"' in line for line in _driver_interception_lines(e))
+                    and await _target_is_inert(selector)
+                    and await _evaluate_isolated(page, _SHOWN_JS, "[data-tv3-cover]") is True
+                ):
+                    await _annotate_challenge_frame(page, _current_page(), occluder_pre)
+                    if _covered_branch(occluder_pre) == "named":
+                        parts = _named_controls(occluder_pre)
+                        said = _layer_text_clause(occluder_pre, occluder_pre.get("selector"))
+                        _record_covered(occluder_pre, "quoted" if said else "named", controls=parts, after_wait=True)
+                        layer, controls, none_found = _named_layer_text(occluder_pre, parts)
+                        listed = f"Its controls: {controls}." if parts else f"{none_found}."
+                        return ToolResult.error(
+                            f"{selector} was covered by {layer}: during the driver's wait that layer intercepted "
+                            f"pointer events at its position, and once the wait ran out {selector} was inside a "
+                            "display:none subtree and the layer was still shown. From the reading before the "
+                            f"click:{said} {listed} Re-observe and act on what the page renders.",
+                            error_class="covered",
+                        )
                 # Diagnosed only now, after the full actionability wait: a transient overlay (a toast,
                 # a closing menu) deserves the whole 15s to clear on its own, not a probe-shortened one.
                 try:
@@ -24351,8 +24468,18 @@ def build_browser_tools(
             await _require_single_target(page, selector)
             el = await page.query_selector(selector)
             if el:
+                # Playwright gives main-frame viewport coordinates even for a framed target, and None for no box.
+                before = await el.bounding_box()
                 await el.scroll_into_view_if_needed()
-                return ToolResult.ok(f"scrolled {selector} into view")
+                after = await el.bounding_box()
+                top = _current_page() or page
+                size = top.viewport_size
+                viewport = (size["width"], size["height"]) if size else None
+                if viewport is None:
+                    inner = await _evaluate_isolated(top, "() => [innerWidth, innerHeight]", "")
+                    if isinstance(inner, list) and len(inner) == 2:
+                        viewport = (int(inner[0]), int(inner[1]))
+                return ToolResult.ok(_scroll_report(selector, before, after, viewport))
         amount = int(args.get("amount", 800))
         if args.get("direction") == "up":
             amount = -amount

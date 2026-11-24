@@ -793,7 +793,7 @@ def test_sdk_agent_guardrail_builders_use_policy_names() -> None:
     assert input_guardrails[0].name == "request_policy_guardrail"
     assert input_guardrails[0].run_in_parallel is False
     assert len(output_guardrails) == 1
-    assert output_guardrails[0].name == "copilot_output_policy_guardrail"
+    assert output_guardrails[0].name == "ember_output_policy_guardrail"
 
 
 @pytest.mark.asyncio
@@ -1055,9 +1055,9 @@ def test_output_policy_block_turn_outcome_persists_and_logs_every_reason(monkeyp
     assert result.turn_outcome is not None
     assert result.turn_outcome.output_policy_reasons == reasons
     log.warning.assert_any_call(
-        "copilot output policy blocked final output",
-        log_code="copilot_output_policy_block",
-        **{"copilot.output_policy_reasons": [reason.value for reason in reasons]},
+        "ember output policy blocked final output",
+        log_code="ember_output_policy_block",
+        **{"ember.output_policy_reasons": [reason.value for reason in reasons]},
     )
 
 

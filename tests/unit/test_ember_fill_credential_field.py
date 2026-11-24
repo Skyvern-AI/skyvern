@@ -666,7 +666,7 @@ async def test_unreadable_field_records_the_fill_and_says_so(monkeypatch: pytest
     assert ctx.scout_trajectory[-1]["credential_field"] == "totp"
     assert "value_landed" not in ctx.scouted_interactions[0].get("observed_effects", {})
     assert any(
-        entry.get("event") == "copilot fill_credential_field readback outcome" and entry.get("outcome") == "unavailable"
+        entry.get("event") == "ember fill_credential_field readback outcome" and entry.get("outcome") == "unavailable"
         for entry in logs
     )
 
@@ -806,7 +806,7 @@ async def test_readback_failure_surfaces_and_skips_recording(monkeypatch: pytest
     assert result["data"]["landing_inferred_from_navigation"] is False
     assert ctx.scouted_interactions == []
     assert any(
-        entry.get("event") == "copilot fill_credential_field readback outcome" and entry.get("outcome") == "empty"
+        entry.get("event") == "ember fill_credential_field readback outcome" and entry.get("outcome") == "empty"
         for entry in logs
     )
 
@@ -2505,7 +2505,7 @@ class TestObservationSeamCredentialBinding:
         ):
             await mcp_hooks_module._bind_login_credential_for_observed_url(ctx, observed_url, result)
 
-        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        emitted = [entry for entry in logs if entry["event"] == "ember credential live-page admission"]
         assert [(entry["seam"], entry["outcome"]) for entry in emitted] == [("page_observation", outcome)]
         assert "resolved_login_credential_id" not in result
         assert policy.resolved_credentials == []

@@ -1469,7 +1469,7 @@ async def _start_run(
     except AccountGroupRefused:
         raise
     except Exception:
-        LOG.warning("Starting a saved workflow run from Copilot raised", workflow_run_id=workflow_run_id, exc_info=True)
+        LOG.warning("Starting a saved workflow run from Ember raised", workflow_run_id=workflow_run_id, exc_info=True)
         try:
             run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id=organization_id)
         except Exception:
@@ -1482,7 +1482,7 @@ async def _start_run(
         )
         raise
     LOG.info(
-        "Copilot started a saved workflow run",
+        "Ember started a saved workflow run",
         chat_id=chat_id,
         interaction_id=interaction_id,
         workflow_run_id=workflow_run_id,
@@ -1496,7 +1496,7 @@ async def _start_run(
         )
     except Exception:
         LOG.warning(
-            "on_run_created failed for a Copilot saved workflow run", workflow_run_id=workflow_run_id, exc_info=True
+            "on_run_created failed for an Ember saved workflow run", workflow_run_id=workflow_run_id, exc_info=True
         )
     return True
 
@@ -1581,7 +1581,7 @@ async def _start_saved_draft_run(
             workflow_permanent_id=saved.workflow_permanent_id, organization_id=organization.organization_id
         )
     except Exception:
-        LOG.warning("Copilot saved a draft from the run card but could not record it", exc_info=True)
+        LOG.warning("Ember saved a draft from the run card but could not record it", exc_info=True)
         return False, "the save could not be recorded in this chat. Propose the run again to run the saved version."
     # Another chat can rewrite this version in place under the same id, so the content must still be the saved draft.
     if (
@@ -1609,7 +1609,7 @@ async def _start_saved_draft_run(
         return False, str(e.detail)
     except Exception:
         # _start_run returns None when the run may exist and raises only once it confirmed the run does not.
-        LOG.warning("Starting the run of a saved Copilot draft raised", workflow_run_id=workflow_run_id, exc_info=True)
+        LOG.warning("Starting the run of a saved Ember draft raised", workflow_run_id=workflow_run_id, exc_info=True)
         return False, "the run could not be started, so no run exists. Propose the run again to run the saved version."
     if started:
         try:
@@ -1622,7 +1622,7 @@ async def _start_saved_draft_run(
                 run_started=True,
             )
         except Exception:
-            LOG.warning("Failed to record that a saved Copilot draft's run started", exc_info=True)
+            LOG.warning("Failed to record that a saved Ember draft's run started", exc_info=True)
     return started, None
 
 

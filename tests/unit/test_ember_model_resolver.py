@@ -95,7 +95,7 @@ async def test_a_ember_turn_sends_the_configured_reasoning_effort(
     )
     resolved_model_name, run_config, _, _ = resolve_model_config(_install_config(monkeypatch, config, "GPT5_TEST"))
 
-    await Runner.run(Agent(name="workflow-copilot", model=resolved_model_name), "hello", run_config=run_config)
+    await Runner.run(Agent(name="ember", model=resolved_model_name), "hello", run_config=run_config)
 
     (request,) = sent
     assert request["reasoning_effort"] == "high"

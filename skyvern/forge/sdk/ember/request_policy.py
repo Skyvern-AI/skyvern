@@ -2817,7 +2817,7 @@ def _bind_criterion_to_request_slot(
     )
     if rekeyed:
         LOG.info(
-            "copilot_request_slot_criterion_rekeyed",
+            "ember_request_slot_criterion_rekeyed",
             slot_id=slot.slot_id,
             canonical_path=slot.canonical_path,
             pinability=pinability,
@@ -2832,7 +2832,7 @@ def _bind_criterion_to_request_slot(
         )
     if minted_requested_output:
         LOG.info(
-            "copilot_request_slot_criterion_minted_requested_output",
+            "ember_request_slot_criterion_minted_requested_output",
             slot_id=slot.slot_id,
             output_path=output_path,
         )
@@ -3138,7 +3138,7 @@ def _parse_completion_criterion_entries(
             requested_output_path_mint_source = "classifier_default"
             if emit_mint_events:
                 LOG.info(
-                    "copilot_registered_download_requested_output_minted",
+                    "ember_registered_download_requested_output_minted",
                     output_path=output_path,
                     requested_output_path_mint_source=requested_output_path_mint_source,
                     criterion_id=f"c{len(entries)}",
@@ -3153,7 +3153,7 @@ def _parse_completion_criterion_entries(
             requested_output_path_mint_source = "classifier_declared"
             if emit_mint_events:
                 LOG.info(
-                    "copilot_registered_download_requested_output_minted",
+                    "ember_registered_download_requested_output_minted",
                     output_path=output_path,
                     requested_output_path_mint_source=requested_output_path_mint_source,
                     criterion_id=f"c{len(entries)}",
@@ -3228,7 +3228,7 @@ def _parse_completion_criterion_entries(
         )
         if judgment_truth_condition is not None and emit_mint_events:
             LOG.info(
-                "copilot_judgment_truth_condition_minted",
+                "ember_judgment_truth_condition_minted",
                 mint_source="classifier",
                 predicate=judgment_truth_condition.predicate,
                 polarity_when_holds=judgment_truth_condition.polarity_when_holds,
@@ -4255,7 +4255,7 @@ def _degrade_pathless_contingent_criteria(policy: RequestPolicy) -> None:
     policy.completion_criteria = swept
     if degraded_ids:
         LOG.info(
-            "copilot_contingent_criterion_mint_degraded",
+            "ember_contingent_criterion_mint_degraded",
             criterion_ids=degraded_ids,
             mint_degrade="contingent_missing_antecedent",
         )
@@ -4310,7 +4310,7 @@ def _classifier_fallback_policy(
     fallback_criteria = _fallback_structured_record_completion_criteria(user_message)
     if fallback_criteria:
         LOG.info(
-            "copilot request policy synthesized fallback structured-record criteria",
+            "ember request policy synthesized fallback structured-record criteria",
             classifier_failure_kind=failure_kind,
             completion_criterion_ids=[criterion.id for criterion in fallback_criteria],
         )
@@ -4619,7 +4619,7 @@ async def _seed_proposed_credential(
     if seed.credential_id not in {item.credential_id for item in policy.auto_bound_credentials}:
         policy.auto_bound_credentials.append(credential)
     LOG.info(
-        "copilot_credential_proposal_hydrated",
+        "ember_credential_proposal_hydrated",
         organization_id=organization_id,
         credential_id=seed.credential_id,
         origin_arm=seed.origin_arm,
@@ -4679,7 +4679,7 @@ def _live_page_url_abstains(
         return False
     if _live_page_log_allowed(policy, page_url, seam, "abstain"):
         LOG.info(
-            "copilot credential live-page admission",
+            "ember credential live-page admission",
             outcome="abstain",
             seam=seam,
             organization_id=organization_id,
@@ -4812,7 +4812,7 @@ async def resolve_credential_for_live_page(
     observation_outcome = "admitted" if record.verdict == "resolved" else record.verdict
     if _live_page_log_allowed(policy, page_url, "page_observation", observation_outcome):
         LOG.info(
-            "copilot credential live-page admission",
+            "ember credential live-page admission",
             outcome=observation_outcome,
             seam="page_observation",
             organization_id=organization_id,
@@ -4861,7 +4861,7 @@ async def admit_credential_for_live_page(
     # vouches for is, so an ambiguous set still asks even when it contains the requested id.
     admitted = resolution.verdict == "resolved" and resolution.contains(credential_id)
     LOG.info(
-        "copilot credential live-page admission",
+        "ember credential live-page admission",
         outcome="admitted"
         if admitted
         else ("wrong_credential" if resolution.verdict == "resolved" else resolution.verdict),
@@ -4935,7 +4935,7 @@ async def admit_vault_login_for_live_page(
     sole = [candidate.credential_id for candidate in candidates] == [credential_id]
     matched = next((site for site in login.sites if site.admits(page_url)), None) if sole else None
     LOG.info(
-        "copilot credential live-page admission",
+        "ember credential live-page admission",
         outcome="admitted" if matched else ("ambiguous" if len(candidates) > 1 else "no_match"),
         seam="fill",
         organization_id=organization_id,

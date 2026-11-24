@@ -641,7 +641,7 @@ def _enrich_llm_span(
         span.set_attribute(key, value)
     ctx = skyvern_context.current()
     if ctx is not None and ctx.copilot_session_id is not None:
-        span.set_attribute("copilot.session_id", ctx.copilot_session_id)
+        span.set_attribute("ember.session_id", ctx.copilot_session_id)
     if not mark_completed:
         return
     span.set_attribute("status", "ok")

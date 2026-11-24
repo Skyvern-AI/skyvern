@@ -182,11 +182,11 @@ def _cancellation_ctx() -> EmberContext:
 
 
 def _cancellation_events(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [entry for entry in logs if entry.get("event") == "copilot_turn_cancelled"]
+    return [entry for entry in logs if entry.get("event") == "ember_turn_cancelled"]
 
 
 def _deadline_events(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [entry for entry in logs if entry.get("event") == "copilot_turn_deadline_expired"]
+    return [entry for entry in logs if entry.get("event") == "ember_turn_deadline_expired"]
 
 
 class _CancellingClock:
@@ -330,7 +330,7 @@ async def test_a_broken_fingerprint_reader_neither_masks_nor_delays_the_cancella
     logs, _ = await _cancel_at_boundary(monkeypatch, boundary="first", elapsed=588.0, ctx=ctx)
 
     assert _cancellation_events(logs) == []
-    assert any(entry.get("event") == "Failed to record a copilot turn cancellation" for entry in logs)
+    assert any(entry.get("event") == "Failed to record an ember turn cancellation" for entry in logs)
 
 
 @pytest.mark.asyncio

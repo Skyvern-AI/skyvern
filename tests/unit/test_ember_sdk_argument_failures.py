@@ -40,7 +40,7 @@ async def project_result(ctx: EmberContext, arguments: str, output: Any) -> dict
     tool = tools.update_and_run_blocks_tool
     with capture_logs() as logs:
         await EmberRunHooks(ctx).on_tool_end(MagicMock(), MagicMock(), tool, output)
-    completed = [log for log in logs if log["event"] == "copilot tool completed"]
+    completed = [log for log in logs if log["event"] == "ember tool completed"]
     assert len(completed) == 1
 
     async def events() -> AsyncIterator[RunItemStreamEvent]:

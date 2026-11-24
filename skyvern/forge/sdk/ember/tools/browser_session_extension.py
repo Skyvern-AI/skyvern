@@ -56,7 +56,7 @@ async def _unconfirmed_result(session_id: str, organization_id: str, error: str)
     try:
         readback = await app.PERSISTENT_SESSIONS_MANAGER.get_session(session_id, organization_id)
     except Exception:
-        LOG.warning("copilot browser session extension readback failed", browser_session_id=session_id, exc_info=True)
+        LOG.warning("ember browser session extension readback failed", browser_session_id=session_id, exc_info=True)
         readback = None
     return {
         "ok": False,
@@ -104,7 +104,7 @@ async def extend_browser_session(ctx: AgentContext, additional_minutes: int) -> 
         return await _unconfirmed_result(session_id, organization_id, _UNCONFIRMED)
     except Exception:
         # Includes BrowserSessionNotFound: the cloud manager can raise it after the extend signal was sent.
-        LOG.warning("copilot browser session extension failed", browser_session_id=session_id, exc_info=True)
+        LOG.warning("ember browser session extension failed", browser_session_id=session_id, exc_info=True)
         return await _unconfirmed_result(session_id, organization_id, _OUTCOME_UNKNOWN)
 
     result: dict[str, Any] = {

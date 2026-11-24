@@ -157,7 +157,7 @@ def _consume_pending_browser_interaction_observation(
         return False
     if not _same_page_ignoring_fragment(pending.url, current_url):
         LOG.warning(
-            "copilot_pending_browser_interaction_observation_page_mismatch",
+            "ember_pending_browser_interaction_observation_page_mismatch",
             tool_name_present=bool(pending.tool_name),
             pending_url_present=bool(pending.url),
             current_url_present=bool(current_url),
@@ -368,7 +368,7 @@ def _apply_scout_pre_action_packet(ctx: AgentContext, selector: str, packet: dic
         ctx.pending_scout_role_name = (selector, role, name)
     else:
         LOG.info(
-            "copilot_scout_role_name_unavailable",
+            "ember_scout_role_name_unavailable",
             reason="empty_role" if not role else "empty_name",
             source=source,
             role_present=bool(role),
@@ -429,7 +429,7 @@ async def _capture_scout_pre_action(ctx: AgentContext, selector: str | None) -> 
     # defeat that comparison.
     packet = (result.get("data") or {}).get("result") if isinstance(result, dict) and result.get("ok") else None
     if not isinstance(packet, dict):
-        LOG.info("copilot_scout_role_name_unavailable", reason="page_read_failed", source=source)
+        LOG.info("ember_scout_role_name_unavailable", reason="page_read_failed", source=source)
         if parsed is None:
             return
         # The parse needed no page, so an unreachable page must not cost the identity it already gave.
@@ -601,7 +601,7 @@ async def _take_viewport_frame(
         try:
             shot = await asyncio.wait_for(do_screenshot(page), timeout=timeout_seconds)
         except Exception as exc:
-            LOG.debug("Copilot viewport frame of the given page failed", error_type=type(exc).__name__)
+            LOG.debug("Ember viewport frame of the given page failed", error_type=type(exc).__name__)
             return None
         return ViewportFrame(
             png=shot.data,
@@ -708,7 +708,7 @@ def _capped_with_eviction_accounting(
             }
             if collection == "scout_trajectory":
                 event["trajectory_index"] = item.get("trajectory_index")
-            LOG.info("copilot_scout_interaction_evicted", **event)
+            LOG.info("ember_scout_interaction_evicted", **event)
     except Exception:
         pass
     return items[-_MAX_SCOUTED_INTERACTIONS:]
@@ -768,7 +768,7 @@ def record_scouted_interaction_fact(ctx: AgentContext, artifact: ScoutedInteract
         ctx.pending_scout_click_records = click_records
 
     LOG.info(
-        "copilot_scout_interaction_captured",
+        "ember_scout_interaction_captured",
         tool_name=artifact["tool_name"],
         selector=artifact.get("selector"),
         source_url=artifact.get("source_url"),
@@ -900,7 +900,7 @@ def _record_scouted_interaction(
     # Page-level key presses, waits, and navigations are factual steps without an element selector.
     if tool_name not in {"press_key", "navigate_browser", "wait_for_either_state"} and not selector:
         LOG.info(
-            "copilot_scout_capture_loss",
+            "ember_scout_capture_loss",
             tool_name=tool_name,
             reason="unresolvable_selector",
             url_present=bool((source_url or "").strip()),
@@ -1065,7 +1065,7 @@ def hydrate_prior_carried_trajectory(ctx: AgentContext) -> bool:
     for carry in prior:
         trajectory.append(_fill_carry_to_interaction(carry, _next_trajectory_index(trajectory)))
     ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
-    LOG.info("copilot_carried_trajectory_hydrated", interaction_count=len(prior))
+    LOG.info("ember_carried_trajectory_hydrated", interaction_count=len(prior))
     return True
 
 
@@ -1285,7 +1285,7 @@ async def _scout_act_observe_page_evidence(
     ctx.last_scout_act_observe_outcome = outcome
     ctx.last_scout_act_observe_packet = safe_parsed
     LOG.info(
-        "copilot_scout_act_observe",
+        "ember_scout_act_observe",
         outcome=outcome,
         duration_ms=int((time.monotonic() - started) * 1000),
         url_present=bool(url),
@@ -1715,7 +1715,7 @@ def _attach_scout_page_summary(ctx: AgentContext, result: dict[str, Any], page_e
             summary["shed"] = shed
     except Exception:
         data.pop("page", None)
-        LOG.warning("copilot_scout_act_observe_summary_failed")
+        LOG.warning("ember_scout_act_observe_summary_failed")
 
 
 def _signed_out_page_facts(evidence: dict[str, Any], scrub_values: Sequence[str] = ()) -> dict[str, Any]:
@@ -1820,7 +1820,7 @@ async def _signed_out_navigation_guard(
         except Exception:
             # Fail closed on any refusal to enter, not on a list of the ways it has refused so far:
             # an unenforced probe is the thing this exists to prevent.
-            LOG.info("copilot_signed_out_navigation_guard_unavailable", exc_info=True)
+            LOG.info("ember_signed_out_navigation_guard_unavailable", exc_info=True)
             yield False
             return
         yield True
@@ -1842,7 +1842,7 @@ async def capture_signed_out_page_observation(
     """
     requestable, withheld = screened_recorded_url(url)
     if requestable is None or withheld is not None:
-        LOG.info("copilot_signed_out_page_observation_skipped", reason=withheld)
+        LOG.info("ember_signed_out_page_observation_skipped", reason=withheld)
         return None
     async with service_worker_blocked_context(browser_state, organization_id=organization_id) as browser_context:
         page = await browser_state.get_working_page()
@@ -1850,7 +1850,7 @@ async def capture_signed_out_page_observation(
             return None
         async with _signed_out_navigation_guard(browser_context, _exact_origin(url)) as guarded:
             if not guarded:
-                LOG.info("copilot_signed_out_page_observation_unenforceable")
+                LOG.info("ember_signed_out_page_observation_unenforceable")
                 return None
             await page.goto(url, wait_until="domcontentloaded", timeout=_SIGNED_OUT_OBSERVATION_TIMEOUT_MS)
             raw = await page.evaluate(composition_structured_evidence_expression())
@@ -1863,13 +1863,13 @@ async def capture_signed_out_page_observation(
                 raw = await page.evaluate(composition_structured_evidence_expression())
                 reached_url = page.url
             except Exception:
-                LOG.info("copilot_signed_out_page_observation_settled_read_failed", exc_info=True)
+                LOG.info("ember_signed_out_page_observation_settled_read_failed", exc_info=True)
     payload = json.loads(raw) if isinstance(raw, str) else raw
     if not isinstance(payload, dict):
         return None
     if _canonical_origin(reached_url) != _canonical_origin(url):
         # A reading from somewhere else is not a reading of this page.
-        LOG.info("copilot_signed_out_page_observation_left_its_origin")
+        LOG.info("ember_signed_out_page_observation_left_its_origin")
         return None
     evidence = parse_composition_structured(payload, inspected_url=url, current_url=reached_url)
     if evidence is None:
@@ -1913,7 +1913,7 @@ async def record_signed_out_page_observation(ctx: AgentContext, url: str) -> Non
             scrub_values=registered_scrub_values(ctx),
         )
     except Exception:
-        LOG.warning("copilot_signed_out_page_observation_failed", exc_info=True)
+        LOG.warning("ember_signed_out_page_observation_failed", exc_info=True)
         return
     if observation is None:
         return
@@ -1924,7 +1924,7 @@ async def record_signed_out_page_observation(ctx: AgentContext, url: str) -> Non
     # The one line that says the lever engaged: every failure path above logs, and without this the
     # claim that the model saw the signed-out page cannot be checked against a run after the fact.
     LOG.info(
-        "copilot_signed_out_page_observation_recorded",
+        "ember_signed_out_page_observation_recorded",
         origin=origin,
         form_count=len(summary.get("forms") or []) if isinstance(summary, dict) else None,
         control_count=len(summary.get("controls") or []) if isinstance(summary, dict) else None,
@@ -1991,7 +1991,7 @@ async def _scout_session_download_names(ctx: AgentContext) -> frozenset[str] | N
             organization_id=organization_id, browser_session_id=browser_session_id
         )
     except Exception:
-        LOG.warning("copilot_scout_download_snapshot_failed", exc_info=True)
+        LOG.warning("ember_scout_download_snapshot_failed", exc_info=True)
         return None
     return frozenset(str(name) for name in files or ())
 
@@ -2008,7 +2008,7 @@ def _record_popup_navigation_headers(ctx: AgentContext, response: Response) -> N
         if ctx.pending_scout_popup_content_type is None and response.request.is_navigation_request():
             ctx.pending_scout_popup_content_type = str(response.headers.get("content-type", ""))
     except Exception:
-        LOG.debug("copilot_popup_navigation_headers_unreadable", exc_info=True)
+        LOG.debug("ember_popup_navigation_headers_unreadable", exc_info=True)
 
 
 def _record_scout_download(ctx: AgentContext) -> None:
@@ -2034,7 +2034,7 @@ def _release_scout_download_listeners(ctx: AgentContext) -> None:
         try:
             detach()
         except Exception:
-            LOG.debug("copilot_scout_download_listener_detach_failed", exc_info=True)
+            LOG.debug("ember_scout_download_listener_detach_failed", exc_info=True)
     ctx.pending_scout_download_detachers = []
 
 
@@ -2053,7 +2053,7 @@ async def _arm_scout_download_listener(ctx: AgentContext) -> None:
         page = await browser_state.get_or_create_page()
         _watch_downloads_for_click(ctx, page)
     except Exception:
-        LOG.warning("copilot_scout_download_listener_failed", exc_info=True)
+        LOG.warning("ember_scout_download_listener_failed", exc_info=True)
 
 
 async def _arm_scout_popup_listener(ctx: AgentContext) -> None:
@@ -2079,7 +2079,7 @@ async def _arm_scout_popup_listener(ctx: AgentContext) -> None:
 
         page.once("popup", _capture)
     except Exception:
-        LOG.warning("copilot_scout_popup_listener_failed", exc_info=True)
+        LOG.warning("ember_scout_popup_listener_failed", exc_info=True)
 
 
 def _release_scout_challenge_listeners(ctx: AgentContext) -> None:
@@ -2087,7 +2087,7 @@ def _release_scout_challenge_listeners(ctx: AgentContext) -> None:
         try:
             detach()
         except Exception:
-            LOG.debug("copilot_scout_challenge_listener_detach_failed", exc_info=True)
+            LOG.debug("ember_scout_challenge_listener_detach_failed", exc_info=True)
     ctx.pending_scout_challenge_detachers = []
 
 
@@ -2137,7 +2137,7 @@ async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
         )
         ctx.pending_scout_challenge_prior_frames = list(zip(already_challenged, prior_areas, strict=True))
     except Exception:
-        LOG.warning("copilot_scout_challenge_listener_failed", exc_info=True)
+        LOG.warning("ember_scout_challenge_listener_failed", exc_info=True)
 
 
 # Bounded so a page that stalls the probe cannot spend the turn budget one click at a time.
@@ -2195,11 +2195,11 @@ async def _maybe_attach_observed_render_target(
         if not content_type:
             content_type = str(await popup.evaluate("document.contentType") or "")
         if not content_type.lower().startswith("image/"):
-            LOG.debug("copilot_observed_render_declined", reason="not_image_render", url=url, content_type=content_type)
+            LOG.debug("ember_observed_render_declined", reason="not_image_render", url=url, content_type=content_type)
             return
         _attach_observed_click_effect(ctx, result, effect="rendered_document_opened")
     except Exception:
-        LOG.warning("copilot_observed_render_target_attach_failed", exc_info=True)
+        LOG.warning("ember_observed_render_target_attach_failed", exc_info=True)
 
 
 async def _maybe_attach_observed_download_target(
@@ -2227,10 +2227,10 @@ async def _maybe_attach_observed_download_target(
             if after is None or not (after - before):
                 return
             download_signal = "store_diff"
-        LOG.info("copilot_observed_download_signal", signal=download_signal, url=url)
+        LOG.info("ember_observed_download_signal", signal=download_signal, url=url)
         _attach_observed_click_effect(ctx, result, effect="download_started")
     except Exception:
-        LOG.warning("copilot_observed_download_target_attach_failed", exc_info=True)
+        LOG.warning("ember_observed_download_target_attach_failed", exc_info=True)
 
 
 async def _close_scout_challenge_baseline(ctx: AgentContext) -> None:
@@ -2368,7 +2368,7 @@ async def read_page_state_on_page(
                 return cast(PageState, scrubbed), reading.page
             failure = "scrubbed_away"
     LOG.info(
-        "copilot_page_state_read_failed",
+        "ember_page_state_read_failed",
         tool_name=tool_name,
         browser_session_id=effective_browser_session_id(ctx),
         reason=failure,
@@ -2449,11 +2449,11 @@ async def _maybe_attach_observed_challenge(ctx: AgentContext, result: dict[str, 
     if vendor is None:
         return
     try:
-        LOG.info("copilot_observed_challenge_signal", vendor=vendor, page_origin=safe_page_origin(url))
+        LOG.info("ember_observed_challenge_signal", vendor=vendor, page_origin=safe_page_origin(url))
         result.setdefault("data", {})
         _attach_observed_click_effect(ctx, result, effect="challenge_raised", challenge_vendor=vendor)
     except Exception:
-        LOG.warning("copilot_observed_challenge_attach_failed", exc_info=True)
+        LOG.warning("ember_observed_challenge_attach_failed", exc_info=True)
 
 
 async def _attach_evaluate_page_facts(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:

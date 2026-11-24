@@ -1915,7 +1915,7 @@ def synthesize_code_block(
             return None
         if not compile_download_target or reached_download_target is None:
             LOG.info(
-                "copilot_spine_same_month_file_match_transform_dropped",
+                "ember_spine_same_month_file_match_transform_dropped",
                 reason_code="download_target_unavailable",
                 selector_matches_transform=False,
             )
@@ -1931,7 +1931,7 @@ def synthesize_code_block(
             file_match_locator = f"page.locator({file_match_selector})" if file_match_selector else ""
             if not file_match_locator:
                 LOG.info(
-                    "copilot_spine_same_month_file_match_transform_dropped",
+                    "ember_spine_same_month_file_match_transform_dropped",
                     reason_code="locator_build_failed",
                     selector_matches_transform=file_match_transform.selector == reached_download_target.selector,
                 )
@@ -1950,7 +1950,7 @@ def synthesize_code_block(
             diagnostics.download_terminal_anchor = reached_download_target.trajectory_anchor
             diagnostics.download_terminal_dropped_trailing = dropped_trailing
             LOG.info(
-                "copilot_spine_download_terminal_sequenced",
+                "ember_spine_download_terminal_sequenced",
                 anchor=reached_download_target.trajectory_anchor,
                 dropped_trailing_count=dropped_trailing,
             )
@@ -1997,7 +1997,7 @@ def synthesize_code_block(
             )
         )
         LOG.info(
-            "copilot_spine_input_templated_prelude",
+            "ember_spine_input_templated_prelude",
             witness_keys=prelude_keys,
             month_helper=input_templated_needs_month,
             iso_date_helper=input_templated_needs_iso_date,
@@ -2007,7 +2007,7 @@ def synthesize_code_block(
         lines.extend(_same_month_helper_lines())
         lines.append(f"{_INDENT}{_DOWNLOAD_TARGET_VAR} = {file_match_locator}")
         LOG.info(
-            "copilot_spine_same_month_file_match_transform_applied",
+            "ember_spine_same_month_file_match_transform_applied",
             provenance_source=SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE,
             parameter_keys=list(file_match_transform.expected_declared_keys),
         )

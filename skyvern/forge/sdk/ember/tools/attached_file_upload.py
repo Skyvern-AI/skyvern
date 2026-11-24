@@ -231,7 +231,7 @@ async def read_attached_pdf(ctx: AgentContext, file_id: str, offset: int = 0) ->
     )
     screened = screen.canonical_user_message
     LOG.info(
-        "copilot.attached_pdf_read",
+        "ember.attached_pdf_read",
         file_id=file_id,
         offset=start,
         window_chars=end - start,

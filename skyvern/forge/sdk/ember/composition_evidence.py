@@ -767,7 +767,7 @@ def post_run_evidence_source_refused(
     if not run_id or page_evidence_source_matches_run(source_browser_session_id, run_browser_session_id):
         return False
     LOG.info(
-        "copilot_post_run_evidence_source_mismatch_refused",
+        "ember_post_run_evidence_source_mismatch_refused",
         workflow_run_id=run_id,
         source_browser_session_id=source_browser_session_id,
         run_browser_session_id=run_browser_session_id,
@@ -1002,7 +1002,7 @@ def _flow_evidence_by_step(ctx: Any) -> dict[int, tuple[dict[str, Any], str]]:
             # Duplicates here mean malformed persisted or deserialized evidence.
             retained_packet, retained_reached_via = by_step[step]
             LOG.warning(
-                "copilot_flow_evidence_duplicate_step_ignored",
+                "ember_flow_evidence_duplicate_step_ignored",
                 observation_step=step,
                 retained_reached_via=retained_reached_via,
                 ignored_reached_via=str(entry.get("reached_via") or ""),
@@ -1029,7 +1029,7 @@ def _iter_block_observation_ref_items(value: Any) -> Iterable[tuple[Any, Any]] |
                 items.append((item.label, item.observation_step))
             else:
                 LOG.warning(
-                    "copilot_block_observation_ref_malformed_item_ignored",
+                    "ember_block_observation_ref_malformed_item_ignored",
                     item_type=type(item).__name__,
                 )
         return items
@@ -1040,7 +1040,7 @@ def normalize_block_observation_refs(value: Any) -> dict[str, int]:
     items = _iter_block_observation_ref_items(value)
     if items is None:
         LOG.warning(
-            "copilot_block_observation_refs_unexpected_type_ignored",
+            "ember_block_observation_refs_unexpected_type_ignored",
             value_type=type(value).__name__,
         )
         return {}
@@ -1055,7 +1055,7 @@ def normalize_block_observation_refs(value: Any) -> dict[str, int]:
         elif isinstance(step, str):
             # String steps are ignored so callers can repair malformed refs.
             LOG.warning(
-                "copilot_block_observation_ref_string_step_ignored",
+                "ember_block_observation_ref_string_step_ignored",
                 label=label.strip(),
                 step_length=len(step),
             )
@@ -1156,7 +1156,7 @@ def _auto_credit_interaction_observation(
         if not interaction_evidence_is_bindable(evidence):
             continue
         LOG.info(
-            "copilot_gate_auto_credited_interaction",
+            "ember_gate_auto_credited_interaction",
             observation_step=step,
             source_tool=evidence.get("source_tool"),
             interaction_selector=evidence.get("interaction_selector"),
@@ -4059,7 +4059,7 @@ def _structured_size_compaction(value: Any) -> dict[str, Any] | None:
         expected_unit = _SIZE_COMPACTION_CATEGORY_UNITS.get(category)
         if expected_unit is None:
             LOG.warning(
-                "copilot_structured_size_compaction_unknown_category_ignored",
+                "ember_structured_size_compaction_unknown_category_ignored",
                 category=category,
             )
             continue

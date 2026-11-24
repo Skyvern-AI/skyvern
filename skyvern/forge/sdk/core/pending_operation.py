@@ -58,7 +58,7 @@ def install_pending_operation_slot(ctx: Any = None) -> None:
         # An uncorrelated slot beats inheriting the previous turn's, which would file this turn's
         # scopes under the previous turn's ids.
         log_fields = {}
-        LOG.warning("copilot_pending_operation_correlation_failed")
+        LOG.warning("ember_pending_operation_correlation_failed")
     _turn_operations.set(_TurnOperations(log_fields=log_fields))
 
 
@@ -140,7 +140,7 @@ def _retire(operations: _TurnOperations, operation_id: int, state: str) -> None:
     if not record.span and duration >= PENDING_OPERATION_LOG_THRESHOLD_SECONDS:
         try:
             LOG.warning(
-                "copilot_pending_operation_slow",
+                "ember_pending_operation_slow",
                 pending_operation=record.name,
                 pending_operation_started_monotonic=round(record.started_monotonic, 3),
                 pending_operation_seconds=round(duration, 3),

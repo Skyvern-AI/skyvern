@@ -736,7 +736,7 @@ async def wait_for_interaction(ctx: EmberContext, interaction: QuestionInteracti
                 _, pending = await asyncio.wait({cleanup}, timeout=QUESTION_CLEANUP_TIMEOUT_SECONDS)
                 if pending:
                     with contained_effect("question cleanup timeout log"):
-                        LOG.warning("Copilot question cleanup timed out", interaction_id=interaction.interaction_id)
+                        LOG.warning("Ember question cleanup timed out", interaction_id=interaction.interaction_id)
             finally:
                 if not cleanup.done():
                     cleanup.cancel()

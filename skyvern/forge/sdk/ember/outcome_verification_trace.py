@@ -4,7 +4,7 @@ The completion-verification verdict and the terminal-gate decision are produced
 and consumed mid-turn, and ``ctx.completion_verification_result`` is cleared at
 the start of every run-tool call. So the verdict and gate decision are captured
 into a per-turn snapshot at the moment they are produced/consumed, and the
-snapshot is attached to the copilot.turn span once at turn finalization — the
+snapshot is attached to the ember.turn span once at turn finalization — the
 snapshot survives a later run-tool call that clears the live result field.
 """
 
@@ -20,10 +20,10 @@ LOG = structlog.get_logger()
 _SNAPSHOT_ATTR = "outcome_verification_trace_snapshot"
 _COMPLETION_PREFIX = "completion_verification_"
 _ABSTENTION_PREFIX = "plain_outcome_no_evidence_abstention_"
-_ABSTENTION_LOG_EVENT = "copilot.completion.plain_outcome_no_evidence_abstention"
-_CODE_ARTIFACT_VIOLATIONS_KEY = "copilot.code_artifact_violations"
-_CODE_ARTIFACT_VIOLATION_LABELS_KEY = "copilot.code_artifact_violation_block_labels"
-_CODE_ARTIFACT_VIOLATION_COUNT_KEY = "copilot.code_artifact_violation_count"
+_ABSTENTION_LOG_EVENT = "ember.completion.plain_outcome_no_evidence_abstention"
+_CODE_ARTIFACT_VIOLATIONS_KEY = "ember.code_artifact_violations"
+_CODE_ARTIFACT_VIOLATION_LABELS_KEY = "ember.code_artifact_violation_block_labels"
+_CODE_ARTIFACT_VIOLATION_COUNT_KEY = "ember.code_artifact_violation_count"
 
 
 def _snapshot(ctx: Any) -> dict[str, Any] | None:
@@ -44,18 +44,18 @@ def record_gate_decision(ctx: Any, fields: dict[str, Any]) -> None:
         if snapshot is not None:
             snapshot.update(fields)
     except Exception:
-        LOG.warning("failed to record copilot gate decision telemetry", exc_info=True)
+        LOG.warning("failed to record ember gate decision telemetry", exc_info=True)
 
 
 def record_criteria_lifecycle(ctx: Any, fields: dict[str, Any]) -> None:
     """Attach criteria-lifecycle fields (epoch, decision reason, tripwire counters,
-    claim tier) to the per-turn snapshot so they ride the copilot.turn span."""
+    claim tier) to the per-turn snapshot so they ride the ember.turn span."""
     try:
         snapshot = _snapshot(ctx)
         if snapshot is not None:
             snapshot.update(fields)
     except Exception:
-        LOG.warning("failed to record copilot criteria lifecycle telemetry", exc_info=True)
+        LOG.warning("failed to record ember criteria lifecycle telemetry", exc_info=True)
 
 
 def record_code_artifact_violations(ctx: Any, violations: list[str], offending_labels: list[str]) -> None:
@@ -75,7 +75,7 @@ def record_code_artifact_violations(ctx: Any, violations: list[str], offending_l
         snapshot[_CODE_ARTIFACT_VIOLATION_LABELS_KEY] = sorted({str(label) for label in offending_labels if str(label)})
         snapshot[_CODE_ARTIFACT_VIOLATION_COUNT_KEY] = len(violations)
     except Exception:
-        LOG.warning("failed to record copilot code artifact violation telemetry", exc_info=True)
+        LOG.warning("failed to record ember code artifact violation telemetry", exc_info=True)
 
 
 def record_completion_verification(ctx: Any, result: Any | None, workflow_run_id: str | None = None) -> None:
@@ -109,7 +109,7 @@ def record_completion_verification(ctx: Any, result: Any | None, workflow_run_id
             snapshot[f"{_COMPLETION_PREFIX}status"] = getattr(result, "status", None) or "not_run"
             snapshot[f"{_COMPLETION_PREFIX}evaluated_on_final_run"] = False
     except Exception:
-        LOG.warning("failed to record copilot completion verification telemetry", exc_info=True)
+        LOG.warning("failed to record ember completion verification telemetry", exc_info=True)
 
 
 def outcome_verification_turn_fields(ctx: Any) -> dict[str, Any]:
@@ -127,7 +127,7 @@ def outcome_verification_turn_fields(ctx: Any) -> dict[str, Any]:
 
 
 def finalize_outcome_verification_trace(ctx: Any, span: Any = None) -> None:
-    """Attach the accumulated snapshot to the copilot.turn span once per turn.
+    """Attach the accumulated snapshot to the ember.turn span once per turn.
 
     Strictly best-effort: a telemetry failure here must never convert a valid
     turn into an unexpected-error result.
@@ -141,7 +141,7 @@ def finalize_outcome_verification_trace(ctx: Any, span: Any = None) -> None:
         target = span if span is not None else otel_trace.get_current_span()
         target.set_attributes(fields)
     except Exception:
-        LOG.warning("failed to finalize copilot outcome verification telemetry", exc_info=True)
+        LOG.warning("failed to finalize ember outcome verification telemetry", exc_info=True)
 
 
 def _otel_safe(fields: dict[str, Any]) -> dict[str, Any]:

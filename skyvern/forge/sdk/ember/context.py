@@ -909,7 +909,7 @@ def finalize_observation_context(ctx: Any, raw_context: str | None) -> str | Non
     sc.carried_trajectory = _merge_carried_trajectory(sc.carried_trajectory, carried_this_turn)
     if sc.carried_trajectory:
         LOG.info(
-            "copilot_carried_trajectory_persisted",
+            "ember_carried_trajectory_persisted",
             source_url=sc.carried_trajectory[0].get("source_url"),
             interaction_count=len(sc.carried_trajectory),
             this_turn_count=len(carried_this_turn),
@@ -1129,7 +1129,7 @@ def record_proposed_credential_in_global_llm_context(
     if proposed is None:
         return clear_proposed_credential(raw_context)
     LOG.info(
-        "copilot_credential_proposal_recorded",
+        "ember_credential_proposal_recorded",
         credential_id=proposed.credential_id,
         origin_arm=proposed.origin_arm,
         admitted_url=loggable_origin(proposed.admitted_url),

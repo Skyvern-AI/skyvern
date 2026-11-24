@@ -1064,7 +1064,7 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
     if outcome.phase == "persisted_block_run" and outcome.is_authoritative and outcome.workflow_run_id:
         ctx.recorded_persisted_block_run_workflow_run_id = outcome.workflow_run_id
     LOG.info(
-        "copilot recorded build-test outcome stored",
+        "ember recorded build-test outcome stored",
         phase=outcome.phase,
         reason_code=outcome.reason_code,
         verdict=outcome.verdict,
@@ -1527,7 +1527,7 @@ def recorded_outcome_from_scout_act_observe_hollow(
     bounded_recapture_result = _bounded_ref(recapture_result)
     value_excerpt = _observed_page_value_excerpt(page_evidence)
     LOG.info(
-        "copilot_hollow_value_carry",
+        "ember_hollow_value_carry",
         reason_code="scout_act_observe_hollow_after_interaction",
         value_excerpt_len=len(value_excerpt),
         value_excerpt_sha8=hashlib.sha256(value_excerpt.encode()).hexdigest()[:8] if value_excerpt else "",

@@ -8239,6 +8239,21 @@ async def test_observe_counts_lines_that_differ_only_in_their_clip_count_as_dupl
     ).handler({})
     assert r.status == "ok"
     assert r.data["summary"]["duplicate_digest_lines"] == 2, r.data
+    # A hidden toggle's note rides the same channel but is not a clip count, so it still tells the toggle apart.
+    toggles = [
+        {"i": 0, "tag": "input", "type": "checkbox", "selector": "#c0", "label": "I agree", "hidden": True},
+        {"i": 1, "tag": "input", "type": "checkbox", "selector": "#c1", "label": "I agree"},
+    ]
+    for side in ("labelDelivers", "labelOffscreen"):
+        page = _digest_page({"text": [], "elements": [{**toggles[0], side: True}, toggles[1]]})
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert r.data["summary"]["duplicate_digest_lines"] == 0, (side, r.content)
+    # The two notes share one identity, so which of two hidden twins is on screen does not move the count.
+    twins = [{**toggles[0], "labelDelivers": True}, {**toggles[0], "i": 1, "selector": "#c1", "labelOffscreen": True}]
+    r = await _tool(
+        build_browser_tools(_fixed_page_provider(_digest_page({"text": [], "elements": twins}))), "observe"
+    ).handler({})
+    assert r.data["summary"]["duplicate_digest_lines"] == 2, r.content
     for case in _DESTINATION_SPLIT_RECORDS:
         elements, expected, qualified = case.values
         page = _digest_page({"text": [], "elements": elements})
@@ -21148,7 +21163,8 @@ async def test_click_refuses_a_skinned_checkbox_with_no_proxy_at_all() -> None:
 
 
 # Zero-size toggles behind a label, a wrapping label, or only aria-labelledby; `#refused` cancels its own toggle, `#bare`
-# has nothing naming it, `#closed` has a label only inside a collapsed section, and `#faded` sits in a faded-out panel.
+# has nothing naming it, `#closed` has a label only inside a collapsed section, `#faded` sits in a faded-out panel, and
+# `#pinned`'s label is below the window in a fixed box that does not scroll, and `#below`'s is below the fold.
 _HIDDEN_NATIVE_TOGGLES_HTML = """<!doctype html><html><body style="margin:0">
 <form style="margin:20px">
   <label for="opt-yes" style="display:inline-block;width:160px;height:24px">Yes</label>
@@ -21171,6 +21187,12 @@ _HIDDEN_NATIVE_TOGGLES_HTML = """<!doctype html><html><body style="margin:0">
   <label for="faded" style="display:inline-block;width:160px;height:24px">Email me</label>
   <div style="opacity:0.01"><input id="faded" type="checkbox"
     style="position:absolute;width:0;height:0;opacity:0;margin:0"></div>
+  <div style="position:fixed;top:100vh;left:0;height:300vh;overflow-y:hidden">
+    <label style="display:inline-block;width:160px;height:24px"><input id="pinned" type="radio" name="pin"
+      style="position:absolute;width:0;height:0;opacity:0;margin:0">Text me</label></div>
+  <div style="height:150vh"></div>
+  <label for="below" style="display:inline-block;width:160px;height:24px">Call me</label>
+  <input id="below" type="radio" name="low" style="position:absolute;width:0;height:0;opacity:0;margin:0">
 </form>
 <script>window.changes = []; document.addEventListener('change', (e) => window.changes.push(e.target.id));
 window.labelClicks = [];
@@ -21227,7 +21249,8 @@ async def test_click_acts_on_every_hidden_native_toggle_observe_says_it_acts_on(
         monkeypatch.setattr(taskv3_tools, "_evaluate_isolated", _no_isolated_world)
     async with _form_in(realm, _HIDDEN_NATIVE_TOGGLES_HTML) as (page, doc):
         tools = build_browser_tools(_fixed_page_provider(page))
-        observed = (await _tool(tools, "observe").handler({})).content
+        first = await _tool(tools, "observe").handler({})
+        observed = first.content
         promise = "[hidden-native: styled proxy; click acts on it directly]"
         promised = {
             sel: next(line for line in observed.splitlines() if f"'{caption}'" in line)
@@ -21239,6 +21262,8 @@ async def test_click_acts_on_every_hidden_native_toggle_observe_says_it_acts_on(
                 ("#refused", "Locked option"),
                 ("#closed", "More options"),
                 ("#faded", "Email me"),
+                ("#pinned", "Text me"),
+                ("#below", "Call me"),
             )
         }
         assert promised["#news"].endswith("[hidden-native: styled proxy]"), promised["#news"]
@@ -21250,29 +21275,48 @@ async def test_click_acts_on_every_hidden_native_toggle_observe_says_it_acts_on(
             "#refused",
             "#closed",
         ], observed
+        offscreen = "[hidden-native: styled proxy; click tries its label, which is outside the viewport now]"
+        assert [sel for sel, line in promised.items() if offscreen in line] == ["#pinned", "#below"], observed
+        # Scroll claims no move for a box that stayed, and the note that follows the label across the viewport edge
+        # stays out of the loop's stall digest.
+        scroll = _tool(tools, "scroll").handler
+        pinned = (await scroll({"selector": "#pinned"})).content
+        assert "into view" not in pinned and "moved from" not in pinned, pinned
+        if realm.startswith("page"):
+            assert "is outside the" in pinned, pinned
+        below = (await scroll({"selector": "#below"})).content
+        assert "moved from" in below, below
+        again = await _tool(tools, "observe").handler({})
+        assert promise in next(line for line in again.content.splitlines() if "'Call me'" in line), again.content
+        digests = {
+            taskv3_loop._canonical_perception_content(r.content, is_observe=True, clip_spans=r.data["clip_spans"])
+            for r in (first, again)
+        }
+        assert len(digests) == 1, (first.content, again.content)
+        await doc.evaluate("() => window.scrollTo(0, 0)")
         click = _tool(tools, "click").handler
         results = {
             sel: await click({"selector": sel})
-            for sel in ("#opt-yes", "#opt-no", "#terms", "#news", "#refused", "#bare", "#closed", "#faded")
+            for sel in ("#opt-yes", "#opt-no", "#terms", "#news", "#refused", "#bare", "#closed", "#faded", "#below")
         }
         states = await doc.evaluate(
-            "() => ['opt-yes', 'opt-no', 'terms', 'news', 'refused', 'bare', 'closed', 'faded']"
+            "() => ['opt-yes', 'opt-no', 'terms', 'news', 'refused', 'bare', 'closed', 'faded', 'below']"
             ".map((id) => document.getElementById(id).checked)"
         )
         changes = await doc.evaluate("() => window.changes")
         label_clicks = await doc.evaluate("() => window.labelClicks")
     # `#news` has no label, so only a realm the page cannot patch toggles it by script.
     scripted = realm in ("page", "same_origin_frame")
-    for sel in ("#opt-yes", "#opt-no", "#terms"):
+    for sel in ("#opt-yes", "#opt-no", "#terms", "#below"):
         assert results[sel].status == "ok" and "via its label" in results[sel].content, (sel, results[sel].content)
     if scripted:
         assert results["#news"].status == "ok" and "toggled directly" in results["#news"].content
     else:
         assert results["#news"].error_class == "unreachable", results["#news"].content
         assert "no <label> that can be clicked away" in results["#news"].content
-    assert states == [False, True, True, scripted, False, False, False, False]
-    assert changes == ["opt-yes", "opt-no", "terms"] + (["news"] if scripted else [])
-    assert label_clicks == ["opt-yes", "terms", "refused"]
+    assert states == [False, True, True, scripted, False, False, False, False, True]
+    assert changes == ["opt-yes", "opt-no", "terms"] + (["news"] if scripted else []) + ["below"]
+    assert label_clicks == ["opt-yes", "terms", "refused", "below"]
     assert "clicked through its label and still reads checked=False" in results["#refused"].content
     assert results["#bare"].error_class == "unreachable", results["#bare"].content
     assert "no <label> or element naming it is drawn" in results["#bare"].content
@@ -43640,25 +43684,48 @@ async def test_acting_on_an_inert_template_control_is_not_reported_as_a_blocked_
     assert "resolved to" not in r.content and "Call log" not in r.content, r.content
 
 
-@pytest.mark.usefixtures("expected_action_timeout")
+# Long enough for the driver to reach the retry that scrolls the page; under a shorter wait the header never hides.
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_a_live_control_that_fails_keeps_its_own_diagnosis() -> None:
+@pytest.mark.parametrize(
+    ("html", "says"),
+    [
+        (
+            """<!doctype html><html><body>
+      <button class="live" style="position:fixed;top:40px;left:0;width:120px;height:30px">Go</button>
+      <div style="position:fixed;inset:0;background:rgba(0,0,0,.4)">blocking overlay</div>
+    </body></html>""",
+            "is covered by",
+        ),
+        # The page hides the control's header once it scrolls, and the driver's retry scrolls it.
+        (
+            """<!doctype html><html style="overflow-anchor:none"><body>
+      <div id="hdr" style="padding-top:40px"><button class="live" style="width:120px;height:30px">Go</button></div>
+      <div style="height:3000px"></div>
+      <div style="position:fixed;inset:0;background:rgba(0,0,0,.4)">blocking overlay</div>
+      <script>addEventListener('scroll', () => { hdr.style.display = scrollY > 0 ? 'none' : ''; });</script>
+    </body></html>""",
+            "during the driver's wait",
+        ),
+    ],
+    ids=["static", "hidden_on_scroll"],
+)
+async def test_a_live_control_that_fails_keeps_its_own_diagnosis(html: str, says: str) -> None:
     # The guard must not answer "not rendered" for every failure that happens to time out. A visible
     # control under a real overlay is the case the inert error would be actively wrong about -- it IS
     # blocked, and telling the model to go find a different element would send it away from the
     # dismissal that unblocks the page.
-    html = """<!doctype html><html><body>
-      <button class="live" style="position:fixed;top:40px;left:0;width:120px;height:30px">Go</button>
-      <div style="position:fixed;inset:0;background:rgba(0,0,0,.4)">blocking overlay</div>
-    </body></html>"""
     async with _content_page(html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "click").handler({"selector": ".live"})
 
     assert r.status == "error", r.content
-    assert "covered" in r.content, r.content
+    assert "covered" in r.content and says in r.content, r.content
     assert "not rendered" not in r.content, r.content
+    assert "<div" not in r.content, r.content
+    # The one field a post-deploy count can tell this branch apart by.
+    assert (taskv3_loop._COVERED_LAYER.get() or {}).get("after_wait", False) is ("wait" in says)
 
 
 async def _no_isolated_world(*_args: Any, **_kwargs: Any) -> None:

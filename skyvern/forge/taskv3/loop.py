@@ -508,7 +508,8 @@ def record_hit_class(
 
     `needed` is on the record because the class alone cannot recover it: a shadow-rooted target
     answers `unknown` with needed=TRUE, so `unknown` would otherwise pool the rows that bought the
-    second probe with the rows that answered nothing. `disabled` is answered before any hit test runs;
+    full second probe with the rows that answered nothing; a `non_target` click with needed=False still buys a
+    cover-only second reading, which changes no dispatch decision. `disabled` is answered before any hit test runs;
     every other `hit_class` value names what the hit test RETURNED, never why — nothing in that probe
     tells a real occluder from a hit that fell through, since a modal scrim drawn as `body::before`
     hit-tests as body and still blocks the click.
@@ -561,7 +562,9 @@ def current_turn() -> int | None:
     return _TURN.get()
 
 
-def record_covered_layer(branch: CoveredBranch, *, controls: int, layer_kind: CoveredLayerKind) -> None:
+def record_covered_layer(
+    branch: CoveredBranch, *, controls: int, layer_kind: CoveredLayerKind, after_wait: bool = False
+) -> None:
     """Record which `covered` message this call rendered. Telemetry only, never a behaviour change.
 
     `controls` is how many controls the MESSAGE named, not how many the probe found: a control with
@@ -571,9 +574,13 @@ def record_covered_layer(branch: CoveredBranch, *, controls: int, layer_kind: Co
     enumerate; under `clipped` it is zero always, because a container is not a layer and its
     controls are never the thing to act on; under `named` it means the layer had no control the
     enumeration could name. Cut on `tool_error_class:covered`, then group by `covered_branch`, and
-    read the count within a branch.
+    read the count within a branch. `after_wait` marks a click whose target the page hid during the
+    driver's wait, so its layer comes from the reading taken before the click.
     """
-    _COVERED_LAYER.set({"branch": branch, "controls": int(controls), "layer_kind": layer_kind})
+    record: dict[str, Any] = {"branch": branch, "controls": int(controls), "layer_kind": layer_kind}
+    if after_wait:
+        record["after_wait"] = True
+    _COVERED_LAYER.set(record)
 
 
 def record_type_reach(*, acted_in_frame: bool, probe_scrolled: bool, hit_on_document_root: bool) -> None:
@@ -1354,8 +1361,8 @@ def _canonical_perception_content(
     if type(delta_at) is int and 0 <= delta_at <= len(content):
         end = delta_end if type(delta_end) is int and delta_at <= delta_end <= len(content) else len(content)
         content = content[:delta_at] + content[end:]
-    # observe's clip counts ("…[+N chars]") annotate what the display cut; a page whose clipped tail
-    # changes has not changed what the model can see, so the count is folded at the offsets observe
+    # observe's clip counts ("…[+N chars]") annotate what the display cut, and its hidden-toggle notes
+    # follow the scroll position; neither changes the page, so both are folded at the offsets observe
     # reported. That a field is clipped at all stays: one that now fits whole has changed. First, because
     # every other pass here shifts offsets -- which holds only while no tool reports clip spans together
     # with notice_at or head_fragment_len.
@@ -2657,6 +2664,7 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "covered_branch",
         "covered_controls",
         "covered_layer_kind",
+        "covered_after_wait",
         "requested_url",
         "landed_url",
         "nav_error_code",
@@ -6275,6 +6283,8 @@ async def run_agent_tool_loop(
                     cost_fields["covered_branch"] = covered["branch"]
                     cost_fields["covered_controls"] = covered["controls"]
                     cost_fields["covered_layer_kind"] = covered["layer_kind"]
+                    if covered.get("after_wait"):
+                        cost_fields["covered_after_wait"] = True
                     if tool_name == "type":
                         cost_fields["type_held_by_layer"] = layer_held_call
             elif result.ok_class is not None:

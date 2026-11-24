@@ -791,7 +791,7 @@ def _log_judgment_evidence_verdict(
     condition: JudgmentTruthCondition, packet_label: str, verdict: str, origin: str
 ) -> None:
     LOG.info(
-        "copilot_judgment_evidence_verdict",
+        "ember_judgment_evidence_verdict",
         predicate=condition.predicate,
         packet_label=packet_label,
         verdict=verdict,

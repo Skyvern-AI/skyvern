@@ -528,7 +528,7 @@ async def _cooperative_cancel_dispatched_run(workflow_run_id: str) -> None:
         )
     except Exception:
         LOG.warning(
-            "Cooperative cancel of dispatched copilot run failed",
+            "Cooperative cancel of dispatched ember run failed",
             workflow_run_id=workflow_run_id,
             exc_info=True,
         )
@@ -548,7 +548,7 @@ async def _delete_dispatch_draft(workflow_id: str, organization_id: str) -> None
         )
     except Exception:
         LOG.warning(
-            "Failed to soft-delete copilot dispatch draft",
+            "Failed to soft-delete ember dispatch draft",
             workflow_id=workflow_id,
             organization_id=organization_id,
             exc_info=True,
@@ -569,7 +569,7 @@ async def _delete_dispatch_draft_if_run_final(workflow_id: str, workflow_run_id:
     )
     if run is None or not run.status.is_final():
         LOG.info(
-            "Skipping copilot dispatch draft delete; run is not final yet",
+            "Skipping ember dispatch draft delete; run is not final yet",
             workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
             status=run.status if run else None,
@@ -627,7 +627,7 @@ def _ember_sandbox_unavailable_result(*, organization_id: str, workflow_permanen
     # The single choke point every "sandbox unavailable" return goes through, so the
     # org/workflow refusal rate is measurable regardless of which caller refused.
     LOG.info(
-        "Copilot block run refused: sandboxed worker unavailable",
+        "Ember block run refused: sandboxed worker unavailable",
         organization_id=organization_id,
         workflow_permanent_id=workflow_permanent_id,
     )
@@ -1769,7 +1769,7 @@ async def _workflow_from_prior_draft(ctx: EmberContext, labels: list[str]) -> Wo
         )
     except Exception:
         # Prior-parse is best-effort; a settings-inherit lookup failure must not block the run tool.
-        LOG.warning("Could not parse prior copilot draft for run-tool label resolution", exc_info=True)
+        LOG.warning("Could not parse prior ember draft for run-tool label resolution", exc_info=True)
         return None
     return workflow if _workflow_covers_labels(workflow, labels) else None
 
@@ -2480,7 +2480,7 @@ async def _observe_completed_run_outputs(
             workflow_run_id=run.workflow_run_id
         )
     except Exception as exc:  # noqa: BLE001 - receipt collection can use block rows when the output-row read fails.
-        LOG.info("copilot_completed_output_rows_unavailable", error_type=type(exc).__name__)
+        LOG.info("ember_completed_output_rows_unavailable", error_type=type(exc).__name__)
         output_rows = []
     _record_completed_run_outputs(
         ctx, execution, run.workflow_run_id, run.created_at, rows, output_rows, seeded_only_labels
@@ -2602,7 +2602,7 @@ async def _attach_registered_output_parameter_values(
         )
     except Exception:
         LOG.warning(
-            "Failed to read workflow run output parameters for copilot run evidence; "
+            "Failed to read workflow run output parameters for ember run evidence; "
             "deterministic graders lose authoritative output-parameter evidence",
             workflow_run_id=workflow_run_id,
             organization_id=getattr(workflow, "organization_id", None),
@@ -3341,7 +3341,7 @@ async def _fetch_dispatched_terminal_page_evidence(
         # The HTML is cut to the budget before redaction, so a refusal here is never about size. The size is not
         # logged because the refused parameters cannot vouch that it differs from a registered value.
         LOG.warning(
-            "copilot_model_facing_result_withheld",
+            "ember_model_facing_result_withheld",
             tool_name="post_run_page_html",
             reason="redaction_unavailable",
         )
@@ -3429,7 +3429,7 @@ async def _capture_dispatched_terminal_page_evidence(
             captured_at=captured_frame.captured_at,
         )
     LOG.info(
-        "copilot_dispatched_terminal_page_evidence_captured",
+        "ember_dispatched_terminal_page_evidence_captured",
         workflow_run_id=run_id,
         dispatch_to_worker=True,
         bounded_page_schema=has_bounded_page_schema(evidence),
@@ -3506,7 +3506,7 @@ async def reusable_origin_input_keys(ctx: EmberContext) -> list[str]:
         snapshot = await _select_execution_snapshot(ctx, [], allow_prior_draft=False)
     except Exception as exc:
         LOG.warning(
-            "copilot_reusable_origin_input_keys_unavailable",
+            "ember_reusable_origin_input_keys_unavailable",
             workflow_id=ctx.workflow_id,
             error_type=type(exc).__name__,
         )
@@ -3572,7 +3572,7 @@ def _resolve_run_data_and_unbound_keys(
         if placeholder is not None:
             data[wp.key] = placeholder
             LOG.info(
-                "Auto-filled missing workflow parameter for copilot test run",
+                "Auto-filled missing workflow parameter for ember test run",
                 parameter_key=wp.key,
                 parameter_type=str(wp.workflow_parameter_type),
             )
@@ -3690,7 +3690,7 @@ async def _complete_origin_run_redaction_registry_from_runtime(
     )
     if runtime_secret_values is None:
         # The run still owes these values, so tool calls on its browser stay withheld.
-        LOG.warning("Copilot origin-run runtime secret handoff missing", workflow_run_id=workflow_run_id)
+        LOG.warning("Ember origin-run runtime secret handoff missing", workflow_run_id=workflow_run_id)
         return registry
 
     parameters = dict(registry.parameters)
@@ -3790,9 +3790,7 @@ async def _close_minted_browser(
     ctx: EmberContext, session_id: str, run_id: str | None, *, reason: BrowserSessionCloseReason
 ) -> None:
     if run_id is not None and await _run_in_a_minted_browser_is_still_live(session_id, run_id, ctx.organization_id):
-        LOG.info(
-            "copilot_minted_browser_kept_for_live_run", browser_session_id=session_id, run_id=run_id, reason=reason
-        )
+        LOG.info("ember_minted_browser_kept_for_live_run", browser_session_id=session_id, run_id=run_id, reason=reason)
 
         async def _close_when_idle() -> None:
             renewal = asyncio.create_task(_renew_kept_browser_activity(session_id))
@@ -3812,9 +3810,7 @@ async def _close_minted_browser(
         task.add_done_callback(_log_detached_cleanup_failure)
         return
     closed = await close_browser_session_quietly(ctx.organization_id, session_id, reason=reason)
-    LOG.info(
-        "copilot_minted_browser_closed", browser_session_id=session_id, run_id=run_id, closed=closed, reason=reason
-    )
+    LOG.info("ember_minted_browser_closed", browser_session_id=session_id, run_id=run_id, closed=closed, reason=reason)
 
 
 async def close_minted_browser_sessions(ctx: EmberContext) -> None:
@@ -4536,14 +4532,14 @@ async def _run_blocks_with_minted_browser_claim(
     # Same check as an edit's, synchronous with the token capture above: the labels and parameters were chosen
     # against the draft an unseen adoption replaced.
     if (adoption := unseen_adoption(ctx)) is not None:
-        LOG.info("copilot candidate run refused", reason="token_changed", adoption=adoption)
+        LOG.info("ember candidate run refused", reason="token_changed", adoption=adoption)
         return {
             **proposal_conflict_result(ctx, lost="The test was not run.", reason="token_changed", adoption=adoption),
             "data": {"run_dispatched": False, _PROPOSAL_BIND_REFUSED_KEY: True},
         }
     if ctx.settings_diverged_proposal_token == (execution.proposal_owner_turn_id, execution.proposal_revision):
         LOG.info(
-            "copilot candidate run refused",
+            "ember candidate run refused",
             reason="settings_diverged",
             proposal_owner_turn_id=execution.proposal_owner_turn_id,
             proposal_revision=execution.proposal_revision,
@@ -4959,7 +4955,7 @@ async def _run_blocks_with_minted_browser_claim(
         used_fresh_run_session = True
         run_detached_from_chat = True
         LOG.info(
-            "copilot_build_test_fresh_session_minted",
+            "ember_build_test_fresh_session_minted",
             labels_to_execute=labels_to_execute,
             frontier_start_label=frontier_start_label,
             run_session_id=run_session_id,
@@ -4972,7 +4968,7 @@ async def _run_blocks_with_minted_browser_claim(
         run_session_id = resume_session_id
         run_detached_from_chat = True
         LOG.info(
-            "copilot_frontier_resume_session_carried",
+            "ember_frontier_resume_session_carried",
             labels_to_execute=labels_to_execute,
             frontier_start_label=frontier_start_label,
             run_session_id=run_session_id,
@@ -5062,7 +5058,7 @@ async def _run_blocks_with_minted_browser_claim(
                 return _test_start_unavailable_result(ctx)
             except Exception:
                 LOG.warning(
-                    "Failed to persist copilot run snapshot; blocking execution",
+                    "Failed to persist ember run snapshot; blocking execution",
                     organization_id=ctx.organization_id,
                     workflow_permanent_id=ctx.workflow_permanent_id,
                     dispatch_to_worker=dispatch_to_worker,
@@ -5278,7 +5274,7 @@ async def _run_blocks_with_minted_browser_claim(
                     "error": "The test run's saved browser profile could not be recorded; execution was not started.",
                 }
             LOG.info(
-                "copilot_build_test_browser_seed_recorded",
+                "ember_build_test_browser_seed_recorded",
                 workflow_run_id=workflow_run.workflow_run_id,
                 browser_seed_source=browser_seed_source,
             )
@@ -5291,7 +5287,7 @@ async def _run_blocks_with_minted_browser_claim(
                 )
             except Exception:
                 LOG.warning(
-                    "copilot_agent_step_run_accounts_record_failed",
+                    "ember_agent_step_run_accounts_record_failed",
                     workflow_run_id=workflow_run.workflow_run_id,
                     exc_info=True,
                 )
@@ -5320,7 +5316,7 @@ async def _run_blocks_with_minted_browser_claim(
                     ]
                 except Exception:
                     LOG.warning(
-                        "copilot_agent_step_accounts_read_failed",
+                        "ember_agent_step_accounts_read_failed",
                         workflow_run_id=workflow_run.workflow_run_id,
                         exc_info=True,
                     )
@@ -5361,7 +5357,7 @@ async def _run_blocks_with_minted_browser_claim(
                 except Exception:
                     bind_unexpected = True
                     LOG.warning(
-                        "copilot candidate run bind failed",
+                        "ember candidate run bind failed",
                         workflow_run_id=workflow_run.workflow_run_id,
                         reason="unexpected_error",
                         exc_info=True,
@@ -5399,7 +5395,7 @@ async def _run_blocks_with_minted_browser_claim(
                     }
                 reason, adoption = bind_conflict
                 LOG.info(
-                    "copilot candidate run bind lost",
+                    "ember candidate run bind lost",
                     workflow_run_id=workflow_run.workflow_run_id,
                     proposal_owner_turn_id=execution.proposal_owner_turn_id,
                     proposal_revision=execution.proposal_revision,
@@ -5492,7 +5488,7 @@ async def _run_blocks_with_minted_browser_claim(
         else:
             if allow_inline_code_execution and requires_sandbox:
                 LOG.warning(
-                    "UNSANDBOXED: executing copilot workflow code in the API process because no sandbox "
+                    "UNSANDBOXED: executing ember workflow code in the API process because no sandbox "
                     "can take this run; the run below is NOT a sandboxed run.",
                     workflow_run_id=workflow_run.workflow_run_id,
                     workflow_permanent_id=ctx.workflow_permanent_id,
@@ -5565,7 +5561,7 @@ async def _run_blocks_with_minted_browser_claim(
                     )
                 )
             except Exception:
-                LOG.warning("copilot_unsubmitted_run_fail_write_failed", workflow_run_id=prepared_run_id, exc_info=True)
+                LOG.warning("ember_unsubmitted_run_fail_write_failed", workflow_run_id=prepared_run_id, exc_info=True)
         # The poll's finally never runs on this path, and a None entry is neither superseded nor checked for a run
         # still using the browser at turn end.
         if (
@@ -5621,7 +5617,7 @@ async def _run_blocks_with_minted_browser_claim(
                     )
                 except Exception:
                     LOG.warning(
-                        "Failed to publish active Copilot run session",
+                        "Failed to publish active Ember run session",
                         organization_id=ctx.organization_id,
                         workflow_permanent_id=ctx.workflow_permanent_id,
                         workflow_run_id=workflow_run.workflow_run_id,
@@ -5705,7 +5701,7 @@ async def _run_blocks_with_minted_browser_claim(
                         failed_iteration = _failed_loop_iteration_carried_past(await _fetch_tick_block_rows())
                     except Exception:
                         LOG.warning(
-                            "Copilot test block rows read failed",
+                            "Ember test block rows read failed",
                             workflow_run_id=workflow_run.workflow_run_id,
                             exc_info=True,
                         )
@@ -5778,7 +5774,7 @@ async def _run_blocks_with_minted_browser_claim(
                     # Recounted after the cancel: iterations kept starting until the run saw it.
                     failed_iteration = _failed_loop_iteration_carried_past(watchdog_block_rows) or failed_iteration
                     LOG.info(
-                        "copilot_test_stopped_at_failed_iteration",
+                        "ember_test_stopped_at_failed_iteration",
                         workflow_run_id=workflow_run.workflow_run_id,
                         loop_label=failed_iteration.loop_label,
                         failed_iteration_index=failed_iteration.iteration_index,
@@ -5885,7 +5881,7 @@ async def _run_blocks_with_minted_browser_claim(
             )
             leave_run_to_owner = run_paused or left_by_backstop
             LOG.info(
-                "copilot_build_test_cancellation_disposition",
+                "ember_build_test_cancellation_disposition",
                 left_to_owner=leave_run_to_owner,
                 run_paused=run_paused,
                 backstop_expired=turn_deadline is not None and turn_deadline.expired(),
@@ -6237,7 +6233,7 @@ async def _run_blocks_with_minted_browser_claim(
                 )
             except Exception:
                 LOG.warning(
-                    "Failed to clear active Copilot run session",
+                    "Failed to clear active Ember run session",
                     organization_id=active_run_association.organization_id,
                     workflow_run_id=active_run_association.workflow_run_id,
                     debug_browser_session_id=active_run_association.debug_browser_session_id,
@@ -6423,7 +6419,7 @@ async def _get_run_results(
         selected_by=selected_by,
     )
     LOG.info(
-        "Copilot run results selected",
+        "Ember run results selected",
         workflow_run_id=workflow_run_id,
         selected_by=selected_by,
         newer_finished_run_ids=[entry["workflow_run_id"] for entry in selection_facts.get("newer_finished_runs", [])],
@@ -6850,7 +6846,7 @@ def _composition_anti_bot_reason(ember_ctx: object) -> str | None:
         return None
     if composition_challenge_carrier(evidence) is None:
         LOG.info(
-            "copilot anti-bot composition evidence keyword-only-suppressed",
+            "ember anti-bot composition evidence keyword-only-suppressed",
             indicator_count=len(normalized_indicators),
             challenge_control_count=control_count,
             challenge_detected=challenge_detected,
@@ -6952,7 +6948,7 @@ def _apply_terminal_challenge_latches(
         )
         ember_ctx.last_failure_category_top = "ANTI_BOT_DETECTION"
     LOG.info(
-        "copilot anti-bot evidence stamp",
+        "ember anti-bot evidence stamp",
         anti_bot_evidence_source=terminal_challenge.challenge_evidence_source,
         stamp_seam="terminal_challenge",
     )
@@ -6984,7 +6980,7 @@ def settle_terminal_challenge_after_enrichment(ember_ctx: EmberContext, result: 
     if anti_bot_match and not anti_bot_evidence_source:
         # Keyword-only, same as the pre-enrichment path: drop the match but keep going, because a
         # structured blocker plus a challenge artifact still decides this without it.
-        LOG.info("copilot anti-bot latch keyword-only-suppressed")
+        LOG.info("ember anti-bot latch keyword-only-suppressed")
         anti_bot_match = None
     terminal_challenge = _terminal_challenge_evidence(
         result,
@@ -7318,12 +7314,12 @@ def _record_run_blocks_result(
     if anti_bot_match and anti_bot_evidence_source:
         ember_ctx.last_test_anti_bot = anti_bot_match
         LOG.info(
-            "copilot anti-bot evidence stamp",
+            "ember anti-bot evidence stamp",
             anti_bot_evidence_source=anti_bot_evidence_source,
             stamp_seam="last_test_anti_bot",
         )
     elif anti_bot_match:
-        LOG.info("copilot anti-bot latch keyword-only-suppressed")
+        LOG.info("ember anti-bot latch keyword-only-suppressed")
         anti_bot_match = None
     if failure_categories:
         carrier_categories = carrier_backed_anti_bot_categories(failure_categories)
@@ -7770,7 +7766,7 @@ def _stash_recorded_run_outcome(ember_ctx: EmberContext, outcome: RecordedRunOut
         else:
             attempt["outcomeReason"] = outcome.display_reason
     LOG.info(
-        "copilot_run_outcome_recorded",
+        "ember_run_outcome_recorded",
         workflow_run_id=outcome.workflow_run_id,
         verdict=outcome.verdict,
         reason_code=outcome.reason_code,
@@ -7805,7 +7801,7 @@ async def _send_run_started_update(ember_ctx: EmberContext, workflow_run_id: str
             )
         )
     except Exception:
-        LOG.debug("copilot run_started send failed", exc_info=True)
+        LOG.debug("ember run_started send failed", exc_info=True)
 
 
 async def _send_run_outcome_update(
@@ -7851,7 +7847,7 @@ async def _send_run_outcome_update(
             )
         )
     except Exception:
-        LOG.debug("copilot run_outcome send failed", exc_info=True)
+        LOG.debug("ember run_outcome send failed", exc_info=True)
 
 
 def _mark_stored_post_run_failure_page(ember_ctx: Any) -> None:
@@ -7892,7 +7888,7 @@ async def _resolve_captcha_solver_availability(ember_ctx: Any, result_url: str |
     except Exception:
         # Unresolved, not disabled: a transient provider failure must not be reported to the model
         # as an organization setting. None keeps every `is True` gate closed exactly as before.
-        LOG.warning("copilot captcha solver availability lookup failed; leaving it unresolved", exc_info=True)
+        LOG.warning("ember captcha solver availability lookup failed; leaving it unresolved", exc_info=True)
         ember_ctx.captcha_solver_available = None
         ember_ctx.captcha_solver_available_for_url = url
         return
@@ -7922,7 +7918,7 @@ def _carry_prior_attempt_change_identity_into_result(
         return
     data["prior_attempt_change_identity"] = identity.model_dump(mode="json")
     LOG.info(
-        "copilot carried prior-attempt change identity into failing run result",
+        "ember carried prior-attempt change identity into failing run result",
         tool_name=tool_name,
         workflow_run_id=run_id,
         prior_workflow_run_id=identity.prior_workflow_run_id,
@@ -8003,7 +7999,7 @@ async def _capture_delivered_output_files(ember_ctx: EmberContext, result: dict[
             else []
         )
     except Exception as exc:
-        LOG.warning("copilot delivered output file read failed", workflow_run_id=run_id, error_type=type(exc).__name__)
+        LOG.warning("ember delivered output file read failed", workflow_run_id=run_id, error_type=type(exc).__name__)
         return
     files = [
         DeliveredOutputFile(artifact_id=artifact.artifact_id, filename=_artifact_file_name(artifact))
@@ -8011,7 +8007,7 @@ async def _capture_delivered_output_files(ember_ctx: EmberContext, result: dict[
     ]
     ember_ctx.delivered_output_files = (run_id, files)
     LOG.info(
-        "copilot recorded delivered output files",
+        "ember recorded delivered output files",
         workflow_run_id=run_id,
         generated_count=len(generated),
         delivered_count=len(files),
@@ -8096,7 +8092,7 @@ def _record_diagnosis_repair_contract(
     ember_ctx.latest_diagnosis_repair_contract = contract
     trace_data = contract.to_trace_data()
     LOG.info(
-        "copilot diagnosis repair contract shadow",
+        "ember diagnosis repair contract shadow",
         **{f"diagnosis_repair_{key}": value for key, value in trace_data.items()},
     )
     with ember_span("diagnosis_repair_contract", data=trace_data):
@@ -8868,13 +8864,13 @@ async def hydrate_prior_run_packet(
             mode="json", exclude_none=True
         )
     except Exception:
-        LOG.warning("copilot prior-run packet unavailable", workflow_run_id=workflow_run_id, exc_info=True)
+        LOG.warning("ember prior-run packet unavailable", workflow_run_id=workflow_run_id, exc_info=True)
         return None
     if queue_failure_frame:
         try:
             enqueue_screenshot_from_result(ember_ctx, result, provenance=stored_run_frame_provenance(result))
         except Exception:
-            LOG.warning("copilot prior-run frame not queued", workflow_run_id=workflow_run_id, exc_info=True)
+            LOG.warning("ember prior-run frame not queued", workflow_run_id=workflow_run_id, exc_info=True)
     # The prompt already carries the workflow in its own section; a second copy here would sit
     # unlabelled beside it, and disagree with it whenever the editor holds an unsaved draft.
     for field in ("canonical_workflow_yaml", "canonical_workflow_yaml_complete", "canonical_workflow_source"):

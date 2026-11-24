@@ -3895,7 +3895,7 @@ class AgentFunction:
             has_code_block_access = await self.has_code_block_access(organization_id)
         except Exception:
             LOG.warning(
-                "Failed to resolve Copilot code-block access; using non-code authoring",
+                "Failed to resolve Ember code-block access; using non-code authoring",
                 organization_id=organization_id,
                 exc_info=True,
             )
@@ -3908,7 +3908,7 @@ class AgentFunction:
             agent_step_enabled = await self.agent_step_enabled(organization_id)
         except Exception:
             LOG.warning(
-                "Failed to resolve Copilot agent_step access; leaving it unavailable",
+                "Failed to resolve Ember agent_step access; leaving it unavailable",
                 organization_id=organization_id,
                 exc_info=True,
             )

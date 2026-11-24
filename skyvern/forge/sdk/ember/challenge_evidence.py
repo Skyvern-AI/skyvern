@@ -262,7 +262,7 @@ def carrier_backed_anti_bot_categories(value: object) -> list[Any]:
             continue
         suppressed_source = challenge_evidence_source_from_entry(entry) if isinstance(entry, Mapping) else None
         LOG.info(
-            "copilot anti-bot category keyword-only-suppressed",
+            "ember anti-bot category keyword-only-suppressed",
             category=_category_name(entry),
             suppressed_evidence_source=suppressed_source.value if suppressed_source else "absent",
         )

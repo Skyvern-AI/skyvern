@@ -990,7 +990,7 @@ async def _verify_requested_output_reads(
             fact["label_association"] = label_association
         verified.append(fact)
     LOG.info(
-        "copilot_requested_output_designation_facts",
+        "ember_requested_output_designation_facts",
         verified_paths=[fact["output_path"] for fact in verified],
         unverified=unverified,
     )
@@ -2223,7 +2223,7 @@ async def read_chat_history_tool(
         else read_chat_history(rows, cursor, limit, ctx.context.chat_history_oldest_shown_id)
     )
     LOG.info(
-        "copilot_chat_history_read",
+        "ember_chat_history_read",
         ok=result["ok"],
         snapshot_rows=len(rows),
         returned_rows=len(result.get("messages", [])),
@@ -2541,7 +2541,7 @@ async def _inspect_locator_matches_invoke(ctx: RunContextWrapper, arguments: str
                 )
             facts = await inspect_locator_matches(page, selectors)
             LOG.info(
-                "copilot_locator_inspection_visibility",
+                "ember_locator_inspection_visibility",
                 selectors=visibility_counts(facts),
                 workflow_permanent_id=ember_ctx.workflow_permanent_id,
                 workflow_copilot_chat_id=ember_ctx.workflow_copilot_chat_id,
