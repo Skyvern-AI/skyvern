@@ -155,6 +155,7 @@ from skyvern.exceptions import (
 from skyvern.file_parser.client import IsolatedParserResult, parse_file_remotely
 from skyvern.file_parser.transport import MAX_PARSER_INPUT_BYTES, MAX_PARSER_OUTPUT_BYTES
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import CLASSIFIER_LABEL_REASON_CODES, FailureCategory, is_v3_stop_entry
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
@@ -2593,6 +2594,29 @@ def _run_lost_its_browser(workflow_run_id: str) -> bool:
     return get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)) is not None
 
 
+def task_block_failure_category(
+    categories: list[dict] | None, task_status: TaskStatus, failure_reason: str | None
+) -> list[dict] | None:
+    """A task's failure_category as its block output carries it. A Task V3 stop name describes the task; the workflow
+    run, templates and Ember keep reading a failed task's classification of its reason, or BUDGET_EXHAUSTED when a
+    tripped cap ended it and no rule matches, and nothing for a terminated one."""
+    if not categories or not any(is_v3_stop_entry(c) for c in categories):
+        return categories
+    kept = [c for c in categories if not is_v3_stop_entry(c)]
+    if task_status != TaskStatus.failed:
+        return kept or None
+    cap_trip = next((c["cap_trip"] for c in categories if is_v3_stop_entry(c) and c.get("cap_trip")), None)
+    classified = (
+        app.AGENT_FUNCTION.classify_failure(failure_reason, fallback_to_unknown=cap_trip is None, status=task_status)
+        or []
+    )
+    if cap_trip is not None and all(c.get("reason_code") in CLASSIFIER_LABEL_REASON_CODES for c in classified):
+        classified = [
+            {"category": FailureCategory.BUDGET_EXHAUSTED.value, "confidence_float": 1.0, "reasoning": cap_trip}
+        ]
+    return [*classified, *kept] or None
+
+
 def _engine_is_unset(engine: RunEngine | None) -> bool:
     return engine is None
 
@@ -3449,6 +3473,9 @@ class BaseTaskBlock(Block):
                     task_screenshot_artifact_ids=[a.artifact_id for a in task_screenshot_artifacts],
                     workflow_screenshot_artifact_ids=[a.artifact_id for a in workflow_screenshot_artifacts],
                 )
+                task_output.failure_category = task_block_failure_category(
+                    task_output.failure_category, updated_task.status, updated_task.failure_reason
+                )
                 output_parameter_value = task_output.model_dump()
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
                 return await self.build_block_result(
@@ -3549,6 +3576,9 @@ class BaseTaskBlock(Block):
                     downloaded_files,
                     task_screenshot_artifact_ids=[a.artifact_id for a in task_screenshot_artifacts],
                     workflow_screenshot_artifact_ids=[a.artifact_id for a in workflow_screenshot_artifacts],
+                )
+                task_output.failure_category = task_block_failure_category(
+                    task_output.failure_category, updated_task.status, updated_task.failure_reason
                 )
                 LOG.warning(
                     f"Task failed with status {updated_task.status}{retry_message}",

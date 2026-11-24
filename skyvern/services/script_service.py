@@ -118,6 +118,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     get_all_blocks,
     render_failure_reason,
     render_failure_record,
+    task_block_failure_category,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -1153,6 +1154,9 @@ async def _update_workflow_block(
                 downloaded_files,
                 task_screenshot_artifact_ids=[a.artifact_id for a in task_screenshot_artifacts],
                 workflow_screenshot_artifact_ids=[a.artifact_id for a in workflow_screenshot_artifacts],
+            )
+            task_output.failure_category = task_block_failure_category(
+                task_output.failure_category, updated_task.status, updated_task.failure_reason
             )
             final_output = task_output.model_dump()
             step_for_billing: Step | None = None

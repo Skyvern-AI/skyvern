@@ -10,7 +10,7 @@ from skyvern.forge.sdk.ember.blocker_signal import (
     EmberToolBlockerSignal,
     assert_clean_user_facing_text,
     build_llm_tool_error_payload,
-    clear_blocker_signal_for_reason_codes,
+    clear_tool_blocker_signals_for_reason_codes,
     contains_internal_machinery_leak,
     maybe_clear_blocker_signal_on_tool_success,
     stash_blocker_signal,
@@ -147,7 +147,7 @@ def test_maybe_clear_on_tool_success_empty_set_keeps_signal() -> None:
 def test_clear_for_reason_codes_matches() -> None:
     ctx = _Ctx()
     ctx.blocker_signal = _make(internal_reason_code="old_reason")
-    clear_blocker_signal_for_reason_codes(ctx, frozenset({"old_reason"}))
+    clear_tool_blocker_signals_for_reason_codes(ctx, frozenset({"old_reason"}))
     assert ctx.blocker_signal is None
 
 
@@ -155,7 +155,7 @@ def test_clear_for_reason_codes_no_match() -> None:
     ctx = _Ctx()
     signal = _make(internal_reason_code="other_reason")
     ctx.blocker_signal = signal
-    clear_blocker_signal_for_reason_codes(ctx, frozenset({"old_reason"}))
+    clear_tool_blocker_signals_for_reason_codes(ctx, frozenset({"old_reason"}))
     assert ctx.blocker_signal is signal
 
 
@@ -166,7 +166,7 @@ def test_clear_helpers_ignore_non_signal_values_on_ctx() -> None:
     ctx.blocker_signal = "not a signal"  # type: ignore[assignment]
     maybe_clear_blocker_signal_on_tool_success(ctx, "update_workflow")
     assert ctx.blocker_signal == "not a signal"
-    clear_blocker_signal_for_reason_codes(ctx, frozenset({"some_reason"}))
+    clear_tool_blocker_signals_for_reason_codes(ctx, frozenset({"some_reason"}))
     assert ctx.blocker_signal == "not a signal"
 
 

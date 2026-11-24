@@ -6,14 +6,23 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import structlog
+from fastapi import HTTPException
+from pydantic import JsonValue
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.ember.blocker_signal import stash_blocker_signal
 from skyvern.forge.sdk.ember.connected_accounts import ConnectionCardPayload, request_user_id
-from skyvern.forge.sdk.ember.context import EmberContext
+from skyvern.forge.sdk.ember.context import CREATE_GOOGLE_SHEET_TOOL_NAME, EmberContext
 from skyvern.forge.sdk.ember.request_policy import RequestPolicy
 from skyvern.forge.sdk.ember.runtime import AgentContext
 from skyvern.forge.sdk.ember.secret_scrub import scrub_secrets_from_structure
+from skyvern.forge.sdk.ember.tools.credentials import (
+    _connection_approval_blocker_signal,
+    admitted_connection_ids,
+    clear_connection_denials,
+    connected_account_choices,
+)
 from skyvern.forge.sdk.integrations.catalog import (
     IntegrationAccount,
     IntegrationEntry,
@@ -21,9 +30,10 @@ from skyvern.forge.sdk.integrations.catalog import (
     integrations_for_org,
 )
 from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection, org_connections_by_id
+from skyvern.forge.sdk.schemas.ember import EmberCreatedSpreadsheet
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, google_sheets_service
-from skyvern.forge.sdk.services.request_principal import get_request_principal, human_user_id
+from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal, human_user_id
 from skyvern.schemas.google_sheets import (
     GoogleSheetsAPIError,
     build_a1,
@@ -374,7 +384,10 @@ async def _read_google_sheet(params: dict[str, Any], ctx: AgentContext) -> dict[
     except ValueError:
         return {"ok": False, "error": "spreadsheet_url is not a Google Sheets URL."}
     policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
-    if policy is None or spreadsheet_id not in policy.user_provided_spreadsheet_ids:
+    user_provided = policy is not None and spreadsheet_id in policy.user_provided_spreadsheet_ids
+    if not user_provided and not any(
+        created.spreadsheet_id == spreadsheet_id for created in await _chat_created_spreadsheets(ctx)
+    ):
         return {
             "ok": False,
             "error": "This spreadsheet is not in a URL the user wrote in this chat, so it was not read.",
@@ -441,3 +454,186 @@ async def _read_google_sheet(params: dict[str, Any], ctx: AgentContext) -> dict[
         )
     scrubbed: dict[str, Any] = scrub_secrets_from_structure(ctx, data)
     return {"ok": True, "data": scrubbed}
+
+
+def _sheet_create_result(
+    ctx: AgentContext,
+    record: EmberCreatedSpreadsheet,
+    status: Literal["created", "already_created"],
+    first_sheet_name: str | None = None,
+) -> dict[str, JsonValue]:
+    clear_connection_denials(ctx, raised_by_create=True)
+    data: dict[str, JsonValue] = {"status": status, **record.model_dump()}
+    if first_sheet_name:
+        data["first_sheet_name"] = first_sheet_name
+    return {"ok": True, "data": data}
+
+
+def _sheet_outcome_unknown(title: str, account: str, reason: str) -> dict[str, JsonValue]:
+    return {
+        "ok": False,
+        "outcome_unknown": True,
+        "error": f"Google did not confirm whether the spreadsheet was created ({reason}). A spreadsheet titled "
+        f"'{title}' may now exist in {account}'s Drive; ask the user to check there. This chat will not create "
+        "another sheet with this title in this account.",
+    }
+
+
+async def _chat_created_spreadsheets(ctx: AgentContext) -> list[EmberCreatedSpreadsheet]:
+    if not isinstance(ctx, EmberContext) or ctx.workflow_copilot_chat_id is None:
+        return []
+    return await app.DATABASE.workflow_params.list_ember_created_spreadsheets(
+        ctx.organization_id, ctx.workflow_copilot_chat_id
+    )
+
+
+async def _create_google_sheet(title: str, connection_id: str, ctx: AgentContext) -> dict[str, JsonValue]:
+    result = await _attempt_google_sheet_create(title, connection_id, ctx)
+    data = result.get("data")
+    result["data"] = {
+        **(data if isinstance(data, dict) else {}),
+        "created_this_chat": [
+            created.model_dump() for created in await _chat_created_spreadsheets(ctx) if created.spreadsheet_id
+        ],
+    }
+    return result
+
+
+async def _attempt_google_sheet_create(title: str, connection_id: str, ctx: AgentContext) -> dict[str, JsonValue]:
+    title = title.strip()
+    connection_id = connection_id.strip()
+    if not title or not connection_id:
+        return {"ok": False, "error": "Nothing was created: title and connection_id are both required."}
+    principal = get_request_principal()
+    if principal is None:
+        return {"ok": False, "error": "Nothing was created: creating a Google Sheet needs a signed-in requester."}
+    try:
+        await enforce_principal_role(principal, "google_sheet.create")
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            detail = exc.detail.get("message") if isinstance(exc.detail, dict) else exc.detail
+            reason = f" ({detail})" if isinstance(detail, str) and detail else ""
+            return {
+                "ok": False,
+                "error": "Nothing was created: the person in this chat does not have the google_sheet.create "
+                f"permission, which creating a Google Sheet needs{reason}. An Admin can grant it.",
+            }
+        return {
+            "ok": False,
+            "error": f"Nothing was created: permissions could not be verified just now ({exc.status_code}).",
+        }
+
+    connections = await org_connections_by_id(ctx.organization_id, request_user_id(ctx.organization_id))
+    google_accounts = [
+        connection for connection in connections if connection.provider == "google" and connection.active
+    ]
+    connection = next((account for account in google_accounts if account.id == connection_id), None)
+    if connection is None:
+        return {
+            "ok": False,
+            "error": "Nothing was created: connection_id is not an active Google connection of this organization.",
+            "data": {"google_connections": [account.facts() for account in google_accounts]},
+        }
+
+    policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    admitted = await admitted_connection_ids(
+        [connection_id],
+        tool_activity=ctx.tool_activity,
+        organization_id=ctx.organization_id,
+        request_policy=policy,
+        listing_admits=(),
+    )
+    blocker = _connection_approval_blocker_signal(
+        [connection_id],
+        policy,
+        admitted_ids=admitted,
+        action="create the Google Sheet",
+        blocked_tool=CREATE_GOOGLE_SHEET_TOOL_NAME,
+        acting_refs=[connection_id],
+    )
+    if blocker is not None:
+        error = stash_blocker_signal(ctx, blocker)
+        if ctx.blocker_signal is blocker:
+            ctx.connected_account_recovery_choices = (
+                await connected_account_choices(
+                    ctx.organization_id,
+                    [{"block_type": "google_sheets_write", "credential_id": connection_id}],
+                    [connection_id],
+                )
+                or []
+            )
+        return {"ok": False, "error": error}
+
+    chat_id = ctx.workflow_copilot_chat_id if isinstance(ctx, EmberContext) else None
+    if chat_id is None:
+        return {"ok": False, "error": "Nothing was created: there is no chat to record the new sheet in."}
+    account = connection.email_address or connection.name
+    access_token = await app.AGENT_FUNCTION.get_google_sheets_credentials(ctx.organization_id, connection_id)
+    if access_token is None:
+        return {
+            "ok": False,
+            "error": f"Nothing was created: no access token could be minted for {account}. The user reconnects "
+            "that account, then this can be tried again.",
+        }
+
+    # The claim is held on the chat row, so every later or concurrent turn, on any pod, sees it before creating.
+    prior = await app.DATABASE.workflow_params.claim_ember_spreadsheet_create(
+        ctx.organization_id, chat_id, title, connection_id
+    )
+    if prior is not None:
+        if prior.spreadsheet_id is not None:
+            return _sheet_create_result(ctx, prior, "already_created")
+        return _sheet_outcome_unknown(title, account, "an earlier create for this title in this chat was not confirmed")
+    try:
+        created = await google_sheets_service.create_spreadsheet(access_token, title)
+    except GoogleSheetsAPIError as error:
+        reason = _sheet_error_reason(error, access_token)
+        refused = 400 <= error.status < 500 and error.status not in (408, 429)
+        LOG.warning(
+            "copilot_create_google_sheet_failed",
+            organization_id=ctx.organization_id,
+            connection_id=connection_id,
+            status=error.status,
+            outcome="refused" if refused else "unknown",
+        )
+        if refused:
+            await app.DATABASE.workflow_params.settle_ember_spreadsheet_create(
+                ctx.organization_id, chat_id, title, connection_id, None
+            )
+            return {"ok": False, "error": f"Google refused the create, so nothing was created: {reason}"}
+        return _sheet_outcome_unknown(title, account, reason)
+    except Exception as error:
+        LOG.warning(
+            "copilot_create_google_sheet_failed",
+            organization_id=ctx.organization_id,
+            connection_id=connection_id,
+            exc_info=True,
+        )
+        return _sheet_outcome_unknown(title, account, type(error).__name__)
+
+    record = EmberCreatedSpreadsheet(
+        title=title,
+        connection_id=connection_id,
+        spreadsheet_id=created.id,
+        spreadsheet_url=created.web_view_link or f"https://docs.google.com/spreadsheets/d/{created.id}/edit",
+    )
+    try:
+        await app.DATABASE.workflow_params.settle_ember_spreadsheet_create(
+            ctx.organization_id, chat_id, title, connection_id, record
+        )
+    except Exception:
+        # The claim stays, so later turns report this create as unconfirmed instead of making a second sheet.
+        LOG.warning(
+            "copilot_create_google_sheet_record_failed",
+            organization_id=ctx.organization_id,
+            connection_id=connection_id,
+            spreadsheet_id=created.id,
+            exc_info=True,
+        )
+    LOG.info(
+        "copilot_google_sheet_created",
+        organization_id=ctx.organization_id,
+        connection_id=connection_id,
+        spreadsheet_id=created.id,
+    )
+    return _sheet_create_result(ctx, record, "created", created.first_sheet_name)

@@ -68,6 +68,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "request_connection": "Preparing an account connection",
     "offer_demonstration": "Offering a demonstration",
     "read_google_sheet": "Reading the Google Sheet",
+    "create_google_sheet": "Creating a Google Sheet",
     "get_organization_usage_quota": "Checking account usage",
     "create_webhook_trigger": "Creating a webhook trigger",
     "test_trigger_mapping": "Testing the trigger mapping",

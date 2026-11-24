@@ -1334,22 +1334,15 @@ async def test_classifier_provenance_round_trips_through_terminal_write(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome_status", ["budget_exhausted", "failed"])
-async def test_budget_exhaustion_producer_persists_non_infra_attribution(
-    sqlite_db: AgentDB, outcome_status: str
-) -> None:
+async def test_budget_exhaustion_producer_persists_non_infra_attribution(sqlite_db: AgentDB) -> None:
     workflow_run_id = "wr_attr_budget"
     async with sqlite_db.Session() as session:
         session.add(_workflow_run_model(workflow_run_id=workflow_run_id, queued_at=_ATTR_QUEUED_AT))
         await session.commit()
 
-    outcome = LoopOutcome(status=outcome_status, reason="Unfinished", cap_trip="max_turns (40) reached")
+    outcome = LoopOutcome(status="budget_exhausted", reason="Unfinished", cap_trip="max_turns (40) reached")
     category = _v3_failure_category(
-        outcome,
-        task_status=TaskStatus.failed,
-        failure_reason=outcome.reason,
-        completion_rejection=None,
-        missing_extraction=False,
+        outcome, task_status=TaskStatus.failed, rejection_guard=None, missing_extraction=False
     )
     await sqlite_db.workflow_runs.update_workflow_run(
         workflow_run_id, status=WorkflowRunStatus.failed, failure_category=category

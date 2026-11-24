@@ -904,6 +904,7 @@ Purpose: Write rows to a Google Sheet, appended below existing data or written o
 Every cell is a JSON value, so a string cell must be quoted. `| tojson` quotes and escapes a referenced value: `[[{{ extract_metric.output.metric | tojson }}]]` renders `[["30 %"]]`, while `[[{{ extract_metric.output.metric }}]]` renders `[[30 %]]`, which is not JSON. A bare scalar such as 30 %, 6.97K or 10200 fails with "Invalid values payload".
 A reference must match the producer's output shape. A browser-task block (extraction, navigation, action, login) holds its payload under `.output`: `{{ extract_metric.output.metric }}`. A code or text_prompt block holds its returned fields on the label itself: `{{ compute_metric.metric }}` (a text_prompt without json_schema returns `llm_response`). An http_request block holds the parsed response body under `.body`: `{{ fetch_metric.body.metric }}`.
 A reference to a value no upstream block produced fails the block, and nothing is written.
+`spreadsheet_url` must point to a spreadsheet that already exists; the block never creates one. `create_sheet_if_missing: true` adds only the tab named by `sheet_name`, so a sheet with several tabs takes one block per tab.
 
 Use Cases:
 - Write an extracted metric into one cell

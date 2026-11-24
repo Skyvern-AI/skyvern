@@ -18,7 +18,7 @@ from skyvern.forge.sdk.credential_site_policy import describe_login_sites
 from skyvern.forge.sdk.db.id import GOOGLE_OAUTH_CREDENTIAL_PREFIX, MICROSOFT_OAUTH_CREDENTIAL_PREFIX
 from skyvern.forge.sdk.ember.blocker_signal import (
     EmberToolBlockerSignal,
-    clear_tool_blocker_signals_for_reason_codes,
+    clear_tool_blocker_signals,
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.ember.connected_accounts import (
@@ -28,6 +28,7 @@ from skyvern.forge.sdk.ember.connected_accounts import (
     request_user_id,
     resolve_connection_reference,
 )
+from skyvern.forge.sdk.ember.context import CREATE_GOOGLE_SHEET_TOOL_NAME
 from skyvern.forge.sdk.ember.credential_resolution import (
     credential_reference_spans,
     grounded_references,
@@ -657,17 +658,30 @@ def _retire_stale_connection_denial(
     ctx: AgentContext, *, workflow_refs: Collection[str], admitted_ids: set[str]
 ) -> None:
     """Drop an earlier attempt's denial once nothing it could have named is unapproved any more. The clear removes
-    every signal holding this reason code, so any reference still unapproved in the definition or the saved
-    workflow keeps them all standing."""
-    stale = ctx.blocker_signal
-    if not isinstance(stale, EmberToolBlockerSignal) or stale.internal_reason_code != UNAPPROVED_CONNECTION_REASON_CODE:
+    every run denial, so any reference still unapproved in the definition or the saved workflow keeps them all
+    standing."""
+    if not _is_connection_denial(ctx.blocker_signal, raised_by_create=False):
         return
     policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
     saved_refs = set(policy.persisted_workflow_connection_ids) if policy is not None else set()
     if (set(workflow_refs) | saved_refs) - _approved_run_credential_ids(policy) - admitted_ids:
         return
-    clear_tool_blocker_signals_for_reason_codes(ctx, frozenset({UNAPPROVED_CONNECTION_REASON_CODE}))
-    ctx.connected_account_recovery_choices = []
+    clear_connection_denials(ctx, raised_by_create=False)
+
+
+def _is_connection_denial(signal: EmberToolBlockerSignal | None, *, raised_by_create: bool) -> bool:
+    return (
+        signal is not None
+        and signal.internal_reason_code == UNAPPROVED_CONNECTION_REASON_CODE
+        and (signal.blocked_tool == CREATE_GOOGLE_SHEET_TOOL_NAME) == raised_by_create
+    )
+
+
+def clear_connection_denials(ctx: AgentContext, *, raised_by_create: bool) -> None:
+    """A sheet create's account denial and a run's are cleared only by their own tool: approving one account for a
+    run says nothing about the account a create named, and the reverse."""
+    if clear_tool_blocker_signals(ctx, lambda signal: _is_connection_denial(signal, raised_by_create=raised_by_create)):
+        ctx.connected_account_recovery_choices = []
 
 
 def _block_can_use(written: Mapping[str, Any], connection: OrgConnection) -> bool:

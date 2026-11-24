@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
@@ -96,6 +96,7 @@ _INTERNAL_TOOL_NAME_TOKENS: tuple[str, ...] = (
     "request_connection",
     "offer_demonstration",
     "read_google_sheet",
+    "create_google_sheet",
     "list_workflow_triggers",
     "test_trigger_mapping",
     "create_webhook_trigger",
@@ -285,26 +286,25 @@ def maybe_clear_blocker_signal_on_tool_success(ctx: _BlockerSignalCtx, succeeded
         ctx.blocker_signal = None
 
 
-def clear_blocker_signal_for_reason_codes(ctx: _BlockerSignalCtx, internal_reason_codes: frozenset[str]) -> None:
-    signal = getattr(ctx, "blocker_signal", None)
-    if isinstance(signal, EmberToolBlockerSignal) and signal.internal_reason_code in internal_reason_codes:
-        ctx.blocker_signal = None
-
-
-def clear_tool_blocker_signals_for_reason_codes(ctx: _BlockerSignalCtx, internal_reason_codes: frozenset[str]) -> None:
-    clear_blocker_signal_for_reason_codes(ctx, internal_reason_codes)
+def clear_tool_blocker_signals(ctx: _BlockerSignalCtx, matches: Callable[[EmberToolBlockerSignal], bool]) -> bool:
+    """Clear matching signals from the sticky, latest and history stores; True when the sticky one was cleared."""
     # getattr matches stash_blocker_signal's defensive read: real contexts type
-    # both fields, but partial test shims may omit them.
+    # these fields, but partial test shims may omit them.
+    signal = getattr(ctx, "blocker_signal", None)
+    sticky_cleared = isinstance(signal, EmberToolBlockerSignal) and matches(signal)
+    if sticky_cleared:
+        ctx.blocker_signal = None
     latest = getattr(ctx, "latest_tool_blocker_signal", None)
-    if isinstance(latest, EmberToolBlockerSignal) and latest.internal_reason_code in internal_reason_codes:
+    if isinstance(latest, EmberToolBlockerSignal) and matches(latest):
         ctx.latest_tool_blocker_signal = None
     history = getattr(ctx, "tool_blocker_signals", None)
     if isinstance(history, list):
-        history[:] = [
-            entry
-            for entry in history
-            if not (isinstance(entry, EmberToolBlockerSignal) and entry.internal_reason_code in internal_reason_codes)
-        ]
+        history[:] = [entry for entry in history if not (isinstance(entry, EmberToolBlockerSignal) and matches(entry))]
+    return sticky_cleared
+
+
+def clear_tool_blocker_signals_for_reason_codes(ctx: _BlockerSignalCtx, internal_reason_codes: frozenset[str]) -> None:
+    clear_tool_blocker_signals(ctx, lambda signal: signal.internal_reason_code in internal_reason_codes)
 
 
 def stash_blocker_signal(ctx: _BlockerSignalCtx, signal: EmberToolBlockerSignal) -> str:
