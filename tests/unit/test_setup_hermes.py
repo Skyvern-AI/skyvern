@@ -15,6 +15,8 @@ from skyvern.cli.setup_commands import (
 
 runner = CliRunner()
 
+pytestmark = pytest.mark.usefixtures("isolated_user_config_dir")
+
 
 @pytest.fixture()
 def hermes_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -175,20 +177,21 @@ def test_setup_hermes_dry_run_masks_secrets(hermes_home: Path) -> None:
     assert "****" in result.output
 
 
-def test_setup_hermes_idempotent_no_backup(hermes_home: Path) -> None:
+def test_setup_hermes_idempotent_no_backup(hermes_home: Path, isolated_user_config_dir: Path) -> None:
     """Running setup twice with same config produces no backup on second run."""
     # First run
     result1 = runner.invoke(setup_app, ["hermes", "--yes"])
     assert result1.exit_code == 0
 
     # Count backups
-    backups_before = list(hermes_home.rglob("*.bak"))
+    backup_dir = isolated_user_config_dir / "skyvern" / "mcp-backups"
+    backups_before = list(backup_dir.glob("config.yaml.bak-*"))
 
     # Second run with same key/url — should be a no-op (exit 0, no error)
     result2 = runner.invoke(setup_app, ["hermes", "--yes"])
     assert result2.exit_code == 0, result2.output
     assert "up to date" in result2.output
-    backups_after = list(hermes_home.rglob("*.bak"))
+    backups_after = list(backup_dir.glob("config.yaml.bak-*"))
 
     # No new backups created on second run
     assert len(backups_after) == len(backups_before)

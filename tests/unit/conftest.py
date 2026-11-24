@@ -1618,3 +1618,12 @@ def skycdp_engine_selection() -> BrowserEngineSelection:
 async def screenshot_stalls_until_its_own_timeout(*, timeout: float, **_kwargs: object) -> bytes:
     await asyncio.sleep(timeout / 1000)
     raise PlaywrightTimeoutError("waiting for fonts to load")
+
+
+@pytest.fixture
+def isolated_user_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the per-user config root (XDG_CONFIG_HOME) at a temp dir so CLI writes stay out of the real home."""
+    root = tmp_path / "user-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(root))
+    monkeypatch.delenv("APPDATA", raising=False)
+    return root

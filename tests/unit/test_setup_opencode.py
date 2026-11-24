@@ -13,6 +13,8 @@ from skyvern.cli.setup_commands import _mask_secrets, setup_app
 
 runner = CliRunner()
 
+pytestmark = pytest.mark.usefixtures("isolated_user_config_dir")
+
 
 def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))

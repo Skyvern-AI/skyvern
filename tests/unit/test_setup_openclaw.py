@@ -12,6 +12,8 @@ from skyvern.cli.setup_commands import _looks_like_json5_source, setup_app
 
 runner = CliRunner()
 
+pytestmark = pytest.mark.usefixtures("isolated_user_config_dir")
+
 
 def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -83,17 +85,18 @@ def test_setup_openclaw_case_insensitive_key(openclaw_home: Path) -> None:
     assert config["mcp"]["servers"]["Skyvern"]["headers"]["x-api-key"] == "test-key-1234567890"
 
 
-def test_setup_openclaw_idempotent_no_backup(openclaw_home: Path) -> None:
+def test_setup_openclaw_idempotent_no_backup(openclaw_home: Path, isolated_user_config_dir: Path) -> None:
     first = runner.invoke(setup_app, ["openclaw", "--yes"])
     assert first.exit_code == 0, first.output
 
-    backups_before = list(openclaw_home.glob("openclaw.json.bak-*"))
+    backup_dir = isolated_user_config_dir / "skyvern" / "mcp-backups"
+    backups_before = list(backup_dir.glob("openclaw.json.bak-*"))
 
     second = runner.invoke(setup_app, ["openclaw", "--yes"])
 
     assert second.exit_code == 0, second.output
     assert "Already configured for OpenClaw" in second.output
-    backups_after = list(openclaw_home.glob("openclaw.json.bak-*"))
+    backups_after = list(backup_dir.glob("openclaw.json.bak-*"))
     assert len(backups_after) == len(backups_before)
 
 
