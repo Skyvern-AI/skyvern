@@ -19,6 +19,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMResponseFormat,
     InvalidLLMResponseType,
     LLMOutputTruncatedError,
+    cause_type_name,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
@@ -281,8 +282,8 @@ def llm_prompt_log_metadata(prompt: str) -> dict[str, int]:
 def llm_error_log_metadata(error: BaseException) -> dict[str, str]:
     """Return content-free metadata suitable for logging an LLM call error."""
     metadata = exception_log_fields(error)
-    if error.__cause__ is not None:
-        metadata["cause_type"] = type(error.__cause__).__name__
+    if (cause_name := cause_type_name(error)) is not None:
+        metadata["cause_type"] = cause_name
     return metadata
 
 

@@ -353,7 +353,9 @@ async def _reauthorize_stream_periodically(
         attempt_started_at = time.monotonic()
         timeout = grace if failure_started_at is None else max(0.001, grace - (attempt_started_at - failure_started_at))
         try:
-            authorized = await asyncio.wait_for(reauthorize(), timeout=timeout)
+            # Not wait_for: on Python 3.11 it drops a cancel that lands as the check ends, so the loop never stops.
+            async with asyncio.timeout(timeout):
+                authorized = await reauthorize()
         except asyncio.CancelledError:
             raise
         except PermissionError:

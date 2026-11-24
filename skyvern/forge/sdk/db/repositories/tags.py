@@ -22,6 +22,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowTagEventModel,
 )
 from skyvern.forge.sdk.db.repositories.workflow_runs import _folder_access_filter
+from skyvern.forge.sdk.db.statement_timeout import apply_statement_timeout
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagEventType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.validators import (
     RUN_METADATA_MAX_KEYS,
@@ -819,12 +820,13 @@ class TagsRepository(BaseRepository):
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
-    @db_operation("get_run_tag_suggestions")
+    @db_operation("get_run_tag_suggestions", warn_on_statement_timeout=True)
     async def get_run_tag_suggestions(
         self,
         organization_id: str,
         limit: int = 1000,
         key_prefix: str | None = None,
+        statement_timeout_seconds: float | None = None,
     ) -> list[tuple[str | None, str | None]]:
         """Distinct (key, value) pairs from active run-tag SET events for the org,
         including reserved ``skyvern.*`` system keys (the registry-backed
@@ -834,6 +836,8 @@ class TagsRepository(BaseRepository):
         consume the whole ``limit`` and starve keys that sort after it. When
         ``key_prefix`` is provided, filtering happens before ranking and limiting."""
         async with self.Session() as session:
+            if statement_timeout_seconds is not None:
+                await apply_statement_timeout(session, statement_timeout_seconds)
             distinct_pairs_stmt = (
                 select(WorkflowRunTagEventModel.key, WorkflowRunTagEventModel.value)
                 .where(WorkflowRunTagEventModel.organization_id == organization_id)
