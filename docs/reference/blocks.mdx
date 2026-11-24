@@ -293,6 +293,8 @@ Parse PDFs, CSVs, Excel files, images, DOCX files, and ZIP archives.
 
 ZIP inputs are unzipped, and the block outputs the extracted file list as `file_name`, `file_path`, and `file_size`. Data Schema is ignored for ZIP inputs; loop over the file list and pass each `file_path` to another File Parser block to parse individual files.
 
+For a CSV, Skyvern picks the delimiter from comma, tab, semicolon, pipe and colon. When none of them fits, it uses comma, or tab for a `.tsv` file. A one-column file stays one column, and a space-separated file parses as one column. A UTF-8 byte order mark is dropped, so the first column's name is the header the file shows.
+
 Very large files can exceed the parser's time budget and fail the block. When a File Parser sits inside a loop, set **On block failure** (Advanced Settings) to *Skip to next iteration* so files that cannot be parsed are skipped and the rest of the list still runs.
 
 | Field | Type | Description |
@@ -576,6 +578,8 @@ error_code: PRECHECK_UNREACHABLE
 ### File Download
 
 Navigate the browser to download a file. The block can keep the file in Skyvern or send it to cloud storage, and it can read the file from an SFTP server instead of a website.
+
+When **URL** points straight at a file, the browser starts a download instead of loading a page. Skyvern fetches the file once, waits for it to finish saving, and completes the block. A download the browser cannot save fails the block.
 
 | Field | Type | Description |
 |-------|------|-------------|

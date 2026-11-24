@@ -27,7 +27,7 @@ Every integration with a **Connect**, **Configure** or **Set up →** button is 
 | Integration | Category | What it does | Button |
 |---|---|---|---|
 | Google Sheets | Workspace | Read and write sheets in your agents | **Connect** |
-| Google Drive | Workspace | Upload run files to Drive folders | **Connect** |
+| Google Drive | Workspace | Upload workflow files and downloaded files to Drive folders | **Connect** |
 | Gmail | Communication | Read emails, including verification codes, and send emails from your agents | **Connect** |
 | Outlook | Communication | Find verification codes and emails in your inbox | **Connect** |
 | 1Password | Credentials | Use logins from your 1Password vaults | **Configure** |
@@ -67,7 +67,7 @@ What each connection asks for, and where you use it:
 | Integration | Access requested | Where you use it |
 |---|---|---|
 | Google Sheets | Read and write spreadsheets, read Drive file metadata | **Google Sheets Read** and **Google Sheets Write** blocks |
-| Google Drive | Full Drive access | **Cloud Storage** block with storage type **Google Drive**; **File Download** block for Drive links |
+| Google Drive | Full Drive access | **Cloud Storage** block with storage type **Google Drive**; **File Download** block with **Download Target** set to **Google Drive**, and for Drive links |
 | Gmail | **Read inbox**: read-only mail. **Send email**: send mail as the account. | **Email Inbox** block and email-based 2FA on [credentials](/credentials) (read); **Send Email** block with **Send with** set to the account (send) |
 | Outlook | Read mail (`Mail.Read`) | **Email Inbox** block, and email-based 2FA on [credentials](/credentials) |
 
