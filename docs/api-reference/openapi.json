@@ -7346,6 +7346,20 @@
                     "type": "string"
                   },
                   "other_information": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "items": {},
+                        "type": "array"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "Extra applicant details as a JSON object or array, for example {\"location\": \"New York, NY\", \"salary_expectation\": \"120000\"}. Plain text is rejected.",
                     "title": "Other Information"
                   },
                   "terminate_criterion": {
@@ -7500,6 +7514,7 @@
                         "type": "null"
                       }
                     ],
+                    "description": "JSON text containing an object or array of extra applicant details, for example {\"location\": \"New York, NY\"}. Plain text is rejected.",
                     "title": "Other Information"
                   },
                   "terminate_criterion": {
