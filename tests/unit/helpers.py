@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from typing import Any, Iterator, Sequence
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from playwright.async_api import Error as PlaywrightError
 from pytest import MonkeyPatch  # type: ignore[import-not-found]
 
 from skyvern.exceptions import MissingBrowserStatePage, get_user_facing_exception_message
@@ -58,7 +57,8 @@ from skyvern.webeye.actions.actions import (
     InputTextAction,
     VerificationCodeAction,
 )
-from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
+from skyvern.webeye.string_util import remove_whitespace
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -776,6 +776,11 @@ _CLICK_ERROR = 'Locator.click: Timeout 5000ms exceeded.\nCall log:\nwaiting for 
 _TYPE_ERROR = f'elementHandle.type: Target closed\nCall log:\n  -   elementHandle.type("{ONE_TIME_CODE}")\n'
 
 
+def _stored_failure(message: str) -> ActionResult:
+    # A row stored before ActionFailure dropped the driver's call log still holds it, typed value and all.
+    return ActionResult(success=False, exception_type="Error", exception_message=remove_whitespace(message))
+
+
 def _step(step_id: str, order: int, output: dict[str, Any]) -> Step:
     created_at = datetime(2026, 9, 18, 12, 0, 0)
     return Step.model_validate(
@@ -810,11 +815,11 @@ def make_one_time_code_steps() -> list[Step]:
                 finished_at=entered_at,
                 status=ActionStatus.failed,
             ),
-            [ActionFailure(PlaywrightError(_FILL_ERROR))],
+            [_stored_failure(_FILL_ERROR)],
         ),
         (
             ClickAction(action_id="act_submit", element_id="submit", step_id="stp_test", action_order=2),
-            [ActionFailure(PlaywrightError(_CLICK_ERROR))],
+            [_stored_failure(_CLICK_ERROR)],
         ),
         (
             CompleteAction(
@@ -837,7 +842,7 @@ def make_one_time_code_steps() -> list[Step]:
                 reasoning=CLICK_REASONING,
                 intention=CLICK_REASONING,
             ),
-            [ActionFailure(PlaywrightError(_CLICK_ERROR))],
+            [_stored_failure(_CLICK_ERROR)],
         ),
     ]
     # Only the saved rows of these inputs carry a marker, so the step copy holds the plain code.
@@ -851,7 +856,7 @@ def make_one_time_code_steps() -> list[Step]:
                 step_id="stp_test",
                 action_order=order,
             ),
-            [ActionFailure(PlaywrightError(_FILL_ERROR))],
+            [_stored_failure(_FILL_ERROR)],
         )
         for action_id, order in (("act_otp_saved_only", 6), ("act_otp_untyped", 7))
     ]
@@ -861,8 +866,8 @@ def make_one_time_code_steps() -> list[Step]:
     legacy = AgentStepOutput(
         actions_and_results=[],
         action_results=[
-            ActionFailure(PlaywrightError(_FILL_ERROR)),
-            ActionFailure(PlaywrightError(_TYPE_ERROR)),
+            _stored_failure(_FILL_ERROR),
+            _stored_failure(_TYPE_ERROR),
             ActionSuccess(data={"failure_rate": "4.2%"}),
         ],
     )
