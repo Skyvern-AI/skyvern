@@ -219,7 +219,9 @@ export {
   POLL_OUTAGE_BUDGET_MS,
   RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS,
   RUN_STATUS_POLL_INTERVAL_MS,
+  fetchWorkflowRunById,
   useWorkflowRunByIdQuery,
   useWorkflowRunQueries,
   useWorkflowRunQuery,
+  workflowRunByIdQueryOptions,
 };

@@ -2,9 +2,15 @@
  * Download contents as a file
  * Source: https://stackoverflow.com/questions/14964035/how-to-export-javascript-array-info-to-csv-on-client-side
  */
-function downloadBlob(content: string, filename: string, contentType: string) {
+function downloadBlob(
+  content: string | BlobPart[],
+  filename: string,
+  contentType: string,
+) {
   // Create a blob
-  const blob = new Blob([content], { type: contentType });
+  const blob = new Blob(typeof content === "string" ? [content] : content, {
+    type: contentType,
+  });
   const url = URL.createObjectURL(blob);
 
   // Create a link to download it
