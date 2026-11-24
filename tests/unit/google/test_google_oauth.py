@@ -2787,7 +2787,9 @@ async def test_config_route_handlers_return_404_when_org_config_disabled(monkeyp
 @pytest.mark.asyncio
 async def test_authorize_route_forwards_credential_id_for_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
     start_mock = AsyncMock(
-        return_value=google_oauth_service.GoogleAuthorizationStart(authorize_url="https://auth", state="st")
+        return_value=google_oauth_service.GoogleAuthorizationStart(
+            authorize_url="https://auth", state="st", credential_id="goac_existing"
+        )
     )
     monkeypatch.setattr(google_oauth_routes.google_oauth_service, "start_authorization", start_mock)
 
@@ -2799,6 +2801,7 @@ async def test_authorize_route_forwards_credential_id_for_reconnect(monkeypatch:
     )
 
     assert response.authorize_url == "https://auth"
+    assert response.credential_id == "goac_existing"
     assert start_mock.await_args.kwargs["credential_id"] == "goac_existing"
     assert start_mock.await_args.kwargs["initiator_id"] == "user_1"
 
@@ -2830,7 +2833,9 @@ async def test_authorize_route_sends_a_new_gmail_connection_to_connected_gmail(
         **changes,
     }
     start_mock = AsyncMock(
-        return_value=google_oauth_service.GoogleAuthorizationStart(authorize_url="https://auth", state="st")
+        return_value=google_oauth_service.GoogleAuthorizationStart(
+            authorize_url="https://auth", state="st", credential_id="goac_existing"
+        )
     )
     monkeypatch.setattr(google_oauth_routes.google_oauth_service, "start_authorization", start_mock)
     monkeypatch.setattr(
@@ -3052,6 +3057,7 @@ async def test_start_authorization_persists_verifier_and_returns_url(monkeypatch
 
     assert result.authorize_url.startswith(google_oauth_service.GOOGLE_AUTHORIZE_ENDPOINT)
     assert result.state
+    assert result.credential_id == "goac_test"
     insert_mock.assert_awaited_once()
     insert_kwargs = insert_mock.await_args.kwargs
     assert insert_kwargs["organization_id"] == "org_1"
