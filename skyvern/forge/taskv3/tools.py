@@ -632,7 +632,7 @@ _POSITIONAL_NOTE_TIMEOUT_SECONDS = 1.0
 # checkbox are refused by a visibility pre-gate before anything raises (they reach the same diagnosis
 # through _unreachable_error); select_option on a custom listbox and select_combobox on a div anchor
 # return their own could-not-open error; but select_combobox on a TYPEABLE anchor (the searchable
-# autocomplete) takes the typeahead branch and raises the driver's call log verbatim, which is the
+# autocomplete) takes the typeahead branch and raises the driver's timeout to the loop, which is the
 # evidence chain this exists to break. press_key returns ok without failing on every shape tried.
 # file_upload is absent for a different reason: set_input_files drives a hidden <input type=file>,
 # which is how essentially every site ships one, so a hidden target is the normal case there.
@@ -842,8 +842,8 @@ def _with_selector_guard(handler: ToolHandler, diagnose_inert: InertTargetDiagno
                 return guarded
             # Diagnosed here rather than per tool because the act paths reach the driver the same
             # way: each waits for a target that is display:none until the timeout, then re-raises the
-            # driver's own call log ("resolved to <button ...>", "element is not visible") for the
-            # loop to hand the model verbatim.
+            # driver's own error, which the loop reduces to its first line and the driver's last
+            # reason ("element is not visible").
             acted_on = args.get("selector")
             if diagnose_inert is not None and isinstance(acted_on, str):
                 inert = await diagnose_inert(acted_on, exc)
