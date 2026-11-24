@@ -653,6 +653,7 @@ _DRAIN_KEPT_NATIVE_TOOLS = {
     "extend_browser_session",
     "fill_credential_field",
     "get_account_group_status",
+    "get_run_group_results",
     "get_organization_usage_quota",
     "get_run_results",
     "inspect_locator_matches",
