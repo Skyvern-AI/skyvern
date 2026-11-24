@@ -429,7 +429,7 @@ function InteractiveStreamView({
           src={imgDataUrl}
           data-frame-token={frameToken}
           onLoad={() => onFrameLoad?.(frameToken ?? 0)}
-          decoding="async"
+          decoding="sync"
           className={cn(
             "min-h-0 w-full flex-1 object-contain",
             currentUrl ? "rounded-b-md" : "rounded-md",
