@@ -4,10 +4,16 @@ import asyncio
 import errno
 import hashlib
 import io
+import json
 import os
+import random
 import shutil
 import subprocess
+import threading
+import time
 import zipfile
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +22,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import zstandard as zstd
+from aiobotocore.credentials import AioCredentialResolver
+from aiobotocore.response import StreamingBody
+from aiohttp import web
+from anyio import CancelScope, to_thread
+from botocore import UNSIGNED
 from freezegun import freeze_time
 from structlog.testing import capture_logs
 
@@ -23,7 +34,7 @@ import skyvern.forge.sdk.artifact.storage.base as base_module
 import skyvern.forge.sdk.artifact.storage.s3 as s3_module
 from skyvern.config import settings
 from skyvern.exceptions import DownloadSaveIncompleteError
-from skyvern.forge.sdk.api.aws import _STREAM_UPLOAD_IO_QUEUE_DEPTH, S3StorageClass, S3Uri
+from skyvern.forge.sdk.api.aws import _STREAM_UPLOAD_IO_QUEUE_DEPTH, AsyncAWSClient, S3StorageClass, S3Uri
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
@@ -39,6 +50,7 @@ from tests.unit.forge.sdk.artifact.storage.test_helpers import (
     create_fake_thought,
     create_fake_workflow_run_block,
 )
+from tests.unit.test_aws_client_ttl import _local_s3
 
 if TYPE_CHECKING:
     from types_boto3_s3.client import S3Client
@@ -74,6 +86,35 @@ def aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     """Mocked AWS Credentials for moto."""
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+
+
+@pytest.fixture(name="storage_bodies")
+def audit_storage_bodies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    observations = SimpleNamespace(reads=[], closes=0, by_content_range={})
+    real_read = StreamingBody.read
+
+    async def read(self: StreamingBody, amt: int | None = None) -> bytes:
+        chunk = await real_read(self, amt)
+        observations.reads.append((amt, len(chunk)))
+        content_range = self.__wrapped__.headers.get("Content-Range")
+        observations.by_content_range.setdefault(content_range, []).append(len(chunk))
+        return chunk
+
+    def close(self: StreamingBody) -> None:
+        observations.closes += 1
+        self.__wrapped__.close()
+
+    monkeypatch.setattr(StreamingBody, "read", read)
+    monkeypatch.setattr(StreamingBody, "close", close, raising=False)
+    return observations
+
+
+@pytest.fixture
+def no_s3_credential_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_lookup(self: AioCredentialResolver) -> None:
+        raise AssertionError("loopback storage must use its explicit fixture credentials")
+
+    monkeypatch.setattr(AioCredentialResolver, "load_credentials", fail_lookup)
 
 
 @freeze_time("2025-06-09T12:00:00")
@@ -1015,124 +1056,73 @@ class TestS3StorageZIPArchiveRetrieve:
             modified_at=datetime.utcnow(),
         )
 
-    async def test_retrieve_text_entry_from_step_archive(
-        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    @pytest.mark.parametrize(
+        ("archive_type", "bundle_key", "expected", "siblings", "zstd_wrapper"),
+        [
+            (
+                ArtifactType.STEP_ARCHIVE,
+                "scrape.html",
+                b"<html>hello world</html>",
+                {"element_tree.json": b"[]"},
+                False,
+            ),
+            (ArtifactType.STEP_ARCHIVE, "screenshot_llm_0.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 50, {}, False),
+            (
+                ArtifactType.TASK_ARCHIVE,
+                "browser_console.log",
+                b"[info] page loaded\n[error] fetch failed",
+                {"har.har": b'{"log":{}}'},
+                False,
+            ),
+            (ArtifactType.TASK_ARCHIVE, "legacy.html", b"<p>legacy</p>", {}, True),
+        ],
+        ids=["step-text", "step-png", "task-console", "legacy-zstd-wrapped-zip"],
+    )
+    async def test_retrieve_member_from_archive(
+        self,
+        s3_storage: S3Storage,
+        boto3_test_client: S3Client,
+        archive_type: ArtifactType,
+        bundle_key: str,
+        expected: bytes,
+        siblings: dict[str, bytes],
+        zstd_wrapper: bool,
     ) -> None:
-        """Retrieve a text artifact stored inside a STEP_ARCHIVE ZIP."""
         step = create_fake_step(TEST_STEP_ID)
-        bundle_key = "scrape.html"
-        expected = b"<html>hello world</html>"
-        zip_bytes = _build_zip({bundle_key: expected, "element_tree.json": b"[]"})
+        artifact = self._make_archive_artifact(s3_storage, step, archive_type, bundle_key)
+        encoded = _build_zip({bundle_key: expected, **siblings})
+        if zstd_wrapper:
+            artifact = artifact.model_copy(update={"uri": f"{artifact.uri}.zst"})
+        parent = artifact.model_copy(
+            update={"artifact_id": generate_artifact_id(), "artifact_type": archive_type, "bundle_key": None}
+        )
+        await s3_storage.store_artifact(parent, encoded)
 
+        assert await s3_storage.retrieve_artifact(artifact) == expected
+
+    @pytest.mark.parametrize(
+        ("bundle_key", "data"),
+        [
+            ("nonexistent.txt", _build_zip({"scrape.html": b"content"})),
+            ("scrape.html", b"this is not a zip file at all"),
+        ],
+        ids=["missing-member", "bad-zip"],
+    )
+    async def test_missing_or_corrupt_archive_member_returns_none(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, bundle_key: str, data: bytes
+    ) -> None:
+        step = create_fake_step(TEST_STEP_ID)
         artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, bundle_key)
-
-        # Upload the archive directly (simulating what _flush_step_archive does)
-        archive_artifact = Artifact(
-            artifact_id=generate_artifact_id(),
-            artifact_type=ArtifactType.STEP_ARCHIVE,
-            uri=artifact.uri,
-            organization_id=TEST_ORGANIZATION_ID,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            created_at=datetime.utcnow(),
-            modified_at=datetime.utcnow(),
+        parent = artifact.model_copy(
+            update={
+                "artifact_id": generate_artifact_id(),
+                "artifact_type": ArtifactType.STEP_ARCHIVE,
+                "bundle_key": None,
+            }
         )
-        await s3_storage.store_artifact(archive_artifact, zip_bytes)
+        await s3_storage.store_artifact(parent, data)
 
-        retrieved = await s3_storage.retrieve_artifact(artifact)
-        assert retrieved == expected
-
-    async def test_retrieve_screenshot_from_step_archive(
-        self, s3_storage: S3Storage, boto3_test_client: S3Client
-    ) -> None:
-        """Retrieve a PNG screenshot from a STEP_ARCHIVE ZIP."""
-        step = create_fake_step(TEST_STEP_ID)
-        bundle_key = "screenshot_llm_0.png"
-        fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
-        zip_bytes = _build_zip({bundle_key: fake_png})
-
-        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, bundle_key)
-        archive_artifact = Artifact(
-            artifact_id=generate_artifact_id(),
-            artifact_type=ArtifactType.STEP_ARCHIVE,
-            uri=artifact.uri,
-            organization_id=TEST_ORGANIZATION_ID,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            created_at=datetime.utcnow(),
-            modified_at=datetime.utcnow(),
-        )
-        await s3_storage.store_artifact(archive_artifact, zip_bytes)
-
-        retrieved = await s3_storage.retrieve_artifact(artifact)
-        assert retrieved == fake_png
-
-    async def test_retrieve_from_task_archive(self, s3_storage: S3Storage, boto3_test_client: S3Client) -> None:
-        """Retrieve a browser console log from a TASK_ARCHIVE ZIP."""
-        step = create_fake_step(TEST_STEP_ID)
-        bundle_key = "browser_console.log"
-        log_content = b"[info] page loaded\n[error] fetch failed"
-        zip_bytes = _build_zip({bundle_key: log_content, "har.har": b'{"log":{}}'})
-
-        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.TASK_ARCHIVE, bundle_key)
-        archive_artifact = Artifact(
-            artifact_id=generate_artifact_id(),
-            artifact_type=ArtifactType.TASK_ARCHIVE,
-            uri=artifact.uri,
-            organization_id=TEST_ORGANIZATION_ID,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            created_at=datetime.utcnow(),
-            modified_at=datetime.utcnow(),
-        )
-        await s3_storage.store_artifact(archive_artifact, zip_bytes)
-
-        retrieved = await s3_storage.retrieve_artifact(artifact)
-        assert retrieved == log_content
-
-    async def test_retrieve_missing_bundle_key_returns_none(
-        self, s3_storage: S3Storage, boto3_test_client: S3Client
-    ) -> None:
-        """bundle_key that doesn't exist inside the ZIP should return None."""
-        step = create_fake_step(TEST_STEP_ID)
-        zip_bytes = _build_zip({"scrape.html": b"content"})
-
-        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, "nonexistent.txt")
-        archive_artifact = Artifact(
-            artifact_id=generate_artifact_id(),
-            artifact_type=ArtifactType.STEP_ARCHIVE,
-            uri=artifact.uri,
-            organization_id=TEST_ORGANIZATION_ID,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            created_at=datetime.utcnow(),
-            modified_at=datetime.utcnow(),
-        )
-        await s3_storage.store_artifact(archive_artifact, zip_bytes)
-
-        result = await s3_storage.retrieve_artifact(artifact)
-        assert result is None
-
-    async def test_retrieve_corrupt_zip_returns_none(self, s3_storage: S3Storage, boto3_test_client: S3Client) -> None:
-        """A corrupt (non-ZIP) payload with a bundle_key should return None gracefully."""
-        step = create_fake_step(TEST_STEP_ID)
-        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, "scrape.html")
-
-        # Upload garbage bytes as the archive
-        archive_artifact = Artifact(
-            artifact_id=generate_artifact_id(),
-            artifact_type=ArtifactType.STEP_ARCHIVE,
-            uri=artifact.uri,
-            organization_id=TEST_ORGANIZATION_ID,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            created_at=datetime.utcnow(),
-            modified_at=datetime.utcnow(),
-        )
-        await s3_storage.store_artifact(archive_artifact, b"this is not a zip file at all")
-
-        result = await s3_storage.retrieve_artifact(artifact)
-        assert result is None
+        assert await s3_storage.retrieve_artifact(artifact) is None
 
     async def test_retrieve_without_bundle_key_returns_raw_bytes(
         self, s3_storage: S3Storage, boto3_test_client: S3Client
@@ -1185,6 +1175,528 @@ class TestS3StorageZIPArchiveRetrieve:
         )
         assert uri.endswith(".zip")
         assert not uri.endswith(".zst")
+
+
+_PNG_KEY = "stp_example_screenshot.png"
+_TEXT_KEY = "stp_example_scrape.txt"
+_SIBLING_KEYS = ("before.webm", "after.zip")
+_MIB = 1024 * 1024
+_PAUSED_PREFIX_BYTES = 64 * 1024
+
+
+@dataclass
+class _ArchiveFixture:
+    encoded: bytes
+    payloads: dict[str, tuple[int, int]]
+
+
+def _archive_fixture(sibling_size: int, *, variant: str = "ordinary") -> _ArchiveFixture:
+    if variant == "empty-object":
+        return _ArchiveFixture(b"", {})
+    png_size = {"stored-growth": 5 * _MIB + 37, "small": 20 * 1024 - 8, "tiny": 1024 - 8}.get(variant, 128 * 1024)
+    text = b"".join(f"tree node {i} at {i * 13}\n".encode() for i in range(12_000))
+    if variant == "deflated-growth":
+        rng = random.Random(21434)
+        text = b"".join(rng.randbytes(_MIB // 4) + b"\0" * (3 * _MIB // 4) for _ in range(16))
+    if variant in {"small", "tiny"}:
+        text = b"sample text"
+    entries = {
+        _SIBLING_KEYS[0]: b"x" * sibling_size,
+        _PNG_KEY: b"\x89PNG\r\n\x1a\n" + bytes(png_size),
+        _TEXT_KEY: text,
+        _SIBLING_KEYS[1]: b"y" * sibling_size,
+    }
+    if variant == "empty":
+        entries[_PNG_KEY] = b""
+    if variant == "replacement":
+        entries[_PNG_KEY] = entries[_PNG_KEY][:-1] + b"z"
+    raw = io.BytesIO()
+    payloads = {}
+    with zipfile.ZipFile(raw, "w") as archive:
+        if variant == "max-comment":
+            archive.comment = b"c" * 65535
+        for key, body in entries.items():
+            file = zipfile.ZipInfo(key)
+            file.file_size = len(body)
+            file.compress_type = zipfile.ZIP_DEFLATED if key == _TEXT_KEY else zipfile.ZIP_STORED
+            padded = variant == "padded" and key == _PNG_KEY
+            if padded:
+                file.extra = b"\xfe\xca" + (60_000).to_bytes(2, "little") + bytes(60_000)
+            with archive.open(file, "w", force_zip64=variant == "zip64" and key == _PNG_KEY) as writer:
+                start = raw.tell()
+                writer.write(body)
+            payloads[key] = start, start + file.compress_size
+            if padded:
+                file.extra = b""  # Only the local record retains the extra field.
+                raw.write(bytes(2 * _MIB))
+                archive.start_dir = raw.tell()
+        if variant == "duplicate":
+            with pytest.warns(UserWarning, match="Duplicate name"):
+                archive.writestr(_PNG_KEY, b"last directory entry")
+            payloads[_PNG_KEY] = raw.tell() - archive.getinfo(_PNG_KEY).compress_size, raw.tell()
+    return _ArchiveFixture(raw.getvalue(), payloads)
+
+
+@dataclass
+class _GetReceipt:
+    range_header: str | None
+    if_match: str | None
+    status: int
+    written: int
+
+
+class _ArchiveEndpoint:
+    etag = '"original"'
+
+    def __init__(
+        self, archive: _ArchiveFixture, mode: str = "normal", replacement: _ArchiveFixture | None = None
+    ) -> None:
+        self.archive = archive
+        self.mode = mode
+        self.replacement = replacement
+        self.head_count = 0
+        self.gets: list[_GetReceipt] = []
+        self.paused = asyncio.Event()
+        self.continue_prefix = asyncio.Event()
+        self.paused_range: str | None = None
+        self.finished = asyncio.Event()
+        self.release = asyncio.Event()
+        self.peer_closed = False
+
+    async def respond(self, request: web.Request) -> web.StreamResponse:
+        data = self.archive.encoded
+        assert "Authorization" not in request.headers
+        if request.method == "HEAD":
+            self.head_count += 1
+            return web.Response(headers={"Content-Length": str(len(data)), "ETag": self.etag})
+        assert request.method == "GET"
+
+        range_header = request.headers.get("Range")
+        if_match = request.headers.get("If-Match")
+        etag = self.etag
+        if self.replacement is not None and self.gets:
+            data = self.replacement.encoded
+            etag = '"replacement"'
+        if if_match is not None and if_match != etag:
+            return self._error(range_header, if_match, 412, "PreconditionFailed")
+        if self.mode == "not-found":
+            return self._error(range_header, if_match, 404, "NoSuchKey")
+        if self.mode == "unsatisfiable":
+            return self._error(range_header, if_match, 416, "InvalidRange")
+        if range_header is None:
+            self.gets.append(_GetReceipt(None, if_match, 200, len(data)))
+            return web.Response(body=data, headers={"ETag": etag})
+
+        start, end = map(int, range_header.removeprefix("bytes=").split("-"))
+        block = data[start : end + 1]
+        headers = {"Content-Range": f"bytes {start}-{end}/{len(data)}", "ETag": etag}
+        if self.mode == "wrong-range":
+            headers["Content-Range"] = f"bytes {start}-{end}/{len(data) + 1}"
+        if self.mode == "wrong-etag":
+            headers["ETag"] = '"wrong-etag"'
+        if self.mode == "wrong-length":
+            block = block[:-1]
+        pause = False
+        if self.mode == "pause":
+            payload_start, payload_end = self.archive.payloads[_PNG_KEY]
+            pause = max(start, payload_start) < min(end + 1, payload_end)
+        interrupted = self.mode in {"ignored-range", "truncated"} or pause
+        if not interrupted:
+            self.gets.append(_GetReceipt(range_header, if_match, 206, len(block)))
+            return web.Response(body=block, status=206, headers=headers)
+
+        status = 200 if self.mode == "ignored-range" else 206
+        if status == 200:
+            headers = {"ETag": etag}
+            block = data
+        response = web.StreamResponse(status=status, headers={**headers, "Content-Length": str(len(block))})
+        receipt = _GetReceipt(range_header, if_match, status, 0)
+        self.gets.append(receipt)
+        transport = request.transport
+        assert transport is not None
+        await response.prepare(request)
+        try:
+            initial = block[: (_PAUSED_PREFIX_BYTES // 2 if pause else min(4096, len(block) // 2))]
+            await response.write(initial)
+            receipt.written = len(initial)
+            if self.mode == "truncated":
+                transport.close()
+            else:
+                if pause:
+                    assert len(block) > _PAUSED_PREFIX_BYTES
+                    self.paused_range = headers["Content-Range"]
+                self.paused.set()
+                if pause:
+                    await self.continue_prefix.wait()
+                    await response.write(block[len(initial) : _PAUSED_PREFIX_BYTES])
+                    receipt.written = _PAUSED_PREFIX_BYTES
+                while not transport.is_closing() and not self.release.is_set():
+                    await asyncio.sleep(0.002)
+                self.peer_closed = transport.is_closing()
+                if not self.peer_closed:
+                    await response.write(block[receipt.written :])
+                    receipt.written = len(block)
+        except ConnectionResetError:
+            self.peer_closed = True
+        finally:
+            self.finished.set()
+        return response
+
+    def _error(self, range_header: str | None, if_match: str | None, status: int, code: str) -> web.Response:
+        body = f"<Error><Code>{code}</Code></Error>".encode()
+        self.gets.append(_GetReceipt(range_header, if_match, status, len(body)))
+        return web.Response(status=status, body=body, content_type="application/xml")
+
+
+def _unsigned_archive_storage(endpoint: str) -> S3Storage:
+    storage = S3Storage(bucket=TEST_BUCKET, endpoint_url=endpoint)
+    storage.async_client = AsyncAWSClient(
+        aws_access_key_id="fixture",
+        aws_secret_access_key="fixture",
+        region_name="us-east-1",
+        endpoint_url=endpoint,
+    )
+    storage.async_client.session.events.register_first("choose-signer.s3", lambda **_: UNSIGNED)
+    return storage
+
+
+def _bundle_artifact(key: str, *, filename: str = "archive.zip") -> Artifact:
+    now = datetime.now(UTC)
+    return Artifact(
+        artifact_id="a_bundle",
+        artifact_type=ArtifactType.HTML_SCRAPE,
+        uri=f"s3://{TEST_BUCKET}/{filename}",
+        organization_id=TEST_ORGANIZATION_ID,
+        created_at=now,
+        modified_at=now,
+        bundle_key=key,
+    )
+
+
+def _assert_released(storage: S3Storage, observed_bodies: int, expected_bodies: int) -> None:
+    assert observed_bodies == expected_bodies
+    clients = storage.async_client._shared_s3_clients
+    assert clients and all(client.leases == 0 for client in clients.values())
+
+
+def _archive_wire_receipt(
+    endpoint: _ArchiveEndpoint,
+    storage_bodies: SimpleNamespace,
+    **result: object,
+) -> str:
+    return json.dumps(
+        {
+            "archive_bytes": len(endpoint.archive.encoded),
+            "head_count": endpoint.head_count,
+            "gets": [asdict(get) for get in endpoint.gets],
+            "get_count": len(endpoint.gets),
+            "server_body_bytes": sum(get.written for get in endpoint.gets),
+            "client_body_bytes": sum(size for _, size in storage_bodies.reads),
+            "bodies_closed": storage_bodies.closes,
+            **result,
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "variant"),
+    [
+        pytest.param(_PNG_KEY, "small", id="ordinary-small"),
+        pytest.param(_PNG_KEY, "tiny", id="tiny-archive"),
+        pytest.param(_PNG_KEY, "stored-growth", id="stored-growth"),
+        pytest.param(_TEXT_KEY, "deflated-growth", id="deflated-growth"),
+        pytest.param(_PNG_KEY, "padded", id="padded-local-extra"),
+        pytest.param(_PNG_KEY, "zip64", id="zip64-member"),
+        pytest.param(_PNG_KEY, "zip64-directory", id="zip64-directory"),
+        pytest.param(_PNG_KEY, "max-comment", id="max-comment"),
+        pytest.param(_PNG_KEY, "duplicate", id="last-duplicate"),
+        pytest.param(_PNG_KEY, "empty", id="empty-member"),
+        pytest.param(_PNG_KEY, "empty-object", id="empty-object"),
+    ],
+)
+async def test_bundled_member_reads_use_bounded_s3_ranges(
+    key: str,
+    variant: str,
+    monkeypatch: pytest.MonkeyPatch,
+    storage_bodies: SimpleNamespace,
+    no_s3_credential_chain: None,
+    record_property: Callable[[str, object], None],
+) -> None:
+    sizes = (
+        (8 * _MIB, 16 * _MIB)
+        if variant.endswith("-growth")
+        else ({"small": 80 * 1024, "tiny": 2048, "empty-object": 0}.get(variant, 128 * 1024),)
+    )
+    consumption = []
+    for size in sizes:
+        with monkeypatch.context() as fixture_writer:
+            if variant == "zip64-directory":
+                fixture_writer.setattr(zipfile, "ZIP64_LIMIT", 65536)
+            archive = _archive_fixture(size, variant=variant)
+        if variant == "zip64-directory":
+            assert b"PK\x06\x06" in archive.encoded[-128:]
+        endpoint = _ArchiveEndpoint(archive)
+        expected, info = b"", None
+        request_budget = {"empty-object": 1, "tiny": 2, "max-comment": 6}.get(variant, 3)
+        if archive.encoded:
+            with zipfile.ZipFile(io.BytesIO(archive.encoded)) as local:
+                expected, info = local.read(key), local.getinfo(key)
+            if variant.endswith("-growth"):
+                physical_bytes = archive.payloads[key][1] - info.header_offset
+                request_budget = 2 + (physical_bytes + _MIB - 1) // _MIB  # HEAD, tail and compressed blocks.
+            if variant == "deflated-growth":
+                assert info.compress_size > _MIB and info.file_size > 3 * info.compress_size
+        before_reads = len(storage_bodies.reads)
+        before_closed = storage_bodies.closes
+        async with _local_s3(respond=endpoint.respond) as (url, seen):
+            storage = _unsigned_archive_storage(url)
+            received = await storage.retrieve_artifact(_bundle_artifact(key))
+            _assert_released(storage, storage_bodies.closes - before_closed, len(endpoint.gets))
+            assert all(not authorization for _, authorization, _ in seen)
+
+        expected_sha = hashlib.sha256(expected).hexdigest()
+        assert received is not None and hashlib.sha256(received).hexdigest() == expected_sha
+        assert endpoint.head_count <= 1 and endpoint.head_count + len(endpoint.gets) <= request_budget
+        wire_bytes = sum(get.written for get in endpoint.gets)
+        assert wire_bytes == sum(count for _, count in storage_bodies.reads[before_reads:])
+        if variant == "tiny":
+            assert 0 < wire_bytes == len(archive.encoded) <= 8192
+        elif variant == "empty-object":
+            assert not endpoint.gets
+        else:
+            assert 0 < wire_bytes < len(archive.encoded)
+        spans = []
+        for get in endpoint.gets:
+            assert get.range_header and get.if_match == endpoint.etag and get.status == 206
+            lo, hi = map(int, get.range_header.removeprefix("bytes=").split("-"))
+            assert 0 <= lo <= hi < len(archive.encoded)
+            assert get.written == hi - lo + 1 <= _MIB
+            spans.append((lo, hi + 1))
+        sibling_overlap = 0
+        for name, (start, end) in archive.payloads.items():
+            if name != key:
+                for lo, hi in spans:
+                    overlap_start, overlap_end = max(lo, start), min(hi, end)
+                    if overlap_start < overlap_end:
+                        assert overlap_start >= len(archive.encoded) - 8192
+                        sibling_overlap += overlap_end - overlap_start
+        if variant == "padded":
+            assert info is not None and not info.extra
+            start, end = archive.payloads[key]
+            assert start - info.header_offset > 60_000
+            ceiling = info.header_offset + info.compress_size + 131_100
+            assert all(hi <= ceiling or lo >= end + 2 * _MIB for lo, hi in spans)
+        consumption.append((wire_bytes, len(endpoint.gets), expected_sha, sibling_overlap))
+        record_property(
+            f"wire_{size}",
+            _archive_wire_receipt(
+                endpoint,
+                SimpleNamespace(
+                    reads=storage_bodies.reads[before_reads:], closes=storage_bodies.closes - before_closed
+                ),
+                member=key,
+                member_bytes=len(expected),
+                member_sha256=expected_sha,
+                compression=info.compress_type if info is not None else None,
+                compressed_bytes=info.compress_size if info is not None else 0,
+                sibling_payload_bytes=size,
+                sibling_overlap_bytes=sibling_overlap,
+                request_budget=request_budget,
+            ),
+        )
+    assert len(set(consumption)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "wire_status"),
+    [
+        ("ignored-range", 200),
+        ("wrong-range", 206),
+        ("wrong-etag", 206),
+        ("wrong-length", 206),
+        ("truncated", 206),
+        ("not-found", 404),
+        ("unsatisfiable", 416),
+        ("replace", 412),
+        ("missing-member", 206),
+        ("bad-crc", 206),
+    ],
+)
+async def test_bundled_member_errors_preserve_unavailable_result(
+    case: str,
+    wire_status: int,
+    storage_bodies: SimpleNamespace,
+    no_s3_credential_chain: None,
+    record_property: Callable[[str, object], None],
+) -> None:
+    archive = _archive_fixture(128 * 1024)
+    if case == "bad-crc":
+        altered = bytearray(archive.encoded)
+        altered[archive.payloads[_PNG_KEY][0] + 17] ^= 1
+        archive.encoded = bytes(altered)
+    replacement = _archive_fixture(128 * 1024, variant="replacement") if case == "replace" else None
+    if replacement is not None:
+        assert len(replacement.encoded) == len(archive.encoded) and replacement.encoded != archive.encoded
+    endpoint = _ArchiveEndpoint(archive, case, replacement=replacement)
+    artifact = _bundle_artifact("missing.txt" if case == "missing-member" else _PNG_KEY)
+    async with _local_s3(respond=endpoint.respond) as (url, _):
+        storage = _unsigned_archive_storage(url)
+        try:
+            async with asyncio.timeout(5):
+                assert await storage.retrieve_artifact(artifact) is None
+                if case == "ignored-range":
+                    await endpoint.finished.wait()
+                    assert endpoint.peer_closed
+        finally:
+            endpoint.release.set()
+        _assert_released(storage, storage_bodies.closes, sum(get.status in {200, 206} for get in endpoint.gets))
+
+    assert endpoint.head_count <= 1 and endpoint.head_count + len(endpoint.gets) <= 3
+    assert endpoint.gets[-1].status == wire_status
+    assert all(get.range_header and get.if_match == endpoint.etag for get in endpoint.gets)
+    if case in {"ignored-range", "wrong-range", "wrong-length", "wrong-etag"}:
+        assert not storage_bodies.reads
+    if case == "replace":
+        assert [get.status for get in endpoint.gets] == [206, 412]
+    record_property("wire", _archive_wire_receipt(endpoint, storage_bodies, case=case))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_kind", ["asyncio", "anyio-level", "queued", "isolation"])
+async def test_bundled_member_cancel_drains_reader_and_releases_body(
+    cancel_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+    storage_bodies: SimpleNamespace,
+    no_s3_credential_chain: None,
+    record_property: Callable[[str, object], None],
+) -> None:
+    archive = _archive_fixture(128 * 1024)
+    endpoint = _ArchiveEndpoint(archive, "pause")
+    extraction_closed = threading.Event()
+    host_thread = threading.get_ident()
+
+    class ObservedZipFile(zipfile.ZipFile):
+        def close(self) -> None:
+            was_open = self.fp is not None
+            super().close()
+            if was_open:
+                assert threading.get_ident() != host_thread
+                extraction_closed.set()
+
+    monkeypatch.setattr(s3_module.zipfile, "ZipFile", ObservedZipFile)
+    limiter = s3_module._archive_thread_limiter()
+    assert limiter.total_tokens == 40
+    monkeypatch.setattr(limiter, "total_tokens", 1)
+    if cancel_kind == "isolation":
+        monkeypatch.setattr(to_thread.current_default_thread_limiter(), "total_tokens", 1)
+    async with _local_s3(respond=endpoint.respond) as (url, _):
+        storage = _unsigned_archive_storage(url)
+        artifact = _bundle_artifact(_PNG_KEY)
+        if cancel_kind == "queued":
+            queued = asyncio.create_task(storage.retrieve_artifact(artifact))
+            try:
+                async with limiter:
+                    async with asyncio.timeout(5):
+                        while limiter.statistics().tasks_waiting == 0 and not queued.done():
+                            await asyncio.sleep(0.001)
+                    assert not queued.done()
+                    queued.cancel()
+                    done, _ = await asyncio.wait({queued}, timeout=1)
+                    assert queued in done, "queued cancellation did not finish with the archive limiter held"
+                    with pytest.raises(asyncio.CancelledError):
+                        await queued
+            finally:
+                endpoint.continue_prefix.set()
+                endpoint.release.set()
+                if not queued.done():
+                    queued.cancel()
+                await asyncio.gather(queued, return_exceptions=True)
+            assert not endpoint.gets and endpoint.head_count <= 1
+            assert not extraction_closed.is_set()
+            assert limiter.borrowed_tokens == limiter.statistics().tasks_waiting == 0
+            _assert_released(storage, storage_bodies.closes, 0)
+            record_property("wire", _archive_wire_receipt(endpoint, storage_bodies, cancelled_while_queued=True))
+            return
+
+        scope = CancelScope()
+
+        async def scoped_read() -> None:
+            with scope:
+                await storage.retrieve_artifact(artifact)
+            assert scope.cancelled_caught
+
+        task = asyncio.create_task(
+            scoped_read() if cancel_kind == "anyio-level" else storage.retrieve_artifact(artifact)
+        )
+        unrelated = None
+        try:
+            async with asyncio.timeout(5):
+                await endpoint.paused.wait()
+                content_range = endpoint.paused_range
+                assert content_range is not None
+                for prefix in (_PAUSED_PREFIX_BYTES // 2, _PAUSED_PREFIX_BYTES):
+                    while sum(storage_bodies.by_content_range.get(content_range, ())) < prefix:
+                        await asyncio.sleep(0.001)
+                    endpoint.continue_prefix.set()
+            chunks = storage_bodies.by_content_range[content_range]
+            assert sum(chunks) == _PAUSED_PREFIX_BYTES and len(chunks) >= 2
+            if cancel_kind == "isolation":
+                unrelated = asyncio.create_task(to_thread.run_sync(threading.get_ident))
+                done, _ = await asyncio.wait({unrelated}, timeout=1)
+                assert unrelated in done, "unrelated sync work blocked behind the paused archive read"
+                assert await unrelated != host_thread
+            assert limiter.borrowed_tokens == 1
+            ticker = []
+            for _ in range(5):
+                await asyncio.sleep(0.002)
+                assert not task.done()
+                ticker.append(time.monotonic())
+            cancelled = time.monotonic()
+            if cancel_kind == "anyio-level":
+                scope.cancel()
+            else:
+                task.cancel()
+                await asyncio.sleep(0)
+                task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=1)
+            assert task in done, "active cancellation did not finish while the payload was paused"
+            if cancel_kind == "anyio-level":
+                await task
+            else:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            cancel_to_join_ms = (time.monotonic() - cancelled) * 1000
+            assert extraction_closed.is_set() and limiter.borrowed_tokens == 0
+            _assert_released(storage, storage_bodies.closes, len(endpoint.gets))
+            async with asyncio.timeout(2):
+                await endpoint.finished.wait()
+        finally:
+            endpoint.continue_prefix.set()
+            endpoint.release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            if unrelated is not None:
+                await asyncio.gather(unrelated, return_exceptions=True)
+
+    assert endpoint.peer_closed
+    assert endpoint.gets[-1].written == _PAUSED_PREFIX_BYTES
+    record_property(
+        "wire",
+        _archive_wire_receipt(
+            endpoint,
+            storage_bodies,
+            ticker_count=len(ticker),
+            ticker_observed_ms=(ticker[-1] - ticker[0]) * 1000,
+            cancel_to_join_ms=cancel_to_join_ms,
+            paused_body_chunk_sizes=chunks,
+            peer_closed=endpoint.peer_closed,
+            parser_closed=extraction_closed.is_set(),
+            unrelated_sync_completed=unrelated is not None,
+        ),
+    )
 
 
 @pytest.mark.asyncio
