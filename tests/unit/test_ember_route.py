@@ -9268,15 +9268,32 @@ async def test_test_end_to_end_route_hands_the_proposal_bound_account_to_the_age
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("canonical_change", ["description", "extra_http_headers"])
+@pytest.mark.parametrize(
+    ("canonical_change", "named_proposal", "auth_kind", "approved"),
+    [
+        ("description", ("turn-original", 1), AuthKind.bearer, False),
+        ("extra_http_headers", ("turn-original", 1), AuthKind.bearer, False),
+        (None, ("turn-original", 1), AuthKind.bearer, True),
+        (None, ("turn-original", 2), AuthKind.bearer, False),
+        (None, ("turn-other", 1), AuthKind.bearer, False),
+        (None, (None, None), AuthKind.bearer, False),
+        # A key caller (MCP's Test) never approves, even naming the stored proposal.
+        (None, ("turn-original", 1), AuthKind.member_api_key, False),
+    ],
+)
 async def test_test_end_to_end_route_rejects_a_stale_pending_proposal(
     monkeypatch: pytest.MonkeyPatch,
     api_key_request: MagicMock,
     ember_stream: MagicMock,
     organization: SimpleNamespace,
-    canonical_change: str,
+    canonical_change: str | None,
+    named_proposal: tuple[str | None, int | None],
+    auth_kind: AuthKind,
+    approved: bool,
 ) -> None:
     captured = install_fake_create(monkeypatch)
+    clicker = RequestPrincipal("org-1", auth_kind, "user_clicker", "org:member")
+    monkeypatch.setattr(ember_route, "get_request_principal", lambda: clicker)
     canonical = _make_ember_workflow("Original", _NOW)
     canonical.extra_http_headers = {"X-Test": "a"}
     proposal = {
@@ -9292,7 +9309,7 @@ async def test_test_end_to_end_route_rejects_a_stale_pending_proposal(
     }
     if canonical_change == "description":
         canonical.description = "Changed after the proposal"
-    else:
+    elif canonical_change == "extra_http_headers":
         canonical.extra_http_headers = {"X-Test": "b"}
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -9303,7 +9320,13 @@ async def test_test_end_to_end_route_rejects_a_stale_pending_proposal(
     )
     result = AgentResult(user_response="done", updated_workflow=None, global_llm_context=None)
     setup_new_ember_mocks(monkeypatch, chat, canonical, result)
-    agent = AsyncMock(return_value=result)
+    dispatched: list[EmberChatRequest] = []
+
+    async def run_agent(**kwargs: Any) -> AgentResult:
+        dispatched.append(kwargs["chat_request"])
+        return result
+
+    agent = AsyncMock(side_effect=run_agent)
     monkeypatch.setattr(ember_route, "run_ember_agent", agent)
     classify_error = MagicMock(wraps=ember_route._http_exception_failure_kind)
     monkeypatch.setattr(ember_route, "_http_exception_failure_kind", classify_error)
@@ -9312,10 +9335,17 @@ async def test_test_end_to_end_route_rejects_a_stale_pending_proposal(
         "title: Client canvas\nworkflow_definition:\n  parameters: []\n  blocks:\n"
         "    - block_type: wait\n      label: client_unreviewed\n      wait_sec: 1\n"
     )
+    request.test_proposal_owner_turn_id, request.test_proposal_revision = named_proposal
+    # The approval flag is the server's; a client that sends it gets it only by naming the stored proposal.
+    request.test_click_approved = True
 
     await ember_chat_post(api_key_request, request, organization)
     await captured["handler"](ember_stream)
 
+    if canonical_change is None:
+        # A Test that names a stale or missing proposal still runs; it just carries no approval.
+        assert [request.test_click_approved for request in dispatched] == [approved]
+        return
     agent.assert_not_awaited()
     assert classify_error.call_args.args[0].status_code == 400
     errors = [
