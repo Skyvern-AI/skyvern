@@ -26,6 +26,8 @@ from typing import Any, Awaitable, Callable, Collection
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from structlog.testing import capture_logs
 
 import skyvern.webeye.action_deadline as action_deadline_module
@@ -10287,9 +10289,11 @@ async def test_disabling_the_stall_guard_silences_its_measurement_streams_too() 
 async def test_model_hidden_secret_values_are_scrubbed_from_the_tool_message_the_model_sees() -> None:
     """A model-hidden value (a magic sign-in link URL and its bare token) must never reach the
     LLM's view of a tool result — including a tool_error raised by a handler — while a
-    registered-but-not-hidden secret (a TOTP code) still passes through untouched."""
+    registered-but-not-hidden secret (a TOTP code) still passes through untouched. A raised error's driver call log
+    never reaches the model either: only the driver's last reason, as fixed wording from a closed list, does."""
     hidden_url = "https://example.test/magic?token=synthetictoken0123"
     hidden_token = "synthetictoken0123"
+    hidden_two_line = "splitsecrethead\nsplitsecrettail"
     visible_code = "123456"
 
     async def clean_handler(_args: dict[str, Any]) -> ToolResult:
@@ -10298,23 +10302,112 @@ async def test_model_hidden_secret_values_are_scrubbed_from_the_tool_message_the
     async def linky_handler(_args: dict[str, Any]) -> ToolResult:
         return ToolResult.ok(f"now at {hidden_url} code {visible_code}")
 
-    async def boom_handler(_args: dict[str, Any]) -> ToolResult:
-        raise ValueError(f"failed at {hidden_url}")
+    # The first line ends inside hidden_two_line, so cutting before scrubbing would leave its first half behind.
+    click_log = (
+        f"Locator.click: Timeout 15000ms exceeded at {hidden_url} {hidden_two_line}\n"
+        '    1) <button onclick="x">Go</button>\n\nCall log:\n'
+        '  - waiting for locator("#go")\n'
+        '    - locator resolved to <button id="go">Go</button>\n'
+        "  - attempting click action\n"
+        "    - element is outside of the viewport\n"
+        "  2 × retrying click action\n"
+        '      - <div style="position:fixed">blocking overlay</div> intercepts pointer events\n'
+        "      - waiting 500ms"
+    )
+    raised = {
+        "boom": ValueError(f"failed at {hidden_url}\nsecond line {hidden_two_line}"),
+        "long": RuntimeError("y" * 1200),
+        "covered": PlaywrightTimeoutError(click_log),
+        "in_flight": PlaywrightTimeoutError(f"{click_log}\n    - performing click action"),
+        "landed": PlaywrightTimeoutError(
+            f"{click_log}\n    - performing click action\n    - click action done\n"
+            "    - waiting for scheduled navigations to finish"
+        ),
+        "drag_pressing": PlaywrightTimeoutError(
+            "Locator.drag_to: Timeout 2000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#src")\n'
+            "  - attempting move and down action\n"
+            "    - element is not stable\n"
+            "  - retrying move and down action\n"
+            "    - performing move and down action"
+        ),
+        "drag_half_done": PlaywrightTimeoutError(
+            "Locator.drag_to: Timeout 2000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#src")\n'
+            "  - attempting move and down action\n"
+            "    - performing move and down action\n"
+            "    - move and down action done\n"
+            "    - waiting for scheduled navigations to finish\n"
+            "    - navigations have finished\n"
+            '  - waiting for locator("#dst")'
+        ),
+        "missing_option": PlaywrightTimeoutError(
+            "Page.select_option: Timeout 15000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#s")\n'
+            "  - attempting select option action\n"
+            "    2 × waiting for element to be visible and enabled\n"
+            "      - did not find some options\n"
+            "    - retrying select option action\n"
+            "      - waiting 20ms"
+        ),
+        "typed_echo": PlaywrightTimeoutError(
+            "Locator.fill: Timeout 15000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#n")\n'
+            '    - fill("abc intercepts pointer events\n- element is not visible\n  click action done\nz")\n'
+            "  - attempting fill action\n"
+            "    - waiting for element to be visible, enabled and editable"
+        ),
+        "press_hung": PlaywrightTimeoutError(
+            "Page.press: Timeout 2000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#q")\n'
+            '    - locator resolved to <input id="q">\n'
+            '  - elementHandle.press("Enter")'
+        ),
+        "type_hung": PlaywrightTimeoutError(
+            "Page.type: Timeout 2000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#q")\n'
+            '    - locator resolved to <input id="q">\n'
+            '  - elementHandle.type("hello")'
+        ),
+        "unknown_key": PlaywrightError(
+            'Page.press: Unknown key: "cmd"\nCall log:\n'
+            '  - waiting for locator("#q")\n'
+            '    - locator resolved to <input id="q">\n'
+            '  - elementHandle.press("cmd+a")'
+        ),
+        "crashed_after_click": PlaywrightError(
+            "Page.click: Target crashed\nCall log:\n"
+            '  - waiting for locator("#go")\n'
+            "    - performing click action\n"
+            "    - click action done\n"
+            "    - waiting for scheduled navigations to finish"
+        ),
+    }
+
+    def raiser(exc: Exception) -> Callable[[dict[str, Any]], Awaitable[ToolResult]]:
+        async def handler(_args: dict[str, Any]) -> ToolResult:
+            raise exc
+
+        return handler
 
     tools = [
         ToolSpec(name="clean", description="c", parameters={"type": "object", "properties": {}}, handler=clean_handler),
         ToolSpec(name="linky", description="l", parameters={"type": "object", "properties": {}}, handler=linky_handler),
-        ToolSpec(name="boom", description="b", parameters={"type": "object", "properties": {}}, handler=boom_handler),
+        *(
+            ToolSpec(name=name, description="b", parameters={"type": "object", "properties": {}}, handler=raiser(exc))
+            for name, exc in raised.items()
+        ),
         make_finish_tool(),
     ]
     script = [
-        [("clean", {}), ("linky", {}), ("boom", {})],
+        [("clean", {}), ("linky", {}), *((name, {}) for name in raised)],
         [("finish", {"status": "completed", "reason": "done"})],
     ]
 
     ctx = SkyvernContext(task_id="tsk_hidden_link")
     ctx.register_secret_value(hidden_url, hide_from_model=True)
     ctx.register_secret_value(hidden_token, hide_from_model=True)
+    ctx.register_secret_value(hidden_two_line, hide_from_model=True)
     ctx.register_secret_value(visible_code)
     skyvern_context.set(ctx)
     try:
@@ -10326,10 +10419,36 @@ async def test_model_hidden_secret_values_are_scrubbed_from_the_tool_message_the
     tool_messages = {m["name"]: m["content"] for m in caller.message_history if m.get("role") == "tool"}
     assert tool_messages["clean"] == "nothing sensitive here"
     assert tool_messages["linky"] == f"now at [withheld: sign-in link] code {visible_code}"
-    assert tool_messages["boom"] == "tool_error: ValueError: failed at [withheld: sign-in link]"
+    click_head = (
+        "tool_error: TimeoutError: Locator.click: Timeout 15000ms exceeded at [withheld: sign-in link] "
+        "[withheld: sign-in link] The driver last reported:"
+    )
+    assert {name: tool_messages[name] for name in raised} == {
+        "boom": "tool_error: ValueError: failed at [withheld: sign-in link]\nsecond line [withheld: sign-in link]",
+        "long": "tool_error: RuntimeError: " + "y" * 1000,
+        "covered": f"{click_head} another element intercepts pointer events.",
+        "in_flight": (
+            f"{click_head} the driver had started the action when the timeout came, so it may have gone through."
+        ),
+        "landed": f"{click_head} the action was performed, and the timeout came after it.",
+        "drag_pressing": "tool_error: TimeoutError: Locator.drag_to: Timeout 2000ms exceeded.",
+        "drag_half_done": "tool_error: TimeoutError: Locator.drag_to: Timeout 2000ms exceeded.",
+        "missing_option": (
+            "tool_error: TimeoutError: Page.select_option: Timeout 15000ms exceeded. "
+            "The driver last reported: did not find some options."
+        ),
+        "typed_echo": "tool_error: TimeoutError: Locator.fill: Timeout 15000ms exceeded.",
+        "press_hung": (
+            "tool_error: TimeoutError: Page.press: Timeout 2000ms exceeded. The driver last reported: "
+            "the driver had started the action when the timeout came, so it may have gone through."
+        ),
+        "type_hung": "tool_error: TimeoutError: Page.type: Timeout 2000ms exceeded.",
+        "unknown_key": 'tool_error: Error: Page.press: Unknown key: "cmd"',
+        "crashed_after_click": "tool_error: Error: Page.click: Target crashed",
+    }
 
-    assert ctx.runtime_secret_values == {hidden_url, hidden_token, visible_code}
-    assert ctx.model_hidden_values == {hidden_url, hidden_token}
+    assert ctx.runtime_secret_values == {hidden_url, hidden_token, hidden_two_line, visible_code}
+    assert ctx.model_hidden_values == {hidden_url, hidden_token, hidden_two_line}
 
 
 @pytest.mark.asyncio
