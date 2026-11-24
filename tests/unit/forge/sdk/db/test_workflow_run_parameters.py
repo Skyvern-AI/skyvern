@@ -189,20 +189,24 @@ async def test_strict_otp_marker_persists_on_root_and_task_owners(
 
             task_select_error: OperationalError | None = None
             try:
-                with scratch_database.connect() as independent_reader:
-                    independent_reader.exec_driver_sql("SET statement_timeout = '2s'")
-                    assert independent_reader.exec_driver_sql("SELECT count(*) FROM tasks").scalar_one() == 0
-            except OperationalError as exc:
-                task_select_error = exc
+                try:
+                    with scratch_database.connect() as independent_reader:
+                        independent_reader.exec_driver_sql("SET statement_timeout = '2s'")
+                        assert independent_reader.exec_driver_sql("SELECT count(*) FROM tasks").scalar_one() == 0
+                except OperationalError as exc:
+                    task_select_error = exc
+                # The blocker outlives the revision's own 5 s lock_timeout, so the wait must end in a lock timeout.
+                with pytest.raises(OperationalError, match="lock timeout"):
+                    migration_future.result(timeout=10)
             finally:
                 blocker_transaction.rollback()
-            migration_future.result(timeout=5)
             assert task_select_error is None, "revision held the tasks ALTER lock while waiting on a foreign key"
     finally:
         if blocker_transaction.is_active:
             blocker_transaction.rollback()
         blocker.close()
 
+    run_migration(schema_path)
     run_migration(hot_path)
     assert 'ALTER TABLE "workflow_runs" ADD COLUMN IF NOT EXISTS otp_request_id VARCHAR' in hot_revision
     assert 'ALTER TABLE "workflow_runs" DROP COLUMN IF EXISTS otp_request_id' in hot_revision

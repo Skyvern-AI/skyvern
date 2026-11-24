@@ -45,7 +45,11 @@ from skyvern.exceptions import PDFParsingError
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.forge_app_initializer import start_forge_app
-from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat, LLMProviderErrorRetryableTask
+from skyvern.forge.sdk.api.llm.exceptions import (
+    InvalidLLMResponseFormat,
+    LLMProviderErrorRetryableTask,
+    withhold_provider_text,
+)
 from skyvern.forge.sdk.utils.capped_subprocess import MEMORY_CAP_ENFORCED, CappedSubprocessError
 from skyvern.forge.sdk.utils.capped_subprocess_child import MIN_MEMORY_BUDGET_BYTES
 from skyvern.forge.sdk.utils.pdf_parser import (
@@ -1024,7 +1028,7 @@ class TestOcrPdfPages:
             with pytest.raises(asyncio.CancelledError):
                 await block._ocr_pdf_pages([b"p1", b"p2"])
 
-    @pytest.mark.parametrize("outage", ["rate_limited", "failed_validation"])
+    @pytest.mark.parametrize("outage", ["rate_limited", "rate_limited_withheld", "failed_validation"])
     async def test_a_total_outage_reason_classifies_as_the_provider_text_did(self, outage: str) -> None:
         """Failure attribution reads the reason text, so dropping the provider's words must not change its category."""
         block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
@@ -1036,9 +1040,17 @@ class TestOcrPdfPages:
         cause = RateLimitError(provider_text)
         provider_error = LLMProviderErrorRetryableTask("synthetic-llm", cause=cause)
 
+        previous_reason = str(provider_error)
+        if outage == "rate_limited_withheld":
+            # What the LLM handler raises for a document prompt.
+            provider_error.__cause__ = cause
+            withhold_provider_text(provider_error)
+
         async def fake_handler(**kwargs: Any) -> Any:
             if outage == "failed_validation":
                 return {"extracted_text": None}
+            if outage == "rate_limited_withheld":
+                raise provider_error
             raise provider_error from cause
 
         with pytest.MonkeyPatch.context() as mp:
@@ -1047,8 +1059,7 @@ class TestOcrPdfPages:
             with pytest.raises(RuntimeError) as raised:
                 await block._ocr_pdf_pages([b"p1", b"p2"])
 
-        if outage == "rate_limited":
-            previous_reason = str(provider_error)
+        if outage != "failed_validation":
             expected_category: str | None = "LLM_ERROR"
         else:
             previous_reason = "OCR response must include extracted_text as a string; got null."
