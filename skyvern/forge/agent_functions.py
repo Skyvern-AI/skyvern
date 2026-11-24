@@ -1580,6 +1580,12 @@ class AgentFunction:
         """Cloud enforces connect permission and origin-folder access; OSS preserves existing stream behavior."""
         return True
 
+    async def browser_session_console_enabled(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str
+    ) -> bool:
+        """Whether this principal may run JavaScript in the session's page from the live view."""
+        return False
+
     async def browser_session_stream_reauthorization_required(
         self, principal: RequestPrincipal | None, organization_id: str
     ) -> bool:
