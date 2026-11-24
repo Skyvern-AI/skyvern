@@ -2012,7 +2012,11 @@ class GoogleSheetsWriteBlockYAML(BlockYAML):
     write_mode: Literal["append", "update"] = "append"
     values: str = ""
     column_mapping: dict[str, str] | None = None
-    create_sheet_if_missing: bool = False
+    create_sheet_if_missing: bool = Field(
+        default=False,
+        description="Add the tab named by sheet_name to the spreadsheet when it has no tab with that name. "
+        "The spreadsheet itself must already exist.",
+    )
     parameter_keys: list[str] | None = None
 
 

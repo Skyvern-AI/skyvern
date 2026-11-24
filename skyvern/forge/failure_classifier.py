@@ -787,6 +787,34 @@ OUTPUT_ONLY_LABEL_REASON_CODES = frozenset(
 )
 
 
+V3_MODEL_VERDICT_REASON_CODE = "model_verdict"
+V3_EXTRACTION_MISSING_REASON_CODE = "extraction_missing"
+V3_BROWSER_CONNECTION_LOST_REASON_CODE = "browser_connection_lost"
+V3_BLANK_PAGE_REASON_CODE = "blank_page"
+# The check, or the model's own verdict, that ended a Task V3 task, by name. Only the task records it: a task block's
+# output, which the workflow run, templates and Ember read, carries the reason's classification in its place.
+V3_STOP_CATEGORIES: dict[str, FailureCategory] = {
+    V3_MODEL_VERDICT_REASON_CODE: FailureCategory.UNKNOWN,
+    "perception_stall": FailureCategory.UNKNOWN,
+    "action_loop": FailureCategory.UNKNOWN,
+    "page_refresh_exhausted": FailureCategory.UNKNOWN,
+    "answer_basis_hold_bound": FailureCategory.UNKNOWN,
+    "no_outcome": FailureCategory.UNKNOWN,
+    "completion_gate": FailureCategory.UNKNOWN,
+    "navigation_dead_end": FailureCategory.NAVIGATION_FAILURE,
+    "browser_lost": FailureCategory.BROWSER_ERROR,
+    V3_BROWSER_CONNECTION_LOST_REASON_CODE: FailureCategory.BROWSER_ERROR,
+    "llm_call_failed": FailureCategory.LLM_ERROR,
+    V3_BLANK_PAGE_REASON_CODE: FailureCategory.WRONG_PAGE_STATE,
+    V3_EXTRACTION_MISSING_REASON_CODE: FailureCategory.DATA_EXTRACTION_FAILURE,
+}
+V3_STOP_REASON_CODES = frozenset(V3_STOP_CATEGORIES)
+
+
+def is_v3_stop_entry(category: object) -> bool:
+    return isinstance(category, dict) and category.get("reason_code") in V3_STOP_REASON_CODES
+
+
 def with_sign_in_form_visible(categories: list[dict] | None) -> list[dict]:
     """Append a record that the failure stopped on a visible sign-in form. Appending keeps the primary entry, which
     attribution, run tags and metrics read, and WRONG_PAGE_STATE has no runtime reader (ADR 0028)."""

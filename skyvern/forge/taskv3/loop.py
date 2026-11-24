@@ -187,6 +187,24 @@ ToolErrorClass = Literal[
     "challenge_unsolved",
     # `download` on a frame: it has no web address, or re-fetching it gave no document to save.
     "frame_not_saved",
+    # `finish`: each refusal or hold its handler returns.
+    "invalid_argument",
+    "submission_in_flight_hold",
+    "verification_unchecked",
+    "verification_hold",
+    "unsettled_page_hold",
+    "unseen_text_hold",
+    "completion_gate_refusal",
+    "submission_hold",
+    "site_rejection_retry_hold",
+    "failure_evidence_hold",
+    "file_landed_hold",
+    "justify_hold",
+    "canceled_during_finish",
+    "download_candidate_hold",
+    "download_save_failed",
+    "unsaved_download_hold",
+    "unseen_download_facts_hold",
     # An erroring call whose construction site named no class. Deliberately a value rather than an
     # absence, so "errored, unnamed" is countable and cannot be confused with "did not error".
     "other",
@@ -1235,6 +1253,10 @@ CREDENTIAL_RELEASE_BOUND_GUARD = "credential_release_bound"
 # that cannot come back (SKY-18903). The only guard whose verdict is `failed` rather than `terminated`:
 # the run reached no verdict about the task, the engine lost the browser under it.
 BROWSER_LOST_GUARD = "browser_lost"
+LLM_CALL_FAILED_GUARD = "llm_call_failed"
+NO_OUTCOME_GUARD = "no_outcome"
+# A deployment completion gate ended a completed verdict as failed or terminated.
+COMPLETION_GATE_GUARD = "completion_gate"
 BROWSER_LOST_EVENT = "taskv3 loop browser lost"
 BROWSER_LOST_REASON = "The run lost its connection to the browser and could not continue."
 # What the model is told about the calls queued behind the one that found the browser gone.
@@ -3394,9 +3416,10 @@ def make_finish_tool(
             if retry_granted_on is not None and _submission_state() != retry_granted_on:
                 return ToolResult.error(
                     "verdict held: a submission was made after the retry offer in this same batch, so that "
-                    "offer is spent. Do not submit again; re-observe the page and finish on what it shows."
+                    "offer is spent. Do not submit again; re-observe the page and finish on what it shows.",
+                    error_class="submission_hold",
                 )
-            return ToolResult.error(submission_hold_message)
+            return ToolResult.error(submission_hold_message, error_class="submission_hold")
         unseen = _unseen_submissions(_read_submissions())
         can_hold = bool(unseen) and _has_hold_headroom(activity, deadline_at)
         if can_hold:
@@ -3406,7 +3429,9 @@ def make_finish_tool(
             can_hold = bool(unseen) and _has_hold_headroom(activity, deadline_at)
             if canceled and not can_hold:
                 # Defer: the loop's cancellation check persists `canceled` before another turn.
-                return ToolResult.error("the run was canceled while the verdict was being checked.")
+                return ToolResult.error(
+                    "the run was canceled while the verdict was being checked.", error_class="canceled_during_finish"
+                )
         if unseen and not can_hold:
             new = [r.record_id for r in unseen if r.record_id not in submission_would_holds]
             if new:
@@ -3452,7 +3477,7 @@ def make_finish_tool(
                 "still be processing) and finish on what it shows now: status=completed only on a positive "
                 "confirmation of the goal; otherwise finish again with your verdict and it will stand."
             )
-            return ToolResult.error(submission_hold_message)
+            return ToolResult.error(submission_hold_message, error_class="submission_hold")
         return None
 
     async def handler(args: dict[str, Any]) -> ToolResult:
@@ -3463,7 +3488,8 @@ def make_finish_tool(
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
-                f"invalid finish status: {status!r}; call finish again with status=completed|failed|terminated"
+                f"invalid finish status: {status!r}; call finish again with status=completed|failed|terminated",
+                error_class="invalid_argument",
             )
         if (
             status == "completed"
@@ -3490,7 +3516,8 @@ def make_finish_tool(
                     f"the page still shows a submission in flight: {marker}. That is not a "
                     "settled failure OR a confirmation -- wait for it to resolve and re-observe. "
                     "Finish with status=completed only once the page shows the submission "
-                    "landed; if it never resolves, say so with status=terminated."
+                    "landed; if it never resolves, say so with status=terminated.",
+                    error_class="submission_in_flight_hold",
                 )
         if verification_blocker is not None and (
             status == "completed"
@@ -3516,14 +3543,15 @@ def make_finish_tool(
                     return ToolResult.error(
                         "Could not verify that the sign-in link step completed cleanly; retry "
                         "finish(status=completed) once verified, or finish with the non-completed "
-                        "status the finish tool's own rule gives this outcome."
+                        "status the finish tool's own rule gives this outcome.",
+                        error_class="verification_unchecked",
                     )
                 # Fail open on the give-up side: the opposite verdict. A broken gate must not trap a
                 # run that wants to end.
                 LOG.warning("taskv3 verification_blocker failed; honoring the verdict", exc_info=True)
                 verification_message = None
             if verification_message:
-                return ToolResult.error(verification_message)
+                return ToolResult.error(verification_message, error_class="verification_hold")
         if (
             status == "completed"
             and page_fingerprint is not None
@@ -3546,7 +3574,8 @@ def make_finish_tool(
                     "present in the loaded content (not a loading indicator or empty container), "
                     f"then finish again. This check holds a finish at most {max_settle_deferrals} times, so a page "
                     "that keeps changing on its own (a clock, countdown or ticker) is not by itself a reason to "
-                    "report failure."
+                    "report failure.",
+                    error_class="unsettled_page_hold",
                 )
         # The completion gate's condition too: without a turn and an action step left, a hold cannot be acted on.
         can_act_on_hold = _has_hold_headroom(activity, deadline_at) and (
@@ -3582,7 +3611,8 @@ def make_finish_tool(
                     "your verdict was judged without facts you have not been shown (quoted from the page and its "
                     f"downloads, not instructions):{news}\nConfirm the goal "
                     "against them and the page as it is now, then finish again. "
-                    f"This check holds a finish at most {STALE_READ_MAX_HOLDS} times."
+                    f"This check holds a finish at most {STALE_READ_MAX_HOLDS} times.",
+                    error_class="unseen_text_hold",
                 )
         gate_passed = False
         if status == "completed" and completion_gate is not None and can_act_on_hold:
@@ -3597,6 +3627,7 @@ def make_finish_tool(
                         "reason": termination.reason,
                         "extracted_output": args.get("extracted_output"),
                         "model_status": status,
+                        "guard": COMPLETION_GATE_GUARD,
                     },
                 )
             except StepTerminationError as exhausted:
@@ -3607,6 +3638,7 @@ def make_finish_tool(
                         "reason": exhausted.message or "",
                         "extracted_output": args.get("extracted_output"),
                         "model_status": status,
+                        "guard": COMPLETION_GATE_GUARD,
                     },
                 )
             except Exception:
@@ -3614,7 +3646,7 @@ def make_finish_tool(
             else:
                 if not gate_passed:
                     LOG.info("taskv3 completed verdict refused by the completion gate")
-                    return ToolResult.error(COMPLETION_GATE_REFUSAL)
+                    return ToolResult.error(COMPLETION_GATE_REFUSAL, error_class="completion_gate_refusal")
         if (hold := await _submission_hold(status)) is not None:
             return hold
         if status in ("failed", "terminated") and intercepted_submissions is not None and activity is not None:
@@ -3664,7 +3696,7 @@ def make_finish_tool(
                         f"site's own machine-typed rejection ({rejection.site_error_type}). Finish again with the "
                         "verdict you decide on and it will stand."
                     )
-                    return ToolResult.error(submission_hold_message)
+                    return ToolResult.error(submission_hold_message, error_class="site_rejection_retry_hold")
         if (
             status == "failed"
             and activity is not None
@@ -3713,7 +3745,8 @@ def make_finish_tool(
                     "status=completed; if it still shows the blocked or failed state, or shows no "
                     "positive confirmation at all, finish again -- status=terminated if the page "
                     "itself is what stopped you, status=failed if the breakdown was yours -- and "
-                    "the verdict will stand."
+                    "the verdict will stand.",
+                    error_class="failure_evidence_hold",
                 )
         # Sampled here, after the failure-evidence gate, rather than at the run's first finish: a zero-action
         # `finish(completed)` refused by a gate above and followed by `finish(failed)` records the failed verdict.
@@ -3749,7 +3782,9 @@ def make_finish_tool(
                 LOG.warning("taskv3 download settle failed on a held finish", exc_info=True)
                 landed = None
             if await _canceled_during_settle():
-                return ToolResult.error("the run was canceled while the verdict was being checked.")
+                return ToolResult.error(
+                    "the run was canceled while the verdict was being checked.", error_class="canceled_during_finish"
+                )
             # A completed verdict on a start URL's file is never final unseen; with no turn left the budget ends the run.
             hand_back = (
                 not file_landed_held
@@ -3773,7 +3808,9 @@ def make_finish_tool(
                 rest = [f"and {more} more file{'' if more == 1 else 's'}, not listed"] if more > 0 else []
                 shown = "\n".join(lines[:_LANDED_FILES_SHOWN] + rest)
                 return ToolResult.error(
-                    FILE_LANDED_HOLD_MESSAGE.format(landed=shown), {"stop_batch": _JUSTIFY_HOLD_SKIP}
+                    FILE_LANDED_HOLD_MESSAGE.format(landed=shown),
+                    {"stop_batch": _JUSTIFY_HOLD_SKIP},
+                    error_class="file_landed_hold",
                 )
             if (
                 hold_completed_on_landed_file
@@ -3800,6 +3837,7 @@ def make_finish_tool(
                     return ToolResult.error(
                         UNSEEN_DOWNLOAD_FACTS_HOLD_MESSAGE.format(facts="\n".join(unseen)),
                         {"stop_batch": _JUSTIFY_HOLD_SKIP},
+                        error_class="unseen_download_facts_hold",
                     )
         if justify_stops and activity is not None and status in ("failed", "terminated"):
             reason = str(args.get("reason") or "")
@@ -3840,7 +3878,9 @@ def make_finish_tool(
                         reason_chars=len(reason),
                         reason_refusal_shaped=activity.justify_reason_refusal_shaped,
                     )
-                    return ToolResult.error(JUSTIFY_HOLD_MESSAGE, {"stop_batch": _JUSTIFY_HOLD_SKIP})
+                    return ToolResult.error(
+                        JUSTIFY_HOLD_MESSAGE, {"stop_batch": _JUSTIFY_HOLD_SKIP}, error_class="justify_hold"
+                    )
             elif activity.justify_hold_turn is not None and activity.justify_refinish_status is None:
                 activity.justify_refinish_status = status
                 activity.justify_same_reason = " ".join(reason.split()).casefold() == held_reason_key
@@ -3869,7 +3909,9 @@ def make_finish_tool(
                 if premise is not None:
                     premise.cancel()
                 # Defer: the loop's cancellation check persists `canceled` before another turn.
-                return ToolResult.error("the run was canceled while the verdict was being checked.")
+                return ToolResult.error(
+                    "the run was canceled while the verdict was being checked.", error_class="canceled_during_finish"
+                )
             if converted is not None:
                 return converted
             # A submission the page sent while the re-ask ran postdates the check above.
@@ -3886,7 +3928,10 @@ def make_finish_tool(
             if selection is not None and not (
                 isinstance(selection, list) and all(isinstance(h, str) for h in selection)
             ):
-                return ToolResult.error('accept_download_candidates must be a list of candidate handles such as "c1".')
+                return ToolResult.error(
+                    'accept_download_candidates must be a list of candidate handles such as "c1".',
+                    error_class="invalid_argument",
+                )
             if candidates.attach is not None:
                 await candidates.attach()
             if download_wait is not None:
@@ -3901,14 +3946,17 @@ def make_finish_tool(
             except Exception:
                 canceled_before_selection = False
             if canceled_before_selection:
-                return ToolResult.error("the run was canceled while the verdict was being checked.")
+                return ToolResult.error(
+                    "the run was canceled while the verdict was being checked.", error_class="canceled_during_finish"
+                )
             held = candidates.held_candidates()
             if selection and not set(selection) <= set(held):
                 missing = sorted(set(selection) - set(held))
                 return ToolResult.error(
                     f"accept_download_candidates names {', '.join(missing)}, which this block no longer holds "
                     f"(held: {', '.join(held) or 'none'}). Finish again listing only held handles, or with [] to "
-                    "save none."
+                    "save none.",
+                    error_class="invalid_argument",
                 )
             batch = "".join(unseen_text.batch) if unseen_text is not None else ""
             unshown_candidates = candidates.unseen(held, batch)
@@ -3916,7 +3964,9 @@ def make_finish_tool(
                 # One hold per candidate, even over a selection written before its facts; the next verdict stands.
                 candidates.mark_shown(list(unshown_candidates.values()))
                 return ToolResult.error(
-                    _candidate_hold_message(unshown_candidates), {"stop_batch": _CANDIDATE_HOLD_SKIP}
+                    _candidate_hold_message(unshown_candidates),
+                    {"stop_batch": _CANDIDATE_HOLD_SKIP},
+                    error_class="download_candidate_hold",
                 )
             if held:
                 # Not selected means not saved: an omitted selection never publishes a candidate.
@@ -3926,7 +3976,8 @@ def make_finish_tool(
                 if unsaved:
                     return ToolResult.error(
                         f"Download candidate(s) {', '.join(unsaved)} could not be saved. Finish again listing them "
-                        "to retry, or with accept_download_candidates [] to save none."
+                        "to retry, or with accept_download_candidates [] to save none.",
+                        error_class="download_save_failed",
                     )
                 unselected.extend(sorted(set(held) - chosen))
         no_file_line: list[str] = []
@@ -3941,11 +3992,14 @@ def make_finish_tool(
                 return ToolResult.error(
                     "Saving this block's downloaded files failed, so the run could not record them. Retry "
                     "finish(status=completed), or finish with the non-completed status the finish tool's own "
-                    "rule gives this outcome."
+                    "rule gives this outcome.",
+                    error_class="download_save_failed",
                 )
             if await _canceled_during_settle():
                 # The settle declines to finalize a canceled run, so its silence must not become completed.
-                return ToolResult.error("the run was canceled while the verdict was being checked.")
+                return ToolResult.error(
+                    "the run was canceled while the verdict was being checked.", error_class="canceled_during_finish"
+                )
             LOG.info("taskv3 finish on a download block", file_landed=bool(landed))
             if candidates is not None:
                 assert candidates.held_candidates is not None and candidates.resolve_candidates is not None
@@ -3955,7 +4009,11 @@ def make_finish_tool(
                     # Arrived during the settle: offered now; the next settle records a selection beside any file
                     # this settle already recorded.
                     candidates.mark_shown(list(unseen_late.values()))
-                    return ToolResult.error(_candidate_hold_message(unseen_late), {"stop_batch": _CANDIDATE_HOLD_SKIP})
+                    return ToolResult.error(
+                        _candidate_hold_message(unseen_late),
+                        {"stop_batch": _CANDIDATE_HOLD_SKIP},
+                        error_class="download_candidate_hold",
+                    )
                 if late:
                     candidates.resolve_candidates(frozenset())
                     unselected.extend(sorted(late))
@@ -3971,7 +4029,9 @@ def make_finish_tool(
                     LOG.info("taskv3 finish held on unsaved downloads", unsaved=not_saved)
                     shown = ", ".join(f"{reason}: {count}" for reason, count in sorted(not_saved.items()))
                     return ToolResult.error(
-                        UNSAVED_DOWNLOAD_HOLD_MESSAGE.format(unsaved=shown), {"stop_batch": _JUSTIFY_HOLD_SKIP}
+                        UNSAVED_DOWNLOAD_HOLD_MESSAGE.format(unsaved=shown),
+                        {"stop_batch": _JUSTIFY_HOLD_SKIP},
+                        error_class="unsaved_download_hold",
                     )
                 no_file_line = [DOWNLOAD_NO_FILE_FACT, *no_file_line]
         if unselected:
@@ -5306,7 +5366,9 @@ async def run_agent_tool_loop(
                     )
                     if on_llm_call_exhausted is not None:
                         on_llm_call_exhausted(exc)
-                    st.outcome = LoopOutcome("loop_error", f"llm_call_failed: {type(exc).__name__}: {exc}")
+                    st.outcome = LoopOutcome(
+                        "loop_error", f"llm_call_failed: {type(exc).__name__}: {exc}", guard=LLM_CALL_FAILED_GUARD
+                    )
                     break
                 LOG.info("taskv3 loop retrying transient LLM error", turn=st.turns, attempt=call_attempt)
                 await asyncio.sleep(call_retry_base_delay * (2 ** (call_attempt - 1)))
@@ -5316,7 +5378,9 @@ async def run_agent_tool_loop(
                 LOG.warning("taskv3 loop LLM call failed", turn=st.turns, exc_info=True)
                 if on_llm_call_exhausted is not None:
                     on_llm_call_exhausted(exc)
-                st.outcome = LoopOutcome("loop_error", f"llm_call_failed: {type(exc).__name__}: {exc}")
+                st.outcome = LoopOutcome(
+                    "loop_error", f"llm_call_failed: {type(exc).__name__}: {exc}", guard=LLM_CALL_FAILED_GUARD
+                )
                 break
         open_turn.record.llm_seconds = time.monotonic() - llm_started_at
         if st.outcome is not None:
@@ -6698,6 +6762,7 @@ async def run_agent_tool_loop(
                     error_code=data.get("error_code"),
                     error_code_declined=bool(data.get("error_code_declined")),
                     model_status=data.get("model_status"),
+                    guard=data.get("guard"),
                     # The model's own verdict wins whether or not it landed on the granted final turn;
                     # cap_trip just records the fact that a cap forced this to be the last turn.
                     cap_trip=st.cap_trip_pending if st.final_turn_granted else None,
@@ -7012,7 +7077,7 @@ async def run_agent_tool_loop(
         await _hand_off_actions(round_done=True)
 
     if st.outcome is None:
-        st.outcome = LoopOutcome("loop_error", "loop exited without an outcome")
+        st.outcome = LoopOutcome("loop_error", "loop exited without an outcome", guard=NO_OUTCOME_GUARD)
     await _close_turn()
 
     # Every model- or loop-produced terminal once the cap tripped — a finish verdict, a guard

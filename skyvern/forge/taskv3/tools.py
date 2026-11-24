@@ -5691,11 +5691,20 @@ async def pending_marker(page: Any, selector: str) -> str | None:
 # top-of-page controls the model most likely wants.
 _LOOK_MAX_MARKS = 60
 
-# Hard per-run ceiling on look() calls. look bills one image per call and is not an action step, so
-# without a cap the only bound is max_turns (~1 image/turn) — a metered vision cost the operator's
-# constraint forbids. A last-resort tool rarely needs more than a handful; past this it returns an
-# error pointing back at the text tools rather than adding another image.
-_LOOK_MAX_PER_RUN = 20
+# Resolves once two frames pass with no scroll event from any element, giving up after about 20 frames so a page
+# that scrolls on its own does not hold the tool. Each frame also resolves on a 50 ms timer in case rAF is paused.
+_SCROLL_SETTLE_JS = """async () => {
+  let moved = true;
+  const onScroll = () => { moved = true; };
+  const frame = () => new Promise((r) => { requestAnimationFrame(r); setTimeout(r, 50); });
+  document.addEventListener("scroll", onScroll, { capture: true, passive: true });
+  try {
+    await frame();
+    for (let i = 0; i < 10 && moved; i++) { moved = false; await frame(); await frame(); }
+  } finally {
+    document.removeEventListener("scroll", onScroll, { capture: true });
+  }
+}"""
 
 # Enumerate the same interactive controls observe() does, across open shadow roots, keeping only the
 # ones with pixels on screen (a visible box intersecting the viewport). Tag each with a transient
@@ -15211,7 +15220,6 @@ def build_browser_tools(
     # act on a different tab can say so.
     _read_page: list[Any] = []
     _observed_page: list[Any] = []
-    _look_count = [0]  # per-run look() invocations, capped at _LOOK_MAX_PER_RUN
     # The (canonical URL, filled-field count) of the last same-URL reload the destructive-nav guard
     # refused. A repeat to that URL confirms intent and is allowed — but only if the at-risk state has
     # not GROWN since (else a file attached after the refusal would be wiped by a stale confirmation).
@@ -24352,6 +24360,10 @@ def build_browser_tools(
         # through to here -- so `page` can be a child frame, and a Frame has no `mouse`. The wheel is a
         # viewport gesture either way, so it belongs to the page.
         await input_dispatch.wheel(_current_page(), 0, amount)
+        # mouse.wheel returns before the page moves, so a look in the same turn would capture the old viewport.
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(OBSERVE_SCREENSHOT_TIMEOUT_SECONDS):
+                await _current_page().evaluate(_SCROLL_SETTLE_JS)
         return ToolResult.ok(f"scrolled {amount}px")
 
     async def wait(args: dict[str, Any]) -> ToolResult:
@@ -24800,15 +24812,9 @@ def build_browser_tools(
             pass
 
     async def look(_args: dict[str, Any]) -> ToolResult:
-        if _look_count[0] >= _LOOK_MAX_PER_RUN:
-            return ToolResult.error(
-                f"look budget reached ({_LOOK_MAX_PER_RUN} per run) — rely on observe/get_html and act on "
-                "what you already saw instead of looking again."
-            )
         page, error = await _resolve_page()
         if error is not None:
             return error
-        _look_count[0] += 1
         # Passive read + server-side render. The screenshot is a viewport frame (device px); the marks
         # are enumerated separately so the boxes are drawn in PIL, never injected into the DOM.
         try:
@@ -24816,9 +24822,14 @@ def build_browser_tools(
             # today so `page` is already the page here, but writing it this way is what keeps the rule
             # "a page-only API is reached through _current_page()" true without exception -- and the
             # exception is what a later edit would copy.
-            png = await _current_page().screenshot()
+            async with asyncio.timeout(OBSERVE_SCREENSHOT_TIMEOUT_SECONDS):
+                png = await _current_page().screenshot(timeout=OBSERVE_SCREENSHOT_TIMEOUT_SECONDS * 1000)
         except Exception as exc:
             LOG.warning("taskv3 look screenshot failed", exc_info=True)
+            if type(exc).__name__ == "TimeoutError":
+                return ToolResult.error(
+                    f"look failed to capture the page: timed out after {OBSERVE_SCREENSHOT_TIMEOUT_SECONDS:g}s"
+                )
             return ToolResult.error(f"look failed to capture the page: {type(exc).__name__}: {exc}")
         try:
             data = await asyncio.wait_for(page.evaluate(_LOOK_ENUM_JS), timeout=30)

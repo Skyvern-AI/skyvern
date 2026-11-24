@@ -57,6 +57,7 @@ from skyvern.forge.sdk.ember.composition_evidence import workflow_target_url as 
 from skyvern.forge.sdk.ember.config import AuthoringCapability, BlockAuthoringPolicy
 from skyvern.forge.sdk.ember.context import (
     BLOCK_RUNNING_TOOLS,
+    CREATE_GOOGLE_SHEET_TOOL_NAME,
     EDIT_BLOCK_AND_RUN_TOOL_NAME,
     EDIT_BLOCK_TOOL_NAME,
     REPLY_TOOL_NAME,
@@ -245,7 +246,7 @@ from .discovery import _discovery_detect_login_wall as _discovery_detect_login_w
 from .discovery import _discovery_resolve_href as _discovery_resolve_href
 from .discovery import _discovery_walk as _discovery_walk
 from .discovery import _resolve_discovery_entry_url as _resolve_discovery_entry_url
-from .errors import ember_tool_failure, register_argument_models, reporting_withheld_browser
+from .errors import ember_tool_failure, finish_tool_call, register_argument_models, reporting_withheld_browser
 from .frontier import _CANONICAL_WORKFLOW_SETTING_FIELDS as _CANONICAL_WORKFLOW_SETTING_FIELDS
 from .frontier import _JINJA_LITERAL_ROOTS as _JINJA_LITERAL_ROOTS
 from .frontier import _JINJA_RUNTIME_GLOBAL_ROOTS as _JINJA_RUNTIME_GLOBAL_ROOTS
@@ -275,6 +276,7 @@ from .guardrails import (
 )
 from .guardrails import _parameter_binding_invariant_error as _parameter_binding_invariant_error
 from .integrations import (
+    _create_google_sheet,
     _list_integrations,
     _read_google_sheet,
     _request_connection,
@@ -1459,13 +1461,14 @@ async def read_google_sheet_tool(
     """Read a Google spreadsheet through the organization's connected Google accounts, without a
     browser or a workflow run. Read-only; returns values, never tokens or formulas.
 
-    `spreadsheet_url` must be a Google Sheets URL the user wrote in this chat; any other
-    spreadsheet is not read. With `connection_id` omitted, every active Sheets-scoped connection
-    is tried. `connections` reports one row per connection with `connection_id`, `name`,
-    `email_address` and a `status`: `opened` (the connection reads this spreadsheet), `no_access`
-    (the account cannot see this spreadsheet), `token_unavailable` (no access token could be
-    minted for the connection), `error` (the attempt failed; see `reason`), or `not_eligible`
-    (the given `connection_id` is not an active Sheets-scoped connection).
+    `spreadsheet_url` must be a Google Sheets URL the user wrote in this chat, or one `create_google_sheet`
+    returned in this chat (pass that call's `connection_id`); any other spreadsheet is not read. With
+    `connection_id` omitted, every active Sheets-scoped connection is tried. `connections` reports one
+    row per connection with `connection_id`, `name`, `email_address` and a `status`: `opened` (the
+    connection reads this spreadsheet), `no_access` (the account cannot see this spreadsheet),
+    `token_unavailable` (no access token could be minted for the connection), `error` (the attempt
+    failed; see `reason`), or `not_eligible` (the given `connection_id` is not an active Sheets-scoped
+    connection).
 
     When a connection opened the spreadsheet the result also has `title`, `tabs` (each with
     `title`, `gid`, `row_count`, `column_count`), `read_through` (the connection the values came
@@ -1485,6 +1488,35 @@ async def read_google_sheet_tool(
     record_tool_step_result_for_ctx(ember_ctx, "read_google_sheet", arguments, result)
     sanitized = sanitize_tool_result_for_llm("read_google_sheet", result)
     return json.dumps(sanitized)
+
+
+@function_tool(failure_error_function=ember_tool_failure, name_override=CREATE_GOOGLE_SHEET_TOOL_NAME)
+async def create_google_sheet_tool(ctx: RunContextWrapper, title: str, connection_id: str) -> str:
+    """Create a new, empty Google spreadsheet in the My Drive of a connected Google account and return its URL.
+    This makes a real file in the user's Drive, so call it only when the user asked in this chat for a new sheet.
+    When the user gave a sheet URL to write to, write to that URL and do not call this.
+
+    `connection_id` is the Google connection whose Drive gets the file: an account `connection_id` from
+    `list_integrations`. One account cannot see a file in another account's Drive, so every block that writes to
+    the new sheet sets `credential_id` to this same `connection_id`. Put `spreadsheet_url` literally into each
+    google_sheets_write block. For several tabs, write one block per tab with `sheet_name` set and
+    `create_sheet_if_missing: true`; the new file starts with one tab, `first_sheet_name`.
+
+    Creating needs the google_sheet.create permission and an account the user approved, as a run does; when the
+    account is not approved the user gets a card to choose one. The same `title` and `connection_id` again in this
+    chat returns the sheet already made (`status` is `already_created`) and creates nothing; `created_this_chat`
+    lists every sheet this chat created. When `outcome_unknown` is true, Google did not confirm the create and a
+    sheet may exist in that account's Drive; this chat will not create that title in that account again, so ask the
+    user to check Drive, or use another title or account, or a sheet URL the user gives.
+    """
+    ember_ctx = ctx.context
+    arguments: dict[str, JsonValue] = {"title": title, "connection_id": connection_id}
+    authority_error = _authority_tool_error(ember_ctx, CREATE_GOOGLE_SHEET_TOOL_NAME)
+    if authority_error:
+        result: dict[str, JsonValue] = {"ok": False, "error": authority_error}
+    else:
+        result = await _create_google_sheet(title, connection_id, ember_ctx)
+    return finish_tool_call(ember_ctx, CREATE_GOOGLE_SHEET_TOOL_NAME, arguments, result)
 
 
 @function_tool(failure_error_function=ember_tool_failure, name_override="get_organization_usage_quota")
@@ -2544,6 +2576,7 @@ NATIVE_TOOLS = [
     request_connection_tool,
     offer_demonstration_tool,
     read_google_sheet_tool,
+    create_google_sheet_tool,
     get_organization_usage_quota_tool,
     list_workflow_triggers_tool,
     test_trigger_mapping_tool,

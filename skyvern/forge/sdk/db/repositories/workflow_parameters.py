@@ -86,6 +86,7 @@ from skyvern.forge.sdk.schemas.ember import (
     EmberChatSender,
     EmberChatSummary,
     EmberCompletionCriteriaSet,
+    EmberCreatedSpreadsheet,
     EmberMessageFeedbackRating,
     EmberPendingTurn,
     EmberProposalMetadata,
@@ -1651,6 +1652,55 @@ class WorkflowParametersRepository(BaseRepository):
                     stamped = True
                 if stamped:
                     self._store_question_turn(chat, entry)
+            await session.commit()
+
+    @db_operation("list_ember_created_spreadsheets")
+    async def list_ember_created_spreadsheets(
+        self, organization_id: str, chat_id: str
+    ) -> list[EmberCreatedSpreadsheet]:
+        async with self.Session() as session:
+            stored = await session.scalar(
+                select(EmberChatModel.created_spreadsheets)
+                .where(EmberChatModel.organization_id == organization_id)
+                .where(EmberChatModel.ember_chat_id == chat_id)
+            )
+        return [EmberCreatedSpreadsheet.model_validate(entry) for entry in stored or []]
+
+    @db_operation("claim_ember_spreadsheet_create")
+    async def claim_ember_spreadsheet_create(
+        self, organization_id: str, chat_id: str, title: str, connection_id: str
+    ) -> EmberCreatedSpreadsheet | None:
+        """Return the chat's entry for this title and account, or record an in-flight claim for it and return None."""
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entries = [EmberCreatedSpreadsheet.model_validate(entry) for entry in chat.created_spreadsheets or []]
+            existing = next(
+                (entry for entry in entries if (entry.title, entry.connection_id) == (title, connection_id)), None
+            )
+            if existing is None:
+                claim = EmberCreatedSpreadsheet(title=title, connection_id=connection_id)
+                chat.created_spreadsheets = [entry.model_dump() for entry in [*entries, claim]]
+                await session.commit()
+            return existing
+
+    @db_operation("settle_ember_spreadsheet_create")
+    async def settle_ember_spreadsheet_create(
+        self,
+        organization_id: str,
+        chat_id: str,
+        title: str,
+        connection_id: str,
+        created: EmberCreatedSpreadsheet | None,
+    ) -> None:
+        """Replace the claim with the created sheet, or drop it when Google refused the create."""
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entries = [
+                entry
+                for entry in (EmberCreatedSpreadsheet.model_validate(raw) for raw in chat.created_spreadsheets or [])
+                if (entry.title, entry.connection_id) != (title, connection_id)
+            ]
+            chat.created_spreadsheets = [entry.model_dump() for entry in [*entries, *([created] if created else [])]]
             await session.commit()
 
     @db_operation("unlink_copilot_single_run")

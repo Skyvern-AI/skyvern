@@ -107,7 +107,11 @@ from skyvern.forge import app
 from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.failure_classifier import (
-    CLASSIFIER_LABEL_REASON_CODES,
+    V3_BLANK_PAGE_REASON_CODE,
+    V3_BROWSER_CONNECTION_LOST_REASON_CODE,
+    V3_EXTRACTION_MISSING_REASON_CODE,
+    V3_MODEL_VERDICT_REASON_CODE,
+    V3_STOP_CATEGORIES,
     FailureCategory,
     bounded_failure_categories,
     is_captcha_solve_failure,
@@ -249,6 +253,7 @@ from skyvern.forge.taskv3.goal_check import (
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, StartUrlDownload
 from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    COMPLETION_GATE_GUARD,
     DEFAULT_MAX_SETTLE_DEFERRALS,
     DownloadSettle,
     DownloadUntil,
@@ -2387,8 +2392,13 @@ def _v3_failure_reason(
         failure_reason = f"task_v3 reported completion but {completion_rejection}"
     elif missing_extraction:
         failure_reason = "task_v3 reported completion but returned no extracted_output for the data-extraction goal"
-    # Only the model's own give-up: a loop guard, a loop error or a spent budget ended the run for its own reason.
-    elif verification_status is not None and outcome.guard is None and outcome.status in ("failed", "terminated"):
+    # Only the model's own give-up: a loop guard, a loop error or a spent budget ended the run for its own reason. A
+    # finish the completion gate converted inside the loop is still the model's call to finish here.
+    elif (
+        verification_status is not None
+        and outcome.guard in (None, COMPLETION_GATE_GUARD)
+        and outcome.status in ("failed", "terminated")
+    ):
         failure_reason = f"{outcome.reason or outcome.status} (last verification code status: {verification_status})"
     else:
         failure_reason = outcome.reason or outcome.status
@@ -2406,44 +2416,33 @@ def _v3_failure_category(
     outcome: LoopOutcome,
     *,
     task_status: TaskStatus,
-    failure_reason: str | None,
-    completion_rejection: str | None,
+    rejection_guard: str | None,
     missing_extraction: bool,
 ) -> list[dict[str, Any]] | None:
-    # failure_category must agree with failure_reason: a vetoed or extraction-less completion,
-    # a loop_error, and any finish verdict the model delivered on the granted turn all failed
-    # for THEIR reason, not the budget's. BUDGET_EXHAUSTED is reserved for the exits where the
-    # cap genuinely is the cause: the loop gave up without a verdict, or the granted-turn
-    # verdict's reason classifies to nothing (usually the model narrating the truncation).
-    cap_is_the_cause = (
-        outcome.cap_trip is not None
-        and completion_rejection is None
-        and not missing_extraction
-        and outcome.status != "loop_error"
-    )
-    if task_status == TaskStatus.failed and outcome.status == "budget_exhausted" and cap_is_the_cause:
+    """The one named entry for what ended a failed or terminated task: no classifier reads the reason text."""
+    if task_status not in (TaskStatus.failed, TaskStatus.terminated):
+        return None
+    rejected = rejection_guard or (V3_EXTRACTION_MISSING_REASON_CODE if missing_extraction else None)
+    if rejected is None and outcome.status == "budget_exhausted":
         return [
             {"category": FailureCategory.BUDGET_EXHAUSTED.value, "confidence_float": 1.0, "reasoning": outcome.cap_trip}
         ]
-    if task_status == TaskStatus.failed:
-        # Same code-level failure classification fail_task records, so v3 failures carry a
-        # failure_category like step-engine failures.
-        failure_category = app.AGENT_FUNCTION.classify_failure(
-            failure_reason, fallback_to_unknown=not cap_is_the_cause, status=TaskStatus.failed
-        )
-        rule_categories = [
-            c for c in failure_category or [] if c.get("reason_code") not in CLASSIFIER_LABEL_REASON_CODES
-        ]
-        if not rule_categories and cap_is_the_cause:
-            return [
-                {
-                    "category": FailureCategory.BUDGET_EXHAUSTED.value,
-                    "confidence_float": 1.0,
-                    "reasoning": outcome.cap_trip,
-                }
-            ]
-        return failure_category
-    return None
+    name = rejected or outcome.guard or V3_MODEL_VERDICT_REASON_CODE
+    entry: dict[str, Any] = {
+        "category": V3_STOP_CATEGORIES.get(name, FailureCategory.UNKNOWN).value,
+        "confidence_float": 1.0,
+        "reasoning": name,
+        "reason_code": name,
+    }
+    if name == V3_MODEL_VERDICT_REASON_CODE:
+        if outcome.error_code is not None:
+            entry["error_code"] = outcome.error_code
+        if outcome.error_code_declined:
+            entry["error_code_declined"] = True
+    if outcome.cap_trip is not None and rejected is None and outcome.status != "loop_error":
+        # Only the stops a tripped cap can have caused carry it; the workflow run reads it.
+        entry["cap_trip"] = outcome.cap_trip
+    return [entry]
 
 
 _ExecuteArgs = ParamSpec("_ExecuteArgs")
@@ -4608,9 +4607,11 @@ class ForgeAgent:
             block_type=block_type,
         )
         completion_rejection: str | None = None
+        rejection_guard: str | None = None
         if outcome.status == "completed" and get_browser_connection_loss(browser_state) is not None:
             # The gates below fail open on a page that is gone, so a loss after the last action must fail here.
             completion_rejection = f"the run lost its browser connection ({BROWSER_CONNECTION_LOST_ERROR_CODE})"
+            rejection_guard = V3_BROWSER_CONNECTION_LOST_REASON_CODE
             LOG.warning("task_v3 completion rejected after a browser connection loss", task_id=task.task_id)
         elif outcome.status == "completed":
             # The deployment gate for a completion the finish tool could not put to it (no headroom left to
@@ -4626,14 +4627,18 @@ class ForgeAgent:
                     browser_state=browser_state,
                 ):
                     completion_rejection = "the deployment completion gate rejected it"
+                    rejection_guard = COMPLETION_GATE_GUARD
             except CompletionGateTerminationError as termination:
-                outcome = replace(outcome, status="terminated", reason=termination.reason)
+                outcome = replace(outcome, status="terminated", reason=termination.reason, guard=COMPLETION_GATE_GUARD)
             except StepTerminationError as exhausted:
                 if outcome.converted_from is not None:
                     # A vetoed re-ask conversion restores the model's own verdict below, whatever the veto count.
                     completion_rejection = exhausted.message or "the deployment completion gate rejected it"
+                    rejection_guard = COMPLETION_GATE_GUARD
                 else:
-                    outcome = replace(outcome, status="failed", reason=exhausted.message or "")
+                    outcome = replace(
+                        outcome, status="failed", reason=exhausted.message or "", guard=COMPLETION_GATE_GUARD
+                    )
             except Exception:
                 LOG.warning(
                     "task_v3 completion gate errored; accepting completion", task_id=task.task_id, exc_info=True
@@ -4676,10 +4681,13 @@ class ForgeAgent:
                     )
                 if blank_page is not None:
                     completion_rejection = f"it finished on a blank page ({blank_page.url})"
+                    rejection_guard = V3_BLANK_PAGE_REASON_CODE
                     LOG.warning(
                         "task_v3 completion rejected on a blank page", task_id=task.task_id, page_url=blank_page.url
                     )
         outcome, completion_rejection = _v3_restore_vetoed_conversion(outcome, completion_rejection, task.task_id)
+        if completion_rejection is None:
+            rejection_guard = None
         task_status, missing_extraction = _v3_task_status(
             outcome, completion_rejection=completion_rejection, extraction_requested=extraction_requested
         )
@@ -4855,11 +4863,7 @@ class ForgeAgent:
                 final_turn_finished=outcome.status != "budget_exhausted",
             )
         failure_category = _v3_failure_category(
-            outcome,
-            task_status=task_status,
-            failure_reason=failure_reason,
-            completion_rejection=completion_rejection,
-            missing_extraction=missing_extraction,
+            outcome, task_status=task_status, rejection_guard=rejection_guard, missing_extraction=missing_extraction
         )
         coded_failure = bool(task.error_code_mapping) and task_status in (TaskStatus.failed, TaskStatus.terminated)
         # The answer belongs to the model's own failed/terminated verdict, never to a completion demoted after the loop.
@@ -4942,7 +4946,8 @@ class ForgeAgent:
                 "task_v3 user-defined error code sources",
                 task_id=task.task_id,
                 task_status=task_status,
-                reached_finish=outcome.guard is None and model_verdict in ("completed", "failed", "terminated"),
+                reached_finish=outcome.guard in (None, COMPLETION_GATE_GUARD)
+                and model_verdict in ("completed", "failed", "terminated"),
                 model_verdict=model_verdict,
                 model_error_code=outcome.error_code,
                 model_declined=outcome.error_code_declined,

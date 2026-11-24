@@ -2343,6 +2343,11 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         if data.get("values_error"):
             return f"Opened the Google Sheet through {opened} connection(s), but could not read its values"
         return f"Read the Google Sheet through {opened} connection(s)"
+    if tool_name == "create_google_sheet":
+        title = sanitize_block_label_for_display(str(data.get("title") or ""), 80)
+        if data.get("status") == "already_created":
+            return f"Reused the Google Sheet '{title}' created earlier in this chat"
+        return f"Created the Google Sheet '{title}'"
     if tool_name == "get_block_schema":
         if "block_types" in data:
             return f"Listed {data.get('count', '?')} block types"

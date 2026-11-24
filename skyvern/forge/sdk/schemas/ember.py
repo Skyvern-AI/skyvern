@@ -257,6 +257,14 @@ class EmberAcceptedTestedRun(BaseModel):
     workflow_run_id: str | None = None
 
 
+class EmberCreatedSpreadsheet(BaseModel):
+    title: str
+    connection_id: str
+    # None while the create is in flight, and for good when its outcome was never confirmed.
+    spreadsheet_id: str | None = None
+    spreadsheet_url: str | None = None
+
+
 class EmberChat(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
