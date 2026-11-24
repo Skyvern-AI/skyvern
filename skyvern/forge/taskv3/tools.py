@@ -8241,6 +8241,16 @@ _ENTRY_VARIANT_TYPES = frozenset(
     {"text", "textarea", "email", "tel", "number", "url", "password", "date", "datetime-local", "month", "time", "week"}
 )
 
+# Follows a label to its control first, as the secret visual mask itself does.
+_IS_PASSWORD_INPUT_JS = """(el) => {
+  if (!el.isContentEditable && !["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName)) {
+    const label = el.closest ? el.closest("label") : null;
+    if (label && label.control) el = label.control;
+  }
+  return el.tagName === "INPUT" && String(el.getAttribute("type")).toLowerCase() === "password";
+}"""
+_SECRET_FIELD_PROBE_TIMEOUT_MS = 2000
+
 # Same rule observe applies before it shows a field's value.
 _FIELD_VALUE_IS_SECRET_JS = (
     "(el) => {" + OTP_INPUT_PRIVACY_JS + "return el.type === 'password' || isOtpInputValueSecret(el);}"
@@ -15161,6 +15171,23 @@ def build_browser_tools(
         # them, and a field that receives one is masked, so no screenshot shows it either.
         return settings.ENABLE_SECRET_VISUAL_MASKING and _confines_secrets()
 
+    def _masks_typed_secrets() -> bool:
+        ctx = skyvern_context.current()
+        return (
+            settings.ENABLE_SECRET_VISUAL_MASKING
+            and ctx is not None
+            and app.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run(ctx.workflow_run_id)
+        )
+
+    async def _mask_typed_secret_field(field: Any, *, timeout: float = _ACTION_TIMEOUT_MS) -> None:
+        # The step engine's rule under Mask Secrets: a password box already hides its value, so it is left as is.
+        await field.wait_for(state="attached", timeout=timeout)
+        # A probe that fails masks the field: masking a password box is harmless, leaving a secret legible is not.
+        with contextlib.suppress(Exception):
+            if await field.evaluate(_IS_PASSWORD_INPUT_JS, timeout=_SECRET_FIELD_PROBE_TIMEOUT_MS):
+                return
+        await apply_secret_visual_mask_to_locator(field, timeout=timeout)
+
     async def _check_totp_code_release(
         marker: str, code: str, parameter_key: str, *, operation: str, page: Any, selector: str | None
     ) -> None:
@@ -15223,6 +15250,8 @@ def build_browser_tools(
                 code = await resolve_totp_placeholder(text, _authorize)
                 if selector and _masks_held_secrets():
                     await apply_secret_visual_mask_to_locator(page.locator(selector).first, timeout=_ACTION_TIMEOUT_MS)
+                elif selector and _masks_typed_secrets():
+                    await _mask_typed_secret_field(page.locator(selector).first)
                 return code
             LOG.warning(
                 "taskv3 refused an unresolved one-time-code value",
@@ -15250,6 +15279,13 @@ def build_browser_tools(
                 # Every tool that writes a resolved value into a field comes through here, so this one
                 # mask covers them all. It is CSS-only and ignores the Mask Secrets opt-in for card data.
                 await apply_secret_visual_mask_to_locator(page.locator(selector).first, timeout=_ACTION_TIMEOUT_MS)
+            elif (
+                resolved != text
+                and _masks_typed_secrets()
+                and ctx is not None
+                and app.WORKFLOW_CONTEXT_MANAGER.is_secret_text(ctx.workflow_run_id, text)
+            ):
+                await _mask_typed_secret_field(page.locator(selector).first)
         return resolved
 
     # INVARIANT: holds at most one page, written by the preflight wrapper (or, ahead of it, the
@@ -21479,6 +21515,7 @@ def build_browser_tools(
         *,
         boxes_before: int,
         secret: bool,
+        mask: bool,
         press_enter: bool,
         url_before: str | None,
     ) -> ToolResult:
@@ -21530,6 +21567,9 @@ def build_browser_tools(
             box = page.locator(f'[data-tv3-codebox="{i}"]').first
             typed = i
             held: str | None = None
+            if mask:
+                with contextlib.suppress(Exception):
+                    await _mask_typed_secret_field(box, timeout=_CODE_BOX_ENABLE_WAIT_MS)
             try:
                 # fill() waits for the box to be enabled, so its timeout bounds the wait for the box before it.
                 await input_dispatch.fill(page, box, char, timeout=_CODE_BOX_ENABLE_WAIT_MS)
@@ -21644,6 +21684,9 @@ def build_browser_tools(
         text = await _resolve_text(args.get("text", ""), operation="type", page=page, selector=selector)
         # A secret source resolved the text, or it is a value a tool delivered as secret (a one-time code typed as is).
         typed_secret = text != args.get("text", "") or _is_runtime_secret(text)
+        # A code the model types as is never resolves, so _resolve_text did not mask its field.
+        if text == args.get("text", "") and _is_runtime_secret(text) and _masks_typed_secrets():
+            await _mask_typed_secret_field(page.locator(selector).first)
         press_enter = args.get("press_enter")
         # The tab's URL, like click's: the re-ask's URL rule reads where an Enter submission started.
         url_before = await _url(_current_page()) if press_enter else None
@@ -21686,6 +21729,14 @@ def build_browser_tools(
                         blocked = await _segmented_write_blocked(page, selector)
                         if blocked is not None:
                             return blocked
+                        if typed_secret and _masks_typed_secrets():
+                            # The date is split across the segments, so each one receives part of the secret.
+                            for label in labels:
+                                with contextlib.suppress(Exception):
+                                    await _mask_typed_secret_field(
+                                        page.locator(f'[data-tv3-dateseg="{label}"]').first,
+                                        timeout=_CODE_BOX_ENABLE_WAIT_MS,
+                                    )
                         return await _fill_date_segment_group(page, selector, date_components, labels)
                     if segment_digits is not None:
                         blocked = await _segmented_write_blocked(page, selector)
@@ -21759,6 +21810,7 @@ def build_browser_tools(
                     code,
                     boxes_before=boxes_before,
                     secret=secret,
+                    mask=typed_secret and _masks_typed_secrets(),
                     press_enter=bool(press_enter),
                     url_before=url_before,
                 )

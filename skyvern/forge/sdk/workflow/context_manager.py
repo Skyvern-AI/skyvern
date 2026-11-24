@@ -3410,6 +3410,13 @@ class WorkflowContextManager:
             token in context.card_secret_ids for token in context.find_embedded_placeholder_tokens(text)
         )
 
+    def is_secret_text(self, workflow_run_id: str | None, text: str | None) -> bool:
+        """Whether text names a secret held by this run, alone or among other placeholders."""
+        if workflow_run_id is None or not isinstance(text, str) or not text:
+            return False
+        context = self.workflow_run_contexts.get(workflow_run_id)
+        return context is not None and (text in context.secrets or bool(context.find_embedded_placeholder_tokens(text)))
+
     def secret_values_for_drop_check(self, workflow_run_id: str | None) -> set[str]:
         """Every configured secret value, with no numeric floor and no masking opt-in, for a check that only
         DROPS page text on a match and never redacts with the set: a short PIN or CVV must still match."""
