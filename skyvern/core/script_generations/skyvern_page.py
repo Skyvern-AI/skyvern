@@ -163,6 +163,10 @@ class SkyvernPage(Page):
         """Public read-only view of the working iframe (None means the main frame)."""
         return object.__getattribute__(self, "_working_frame")
 
+    @property
+    def page_ai(self) -> SkyvernPageAi:
+        return object.__getattribute__(self, "_ai")
+
     async def _decorate_call(
         self,
         fn: Callable,
