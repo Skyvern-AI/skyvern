@@ -1968,17 +1968,20 @@ async def test_first_prompt_conditional_uses_blank_page_but_task_requires_url(
         app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts = AsyncMock(return_value=[])
         app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts = AsyncMock(return_value=[])
         task_output = SimpleNamespace(
+            failure_category=None,
             model_dump=lambda: {
                 "extracted_information": {
                     "evaluations": [{"condition_index": 1, "reasoning": "matched", "result": True}]
                 }
-            }
+            },
         )
         with (
             patch.object(
                 block_module.TaskOutput,
                 "from_task",
-                side_effect=[SimpleNamespace(model_dump=dict), task_output] if reroll else [task_output],
+                side_effect=[SimpleNamespace(failure_category=None, model_dump=dict), task_output]
+                if reroll
+                else [task_output],
             ),
             patch.object(BaseTaskBlock, "record_output_parameter_value", new_callable=AsyncMock),
             patch.object(BaseTaskBlock, "build_block_result", new_callable=AsyncMock) as extraction_result,

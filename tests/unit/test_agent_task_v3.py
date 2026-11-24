@@ -19,6 +19,7 @@ import re
 import string
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -43,6 +44,7 @@ from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -70,6 +72,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     NavigationBlock,
     TaskBlock,
     ValidationBlock,
+    task_block_failure_category,
 )
 from skyvern.forge.sdk.workflow.models.credential_release import CodeBlockCredentialReleaseError
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -98,6 +101,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_LOOP_GUARD,
     DOWNLOAD_NO_FILE_FACT,
+    LLM_CALL_FAILED_GUARD,
     NAV_DEAD_END_GUARD,
     LoopOutcome,
     RoundAction,
@@ -6889,18 +6893,113 @@ async def test_execute_task_v3_refused_round_persists_a_failed_row_without_a_bud
     ]
 
 
+def _stop_entry(name: str, category: str, **extra: Any) -> list[dict[str, Any]]:
+    return [{"category": category, "confidence_float": 1.0, "reasoning": name, "reason_code": name, **extra}]
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "run_kwargs", "status", "category"),
+    [
+        pytest.param(
+            LoopOutcome(status="terminated", reason="The records list is suspended."),
+            {},
+            TaskStatus.terminated,
+            _stop_entry("model_verdict", "UNKNOWN"),
+            id="model_verdict",
+        ),
+        pytest.param(
+            LoopOutcome(status="failed", reason="The records list is suspended.", error_code="RECORDS_SUSPENDED"),
+            {},
+            TaskStatus.failed,
+            _stop_entry("model_verdict", "UNKNOWN", error_code="RECORDS_SUSPENDED"),
+            id="model_verdict_error_code",
+        ),
+        pytest.param(
+            LoopOutcome(status="terminated", reason="None of the codes fit.", error_code_declined=True),
+            {},
+            TaskStatus.terminated,
+            _stop_entry("model_verdict", "UNKNOWN", error_code_declined=True),
+            id="model_verdict_declined",
+        ),
+        *(
+            pytest.param(
+                LoopOutcome(status=status, reason="A check stopped the run.", guard=guard),
+                {},
+                TaskStatus.terminated if status == "terminated" else TaskStatus.failed,
+                _stop_entry(guard, category),
+                id=guard,
+            )
+            for guard, status, category in [
+                ("perception_stall", "terminated", "UNKNOWN"),
+                ("action_loop", "terminated", "UNKNOWN"),
+                ("page_refresh_exhausted", "terminated", "UNKNOWN"),
+                ("answer_basis_hold_bound", "terminated", "UNKNOWN"),
+                ("navigation_dead_end", "terminated", "NAVIGATION_FAILURE"),
+                ("browser_lost", "failed", "BROWSER_ERROR"),
+                ("llm_call_failed", "loop_error", "LLM_ERROR"),
+                ("no_outcome", "loop_error", "UNKNOWN"),
+                ("completion_gate", "terminated", "UNKNOWN"),
+            ]
+        ),
+        pytest.param(
+            LoopOutcome(status="completed", reason="done", billable_actions=["click"]),
+            {"completion_gate_vetoes": True},
+            TaskStatus.failed,
+            _stop_entry("completion_gate", "UNKNOWN"),
+            id="completion_gate_after_loop",
+        ),
+        pytest.param(
+            LoopOutcome(status="completed", reason="done", billable_actions=["click"]),
+            {"browser_connection_lost": True},
+            TaskStatus.failed,
+            _stop_entry("browser_connection_lost", "BROWSER_ERROR"),
+            id="browser_connection_lost",
+        ),
+        pytest.param(
+            LoopOutcome(status="completed", reason="search submitted", billable_actions=["click"]),
+            {
+                "task_block": _make_block(NavigationBlock, navigation_goal="Search"),
+                "page_url_after_loop": "about:blank",
+            },
+            TaskStatus.failed,
+            _stop_entry("blank_page", "WRONG_PAGE_STATE"),
+            id="blank_page",
+        ),
+        pytest.param(
+            LoopOutcome(status="completed", reason="done", billable_actions=[]),
+            {"data_extraction_goal": "Extract the records"},
+            TaskStatus.failed,
+            _stop_entry("extraction_missing", "DATA_EXTRACTION_FAILURE"),
+            id="extraction_missing",
+        ),
+        pytest.param(
+            LoopOutcome(status="budget_exhausted", reason="cap", cap_trip="max_turns (40) reached"),
+            {},
+            TaskStatus.failed,
+            [{"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": "max_turns (40) reached"}],
+            id="budget",
+        ),
+        pytest.param(
+            LoopOutcome(status="canceled", reason="run canceled"), {}, TaskStatus.canceled, None, id="canceled"
+        ),
+        pytest.param(LoopOutcome(status="completed", reason="done"), {}, TaskStatus.completed, None, id="completed"),
+    ],
+)
 async def test_execute_task_v3_failed_run_carries_failure_category(
     monkeypatch: pytest.MonkeyPatch,
+    outcome: LoopOutcome,
+    run_kwargs: dict[str, Any],
+    status: TaskStatus,
+    category: list[dict[str, Any]] | None,
 ) -> None:
-    # fail_task records a code-level failure classification; v3's direct finalization must too.
-    outcome = LoopOutcome(status="budget_exhausted", reason="Reached the maximum steps (2)", billable_actions=[])
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
-    )
-    assert task.status == TaskStatus.failed
-    update_kwargs = loop_mock.update_task_kwargs
-    assert update_kwargs.get("failure_category")
+    monkeypatch.setattr(agent_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    run_kwargs = {"data_extraction_goal": None, "extracted_information_schema": None, **run_kwargs}
+    if run_kwargs.pop("browser_connection_lost", False):
+        monkeypatch.setattr(agent_module, "get_browser_connection_loss", lambda _state: object())
+    _step, task, loop_mock, _post = await _run_execute_task_v3(monkeypatch, replace(outcome), **run_kwargs)
+    assert task.status == status
+    assert loop_mock.update_task_kwargs.get("failure_category") == category
 
 
 @pytest.mark.asyncio
@@ -6991,9 +7090,8 @@ async def test_execute_task_v3_cap_tripped_finish_keeps_output_and_decision_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A finish delivered on the granted final turn: the model's verdict and reason stand, the
-    # extracted_output persists despite the non-completed status, the category classifies from the
-    # model's reason (a captcha block is anti-bot, not budget — the cap merely coincided), and the
-    # terminal decision row is written like any other finish.
+    # extracted_output persists despite the non-completed status, the category names the model's
+    # verdict and the cap that coincided, and the terminal decision row is written like any other finish.
     from skyvern.forge import agent as agent_mod
 
     outcome = LoopOutcome(
@@ -7007,8 +7105,9 @@ async def test_execute_task_v3_cap_tripped_finish_keeps_output_and_decision_row(
     assert task.status == TaskStatus.failed
     update_kwargs = loop_mock.update_task_kwargs
     assert update_kwargs.get("failure_reason") == "blocked by a captcha"
-    category = update_kwargs.get("failure_category")
-    assert category and category[0]["category"] == "ANTI_BOT_DETECTION", category
+    assert update_kwargs.get("failure_category") == _stop_entry(
+        "model_verdict", "UNKNOWN", cap_trip="Reached the maximum steps (25)"
+    )
     assert update_kwargs.get("extracted_information") == {"rows": [1]}
     persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
     assert persisted.action_type == ActionType.TERMINATE
@@ -7016,22 +7115,29 @@ async def test_execute_task_v3_cap_tripped_finish_keeps_output_and_decision_row(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_cap_tripped_finish_with_unclassifiable_reason_falls_back_to_budget(
+async def test_execute_task_v3_model_verdict_category_does_not_read_the_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A granted-turn failed verdict whose reason carries no classifiable signal is usually the
-    # model narrating the truncation: the typed cap fact beats an UNKNOWN keyword fallback.
-    outcome = LoopOutcome(
-        status="failed",
-        reason="could not finish filling in the remaining sections",
-        cap_trip="max_turns (40) reached",
-        billable_actions=["click"],
-        extracted_output={"partial": True},
-    )
-    _step, task, loop_mock, _post = await _run_execute_task_v3(monkeypatch, outcome, action_rounds=None)
-    assert task.status == TaskStatus.failed
-    category = loop_mock.update_task_kwargs.get("failure_category")
-    assert category == [
+    # One exit, two reasons: one a keyword pass labels and one it does not. Both record the same entry.
+    labelled, unlabelled = "Login failed: invalid username or password", "could not finish the remaining sections"
+    assert (classify_from_failure_reason(labelled) or [{}])[0].get("category") == "AUTH_FAILURE"
+    assert classify_from_failure_reason(unlabelled) is None
+    categories, block_categories = [], []
+    for reason in (labelled, unlabelled):
+        outcome = LoopOutcome(
+            status="failed", reason=reason, cap_trip="max_turns (40) reached", billable_actions=["click"]
+        )
+        _step, task, loop_mock, _post = await _run_execute_task_v3(monkeypatch, outcome, action_rounds=None)
+        assert task.status == TaskStatus.failed
+        stored = loop_mock.update_task_kwargs.get("failure_category")
+        categories.append(json.dumps(stored))
+        block_categories.append(task_block_failure_category(stored, TaskStatus.failed, reason))
+    assert categories[0] == categories[1]
+    assert json.loads(categories[0]) == _stop_entry("model_verdict", "UNKNOWN", cap_trip="max_turns (40) reached")
+    # The block output, which the workflow run, credential fallback and templates read, keeps the reason's
+    # classification, and BUDGET_EXHAUSTED when no rule matches under a tripped cap.
+    assert block_categories[0] == classify_from_failure_reason(labelled)
+    assert block_categories[1] == [
         {"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": "max_turns (40) reached"}
     ]
 
@@ -7041,8 +7147,7 @@ async def test_execute_task_v3_cap_tripped_guard_termination_is_not_budget_categ
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A repeat-guard termination on the granted turn terminated for the guard's reason (which rides
-    # `guard`, beside the customer-facing sentence in failure_reason); stamping BUDGET_EXHAUSTED over
-    # it would mix the label axes.
+    # `guard`, beside the customer-facing sentence in failure_reason), not the budget's.
     outcome = LoopOutcome(
         status="terminated",
         reason='The run repeated the same action on the "Continue" button and the page did not change.',
@@ -7055,7 +7160,9 @@ async def test_execute_task_v3_cap_tripped_guard_termination_is_not_budget_categ
         monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
     )
     assert task.status == TaskStatus.terminated
-    assert loop_mock.update_task_kwargs.get("failure_category") is None
+    stored = loop_mock.update_task_kwargs.get("failure_category")
+    assert stored == _stop_entry("action_loop", "UNKNOWN", cap_trip="max_turns (40) reached")
+    assert task_block_failure_category(stored, TaskStatus.terminated, outcome.reason) is None
 
 
 @pytest.mark.asyncio
@@ -7075,9 +7182,9 @@ async def test_execute_task_v3_cap_tripped_missing_extraction_keeps_its_own_cate
         monkeypatch, outcome, data_extraction_goal="Extract the rows", extracted_information_schema=None
     )
     assert task.status == TaskStatus.failed
-    category = loop_mock.update_task_kwargs.get("failure_category")
-    assert category, category
-    assert category[0]["category"] != "BUDGET_EXHAUSTED", category
+    assert loop_mock.update_task_kwargs.get("failure_category") == _stop_entry(
+        "extraction_missing", "DATA_EXTRACTION_FAILURE"
+    )
 
 
 @pytest.mark.asyncio
@@ -7090,6 +7197,7 @@ async def test_execute_task_v3_cap_tripped_loop_error_keeps_provider_category_an
     outcome = LoopOutcome(
         status="loop_error",
         reason="llm_call_failed: RuntimeError: provider unavailable",
+        guard=LLM_CALL_FAILED_GUARD,
         cap_trip="max_tool_calls (100) reached",
         billable_actions=[],
         extracted_output={"rows": [8]},
@@ -7098,9 +7206,7 @@ async def test_execute_task_v3_cap_tripped_loop_error_keeps_provider_category_an
         monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
     )
     assert task.status == TaskStatus.failed
-    category = loop_mock.update_task_kwargs.get("failure_category")
-    assert category, category
-    assert category[0]["category"] != "BUDGET_EXHAUSTED", category
+    assert loop_mock.update_task_kwargs.get("failure_category") == _stop_entry("llm_call_failed", "LLM_ERROR")
     assert loop_mock.update_task_kwargs.get("extracted_information") == {"rows": [8]}
 
 

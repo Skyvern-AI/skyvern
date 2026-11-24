@@ -295,6 +295,12 @@ def _erroring_tool(
     )
 
 
+def _finish_error_classes(logs: list[dict[str, Any]]) -> list[str | None]:
+    return [
+        e.get("tool_error_class") for e in logs if e["event"] == "taskv3 tool call finished" and e["tool"] == "finish"
+    ]
+
+
 async def _run(
     script: list[list[tuple[str, dict[str, Any]]]],
     tools: list[ToolSpec],
@@ -520,7 +526,7 @@ def _look_tool(
     async def handler(args: dict[str, Any]) -> ToolResult:
         sink.append(("look", args))
         if fail_before_renumbering:
-            return ToolResult.error("look budget reached")
+            return ToolResult.error("look failed to capture the page: TimeoutError")
         return ToolResult.ok("[1] button 'Next'", data={"marks_renumbered": True}, screenshots=[image])
 
     return ToolSpec(
@@ -743,11 +749,13 @@ async def test_action_batching_multiple_tool_calls_one_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_max_turns_budget_exhausted() -> None:
-    click_calls: list[tuple[str, dict[str, Any]]] = []
-    tools = [_recording_tool("click", click_calls), make_finish_tool()]
-    script = [[("click", {})]] * 10  # never finishes
-    outcome, _ = await _run(script, tools, max_turns=3)
+@pytest.mark.parametrize("tool_name", ["click", "look"])
+async def test_max_turns_budget_exhausted(tool_name: str) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tool = _look_tool(calls) if tool_name == "look" else _recording_tool("click", calls)
+    tools = [tool, make_finish_tool()]
+    script = [[(tool_name, {})]] * 10  # never finishes
+    outcome, caller = await _run(script, tools, max_turns=3)
 
     assert outcome.status == "budget_exhausted"
     # Deliberate contract change: the first trip grants one final observed turn instead of ending
@@ -756,6 +764,7 @@ async def test_max_turns_budget_exhausted() -> None:
     assert "max_turns" not in outcome.reason
     assert outcome.cap_trip == "max_turns (3) reached"
     assert outcome.turns == 4
+    assert max(caller.image_blocks_per_call) <= 1
 
 
 @pytest.mark.asyncio
@@ -1138,8 +1147,10 @@ async def test_verification_blocker_refuses_completed_but_not_failed() -> None:
         [("finish", {"status": "completed", "reason": "done"})],
         [("finish", {"status": "failed", "reason": "verification never delivered a code"})],
     ]
-    outcome, _ = await _run(script, tools)
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
 
+    assert _finish_error_classes(logs) == ["verification_hold", None]
     tool_messages = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
     assert any("verification never delivered a code" in m["content"] for m in tool_messages)
     assert outcome.status == "failed"
@@ -1221,7 +1232,7 @@ async def test_transient_call_error_exhausts_retries_to_loop_error() -> None:
         max_call_retries=2,
         call_retry_base_delay=0.0,
     )
-    assert outcome.status == "loop_error"
+    assert (outcome.status, outcome.guard) == ("loop_error", "llm_call_failed")
     assert "llm_call_failed" in outcome.reason
 
 
@@ -6058,7 +6069,9 @@ async def test_finish_completed_defers_until_page_settles() -> None:
         [("finish", {"status": "completed", "reason": "looks done"})],
         [("finish", {"status": "completed", "reason": "confirmed on settled page"})],
     ]
-    outcome, _ = await _run(script, [make_finish_tool(page_fingerprint=fingerprint, settle_wait_seconds=0.0)])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [make_finish_tool(page_fingerprint=fingerprint, settle_wait_seconds=0.0)])
+    assert _finish_error_classes(logs) == ["unsettled_page_hold", None]
     assert outcome.status == "completed"
     assert outcome.reason == "confirmed on settled page"
     deferral_messages = [
@@ -6087,7 +6100,9 @@ async def test_finish_completed_is_held_once_on_page_text_no_result_carried() ->
         [("finish", {"status": "completed", "reason": "the list is empty"})],
         [("finish", {"status": "completed", "reason": "deleted the listed item"})],
     ]
-    outcome, _ = await _run(script, [finish], unseen_text=unseen)
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [finish], unseen_text=unseen)
+    assert _finish_error_classes(logs) == ["unseen_text_hold", None]
     assert (outcome.status, outcome.reason) == ("completed", "deleted the listed item")
     assert any('"Cart A"' in str(m.get("content")) for m in outcome.messages if m.get("name") == "finish")
 
@@ -7709,7 +7724,9 @@ async def test_finish_failed_after_captcha_defers_for_evidence_then_corrected_ve
         [("observe", {})],
         [("finish", {"status": "completed", "reason": "the page shows the application was submitted"})],
     ]
-    outcome, _ = await _run(script, tools, activity=activity)
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    assert _finish_error_classes(logs) == ["failure_evidence_hold", None]
     assert outcome.status == "completed"
     assert outcome.reason == "the page shows the application was submitted"
     deferrals = [
@@ -8288,7 +8305,7 @@ async def test_a_cancel_seen_while_waiting_on_a_request_sent_during_the_reask_ne
         deadline_at=time.monotonic() + FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS + 0.2,
     )
     result = await finish.handler({"status": "terminated", "reason": "r"})
-    assert (result.status, result.data) == ("error", None)
+    assert (result.status, result.data, result.error_class) == ("error", None, "canceled_during_finish")
 
 
 @pytest.mark.asyncio
@@ -8361,7 +8378,7 @@ async def test_submission_hold_wait_on_a_held_submission_ends_on_cancel() -> Non
     finish = make_finish_tool(activity=activity, intercepted_submissions=submissions, should_cancel=canceled)
     started = time.monotonic()
     result = await finish.handler({"status": "terminated", "reason": "r"})
-    assert result.status == "error"
+    assert (result.status, result.error_class) == ("error", "submission_hold")
     assert "still waiting" in result.content
     assert time.monotonic() - started < SUBMISSION_HELD_WAIT_MAX_SECONDS / 2
 
@@ -8480,7 +8497,8 @@ async def test_a_new_response_does_not_re_wait_on_a_submission_already_held_for(
     activity.turn += 1
     started = time.monotonic()
     second = await finish.handler({"status": "terminated", "reason": "r2"})
-    assert second.status == "error" and "got the site's response" in second.content
+    assert (second.status, second.error_class) == ("error", "submission_hold")
+    assert "got the site's response" in second.content
     assert time.monotonic() - started < 0.6
 
 
@@ -8582,6 +8600,7 @@ async def test_a_lone_typed_rejection_holds_a_give_up_once_for_the_permitted_ret
     outcome, logs = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=[_REJECTED])
     assert (outcome.status, outcome.reason) == ("terminated", "not retrying")
     assert [e["event"] for e in logs].count(_RETRY_HELD) == 1
+    assert _finish_error_classes(logs) == ["site_rejection_retry_hold", None]
 
 
 @pytest.mark.asyncio
@@ -8875,7 +8894,11 @@ async def test_justification_hold_stands_aside_without_room_to_continue(
     with capture_logs() as logs:
         result = await finish.handler({"status": "terminated", "reason": "r1"})
     if cause is None:
-        assert (result.status, result.content) == ("error", loop_module.JUSTIFY_HOLD_MESSAGE)
+        assert (result.status, result.content, result.error_class) == (
+            "error",
+            loop_module.JUSTIFY_HOLD_MESSAGE,
+            "justify_hold",
+        )
         assert [e["event"] for e in _justify_events(logs)] == [_JUSTIFY_HELD]
     else:
         assert result.status == "ok"
@@ -9419,7 +9442,9 @@ async def test_a_frozen_control_holds_the_verdict_once_and_then_gets_out_of_the_
         [("finish", {"status": "completed", "reason": "submitted the application"})],
         [("finish", {"status": "completed", "reason": "still looks submitted to me"})],
     ]
-    outcome, _ = await _run(script, [make_finish_tool(pending_marker=probe, submit_watch=watch)])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [make_finish_tool(pending_marker=probe, submit_watch=watch)])
+    assert _finish_error_classes(logs) == ["submission_in_flight_hold", None]
     assert outcome.status == "completed", outcome.status
     assert outcome.reason == "still looks submitted to me"
     assert len(_held_messages(outcome)) == 1, outcome.messages
@@ -10998,27 +11023,35 @@ async def test_a_completed_finish_with_no_file_and_unsaved_downloads_is_handed_b
         unseen_facts = DownloadFailureFacts(attach=attach)
     justified = case in ("justification_hold_not_stacked", "start_url_unseen_then_terminated")
     activity = None if not no_turn_left and not justified else ActivityRecency()
-    outcome, _ = await _run(
-        ([[("observe", {})]] if final_turn else [])
-        + [[("finish", {"status": status, "reason": "the export finished"})] for status in statuses],
-        [
-            *([_recording_tool("observe", observe_calls)] if final_turn else []),
-            make_finish_tool(
-                download_settle=settle,
-                file_landed_hold=case != "hold_switched_off",
-                unsaved_downloads=unsaved_downloads,
-                activity=activity,
-                justify_stops=justified,
-                hold_completed_on_landed_file=case.startswith("start_url"),
-                download_facts=unseen_facts,
-            ),
-        ],
-        **({"max_turns": 1} if no_turn_left else {}),
-        **({"activity": activity} if activity is not None else {}),
-    )
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            ([[("observe", {})]] if final_turn else [])
+            + [[("finish", {"status": status, "reason": "the export finished"})] for status in statuses],
+            [
+                *([_recording_tool("observe", observe_calls)] if final_turn else []),
+                make_finish_tool(
+                    download_settle=settle,
+                    file_landed_hold=case != "hold_switched_off",
+                    unsaved_downloads=unsaved_downloads,
+                    activity=activity,
+                    justify_stops=justified,
+                    hold_completed_on_landed_file=case.startswith("start_url"),
+                    download_facts=unseen_facts,
+                ),
+            ],
+            **({"max_turns": 1} if no_turn_left else {}),
+            **({"activity": activity} if activity is not None else {}),
+        )
 
     results = [str(m["content"]) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
     assert len(results) == len(statuses), results
+    unseen_held = [0] if unseen_facts is not None and statuses[0] == "completed" else []
+    held_classes = {
+        **dict.fromkeys(unsaved_held, "unsaved_download_hold"),
+        **dict.fromkeys(landed_held, "file_landed_hold"),
+        **dict.fromkeys(unseen_held, "unseen_download_facts_hold"),
+    }
+    assert _finish_error_classes(logs) == [held_classes.get(i) for i in range(len(statuses))]
     # A start URL's file the agent was never shown cannot make the block completed; with no turn left the budget ends it.
     assert outcome.status == ("budget_exhausted" if final_turn else statuses[-1])
     assert [i for i, result in enumerate(results) if "capture_failed: 2" in result] == unsaved_held
@@ -11136,8 +11169,10 @@ async def test_completion_gate_veto_refuses_the_finish_and_a_later_approved_fini
         [("click", {"selector": "#submit"})],
         [("finish", {"status": "completed", "reason": "submitted"})],
     ]
-    outcome, _ = await _run(script, tools, activity=activity, max_action_steps=5)
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity, max_action_steps=5)
 
+    assert _finish_error_classes(logs) == ["completion_gate_refusal", None]
     assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "submitted", True)
     assert click_calls == [("click", {"selector": "#submit"})]
     assert _gate_refusals(outcome) == 1
@@ -11162,7 +11197,7 @@ async def test_completion_gate_raise_ends_the_run_with_the_gates_reason(
         [[("finish", {"status": "completed", "reason": "done"})]], [make_finish_tool(completion_gate=gate)]
     )
 
-    assert outcome.status == status
+    assert (outcome.status, outcome.guard) == (status, "completion_gate")
     assert reason in outcome.reason
     assert not outcome.gate_passed
     assert outcome.model_status == "completed"
@@ -16516,11 +16551,13 @@ async def test_a_selected_candidate_that_fails_to_save_holds_the_finish(
     none = ("finish", {"status": "completed", "reason": "nothing to save", "accept_download_candidates": []})
     with patch.object(interceptor, "_atomically_write_bytes", side_effect=OSError("disk full")):
         # The first selection came before c1's facts were shown, so it holds; the next one fails to save.
-        outcome, _ = await _run(
-            [[accept], [accept], [none]],
-            [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
-        )
+        with capture_logs() as logs:
+            outcome, _ = await _run(
+                [[accept], [accept], [none]],
+                [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
+            )
 
+    assert _finish_error_classes(logs) == ["download_candidate_hold", "download_save_failed", None]
     finishes = _finish_contents(outcome)
     assert len(finishes) == 3, finishes
     assert "c1" in finishes[1] and "could not be saved" in finishes[1], finishes
@@ -16596,11 +16633,13 @@ async def test_selecting_a_candidate_the_block_no_longer_holds_does_not_complete
 
     stale = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c7"]})
     none = ("finish", {"status": "completed", "reason": "nothing to save", "accept_download_candidates": []})
-    outcome, _ = await _run(
-        [[stale], [none]],
-        [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
-    )
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            [[stale], [none]],
+            [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
+        )
 
+    assert _finish_error_classes(logs) == ["invalid_argument", None]
     finishes = _finish_contents(outcome)
     assert len(finishes) == 2 and "c7" in finishes[0], finishes
     assert outcome.reason == "nothing to save"

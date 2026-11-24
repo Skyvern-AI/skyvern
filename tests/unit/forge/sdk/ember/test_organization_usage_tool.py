@@ -62,6 +62,7 @@ CATALOG_WITHOUT_THIS_TOOL = [
     "list_credentials",
     "list_integrations",
     "read_google_sheet",
+    "create_google_sheet",
     "list_workflow_triggers",
     "test_trigger_mapping",
     "create_webhook_trigger",
