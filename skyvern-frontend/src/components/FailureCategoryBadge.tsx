@@ -19,8 +19,10 @@ function FailureCategoryBadge({ failureCategory }: Props) {
   );
   const first = failureCategory?.[0];
   // failure_category is untyped JSON on the backend and can carry model output, so guard at runtime.
+  // A Task V3 task the model itself ended names that, not a category; the failure reason says why.
   const primary =
     first !== diagnostic &&
+    first?.reason_code !== MODEL_VERDICT &&
     typeof first?.category === "string" &&
     first.category.trim()
       ? getFailureCategoryDisplay(first)
@@ -55,6 +57,7 @@ function FailureCategoryBadge({ failureCategory }: Props) {
 }
 
 const HAR_ANTI_BOT_DIAGNOSTIC = "har_anti_bot_diagnostic";
+const MODEL_VERDICT = "model_verdict";
 
 function DiagnosticBadge({ entry }: { entry: FailureCategory }) {
   const label =
