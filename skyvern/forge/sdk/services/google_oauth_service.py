@@ -74,9 +74,9 @@ GOOGLE_SHEETS_SCOPES: tuple[str, ...] = (
 )
 GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_GMAIL_SCOPES: tuple[str, ...] = (GOOGLE_GMAIL_READONLY_SCOPE,)
-# Drive uploads accept pasted folder IDs/URLs. drive.file cannot write to
-# arbitrary existing folders unless the app created or Picker-selected them, so
-# this profile intentionally uses full Drive scope until a Picker flow exists.
+# Drive uploads accept pasted folder IDs/URLs. Full Drive remains the capability
+# required by those actions; the consent profile also asks for drive.file so the
+# browser picker can mint a chosen-files-only token from the same connection.
 GOOGLE_DRIVE_SCOPES: tuple[str, ...] = ("https://www.googleapis.com/auth/drive",)
 # Only the files a person chooses in the picker or the app creates.
 GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
@@ -94,7 +94,7 @@ GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_READ_SEND = "gmail_read_send"
 GOOGLE_OAUTH_SCOPE_PROFILES: dict[str, tuple[str, ...]] = {
     GOOGLE_OAUTH_SCOPE_PROFILE_SHEETS: GOOGLE_SHEETS_SCOPES,
     GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL: GOOGLE_GMAIL_SCOPES,
-    GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE: GOOGLE_DRIVE_SCOPES,
+    GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE: (*GOOGLE_DRIVE_SCOPES, GOOGLE_DRIVE_FILE_SCOPE),
     GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE_FILE: GOOGLE_DRIVE_FILE_SCOPES,
     GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_SEND: GOOGLE_GMAIL_SEND_SCOPES,
     GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_READ_SEND: (*GOOGLE_GMAIL_SCOPES, *GOOGLE_GMAIL_SEND_SCOPES),
@@ -183,6 +183,10 @@ class ExpiredRefreshTokenError(MissingAccessTokenError):
     or expired. Subclasses ``MissingAccessTokenError`` so existing reconnect handling still catches
     it, while letting callers flip the credential to a "needs reconnect" state on this signal alone
     (as opposed to a transient transport error)."""
+
+
+class InvalidScopeError(MissingAccessTokenError):
+    """Raised when Google rejects scopes requested during a refresh."""
 
 
 class RotatedRefreshTokenPersistenceError(RuntimeError):
@@ -287,6 +291,13 @@ def _is_invalid_grant(exc: RefreshError) -> bool:
     return bool(exc.args and isinstance(exc.args[0], str) and exc.args[0].split(":", 1)[0] == "invalid_grant")
 
 
+def _is_invalid_scope(exc: RefreshError) -> bool:
+    for detail in exc.args:
+        if isinstance(detail, Mapping):
+            return detail.get("error") == "invalid_scope"
+    return bool(exc.args and isinstance(exc.args[0], str) and exc.args[0].split(":", 1)[0] == "invalid_scope")
+
+
 @dataclass(frozen=True)
 class GoogleCredentialSecrets:
     """Decrypted credential material needed to mint an access token."""
@@ -302,6 +313,8 @@ class GoogleCredentialSecrets:
 class GoogleRefreshResult:
     access_token: str
     credential_version: datetime.datetime | None
+    granted_scopes: tuple[str, ...] | None = None
+    expires_at: datetime.datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -670,6 +683,7 @@ async def start_authorization(
     if app_origin is not None:
         _validate_app_origin(app_origin, resolved_config.config)
 
+    is_plain_reconnect = credential_id is not None and scope_profile is None
     state = oauth_consent.generate_consent_state()
     nonce = oauth_consent.consent_nonce(state, initiator_id)
     # Pre-generate the PKCE verifier so the pending row lands with the verifier
@@ -683,7 +697,6 @@ async def start_authorization(
         # Re-request the scopes already granted (plus any profile) so the same workflow blocks keep working.
         requested_scopes_override = scopes_for_profile(scope_profile) if scope_profile is not None else None
         is_send_upgrade = scope_profile in _SEND_UPGRADE_SCOPE_PROFILES
-        is_plain_reconnect = requested_scopes_override is None
 
         def adjust_scopes(row: GoogleOAuthCredentialBase, scopes: list[str]) -> list[str]:
             # Without a recorded account the callback cannot prove the same account signed in again, so the user
@@ -700,6 +713,10 @@ async def start_authorization(
                 )
             if is_plain_reconnect:
                 merged = list(row.scopes_granted) or scopes
+                if GOOGLE_DRIVE_FILE_SCOPE not in row.scopes_granted and has_required_scopes(
+                    row.scopes_granted, GOOGLE_DRIVE_SCOPES
+                ):
+                    merged = _merge_scopes(merged, (GOOGLE_DRIVE_FILE_SCOPE,))
             else:
                 merged = (
                     _merge_scopes(row.scopes_granted, scopes)
@@ -913,6 +930,19 @@ async def verify_google_identity(id_token: str | None, client_id: str) -> Google
     return GoogleIdentity(subject=subject, email=normalize_email_address(email))
 
 
+def _required_consent_scopes(context: PendingConsentContext, scopes_granted: Sequence[str]) -> set[str]:
+    prior_scopes = _normalized_scopes(context.scopes_granted)
+    required_scopes = _normalized_scopes(context.scopes_requested) | prior_scopes
+    granted_scopes = _normalized_scopes(scopes_granted)
+    if (
+        GOOGLE_DRIVE_FILE_SCOPE in required_scopes  # nosemgrep: incomplete-url-substring-sanitization
+        and GOOGLE_DRIVE_FILE_SCOPE not in prior_scopes
+        and _normalized_scopes(GOOGLE_DRIVE_SCOPES) <= granted_scopes
+    ):
+        required_scopes.remove(GOOGLE_DRIVE_FILE_SCOPE)
+    return required_scopes
+
+
 async def verify_gmail_send_consent(
     context: PendingConsentContext,
     scopes_granted: Sequence[str],
@@ -928,7 +958,7 @@ async def verify_gmail_send_consent(
             raise GmailSendConsentRejectedError(GmailSendConsentRejection.IDENTITY_UNVERIFIED)
     else:
         identity = None
-    if not _normalized_scopes(context.scopes_requested) <= _normalized_scopes(scopes_granted):
+    if not _required_consent_scopes(context, scopes_granted) <= _normalized_scopes(scopes_granted):
         raise GmailSendConsentRejectedError(GmailSendConsentRejection.SCOPES_NOT_GRANTED, gmail_send=gmail_send)
     identity_required = gmail_send or bool(context.google_subject or context.email_address)
     if not identity_required:
@@ -1021,6 +1051,8 @@ async def refresh_access_token(
     except RefreshError as exc:
         if _is_invalid_grant(exc):
             raise ExpiredRefreshTokenError(f"Google rejected the refresh token: {exc}") from exc
+        if _is_invalid_scope(exc):
+            raise InvalidScopeError(f"Google rejected the requested scopes: {exc}") from exc
         raise MissingAccessTokenError(f"Google token refresh failed: {exc}") from exc
     except GoogleAuthError as exc:
         raise MissingAccessTokenError(f"Google token refresh failed: {exc}") from exc
@@ -1082,6 +1114,7 @@ async def access_token_from_secrets(
 async def credentials_from_secrets(
     credential_secrets: GoogleCredentialSecrets,
     organization_id: str | None = None,
+    requested_scopes: Sequence[str] | None = None,
 ) -> Credentials:
     """Build a refreshed ``Credentials`` from already-decrypted secrets. Network-only; no DB."""
     resolved_config = await resolve_client_config(organization_id, strict=False)
@@ -1098,13 +1131,15 @@ async def credentials_from_secrets(
         token_uri=GOOGLE_TOKEN_ENDPOINT,
         client_id=client_id,
         client_secret=client_secret,
-        scopes=credential_secrets.scopes,
+        scopes=list(requested_scopes) if requested_scopes is not None else credential_secrets.scopes,
     )
     try:
         await asyncio.to_thread(creds.refresh, GoogleAuthRequest())
     except RefreshError as exc:
         if _is_invalid_grant(exc):
             raise ExpiredRefreshTokenError(f"Google rejected the refresh token: {exc}") from exc
+        if _is_invalid_scope(exc):
+            raise InvalidScopeError(f"Google rejected the requested scopes: {exc}") from exc
         raise MissingAccessTokenError(f"Google token refresh failed: {exc}") from exc
     except GoogleAuthError as exc:
         raise MissingAccessTokenError(f"Google token refresh failed: {exc}") from exc
@@ -1131,8 +1166,16 @@ async def refresh_and_rotate(
     organization_id: str,
     credential_id: str,
     credential_secrets: GoogleCredentialSecrets,
+    requested_scopes: Sequence[str] | None = None,
 ) -> GoogleRefreshResult:
-    creds = await credentials_from_secrets(credential_secrets, organization_id)
+    if requested_scopes is None:
+        creds = await credentials_from_secrets(credential_secrets, organization_id)
+    else:
+        creds = await credentials_from_secrets(
+            credential_secrets,
+            organization_id,
+            requested_scopes=requested_scopes,
+        )
     access_token = creds.token
     if not isinstance(access_token, str) or not access_token:
         raise MissingAccessTokenError("Google token response did not include access_token")
@@ -1180,7 +1223,17 @@ async def refresh_and_rotate(
             raise RotatedRefreshTokenPersistenceError(
                 "Failed to persist rotated Google refresh token; reconnect the Google account"
             ) from exc
-    return GoogleRefreshResult(access_token=access_token, credential_version=credential_version)
+    granted_scopes = None
+    expires_at = None
+    if requested_scopes is not None:
+        granted_scopes = tuple(creds.granted_scopes) if creds.granted_scopes is not None else None
+        expires_at = creds.expiry
+    return GoogleRefreshResult(
+        access_token=access_token,
+        credential_version=credential_version,
+        granted_scopes=granted_scopes,
+        expires_at=expires_at,
+    )
 
 
 async def get_credentials_for_org(organization_id: str) -> list[GoogleOAuthCredentialBase]:

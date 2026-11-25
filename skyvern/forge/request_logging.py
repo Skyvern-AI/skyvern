@@ -48,6 +48,7 @@ _SENSITIVE_ENDPOINTS = {
     "POST /api/v1/internal/gmail/send",
     "POST /api/v1/internal/gmail/attachment",
     "POST /api/v1/internal/gmail/trigger-read",
+    "POST /api/v1/internal/gmail/login-code",
     # Agent reports can contain credentials before route redaction.
     "POST /v1/agent_feedback",
     "GET /api/v1/users/me/onboarding",
@@ -64,6 +65,8 @@ _SENSITIVE_ENDPOINTS = {
     "PUT /api/v1/google/oauth/config",
     "POST /v1/google/oauth/callback",
     "POST /api/v1/google/oauth/callback",
+    "POST /v1/integrations/google/drive/picker-token",
+    "POST /api/v1/integrations/google/drive/picker-token",
     "POST /v1/recipes/jobs/apply",
     "POST /v1/browser_sessions/external",
     # Editor-assist bodies carry workflow YAML and code, which can hold secrets.
