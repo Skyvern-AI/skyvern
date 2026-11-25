@@ -664,7 +664,9 @@ async def test_a_task_v2_response_looks_up_and_reads_each_download_once_and_keep
         "second_copy_only": _download_output(["a_2"]),
         "mixed_runs": _download_output(["a_1", "o_1"]),
     }
-    refreshed = await service._refresh_output_urls(outputs, "o_1", "wr_1", comparison=comparison)
+    refreshed = await service._refresh_output_urls(
+        outputs, "o_1", "wr_1", comparison=comparison, run_task_ids=frozenset({"oc_1"})
+    )
 
     assert [f.artifact_id for f in files or []] == ["a_1", "b_1"]
     assert refreshed["task"]["downloaded_file_artifact_ids"] == ["a_1", "b_1"]

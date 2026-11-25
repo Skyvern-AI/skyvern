@@ -27,6 +27,8 @@ from skyvern.forge.sdk.artifact.signing import (
     verify_artifact_signature,
 )
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 
 pytestmark = pytest.mark.usefixtures("public_dns")
 
@@ -779,35 +781,130 @@ def _corrupt_signature(url: str, drop_index: int = 13) -> str:
 
 
 @pytest.mark.asyncio
-async def test_resolve_remints_first_party_url_with_corrupted_signature(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("damage", ["corrupted", "expired"])
+async def test_resolve_remints_first_party_url_with_unverifiable_signature(
+    monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
     get_artifact_by_id = _patch_artifact_lookup(monkeypatch, _artifact())
     download_mock = AsyncMock(return_value="/tmp/docs_5.pdf")
     monkeypatch.setattr(files, "download_file", download_mock)
-    signed = sign_artifact_url(_BASE_URL, "a_1", parse_keyring(_KEYRING_JSON))
-    corrupted = _corrupt_signature(signed)
+    keyring = parse_keyring(_KEYRING_JSON)
+    unverifiable = (
+        _corrupt_signature(sign_artifact_url(_BASE_URL, "a_1", keyring))
+        if damage == "corrupted"
+        else sign_artifact_url(_BASE_URL, "a_1", keyring, expiry_seconds=-60)
+    )
 
-    await files.resolve_local_or_download_file(corrupted, "wr_1", organization_id="org-1")
+    await files.resolve_local_or_download_file(unverifiable, "wr_1", organization_id="org-1")
 
     get_artifact_by_id.assert_awaited_once_with(artifact_id="a_1", organization_id="org-1")
     downloaded_url = download_mock.await_args.args[0]
-    assert downloaded_url != corrupted
+    assert downloaded_url != unverifiable
     parsed = parse_artifact_content_url(downloaded_url, _BASE_URL)
     assert parsed is not None
-    assert verify_artifact_signature(
-        "a_1", parsed.expiry or "", parsed.kid or "", parsed.sig or "", parse_keyring(_KEYRING_JSON)
-    )
+    assert verify_artifact_signature("a_1", parsed.expiry or "", parsed.kid or "", parsed.sig or "", keyring)
 
 
 @pytest.mark.asyncio
-async def test_resolve_remints_expired_first_party_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_artifact_lookup(monkeypatch, _artifact())
-    download_mock = AsyncMock(return_value="/tmp/docs_5.pdf")
-    monkeypatch.setattr(files, "download_file", download_mock)
-    expired = sign_artifact_url(_BASE_URL, "a_1", parse_keyring(_KEYRING_JSON), expiry_seconds=-60)
+@pytest.mark.parametrize("enforced", [True, False])
+@pytest.mark.parametrize("subject_reads", [True, False])
+@pytest.mark.parametrize("executing", ["wr_1", "tsk_solo"])
+@pytest.mark.parametrize("owned", [True, False])
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "content_url",
+        "signed_content_url",
+        "unknown_content_url",
+        "artifact_uri",
+        "artifact_uri_lookup_error",
+        "download_uri",
+        "upload_uri",
+        "org_upload_uri",
+        "session_uri",
+    ],
+)
+async def test_resolve_refuses_artifact_references_the_run_cannot_read_when_enforced(
+    monkeypatch: pytest.MonkeyPatch, reference: str, owned: bool, executing: str, subject_reads: bool, enforced: bool
+) -> None:
+    """A run's file input can name any stored object of its organization; with the read check enforced, a storage URI
+    or a content URL being re-signed is fetched only when it is the run's own or the run itself can read it. The run
+    is a workflow run, or a task that runs outside one."""
+    env_org = f"{settings.ENV}/org-1"
+    subject = {"workflow_run_id": executing} if executing.startswith("wr_") else {"task_id": executing}
+    owner_run = executing if owned else "wr_other"
+    # A task's own row names only the task, with no run id: the weakest tie it must still recognize as its own.
+    owner = (
+        {"workflow_run_id": owner_run, "run_id": owner_run} if owner_run.startswith("wr_") else {"task_id": owner_run}
+    )
+    uri = {
+        "artifact_uri": f"s3://bucket/v1/{env_org}/tsk_1/01_0_stp_1/2026-11-23T00:00:00_a_9_screenshot_final.png",
+        "artifact_uri_lookup_error": f"s3://bucket/v1/{env_org}/tsk_1/01_0_stp_1/2026-11-23T00:00:00_a_9_html.html",
+        "download_uri": f"s3://bucket/downloads/{env_org}/{owner_run}/report.pdf",
+        "upload_uri": f"s3://bucket/{env_org}/2026-11-23/{owner_run}/5f0c_report.pdf",
+        "org_upload_uri": f"s3://bucket/{env_org}/2026-11-23/5f0c_report.pdf",
+        "session_uri": f"s3://bucket/v1/{env_org}/browser_sessions/pbs_1/downloads/report.pdf",
+    }.get(reference, "s3://bucket/downloads/docs_5.pdf")
+    now = datetime(2026, 11, 23, tzinfo=timezone.utc)
+    artifact = Artifact(
+        artifact_id="a_9",
+        artifact_type=ArtifactType.DOWNLOAD,
+        uri=uri,
+        organization_id="org-1",
+        created_at=now,
+        modified_at=now,
+        **owner,
+    )
 
-    await files.resolve_local_or_download_file(expired, "wr_1", organization_id="org-1")
+    async def get_artifact_by_id(artifact_id: str, organization_id: str) -> Artifact | None:
+        if reference == "artifact_uri_lookup_error":
+            raise RuntimeError("lookup failed")
+        return artifact if artifact_id == "a_9" else None
 
-    assert download_mock.await_args.args[0] != expired
+    async def readable_as_subject(
+        _organization_id: str, workflow_run_id: str | None, artifacts: list[Artifact], *, task_id: str | None = None
+    ) -> set[str]:
+        asked_as = {"workflow_run_id": workflow_run_id} if workflow_run_id else {"task_id": task_id}
+        return {a.artifact_id for a in artifacts} if subject_reads and asked_as == subject else set()
+
+    _patch_artifact_lookup(monkeypatch, artifact)
+    forge_app.DATABASE.artifacts.get_artifact_by_id = AsyncMock(side_effect=get_artifact_by_id)
+    forge_app.DATABASE.artifacts.find_download_artifact = AsyncMock(return_value=artifact)
+    storage = MagicMock()
+    storage.assert_managed_file_access = MagicMock(return_value=None)
+    storage.download_managed_file = AsyncMock(return_value=b"report")
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(forge_app.AGENT_FUNCTION, "readable_run_artifact_ids", readable_as_subject)
+    monkeypatch.setattr(settings, "ARTIFACT_REFERENCE_READ_CHECK", enforced)
+    keyring = parse_keyring(_KEYRING_JSON)
+    content_url = {
+        "content_url": _corrupt_signature(sign_artifact_url(_BASE_URL, "a_9", keyring)),
+        "signed_content_url": sign_artifact_url(_BASE_URL, "a_9", keyring),
+        "unknown_content_url": _corrupt_signature(sign_artifact_url(_BASE_URL, "a_404", keyring)),
+    }.get(reference)
+    if content_url is not None:
+        monkeypatch.setattr(files, "download_file", AsyncMock(return_value="/tmp/report.pdf"))
+    outside_run = reference == "session_uri" or (
+        not owned and reference in ("content_url", "artifact_uri", "download_uri", "upload_uri")
+    )
+    refused = enforced and (reference == "artifact_uri_lookup_error" or (outside_run and not subject_reads))
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="org-1", run_id=executing, **subject)):
+        if content_url is not None:
+            fetch = files.resolve_local_or_download_file(content_url, executing, organization_id="org-1")
+        else:
+            fetch = files.download_file(uri, organization_id="org-1")
+        if refused:
+            with pytest.raises(PermissionError):
+                await fetch
+            return
+        path = await fetch
+
+    if content_url is None:
+        assert Path(path).read_bytes() == b"report"
+        os.remove(path)
+    else:
+        assert path == "/tmp/report.pdf"
 
 
 @pytest.mark.asyncio
