@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import zipfile
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, tzinfo
@@ -11,6 +13,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
+from botocore.exceptions import ClientError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -23,12 +26,14 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.storage.base import BrowserProfileSnapshot
 from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
     ProfilePublicationConflict,
     ProfilePublicationUnconfirmed,
 )
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -74,7 +79,11 @@ from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
-from tests.unit.forge.sdk.artifact.storage.test_helpers import artifact_root
+from tests.unit.forge.sdk.artifact.storage.test_helpers import (
+    ProfileTransport,
+    artifact_root,
+    install_s3_profile_transport,
+)
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -344,26 +353,47 @@ async def test_ensure_managed_browser_profile_skips_non_persist_workflow(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["sealed-denied-missing", "sealed-denied-plaintext"])
 async def test_ensure_managed_browser_profile_seeds_new_profile_from_legacy_archive(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str
 ) -> None:
-    profile = SimpleNamespace(browser_profile_id="bp_managed")
+    profile = SimpleNamespace(browser_profile_id="bp_managed", proxy_session_id=None, is_managed=True)
     get_or_create = AsyncMock(return_value=(profile, True))
     monkeypatch.setattr(app.DATABASE.browser_sessions, "get_or_create_managed_browser_profile", get_or_create)
-    store = _mock_storage(monkeypatch, legacy_dir="/tmp/legacy_session")
+    storage, transport = S3Storage(), ProfileTransport()
+    legacy, sealed = storage._workflow_session_uris("o_test", "wpid_test")
+    destination, _ = storage._profile_uris("o_test", profile.browser_profile_id)
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
+    monkeypatch.setattr(app, "STORAGE", storage)
+    monkeypatch.setattr(app.DATABASE.browser_sessions, "hard_delete_browser_profile", AsyncMock())
+    if source == "sealed-denied-plaintext":
+        transport.objects[legacy] = ArtifactManager._build_zip({"Default/Cookies": b"legacy login"})
+        transport.objects[sealed] = b"unreadable seal"
+    original = transport.objects.copy()
+    read = transport.download_file
 
-    await WorkflowService()._ensure_managed_browser_profile(
+    async def refuse_seal(uri: str) -> bytes | None:
+        if uri == sealed:
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}}, "GetObject"
+            )
+        return await read(uri)
+
+    monkeypatch.setattr(transport, "download_file", refuse_seal)
+    install_s3_profile_transport(storage, transport, monkeypatch)
+
+    result = await WorkflowService()._ensure_managed_browser_profile(
         workflow=_workflow(),
         workflow_run=_workflow_run(),
         parameter_values={},
     )
 
-    store.assert_awaited_once_with(
-        "o_test",
-        profile_id="bp_managed",
-        directory="/tmp/legacy_session",
-        require_encryption=False,
-    )
+    assert result == profile.browser_profile_id
+    if source == "sealed-denied-plaintext":
+        with zipfile.ZipFile(io.BytesIO(transport.objects.pop(destination))) as bundle:
+            assert bundle.read("Default/Cookies") == b"legacy login"
+    assert transport.objects == original
 
 
 @pytest.mark.asyncio
