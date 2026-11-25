@@ -193,17 +193,19 @@ async def test_sqlite_bootstrap_adds_attempt_columns_to_existing_tables(
     sqlite_bootstrap_db,
     patched_env_writes,
 ) -> None:
-    """Bootstrap adds the retry attempt and task queue columns to a database created before them, so ORM reads work."""
+    """Bootstrap adds columns newer than an existing database, so ORM reads work."""
     from sqlalchemy import select
 
     from skyvern.forge.api_app import _bootstrap_sqlite
-    from skyvern.forge.sdk.db.models import Base, TaskModel, WorkflowRunBlockModel
+    from skyvern.forge.sdk.db.models import Base, BrowserProfileModel, TaskModel, WorkflowRunBlockModel
 
     async with sqlite_bootstrap_db.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.exec_driver_sql("ALTER TABLE tasks DROP COLUMN attempt_number")
         await conn.exec_driver_sql("ALTER TABLE tasks DROP COLUMN task_queue")
         await conn.exec_driver_sql("ALTER TABLE workflow_run_blocks DROP COLUMN attempt_number")
+        await conn.exec_driver_sql("ALTER TABLE browser_profiles DROP COLUMN source_browser_session_id")
+        await conn.exec_driver_sql("ALTER TABLE browser_profiles DROP COLUMN source_workflow_run_id")
 
     await _bootstrap_sqlite()
     await _bootstrap_sqlite()
@@ -211,6 +213,7 @@ async def test_sqlite_bootstrap_adds_attempt_columns_to_existing_tables(
     async with sqlite_bootstrap_db.Session() as session:
         assert (await session.execute(select(TaskModel))).scalars().all() == []
         assert (await session.execute(select(WorkflowRunBlockModel))).scalars().all() == []
+        assert (await session.execute(select(BrowserProfileModel))).scalars().all() == []
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -39,6 +40,7 @@ def _build_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, AsyncMoc
         return SimpleNamespace(organization_id=ORG_ID)
 
     monkeypatch.setattr(forge_app.AGENT_FUNCTION, "credential_folders_restricted", AsyncMock(return_value=False))
+    monkeypatch.setattr(forge_app.AGENT_FUNCTION, "browser_profile_source_rules_apply", AsyncMock(return_value=False))
     list_browser_profiles = AsyncMock()
     monkeypatch.setattr(
         forge_app.DATABASE.browser_sessions,
@@ -56,24 +58,55 @@ def _build_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, AsyncMoc
     return TestClient(fastapi_app), list_browser_profiles
 
 
-def test_list_browser_profiles_default_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("source_rules_apply", "hidden_by_source", "page_size", "expected_ids"),
+    [(False, set(), 10, ["bp_1", "bp_2"]), (True, {"bp_1"}, 2, ["bp_2", "bp_3"])],
+    ids=["no_source_rules", "source_hidden_before_paging"],
+)
+def test_list_browser_profiles_default_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+    source_rules_apply: bool,
+    hidden_by_source: set[str],
+    page_size: int,
+    expected_ids: list[str],
+) -> None:
     client, list_browser_profiles = _build_client(monkeypatch)
-    list_browser_profiles.return_value = [_profile("bp_1"), _profile("bp_2")]
+    stored = [_profile(f"bp_{index}") for index in range(1, 3 if not source_rules_apply else 31)]
+    checked: set[str] = set()
 
-    response = client.get("/v1/browser_profiles")
+    async def paged(**kwargs: object) -> list[BrowserProfile]:
+        size = cast(int, kwargs["page_size"])
+        offset = (cast(int, kwargs["page"]) - 1) * size
+        return stored[offset : offset + size]
+
+    async def hidden(_principal: object, _organization_id: str, profile_ids: set[str]) -> set[str]:
+        checked.update(profile_ids)
+        return profile_ids & hidden_by_source
+
+    list_browser_profiles.side_effect = paged
+    monkeypatch.setattr(
+        forge_app.AGENT_FUNCTION, "browser_profile_source_rules_apply", AsyncMock(return_value=source_rules_apply)
+    )
+    monkeypatch.setattr(forge_app.AGENT_FUNCTION, "hidden_browser_profile_ids", hidden)
+
+    response = client.get(f"/v1/browser_profiles?page_size={page_size}")
 
     assert response.status_code == 200
     body = response.json()
-    assert [p["browser_profile_id"] for p in body] == ["bp_1", "bp_2"]
-    list_browser_profiles.assert_awaited_once_with(
-        organization_id=ORG_ID,
-        include_deleted=False,
-        page=1,
-        page_size=10,
-        search_key=None,
-        managed=None,
-        exclude_search_profile_ids=set(),
-    )
+    assert [p["browser_profile_id"] for p in body] == expected_ids
+    if not source_rules_apply:
+        list_browser_profiles.assert_awaited_once_with(
+            organization_id=ORG_ID,
+            include_deleted=False,
+            page=1,
+            page_size=10,
+            search_key=None,
+            managed=None,
+            exclude_search_profile_ids=set(),
+        )
+    else:
+        # Only the rows needed to fill the page are checked, not every saved profile in the organization.
+        assert len(checked) < len(stored)
 
 
 def test_list_browser_profiles_explicit_pagination(monkeypatch: pytest.MonkeyPatch) -> None:

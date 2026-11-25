@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 from collections.abc import Callable
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason, derive_failure_attribution
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.db.models import BrowserProfileModel, CredentialModel, WorkflowModel, WorkflowRunModel
+from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.workflow import context_manager as context_manager_module
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.browser_profile_key import build_browser_profile_key_digest
@@ -75,6 +77,7 @@ def _svc(
     monkeypatch.setattr(svc, "_managed_browser_profile_has_content", AsyncMock(return_value=has_content))
     monkeypatch.setattr(svc, "_resolve_credential_browser_profile_id_for_setup", AsyncMock(return_value=credential))
     monkeypatch.setattr(svc, "_resolve_picked_profile_role", AsyncMock(return_value=(pick_role, pick_owner)))
+    monkeypatch.setattr(svc, "_run_may_seed_from_profile", AsyncMock(return_value=True))
     return svc
 
 
@@ -495,9 +498,16 @@ async def test_row2_off_no_pick_credential_seeds_readonly(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_plain_pick_is_living_under_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("run_may_use_profile", [True, False], ids=["usable", "source_not_usable"])
+async def test_plain_pick_is_living_under_engine(monkeypatch: pytest.MonkeyPatch, run_may_use_profile: bool) -> None:
     # v32 (B1): a plain pick is always LIVING under the engine (seed==sink); the persist toggle drops out.
     svc = _svc(monkeypatch, pick_role="plain")
+    monkeypatch.setattr(svc, "_run_may_seed_from_profile", AsyncMock(return_value=run_may_use_profile))
+    if not run_may_use_profile:
+        # A pick or override whose source the run cannot use starts fresh, also for runs started internally.
+        assert await _resolve(svc, _workflow(pick="bp_pick")) == (None, BrowserSeedSource.fresh, None)
+        assert await _resolve(svc, _workflow(), override="bp_pick") == (None, BrowserSeedSource.fresh, None)
+        return
     assert await _resolve(svc, _workflow(pick="bp_pick")) == ("bp_pick", BrowserSeedSource.picked, "bp_pick")
 
 
@@ -1412,12 +1422,21 @@ def _workflow_with_blocks(*blocks: LoginBlock) -> SimpleNamespace:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("profile_workflow", "run_may_use_profile", "expected"),
-    [(None, False, "bp_cred"), ("wpid_restricted", True, "bp_cred"), ("wpid_restricted", False, None)],
-    ids=["unbound_profile", "bound_profile_usable", "bound_profile_not_usable"],
+    ("profile_workflow", "profile_source", "run_may_use_profile", "expected"),
+    [
+        (None, None, False, "bp_cred"),
+        ("wpid_restricted", None, True, "bp_cred"),
+        ("wpid_restricted", None, False, None),
+        (None, ("pbs_source", None), False, None),
+    ],
+    ids=["unbound_profile", "bound_profile_usable", "bound_profile_not_usable", "sourced_profile_not_usable"],
 )
 async def test_setup_credential_resolves_single_login_block(
-    monkeypatch: pytest.MonkeyPatch, profile_workflow: str | None, run_may_use_profile: bool, expected: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    profile_workflow: str | None,
+    profile_source: tuple[str | None, str | None] | None,
+    run_may_use_profile: bool,
+    expected: str | None,
 ) -> None:
     monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})  # no run context at setup
     monkeypatch.setattr(
@@ -1433,6 +1452,16 @@ async def test_setup_credential_resolves_single_login_block(
                 browser_profile_id="bp_cred", auto_profile_disabled=False, workflow_permanent_id=profile_workflow
             )
         ),
+    )
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_browser_profile_sources",
+        AsyncMock(return_value={"bp_cred": profile_source} if profile_source else {}),
+    )
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "is_browser_profile_access_scoped",
+        functools.partial(BrowserSessionsRepository.is_browser_profile_access_scoped, app.DATABASE.browser_sessions),
     )
     monkeypatch.setattr(
         app.AGENT_FUNCTION, "workflow_run_can_use_browser_profile", AsyncMock(return_value=run_may_use_profile)

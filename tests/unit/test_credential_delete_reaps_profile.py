@@ -50,6 +50,9 @@ def _setup_app(
     async def get_profile(*, profile_id: str, organization_id: str) -> SimpleNamespace | None:
         return profiles.get(profile_id)
 
+    async def access_scoped(*, organization_id: str, profile: SimpleNamespace) -> bool:
+        return profile.workflow_permanent_id is not None
+
     async def delete_profile_row(*, profile_id: str, organization_id: str) -> None:
         if db_raises:
             raise RuntimeError("db down")
@@ -83,6 +86,7 @@ def _setup_app(
             browser_sessions=SimpleNamespace(
                 has_live_browser_profile_references=has_live,
                 get_browser_profile=get_profile,
+                is_browser_profile_access_scoped=access_scoped,
                 delete_browser_profile=db_delete_profile,
             ),
         ),
