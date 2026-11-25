@@ -275,6 +275,7 @@ def expand_secret_encodings(value: str) -> set[str]:
         urllib.parse.quote(value, safe=""),
         urllib.parse.quote_plus(value),
         json.dumps(value)[1:-1],
+        json.dumps(value, ensure_ascii=False)[1:-1],
         html.escape(value, quote=True),
         base64.b64encode(value.encode()).decode(),
     }

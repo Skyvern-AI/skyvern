@@ -274,8 +274,9 @@ ACTING_ACCOUNT_TOOL_NAMES: frozenset[str] = frozenset(
 ) | frozenset(name for name, (_, action) in CATALOG_ACTION_TOOLS.items() if action.acts)
 RUN_TOOL_DESCRIPTIONS: dict[str, str] = {
     "read_run_data": "Read what this run already has. Without name: the names of its workflow parameters, its "
-    "earlier blocks with their status, and its files. With name: that parameter's value, that block's "
-    "output and outcome, or that file's URL. Secret values are masked. With offset, a cut result from that "
+    "block outputs with their status, and its files; a null status marks a block output handed in from an earlier "
+    "run. With name: that parameter's value, that block's output and outcome (name a block by its label or its "
+    "<label>_output key), or that file's URL. Secret values are masked. With offset, a cut result from that "
     "character on.",
     "page_goto": "Open url in this run's browser.",
     "page_click": "Click the element prompt describes." + _NO_SECOND_AGENT,

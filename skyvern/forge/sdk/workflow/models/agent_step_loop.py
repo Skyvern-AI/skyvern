@@ -126,6 +126,21 @@ _TRAIL_WRITE_SECONDS = 2
 _PAGE_TITLE_SECONDS = 2
 _MASK = "*****"
 _Fact = str | list[dict[str, str]]
+# Characters that render as nothing and that json.dumps(ensure_ascii=False) leaves raw; written as the escape
+# ensure_ascii would give, so hidden page text stays visible to the model.
+_INVISIBLE_ESCAPES = {
+    code_point: json.dumps(chr(code_point))[1:-1]
+    for first, last in (
+        (0x85, 0x85),
+        (0x200B, 0x200F),
+        (0x2028, 0x202E),
+        (0x2060, 0x2060),
+        (0x2066, 0x2069),
+        (0xFEFF, 0xFEFF),
+        (0xE0000, 0xE007F),
+    )
+    for code_point in range(first, last + 1)
+}
 _OPAQUE_TOKEN = re.compile(rf"{_TOKEN_PREFIX}[0-9a-f]{{8}}")
 
 _INSTRUCTIONS = (
@@ -169,7 +184,7 @@ class _RunState:
     # Kept out of run_context.parameters, which outlives this execution while child labels repeat in the next one.
     child_outputs: dict[str, OutputParameter] = field(default_factory=dict)
     calls: list[dict[str, Any]] = field(default_factory=list)
-    # The report each child block returned, by label, so read_run_data can page the text the model was shown.
+    # The report each child block or page command returned, by name, so read_run_data can page what the model saw.
     results: dict[str, dict[str, Any]] = field(default_factory=dict)
     answer: dict[str, Any] | None = None
     drained: bool = False
@@ -508,6 +523,21 @@ def resolve_agent_model(llm_key: str) -> tuple[str | Model, RunConfig]:
     )
 
 
+def _finish_argument_facts(answer: JsonValue, schema: dict[str, Any]) -> list[str]:
+    properties = schema.get("properties")
+    if not isinstance(answer, dict) or not isinstance(properties, dict):
+        return []
+    absent = [key for key in properties if key not in answer]
+    facts = []
+    for key, value in answer.items():
+        inside = [name for name in absent if f'<parameter name="{name}">' in value] if isinstance(value, str) else []
+        if inside:
+            tags = " and ".join(f'<parameter name="{name}">' for name in inside)
+            facts.append(f"The value of {key} contains {tags}, and the arguments have no {' or '.join(inside)} key.")
+    facts += [f"{key} is not one of finish's fields." for key in answer if key not in properties]
+    return facts
+
+
 def _finish_tool(schema: dict[str, Any], state: _RunState) -> FunctionTool:
     async def invoke(arguments: str) -> str:
         try:
@@ -518,7 +548,8 @@ def _finish_tool(schema: dict[str, Any], state: _RunState) -> FunctionTool:
         error = _validate_response_against_json_schema(answer, schema, "finish")
         _record_call(state, answer, tool="finish", status="invalid_arguments" if error else "completed")
         if error:
-            return f"{error.rstrip('.')}. Call finish again with arguments that match its schema."
+            facts = "".join(f" {fact}" for fact in _finish_argument_facts(answer, schema))
+            return f"{error.rstrip('.')}.{facts} Call finish again with arguments that match its schema."
         state.answer = answer
         return "Answer recorded."
 
@@ -730,10 +761,13 @@ def _masked_text(report: dict[str, Any], run_context: WorkflowRunContext) -> str
         run_context.mask_platform_smtp_for_agent(report),
         excluded_secret_ids=run_context.agent_unmasked_platform_secret_ids(),
     )
-    return redact_secrets_from_text(
-        json.dumps(data, default=lambda value: run_context.mask_platform_smtp_for_agent(str(value))),
-        run_context.agent_redactable_secret_values(),
+    text = json.dumps(
+        data, ensure_ascii=False, default=lambda value: run_context.mask_platform_smtp_for_agent(str(value))
     )
+    # A lone surrogate can't be encoded as UTF-8 and would fail the model request, so it stays escaped.
+    return redact_secrets_from_text(
+        text.encode("utf-8", "backslashreplace").decode(), run_context.agent_redactable_secret_values()
+    ).translate(_INVISIBLE_ESCAPES)
 
 
 def _window(text: str, offset: int = 0, name: str | None = None) -> str:
@@ -776,11 +810,14 @@ def _run_tool(
             raise
         except Exception as e:
             report = {"status": "failed", "output": None, "error": _error_text(e)}
+        result_name = f"{state.label}_{name}_{len(state.trail) + 1}" if name in _PAGE_COMMANDS else None
         _record_call(state, describe(written)[1] if describe else written, tool=name, status=report["status"])
         # A read_run_data window is already masked text cut from a longer result.
         if name == "read_run_data" and report["status"] == "completed":
             return report["output"]
-        return _window(_masked_text(report, state.run_context))
+        if result_name is not None:
+            state.results[result_name] = report
+        return _window(_masked_text(report, state.run_context), 0, result_name)
 
     return FunctionTool(
         name=name,
@@ -794,6 +831,37 @@ def _run_tool(
         on_invoke_tool=_in_turn(state, invoke, describe),
         strict_json_schema=False,
     )
+
+
+def _is_recorded_category(value: JsonValue) -> bool:
+    # A recorded category is null or a non-empty list of entries, each holding a category or a diagnostic reason_code
+    # (writers store null, never []); a key of that name holding anything else is the author's or the page's data.
+    return value is None or (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(entry, dict) and ("category" in entry or "reason_code" in entry) for entry in value)
+    )
+
+
+def _without_failure_category(output: JsonValue) -> JsonValue:
+    if isinstance(output, dict):
+        return {
+            key: _without_failure_category(value)
+            for key, value in output.items()
+            if not (key == "failure_category" and _is_recorded_category(value))
+        }
+    if isinstance(output, list):
+        return [_without_failure_category(item) for item in output]
+    return output
+
+
+def _block_labels(run_context: WorkflowRunContext) -> list[str]:
+    return [*run_context.workflow_run_outputs, *sorted(run_context.carried_block_labels)]
+
+
+def _block_report(run_context: WorkflowRunContext, label: str, output: JsonValue) -> dict[str, JsonValue]:
+    outcome = run_context.get_block_outcome(label)
+    return {"output": _without_failure_category(output), "outcome": asdict(outcome) if outcome else None}
 
 
 def _reserved_names(state: _RunState) -> frozenset[str]:
@@ -860,18 +928,22 @@ async def _read_run_data(state: _RunState, name: str | None = None) -> object:
         for key, parameter in run_context.parameters.items()
         if parameter.parameter_type != ParameterType.OUTPUT and key not in platform_keys and key not in file_keys
     }
-    if name in run_context.workflow_run_outputs:
-        outcome = run_context.get_block_outcome(name)
-        return {"output": run_context.workflow_run_outputs[name], "outcome": asdict(outcome) if outcome else None}
+    if name is not None and name in run_context.workflow_run_outputs:
+        return _block_report(run_context, name, run_context.workflow_run_outputs[name])
+    # Registering a secret overwrites a carried output of the same name with the secret's placeholder.
+    if name in parameters and is_sensitive_workflow_parameter(parameters[name]):
+        return _MASK
+    if name is not None and name in run_context.carried_block_labels:
+        return _block_report(run_context, name, run_context.values.get(name))
     if name in parameters:
-        return _MASK if is_sensitive_workflow_parameter(parameters[name]) else run_context.values.get(name)
+        return run_context.values.get(name)
     files = await _run_files(state)
     if name is None:
         return {
             "parameters": list(parameters),
             "blocks": {
                 label: outcome.status if (outcome := run_context.get_block_outcome(label)) else None
-                for label in run_context.workflow_run_outputs
+                for label in _block_labels(run_context)
             },
             "files": list(files),
         }
@@ -881,6 +953,9 @@ async def _read_run_data(state: _RunState, name: str | None = None) -> object:
 
 
 async def _read_run_data_window(state: _RunState, name: str | None = None, offset: int = 0) -> str:
+    labels = _block_labels(state.run_context)
+    if name not in state.results and name not in labels:
+        name = next((label for label in labels if f"{label}_output" == name), name)
     report = state.results.get(name) if name is not None else None
     if report is None:
         report = {"status": "completed", "output": await _read_run_data(state, name), "error": None}
@@ -1377,7 +1452,8 @@ async def _execute_child(child: Block, written: dict[str, Any], state: _RunState
             organization_id=state.organization_id,
             browser_session_id=state.browser_session_id,
         )
-    report = {"status": result.status, "output": result.output_parameter_value, "error": result.failure_reason}
+    output = _without_failure_category(result.output_parameter_value)
+    report = {"status": result.status, "output": output, "error": result.failure_reason}
     return report, result.workflow_run_block_id
 
 
@@ -1582,7 +1658,7 @@ async def run_agent_step(
         # web_search needs today's date, which follows the cached prefix and stays fixed for the run.
         instructions=CacheableSystemInstructions(
             _INSTRUCTIONS,
-            f"\n\nCurrent UTC datetime: {datetime.now(UTC).isoformat(timespec='seconds')}"
+            f"\n\nStep started at (UTC): {datetime.now(UTC).isoformat(timespec='seconds')}"
             + (f"\n\n{block.workflow_system_prompt}" if block.workflow_system_prompt else "")
             + (f"\n\n{state.skill_list}" if state.skill_list else "")
             + _withheld_note(withheld, state.saved_block_gmail),
