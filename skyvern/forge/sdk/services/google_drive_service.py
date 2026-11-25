@@ -8,8 +8,6 @@ import tempfile
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from mimetypes import guess_type
 from pathlib import Path
 from typing import Any, Literal
@@ -20,6 +18,13 @@ import httpx
 
 from skyvern.config import settings
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.forge.sdk.integrations.google.client import (
+    GoogleAPIError,
+    error_from_response,
+    is_rate_limit_reason,
+    is_rate_limit_refusal,
+)
+from skyvern.forge.sdk.integrations.http import compute_backoff
 from skyvern.forge.sdk.services.file_download_utils import publish_unique_download
 
 DRIVE_UPLOAD_API_BASE = "https://www.googleapis.com/upload/drive/v3"
@@ -43,17 +48,12 @@ SHEET_CONVERTIBLE_MEDIA_TYPES = {
 _DRIVE_FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _DEFAULT_BACKOFF_SECONDS = 1.0
-_RATE_LIMIT_403_REASONS = frozenset({"ratelimitexceeded", "userratelimitexceeded"})
 _FILE_PERMISSION_403_REASONS = frozenset({"insufficientFilePermissions", "teamDriveMembershipRequired"})
 _sleep = asyncio.sleep
 
 
-class GoogleDriveAPIError(RuntimeError):
-    def __init__(self, *, status: int, code: str | None, message: str) -> None:
-        super().__init__(message)
-        self.status = status
-        self.code = code
-        self.message = message
+class GoogleDriveAPIError(GoogleAPIError):
+    pass
 
 
 class GoogleDriveNativeDocumentError(GoogleDriveAPIError):
@@ -151,64 +151,22 @@ def is_retryable_resumable_status(status_code: int) -> bool:
 
 
 def is_retryable_resumable_response(status_code: int, body_text: str | None) -> bool:
-    if is_retryable_resumable_status(status_code):
-        return True
-    if status_code == 403 and body_text:
-        try:
-            payload = json.loads(body_text)
-        except ValueError:
-            return False
-        error = payload.get("error") if isinstance(payload, dict) else None
-        errors = error.get("errors") if isinstance(error, dict) else None
-        if isinstance(errors, list):
-            return any(
-                isinstance(item, dict) and str(item.get("reason", "")).lower() in _RATE_LIMIT_403_REASONS
-                for item in errors
-            )
-    return False
+    return is_retryable_resumable_status(status_code) or is_rate_limit_refusal(status_code, body_text)
 
 
 def _compute_backoff(attempt: int, retry_after: str | None) -> float:
-    if retry_after:
-        value = retry_after.strip()
-        try:
-            return max(0.0, float(value))
-        except ValueError:
-            pass
-        try:
-            target = parsedate_to_datetime(value)
-        except (TypeError, ValueError):
-            target = None
-        if target is not None:
-            if target.tzinfo is None:
-                target = target.replace(tzinfo=timezone.utc)
-            return max(0.0, (target - datetime.now(timezone.utc)).total_seconds())
-    return _DEFAULT_BACKOFF_SECONDS * (2 ** (attempt - 1))
+    return compute_backoff(attempt, retry_after, base_seconds=_DEFAULT_BACKOFF_SECONDS, factor=2)
 
 
 def _raise_for_error(response: httpx.Response) -> None:
     if response.is_success:
         return
-    status = response.status_code
-    try:
-        payload: Any = response.json() or {}
-    except ValueError:
-        raise GoogleDriveAPIError(
-            status=status,
-            code=None,
-            message=response.text[:500] or "Google Drive API error",
-        ) from None
-    err = payload.get("error") if isinstance(payload, dict) else {}
-    if not isinstance(err, dict):
-        raise GoogleDriveAPIError(status=status, code=None, message="Google Drive API error")
-    message = err.get("message") or "Google Drive API error"
-    details = err.get("errors")
-    code: str | None = None
-    if isinstance(details, list) and details and isinstance(details[0], dict):
-        code = details[0].get("reason")
-    if status == 403 and code in {"insufficientPermissions", "insufficientScopes"}:
-        code = "reconnect_required"
-    raise GoogleDriveAPIError(status=status, code=code, message=message)
+    raise error_from_response(
+        response,
+        GoogleDriveAPIError,
+        default_message="Google Drive API error",
+        body_text_when_message_missing=False,
+    )
 
 
 def error_from_response_body(status: int, body: str | None) -> GoogleDriveAPIError:
@@ -966,7 +924,7 @@ def _folder_action_error(exc: GoogleDriveAPIError, operation: DriveFolderOperati
             "The connected Google account cannot see this Drive folder or file. Check the link, and that "
             "the account has access to it or is a member of its shared drive."
         )
-    elif exc.status == 429 or (exc.code or "").lower() in _RATE_LIMIT_403_REASONS:
+    elif exc.status == 429 or is_rate_limit_reason(exc.code or ""):
         hint = "Google Drive is limiting requests from this account. Run again in a few minutes."
     else:
         hint = f"Google Drive could not complete this request (HTTP {exc.status})."

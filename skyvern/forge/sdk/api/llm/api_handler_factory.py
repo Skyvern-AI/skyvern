@@ -2809,6 +2809,8 @@ class LLMAPIHandlerFactory:
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
                         last_llm_model=actual_model,
                     )
+                    if actual_model is not None:
+                        step.last_llm_model = actual_model
                 if thought:
                     await app.DATABASE.observer.update_thought(
                         thought_id=thought.observer_thought_id,
@@ -3495,6 +3497,8 @@ class LLMAPIHandlerFactory:
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
                         last_llm_model=actual_model,
                     )
+                    if actual_model is not None:
+                        step.last_llm_model = actual_model
                 if thought:
                     await app.DATABASE.observer.update_thought(
                         thought_id=thought.observer_thought_id,
@@ -4394,6 +4398,8 @@ class LLMCaller:
                     incremental_cached_tokens=call_stats.cached_tokens,
                     last_llm_model=actual_model,
                 )
+                if actual_model is not None:
+                    step.last_llm_model = actual_model
             if thought:
                 await app.DATABASE.observer.update_thought(
                     thought_id=thought.observer_thought_id,
