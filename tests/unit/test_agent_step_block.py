@@ -322,6 +322,7 @@ async def _run_agent_block(
     parameter_keys: list[str] | None = None,
     stored_tools: list[str] | None = None,
     block_model: dict[str, str | dict[str, str]] | None = None,
+    data_schema: dict[str, Any] | None = None,
     **block_fields: bool,
 ) -> tuple[BlockResult, _FlagProvider]:
     """With no model, the block resolves the variant's real model, which sends through litellm.acompletion."""
@@ -339,6 +340,7 @@ async def _run_agent_block(
             tools=tools,
             parameter_keys=parameter_keys,
             model=block_model,
+            **({"data_schema": data_schema} if data_schema is not None else {}),
             **block_fields,
         ),
         {
@@ -2346,23 +2348,71 @@ async def test_read_run_data_returns_an_earlier_blocks_output_and_masks_secret_p
         created_at=now,
         modified_at=now,
     )
-    # A secret parameter's value is the id its secret is registered under, not the secret.
+    run_context.register_block_reference_variable("api_token", {"total": 1}, carried=True)
+    # A secret parameter's value is the id its secret is registered under, not the secret; registering it overwrites a
+    # carried block output of the same name.
     run_context.values["api_token"] = "secret_id_api_token"
     run_context.secrets["secret_id_api_token"] = SECRET
     await run_context.register_output_parameter_value_post_execution(
         make_block_output_parameter("search_output"), {"extracted_information": {"price": 42, "token": SECRET}}
     )
     run_context.record_block_outcome("search", BlockStatus.completed, [], None)
+    quote = {"total": 7, "token": SECRET}
+    run_context.values["quote_output"] = quote
+    run_context.register_block_reference_variable("quote", quote, carried=True)
+    category = [{"category": "UNKNOWN", "confidence_float": 0.5, "reasoning": "No keyword match found"}]
+    authored = [
+        {"failure_category": []},
+        {"failure_category": ["late"]},
+        {"failure_category": [{"code": "late_delivery", "count": 3}]},
+    ]
+    records = [*authored, {"failure_category": None}, {"failure_category": [{"reason_code": "site_throttle"}]}]
+    loop_output = [
+        [
+            {
+                "loop_value": "a",
+                "output_parameter": None,
+                "output_value": {"failure_category": category, "records": records},
+            }
+        ]
+    ]
+    await run_context.register_output_parameter_value_post_execution(
+        make_block_output_parameter("loop_output"), loop_output
+    )
+    run_context.record_block_outcome("loop", BlockStatus.completed, [], None)
+    child_output = {"status": "failed", "failure_category": category, "errors": [{"error_code": "page_closed"}]}
+
+    async def failed_task(
+        block: BaseTaskBlock, workflow_run_id: str, workflow_run_block_id: str, **_: object
+    ) -> BlockResult:
+        await block.record_output_parameter_value(run_context, RUN, child_output)
+        return BlockResult(
+            success=False,
+            output_parameter=block.output_parameter,
+            output_parameter_value=child_output,
+            status=BlockStatus.failed,
+            failure_reason="page closed",
+            workflow_run_block_id=workflow_run_block_id,
+        )
+
+    monkeypatch.setattr(BaseTaskBlock, "execute", failed_task)
 
     async def downloaded_files(organization_id: str, run_id: str | None) -> list[FileInfo]:
         return [FileInfo(url="https://example.com/invoice.pdf", filename="invoice.pdf")]
 
     monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_current_attempt_downloaded_files=downloaded_files))
+    reads = ("search", "search_output", "quote", "quote_output", "loop", "api_token", "api_token_output")
     model = _ScriptedModel(
         [
-            [scripted_call("read_run_data", {}, call_id="index")],
-            [scripted_call("read_run_data", {"name": "search"}, call_id="search")],
-            [scripted_call("read_run_data", {"name": "api_token"}, call_id="secret")],
+            [
+                scripted_call("read_run_data", {}, call_id="index"),
+                *(scripted_call("read_run_data", {"name": name}, call_id=name) for name in reads),
+            ],
+            [scripted_call("browser_task", {"navigation_goal": "Open it"}, call_id="task")],
+            [
+                scripted_call("read_run_data", {"name": "agent_task_9"}, call_id="reread"),
+                scripted_call("read_run_data", {"name": "agent_task_9_output"}, call_id="reread_output"),
+            ],
             [scripted_call("finish", {"answer": "42"}, call_id="finish")],
         ]
     )
@@ -2372,13 +2422,25 @@ async def test_read_run_data_returns_an_earlier_blocks_output_and_masks_secret_p
     assert result.status == BlockStatus.completed
     assert _tool_output(model, "index") == {
         "parameters": ["api_token"],
-        "blocks": {"search": "completed"},
+        "blocks": {"search": "completed", "loop": "completed", "api_token": None, "quote": None},
         "files": ["invoice.pdf"],
     }
     search = _tool_output(model, "search")
     assert search["output"]["extracted_information"] == {"price": 42, "token": "*****"}
     assert search["outcome"]["status"] == "completed"
-    assert _tool_output(model, "secret") == "*****"
+    assert _tool_output(model, "search_output") == search
+    assert _tool_output(model, "quote") == _tool_output(model, "quote_output")
+    assert _tool_output(model, "quote_output") == {"output": {"total": 7, "token": "*****"}, "outcome": None}
+    assert _tool_output(model, "loop")["output"][0][0]["output_value"] == {"records": [*authored, {}, {}]}
+    assert _tool_output(model, "api_token") == _tool_output(model, "api_token_output") == "*****"
+    for call_id in ("task", "reread", "reread_output"):
+        (text,) = tool_outputs_for(model.inputs[-1][1], call_id)
+        assert "failure_category" not in text
+        assert json.loads(text)["output"]["errors"] == [{"error_code": "page_closed"}]
+    assert json.loads(tool_outputs_for(model.inputs[-1][1], "task")[0])["error"] == "page closed"
+    assert run_context.values["agent_task_9_output"]["failure_category"] == category
+    assert run_context.values["loop_output"][0][0]["output_value"]["failure_category"] == category
+    assert run_context.workflow_run_outputs["loop"][0][0]["output_value"]["failure_category"] == category
     assert SECRET not in json.dumps(model.inputs, default=str)
 
 
@@ -2444,18 +2506,20 @@ async def test_a_cut_child_result_names_the_read_run_data_call_that_continues_it
 
 
 @pytest.mark.asyncio
-async def test_bad_read_run_data_reads_fail_within_the_cap_and_a_cut_page_result_gives_only_its_size(
+async def test_bad_read_run_data_reads_fail_within_the_cap_and_page_results_arrive_unescaped_and_pageable_by_name(
     monkeypatch: pytest.MonkeyPatch, database: AgentDB
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
     _big_child_output(monkeypatch)
+    japanese = "献立の説明文" * 2_500
+    extracts = {"everything": "p" * 30_000, "menu": japanese + "\ud800\u2028\U000e0041"}
 
     class Page:
         page = SimpleNamespace(url="https://example.com/")
         page_ai = _page_ai("https://example.com/")
 
         async def extract(self, prompt: str, schema: dict[str, Any] | None = None) -> str:
-            return "p" * 30_000
+            return extracts["menu" if "menu" in prompt else "everything"]
 
     async def create(browser_session_id: str | None = None) -> Page:
         return Page()
@@ -2471,11 +2535,18 @@ async def test_bad_read_run_data_reads_fail_within_the_cap_and_a_cut_page_result
             scripted_call("read_run_data", {"name": "x" * 30_000}, call_id="unknown"),
         ]
 
+    def rest_of_page(model_input: list[Any]) -> list[TResponseOutputItem]:
+        (text,) = tool_outputs_for(model_input, "page")
+        name, offset = _CUT_NOTICE.findall(text)[-1]
+        return [scripted_call("read_run_data", {"name": name, "offset": int(offset)}, call_id="rest")]
+
     model = _ScriptedModel(
         [
             TEXT_PROMPT_CHILD,
             bad_reads,
             [scripted_call("page_extract", {"prompt": "everything"}, call_id="page")],
+            rest_of_page,
+            [scripted_call("page_extract", {"prompt": "menu"}, call_id="menu")],
             VALID_FINISH,
         ]
     )
@@ -2492,12 +2563,18 @@ async def test_bad_read_run_data_reads_fail_within_the_cap_and_a_cut_page_result
     assert unknown.startswith('{"status": "failed", "output": null, "error": "ValueError: Nothing in this run')
     assert len(unknown) < 20_100
     assert "read_run_data(" not in unknown[20_000:]
+    url = "https://example.com/"
+    page_text = json.dumps({"status": "completed", "url": url, "output": "p" * 30_000, "error": None})
     (page,) = tool_outputs_for(model.inputs[3][1], "page")
-    page_total = len(
-        json.dumps({"status": "completed", "url": "https://example.com/", "output": "p" * 30_000, "error": None})
-    )
-    assert str(page_total) in page[20_000:]
-    assert "read_run_data(" not in page
+    assert page.startswith(page_text[:20_000])
+    assert _CUT_NOTICE.findall(page[20_000:]) == [("agent_page_extract_5", "20000")]
+    (rest,) = tool_outputs_for(model.inputs[4][1], "rest")
+    assert page[:20_000] + rest[: len(page_text) - 20_000] == page_text
+    assert "read_run_data(" not in rest
+    (menu,) = tool_outputs_for(model.inputs[5][1], "menu")
+    assert json.loads(menu) == {"status": "completed", "url": url, "output": extracts["menu"], "error": None}
+    assert japanese in menu
+    assert menu.encode("utf-8") and not {"\u2028", "\U000e0041"} & set(menu)
 
 
 @pytest.mark.asyncio
@@ -2653,22 +2730,32 @@ async def test_the_agent_block_bills_its_decisions_when_a_write_after_the_loop_f
 
 
 @pytest.mark.asyncio
-async def test_no_call_runs_after_a_valid_finish_in_the_same_response(
+async def test_a_rejected_finish_names_where_its_fields_went_and_no_call_runs_after_a_valid_one(
     monkeypatch: pytest.MonkeyPatch, database: AgentDB, child_prompts: list[str]
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    fields = ("delivery_fee", "drink_plan", "staffing_setup")
+    schema = {"type": "object", "properties": {key: {"type": "string"} for key in fields}, "required": list(fields)}
+    leaked = 'x</delivery_fee>\n<parameter name="drink_plan">y</drink_plan>\n<parameter name="staffing_setup">z'
+    valid = {"delivery_fee": "x", "drink_plan": "y", "staffing_setup": "z</staffing_setup>"}
     model = _ScriptedModel(
         [
+            [scripted_call("finish", {"delivery_fee": leaked}, call_id="leaked")],
+            [scripted_call("finish", {"delivery_fee": "x", "drink_plan>": "y", "staffing_setup": "z"}, call_id="key")],
             [
-                scripted_call("finish", {"answer": "done"}, call_id="f1"),
+                scripted_call("finish", valid, call_id="f1"),
                 scripted_call("run_block", {"block_type": "text_prompt", "arguments": {"prompt": "Hi"}}, call_id="t"),
-                scripted_call("finish", {"answer": "changed"}, call_id="f2"),
-            ]
+                scripted_call("finish", {**valid, "drink_plan": "changed"}, call_id="f2"),
+            ],
         ]
     )
 
-    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
+    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, data_schema=schema)
 
+    (leaked_reply,) = tool_outputs_for(model.inputs[1][1], "leaked")
+    assert all(key in leaked_reply for key in fields)
+    (key_reply,) = tool_outputs_for(model.inputs[2][1], "key")
+    assert "drink_plan>" in key_reply
     rows = await database.observer.get_workflow_run_blocks(
         workflow_run_id=RUN, organization_id=ORG, with_tool_calls=True
     )
@@ -2676,9 +2763,15 @@ async def test_no_call_runs_after_a_valid_finish_in_the_same_response(
     assert child_prompts == []
     assert result.status == BlockStatus.completed
     assert isinstance(result.output_parameter_value, dict)
-    assert result.output_parameter_value["output"] == {"answer": "done"}
-    assert [call["tool"] for call in result.output_parameter_value["tool_calls"]] == ["finish"]
+    assert result.output_parameter_value["output"] == valid
+    assert [(call["tool"], call["status"]) for call in result.output_parameter_value["tool_calls"]] == [
+        ("finish", "invalid_arguments"),
+        ("finish", "invalid_arguments"),
+        ("finish", "completed"),
+    ]
     assert [(call.tool, call.status) for call in rows[0].tool_calls or []] == [
+        ("finish", "invalid_arguments"),
+        ("finish", "invalid_arguments"),
         ("finish", "completed"),
         ("run_block", "skipped"),
         ("finish", "skipped"),

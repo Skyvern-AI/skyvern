@@ -88,6 +88,10 @@ def test_redact_secrets_from_text_replaces_encoded_variants() -> None:
 
     assert secret not in result
     assert result.splitlines() == [REDACTED_SECRET_PLACEHOLDER] * len(expand_secret_encodings(secret))
+    non_ascii = 'パス"ワード'
+    shown = redact_secrets_from_text(json.dumps({"note": f"key {non_ascii} end"}, ensure_ascii=False), {non_ascii})
+    assert "ワード" not in shown
+    assert json.loads(shown) == {"note": f"key {REDACTED_SECRET_PLACEHOLDER} end"}
 
 
 def test_redact_secrets_from_text_replaces_longest_secret_first() -> None:
