@@ -5,6 +5,7 @@ import shutil
 import stat
 import tempfile
 import threading
+from collections.abc import Mapping
 from contextlib import ExitStack, suppress
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -21,12 +22,12 @@ from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
+    downloads_to_save,
     get_download_dir,
     get_skyvern_temp_dir,
     make_run_temp_directory,
     parse_uri_to_path,
     register_local_download_root,
-    wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.base import (
@@ -34,7 +35,6 @@ from skyvern.forge.sdk.artifact.storage.base import (
     BaseStorage,
     BrowserProfileSnapshot,
     download_checksums_by_uri,
-    is_file_from_retry_attempt,
     resolve_download_attempt_fail_open,
 )
 from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
@@ -618,12 +618,12 @@ class LocalStorage(BaseStorage):
         run_id: str | None,
         *,
         attempt_number: int | None = None,
+        files: Mapping[str, str] | None = None,
     ) -> None:
         if run_id is None:
             return
         download_dir = get_download_dir(run_id=run_id)
-        files = os.listdir(download_dir)
-        if not files:
+        if files is None and not os.listdir(download_dir):
             return
         owner_id, number, started_at = await resolve_download_attempt_fail_open(organization_id, run_id, attempt_number)
         destination = Path(self.artifact_path) / DOWNLOAD_FILE_PREFIX / settings.ENV / organization_id / run_id
@@ -634,17 +634,10 @@ class LocalStorage(BaseStorage):
         )
         saved = download_checksums_by_uri(artifacts)
         skipped: list[str] = []
-        for filename in files:
-            if filename.endswith(BROWSER_DOWNLOADING_SUFFIX):
-                continue
-            source = Path(download_dir) / filename
-            if not source.is_file():
-                continue
-            filename = await wait_for_pending_extension_rename(download_dir, filename)
-            source = Path(download_dir) / filename
-            if not source.is_file() or (number > 1 and not is_file_from_retry_attempt(str(source), started_at)):
-                continue
-            target = destination / filename
+        for key, path in await downloads_to_save(download_dir, files, started_at if number > 1 else None):
+            filename = os.path.basename(key)
+            source = Path(path)
+            target = destination / key
             uri = managed_file_uri(target.resolve())
             try:
                 checksum = calculate_sha256_for_file(str(source))

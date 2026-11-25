@@ -5625,6 +5625,24 @@ class WorkflowService:
             )
             return fallback_on_error
 
+    async def _credential_profile_usable_by_run(
+        self, profile: BrowserProfile, *, organization_id: str, workflow_run_id: str | None
+    ) -> bool:
+        # A profile tied to a workflow keeps that workflow's folder access when a credential carries it into a run.
+        if profile.workflow_permanent_id is None:
+            return True
+        if await app.AGENT_FUNCTION.workflow_run_can_use_browser_profile(
+            organization_id, workflow_run_id, profile.browser_profile_id
+        ):
+            return True
+        LOG.warning(
+            "Credential browser profile is not usable by this run; not seeding from it",
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            browser_profile_id=profile.browser_profile_id,
+        )
+        return False
+
     async def _resolve_credential_browser_profile_id_for_setup(
         self,
         *,
@@ -5667,6 +5685,10 @@ class WorkflowService:
                     profile_id=db_cred.browser_profile_id,
                     organization_id=organization_id,
                 )
+                if profile and not await self._credential_profile_usable_by_run(
+                    profile, organization_id=organization_id, workflow_run_id=workflow_run_id
+                ):
+                    continue
             except Exception:
                 LOG.warning(
                     "Failed to resolve credential browser profile for setup seed",
@@ -11694,6 +11716,10 @@ class WorkflowService:
                             browser_profile_id=db_cred.browser_profile_id,
                             workflow_run_id=workflow_run_id,
                         )
+                        continue
+                    if not await self._credential_profile_usable_by_run(
+                        profile, organization_id=organization_id, workflow_run_id=workflow_run_id
+                    ):
                         continue
                     LOG.info(
                         "Resolved browser_profile_id from LoginBlock credential",

@@ -91,7 +91,17 @@ AGENT_BLOCK_TOOLS: dict[BlockType, BlockTool | str] = {
         tool_name="web_search",
         description="Search the web. With prompt, and optionally json_schema, the results are read into an answer.",
     ),
-    BlockType.CODE: BlockTool(CodeBlockYAML, ("code",)),
+    BlockType.CODE: BlockTool(
+        CodeBlockYAML,
+        ("code",),
+        description="Run Python in a sandbox. `page` is this run's browser page (Playwright Page API), and "
+        "`await open_page(page, url)` opens another tab in it. `await page.context.request.get(url)` fetches a URL "
+        "with the page's cookies; it can't reach loopback or private hosts. `await response.body()` is its bytes. "
+        "`await read_run_file(name)` returns the bytes of one of this run's files (names from read_run_data). "
+        "`await publish_file(filename, data=<bytes> | text=<str> | folder={path: bytes or text})` saves a new run "
+        "file (folder= makes a ZIP) and returns its name and size. Imports: asyncio, datetime, html, json, re. "
+        "open() reads and writes only under /tmp. The code's local variables are the output.",
+    ),
     BlockType.TEXT_PROMPT: BlockTool(
         TextPromptBlockYAML,
         ("prompt", "json_schema"),
@@ -264,7 +274,7 @@ ACTING_ACCOUNT_TOOL_NAMES: frozenset[str] = frozenset(
 ) | frozenset(name for name, (_, action) in CATALOG_ACTION_TOOLS.items() if action.acts)
 RUN_TOOL_DESCRIPTIONS: dict[str, str] = {
     "read_run_data": "Read what this run already has. Without name: the names of its workflow parameters, its "
-    "earlier blocks with their status, and its downloaded files. With name: that parameter's value, that block's "
+    "earlier blocks with their status, and its files. With name: that parameter's value, that block's "
     "output and outcome, or that file's URL. Secret values are masked. With offset, a cut result from that "
     "character on.",
     "page_goto": "Open url in this run's browser.",

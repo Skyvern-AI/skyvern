@@ -1088,7 +1088,7 @@ def _registered_secret_scrubber(
                 registered.update(
                     manager.get_secret_values_for_run(workflow_run_id, respect_artifact_redaction_flag=False)
                 )
-                run_context = manager.workflow_run_contexts.get(workflow_run_id)
+                run_context = manager.redaction_inputs_for_run(workflow_run_id)
                 if run_context is not None:
                     # Artifact collection filters short credentials. Diagnostic
                     # logs must protect every nonempty registered string instead.

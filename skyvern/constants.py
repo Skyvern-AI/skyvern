@@ -160,6 +160,11 @@ class ScrapeType(StrEnum):
 SCRAPE_TYPE_ORDER = [ScrapeType.NORMAL, ScrapeType.NORMAL, ScrapeType.RELOAD]
 DEFAULT_MAX_TOKENS = 100000
 MAX_FILE_PARSE_INPUT_TOKENS = 256_000
+# Parse limits for CSV and Excel inputs: rows and cells of the parsed table (a workbook sheet counts from A1 to its
+# last value, the frame pandas builds) and the decoded bytes read to build it.
+FILE_PARSER_MAX_ROWS = 250_000
+FILE_PARSER_MAX_CELLS = 5_000_000
+FILE_PARSER_MAX_DECODED_BYTES = 200 * 1024 * 1024
 # Safety ceiling on how many pages of a scanned/image-only PDF are OCR'd via the vision-LLM
 # fallback. Each page is a separate LLM call, so this bounds cost; MAX_FILE_PARSE_INPUT_TOKENS
 # still bounds the concatenated text handed to downstream extraction.

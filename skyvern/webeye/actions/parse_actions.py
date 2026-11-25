@@ -26,6 +26,7 @@ from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.trace import traced
 from skyvern.services.otp_service import (
+    describe_sources_checked,
     describe_webhook_contract_failure,
     has_credential_totp_candidate,
     poll_otp_value,
@@ -1102,7 +1103,10 @@ async def generate_cua_fallback_actions(
                     is_magic_link=True,
                 )
             except NoTOTPVerificationCodeFound as e:
-                reasoning_suffix = f"No magic link found.{describe_webhook_contract_failure(e.webhook_diagnostics)}"
+                reasoning_suffix = (
+                    f"No magic link found.{describe_webhook_contract_failure(e.webhook_diagnostics)}"
+                    f"{describe_sources_checked(e.sources_checked)}"
+                )
                 reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
                 action = TerminateAction(
                     reasoning=reasoning,
@@ -1147,7 +1151,10 @@ async def generate_cua_fallback_actions(
             )
         except NoTOTPVerificationCodeFound as e:
             otp_value = None
-            reasoning_suffix = f"No verification code found.{describe_webhook_contract_failure(e.webhook_diagnostics)}"
+            reasoning_suffix = (
+                f"No verification code found.{describe_webhook_contract_failure(e.webhook_diagnostics)}"
+                f"{describe_sources_checked(e.sources_checked)}"
+            )
             reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
         except FailedToGetTOTPVerificationCode as e:
             otp_value = None
@@ -1157,7 +1164,7 @@ async def generate_cua_fallback_actions(
         # OTP value obtained - use it as verification code
         if otp_value and otp_value.get_otp_type() == OTPType.TOTP:
             verification_code = otp_value.value
-            reasoning = reasoning or f"Received verification code: {verification_code}"
+            reasoning = reasoning or "Received a verification code"
             action = VerificationCodeAction(
                 verification_code=verification_code,
                 reasoning=reasoning,

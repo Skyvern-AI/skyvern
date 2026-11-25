@@ -14,6 +14,8 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.custom_llms import (
+    CUSTOM_LLM_API_KEY_MASK,
+    SECRET_EXTRA_PARAMETER_KEYS,
     CustomLLM,
     CustomLLMConfig,
     CustomLLMCreateRequest,
@@ -24,6 +26,7 @@ from skyvern.forge.sdk.schemas.custom_llms import (
     config_with_preserved_secrets,
     custom_llm_from_org_auth_token,
     custom_llm_response_from_org_auth_token,
+    litellm_routing_extra_parameter_keys,
 )
 from skyvern.forge.sdk.schemas.organizations import ClearOrganizationAuthTokenResponse, Organization
 from skyvern.forge.sdk.services import org_auth_service
@@ -43,6 +46,35 @@ async def _validate_custom_llm_api_base(config: CustomLLMConfig) -> None:
     if config.provider is CustomLLMProvider.OPENROUTER and parsed.hostname != "openrouter.ai":
         raise HTTPException(status_code=400, detail="OpenRouter api_base must use openrouter.ai")
     config.api_base = await asyncio.to_thread(validate_fetch_url, config.api_base)
+
+
+def _reject_litellm_routing_extra_parameters(config: CustomLLMConfig) -> None:
+    routing_keys = litellm_routing_extra_parameter_keys(config.extra_parameters)
+    if routing_keys:
+        raise HTTPException(status_code=400, detail=f"extra_parameters key '{routing_keys[0]}' is not allowed")
+
+
+def _sends_masked_secret(config: CustomLLMConfig) -> bool:
+    if config.api_key == CUSTOM_LLM_API_KEY_MASK:
+        return True
+    return any(
+        isinstance(headers, dict) and CUSTOM_LLM_API_KEY_MASK in headers.values()
+        for headers in (config.extra_parameters.get(key) for key in SECRET_EXTRA_PARAMETER_KEYS)
+    )
+
+
+def _require_secret_reentry_on_destination_change(config: CustomLLMConfig, existing_config: CustomLLMConfig) -> None:
+    if not _sends_masked_secret(config):
+        return
+    if (
+        config.provider != existing_config.provider
+        or config.api_base != existing_config.api_base
+        or litellm_routing_extra_parameter_keys(existing_config.extra_parameters)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Provider or API base changed; enter the API key and secret headers again",
+        )
 
 
 async def _get_custom_llm(
@@ -113,6 +145,7 @@ async def create_custom_llm(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     _request_authorization: None = Depends(require_request_actions(frozenset({"custom_model.create"}))),
 ) -> CustomLLMResponse:
+    _reject_litellm_routing_extra_parameters(request.config)
     await _validate_custom_llm_api_base(request.config)
     token = await app.DATABASE.organizations.create_org_auth_token(
         organization_id=current_org.organization_id,
@@ -151,6 +184,8 @@ async def update_custom_llm(
 ) -> CustomLLMResponse:
     try:
         existing_custom_llm = await _get_custom_llm(current_org.organization_id, custom_llm_id)
+        _require_secret_reentry_on_destination_change(request.config, existing_custom_llm.config)
+        _reject_litellm_routing_extra_parameters(request.config)
         config = config_with_preserved_secrets(request.config, existing_custom_llm.config)
         await _validate_custom_llm_api_base(config)
         token = await app.DATABASE.organizations.update_org_auth_token(

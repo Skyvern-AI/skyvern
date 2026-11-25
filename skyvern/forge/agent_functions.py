@@ -42,7 +42,7 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
-from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core import aiohttp_helper, skyvern_context
 from skyvern.forge.sdk.core.http_request_authorization import GuardedHTTPHopResponse, GuardedHTTPHopStream
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -158,6 +158,13 @@ if TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
+OUTBOUND_RESPONSE_LIMIT_BYTES = 25 * 1024 * 1024
+
+
+def _bounded_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    request_headers = {name: value for name, value in headers.items() if name.lower() != "accept-encoding"}
+    request_headers["Accept-Encoding"] = "gzip, deflate"
+    return request_headers
 
 
 async def record_request_audit_event(
@@ -1398,6 +1405,13 @@ class AgentFunction:
     ) -> None:
         """Cloud raises 403 when a folder denies the action on any of the runs, checked in one pass; OSS allows."""
         return None
+
+    async def workflow_run_can_use_browser_profile(
+        self, organization_id: str, workflow_run_id: str | None, browser_profile_id: str
+    ) -> bool:
+        """Cloud checks the run's principal (the requester before a run exists) against the folder of the profile's
+        workflow; OSS has no folder ACLs."""
+        return True
 
     async def enforce_credential_folder_access_for_ids(
         self,
@@ -3661,12 +3675,15 @@ class AgentFunction:
         closing the DNS-rebinding window between validation and connect.
         """
         async with bound_webhook_request(attempts, timeout_seconds), pinned_ip_client(resolved_ips) as client:
-            return await client.post(
+            async with client.stream(
+                "POST",
                 url,
                 content=payload,
-                headers=headers,
+                headers=_bounded_response_headers(headers),
                 timeout=httpx.Timeout(timeout_seconds),
-            )
+            ) as response:
+                body, _ = await aiohttp_helper.read_httpx_response_body_limited(response, OUTBOUND_RESPONSE_LIMIT_BYTES)
+                return aiohttp_helper.buffered_httpx_response(response, body)
 
     async def relay_http_request_hop(
         self,
@@ -3715,13 +3732,17 @@ class AgentFunction:
         # operation, so a slow-drip endpoint needs the outer cap to stay within the budget.
         try:
             async with asyncio.timeout(timeout_seconds), pinned_ip_client(resolved_ips) as client:
-                response = await client.request(
+                async with client.stream(
                     method,
                     url,
                     content=payload or None,
-                    headers=headers,
+                    headers=_bounded_response_headers(headers),
                     timeout=httpx.Timeout(timeout_seconds),
-                )
+                ) as upstream:
+                    body, _ = await aiohttp_helper.read_httpx_response_body_limited(
+                        upstream, OUTBOUND_RESPONSE_LIMIT_BYTES
+                    )
+                    response = aiohttp_helper.buffered_httpx_response(upstream, body)
         except TimeoutError as e:
             raise httpx.ReadTimeout(f"TOTP verification request exceeded {timeout_seconds}s") from e
         return TOTPVerificationResponse(

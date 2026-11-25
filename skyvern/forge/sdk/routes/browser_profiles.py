@@ -1220,6 +1220,9 @@ async def _create_profile_from_session_locked(
         proxy_location = browser_session.proxy_location or ProxyLocation.RESIDENTIAL_ISP
         proxy_session_id = browser_session.proxy_session_id
 
+    source_workflow_permanent_id = await app.DATABASE.browser_sessions.get_browser_session_workflow_permanent_id(
+        organization_id=organization_id, browser_session_id=browser_session_id
+    )
     try:
         try:
             profile = await app.DATABASE.browser_sessions.create_browser_profile(
@@ -1229,6 +1232,7 @@ async def _create_profile_from_session_locked(
                 source_browser_type=source_browser_type,
                 proxy_location=proxy_location,
                 proxy_session_id=proxy_session_id,
+                workflow_permanent_id=source_workflow_permanent_id,
             )
         except IntegrityError as exc:
             _handle_duplicate_profile_name(organization_id=organization_id, name=name, exc=exc)
@@ -1383,6 +1387,7 @@ async def _create_profile_from_workflow_run(
                 description=description,
                 proxy_location=proxy_location,
                 proxy_session_id=proxy_session_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
             )
         except IntegrityError as exc:
             _handle_duplicate_profile_name(organization_id=organization_id, name=name, exc=exc)

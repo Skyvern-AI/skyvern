@@ -9,7 +9,7 @@ import shutil
 import tempfile
 import time
 import zipfile
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -688,6 +688,7 @@ async def download_file(
     staging_dir: str | None = None,
     *,
     limit_managed_file_size: bool = False,
+    require_managed_file_size: bool = False,
 ) -> str:
     if not url or not url.strip():
         raise ValueError("Download URL is empty — no file download was triggered by the browser")
@@ -725,6 +726,8 @@ async def download_file(
             if managed_limit_mb:
                 # Checked from storage metadata so an oversized object is refused before its bytes are loaded.
                 managed_size = await app.STORAGE.managed_file_size(url, organization_id)
+                if managed_size is None and require_managed_file_size:
+                    raise DownloadFileMaxSizeExceeded(managed_limit_mb)
                 if managed_size is not None and managed_size > managed_limit_mb * 1024 * 1024:
                     raise DownloadFileMaxSizeExceeded(managed_limit_mb)
 
@@ -1407,6 +1410,37 @@ async def wait_for_pending_extension_rename(download_dir: str, filename: str) ->
     if not os.path.exists(path):
         return _resolve_extension_rename_twin(download_dir, filename)
     return filename
+
+
+async def downloads_to_save(
+    download_dir: str, files: Mapping[str, str] | None, retry_attempt_started_at: datetime | None
+) -> list[tuple[str, str]]:
+    """Each file to save as (key under the run's download prefix, local path): without ``files``, the settled files at
+    the top of the download directory; with it, each name in the folder its path has inside that directory, else at
+    the top."""
+    if files is not None:
+        root = Path(download_dir).resolve()
+        entries = []
+        for name, path in files.items():
+            source = Path(path).resolve()
+            if name != os.path.basename(name) or name in {"", ".", ".."} or not source.is_file():
+                LOG.warning("Run file not saved: bad name or missing file", run_file=name, path=path)
+                continue
+            folder = source.parent.relative_to(root) if source.is_relative_to(root) else Path()
+            entries.append(((folder / name).as_posix(), str(source)))
+        return entries
+    entries = []
+    for file in os.listdir(download_dir):
+        if file.endswith(BROWSER_DOWNLOADING_SUFFIX) or not os.path.isfile(os.path.join(download_dir, file)):
+            continue
+        file = await wait_for_pending_extension_rename(download_dir, file)
+        path = os.path.join(download_dir, file)
+        if not os.path.isfile(path):
+            continue
+        if retry_attempt_started_at is not None and not is_file_from_retry_attempt(path, retry_attempt_started_at):
+            continue
+        entries.append((file, path))
+    return entries
 
 
 def _resolve_extension_rename_twin(download_dir: str, filename: str) -> str:

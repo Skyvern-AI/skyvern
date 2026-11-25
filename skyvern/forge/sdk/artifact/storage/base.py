@@ -1,7 +1,7 @@
 import os
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import BinaryIO, Protocol, cast
@@ -614,10 +614,12 @@ class BaseStorage(ABC):
         run_id: str | None,
         *,
         attempt_number: int | None = None,
+        files: Mapping[str, str] | None = None,
     ) -> None:
         """Raises DownloadSaveIncompleteError after the loop when any file could not be fully
         saved and registered; every other file already is when it raises, so the save is
-        retryable-incomplete."""
+        retryable-incomplete. ``files`` (run-file name to local path) saves those files instead of
+        the top of the download directory (``downloads_to_save``)."""
 
     def get_downloaded_file_signature_aliases(self, file_info: FileInfo) -> list[DownloadedFileSignature]:
         return []

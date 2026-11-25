@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import socket
+import zlib
 from collections.abc import Callable, Mapping
 from http.cookies import SimpleCookie
 from typing import Any
@@ -11,6 +12,7 @@ from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
+import httpx
 import structlog
 from aiohttp.abc import AbstractCookieJar, AbstractResolver, ResolveResult
 from aiohttp.helpers import parse_mimetype
@@ -32,7 +34,6 @@ from skyvern.utils.url_validators import (
 LOG = structlog.get_logger()
 DEFAULT_REQUEST_TIMEOUT = 30
 DEFAULT_GUARDED_HTTP_RESPONSE_LIMIT_BYTES = 100 * 1024 * 1024
-OUTBOUND_RESPONSE_SIZE_LIMIT_FLAG = "OUTBOUND_RESPONSE_SIZE_LIMIT"
 _SAFE_CROSS_ORIGIN_REDIRECT_HEADERS = frozenset({"accept", "accept-language", "user-agent"})
 
 
@@ -172,22 +173,6 @@ def ssrf_guarded_tcp_connector(resolver: SSRFGuardedResolver | None = None) -> a
     return aiohttp.TCPConnector(resolver=resolver or SSRFGuardedResolver(), use_dns_cache=False)
 
 
-async def outbound_response_size_limit_enabled(organization_id: str | None) -> bool:
-    # Org-scoped so every request from one org resolves the same way; calls without an org share one distinct_id.
-    try:
-        return (
-            await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                OUTBOUND_RESPONSE_SIZE_LIMIT_FLAG,
-                organization_id or OUTBOUND_RESPONSE_SIZE_LIMIT_FLAG,
-                properties={"organization_id": organization_id} if organization_id else None,
-            )
-            is True
-        )
-    except Exception:
-        LOG.warning("Failed to resolve outbound response size limit flag; leaving it off", exc_info=True)
-        return False
-
-
 async def read_response_body_limited(response: aiohttp.ClientResponse, limit_bytes: int, url: str) -> bytes:
     # response.content yields decoded bytes, so a compressed body is counted at its expanded size.
     body = bytearray()
@@ -198,6 +183,115 @@ async def read_response_body_limited(response: aiohttp.ClientResponse, limit_byt
                 413, redact_url_for_display(url) or "[redacted]", "Response body exceeds its size limit"
             )
     return bytes(body)
+
+
+class _DeflateResponseDecoder:
+    def __init__(self) -> None:
+        self._decoder = zlib.decompressobj()
+        self._first_attempt = True
+
+    def decompress(self, data: bytes, max_length: int) -> bytes:
+        first_attempt = self._first_attempt
+        self._first_attempt = False
+        try:
+            return self._decoder.decompress(data, max_length)
+        except zlib.error:
+            if not first_attempt:
+                raise
+            self._decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+            return self._decoder.decompress(data, max_length)
+
+    def flush(self, max_length: int) -> bytes:
+        return self._decoder.flush(max_length)
+
+    @property
+    def eof(self) -> bool:
+        return self._decoder.eof
+
+    @property
+    def unconsumed_tail(self) -> bytes:
+        return self._decoder.unconsumed_tail
+
+    @property
+    def unused_data(self) -> bytes:
+        return self._decoder.unused_data
+
+
+def _httpx_response_decoder(content_encoding: str) -> Any | None:
+    encodings = [encoding.strip().lower() for encoding in content_encoding.split(",") if encoding.strip()]
+    if not encodings or encodings == ["identity"]:
+        return None
+    if len(encodings) != 1:
+        raise httpx.DecodingError("Unsupported response content encoding")
+    if encodings[0] == "gzip":
+        return zlib.decompressobj(16 + zlib.MAX_WBITS)
+    if encodings[0] == "deflate":
+        return _DeflateResponseDecoder()
+    raise httpx.DecodingError("Unsupported response content encoding")
+
+
+def _httpx_response_has_body(response: httpx.Response) -> bool:
+    return response.request.method.upper() != "HEAD" and not (
+        100 <= response.status_code < 200 or response.status_code in {204, 205, 304}
+    )
+
+
+async def read_httpx_response_body_limited(response: httpx.Response, limit_bytes: int) -> tuple[bytes, bool]:
+    if not _httpx_response_has_body(response):
+        return b"", False
+
+    content_encoding = response.headers.get("content-encoding", "")
+    decoder = _httpx_response_decoder(content_encoding)
+    body = bytearray()
+    saw_wire_bytes = False
+
+    try:
+        async for raw_chunk in response.aiter_raw():
+            if raw_chunk:
+                saw_wire_bytes = True
+            if decoder is None:
+                body.extend(raw_chunk[: limit_bytes - len(body) + 1])
+                if len(body) > limit_bytes:
+                    return bytes(body[:limit_bytes]), True
+                continue
+
+            pending = raw_chunk
+            while pending:
+                assert decoder is not None
+                chunk = decoder.decompress(pending, min(limit_bytes - len(body) + 1, 64 * 1024))
+                pending = decoder.unconsumed_tail
+                body.extend(chunk)
+                if len(body) > limit_bytes:
+                    return bytes(body[:limit_bytes]), True
+                if decoder.eof and decoder.unused_data:
+                    if content_encoding.strip().lower() != "gzip":
+                        raise httpx.DecodingError("Trailing bytes after compressed response")
+                    pending = decoder.unused_data
+                    decoder = _httpx_response_decoder(content_encoding)
+
+        if decoder is not None and saw_wire_bytes:
+            body.extend(decoder.flush(limit_bytes - len(body) + 1))
+            if not decoder.eof:
+                raise httpx.DecodingError("Incomplete compressed response")
+    except zlib.error as exc:
+        raise httpx.DecodingError("Invalid compressed response") from exc
+
+    return bytes(body[:limit_bytes]), len(body) > limit_bytes
+
+
+def buffered_httpx_response(response: httpx.Response, body: bytes) -> httpx.Response:
+    headers = {
+        name: value
+        for name, value in response.headers.items()
+        if name.lower() not in {"content-encoding", "content-length"}
+    }
+    return httpx.Response(
+        status_code=response.status_code,
+        headers=headers,
+        content=body,
+        request=response.request,
+        extensions=response.extensions,
+    )
 
 
 def declared_charset(content_type: str) -> str | None:
@@ -251,7 +345,7 @@ async def aiohttp_request(
         method: HTTP method (GET, POST, etc.)
         url: Request URL
         headers: Request headers
-        organization_id: Organization used to resolve managed egress routing and the size limit flag cohort
+        organization_id: Organization used to resolve managed egress routing
         data: Request body data (dict for form data, or other types)
         json_data: JSON data to send (takes precedence over data)
         files: Dictionary mapping field names to file paths for multipart file uploads
@@ -262,8 +356,7 @@ async def aiohttp_request(
         authorize_redirect: Refuses a redirect (rather than following it) when it returns False for
             the next URL; the caller decides which destinations the request's contents may reach
         use_controlled_egress: Route each validated hop through the deployment's controlled relay
-        response_limit_bytes: Most body bytes accepted; the relay always applies it, the direct path only
-            when the size limit flag is on
+        response_limit_bytes: Most body bytes accepted
         read_body: When False, skip reading the body on the direct path and return None for it
 
     Returns:
@@ -420,20 +513,12 @@ async def aiohttp_request(
                 if not read_body:
                     return response.status, response_headers, None
 
-                if await outbound_response_size_limit_enabled(organization_id):
-                    limited_body = await read_response_body_limited(response, response_limit_bytes, current_url)
-                    return (
-                        response.status,
-                        response_headers,
-                        decode_bounded_response_body(response.headers.get("Content-Type", ""), limited_body),
-                    )
-
-                try:
-                    response_body = await response.json()
-                except (aiohttp.ContentTypeError, Exception):
-                    response_body = await response.text()
-
-                return response.status, response_headers, response_body
+                limited_body = await read_response_body_limited(response, response_limit_bytes, current_url)
+                return (
+                    response.status,
+                    response_headers,
+                    decode_bounded_response_body(response.headers.get("Content-Type", ""), limited_body),
+                )
         raise HttpException(400, current_url, "Too many redirects while making HTTP request")
 
 

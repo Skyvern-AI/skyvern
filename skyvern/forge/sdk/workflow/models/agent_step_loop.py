@@ -68,6 +68,7 @@ from skyvern.forge.sdk.integrations.connected_accounts import (
     settable_connected_account_fields,
 )
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext, _is_platform_smtp_aws_key
@@ -165,7 +166,6 @@ class _RunState:
     actions: dict[str, tuple[IntegrationEntry, IntegrationAction, list[OrgConnection]]] = field(default_factory=dict)
     workflow_system_prompt: str | None = None
     tools: list[str] | None = None
-    file_keys: list[str] = field(default_factory=list)
     # Kept out of run_context.parameters, which outlives this execution while child labels repeat in the next one.
     child_outputs: dict[str, OutputParameter] = field(default_factory=dict)
     calls: list[dict[str, Any]] = field(default_factory=list)
@@ -611,7 +611,10 @@ def _account_choices(accounts: list[OrgConnection], state: _RunState, needs: Seq
     return f"one of the run's connected accounts: {json.dumps(choices)}"
 
 
-def _yaml_arguments(tool: BlockTool, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
+async def _yaml_arguments(
+    tool: BlockTool, written: dict[str, Any], state: _RunState, output_key: str
+) -> tuple[dict[str, Any], dict[str, FileInfo]]:
+    """The block's YAML arguments, and the run files that reach it only as a parameter for this one call."""
     if unknown := sorted(set(written) - set(tool.arguments)):
         raise ValueError(f"Unknown arguments {unknown}; the allowed arguments are {list(tool.arguments)}.")
     arguments = dict(written)
@@ -630,14 +633,24 @@ def _yaml_arguments(tool: BlockTool, written: dict[str, Any], state: _RunState) 
             raise ValueError(f"credential must be one of {state.credential_keys}.")
         parameter_keys.append(credential)
     files = arguments.pop("files", []) if "files" in pseudo else []
-    if not isinstance(files, list) or not all(isinstance(name, str) and name in state.file_keys for name in files):
-        raise ValueError(f"files must be names from {state.file_keys}.")
+    handed: dict[str, FileInfo] = {}
+    if files != []:
+        run_files = await _run_files(state)
+        accepted = [*run_files, *state.child_outputs]
+        if not isinstance(files, list) or not all(isinstance(name, str) and name in accepted for name in files):
+            raise ValueError(f"files must be names from {accepted}.")
+        for name in files:
+            if name in state.child_outputs or state.run_context.has_parameter(name):
+                continue
+            if state.run_context.has_value(name) or name == output_key:
+                raise ValueError(f"The file {name!r} can't be handed over: the run already has a value named {name!r}.")
+            handed[name] = run_files[name]
     parameter_keys += dict.fromkeys(files)
     if parameter_keys:
         arguments["parameter_keys"] = parameter_keys
     if tool.nested_agent:
         arguments |= {"engine": RunEngine.skyvern_v3, "engine_pinned": True}
-    return arguments
+    return arguments, handed
 
 
 def _dedicated_tool(block_type: BlockType, tool: BlockTool, state: _RunState) -> FunctionTool:
@@ -783,6 +796,14 @@ def _run_tool(
     )
 
 
+def _reserved_names(state: _RunState) -> frozenset[str]:
+    return frozenset([*state.results, *state.child_outputs])
+
+
+async def _run_files(state: _RunState) -> dict[str, FileInfo]:
+    return await state.run_context.run_files(reserved=_reserved_names(state))
+
+
 def _error_text(e: Exception) -> str:
     text = f"{type(e).__name__}: {e}"
     return f"{text} {e.reason}" if isinstance(e, ScrapingFailed) and e.reason else text
@@ -833,21 +854,18 @@ async def _page_title(state: _RunState, page: ScriptSkyvernPage) -> str | None:
 async def _read_run_data(state: _RunState, name: str | None = None) -> object:
     run_context = state.run_context
     platform_keys = run_context.platform_smtp_parameter_keys()
+    file_keys = run_context.file_url_parameter_keys()
     parameters = {
         key: parameter
         for key, parameter in run_context.parameters.items()
-        if parameter.parameter_type != ParameterType.OUTPUT and key not in platform_keys
+        if parameter.parameter_type != ParameterType.OUTPUT and key not in platform_keys and key not in file_keys
     }
     if name in run_context.workflow_run_outputs:
         outcome = run_context.get_block_outcome(name)
         return {"output": run_context.workflow_run_outputs[name], "outcome": asdict(outcome) if outcome else None}
     if name in parameters:
         return _MASK if is_sensitive_workflow_parameter(parameters[name]) else run_context.values.get(name)
-    files = (
-        await app.STORAGE.get_downloaded_files(state.organization_id, state.workflow_run_id)
-        if state.organization_id
-        else []
-    )
+    files = await _run_files(state)
     if name is None:
         return {
             "parameters": list(parameters),
@@ -855,9 +873,9 @@ async def _read_run_data(state: _RunState, name: str | None = None) -> object:
                 label: outcome.status if (outcome := run_context.get_block_outcome(label)) else None
                 for label in run_context.workflow_run_outputs
             },
-            "downloaded_files": [file.filename for file in files],
+            "files": list(files),
         }
-    if file := next((file for file in files if file.filename == name), None):
+    if file := files.get(name):
         return file.model_dump(mode="json")
     raise ValueError(f"Nothing in this run is named {name!r}. Call read_run_data without a name for the names.")
 
@@ -1242,13 +1260,30 @@ async def _run_child_block(
         if not isinstance(written, dict):
             raise ValueError("arguments must be a JSON object.")
         state.run_context.reject_platform_smtp_references(written)
+        arguments, handed = await _yaml_arguments(tool, written, state, output_parameter.key)
         block_yaml = tool.yaml_class(
-            **_yaml_arguments(tool, written, state),
+            **arguments,
             label=label,
             ignore_workflow_system_prompt=state.ignore_workflow_system_prompt,
         )
+        handed_parameters = {
+            name: WorkflowParameter(
+                workflow_parameter_id=str(uuid.uuid4()),
+                workflow_parameter_type=WorkflowParameterType.FILE_URL,
+                workflow_id=state.workflow_id,
+                key=name,
+                created_at=now,
+                modified_at=now,
+            )
+            for name in handed
+        }
         # The send-email converter adds the platform SMTP parameters to this dict.
-        parameters = {**state.child_outputs, **state.run_context.parameters, output_parameter.key: output_parameter}
+        parameters = {
+            **state.child_outputs,
+            **handed_parameters,
+            **state.run_context.parameters,
+            output_parameter.key: output_parameter,
+        }
         child = block_yaml_to_block(block_yaml, parameters)  # type: ignore[arg-type]
     except InvalidWorkflowDefinition:
         raise
@@ -1276,6 +1311,8 @@ async def _run_child_block(
             and not state.run_context.has_parameter(parameter.key)
         ]
         try:
+            for name, file in handed.items():
+                state.run_context.values[name] = file.url
             for parameter in parameters.values():
                 if not isinstance(parameter, AWSSecretParameter):
                     continue
@@ -1307,11 +1344,12 @@ async def _run_child_block(
                 and output_parameter.key not in state.run_context.parameters
             ):
                 state.child_outputs[output_parameter.key] = output_parameter
-                state.file_keys.append(output_parameter.key)
         finally:
             for key in temporary_smtp_keys:
                 state.run_context.parameters.pop(key, None)
                 state.run_context.values.pop(key, None)
+            for name in handed:
+                state.run_context.values.pop(name, None)
     _record_call(
         state,
         written,
@@ -1329,6 +1367,7 @@ async def _run_child_block(
 
 async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> tuple[dict[str, Any], str | None]:
     child._agent_smtp_isolation = True
+    child._run_file_reserved_names = _reserved_names(state)
     child.mark_fields_prerendered(written)
     # Children write their own LLM cost to their own rows.
     with model_usage_observer(None):
@@ -1501,12 +1540,6 @@ async def run_agent_step(
         browser_session_id=browser_session_id,
         run_context=run_context,
         credential_keys=_credential_keys(block.parameters),
-        file_keys=[
-            key
-            for key, parameter in run_context.parameters.items()
-            if isinstance(parameter, WorkflowParameter)
-            and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
-        ],
         ignore_workflow_system_prompt=block.ignore_workflow_system_prompt,
         workflow_system_prompt=block.workflow_system_prompt,
         tools=block.tools,

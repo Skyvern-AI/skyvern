@@ -286,10 +286,28 @@ async def apply_secret_visual_mask_to_active_element(page: Page) -> None:
 _SECRET_VISUAL_MASK_TIMEOUT_MS = 2000
 
 
-async def apply_secret_visual_mask_to_locator(locator: Locator, *, timeout: float) -> None:
+# The step engine's Mask Secrets rule leaves a password box alone, since it already hides its value. Follows a label to
+# its control first, as the mask itself does.
+_IS_PASSWORD_INPUT_SCRIPT = """(el) => {
+  if (!el.isContentEditable && !["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName)) {
+    const label = el.closest ? el.closest("label") : null;
+    if (label && label.control) el = label.control;
+  }
+  return el.tagName === "INPUT" && String(el.getAttribute("type")).toLowerCase() === "password";
+}"""
+
+
+async def apply_secret_visual_mask_to_locator(
+    locator: Locator, *, timeout: float, skip_password_input: bool = False
+) -> None:
     # Waits for the field as long as the write that follows would, so a late render cannot outlast the mask and
     # take the value unmasked; a field that never comes raises here, as the write would have.
     await locator.wait_for(state="attached", timeout=timeout)
+    if skip_password_input:
+        # A probe that fails masks the field: masking a password box is harmless, leaving a secret legible is not.
+        with contextlib.suppress(Exception):
+            if await locator.evaluate(_IS_PASSWORD_INPUT_SCRIPT, timeout=_SECRET_VISUAL_MASK_TIMEOUT_MS):
+                return
     # A field that detaches or re-renders mid-evaluation fails the first attempt; the retry re-resolves the
     # locator to the element the write will also reach. Each attempt is capped, since the field has attached.
     for attempt in range(2):

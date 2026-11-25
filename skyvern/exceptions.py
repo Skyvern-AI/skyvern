@@ -1860,6 +1860,8 @@ class NoTOTPVerificationCodeFound(SkyvernHTTPException):
     # Status-code summary of what totp_verification_url returned, set only when the
     # endpoint answered every poll without ever honoring the documented response shape.
     webhook_diagnostics: str | None = None
+    # Counts-only sentence naming the sources the poll tried; never carries a code, identifier or URL.
+    sources_checked: str | None = None
 
     def __init__(
         self,
@@ -1869,8 +1871,10 @@ class NoTOTPVerificationCodeFound(SkyvernHTTPException):
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         webhook_diagnostics: str | None = None,
+        sources_checked: str | None = None,
     ) -> None:
         self.webhook_diagnostics = webhook_diagnostics
+        self.sources_checked = sources_checked
         msg = "No TOTP verification code found."
         if task_id:
             msg += f" task_id={task_id}"

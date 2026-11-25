@@ -491,6 +491,10 @@ class Settings(BaseSettings):
     # Cluster-local gRPC endpoint for credential-free FileParserBlock decoding. Empty keeps the OSS/local parser;
     # managed worker charts always set it and therefore fail closed rather than parsing beside worker credentials.
     FILE_PARSER_SERVICE_TARGET: str = ""
+    # CSV and Excel parse limits for the local FileParserBlock; the isolated parser service uses the constants.
+    FILE_PARSER_MAX_ROWS: int = Field(default=constants.FILE_PARSER_MAX_ROWS, gt=0)
+    FILE_PARSER_MAX_CELLS: int = Field(default=constants.FILE_PARSER_MAX_CELLS, gt=0)
+    FILE_PARSER_MAX_DECODED_BYTES: int = Field(default=constants.FILE_PARSER_MAX_DECODED_BYTES, gt=0)
     # Most memory a pdfplumber child may add (RLIMIT_AS on Linux, an RSS watchdog everywhere); rendering a 300 dpi A0
     # or A1 scan for OCR can need more than 512 MiB. A pod with less free memory than this, after a 256 MiB margin and
     # the result reserve, gets what is left, and under 128 MiB the call fails, because memory.oom.group kills the whole

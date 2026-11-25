@@ -58,6 +58,15 @@ class InvalidLLMConfigError(BaseLLMError):
         super().__init__(f"LLM config with key {llm_key} is not a valid LLMConfig")
 
 
+class CustomLLMNeedsResaveError(BaseLLMError):
+    def __init__(self, llm_key: str) -> None:
+        self.llm_key = llm_key
+        super().__init__(
+            "This custom model must be saved again before it can run: remove the routing parameter from its "
+            "advanced parameters and re-enter its API key in Settings."
+        )
+
+
 def _cause_detail(cause: BaseException | None) -> str:
     return f" — {type(cause).__name__}: {cause}" if cause else ""
 

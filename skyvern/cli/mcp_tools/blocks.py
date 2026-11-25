@@ -98,7 +98,9 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "download_to_s3": "Download a URL directly to S3 storage",
     "data_export": "Write schema-defined workflow records to a Parquet file",
     "upload_to_s3": "Upload local content to S3",
-    "file_url_parser": "Parse a file (CSV/Excel/PDF/image/DOCX) from a URL; ZIP archives are unzipped to a file list",
+    "file_url_parser": "Parse a file (CSV/Excel/PDF/image/DOCX) from a URL. A ZIP archive returns its files; each "
+    "is saved as one of the run's downloaded files and has a file_path that file_url_parser and split_pdf take as "
+    "file_url.",
     "pdf_parser": "Extract structured data from a PDF document",
     "human_interaction": "Pause workflow for human approval via email",
     "print_page": "Print the current page to PDF",

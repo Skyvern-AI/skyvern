@@ -41,11 +41,14 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CUSTOM_LLM_KEY_PREFIX,
     custom_llm_passthrough_parameters,
+    is_custom_llm_blocked,
     is_custom_llm_key,
     is_custom_llm_owned_by_organization,
+    raise_if_custom_llm_blocked,
 )
 from skyvern.forge.sdk.api.llm.exceptions import (
     BaseLLMError,
+    CustomLLMNeedsResaveError,
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
     InvalidLLMResponseFormat,
@@ -2109,6 +2112,8 @@ class LLMAPIHandlerFactory:
                 default,
             )
         organization_id = context.organization_id if context is not None else None
+        if is_custom_llm_key(override_llm_key):
+            raise_if_custom_llm_blocked(override_llm_key, organization_id)
         if is_custom_llm_key(override_llm_key) and not _custom_key_belongs_to_run_org(
             override_llm_key, organization_id
         ):
@@ -3813,11 +3818,23 @@ def _custom_key_belongs_to_run_org(llm_key: str, organization_id: str | None) ->
     return is_custom_llm_owned_by_organization(custom_llm_id, organization_id)
 
 
+def _blocked_custom_llm_handler(llm_key: str) -> LLMAPIHandler:
+    async def blocked_custom_llm_handler(*args: Any, **kwargs: Any) -> Any:
+        raise CustomLLMNeedsResaveError(llm_key)
+
+    blocked_custom_llm_handler.llm_key = llm_key  # type: ignore[attr-defined]
+    return blocked_custom_llm_handler
+
+
 def _resolve_org_default_llm_handler(
     llm_key: str,
     organization_id: str | None,
     fallback: LLMAPIHandler,
 ) -> LLMAPIHandler:
+    # Callers resolve the org default before applying an explicit model, so a blocked default
+    # fails only if it is actually called.
+    if is_custom_llm_key(llm_key) and is_custom_llm_blocked(llm_key, organization_id):
+        return _blocked_custom_llm_handler(llm_key)
     try:
         if is_custom_llm_key(llm_key) and not _custom_key_belongs_to_run_org(llm_key, organization_id):
             LOG.warning(
