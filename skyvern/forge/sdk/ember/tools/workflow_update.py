@@ -106,6 +106,7 @@ from skyvern.forge.sdk.ember.workflow_yaml import (
     _repair_next_block_label_chain,
     dump_workflow_yaml,
     inherited_header_settings,
+    inherited_workflow_settings,
     merge_private_workflow_settings,
     private_workflow_settings_from_yaml,
     reconcile_workflow_completion_contract,
@@ -119,6 +120,7 @@ from skyvern.forge.sdk.ember.workflow_yaml import (
     runner_code_block_associations,
     submitted_private_workflow_settings,
     with_workflow_yaml_title,
+    workflow_setting_inherits,
 )
 from skyvern.forge.sdk.schemas.ember import (
     EMBER_PRIVATE_SETTINGS_KEY,
@@ -3640,15 +3642,24 @@ def strip_ember_yaml_headers(workflow_yaml: str | None) -> str | None:
         return None
 
 
+# Studio always leaves out enable_self_healing, and leaves out code_version only when it is unset, so a submitted
+# canvas without them takes the known source's value rather than the saved row's.
+CANVAS_SETTINGS_FROM_SOURCE = frozenset({"code_version", "enable_self_healing"})
+
+
 def ember_workflow_yaml_matches(
     submitted_yaml: str | None,
     *known_sources: str | None,
     inherited_proxy_location: ProxyLocationInput = None,
     inherited_code_version: int | None = None,
+    inherited_settings: Mapping[str, object] | None = None,
 ) -> bool:
     submitted_yaml = strip_ember_yaml_headers(submitted_yaml)
     if not submitted_yaml:
         return False
+    submitted_inherited_settings = {
+        key: value for key, value in (inherited_settings or {}).items() if key not in CANVAS_SETTINGS_FROM_SOURCE
+    }
     try:
         for source in known_sources:
             sanitized_source = strip_ember_yaml_headers(source)
@@ -3658,6 +3669,7 @@ def ember_workflow_yaml_matches(
                 sanitized_source,
                 inherited_code_version=inherited_code_version,
                 inherited_proxy_location=inherited_proxy_location,
+                inherited_settings=inherited_settings,
             )
             submitted_with_notes, _, _ = carry_block_notes_from_versions(submitted_yaml, sanitized_source, None)
             if (
@@ -3666,6 +3678,7 @@ def ember_workflow_yaml_matches(
                     inherited_code_version=source_canvas.code_version,
                     inherited_enable_self_healing=source_canvas.enable_self_healing,
                     inherited_proxy_location=inherited_proxy_location,
+                    inherited_settings=submitted_inherited_settings,
                 )
                 == source_canvas
             ):
@@ -3714,6 +3727,11 @@ def ember_canvas_fingerprint(
     return hmac.new(skyvern_settings.SECRET_KEY.encode(), message, hashlib.sha256).hexdigest()
 
 
+def proposal_restore_inherited_settings(saved: Workflow) -> dict[str, object]:
+    # Studio shows and sends a null saved cache key as "default".
+    return {**inherited_workflow_settings(saved), "cache_key": saved.cache_key or "default"}
+
+
 @runtime_checkable
 class _ParameterKeyedBlock(Protocol):
     parameter_keys: list[str] | None
@@ -3725,6 +3743,7 @@ def _normalized_canvas_for_proposal_restore(
     inherited_code_version: int | None = None,
     inherited_enable_self_healing: bool | None = None,
     inherited_proxy_location: ProxyLocationInput = None,
+    inherited_settings: Mapping[str, object] | None = None,
 ) -> WorkflowCreateYAMLRequest:
     """Normalize editor-only empty code outlines before comparing canvas custody.
 
@@ -3733,6 +3752,14 @@ def _normalized_canvas_for_proposal_restore(
     difference must not make an unchanged canonical canvas suppress proposal recovery.
     """
     normalized = _normalize_ember_yaml(workflow_yaml)
+    # Filled before the normalization below, whose assignments would mark every field as set.
+    normalized = normalized.model_copy(
+        update={
+            key: value
+            for key, value in (inherited_settings or {}).items()
+            if workflow_setting_inherits(normalized, key)
+        }
+    )
     normalized.webhook_callback_url = normalized.webhook_callback_url or None
     normalized.description = normalized.description or None
     normalized.proxy_location = resolve_proxy_location(normalized, inherited_proxy_location)
@@ -3893,12 +3920,14 @@ async def _validated_pending_workflow_proposal(
         return None
     # An explicit canvas edit remains the model's input to the normal update tool, so restore only over the
     # saved canvas or the same pending proposal.
+    saved = canonical or ctx.saved_workflow
     if ctx.workflow_yaml and not ember_workflow_yaml_matches(
         ctx.workflow_yaml,
         sanitized_yaml,
-        saved_workflow_canvas(ctx, canonical),
+        saved_workflow_canvas(ctx, saved),
         inherited_proxy_location=canonical.proxy_location if canonical is not None else None,
         inherited_code_version=canonical.code_version if canonical is not None else None,
+        inherited_settings=proposal_restore_inherited_settings(saved) if saved is not None else None,
     ):
         LOG.info(
             "ember_pending_proposal_restore_rejected",
@@ -3907,6 +3936,13 @@ async def _validated_pending_workflow_proposal(
         )
         ctx.canvas_rejected_proposal_yaml = sanitized_yaml
         return None
+    LOG.info(
+        "ember_pending_proposal_restored",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        proposal_revision=metadata.revision if metadata is not None else None,
+        proposal_owner_turn_id=metadata.owner_turn_id if metadata is not None else None,
+        canonical_fingerprint=metadata.canonical_fingerprint if metadata is not None else None,
+    )
     return proposal, sanitized_yaml
 
 
