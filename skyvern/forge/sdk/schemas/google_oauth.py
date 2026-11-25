@@ -82,6 +82,7 @@ class GoogleOAuthCredentialBase(BaseModel):
     state: str
     scopes_requested: list[str] = Field(default_factory=list)
     scopes_granted: list[str] = Field(default_factory=list)
+    initiating_user_id: str | None = Field(default=None, exclude=True, repr=False)
     created_at: datetime
     modified_at: datetime
 

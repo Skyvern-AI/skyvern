@@ -299,13 +299,24 @@ function getResponseDetail(data: unknown): string | undefined {
 function getResponseErrorCode(data: unknown): string | undefined {
   if (data && typeof data === "object" && "detail" in data) {
     const detail = (data as { detail?: unknown }).detail;
-    if (detail && typeof detail === "object" && "error_code" in detail) {
-      const errorCode = (detail as { error_code?: unknown }).error_code;
+    if (detail && typeof detail === "object") {
+      const structuredDetail = detail as {
+        code?: unknown;
+        error_code?: unknown;
+      };
+      const errorCode = structuredDetail.error_code ?? structuredDetail.code;
       return typeof errorCode === "string" ? errorCode : undefined;
     }
   }
   return undefined;
 }
+
+const NON_AUTH_FORBIDDEN_CODES = new Set([
+  "organization_admin_required",
+  "picker_owner_only",
+  "picker_reconnect_required",
+  "picker_token_too_broad",
+]);
 
 clients.forEach((instance) => {
   instance.interceptors.response.use(
@@ -320,9 +331,9 @@ clients.forEach((instance) => {
       if (axios.isAxiosError(error)) {
         const statusCode = error.response?.status;
         const detail = getResponseDetail(error.response?.data);
-        const isOrganizationAdminDenial =
-          getResponseErrorCode(error.response?.data) ===
-          "organization_admin_required";
+        const isNonAuthForbidden = NON_AUTH_FORBIDDEN_CODES.has(
+          getResponseErrorCode(error.response?.data) ?? "",
+        );
         const retryConfig = error.config as UISessionRetryConfig | undefined;
         if (
           statusCode === 403 &&
@@ -347,8 +358,7 @@ clients.forEach((instance) => {
           }
         }
         if (
-          (statusCode === 401 ||
-            (statusCode === 403 && !isOrganizationAdminDenial)) &&
+          (statusCode === 401 || (statusCode === 403 && !isNonAuthForbidden)) &&
           retryConfig &&
           !retryConfig.uiSessionRetry
         ) {
@@ -363,7 +373,7 @@ clients.forEach((instance) => {
         }
         const isAuthFailure =
           statusCode === 401 ||
-          (statusCode === 403 && !isOrganizationAdminDenial) ||
+          (statusCode === 403 && !isNonAuthForbidden) ||
           (statusCode === 404 && detail === "Organization not found");
 
         if (statusCode && isAuthFailure) {
@@ -463,6 +473,10 @@ async function getClient(
   return getClientForVersion(version);
 }
 
+async function getClientWithFreshCredential(version: ApiVersion = "v1") {
+  return await getClient(freshCredentialGetter, version);
+}
+
 async function getClientWithRequestHeaders(
   credentialGetter: CredentialGetter | null,
   version: ApiVersion = "v1",
@@ -506,4 +520,9 @@ export async function deleteUploadedFileOnPageExit(
   }
 }
 
-export { artifactApiClient, getClient, getClientWithRequestHeaders };
+export {
+  artifactApiClient,
+  getClient,
+  getClientWithFreshCredential,
+  getClientWithRequestHeaders,
+};

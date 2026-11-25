@@ -282,8 +282,9 @@ async def google_oauth_callback(
         google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE in context.scopes_requested
         and google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE not in context.scopes_granted
     )
+    requested_drive_file = google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE in context.scopes_requested
     is_reconnect = context.state in {google_oauth_service.STATE_ACTIVE, google_oauth_service.STATE_ERROR}
-    if requested_gmail_send or is_reconnect:
+    if requested_gmail_send or requested_drive_file or is_reconnect:
         try:
             identity = await google_oauth_service.verify_gmail_send_consent(
                 context,

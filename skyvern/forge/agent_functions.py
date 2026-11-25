@@ -198,6 +198,18 @@ async def record_request_audit_event(
     )
 
 
+async def record_request_audit_event_strict(
+    organization_id: str,
+    action: str,
+    resource_type: str,
+    resource_id: str | None,
+) -> None:
+    await app.AGENT_FUNCTION.record_audit_event_strict(
+        get_request_principal(),
+        AuditEvent(organization_id, action, resource_type, resource_id),
+    )
+
+
 EMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS = 30
 EMAIL_OTP_MAX_RESULTS = 5
 EMAIL_OTP_SEARCH_INTERVAL_SECONDS = 30
@@ -1581,6 +1593,10 @@ class AgentFunction:
 
     async def record_audit_event(self, principal: RequestPrincipal | None, event: AuditEvent) -> None:
         """OSS has no customer audit store; cloud overrides this best-effort hook."""
+        return None
+
+    async def record_audit_event_strict(self, principal: RequestPrincipal | None, event: AuditEvent) -> None:
+        """OSS has no customer audit store; cloud overrides this strict hook."""
         return None
 
     async def record_request_reads(
