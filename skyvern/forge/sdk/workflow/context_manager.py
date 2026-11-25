@@ -89,6 +89,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
 )
 from skyvern.forge.sdk.workflow.models._jinja import _JSON_TYPE_MARKER
 from skyvern.forge.sdk.workflow.models.parameter import (
+    BITWARDEN_AWS_KEY_DEFAULTS,
     PARAMETER_TYPE,
     PLATFORM_SMTP_AWS_KEYS,
     AWSSecretParameter,
@@ -2136,7 +2137,8 @@ class WorkflowRunContext:
         # If the parameter is an AWS secret, fetch the secret value and store it in the secrets dict
         # The value of the parameter will be the random secret id with format `secret_<uuid>`.
         # We'll replace the random secret id with the actual secret value when we need to use it.
-        secret_value = await self._aws_client.get_secret(aws_key)
+        secret_name = settings.platform_secret_name(aws_key) if aws_key in PLATFORM_SMTP_AWS_KEYS.values() else aws_key
+        secret_value = await self._aws_client.get_secret(secret_name)
         if secret_value is not None:
             random_secret_id = self.register_secret_value(secret_value)
             if is_platform_smtp:
@@ -2329,9 +2331,13 @@ class WorkflowRunContext:
                     )
             if any(not value and _is_platform_smtp_aws_key(aws_keys[index]) for index, value in enumerate(configured)):
                 raise InvalidWorkflowDefinition("Platform-managed secrets are restricted to platform email delivery.")
-            client_id = configured[0] or await self._aws_client.get_secret(aws_keys[0])
-            client_secret = configured[1] or await self._aws_client.get_secret(aws_keys[1])
-            master_password = configured[2] or await self._aws_client.get_secret(aws_keys[2])
+            secret_names = [
+                settings.platform_secret_name(key) if key in BITWARDEN_AWS_KEY_DEFAULTS.values() else key
+                for key in aws_keys
+            ]
+            client_id = configured[0] or await self._aws_client.get_secret(secret_names[0])
+            client_secret = configured[1] or await self._aws_client.get_secret(secret_names[1])
+            master_password = configured[2] or await self._aws_client.get_secret(secret_names[2])
         except Exception as e:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
