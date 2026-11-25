@@ -76,7 +76,7 @@ Starts PostgreSQL, the API server with its browser, and the web UI.
     ```
   </Step>
   <Step title="Set your LLM key">
-    In `.env`, enable one provider (see [Set up an LLM provider](#set-up-an-llm-provider)).
+    In `.env`, enable one provider and set `LLM_KEY` to its model (see [Set up an LLM provider](#set-up-an-llm-provider)).
   </Step>
   <Step title="Clear the UI's placeholder key">
     In `skyvern-frontend/.env`, set `VITE_SKYVERN_API_KEY=` (empty). The UI then reads the key the server generates. If you leave `YOUR_API_KEY` there, the UI sends it as is and every request fails.
@@ -129,7 +129,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
 ```
 
-`LLM_KEY` defaults to `OPENAI_GPT5_5`. `SECONDARY_LLM_KEY` sets a cheaper model for lighter calls. Azure OpenAI, Gemini, Vertex AI, Bedrock, OpenRouter, Groq, and others work the same way. The provider flags and every valid `LLM_KEY` are in [configuration](/reference/configuration). Restart the server after any change. With Docker Compose, run `docker compose up -d` so the container is recreated with the new values. `docker compose restart` keeps the old ones.
+`LLM_KEY` defaults to `OPENAI_GPT5_5` only when the variable is missing. `.env.example` sets `LLM_KEY=""`, and an empty value means no model: every LLM call fails with "Your LLM provider is not configured." Set it to a model, as in the examples above. `SECONDARY_LLM_KEY` sets a cheaper model for lighter calls. Azure OpenAI, Gemini, Vertex AI, Bedrock, OpenRouter, Groq, and others work the same way. The provider flags and every valid `LLM_KEY` are in [configuration](/reference/configuration). Restart the server after any change. With Docker Compose, run `docker compose up -d` so the container is recreated with the new values. `docker compose restart` keeps the old ones.
 
 ### Use a local model
 
@@ -158,7 +158,7 @@ OPENAI_COMPATIBLE_SUPPORTS_VISION=true
 ```
 
 <Warning>
-If Skyvern runs in Docker, `localhost` is the container. Use `http://host.docker.internal:11434` (or your port) to reach a model on the host. Without `LLM_KEY`, Skyvern keeps calling the default OpenAI model.
+If Skyvern runs in Docker, `localhost` is the container. Use `http://host.docker.internal:11434` (or your port) to reach a model on the host. Set `LLM_KEY` too. If it is empty, as in `.env.example`, LLM calls fail. If it is missing, Skyvern calls the default OpenAI model.
 </Warning>
 
 ## Browser options
