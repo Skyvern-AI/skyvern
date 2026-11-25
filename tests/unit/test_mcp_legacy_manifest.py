@@ -18,7 +18,8 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_act": "407b30ac46dc9cbf83e1eca17c7eef3c19bf850ef8a87b76a3f089dce114d669",
     "skyvern_bitwarden_config_clear": "107c38d2c0da3a2f2fcc0b75935dcfe2b9d24ef1f7e369e22834ef23d6cd4ea3",
     "skyvern_bitwarden_config_get": "da79546595e7667c65a5e45b8625c8712026adb71b4d2dfc627621af1a2577c4",
-    "skyvern_bitwarden_config_set": "a2060a44ff914b81cae13fa5e669be5b05f5b6c6e4b2b0bd6c29c156b936c6c3",
+    # Re-frozen: saving replaces the stored credential, so destructiveHint is now true. Annotations only.
+    "skyvern_bitwarden_config_set": "f7b4fc5b6e82b237661dab5fb03f9454866095842f6d027aea8ce9648a90f478",
     "skyvern_bitwarden_items": "abf727ff755578e4dc4a475643ca1477a7c923c4009edca27b782afbfb63cd30",
     "skyvern_block_schema": "e7527dcb32d072814b3660ad5b1b837e957bd1605c872f8340cbc670fe59d2f5",
     "skyvern_block_validate": "ba988cb4d78e5f4c08e002f91b446dfbb2cdb4672a78060d15c76f91e7be3da1",
@@ -84,7 +85,9 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_observe": "136835d77007121a9c8a493814ab8ece29a8cc73139dfb652157e501b192c558",
     "skyvern_onepassword_config_clear": "3be70bda330d83d0dd67eb1e41d6ba4586a0868f9620a40ead1c3bdf369c6fab",
     "skyvern_onepassword_config_get": "55ec9485f837fbd6c4ac9fc8602ea7c92234ea383ed1aee7b9810b17bba5c62b",
-    "skyvern_onepassword_config_set": "78493cf6da057ba5534d0a30102687d75d7517419bd8e08223dadeeb0a91154e",
+    # Re-frozen: saving replaces the stored token, so destructiveHint is now true. Annotations only.
+    # A manifest digest, not a secret; "password" in the tool name trips gitleaks' generic-api-key rule.
+    "skyvern_onepassword_config_set": "486fa414087abcad10d38a03227f31b6ecc4650c010a109d0b26797564264bf5",  # gitleaks:allow
     "skyvern_onepassword_items": "4b08cbaf5853ff9b2547e058efe664cfdfefb4025d9a8c88f6b6ac8af261283d",
     "skyvern_open_tabs": "9f85d7bff702f3fa5c7558ff3f89bbad8823badba70124ad30c73dbc4d4f8abd",
     "skyvern_org_get": "af99aada703881af2423d36eba5af5a0832eaf51797428f07f2e3dcee66f52a7",
