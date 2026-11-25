@@ -5133,6 +5133,10 @@ class WorkflowService:
         read_only creates, seeds, re-pins and selects nothing, so a profile or selection not yet made is absent."""
         if start_fresh:
             return None, BrowserSeedSource.fresh, None
+        if explicit_request_browser_profile_id and not await self._run_may_seed_from_profile(
+            explicit_request_browser_profile_id, workflow_run=workflow_run, read_only=read_only
+        ):
+            return None, BrowserSeedSource.fresh, None
         if explicit_request_browser_profile_id:
             # v32: a run-form override is a pick FOR THAT RUN — under the engine a plain override writes
             # on success (sink = the override, like any living pick), a credential-owned / foreign override
@@ -5161,6 +5165,8 @@ class WorkflowService:
         # before the persist/key branch below — makes a key sent alongside a pick deterministically
         # ignored (the UI keeps them mutually exclusive; the backend stays deterministic).
         pick = workflow.browser_profile_id
+        if pick and not await self._run_may_seed_from_profile(pick, workflow_run=workflow_run, read_only=read_only):
+            return None, BrowserSeedSource.fresh, None
         if pick:
             role, _owner_credential_id = await self._resolve_picked_profile_role(
                 browser_profile_id=pick, workflow=workflow, organization_id=organization_id
@@ -5625,11 +5631,28 @@ class WorkflowService:
             )
             return fallback_on_error
 
+    async def _run_may_seed_from_profile(
+        self, browser_profile_id: str, *, workflow_run: WorkflowRun, read_only: bool
+    ) -> bool:
+        # Every run start reaches here, including runs a workflow trigger starts with no request to guard.
+        profile = await app.DATABASE.browser_sessions.get_browser_profile(
+            profile_id=browser_profile_id, organization_id=workflow_run.organization_id
+        )
+        if profile is None:
+            return True
+        return await self._credential_profile_usable_by_run(
+            profile,
+            organization_id=workflow_run.organization_id,
+            workflow_run_id=None if read_only else workflow_run.workflow_run_id,
+        )
+
     async def _credential_profile_usable_by_run(
         self, profile: BrowserProfile, *, organization_id: str, workflow_run_id: str | None
     ) -> bool:
         # A profile tied to a workflow keeps that workflow's folder access when a credential carries it into a run.
-        if profile.workflow_permanent_id is None:
+        if not await app.DATABASE.browser_sessions.is_browser_profile_access_scoped(
+            organization_id=organization_id, profile=profile
+        ):
             return True
         if await app.AGENT_FUNCTION.workflow_run_can_use_browser_profile(
             organization_id, workflow_run_id, profile.browser_profile_id

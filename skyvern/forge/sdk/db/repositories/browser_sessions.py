@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import structlog
-from sqlalchemy import Select, and_, case, desc, exists, func, or_, select, update
+from sqlalchemy import Select, and_, case, desc, exists, func, or_, select, union, update
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
@@ -244,6 +244,8 @@ class BrowserSessionsRepository(BaseRepository):
         *,
         browser_profile_id: str | None = None,
         workflow_permanent_id: str | None = None,
+        source_browser_session_id: str | None = None,
+        source_workflow_run_id: str | None = None,
         session: AsyncSession | None = None,
     ) -> BrowserProfile:
         async with nullcontext(session) if session is not None else self.Session() as connection:
@@ -262,6 +264,8 @@ class BrowserSessionsRepository(BaseRepository):
                 proxy_location=serialize_proxy_location(proxy_location),
                 proxy_session_id=proxy_session_id,
                 workflow_permanent_id=workflow_permanent_id,
+                source_browser_session_id=source_browser_session_id,
+                source_workflow_run_id=source_workflow_run_id,
             )
             connection.add(browser_profile)
             if session is None:
@@ -271,54 +275,133 @@ class BrowserSessionsRepository(BaseRepository):
             await connection.refresh(browser_profile)
             return BrowserProfile.model_validate(browser_profile)
 
-    @db_operation("get_browser_session_workflow_permanent_id")
-    async def get_browser_session_workflow_permanent_id(
+    @db_operation("get_browser_session_workflow_permanent_ids")
+    async def get_browser_session_workflow_permanent_ids(
         self, *, organization_id: str, browser_session_id: str
-    ) -> str | None:
-        """The workflow a session's browser state came from: its binding, its creator, then the latest run in it."""
+    ) -> frozenset[str]:
+        """Every workflow a session's browser state came from, by the same links the session folder rule counts."""
         browser = PersistentBrowserSessionModel
-        creator_run_workflow = (
-            select(WorkflowRunModel.workflow_permanent_id)
-            .where(
-                WorkflowRunModel.organization_id == organization_id,
-                WorkflowRunModel.workflow_run_id == browser.created_for_workflow_run_id,
-            )
-            .scalar_subquery()
+        run = WorkflowRunModel
+        this_session = and_(
+            browser.organization_id == organization_id, browser.persistent_browser_session_id == browser_session_id
         )
-        latest_run_workflow = (
-            select(WorkflowRunModel.workflow_permanent_id)
-            .where(
-                WorkflowRunModel.organization_id == organization_id,
-                WorkflowRunModel.browser_session_id == browser.persistent_browser_session_id,
-                WorkflowRunModel.workflow_permanent_id.is_not(None),
-            )
-            .order_by(desc(WorkflowRunModel.created_at))
-            .limit(1)
-            .scalar_subquery()
-        )
-        seed_profile_workflow = (
-            select(BrowserProfileModel.workflow_permanent_id)
-            .where(
+        sources = [
+            select(browser.bound_workflow_permanent_id.label("wpid")).where(this_session),
+            select(browser.created_for_workflow_permanent_id.label("wpid")).where(this_session),
+            select(run.workflow_permanent_id.label("wpid")).where(
+                this_session,
+                run.organization_id == organization_id,
+                run.workflow_run_id == browser.created_for_workflow_run_id,
+            ),
+            select(BrowserProfileModel.workflow_permanent_id.label("wpid")).where(
+                this_session,
                 BrowserProfileModel.organization_id == organization_id,
                 BrowserProfileModel.browser_profile_id == browser.browser_profile_id,
-            )
-            .scalar_subquery()
-        )
+            ),
+            *(
+                select(model.workflow_permanent_id.label("wpid")).where(
+                    model.organization_id == organization_id, model.browser_session_id == browser_session_id
+                )
+                for model in (WorkflowRunModel, DebugSessionModel, BrowserRecordingModel, TaskV2Model)
+            ),
+            *(
+                select(run.workflow_permanent_id.label("wpid")).where(
+                    task.organization_id == organization_id,
+                    task.browser_session_id == browser_session_id,
+                    run.organization_id == organization_id,
+                    run.workflow_run_id == task.workflow_run_id,
+                )
+                for task in (TaskModel, TaskV2Model)
+            ),
+            select(run.workflow_permanent_id.label("wpid")).where(
+                WorkflowRunAttemptModel.organization_id == organization_id,
+                WorkflowRunAttemptModel.pinned_browser_session_id == browser_session_id,
+                run.organization_id == organization_id,
+                run.workflow_run_id == WorkflowRunAttemptModel.workflow_run_id,
+            ),
+        ]
         async with self.Session() as session:
-            return await session.scalar(
+            rows = await session.scalars(union(*sources))
+            return frozenset(workflow_permanent_id for workflow_permanent_id in rows if workflow_permanent_id)
+
+    @db_operation("get_browser_profile_sources")
+    async def get_browser_profile_sources(
+        self, *, organization_id: str, browser_profile_ids: set[str]
+    ) -> dict[str, tuple[str | None, str | None]]:
+        """(source session, source run) for each profile that was saved from one."""
+        if not browser_profile_ids:
+            return {}
+        async with self.Session() as session:
+            rows = await session.execute(
                 select(
-                    func.coalesce(
-                        browser.bound_workflow_permanent_id,
-                        browser.created_for_workflow_permanent_id,
-                        creator_run_workflow,
-                        latest_run_workflow,
-                        seed_profile_workflow,
-                    )
+                    BrowserProfileModel.browser_profile_id,
+                    BrowserProfileModel.source_browser_session_id,
+                    BrowserProfileModel.source_workflow_run_id,
                 ).where(
-                    browser.organization_id == organization_id,
-                    browser.persistent_browser_session_id == browser_session_id,
+                    BrowserProfileModel.organization_id == organization_id,
+                    BrowserProfileModel.browser_profile_id.in_(browser_profile_ids),
+                    or_(
+                        BrowserProfileModel.source_browser_session_id.is_not(None),
+                        BrowserProfileModel.source_workflow_run_id.is_not(None),
+                    ),
                 )
             )
+            return {profile_id: (session_id, run_id) for profile_id, session_id, run_id in rows.all()}
+
+    @db_operation("get_browser_session_seed_profile_ids")
+    async def get_browser_session_seed_profile_ids(
+        self, *, organization_id: str, browser_session_ids: set[str]
+    ) -> dict[str, str]:
+        """The profile each session was started from, for sessions started from one."""
+        if not browser_session_ids:
+            return {}
+        async with self.Session() as session:
+            rows = await session.execute(
+                select(
+                    PersistentBrowserSessionModel.persistent_browser_session_id,
+                    PersistentBrowserSessionModel.browser_profile_id,
+                ).where(
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.persistent_browser_session_id.in_(browser_session_ids),
+                    PersistentBrowserSessionModel.browser_profile_id.is_not(None),
+                )
+            )
+            return {browser_session_id: browser_profile_id for browser_session_id, browser_profile_id in rows.all()}
+
+    @db_operation("get_browser_profile_source_seed_ids")
+    async def get_browser_profile_source_seed_ids(
+        self, *, organization_id: str, browser_session_id: str | None, workflow_run_id: str | None
+    ) -> set[str]:
+        """Profiles the source session or run was seeded from; their state is part of what the source holds."""
+        seeds: list[Select[tuple[str | None]]] = []
+        if browser_session_id:
+            seeds.append(
+                select(PersistentBrowserSessionModel.browser_profile_id).where(
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.persistent_browser_session_id == browser_session_id,
+                )
+            )
+        if workflow_run_id:
+            seeds.append(
+                select(WorkflowRunModel.browser_profile_id).where(
+                    WorkflowRunModel.organization_id == organization_id,
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                )
+            )
+        if not seeds:
+            return set()
+        async with self.Session() as session:
+            rows = await session.scalars(union(*seeds))
+            return {browser_profile_id for browser_profile_id in rows.all() if browser_profile_id}
+
+    async def is_browser_profile_access_scoped(self, *, organization_id: str, profile: BrowserProfile) -> bool:
+        """Whether a profile carries a workflow's or a source's access rules beyond the organization."""
+        if profile.workflow_permanent_id is not None:
+            return True
+        sources = await self.get_browser_profile_sources(
+            organization_id=organization_id, browser_profile_ids={profile.browser_profile_id}
+        )
+        return profile.browser_profile_id in sources
 
     @db_operation("get_or_create_managed_browser_profile")
     async def get_or_create_managed_browser_profile(

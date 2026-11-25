@@ -52,7 +52,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     is_external_cdp_session,
 )
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_snapshot
 from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
@@ -289,15 +289,27 @@ async def list_browser_profiles(
             if not {credential_id for credential_id, _folder_id in links} <= allowed_credential_ids
         }
 
-    profiles = await app.DATABASE.browser_sessions.list_browser_profiles(
-        organization_id=organization_id,
-        include_deleted=include_deleted,
-        page=page,
-        page_size=page_size,
-        search_key=search_key,
-        managed=managed,
-        exclude_search_profile_ids=hidden_profile_ids,
-    )
+    if await app.AGENT_FUNCTION.browser_profile_source_rules_apply(principal, organization_id):
+        profiles = await _list_browser_profiles_visible_by_source(
+            principal,
+            organization_id=organization_id,
+            include_deleted=include_deleted,
+            page=page,
+            page_size=page_size,
+            search_key=search_key,
+            managed=managed,
+            exclude_search_profile_ids=hidden_profile_ids,
+        )
+    else:
+        profiles = await app.DATABASE.browser_sessions.list_browser_profiles(
+            organization_id=organization_id,
+            include_deleted=include_deleted,
+            page=page,
+            page_size=page_size,
+            search_key=search_key,
+            managed=managed,
+            exclude_search_profile_ids=hidden_profile_ids,
+        )
 
     if (
         profiles
@@ -1101,6 +1113,20 @@ async def _create_profile_from_session_locked(
         )
         return saved_profile
 
+    # Decided before the archive is fetched, so a refused save leaves no downloaded copy behind.
+    source_workflows = await app.DATABASE.browser_sessions.get_browser_session_workflow_permanent_ids(
+        organization_id=organization_id, browser_session_id=browser_session_id
+    )
+    if len(source_workflows) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This browser session was used by more than one workflow, so it cannot be saved as one profile. "
+                "Save the profile from a single workflow run instead."
+            ),
+        )
+    source_workflow_permanent_id = next(iter(source_workflows), None)
+
     # Read the storage id the session actually exported to: reuse writes back to its bp_, but a fallback
     # (saved profile failed to load) exported under the session id, so resolve from the loaded profile.
     loaded_profile_id = browser_session.browser_profile_id if browser_session.browser_profile_loaded else None
@@ -1220,9 +1246,6 @@ async def _create_profile_from_session_locked(
         proxy_location = browser_session.proxy_location or ProxyLocation.RESIDENTIAL_ISP
         proxy_session_id = browser_session.proxy_session_id
 
-    source_workflow_permanent_id = await app.DATABASE.browser_sessions.get_browser_session_workflow_permanent_id(
-        organization_id=organization_id, browser_session_id=browser_session_id
-    )
     try:
         try:
             profile = await app.DATABASE.browser_sessions.create_browser_profile(
@@ -1233,6 +1256,7 @@ async def _create_profile_from_session_locked(
                 proxy_location=proxy_location,
                 proxy_session_id=proxy_session_id,
                 workflow_permanent_id=source_workflow_permanent_id,
+                source_browser_session_id=browser_session_id,
             )
         except IntegrityError as exc:
             _handle_duplicate_profile_name(organization_id=organization_id, name=name, exc=exc)
@@ -1351,6 +1375,14 @@ async def _create_profile_from_workflow_run(
             detail="Workflow does not persist browser sessions",
         )
 
+    # A run in a persistent session may carry other workflows' state, so the session is a source too and the
+    # saver needs access to it.
+    run_session_id = workflow_run.browser_session_id
+    if run_session_id:
+        await app.AGENT_FUNCTION.enforce_folder_access_for_ids(
+            get_request_principal(), "browser_profile.create", {("browser_session_id", run_session_id)}
+        )
+
     # The session persistence task runs asynchronously after workflow completion.
     # Poll for a short grace period so that immediate profile-creation requests
     # succeed without forcing clients to implement retry loops.
@@ -1388,6 +1420,8 @@ async def _create_profile_from_workflow_run(
                 proxy_location=proxy_location,
                 proxy_session_id=proxy_session_id,
                 workflow_permanent_id=workflow.workflow_permanent_id,
+                source_browser_session_id=run_session_id,
+                source_workflow_run_id=workflow_run_id,
             )
         except IntegrityError as exc:
             _handle_duplicate_profile_name(organization_id=organization_id, name=name, exc=exc)
@@ -1424,3 +1458,40 @@ async def _create_profile_from_workflow_run(
         discard_temp_working_dir(snapshot.directory)
 
     return profile
+
+
+async def _list_browser_profiles_visible_by_source(
+    principal: RequestPrincipal | None,
+    *,
+    organization_id: str,
+    include_deleted: bool,
+    page: int,
+    page_size: int,
+    search_key: str | None,
+    managed: bool | None,
+    exclude_search_profile_ids: set[str],
+) -> list[BrowserProfile]:
+    """Fill the requested page from the rows a caller may see, checking sources only for the rows read so far."""
+    wanted = page * page_size
+    visible: list[BrowserProfile] = []
+    db_page = 1
+    while len(visible) < wanted:
+        rows = await app.DATABASE.browser_sessions.list_browser_profiles(
+            organization_id=organization_id,
+            include_deleted=include_deleted,
+            page=db_page,
+            page_size=page_size,
+            search_key=search_key,
+            managed=managed,
+            exclude_search_profile_ids=exclude_search_profile_ids,
+        )
+        if not rows:
+            break
+        hidden = await app.AGENT_FUNCTION.hidden_browser_profile_ids(
+            principal, organization_id, {row.browser_profile_id for row in rows}
+        )
+        visible += [row for row in rows if row.browser_profile_id not in hidden]
+        if len(rows) < page_size:
+            break
+        db_page += 1
+    return visible[(page - 1) * page_size : wanted]

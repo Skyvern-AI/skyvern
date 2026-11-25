@@ -2097,6 +2097,9 @@ class BrowserProfileModel(Base):
     is_managed = Column(Boolean, nullable=False, server_default=sqlalchemy.false(), default=False)
     workflow_permanent_id = Column(String, nullable=True)
     browser_profile_key_digest = Column(String, nullable=True)
+    # The session or workflow run a profile was saved from; the profile keeps that source's access rules.
+    source_browser_session_id = Column(String, nullable=True)
+    source_workflow_run_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)

@@ -1411,6 +1411,18 @@ class AgentFunction:
         """Cloud raises 403 when a folder denies the action on any of the runs, checked in one pass; OSS allows."""
         return None
 
+    async def browser_profile_source_rules_apply(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> bool:
+        """Whether any rule could hide a saved profile's source from this caller; OSS has no folder ACLs."""
+        return False
+
+    async def hidden_browser_profile_ids(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_profile_ids: set[str]
+    ) -> set[str]:
+        """Profiles whose source session or run the caller cannot access; OSS has no folder ACLs."""
+        return set()
+
     async def workflow_run_can_use_browser_profile(
         self, organization_id: str, workflow_run_id: str | None, browser_profile_id: str
     ) -> bool:
