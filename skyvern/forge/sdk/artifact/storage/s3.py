@@ -619,7 +619,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         return snapshot.directory if snapshot is not None else None
 
     async def retrieve_browser_session_snapshot(
-        self, organization_id: str, workflow_permanent_id: str
+        self, organization_id: str, workflow_permanent_id: str, *, allow_sealed_fallback: bool = False
     ) -> BrowserProfileSnapshot | None:
         return await retrieve_remote_profile(
             self._workflow_session_uris(organization_id, workflow_permanent_id),
@@ -628,6 +628,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             download=self.async_client.download_file,
             stat=self._profile_object_info,
             purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+            allow_sealed_fallback=allow_sealed_fallback,
         )
 
     async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
