@@ -53,7 +53,7 @@ from skyvern.schemas.runs import (
 from skyvern.schemas.webhooks import RunWebhookPreviewResponse, RunWebhookReplayResponse
 from skyvern.services import run_service, task_v2_service
 from skyvern.services.webhook_delivery import log_workflow_webhook_delivery_finalized
-from skyvern.utils.url_validators import validate_fetch_url_with_resolved_ips
+from skyvern.utils.url_validators import redact_url_for_display, validate_fetch_url_with_resolved_ips
 
 LOG = structlog.get_logger()
 
@@ -604,17 +604,17 @@ async def _deliver_webhook(
             response_body = body_text or None
     except httpx.TimeoutException:
         error = "Request timed out after 60 seconds."
-        LOG.warning("Webhook replay timed out", url=url)
+        LOG.warning("Webhook replay timed out", url=redact_url_for_display(url))
     except (httpx.NetworkError, httpx.ProxyError) as exc:
         error = f"Could not reach URL: {exc}"
-        LOG.warning("Webhook replay network error", url=url, error=str(exc))
+        LOG.warning("Webhook replay network error", url=redact_url_for_display(url), error=str(exc))
     except BlockedHost:
         # The host passed validation, then resolved to a blocked address at delivery (DNS rebinding or proxy refusal).
         error = "The target host was refused by SSRF protection."
-        LOG.warning("Webhook replay target refused", url=url)
+        LOG.warning("Webhook replay target refused", url=redact_url_for_display(url))
     except Exception as exc:  # pragma: no cover - defensive guard
         error = f"Unexpected error: {exc}"
-        LOG.error("Webhook replay unexpected error", url=url, error=str(exc), exc_info=True)
+        LOG.error("Webhook replay unexpected error", url=redact_url_for_display(url), error=str(exc), exc_info=True)
 
     latency_ms = int((perf_counter() - start) * 1000)
     return status_code, latency_ms, response_body, error
@@ -644,7 +644,7 @@ async def _validate_target_url(url: str) -> tuple[str, tuple[str, ...]]:
     except SkyvernHTTPException:
         raise
     except Exception as exc:  # pragma: no cover - defensive guard
-        LOG.error("Unexpected error validating webhook URL", url=url, error=str(exc))
+        LOG.error("Unexpected error validating webhook URL", url=redact_url_for_display(url), error=str(exc))
         raise SkyvernHTTPException(
             "Unexpected error while validating the webhook URL.",
             status_code=status.HTTP_400_BAD_REQUEST,
