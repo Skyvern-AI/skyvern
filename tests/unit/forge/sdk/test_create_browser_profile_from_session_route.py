@@ -70,7 +70,11 @@ def _profile() -> BrowserProfile:
     )
 
 
-async def _stored_profile(*, workflow_permanent_id: str | None = None, **_kwargs: object) -> BrowserProfile:
+_stored_rows: list[dict[str, object]] = []
+
+
+async def _stored_profile(*, workflow_permanent_id: str | None = None, **kwargs: object) -> BrowserProfile:
+    _stored_rows.append({"workflow_permanent_id": workflow_permanent_id, **kwargs})
     return _profile().model_copy(update={"workflow_permanent_id": workflow_permanent_id})
 
 
@@ -91,6 +95,8 @@ def _build_client(
     *,
     raise_server_exceptions: bool = False,
 ) -> tuple[TestClient, SimpleNamespace]:
+    _stored_rows.clear()
+
     async def _fake_org() -> SimpleNamespace:
         return SimpleNamespace(organization_id="org_oss")
 
@@ -107,7 +113,10 @@ def _build_client(
         get_workflow_run=AsyncMock(),
         get_workflow=AsyncMock(),
         create_profile=AsyncMock(side_effect=_stored_profile),
+        stored_rows=_stored_rows,
         session_workflow=AsyncMock(return_value=None),
+        session_workflows=AsyncMock(return_value=frozenset()),
+        enforce_folder_access_for_ids=AsyncMock(return_value=None),
         get_db_profile=AsyncMock(return_value=SimpleNamespace(is_managed=True, workflow_permanent_id="wp_1")),
         delete_db_profile=AsyncMock(),
         hard_delete_db_profile=AsyncMock(),
@@ -138,7 +147,10 @@ def _build_client(
     forge_app.set_app(
         SimpleNamespace(
             CACHE=mocks.cache,
-            AGENT_FUNCTION=SimpleNamespace(is_browser_memory_engine_enabled_for_org=mocks.engine_enabled),
+            AGENT_FUNCTION=SimpleNamespace(
+                is_browser_memory_engine_enabled_for_org=mocks.engine_enabled,
+                enforce_folder_access_for_ids=mocks.enforce_folder_access_for_ids,
+            ),
             RATE_LIMITER=SimpleNamespace(rate_limit_submit_run=mocks.rate_limit_submit_run),
             PERSISTENT_SESSIONS_MANAGER=SimpleNamespace(
                 get_observer_browser_state=mocks.observe_session,
@@ -151,6 +163,7 @@ def _build_client(
                 browser_sessions=SimpleNamespace(
                     get_persistent_browser_session=mocks.get_session,
                     get_browser_session_workflow_permanent_id=mocks.session_workflow,
+                    get_browser_session_workflow_permanent_ids=mocks.session_workflows,
                     create_browser_profile=mocks.create_profile,
                     get_browser_profile=mocks.get_db_profile,
                     delete_browser_profile=mocks.delete_db_profile,
@@ -406,6 +419,7 @@ def _workflow_run(**kwargs: object) -> SimpleNamespace:
         "workflow_permanent_id": "wp_1",
         "browser_profile_id": None,
         "browser_sink_profile_id": None,
+        "browser_session_id": None,
     }
     base.update(kwargs)
     return SimpleNamespace(**base)
@@ -586,15 +600,23 @@ def test_create_empty_profile_preserves_duplicate_name_handling(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_session_id", "saver_may_access_session"),
+    [(None, True), ("pbs_run", True), ("pbs_run", False)],
+    ids=["no_session", "session_accessible", "session_not_accessible"],
+)
 async def test_create_profile_from_workflow_run_still_stores_workflow_archive(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, run_session_id: str | None, saver_may_access_session: bool
 ) -> None:
     _client, mocks = _build_client(monkeypatch)
+    if not saver_may_access_session:
+        mocks.enforce_folder_access_for_ids.side_effect = HTTPException(status_code=403, detail="denied")
     mocks.get_workflow_run.return_value = SimpleNamespace(
         workflow_id="wf_1",
         workflow_permanent_id="wp_1",
         browser_profile_id=None,
         browser_sink_profile_id=None,
+        browser_session_id=run_session_id,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -602,6 +624,15 @@ async def test_create_profile_from_workflow_run_still_stores_workflow_archive(
     )
     mocks.retrieve_session.return_value = "/tmp/workflow_session_dir"
 
+    if not saver_may_access_session:
+        # The run's browser session may hold other workflows' state, so the saver needs access to that session.
+        with pytest.raises(HTTPException) as exc_info:
+            await browser_profiles_route._create_profile_from_workflow_run(
+                organization_id="org_oss", name="my profile", description=None, workflow_run_id="wr_1"
+            )
+        assert exc_info.value.status_code == 403
+        assert mocks.stored_rows == []
+        return
     profile = await browser_profiles_route._create_profile_from_workflow_run(
         organization_id="org_oss",
         name="my profile",
@@ -610,6 +641,8 @@ async def test_create_profile_from_workflow_run_still_stores_workflow_archive(
     )
 
     assert profile.workflow_permanent_id == "wp_1"
+    assert mocks.stored_rows[-1]["source_workflow_run_id"] == "wr_1"
+    assert mocks.stored_rows[-1]["source_browser_session_id"] == run_session_id
     assert profile.is_managed is False
     mocks.retrieve_session.assert_awaited_once_with(
         organization_id="org_oss",
@@ -672,6 +705,7 @@ async def test_create_profile_from_workflow_run_reads_managed_profile_blob(
         workflow_permanent_id="wp_1",
         browser_profile_id="bp_managed",
         browser_sink_profile_id=None,
+        browser_session_id=None,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -707,6 +741,7 @@ async def test_create_profile_from_workflow_run_falls_back_to_legacy_archive_for
         workflow_permanent_id="wp_1",
         browser_profile_id="bp_managed",
         browser_sink_profile_id=None,
+        browser_session_id=None,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -745,6 +780,7 @@ async def test_create_profile_from_workflow_run_skips_user_profile_blob(
         workflow_permanent_id="wp_1",
         browser_profile_id="bp_user",
         browser_sink_profile_id=None,
+        browser_session_id=None,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -778,6 +814,7 @@ async def test_failed_workflow_run_profile_creation_hard_deletes_half_created_pr
         workflow_permanent_id="wp_1",
         browser_profile_id=None,
         browser_sink_profile_id=None,
+        browser_session_id=None,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -854,9 +891,24 @@ async def test_no_profile_is_saved_from_a_registered_external_session(
     mocks.observe_session.assert_not_awaited()
 
 
-def test_promote_inherits_session_proxy_pin_and_source_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("source_workflows", [frozenset({"wp_1"}), frozenset({"wp_1", "wp_2"})], ids=["one", "several"])
+def test_promote_inherits_session_proxy_pin_and_source_workflow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source_workflows: frozenset[str]
+) -> None:
     client, mocks = _build_client(monkeypatch)
-    mocks.session_workflow.return_value = "wp_1"
+    # The session reaches its workflow only through a link the run lookup does not cover (a debug session).
+    mocks.session_workflows.return_value = source_workflows
+    monkeypatch.setattr(browser_profiles_route.settings, "TEMP_PATH", str(tmp_path))
+    downloads: list[Path] = []
+
+    async def download(**_kwargs: object) -> str:
+        directory = tmp_path / f"skyvern_browser_profile_{len(downloads)}"
+        directory.mkdir()
+        (directory / "Cookies").write_text("session_token=abc")
+        downloads.append(directory)
+        return str(directory)
+
+    mocks.retrieve_profile.side_effect = download
     mocks.get_session.return_value = _session(
         generate_browser_profile=True,
         proxy_location=ProxyLocation.RESIDENTIAL_ISP,
@@ -866,8 +918,15 @@ def test_promote_inherits_session_proxy_pin_and_source_workflow(monkeypatch: pyt
 
     response = client.post("/v1/browser_profiles/", json={"name": "my profile", "browser_session_id": "pbs_1"})
 
+    if len(source_workflows) > 1:
+        # A session used by several workflows is refused; nothing is stored and no downloaded copy is left behind.
+        assert response.status_code == 409
+        assert mocks.stored_rows == []
+        assert not any(directory.exists() for directory in downloads)
+        return
     assert response.status_code == 200
     assert response.json()["workflow_permanent_id"] == "wp_1"
+    assert mocks.stored_rows[-1]["source_browser_session_id"] == "pbs_1"
     assert mocks.create_profile.await_args.kwargs["proxy_location"] == ProxyLocation.RESIDENTIAL_ISP
     assert mocks.create_profile.await_args.kwargs["proxy_session_id"] == "abc1234567"
 
@@ -1268,7 +1327,7 @@ async def test_overlapping_saves_of_a_closing_session_create_one_profile(
 
 
 def _run_and_workflow(persist: bool) -> tuple[SimpleNamespace, SimpleNamespace]:
-    run = SimpleNamespace(workflow_id="w", workflow_permanent_id="wpid")
+    run = SimpleNamespace(workflow_id="w", workflow_permanent_id="wpid", browser_session_id=None)
     workflow = SimpleNamespace(persist_browser_session=persist, workflow_permanent_id="wpid")
     return run, workflow
 

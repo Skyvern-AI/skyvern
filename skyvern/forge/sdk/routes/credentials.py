@@ -1445,6 +1445,16 @@ async def test_credential(
                 browser_profile_id=existing_browser_profile_id,
             )
             existing_browser_profile_id = None
+        elif (
+            data.save_browser_profile
+            and await app.DATABASE.browser_sessions.is_browser_profile_access_scoped(
+                organization_id=organization_id, profile=profile
+            )
+            and not await app.AGENT_FUNCTION.workflow_run_can_use_browser_profile(
+                organization_id, None, existing_browser_profile_id
+            )
+        ):
+            raise HTTPException(status_code=403, detail="Browser profile not accessible")
 
     LOG.info(
         "Testing credential",
@@ -2558,9 +2568,11 @@ async def delete_organization_credential(
                 profile = await app.DATABASE.browser_sessions.get_browser_profile(
                     profile_id=profile_id, organization_id=organization_id
                 )
-                # A profile tied to a workflow belongs to that workflow's folder, so deleting the credential
-                # only drops the link.
-                if profile is not None and profile.workflow_permanent_id is not None:
+                # A profile tied to a workflow or saved from a source keeps that access, so deleting the
+                # credential only drops the link.
+                if profile is not None and await app.DATABASE.browser_sessions.is_browser_profile_access_scoped(
+                    organization_id=organization_id, profile=profile
+                ):
                     LOG.warning(
                         "browser_memory.credential_profile_kept",
                         organization_id=organization_id,

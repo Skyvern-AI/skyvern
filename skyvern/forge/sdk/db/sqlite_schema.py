@@ -14,6 +14,8 @@ _SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("workflow_run_blocks", "tool_calls", "JSON"),
     ("google_oauth_credentials", "google_subject", "VARCHAR"),
     ("tasks", "task_queue", "VARCHAR"),
+    ("browser_profiles", "source_browser_session_id", "VARCHAR"),
+    ("browser_profiles", "source_workflow_run_id", "VARCHAR"),
 )
 
 

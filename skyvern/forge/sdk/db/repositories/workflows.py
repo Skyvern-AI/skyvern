@@ -567,6 +567,22 @@ class WorkflowsRepository(BaseRepository):
                 )
             return None
 
+    @db_operation("get_workflow_browser_profile_id")
+    async def get_workflow_browser_profile_id(
+        self, workflow_permanent_id: str, organization_id: str, version: int | None = None
+    ) -> str | None:
+        """The saved browser profile of the version get_workflow_by_permanent_id would return."""
+        query = select(WorkflowModel.browser_profile_id).where(
+            WorkflowModel.workflow_permanent_id == workflow_permanent_id,
+            WorkflowModel.organization_id == organization_id,
+            WorkflowModel.deleted_at.is_(None),
+            or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != EMBER_TEST_WORKFLOW_CREATOR),
+        )
+        if version:
+            query = query.where(WorkflowModel.version == version)
+        async with self.Session() as session:
+            return await session.scalar(query.order_by(WorkflowModel.version.desc()).limit(1))
+
     @db_operation("get_workflow_original_creators")
     async def get_workflow_original_creators(
         self, workflow_permanent_ids: set[str], organization_id: str
