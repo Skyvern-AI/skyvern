@@ -4,7 +4,7 @@ agent step refuses a tool call naming a "no" account; no run is refused on scope
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from typing import Literal
 
 from skyvern.forge.sdk.integrations.catalog import (
@@ -34,8 +34,12 @@ _PARTIAL: dict[str, tuple[str, ...]] = {
     google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE: (
         f"{_GOOGLE}spreadsheets.readonly",
         f"{_GOOGLE}drive.readonly",
-        f"{_GOOGLE}drive.file",
+        google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
     ),
+}
+# Grants a rule finds partial; a narrow-only Drive grant reaches only the files a person chose.
+_PARTIAL_RULES: dict[str, Callable[[Collection[str]], bool]] = {
+    _GOOGLE_DRIVE_SCOPE: google_oauth_service.grants_drive_steps,
 }
 
 
@@ -59,7 +63,10 @@ def _fit(provider: str, scopes_granted: Collection[str] | None, needs: Collectio
 def _need_fit(provider: str, scopes_granted: Collection[str], need: str) -> AccountFit:
     if _holds(provider, scopes_granted, (need, *_BROADER.get(need, ()))):
         return "yes"
-    return "unknown" if _holds(provider, scopes_granted, _PARTIAL.get(need, ())) else "no"
+    if _holds(provider, scopes_granted, _PARTIAL.get(need, ())):
+        return "unknown"
+    rule = _PARTIAL_RULES.get(need)
+    return "unknown" if rule is not None and rule(scopes_granted) else "no"
 
 
 def account_fit(account: IntegrationAccount, action: IntegrationAction | IntegrationTrigger) -> AccountFit:

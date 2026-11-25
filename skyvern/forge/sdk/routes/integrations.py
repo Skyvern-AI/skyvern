@@ -4,6 +4,7 @@ from fastapi import Depends
 
 from skyvern.forge import app
 from skyvern.forge.sdk.integrations.catalog import integration_entries, integration_entries_for_org, page_payload
+from skyvern.forge.sdk.routes.google_drive import google_drive_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
@@ -23,3 +24,7 @@ async def list_integrations(
     known = [*entries, *integration_entries(powerbi_available=True, gmail_available=True)]
     entries += await app.AGENT_FUNCTION.more_integration_entries(known)
     return [page_payload(entry) for entry in entries]
+
+
+base_router.include_router(google_drive_router, prefix="/integrations/google/drive", include_in_schema=False)
+legacy_base_router.include_router(google_drive_router, prefix="/integrations/google/drive", include_in_schema=False)

@@ -14,7 +14,7 @@ import datetime
 import hmac
 import json
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from urllib.parse import urlparse
@@ -78,17 +78,24 @@ GOOGLE_GMAIL_SCOPES: tuple[str, ...] = (GOOGLE_GMAIL_READONLY_SCOPE,)
 # arbitrary existing folders unless the app created or Picker-selected them, so
 # this profile intentionally uses full Drive scope until a Picker flow exists.
 GOOGLE_DRIVE_SCOPES: tuple[str, ...] = ("https://www.googleapis.com/auth/drive",)
+# Only the files a person chooses in the picker or the app creates.
+GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+GOOGLE_DRIVE_FILE_SCOPES: tuple[str, ...] = (GOOGLE_DRIVE_FILE_SCOPE,)
+# What a Drive step requires; _REQUIRED_SCOPE_RULES says which grants meet it.
+GOOGLE_DRIVE_STEP_SCOPES: tuple[str, ...] = (GOOGLE_DRIVE_FILE_SCOPE,)
 # openid and email make Google return an ID token, which is the only server-verified account identity.
 GOOGLE_GMAIL_SEND_SCOPES: tuple[str, ...] = (GOOGLE_GMAIL_SEND_SCOPE, "openid", "email")
 GOOGLE_OAUTH_SCOPE_PROFILE_SHEETS = "google_sheets"
 GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL = "gmail"
 GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE = "google_drive"
+GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE_FILE = "google_drive_file"
 GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_SEND = "gmail_send"
 GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_READ_SEND = "gmail_read_send"
 GOOGLE_OAUTH_SCOPE_PROFILES: dict[str, tuple[str, ...]] = {
     GOOGLE_OAUTH_SCOPE_PROFILE_SHEETS: GOOGLE_SHEETS_SCOPES,
     GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL: GOOGLE_GMAIL_SCOPES,
     GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE: GOOGLE_DRIVE_SCOPES,
+    GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE_FILE: GOOGLE_DRIVE_FILE_SCOPES,
     GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_SEND: GOOGLE_GMAIL_SEND_SCOPES,
     GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_READ_SEND: (*GOOGLE_GMAIL_SCOPES, *GOOGLE_GMAIL_SEND_SCOPES),
 }
@@ -99,6 +106,27 @@ _SEND_UPGRADE_SCOPE_PROFILES = frozenset(
 _GOOGLE_SCOPE_ALIASES = {
     "email": "https://www.googleapis.com/auth/userinfo.email",
     "profile": "https://www.googleapis.com/auth/userinfo.profile",
+}
+_NARROW_DRIVE_ALLOWED_SCOPES = frozenset(
+    {GOOGLE_DRIVE_FILE_SCOPE, "openid", _GOOGLE_SCOPE_ALIASES["email"]},
+)
+
+
+def is_narrow_drive_grant(granted_scopes: Iterable[str] | None) -> bool:
+    """True only for a "chosen files only" Drive grant: no scope beyond narrow Drive and the identity scopes."""
+    granted = _normalized_scopes(granted_scopes or ())
+    return not granted.isdisjoint(GOOGLE_DRIVE_FILE_SCOPES) and granted <= _NARROW_DRIVE_ALLOWED_SCOPES
+
+
+def grants_drive_steps(granted_scopes: Iterable[str] | None) -> bool:
+    granted = _normalized_scopes(granted_scopes or ())
+    return not granted.isdisjoint(GOOGLE_DRIVE_SCOPES) or is_narrow_drive_grant(granted)
+
+
+# Older Sheets connections hold the narrow Drive scope beside their Sheets scopes, so holding it must not make them
+# Drive accounts: a requirement for a scope listed here is met by its rule, not by membership.
+_REQUIRED_SCOPE_RULES: dict[str, Callable[[Iterable[str] | None], bool]] = {
+    GOOGLE_DRIVE_FILE_SCOPE: grants_drive_steps,
 }
 
 CONSENT_TTL_SECONDS = 600
@@ -451,7 +479,7 @@ def scopes_for_profile(scope_profile: str | None) -> list[str]:
     return list(GOOGLE_OAUTH_SCOPE_PROFILES[scope_profile])
 
 
-def _normalized_scopes(scopes: Sequence[str]) -> set[str]:
+def _normalized_scopes(scopes: Iterable[str]) -> set[str]:
     return {_GOOGLE_SCOPE_ALIASES.get(scope, scope) for scope in scopes}
 
 
@@ -464,7 +492,9 @@ def has_required_scopes(
     required_scopes: list[str] | tuple[str, ...],
 ) -> bool:
     granted = set(granted_scopes or [])
-    return all(scope in granted for scope in required_scopes)
+    return all(
+        rule(granted) if (rule := _REQUIRED_SCOPE_RULES.get(scope)) else scope in granted for scope in required_scopes
+    )
 
 
 def _validate_redirect_uri(redirect_uri: str, client_config: GoogleOAuthClientConfig | None = None) -> None:

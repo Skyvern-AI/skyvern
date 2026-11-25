@@ -1182,3 +1182,61 @@ async def move_file(*, access_token: str, item: str, destination_folder: str) ->
         return {**result, "web_view_link": moved.get("webViewLink"), "moved": True}
 
     return await _run_folder_action("move_file", access_token, action)
+
+
+@dataclass(frozen=True)
+class DriveFilesPage:
+    files: list[dict[str, Any]]
+    next_page_token: str | None = None
+    incomplete_search: bool = False
+
+
+def _escape_drive_query(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+async def list_files(
+    *,
+    access_token: str,
+    folders: bool,
+    query: str | None = None,
+    page_token: str | None = None,
+    page_size: int = 25,
+    search_all_drives: bool = False,
+    downloadable_only: bool = False,
+) -> DriveFilesPage:
+    terms = [f"mimeType {'=' if folders else '!='} '{GOOGLE_FOLDER_MIME_TYPE}'", "trashed = false"]
+    if downloadable_only:
+        # download_file exports only Google Docs; every other Workspace type raises GoogleDriveNativeDocumentError.
+        terms.append(f"(mimeType = '{GOOGLE_DOC_MIME_TYPE}' or not mimeType contains '{GOOGLE_WORKSPACE_MIME_PREFIX}')")
+    if query:
+        terms.append(f"name contains '{_escape_drive_query(query)}'")
+    params = {
+        "q": " and ".join(terms),
+        "pageSize": str(max(1, min(100, page_size))),
+        "fields": f"incompleteSearch,{_DRIVE_LIST_FIELDS}" if search_all_drives else _DRIVE_LIST_FIELDS,
+        "orderBy": "modifiedTime desc",
+        "spaces": "drive",
+        "supportsAllDrives": "true",
+        "includeItemsFromAllDrives": "true",
+        # The default corpora=user only returns shared-drive files the user has already opened.
+        **({"corpora": "allDrives"} if search_all_drives else {}),
+        **({"pageToken": page_token} if page_token else {}),
+    }
+    async with httpx.AsyncClient(timeout=settings.GOOGLE_DRIVE_API_TIMEOUT_SECONDS) as client:
+        payload = await _drive_request(
+            client,
+            "GET",
+            f"{DRIVE_API_BASE}/files",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+        )
+    return DriveFilesPage(
+        files=[
+            {**_listed_item(item), "name": item.get("name") or item["id"]}
+            for item in payload.get("files") or []
+            if isinstance(item, dict) and item.get("id")
+        ],
+        next_page_token=payload.get("nextPageToken"),
+        incomplete_search=search_all_drives and payload.get("incompleteSearch") is True,
+    )

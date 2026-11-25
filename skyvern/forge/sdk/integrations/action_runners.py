@@ -50,7 +50,7 @@ async def run_google_drive_folder_action(
     # Minted for this organization's own connection, so both ends of a move go through one account of the
     # organization running the block.
     access_token = await resolve_account_token(
-        organization_id, connection_id, list(google_oauth_service.GOOGLE_DRIVE_SCOPES), api="google"
+        organization_id, connection_id, list(google_oauth_service.GOOGLE_DRIVE_STEP_SCOPES), api="google"
     )
     if not access_token:
         raise ActionRunFailed(await google_oauth_service.describe_credential_failure(organization_id, connection_id))
