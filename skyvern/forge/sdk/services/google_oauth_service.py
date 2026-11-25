@@ -54,6 +54,7 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     GoogleOAuthCredentialBase,
 )
 from skyvern.forge.sdk.services import oauth_consent, oauth_redirect_uri
+from skyvern.forge.sdk.services.request_principal import synthetic_user_id
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.email_validation import normalize_email_address
 
@@ -732,6 +733,7 @@ async def promote_pending_credential(
         encrypted_method=DEFAULT_ENCRYPT_METHOD,
         scopes_granted=_coerce_scopes(scopes_granted),
         now=now,
+        initiating_user_id=None if initiator_id == synthetic_user_id(organization_id) else initiator_id,
         google_subject=identity.subject if identity else None,
         email_address=identity.email if identity else None,
     )
