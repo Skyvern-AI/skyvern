@@ -145,14 +145,18 @@ def google_access_token_cache_lock_key(organization_id: str, credential_id: str)
     return f"{google_access_token_cache_key(organization_id, credential_id)}:lock"
 
 
-def google_access_token_cache_lock(organization_id: str, credential_id: str) -> AsyncLock:
+def google_access_token_cache_lock(
+    organization_id: str,
+    credential_id: str,
+    blocking_timeout: int = GOOGLE_ACCESS_TOKEN_CACHE_LOCK_BLOCKING_TIMEOUT_SECONDS,
+) -> AsyncLock:
     get_lock = getattr(app.CACHE, "get_lock", None)
     lock_name = google_access_token_cache_lock_key(organization_id, credential_id)
     if get_lock is None:
         return NoopLock(lock_name)
     return get_lock(
         lock_name,
-        blocking_timeout=GOOGLE_ACCESS_TOKEN_CACHE_LOCK_BLOCKING_TIMEOUT_SECONDS,
+        blocking_timeout=blocking_timeout,
         timeout=GOOGLE_ACCESS_TOKEN_CACHE_LOCK_TIMEOUT_SECONDS,
     )
 
@@ -401,6 +405,26 @@ async def resolve_client_config(
     return GoogleOAuthClientConfigResolution(config=env_config, source="environment" if env_config else "missing")
 
 
+async def _invalidate_flipped_access_tokens(organization_id: str, credential_ids: list[str]) -> None:
+    if not credential_ids:
+        return
+    LOG.info(
+        "Marked Google OAuth credentials for reconnect after client config change",
+        organization_id=organization_id,
+        count=len(credential_ids),
+    )
+    # A cached access token outlives the state flip, so callers would keep using a credential marked for reconnect.
+    for credential_id in credential_ids:
+        try:
+            await invalidate_google_access_token_cache(organization_id, credential_id)
+        except Exception:
+            LOG.warning(
+                "Failed to invalidate access-token cache after client config change",
+                credential_id=credential_id,
+                exc_info=True,
+            )
+
+
 async def save_client_config(
     organization_id: str,
     config: GoogleOAuthClientConfig,
@@ -420,12 +444,7 @@ async def save_client_config(
         new_client_id=config.client_id,
         now=now,
     )
-    if flipped:
-        LOG.info(
-            "Marked Google OAuth credentials for reconnect after client config change",
-            organization_id=organization_id,
-            count=flipped,
-        )
+    await _invalidate_flipped_access_tokens(organization_id, flipped)
     return GoogleOAuthClientConfigResolution(config=config, source="organization")
 
 
@@ -442,12 +461,7 @@ async def delete_client_config(organization_id: str) -> bool:
         new_client_id=env_config.client_id if env_config else None,
         now=now,
     )
-    if flipped:
-        LOG.info(
-            "Marked Google OAuth credentials for reconnect after client config change",
-            organization_id=organization_id,
-            count=flipped,
-        )
+    await _invalidate_flipped_access_tokens(organization_id, flipped)
     return bool(invalidated or flipped)
 
 

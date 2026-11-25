@@ -293,7 +293,7 @@ class GoogleOAuthRepository(BaseRepository):
         organization_id: str,
         new_client_id: str | None,
         now: datetime.datetime,
-    ) -> int:
+    ) -> list[str]:
         async with self.Session() as session:
             filters = [
                 GoogleOAuthCredentialModel.organization_id == organization_id,
@@ -309,10 +309,11 @@ class GoogleOAuthRepository(BaseRepository):
                     state=STATE_ERROR,
                     modified_at=now,
                 )
+                .returning(GoogleOAuthCredentialModel.id)
             )
-            result = await session.execute(stmt)
+            flipped = list((await session.execute(stmt)).scalars().all())
             await session.commit()
-            return result.rowcount or 0
+            return flipped
 
     @db_operation("promote_pending_to_active")
     async def promote_pending_to_active(

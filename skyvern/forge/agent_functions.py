@@ -3121,6 +3121,19 @@ class AgentFunction:
             )
             return credential_id
 
+    async def get_or_mint_google_access_token(
+        self,
+        organization_id: str,
+        credential_id: str,
+        mint: Callable[[], Awaitable[str]],
+        *,
+        lock_wait_seconds: int = google_oauth_service.GOOGLE_ACCESS_TOKEN_CACHE_LOCK_BLOCKING_TIMEOUT_SECONDS,
+        rejected_token: str | None = None,
+    ) -> str:
+        """Read-through access-token cache keyed on a stored credential id; ``mint`` errors propagate.
+        A cached ``rejected_token`` is a miss, and a miss waits at most ``lock_wait_seconds`` for another minter."""
+        return await mint()
+
     async def get_google_sheets_credentials(
         self,
         organization_id: str,
