@@ -13,7 +13,18 @@ from skyvern.services.workflow_service import get_workflow_run_response, workflo
 
 
 @pytest.mark.asyncio
-async def test_get_workflow_run_response_passes_through_all_fields() -> None:
+@pytest.mark.parametrize(
+    ("stored_status", "started", "expected_status"),
+    [
+        (WorkflowRunStatus.completed, True, RunStatus.completed),
+        # A marked run is stored as running before it starts; reads report it as queued.
+        (WorkflowRunStatus.running, False, RunStatus.queued),
+    ],
+    ids=["completed", "unstarted-reservation"],
+)
+async def test_get_workflow_run_response_passes_through_all_fields(
+    stored_status: WorkflowRunStatus, started: bool, expected_status: RunStatus
+) -> None:
     now = datetime.now(timezone.utc)
     script_run = ScriptRunResponse(
         ai_fallback_triggered=False,
@@ -26,7 +37,7 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
         workflow_permanent_id="wpid_123",
         organization_id="o_123",
         otp_request_id="otpr_response",
-        status=WorkflowRunStatus.completed,
+        status=stored_status,
         run_with="code",
         ai_fallback=True,
         browser_session_id="pbs_123",
@@ -36,8 +47,8 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
         created_at=now,
         modified_at=now,
         queued_at=now,
-        started_at=now,
-        finished_at=now,
+        started_at=now if started else None,
+        finished_at=now if started else None,
     )
 
     status_resp = MagicMock(
@@ -73,7 +84,7 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
     assert resp.browser_session_id == "pbs_123"
     assert resp.max_screenshot_scrolls == 5
     assert resp.run_with == "code"
-    assert resp.status == RunStatus.completed
+    assert resp.status == expected_status
     assert resp.step_count == 4
     assert resp.run_request is not None
     assert resp.run_request.otp_request_id == "otpr_response"

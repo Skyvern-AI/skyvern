@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, FailedToGetTOTPVerificationCode, SkyvernHTTPException
@@ -369,13 +370,21 @@ async def test_replay_reports_a_refused_target_without_an_unexpected_error() -> 
     async def _deliver(**kwargs: object) -> httpx.Response:
         raise BlockedHost("rebinding.example.test")
 
-    with patch("skyvern.services.webhook_service.app.AGENT_FUNCTION.deliver_webhook", _deliver):
+    target_url = f"{REBINDING_HOST_URL}/fake-path-token?fake_key=fake-query-value"
+    with (
+        patch("skyvern.services.webhook_service.app.AGENT_FUNCTION.deliver_webhook", _deliver),
+        capture_logs() as logs,
+    ):
         status_code, _latency, _body, error = await webhook_service._deliver_webhook(
-            url=REBINDING_HOST_URL, payload="{}", headers={}
+            url=target_url, payload="{}", headers={}
         )
 
     assert status_code is None
     assert error == "The target host was refused by SSRF protection."
+    refused = next(entry for entry in logs if entry["event"] == "Webhook replay target refused")
+    assert refused["url"] == "https://rebinding.example.test/…?…"
+    assert "fake-path-token" not in repr(logs)
+    assert "fake-query-value" not in repr(logs)
 
 
 @pytest.fixture

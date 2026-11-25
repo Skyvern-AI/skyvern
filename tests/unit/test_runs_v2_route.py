@@ -31,7 +31,12 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow import retry_policy
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    WorkflowRequestBody,
+    WorkflowRun,
+    WorkflowRunStatus,
+    workflow_run_status_for_reads,
+)
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TaskRunRequest
@@ -931,11 +936,17 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
         trigger_type=original_trigger_type,
         otp_request_id=None,
     )
+    # A guarded retry creates a marked run, stored as running before it starts.
+    retried_status = WorkflowRunStatus.running if guarded_retry else WorkflowRunStatus.created
     retried_run = SimpleNamespace(
         workflow_run_id="wr_retry",
         workflow_id="wf_original",
-        status=WorkflowRunStatus.created,
-        status_for_reads=WorkflowRunStatus.created,
+        status=retried_status,
+        status_for_reads=workflow_run_status_for_reads(
+            status=retried_status,
+            otp_request_id="otpr_retry" if guarded_retry else None,
+            started_at=None,
+        ),
         failure_reason=None,
         created_at=created_at,
         modified_at=created_at,
@@ -1084,6 +1095,7 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
     assert call_kwargs["workflow_request"].run_metadata == {"env": "prod"}
 
     assert response.run_id == "wr_retry"
+    assert response.status == ("queued" if guarded_retry else "created")
     assert response.run_id != original_run.workflow_run_id
     assert response.run_request is not None
     assert response.run_request.workflow_id == "wpid_123"

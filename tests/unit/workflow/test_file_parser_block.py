@@ -312,16 +312,49 @@ class TestFileParserBlockAutoDetectExecution:
         assert image_result.output_parameter_value == {"value": "synthetic pages"}
         assert received_images == [[b"synthetic-page-1", b"synthetic-page-2"]]
 
-    async def test_docx_downloaded_from_extensionless_url_is_parsed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        ("url_source", "numeric_url"),
+        [
+            ("parameter", False),
+            ("block_output_parameter", False),
+            ("rendered_block_output", False),
+            ("block_output_parameter", True),
+            ("rendered_block_output", True),
+        ],
+    )
+    async def test_docx_from_a_parameterized_url_is_parsed_without_logging_the_resolved_value(
+        self, url_source: str, numeric_url: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         path = _create_docx(tmp_path / "downloaded", paragraphs=["Hello", "World"])
-        block = _make_file_parser_block("https://example.com/download?id=123", FileType.AUTO_DETECT)
+        file_url = "https://files.example.test/fake-path-token/download?fake_key=fake-query-value"
+        block_output = {"downloaded_files": [{"url": 42 if numeric_url else file_url}]}
+        workflow_run_context = _mock_workflow_run_context()
+        if url_source == "rendered_block_output":
+            block = _make_file_parser_block(json.dumps(block_output), FileType.AUTO_DETECT)
+        else:
+            block = _make_file_parser_block("file_url_parameter", FileType.AUTO_DETECT)
+            workflow_run_context.has_parameter.return_value = True
+            workflow_run_context.has_value.return_value = True
+            workflow_run_context.get_value.return_value = file_url if url_source == "parameter" else block_output
 
-        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch, workflow_run_context)
 
+        if numeric_url:
+            assert isinstance(result, BlockResult)
+            extracted = next(entry for entry in logs if entry["event"].startswith("FileParserBlock Extracted"))
+            assert extracted["extracted_url"] == "[invalid URL]"
+            return
         assert result.success is True
         assert result.output_parameter_value == {"value": "Hello\nWorld"}
+        resolution_logs = [entry for entry in logs if "file url" in entry["event"].lower()]
+        assert resolution_logs
+        assert "fake-path-token" not in repr(resolution_logs)
+        assert "fake-query-value" not in repr(resolution_logs)
+        if url_source == "parameter":
+            parameterized = next(entry for entry in resolution_logs if entry["event"].endswith("parameter value"))
+            assert parameterized["file_parameter_value_type"] == "str"
+            assert parameterized["file_parameter_value_length"] == len(file_url)
 
     async def test_legacy_doc_reports_conversion_guidance(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -829,9 +862,6 @@ class TestExtractFileUrlFromBlockOutput:
 
     def test_list_returns_none(self) -> None:
         assert self._extract([{"url": "https://example.com/file.pdf"}]) is None
-
-    def test_integer_returns_none(self) -> None:
-        assert self._extract(42) is None
 
 
 @pytest.mark.asyncio

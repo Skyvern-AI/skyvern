@@ -608,10 +608,13 @@ def _make_request(method: str = "GET", path: str = "/api/v1/test") -> Request:
     return Request({"type": "http", "method": method, "path": path, "headers": [], "query_string": b""})
 
 
-def test_sanitize_headers_removes_posthog_attribution_but_keeps_ordinary_header() -> None:
+def test_sanitize_headers_removes_attribution_and_signature_headers_but_keeps_ordinary_header() -> None:
     assert _sanitize_headers(
         {
             "X-PostHog-Attribution": "encoded-attribution",
+            "Svix-Id": "msg_fake",
+            "Svix-Timestamp": "1700000000",
+            "Svix-Signature": "v1,fake-signature",
             "X-Request-ID": "request-id",
         }
     ) == {"X-Request-ID": "request-id"}
