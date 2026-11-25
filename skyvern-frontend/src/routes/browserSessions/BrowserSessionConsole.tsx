@@ -28,10 +28,26 @@ const STATUS_CLASS: Record<ConsoleStatus, string> = {
 interface Props {
   canRun: boolean;
   onEvaluate: (expression: string) => Promise<ConsoleResult>;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  onReturnFocus?: () => void;
 }
 
-function BrowserSessionConsole({ canRun, onEvaluate }: Props) {
-  const [open, setOpen] = useState(false);
+function BrowserSessionConsole({
+  canRun,
+  onEvaluate,
+  open: openProp,
+  onOpenChange,
+  onReturnFocus,
+}: Props) {
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = openProp ?? internalOpen;
+  const setOpen = (next: boolean) => {
+    if (openProp === undefined) {
+      setInternalOpen(next);
+    }
+    onOpenChange?.(next);
+  };
   const [value, setValue] = useState("");
   const [running, setRunning] = useState(false);
   const [entries, setEntries] = useState<ConsoleEntry[]>([]);
@@ -39,6 +55,16 @@ function BrowserSessionConsole({ canRun, onEvaluate }: Props) {
   const historyIndexRef = useRef<number | null>(null);
   const nextIdRef = useRef(0);
   const outputRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const wasOpenRef = useRef(open);
+
+  useEffect(() => {
+    const wasOpen = wasOpenRef.current;
+    wasOpenRef.current = open;
+    if (!wasOpen && open && canRun) {
+      textareaRef.current?.focus();
+    }
+  }, [open, canRun]);
 
   useEffect(() => {
     const output = outputRef.current;
@@ -102,10 +128,31 @@ function BrowserSessionConsole({ canRun, onEvaluate }: Props) {
   }
 
   return (
-    <div className="flex w-full flex-shrink-0 flex-col border-t border-slate-700 bg-slate-900 text-xs">
+    <div
+      className="flex w-full flex-shrink-0 flex-col border-t border-slate-700 bg-slate-900 text-xs"
+      onKeyDown={(e) => {
+        if (
+          e.key === "F12" &&
+          !e.altKey &&
+          !e.ctrlKey &&
+          !e.metaKey &&
+          !e.shiftKey
+        ) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (!e.repeat) {
+            const next = !open;
+            setOpen(next);
+            if (!next) {
+              onReturnFocus?.();
+            }
+          }
+        }
+      }}
+    >
       <button
         type="button"
-        onClick={() => setOpen((isOpen) => !isOpen)}
+        onClick={() => setOpen(!open)}
         className="flex h-8 items-center gap-2 px-3 text-slate-300 hover:text-slate-100"
         aria-expanded={open}
       >
@@ -116,6 +163,9 @@ function BrowserSessionConsole({ canRun, onEvaluate }: Props) {
         )}
         <span className="font-medium">Console</span>
         <span className="text-slate-500">Run JavaScript in this page</span>
+        <kbd className="ml-auto rounded border border-slate-700 bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-slate-400">
+          F12
+        </kbd>
       </button>
       {open && (
         <div className="flex h-56 flex-col border-t border-slate-800">
@@ -159,6 +209,7 @@ function BrowserSessionConsole({ canRun, onEvaluate }: Props) {
           <div className="flex items-start gap-2 border-t border-slate-800 px-3 py-2">
             <span className="pt-1 font-mono text-sky-300">&gt;</span>
             <textarea
+              ref={textareaRef}
               value={value}
               onChange={(e) => {
                 historyIndexRef.current = null;

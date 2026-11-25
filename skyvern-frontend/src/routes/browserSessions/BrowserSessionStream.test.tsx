@@ -93,6 +93,8 @@ vi.mock("@/routes/streaming/InteractiveStreamView", () => ({
     userIsControlling,
     onNavigate,
     onHistoryNavigate,
+    containerRef,
+    handlers,
   }: {
     streamImgSrc: string;
     currentUrl?: string;
@@ -100,12 +102,22 @@ vi.mock("@/routes/streaming/InteractiveStreamView", () => ({
     userIsControlling: boolean;
     onNavigate?: (url: string) => void;
     onHistoryNavigate?: (action: unknown) => void;
+    containerRef?: React.RefObject<HTMLDivElement>;
+    handlers?: {
+      handleKeyDown: (e: React.KeyboardEvent) => void;
+      handleKeyUp: (e: React.KeyboardEvent) => void;
+    };
   }) => {
     interactiveStreamState.onNavigate = onNavigate;
     interactiveStreamState.onHistoryNavigate = onHistoryNavigate;
     interactiveStreamState.showControlButtons = showControlButtons;
     return (
-      <>
+      <div
+        ref={containerRef}
+        tabIndex={0}
+        onKeyDown={handlers?.handleKeyDown}
+        onKeyUp={handlers?.handleKeyUp}
+      >
         <div
           data-frame={streamImgSrc}
           data-url={currentUrl}
@@ -114,7 +126,7 @@ vi.mock("@/routes/streaming/InteractiveStreamView", () => ({
         {showControlButtons && userIsControlling && (
           <button type="button">stop controlling</button>
         )}
-      </>
+      </div>
     );
   },
 }));
@@ -681,6 +693,80 @@ describe("BrowserSessionStream terminal statuses", () => {
     );
     expect(raf).toHaveBeenCalledTimes(1);
     raf.mockRestore();
+  });
+
+  it("mounts the console without remounting the stream view and toggles/focuses it on F12", async () => {
+    render(
+      <BrowserSessionStream
+        browserSessionId="pbs_console"
+        interactive
+        showControlButtons
+        showConsole
+      />,
+    );
+    await waitFor(() =>
+      expect(
+        FakeStreamSocket.instances.some((s) =>
+          s.url.includes("/stream/cdp_input/browser_session/pbs_console"),
+        ),
+      ).toBe(true),
+    );
+    const streamSocket = FakeStreamSocket.instances.find((s) =>
+      s.url.includes("/stream/browser_sessions/pbs_console"),
+    )!;
+    const inputSocket = FakeStreamSocket.instances.find((s) =>
+      s.url.includes("/stream/cdp_input/browser_session/pbs_console"),
+    )!;
+
+    act(() => {
+      streamSocket.emitStreamMessage({
+        status: "running",
+        screenshot: "frame-1",
+      });
+    });
+    const frameBefore = await screen.findByTestId("stream-frame");
+
+    act(() => {
+      inputSocket.emit("message", {
+        data: JSON.stringify({ kind: "ready" }),
+      });
+      inputSocket.emit("message", {
+        data: JSON.stringify({ kind: "console", available: true }),
+      });
+    });
+
+    expect(screen.getByRole("button", { name: /console/i })).toBeTruthy();
+    expect(screen.getByTestId("stream-frame")).toBe(frameBefore);
+
+    act(() => cdpInputState.setUserIsControlling?.(true));
+    const streamContainer = frameBefore.parentElement!;
+    act(() => {
+      streamContainer.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "F12",
+          code: "F12",
+          bubbles: true,
+        }),
+      );
+    });
+
+    const textarea = await screen.findByLabelText(
+      "JavaScript to run in the page",
+    );
+    expect(document.activeElement).toBe(textarea);
+
+    act(() => {
+      textarea.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "F12",
+          code: "F12",
+          bubbles: true,
+        }),
+      );
+    });
+
+    expect(screen.queryByLabelText("JavaScript to run in the page")).toBeNull();
+    expect(document.activeElement).toBe(streamContainer);
   });
 });
 

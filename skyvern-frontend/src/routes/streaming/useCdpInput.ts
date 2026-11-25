@@ -44,6 +44,7 @@ interface UseCdpInputOptions {
   // selection model (canvas grids, editors) still copy there.
   forwardCopyShortcut?: boolean;
   onInput?: () => void;
+  onToggleConsole?: () => void;
 }
 
 interface UseCdpInputReturn {
@@ -99,6 +100,7 @@ export function useCdpInput({
   onClipboardCopy,
   forwardCopyShortcut = false,
   onInput,
+  onToggleConsole,
 }: UseCdpInputOptions): UseCdpInputReturn {
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [inputReady, setInputReady] = useState(false);
@@ -144,17 +146,21 @@ export function useCdpInput({
     }
     pendingMouseMoveRef.current = null;
   };
-  const interceptedClipboardKeysRef = useRef(new Set<string>());
+  const interceptedKeysRef = useRef(new Set<string>());
   const onClipboardPasteRef = useRef(onClipboardPaste);
   const onClipboardPasteErrorRef = useRef(onClipboardPasteError);
   const onClipboardCopyRef = useRef(onClipboardCopy);
   const onInputRef = useRef(onInput);
+  const onToggleConsoleRef = useRef(onToggleConsole);
+  const consoleAvailableRef = useRef(consoleAvailable);
   onClipboardPasteRef.current = onClipboardPaste;
   onClipboardPasteErrorRef.current = onClipboardPasteError;
   onClipboardCopyRef.current = onClipboardCopy;
   const forwardCopyShortcutRef = useRef(forwardCopyShortcut);
   forwardCopyShortcutRef.current = forwardCopyShortcut;
   onInputRef.current = onInput;
+  onToggleConsoleRef.current = onToggleConsole;
+  consoleAvailableRef.current = consoleAvailable;
 
   const pasteClipboard = useCallback(() => {
     if (!interactive || !userIsControlling || !onClipboardPasteRef.current) {
@@ -552,20 +558,36 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
+      if (
+        e.key === "F12" &&
+        !e.altKey &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.shiftKey &&
+        onToggleConsoleRef.current &&
+        consoleAvailableRef.current
+      ) {
+        interceptedKeysRef.current.add(e.code);
+        if (!e.repeat) {
+          onToggleConsoleRef.current();
+        }
+        return;
+      }
       const clipboardModifier = e.metaKey || e.ctrlKey;
       const key = e.key.toLowerCase();
       if (clipboardModifier && key === "v" && onClipboardPasteRef.current) {
-        interceptedClipboardKeysRef.current.add(e.code);
+        interceptedKeysRef.current.add(e.code);
         pasteClipboard();
         return;
       }
       if (clipboardModifier && key === "c" && onClipboardCopyRef.current) {
         onClipboardCopyRef.current();
         if (!forwardCopyShortcutRef.current) {
-          interceptedClipboardKeysRef.current.add(e.code);
+          interceptedKeysRef.current.add(e.code);
           return;
         }
       }
+      interceptedKeysRef.current.delete(e.code);
       const isPrintable = e.key.length === 1;
       const windowsVirtualKeyCode = virtualKeyCodeFor(e);
       const payload: Record<string, unknown> = {
@@ -601,7 +623,7 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
-      if (interceptedClipboardKeysRef.current.delete(e.code)) {
+      if (interceptedKeysRef.current.delete(e.code)) {
         return;
       }
       const windowsVirtualKeyCode = virtualKeyCodeFor(e);

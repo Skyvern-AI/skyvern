@@ -276,6 +276,13 @@ function BrowserSessionStream({
     sendClipboardCommand({ kind: "clipboard-copy" }, "Copy failed");
   }, [sendClipboardCommand]);
 
+  const [consoleOpen, setConsoleOpen] = useState(false);
+  const wasConsoleOpenRef = useRef(false);
+
+  const handleToggleConsole = useCallback(() => {
+    setConsoleOpen((wasOpen) => !wasOpen);
+  }, []);
+
   // The CDP input socket must be wired whenever the stream can be controlled,
   // whether by default interaction or via the take-control button.
   const controllable = interactive || showControlButtons;
@@ -306,7 +313,23 @@ function BrowserSessionStream({
     onClipboardPasteError: toastClipboardReadFailed,
     onClipboardCopy: controllable ? onClipboardCopy : undefined,
     forwardCopyShortcut: true,
+    onToggleConsole:
+      showConsole && !demonstrating ? handleToggleConsole : undefined,
   });
+
+  useEffect(() => {
+    if (!consoleAvailable || !showConsole || demonstrating) {
+      setConsoleOpen(false);
+    }
+  }, [consoleAvailable, showConsole, demonstrating]);
+
+  useEffect(() => {
+    const wasOpen = wasConsoleOpenRef.current;
+    wasConsoleOpenRef.current = consoleOpen;
+    if (wasOpen && !consoleOpen && userIsControlling) {
+      containerRef.current?.focus();
+    }
+  }, [consoleOpen, userIsControlling, containerRef]);
   useManualSignInControl(
     controllable ? browserSessionId : undefined,
     setUserIsControlling,
@@ -710,16 +733,20 @@ function BrowserSessionStream({
         pastedCharacters={pastedCharacters}
       />
     );
-    if (!showConsole || !consoleAvailable || demonstrating) {
+    if (!showConsole) {
       return streamView;
     }
     return (
       <div className="flex h-full w-full flex-col">
         <div className="min-h-0 w-full flex-1">{streamView}</div>
-        <BrowserSessionConsole
-          canRun={userIsControlling}
-          onEvaluate={evaluateExpression}
-        />
+        {consoleAvailable && !demonstrating && (
+          <BrowserSessionConsole
+            canRun={userIsControlling}
+            onEvaluate={evaluateExpression}
+            open={consoleOpen}
+            onOpenChange={setConsoleOpen}
+          />
+        )}
       </div>
     );
   }
