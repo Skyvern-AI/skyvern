@@ -9,6 +9,7 @@ keywords:
   - timeline
   - outputs
   - run history
+  - run group
   - artifacts
   - recording
   - download
@@ -135,6 +136,22 @@ Click **Runs** in the sidebar to open **Run History**, every run in your organiz
 - Click a run to open it in Studio.
 
 To see only one agent's runs while you work on it, open the **Past Runs** list from the Studio top bar.
+
+## Read a group of runs
+
+Ask Copilot to run a saved agent once per row of inputs, or once for each of several saved credentials, and it shows a card listing what it will run. You can remove rows there; nothing runs until you approve. Each row then becomes its own run, in its own fresh browser, with its own run ID. A group holds up to 25 runs by default.
+
+Once you approve, the card in the chat links **Open results**, which opens the **Run group** page at `/run-groups/<group id>`. Its header shows the group ID, whether the group is `running`, `stopping` or `finished`, how many runs it holds, and a count for each outcome. One table row per run:
+
+| Column | What it shows |
+|---|---|
+| **Row** | The run's position in the group |
+| **Inputs** | The input values that run used |
+| **Outcome** | **Waiting**, **Running**, **Completed**, **Failed before acting**, **Unknown, may have acted** or **Canceled** |
+| **Run** | A link to the run, or **Not started** |
+| **Final output** | The output of the run's last block |
+
+The table pages 25 rows at a time. **Download CSV** exports every row in the group, not just the page you are on. While runs are still going, **Stop** cancels the ones that haven't finished; confirm with **Stop runs**. Runs that already finished keep their results. The chat's own **Stop** button does not stop these runs, so use **Stop** here or ask Copilot to cancel the group.
 
 ## Schedule an agent
 
