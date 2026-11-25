@@ -2405,7 +2405,7 @@ async def test_save_client_config_uses_aes_gcm(monkeypatch: pytest.MonkeyPatch) 
     )
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     replace_mock = AsyncMock()
-    mark_mock = AsyncMock(return_value=2)
+    mark_mock = AsyncMock(return_value=[])
     monkeypatch.setattr(
         google_oauth_service.app,
         "DATABASE",
@@ -2471,7 +2471,7 @@ async def test_delete_client_config_invalidates_org_token_when_enabled(monkeypat
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "env-client", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "env-secret", raising=False)
     invalidate_mock = AsyncMock()
-    mark_mock = AsyncMock(return_value=1)
+    mark_mock = AsyncMock(return_value=["goac_1"])
     monkeypatch.setattr(
         google_oauth_service.app,
         "DATABASE",
@@ -2481,6 +2481,12 @@ async def test_delete_client_config_invalidates_org_token_when_enabled(monkeypat
         ),
         raising=False,
     )
+    cached_tokens = {google_oauth_service.google_access_token_cache_key("org_1", "goac_1"): "AT-cached"}
+
+    async def cache_set(key: str, value: str, ex: Any = None) -> None:
+        cached_tokens[key] = value
+
+    monkeypatch.setattr(google_oauth_service.app, "CACHE", SimpleNamespace(set=cache_set), raising=False)
 
     await google_oauth_service.delete_client_config("org_1")
 
@@ -2492,6 +2498,8 @@ async def test_delete_client_config_invalidates_org_token_when_enabled(monkeypat
     assert mark_mock.await_args.kwargs["organization_id"] == "org_1"
     assert mark_mock.await_args.kwargs["new_client_id"] == "env-client"
     assert isinstance(mark_mock.await_args.kwargs["now"], datetime.datetime)
+    # The credential just marked for reconnect must not keep serving its cached access token.
+    assert cached_tokens == {google_oauth_service.google_access_token_cache_key("org_1", "goac_1"): ""}
 
 
 @pytest.mark.asyncio
@@ -2506,7 +2514,7 @@ async def test_delete_client_config_marks_mismatched_against_missing_env_config(
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "", raising=False)
     invalidate_mock = AsyncMock()
-    mark_mock = AsyncMock(return_value=1)
+    mark_mock = AsyncMock(return_value=[])
     monkeypatch.setattr(
         google_oauth_service.app,
         "DATABASE",
