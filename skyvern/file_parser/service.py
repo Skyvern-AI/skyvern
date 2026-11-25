@@ -24,6 +24,7 @@ from skyvern.constants import (
     PDF_OCR_MAX_PAGE_IMAGE_EDGE_PX,
 )
 from skyvern.file_parser.parser import (
+    PARSE_RESOURCE_LIMIT_MESSAGE,
     ParserFailure,
     ParserLimits,
     ParserPart,
@@ -43,7 +44,11 @@ from skyvern.file_parser.transport import (
     MAX_PARSER_TOKENS,
     TRANSFER_CHUNK_BYTES,
 )
-from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError, run_in_capped_subprocess
+from skyvern.forge.sdk.utils.capped_subprocess import (
+    CappedSubprocessError,
+    hit_resource_limit,
+    run_in_capped_subprocess,
+)
 
 LOG = logging.getLogger(__name__)
 _file_parser_pb2 = cast(Any, file_parser_pb2)
@@ -234,10 +239,15 @@ class FileParserService(FileParserServicerBase):
                 error=_file_parser_pb2.ParseError(code="timeout", message="File parsing exceeded its time limit")
             )
         except CappedSubprocessError as exc:
-            code = "timeout" if exc.kind == "timeout" else "parse_failed"
-            yield _file_parser_pb2.ParseResponse(
-                error=_file_parser_pb2.ParseError(code=code, message=f"File parsing stopped ({exc.kind})")
-            )
+            if hit_resource_limit(exc):
+                yield _file_parser_pb2.ParseResponse(
+                    error=_file_parser_pb2.ParseError(code="parse_limit_exceeded", message=PARSE_RESOURCE_LIMIT_MESSAGE)
+                )
+            else:
+                code = "timeout" if exc.kind == "timeout" else "parse_failed"
+                yield _file_parser_pb2.ParseResponse(
+                    error=_file_parser_pb2.ParseError(code=code, message=f"File parsing stopped ({exc.kind})")
+                )
         except ParserFailure as exc:
             yield _file_parser_pb2.ParseResponse(error=_file_parser_pb2.ParseError(code=exc.code, message=str(exc)))
         except Exception as exc:

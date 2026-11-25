@@ -155,6 +155,7 @@ from skyvern.exceptions import (
 )
 from skyvern.file_parser.client import IsolatedParserResult, parse_file_remotely
 from skyvern.file_parser.parser import (
+    PARSE_RESOURCE_LIMIT_MESSAGE,
     ParserFailure,
     TableLimits,
     check_csv_size_within_limits,
@@ -255,8 +256,8 @@ from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePassw
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.capped_subprocess import (
-    MEMORY_CAP_ENFORCED,
     CappedSubprocessError,
+    hit_resource_limit,
     run_in_capped_subprocess,
 )
 from skyvern.forge.sdk.utils.pdf_parser import (
@@ -15101,15 +15102,8 @@ def _run_excel_child(func: Callable[..., dict[str, Any]], *args: Any, max_result
             result_memory_factor=1,
         )
     except CappedSubprocessError as exc:
-        # Under the address-space cap, calamine's allocator aborts the child when it cannot get memory, and that
-        # reports as a crash by signal rather than as out_of_memory.
-        killed_at_cap = exc.kind == "crashed" and MEMORY_CAP_ENFORCED and (exc.returncode or 0) < 0
-        if exc.kind in ("out_of_memory", "result_too_large", "timeout") or killed_at_cap:
-            raise ParserFailure(
-                "The Excel file is too large or complex to parse within the parser's memory and time limits. "
-                "Split it into smaller files, then try again.",
-                code="parse_limit_exceeded",
-            ) from exc
+        if hit_resource_limit(exc):
+            raise ParserFailure(PARSE_RESOURCE_LIMIT_MESSAGE, code="parse_limit_exceeded") from exc
         if exc.kind == "no_headroom":
             raise ParserFailure(
                 "The worker does not have enough free memory to parse this Excel file right now. Try again shortly.",
@@ -15569,6 +15563,7 @@ class FileParserBlock(Block):
             outcome = _run_excel_child(
                 validate_excel_plain,
                 file_path,
+                self.worksheet,
                 asdict(_table_limits()),
                 max_result_bytes=_EXCEL_VALIDATION_RESULT_BYTES,
             )

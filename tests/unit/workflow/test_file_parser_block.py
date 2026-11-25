@@ -404,6 +404,10 @@ class TestFileParserBlockAutoDetectExecution:
             ("csv_over_rows", None, "rows"),
             ("csv_over_cells", None, "cells"),
             ("csv_duplicate_headers", None, "cells"),
+            ("csv_long_header", None, "bytes"),
+            ("csv_control_characters", None, "bytes"),
+            ("csv_duplicate_long_headers", 3, None),
+            ("csv_ragged_rows", None, "bytes"),
             ("csv_over_bytes", None, "bytes"),
             ("csv_blank_over_bytes", None, "bytes"),
             ("xlsx_in_budget", 3, None),
@@ -412,8 +416,11 @@ class TestFileParserBlockAutoDetectExecution:
             ("xlsx_over_decoded_bytes", None, "bytes"),
             ("xlsx_sparse_target_worksheet", None, "cells"),
             ("xlsx_oversized_first_sheet", 1, None),
+            ("xlsx_huge_first_sheet", 1, None),
             ("xlsx_repeated_shared_string", None, "bytes"),
             ("xlsx_repeated_non_ascii_shared_string", None, "bytes"),
+            ("xlsx_many_short_cells", None, "bytes"),
+            ("xlsx_small_int_cells", 300, None),
             ("ods_workbook", 1, None),
             ("xls_in_budget", 2, None),
             ("xls_sparse_far_cell", None, "cells"),
@@ -435,12 +442,15 @@ class TestFileParserBlockAutoDetectExecution:
         if exceeded_unit == "memory" and parser_path == "shared_parser":
             pytest.skip("parse_file runs in-process here; the block and the parser service run it under a memory cap")
         path, worksheet = _write_parse_budget_case(case, tmp_path)
+        # Many short cells: small JSON, but rows the worker rebuilds that outgrow the decoded-size limit.
+        raised = case in ("xlsx_many_short_cells", "xlsx_small_int_cells")
+        max_rows, max_cells = (10_000, 100_000) if raised else (3, 12)
         file_type = FileType.EXCEL if path.suffix == ".ods" else FileType.AUTO_DETECT
         failure: str | None = None
         rows: list[dict[str, Any]] = []
         if parser_path == "block":
-            monkeypatch.setattr(settings, "FILE_PARSER_MAX_ROWS", 3)
-            monkeypatch.setattr(settings, "FILE_PARSER_MAX_CELLS", 12)
+            monkeypatch.setattr(settings, "FILE_PARSER_MAX_ROWS", max_rows)
+            monkeypatch.setattr(settings, "FILE_PARSER_MAX_CELLS", max_cells)
             monkeypatch.setattr(settings, "FILE_PARSER_MAX_DECODED_BYTES", 64 * 1024)
             monkeypatch.setattr(settings, "PDFPLUMBER_MAX_MEMORY_BYTES", 256 * 1024 * 1024)
             block = _make_file_parser_block(f"https://example.com/{path.name}", file_type)
@@ -450,7 +460,7 @@ class TestFileParserBlockAutoDetectExecution:
             rows = result.output_parameter_value if result.success else []
         elif parser_path == "isolated_service":
             server = grpc.aio.server(options=GRPC_OPTIONS)
-            service = FileParserService(tmp_path, table_limits=TableLimits(3, 12, 64 * 1024))
+            service = FileParserService(tmp_path, table_limits=TableLimits(max_rows, max_cells, 64 * 1024))
             file_parser_pb2_grpc.add_FileParserServicer_to_server(service, server)
             port = server.add_insecure_port("127.0.0.1:0")
             await server.start()
@@ -487,8 +497,8 @@ class TestFileParserBlockAutoDetectExecution:
                 timeout_seconds=30,
                 max_page_image_bytes=3_500_000,
                 max_page_image_edge_px=7_900,
-                max_table_rows=3,
-                max_table_cells=12,
+                max_table_rows=max_rows,
+                max_table_cells=max_cells,
                 max_table_decoded_bytes=64 * 1024,
             )
             try:
@@ -506,8 +516,7 @@ class TestFileParserBlockAutoDetectExecution:
                 failure = str(e)
 
         if exceeded_unit == "memory":
-            assert failure is not None
-            assert ("too large or complex" if parser_path == "block" else "File parsing stopped") in failure
+            assert failure is not None and "too large or complex" in failure
         elif exceeded_unit is not None:
             assert failure is not None and "exceeds the parse limit" in failure
             assert exceeded_unit in failure.partition("exceeds the parse limit")[2]
@@ -601,6 +610,17 @@ def _write_parse_budget_case(case: str, directory: Path) -> tuple[Path, str | No
             path.write_text("name,city\n" + "".join(f"n{i},c{i}\n" for i in range(4)))
         elif case == "csv_blank_over_bytes":
             path.write_text(" " * 70_000)
+        elif case == "csv_ragged_rows":
+            # Extra fields land under a None key, which the JSON output writes as an added "null" key; this file's
+            # output is just over the 64 KiB limit only once that key and the array separators are counted.
+            path.write_text("h\n" + ("a," + "x" * 21_830 + "\n") * 3)
+        elif case == "csv_duplicate_long_headers":
+            path.write_text(",".join(["h" * 6000] * 4) + "\n" + "1,2,3,4\n" * 3)
+        elif case == "csv_control_characters":
+            # U+0001 is one byte in UTF-8 but six ("\\u0001") in the JSON the parser returns.
+            path.write_text("notes\n" + ("\x01" * 4000 + "\n") * 3)
+        elif case == "csv_long_header":
+            path.write_text("h" * 30_000 + "\n" + "x\n" * 3)
         elif case == "csv_duplicate_headers":
             path.write_text(",".join(["h"] * 7) + "\n" + ("1,2,3,4,5,6,7\n" * 2))
         elif case == "csv_over_cells":
@@ -638,6 +658,10 @@ def _write_parse_budget_case(case: str, directory: Path) -> tuple[Path, str | No
         pd.DataFrame({"name": ["a", "b", "c"], "city": ["d", "e", "f"]}).to_excel(path, index=False)
     elif case == "xlsx_over_rows":
         pd.DataFrame({"name": ["a", "b", "c", "d"], "city": ["e", "f", "g", "h"]}).to_excel(path, index=False)
+    elif case == "xlsx_small_int_cells":
+        pd.DataFrame({"a": [1] * 300, "b": [2] * 300, "c": [3] * 300}).to_excel(path, index=False)
+    elif case == "xlsx_many_short_cells":
+        pd.DataFrame({"a": [1] * 400, "b": [2] * 400, "c": [3] * 400}).to_excel(path, index=False)
     elif case == "xlsx_repeated_shared_string":
         pd.DataFrame({"notes": ["x" * 20_000] * 3, "copy": ["x" * 20_000] * 3}).to_excel(path, index=False)
     elif case == "xlsx_repeated_non_ascii_shared_string":
@@ -648,6 +672,14 @@ def _write_parse_budget_case(case: str, directory: Path) -> tuple[Path, str | No
     else:
         workbook = openpyxl.Workbook()
         sheet = workbook.active
+        if case == "xlsx_huge_first_sheet":
+            sheet["A1"] = "name"
+            sheet.cell(row=200_000, column=200, value="far")
+            data_sheet = workbook.create_sheet("Data")
+            data_sheet["A1"] = "name"
+            data_sheet["A2"] = "a"
+            workbook.save(path)
+            return path, "Data"
         if case == "xlsx_oversized_first_sheet":
             sheet["A1"] = "name"
             sheet.cell(row=2, column=20, value="far")

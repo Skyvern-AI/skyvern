@@ -532,6 +532,14 @@ def _wait_for_exit(process: subprocess.Popen[bytes], owns_process_group: bool = 
         return process.wait()
 
 
+def hit_resource_limit(error: CappedSubprocessError) -> bool:
+    """Whether the child stopped at its memory, time or result limit rather than failing for another reason."""
+    # Under the address-space cap a native allocator that cannot get memory aborts the child, so a death by signal
+    # counts as the memory limit (see _describe_exit).
+    killed_at_cap = error.kind == "crashed" and MEMORY_CAP_ENFORCED and (error.returncode or 0) < 0
+    return error.kind in ("out_of_memory", "result_too_large", "timeout") or killed_at_cap
+
+
 def _raise_failure(kind: CappedSubprocessFailure, message: str, **log_fields: object) -> NoReturn:
     LOG.warning("Capped subprocess failed", failure=kind, **log_fields)
     error_type = log_fields.get("error_type")

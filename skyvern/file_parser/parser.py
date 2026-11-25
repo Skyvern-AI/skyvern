@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import os
+import sys
 import zipfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -218,6 +219,54 @@ def _clean_dataframe_for_json(dataframe: pd.DataFrame) -> list[dict[str, Any]]:
     return records
 
 
+PARSE_RESOURCE_LIMIT_MESSAGE = (
+    "The file is too large or complex to parse within the parser's memory and time limits. "
+    "Split it into smaller files, then try again."
+)
+
+
+def _json_size(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8", errors="surrogatepass"))
+
+
+def _json_size_upper_bound(value: object) -> int:
+    # JSON escaping turns one character into at most 6 bytes (a \u00XX escape).
+    if isinstance(value, dict) and None not in value and None not in value.values():
+        try:
+            # A CSV record of only string keys and values: count its characters without a Python loop.
+            return 6 * (sum(map(len, value)) + sum(map(len, value.values()))) + 7 * len(value) + 2
+        except TypeError:
+            pass
+    if isinstance(value, dict):
+        return 2 + sum(7 + 6 * len(key or "null") + _json_size_upper_bound(item) for key, item in value.items())
+    if isinstance(value, list):
+        return 2 + sum(1 + _json_size_upper_bound(item) for item in value)
+    return 6 * len(value) + 2 if isinstance(value, str) else 5
+
+
+def _encoded_size_within(value: object, budget: int) -> int:
+    """Size of value as the parser's compact JSON (escapes included), stopping once it passes budget."""
+    # A record that surely fits is sized in one C-encoder call; one that might not is sized field by field, so an
+    # oversized record is never built whole just to be measured.
+    if _json_size_upper_bound(value) <= budget:
+        return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8", errors="surrogatepass"))
+    if isinstance(value, dict):
+        size = 2 + max(len(value) - 1, 0)
+        for key, item in value.items():
+            size += (6 if key is None else _json_size(key)) + 1 + _encoded_size_within(item, budget - size)
+            if size > budget:
+                break
+        return size
+    if isinstance(value, list):
+        size = 2 + max(len(value) - 1, 0)
+        for item in value:
+            size += _encoded_size_within(item, budget - size)
+            if size > budget:
+                break
+        return size
+    return _json_size(value)
+
+
 def _check_table_limit(file_kind: str, used: int, limit: int, unit: str) -> None:
     if used > limit:
         raise ParserFailure(
@@ -237,11 +286,17 @@ def read_csv_rows_within_limits(reader: csv.DictReader[str], limits: TableLimits
     width = len(reader.fieldnames or ())
     rows: list[dict[str, Any]] = []
     cells = 0
+    # Each record is measured as the JSON object the parser emits: every record repeats the header names, and extra
+    # fields sit under a None key that serializes as "null". The 2 is the array's brackets.
+    output_bytes = 2
     for row in reader:
         overflow = row.get(None)
         cells += width + (len(overflow) if isinstance(overflow, list) else 0)
+        # The row and cell limits come first, so an over-wide row is rejected before it is encoded.
         _check_table_limit("CSV", len(rows) + 1, limits.max_rows, "rows")
         _check_table_limit("CSV", cells, limits.max_cells, "cells")
+        output_bytes += _encoded_size_within(row, limits.max_decoded_bytes - output_bytes) + (1 if rows else 0)
+        _check_table_limit("CSV", output_bytes, limits.max_decoded_bytes, "bytes")
         rows.append(row)
     return rows
 
@@ -291,18 +346,33 @@ def _parse_excel(file_path: Path, worksheet: str | None, limits: TableLimits) ->
     return _clean_dataframe_for_json(dataframe)
 
 
+def _rebuilt_value_size(value: object) -> int:
+    # json.loads reuses CPython's small ints and the True/False/None singletons, so they add no object per cell.
+    if value is None or isinstance(value, bool) or (isinstance(value, int) and -5 <= value <= 256):
+        return 0
+    return sys.getsizeof(value)
+
+
 def _excel_json(file_path: Path, worksheet: str | None, limits: TableLimits) -> bytes:
-    data = json.dumps(_parse_excel(file_path, worksheet, limits), separators=(",", ":"), ensure_ascii=False).encode()
+    rows = _parse_excel(file_path, worksheet, limits)
+    # The worker rebuilds these rows from the JSON, and short cells take far more memory as objects than as JSON.
+    decoded = sum(sys.getsizeof(row) + sum(_rebuilt_value_size(value) for value in row.values()) for row in rows)
+    _check_table_limit("Excel", decoded, limits.max_decoded_bytes, "bytes")
+    data = json.dumps(rows, separators=(",", ":"), ensure_ascii=False).encode()
     # Cells sharing one stored string each carry their own copy here, so the output can outgrow the file.
     _check_table_limit("Excel", len(data), limits.max_decoded_bytes, "bytes")
     return data
 
 
-def validate_excel_plain(file_path: str, limits: dict[str, int]) -> dict[str, Any]:
-    """Capped-subprocess entry: check the limits that need no parse, then read one row the way validation does."""
+def validate_excel_plain(file_path: str, worksheet: str | None, limits: dict[str, int]) -> dict[str, Any]:
+    """Capped-subprocess entry: check the limits that need no parse, then read one row of the sheet to be parsed."""
     try:
         check_workbook_within_limits(Path(file_path), TableLimits(**limits))
-        pd.read_excel(file_path, nrows=1, engine="calamine")
+        with pd.ExcelFile(file_path, engine="calamine") as workbook:
+            # A missing worksheet is reported by the parse step, which names only the requested sheet.
+            if worksheet and worksheet not in workbook.sheet_names:
+                return {}
+            pd.read_excel(workbook, sheet_name=worksheet or 0, nrows=1)
     except ParserFailure as exc:
         return {"error_code": exc.code, "error_message": str(exc)}
     except Exception as exc:
