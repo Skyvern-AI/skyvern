@@ -2269,7 +2269,7 @@ class BitwardenService:
         master_password = settings.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD
         if not master_password:
             secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD
-            master_password = await get_aws_client().get_secret(secret_key)
+            master_password = await get_aws_client().get_secret(settings.platform_secret_name(secret_key))
         if not master_password:
             raise BitwardenSecretError("Skyvern auth master password is not set")
         return master_password
@@ -2279,7 +2279,7 @@ class BitwardenService:
         bw_organization_id = settings.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID
         if not bw_organization_id:
             secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID
-            bw_organization_id = await get_aws_client().get_secret(secret_key)
+            bw_organization_id = await get_aws_client().get_secret(settings.platform_secret_name(secret_key))
         if not bw_organization_id:
             raise BitwardenSecretError("Skyvern auth organization ID is not set")
         return bw_organization_id
@@ -2289,7 +2289,7 @@ class BitwardenService:
         client_id = settings.SKYVERN_AUTH_BITWARDEN_CLIENT_ID
         if not client_id:
             secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_ID
-            client_id = await get_aws_client().get_secret(secret_key)
+            client_id = await get_aws_client().get_secret(settings.platform_secret_name(secret_key))
         if not client_id:
             raise BitwardenSecretError("Skyvern auth client ID is not set")
         return client_id
@@ -2299,7 +2299,7 @@ class BitwardenService:
         client_secret = settings.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET
         if not client_secret:
             secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET
-            client_secret = await get_aws_client().get_secret(secret_key)
+            client_secret = await get_aws_client().get_secret(settings.platform_secret_name(secret_key))
         if not client_secret:
             raise BitwardenSecretError("Skyvern auth client secret is not set")
         return client_secret

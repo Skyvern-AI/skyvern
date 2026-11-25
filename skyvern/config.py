@@ -483,6 +483,7 @@ class Settings(BaseSettings):
 
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
+    USE_STAGING_PLATFORM_SECRETS: bool = False
     MAX_UPLOAD_FILE_SIZE: int = 30 * 1024 * 1024  # 30 MB
     # Extensions added to the /v1/upload_file allowlist. Set it as a JSON list, e.g. '["gz","epub"]';
     # a bare comma list fails at startup. The executable and markup denylist still applies.
@@ -1339,6 +1340,12 @@ class Settings(BaseSettings):
     @property
     def is_skyvern_base_url_explicitly_configured(self) -> bool:
         return "SKYVERN_BASE_URL" in self.model_fields_set
+
+    def platform_secret_name(self, name: str) -> str:
+        """Resolve an approved platform secret name immediately before a Secrets Manager read."""
+        if self.USE_STAGING_PLATFORM_SECRETS and self.ENV == "staging" and self.AWS_REGION == "us-east-1":
+            return f"{name}_staging"
+        return name
 
     def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """
