@@ -80,6 +80,21 @@ _WORKFLOW_SETTINGS_FIELDS = tuple(
 )
 
 
+def workflow_setting_inherits(request: WorkflowCreateYAMLRequest, key: str) -> bool:
+    """Whether the save path takes setting ``key`` from the saved workflow instead of the request."""
+    return key not in request.model_fields_set or (
+        key in _SETTINGS_NULL_INHERITS and request.model_dump(include={key}).get(key) is None
+    )
+
+
+def inherited_workflow_settings(workflow: Workflow) -> dict[str, object]:
+    """The non-private root settings a saved draft takes from ``workflow`` where it omits them."""
+    settings = workflow.model_dump(include={*_WORKFLOW_SETTINGS_FIELDS, *_SETTINGS_NULL_INHERITS})
+    # Stored workflows allow legacy nulls; YAML requests require a boolean.
+    settings["run_sequentially"] = settings["run_sequentially"] or False
+    return settings
+
+
 def inherited_header_settings(workflow: Workflow) -> dict[str, Any]:
     return {
         "extra_http_headers": workflow.extra_http_headers,
@@ -772,9 +787,7 @@ def canonical_ember_workflow(
             for key in _FILE_UPLOAD_BLANK_MEANS_UNSET & {k for k, v in location.block.items() if v == ""}:
                 del location.block[key]
     for key, value in (inherited or {}).items():
-        if key != "workflow_definition" and (
-            key not in request.model_fields_set or (key in _SETTINGS_NULL_INHERITS and key not in canonical)
-        ):
+        if key != "workflow_definition" and workflow_setting_inherits(request, key):
             canonical[key] = value
     return canonical
 
