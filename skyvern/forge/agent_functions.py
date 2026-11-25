@@ -95,6 +95,7 @@ from skyvern.forge.sdk.services.request_principal import (
     human_user_id,
     scoped_api_key_id_from_actor,
 )
+from skyvern.forge.sdk.services.request_reads import RequestReads
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar, CodeFailure
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
@@ -1580,6 +1581,18 @@ class AgentFunction:
 
     async def record_audit_event(self, principal: RequestPrincipal | None, event: AuditEvent) -> None:
         """OSS has no customer audit store; cloud overrides this best-effort hook."""
+        return None
+
+    async def record_request_reads(
+        self,
+        principal: RequestPrincipal | None,
+        *,
+        method: str,
+        action: str | None,
+        resource: Mapping[str, object],
+        reads: RequestReads,
+    ) -> None:
+        """Called after a request's handler returns; OSS has no customer audit store, so it records nothing."""
         return None
 
     async def authorize_request(

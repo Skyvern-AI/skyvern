@@ -36,6 +36,7 @@ from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.services.artifact_reference_access import check_run_artifact_reference
+from skyvern.forge.sdk.services.request_reads import note_shared_artifact_links
 from skyvern.utils.secret_redaction import (
     MIN_UNANCHORED_SECRET_LENGTH,
     REDACTION_FAILED_STUB,
@@ -1716,13 +1717,17 @@ class ArtifactManager:
             # basename. Without this fallback the path basename is just
             # "content" and the UI falls back to a literal "download" label.
             artifact_name = artifact.bundle_key or artifact_filename_from_uri(artifact.uri) or None
-            return self._bundle_content_url(
+            link: str | None = self._bundle_content_url(
                 artifact.artifact_id,
                 artifact_name=artifact_name,
                 artifact_type=artifact.artifact_type,
                 expiry_seconds=expiry_seconds,
             )
-        return await app.STORAGE.get_share_link(artifact)
+        else:
+            link = await app.STORAGE.get_share_link(artifact)
+        if link:
+            note_shared_artifact_links(((artifact, link),))
+        return link
 
     async def remint_content_url_if_unverified(
         self, parsed: ParsedArtifactContentUrl, organization_id: str | None
@@ -1803,7 +1808,7 @@ class ArtifactManager:
         expiry_seconds = await self.resolve_artifact_url_expiry_seconds(organization_id)
 
         if _bundling_enabled():
-            return [
+            links: list[str | None] = [
                 self._bundle_content_url(
                     artifact.artifact_id,
                     artifact_name=artifact.bundle_key,
@@ -1812,6 +1817,8 @@ class ArtifactManager:
                 )
                 for artifact in artifacts
             ]
+            note_shared_artifact_links(zip(artifacts, links, strict=True))
+            return links
 
         bundled_indices = [i for i, a in enumerate(artifacts) if a.bundle_key]
         non_bundled_indices = [i for i, a in enumerate(artifacts) if not a.bundle_key]
@@ -1835,6 +1842,7 @@ class ArtifactManager:
                 expiry_seconds=artifact_url_expiry_seconds_for_type(a.artifact_type, expiry_seconds),
             )
 
+        note_shared_artifact_links(zip(artifacts, result, strict=True))
         LOG.debug(
             "get_share_links_with_bundle_support",
             total=len(artifacts),

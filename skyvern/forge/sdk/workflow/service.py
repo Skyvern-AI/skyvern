@@ -13,16 +13,21 @@ import time
 import unicodedata
 import uuid
 from collections import Counter, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from hashlib import sha256
 from http import HTTPStatus
+from itertools import chain
+from types import MappingProxyType
 from typing import Any, Literal, NamedTuple, TypeVar, cast, overload
+from urllib.parse import SplitResult, parse_qsl, unquote, urlsplit
 
 import structlog
+from botocore.exceptions import UnknownRegionError
+from botocore.handlers import VALID_BUCKET
 from jinja2 import TemplateSyntaxError
 from jinja2 import meta as jinja2_meta
 from pydantic import BaseModel
@@ -106,8 +111,10 @@ from skyvern.forge.final_failure_diagnostic import (
     final_har_user_errors,
 )
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.aws import S3Uri
 from skyvern.forge.sdk.api.files import discard_temp_working_dir, is_temp_working_dir, resolve_run_download_id
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.signing import parse_artifact_content_url
 from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
 from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_artifacts, artifact_filename_from_uri
 from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
@@ -225,6 +232,15 @@ from skyvern.forge.sdk.services.browser_session_artifacts import (
 )
 from skyvern.forge.sdk.services.org_auth_token_service import get_valid_org_api_token
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal
+from skyvern.forge.sdk.services.request_reads import (
+    ArtifactLink,
+    RunStatusLinks,
+    artifact_link_digest,
+    defer_file_link_issuance,
+    note_returned_file_links,
+    note_run_status_links,
+    run_status_link_capture,
+)
 from skyvern.forge.sdk.streaming.registries import (
     claim_stream_closing,
     release_stream_closing,
@@ -423,8 +439,10 @@ from skyvern.schemas.run_enums import RunEngine, WebhookDeliveryStatus
 from skyvern.schemas.runs import (
     ProxyLocation,
     ProxyLocationInput,
+    RunResponse,
     RunStatus,
     RunType,
+    TaskRunResponse,
     WorkflowRunRequest,
     WorkflowRunResponse,
     read_browser_type,
@@ -1187,6 +1205,288 @@ def _is_download_registration(value: dict[str, Any]) -> bool:
         and all(isinstance(aid, str) for aid in artifact_ids)
         and isinstance(value["downloaded_files"], list)
     )
+
+
+def _workflow_output_artifact_urls(value: Any) -> Iterator[str]:
+    """Yield possible returned links for membership checks only."""
+    children: Iterable[object]
+    if isinstance(value, dict):
+        files = value.get("downloaded_files")
+        if isinstance(files, list):
+            for file in files:
+                if isinstance(file, dict) and isinstance(url := file.get("url"), str) and url:
+                    yield url
+        for key in ("downloaded_file_urls", "task_screenshots", "workflow_screenshots"):
+            urls = value.get(key)
+            if isinstance(urls, list):
+                yield from (url for url in urls if isinstance(url, str) and url)
+        url = value.get("artifact_url")
+        if isinstance(url, str) and url:
+            yield url
+        children = value.values()
+    elif isinstance(value, list):
+        children = value
+    else:
+        return
+
+    for child in children:
+        if isinstance(child, (dict, list)):
+            yield from _workflow_output_artifact_urls(child)
+
+
+def _run_status_artifact_urls(response: WorkflowRunResponseBase | RunResponse) -> Iterator[str]:
+    """Typed run links and workflow output links from the final response."""
+    if response.recording_url:
+        yield response.recording_url
+    yield from response.screenshot_urls or ()
+    for file in response.downloaded_files or ():
+        if file.url:
+            yield file.url
+    if isinstance(response, WorkflowRunResponseBase):
+        yield from response.recording_urls or ()
+        yield from response.downloaded_file_urls or ()
+        output: dict[str, object] | dict[object, object] | list[object] | str | None = response.outputs
+    elif not isinstance(response, TaskRunResponse) or response.run_type == RunType.task_v2:
+        output = response.output
+    else:
+        # Task-v1 links can only be returned through the typed fields above.
+        return
+    yield from _workflow_output_artifact_urls(output)
+
+
+# Bound optional provenance enrichment separately from the existing request audit writer.
+_STORED_STATUS_LINK_LIMIT = 128
+_STORED_STATUS_LINK_TIMEOUT = 0.5
+_STORED_STATUS_LINK_MAX_LENGTH = 8192
+_S3_STATUS_LINK_HOST = re.compile(
+    r"(?:(?P<bucket>[a-z0-9][a-z0-9.-]*)\.)?s3"
+    r"(?:[.-](?:dualstack\.)?(?P<region>[a-z]{2}(?:-[a-z0-9]+)+-\d+|external-1))?"
+    r"(?P<suffix>\.amazonaws\.com(?:\.cn)?)"
+)
+_S3_STATUS_QUERY_KEYS = frozenset({"awsaccesskeyid", "expires", "signature"})
+_AZURE_STATUS_QUERY_KEYS = frozenset({"sp", "st", "se", "spr", "sip", "sv", "sr", "sig", "rscd", "rsct"})
+
+
+def _s3_status_link_uri(parts: SplitResult, host: re.Match[str]) -> str | None:
+    """Reverse an ordinary S3 address only within the initialized signer's namespace."""
+    query = [(key.lower(), value) for key, value in parse_qsl(parts.query, keep_blank_values=True)]
+    if not all(
+        key.startswith(("x-amz-", "response-")) or key in _S3_STATUS_QUERY_KEYS or (key, value) == ("x-id", "GetObject")
+        for key, value in query
+    ):
+        return None
+    escaped_key = parts.path.removeprefix("/")
+    bucket = host["bucket"]
+    if bucket is None:
+        # The path-style bucket is a raw segment. A percent escape cannot create its delimiter.
+        bucket, separator, escaped_key = escaped_key.partition("/")
+        if not separator or bucket in {".", ".."} or not VALID_BUCKET.fullmatch(bucket):
+            return None
+    if re.search(r"%(?![0-9a-fA-F]{2})", escaped_key):
+        return None
+    try:
+        key = unquote(escaped_key, errors="strict")
+    except UnicodeError:
+        return None
+    if not key or re.search(r"[\x00-\x1f\x7f]", key) or {".", ".."}.intersection(key.split("/")):
+        return None
+    # The AWS serializer quotes the Key as data, including a POSIX filename's backslash. Confirm
+    # the key round-trips through the URI parser used for both upload and GetObject.
+    uri = f"s3://{bucket}/{key}"
+    if S3Uri(uri).key != key:
+        return None
+
+    storage = app.STORAGE
+    if not isinstance(storage, S3Storage):
+        return None
+    # The existing registry is per event loop. Reading the ready client avoids opening or refreshing
+    # a session through AsyncAWSClient.session or _s3_client just to verify a stored address.
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    aws = storage.async_client
+    shared = aws._shared_s3_clients.get(loop)
+    if shared is None or shared.session is not aws._session:
+        return None
+    if not shared.ready.done() or shared.ready.cancelled() or shared.ready.exception() is not None:
+        return None
+    meta = shared.ready.result().meta
+    try:
+        endpoint = urlsplit(meta.endpoint_url)
+    except ValueError:
+        return None
+    producer = _S3_STATUS_LINK_HOST.fullmatch(endpoint.netloc)
+    if (
+        not meta.partition
+        or endpoint.scheme != "https"
+        or endpoint.path not in ("", "/")
+        or endpoint.query
+        or endpoint.fragment
+        or producer is None
+        or producer["bucket"] is not None
+        or producer["suffix"] != host["suffix"]
+    ):
+        return None
+
+    # This session already loaded its SDK endpoint resolver to construct the ready S3 client.
+    # In particular, the commercial and GovCloud partitions share a DNS suffix.
+    try:
+        for authority in (producer, host):
+            region = authority["region"]
+            if region is None or region == "external-1":
+                # Botocore's regionless S3 and s3-external-1 endpoints belong to aws only.
+                if meta.partition != "aws" or authority["suffix"] != ".amazonaws.com":
+                    return None
+            elif shared.session.get_partition_for_region(region) != meta.partition:
+                return None
+    except UnknownRegionError:
+        return None
+    return uri
+
+
+def _stored_status_link_locator(url: str) -> tuple[Literal["artifact_id", "uri"], str] | None:
+    """An exact artifact address to check against host rows, without retaining query credentials."""
+    if len(url) > _STORED_STATUS_LINK_MAX_LENGTH or url.startswith(" ") or re.search(r"[\x00-\x1f\x7f]", url):
+        return None
+    # LocalStorage returns the stored URI verbatim. The later metadata match is exact.
+    if url.startswith("file://"):
+        return ("uri", url)
+    if "\\" in url:
+        return None
+    if parsed := parse_artifact_content_url(url, settings.SKYVERN_BASE_URL):
+        # This is only a bounded lookup key. A URL path supplies neither ownership nor an audit ID.
+        if re.fullmatch(r"a_[0-9]{1,20}", parsed.artifact_id):
+            return ("artifact_id", parsed.artifact_id)
+        return None
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if parts.scheme != "https" or parts.fragment or parts.username is not None or parts.password is not None:
+        return None
+    if s3 := _S3_STATUS_LINK_HOST.fullmatch(parts.netloc):
+        uri = _s3_status_link_uri(parts, s3)
+        return ("uri", uri) if uri is not None else None
+    try:
+        path = unquote(parts.path.removeprefix("/"), errors="strict")
+    except UnicodeError:
+        return None
+    if not path or re.search(r"[\x00-\x1f\x7f\\]", path) or {".", ".."}.intersection(path.split("/")):
+        return None
+    # The storage clients sign GETs of the current object. Alternate version, generation, or subresource
+    # selectors are outside that address. Only the clients' signing and response-override keys are accepted.
+    query = [(key.lower(), value) for key, value in parse_qsl(parts.query, keep_blank_values=True)]
+    query_keys = {key for key, _ in query}
+    prefix, _, rest = path.partition("/")
+    if parts.netloc == "storage.googleapis.com" and prefix and rest:
+        if all(key.startswith(("x-goog-", "response-")) for key in query_keys):
+            return ("uri", f"gs://{prefix}/{rest}")
+    if parts.netloc.endswith(".blob.core.windows.net") and prefix and rest:
+        storage = app.STORAGE
+        if (
+            isinstance(storage, AzureStorage)
+            and parts.netloc == f"{storage.async_client.account_name}.blob.core.windows.net"
+            and query_keys <= _AZURE_STATUS_QUERY_KEYS
+        ):
+            return ("uri", f"azure://{prefix}/{rest}")
+    return None
+
+
+async def _retain_workflow_status_links(
+    response: WorkflowRunResponseBase,
+    captured: Mapping[str, ArtifactLink],
+    organization_id: str,
+    workflow_run_id: str,
+    task_v2_id: str | None,
+    scoped_tasks: Sequence[Task],
+    known_artifacts: Iterable[Artifact],
+) -> dict[bytes, tuple[str, str | None]]:
+    retained: dict[bytes, tuple[str, str | None]] = {}
+    pending: dict[bytes, tuple[Literal["artifact_id", "uri"], str]] = {}
+    limit_reached = False
+    for url in _run_status_artifact_urls(response):
+        if not url:
+            continue
+        digest = artifact_link_digest(url)
+        host_attribution = captured.get(url)
+        if host_attribution is not None:
+            retained[digest] = (host_attribution.artifact_type, host_attribution.artifact_id)
+            if host_attribution.artifact_id is not None:
+                continue
+        if digest in pending:
+            continue
+        if len(pending) == _STORED_STATUS_LINK_LIMIT:
+            limit_reached = True
+            continue
+        locator = _stored_status_link_locator(url)
+        if locator is not None:
+            pending[digest] = locator
+    if limit_reached:
+        LOG.warning("Workflow status stored-link metadata limit reached")
+    if not pending:
+        return retained
+
+    requested_ids = {value for kind, value in pending.values() if kind == "artifact_id"}
+    storage_uris = {value for kind, value in pending.values() if kind == "uri"}
+    known_by_id: dict[str, tuple[str, str]] = {}
+    if requested_ids:
+        task_ids = {task.task_id for task in scoped_tasks}
+        run_ids = {workflow_run_id, *task_ids}
+        if task_v2_id is not None:
+            run_ids.add(task_v2_id)
+        known_by_id = {
+            row.artifact_id: (str(row.artifact_type), row.artifact_id)
+            for row in known_artifacts
+            if row.artifact_id in requested_ids
+            and row.organization_id == organization_id
+            and (
+                row.workflow_run_id == workflow_run_id
+                or row.run_id in run_ids
+                or row.task_id in task_ids
+                or (task_v2_id is not None and row.observer_cruise_id == task_v2_id)
+            )
+        }
+    # A partial in-memory population can prove a primary-key hit, but cannot rule out two
+    # registrations for a raw storage URI. Resolve URI ambiguity at the repository.
+    unresolved_ids = requested_ids - known_by_id.keys()
+    by_uri: dict[str, tuple[str, str]] = {}
+    if unresolved_ids or storage_uris:
+        try:
+            async with asyncio.timeout(_STORED_STATUS_LINK_TIMEOUT), app.DATABASE.Session.released():
+                rows = await app.DATABASE.artifacts.get_workflow_status_artifact_locators(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    task_v2_id=task_v2_id,
+                    artifact_ids=unresolved_ids,
+                    storage_uris=storage_uris,
+                )
+        except Exception:
+            # Keep the original response and current host-issued evidence on failure. A caller cancellation
+            # is not caught here. SQL params, URLs, and exception bodies stay out of the audit/log entry.
+            LOG.warning("Workflow status stored-link metadata unavailable")
+        else:
+            for artifact_id, artifact_type, storage_uri in rows:
+                if not artifact_type:
+                    continue
+                if storage_uri is None:
+                    known_by_id[artifact_id] = (artifact_type, artifact_id)
+                else:
+                    by_uri[storage_uri] = (artifact_type, artifact_id)
+
+    for digest, (kind, value) in pending.items():
+        attribution = known_by_id.get(value) if kind == "artifact_id" else by_uri.get(value)
+        if attribution is not None:
+            retained[digest] = attribution
+    return retained
+
+
+def note_returned_run_status_links(
+    response: WorkflowRunResponseBase | RunResponse,
+    links: RunStatusLinks | None,
+) -> None:
+    principal = get_request_principal()
+    note_run_status_links(links, principal.organization_id if principal else None, _run_status_artifact_urls(response))
 
 
 async def _as_outputs_copies(
@@ -3209,6 +3509,8 @@ class WorkflowService:
         comparison: ResponseComparison | None = None,
         canonical: Sequence[FileInfo] = (),
         run_task_ids: frozenset[str] | None = None,
+        *,
+        remember_artifact_rows: Callable[[Sequence[Artifact]], None] | None = None,
     ) -> Any:
         """Two-pass batch URL refresh: scan artifact IDs (sync), fetch all in 2 parallel DB calls, substitute in-place."""
         if not organization_id:
@@ -3302,6 +3604,7 @@ class WorkflowService:
             download_run_id=download_run_id,
             canonical=canonical,
             run_task_ids=run_task_ids,
+            remember_artifact_rows=remember_artifact_rows,
         )
 
     async def _substitute_artifact_urls(
@@ -3320,6 +3623,8 @@ class WorkflowService:
         download_run_id: str | None = None,
         canonical: Sequence[FileInfo] = (),
         run_task_ids: frozenset[str] | None = None,
+        *,
+        remember_artifact_rows: Callable[[Sequence[Artifact]], None] | None = None,
     ) -> Any:
         """Substitute artifact IDs with pre-built URLs and FileInfos (no DB in the common path).
 
@@ -3409,16 +3714,22 @@ class WorkflowService:
                             historical_artifacts=[
                                 artifact for artifact in historical_artifacts if artifact.task_id == task_id
                             ],
+                            remember_artifact_rows=remember_artifact_rows,
                         )
                     else:
                         value["task_screenshots"] = await self._legacy_task_screenshot_urls(
-                            task_id, organization_id, workflow_run_id, run_task_ids
+                            task_id,
+                            organization_id,
+                            workflow_run_id,
+                            run_task_ids,
+                            remember_artifact_rows=remember_artifact_rows,
                         )
                 if value.get("workflow_screenshots"):
                     value["workflow_screenshots"] = await self.get_recent_workflow_screenshot_urls(
                         workflow_run_id=workflow_run_id,
                         organization_id=organization_id,
                         historical_artifacts=historical_artifacts,
+                        remember_artifact_rows=remember_artifact_rows,
                     )
             else:
                 if _is_download_registration(value):
@@ -3446,6 +3757,7 @@ class WorkflowService:
                         download_run_id=download_run_id,
                         canonical=canonical,
                         run_task_ids=run_task_ids,
+                        remember_artifact_rows=remember_artifact_rows,
                     )
         elif isinstance(value, list):
             for i, item in enumerate(value):
@@ -3467,6 +3779,7 @@ class WorkflowService:
                     download_run_id=download_run_id,
                     canonical=canonical,
                     run_task_ids=run_task_ids,
+                    remember_artifact_rows=remember_artifact_rows,
                 )
         return value
 
@@ -16683,6 +16996,8 @@ class WorkflowService:
         organization_id: str | None,
         workflow_run_id: str,
         run_task_ids: frozenset[str] | None = None,
+        *,
+        remember_artifact_rows: Callable[[Sequence[Artifact]], None] | None = None,
     ) -> list[str]:
         artifacts = await self.get_recent_task_screenshot_artifacts(organization_id=organization_id, task_id=task_id)
         if (
@@ -16698,6 +17013,8 @@ class WorkflowService:
         if not artifacts:
             return []
         urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
+        if remember_artifact_rows is not None:
+            remember_artifact_rows(artifacts)
         return [url for url in urls if url is not None]
 
     async def _task_in_run_tree(
@@ -16777,6 +17094,7 @@ class WorkflowService:
         task_id: str | None = None,
         task_v2_id: str | None = None,
         limit: int = 3,
+        remember_artifact_rows: Callable[[Sequence[Artifact]], None] | None = None,
     ) -> list[str]:
         """Return the latest action/final screenshot URLs for a task (v1 or v2)."""
         artifacts = await self.get_recent_task_screenshot_artifacts(
@@ -16788,6 +17106,8 @@ class WorkflowService:
         if not artifacts:
             return []
         urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
+        if remember_artifact_rows is not None:
+            remember_artifact_rows(artifacts)
         return [u for u in urls if u is not None]
 
     async def get_recent_workflow_screenshot_artifacts(
@@ -16856,6 +17176,8 @@ class WorkflowService:
         limit: int = 3,
         workflow_run_tasks: list[Task] | None = None,
         historical_artifacts: list[Artifact] | None = None,
+        *,
+        remember_artifact_rows: Callable[[Sequence[Artifact]], None] | None = None,
     ) -> list[str]:
         """Return latest screenshot URLs across recent tasks in a workflow run."""
         artifacts = await self.get_recent_workflow_screenshot_artifacts(
@@ -16868,6 +17190,8 @@ class WorkflowService:
         if not artifacts:
             return []
         urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
+        if remember_artifact_rows is not None:
+            remember_artifact_rows(artifacts)
         return [u for u in urls if u is not None]
 
     async def get_workflow_run_llm_cost_sum(
@@ -16945,6 +17269,8 @@ class WorkflowService:
         organization_id: str | None,
         historical_artifacts: list[Artifact] | None = None,
         current_attempt_artifacts: list[Artifact] | None = None,
+        *,
+        remember_artifact_rows: Callable[[Sequence[Artifact]], None] | None = None,
     ) -> tuple[list[str], bool]:
         """Fetch recording URLs, preferring precise run-scoped recordings over the shared
         browser-session recording.
@@ -16978,6 +17304,8 @@ class WorkflowService:
                 if archived
                 else await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(run_recording_artifacts)
             )
+            if remember_artifact_rows is not None and not archived:
+                remember_artifact_rows(run_recording_artifacts)
             return [url for url in urls if url is not None], archived
         # "/run_recordings/" mirrors run_recording_clips.RUN_RECORDING_PATH_SEGMENT.
         clip_artifacts = [a for a in run_recording_artifacts if a.uri and "/run_recordings/" in a.uri]
@@ -16985,6 +17313,8 @@ class WorkflowService:
             recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(clip_artifacts[0])
             if not recording_archived:
                 urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(clip_artifacts)
+                if remember_artifact_rows is not None:
+                    remember_artifact_rows(clip_artifacts)
                 recording_urls = [u for u in urls if u is not None]
 
         # Fall back to the shared browser-session recording (windowed, then unbounded for a
@@ -17000,10 +17330,11 @@ class WorkflowService:
             else:
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
-                            organization_id=workflow_run.organization_id,
-                            browser_session_id=workflow_run.browser_session_id,
-                        )
+                        with defer_file_link_issuance():
+                            recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
+                                organization_id=workflow_run.organization_id,
+                                browser_session_id=workflow_run.browser_session_id,
+                            )
                         lower_bound = _as_utc(workflow_run.started_at)
                         run_end = _as_utc(workflow_run.finished_at) if workflow_run.finished_at else datetime.now(UTC)
                         upper_bound = run_end + RECORDING_WINDOW_END_BUFFER
@@ -17013,6 +17344,15 @@ class WorkflowService:
                             # close, often long after run_end, so it never lands in the bounded
                             # window. Drop the upper bound rather than show "no recording".
                             recording_urls = _select_recording_urls_in_window(recordings, lower_bound)
+                        artifact_ids_by_url = {
+                            recording.url: recording.artifact_id for recording in recordings if recording.artifact_id
+                        }
+                        note_returned_file_links(
+                            "workflow_run",
+                            workflow_run.workflow_run_id,
+                            ArtifactType.RECORDING,
+                            ((url, artifact_ids_by_url.get(url)) for url in recording_urls),
+                        )
                 except TimeoutError:
                     LOG.warning("Timeout getting recordings", browser_session_id=workflow_run.browser_session_id)
 
@@ -17031,6 +17371,8 @@ class WorkflowService:
             recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(run_recording_artifacts[0])
             if not recording_archived:
                 urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(run_recording_artifacts)
+                if remember_artifact_rows is not None:
+                    remember_artifact_rows(run_recording_artifacts)
                 recording_urls = [u for u in urls if u is not None]
 
         return recording_urls, recording_archived
@@ -17052,10 +17394,11 @@ class WorkflowService:
         download_run_id = (context.run_id if context and context.run_id else None) or workflow_run.workflow_run_id
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                downloaded_files = await app.STORAGE.get_downloaded_files(
-                    organization_id=workflow_run.organization_id,
-                    run_id=download_run_id,
-                )
+                with defer_file_link_issuance():
+                    downloaded_files = await app.STORAGE.get_downloaded_files(
+                        organization_id=workflow_run.organization_id,
+                        run_id=download_run_id,
+                    )
                 artifact_ids: set[str] | None = None
                 if attempt_rows and attempt_number is not None:
                     artifact_ids = await self._download_artifact_ids_for_attempt(
@@ -17076,10 +17419,11 @@ class WorkflowService:
                 )
                 workflow_run_downloaded_files = downloaded_files
                 if task_v2:
-                    task_v2_downloaded_files = await app.STORAGE.get_downloaded_files(
-                        organization_id=workflow_run.organization_id,
-                        run_id=task_v2.observer_cruise_id,
-                    )
+                    with defer_file_link_issuance():
+                        task_v2_downloaded_files = await app.STORAGE.get_downloaded_files(
+                            organization_id=workflow_run.organization_id,
+                            run_id=task_v2.observer_cruise_id,
+                        )
                     if task_v2_downloaded_files:
                         task_v2_artifact_ids = None
                         if (
@@ -17128,6 +17472,12 @@ class WorkflowService:
                 comparison,
             )
             downloaded_file_urls = [file_info.url for file_info in downloaded_files]
+            note_returned_file_links(
+                "workflow_run",
+                workflow_run.workflow_run_id,
+                ArtifactType.DOWNLOAD,
+                ((file_info.url, file_info.artifact_id) for file_info in downloaded_files),
+            )
         return downloaded_files, downloaded_file_urls
 
     async def build_workflow_run_status_response(
@@ -17287,39 +17637,54 @@ class WorkflowService:
             artifacts_accessible = access.allowed
             # One deadline and one set of content verdicts for every download list this response shows.
             comparison = ResponseComparison()
+            status_link_capture = run_status_link_capture.get()
+            artifact_ids_by_url: dict[str, ArtifactLink] | None = (
+                {} if status_link_capture is not None and artifacts_accessible else None
+            )
+            # Keep audit-only rows separate from the PDF/refresh cache until final URL membership.
+            status_artifact_rows: dict[str, Artifact] = {}
+
+            def remember_status_rows(rows: Sequence[Artifact]) -> None:
+                status_artifact_rows.update((row.artifact_id, row) for row in rows)
+
+            remember_artifact_rows = remember_status_rows if artifact_ids_by_url is not None else None
 
             async def fetch_screenshots() -> list[str]:
                 if not artifacts_accessible:
                     return []
-                return await self.get_recent_workflow_screenshot_urls(
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                    workflow_run_tasks=screenshot_tasks,
-                    historical_artifacts=current_attempt_artifacts,
-                )
+                with defer_file_link_issuance(artifact_ids_by_url):
+                    return await self.get_recent_workflow_screenshot_urls(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        workflow_run_tasks=screenshot_tasks,
+                        historical_artifacts=current_attempt_artifacts,
+                        remember_artifact_rows=remember_artifact_rows,
+                    )
 
             async def fetch_artifacts() -> tuple[
                 tuple[list[str], bool], tuple[list[FileInfo] | None, list[str] | None]
             ]:
                 if not artifacts_accessible:
                     return ([], False), (None, None)
-                return await asyncio.gather(
-                    self._fetch_recording_urls(
-                        workflow_run,
-                        task_v2,
-                        organization_id,
-                        historical_artifacts=historical_artifacts,
-                        current_attempt_artifacts=current_attempt_artifacts,
-                    ),
-                    self._fetch_downloaded_files(
-                        workflow_run,
-                        task_v2,
-                        attempt_rows=attempt_rows,
-                        attempt_number=current_attempt,
-                        historical_artifacts=historical_artifacts,
-                        comparison=comparison,
-                    ),
-                )
+                with defer_file_link_issuance(artifact_ids_by_url):
+                    return await asyncio.gather(
+                        self._fetch_recording_urls(
+                            workflow_run,
+                            task_v2,
+                            organization_id,
+                            historical_artifacts=historical_artifacts,
+                            current_attempt_artifacts=current_attempt_artifacts,
+                            remember_artifact_rows=remember_artifact_rows,
+                        ),
+                        self._fetch_downloaded_files(
+                            workflow_run,
+                            task_v2,
+                            attempt_rows=attempt_rows,
+                            attempt_number=current_attempt,
+                            historical_artifacts=historical_artifacts,
+                            comparison=comparison,
+                        ),
+                    )
 
             (
                 screenshot_urls_raw,
@@ -17375,23 +17740,25 @@ class WorkflowService:
                 outputs = {key: REDACTED_ARTIFACT for key in outputs}
                 masked_output_count = len(outputs)
             outputs = {key: _cap(value, key) for key, value in outputs.items()}
-            # Refresh any expired presigned screenshot URLs in the outputs
-            async with app.DATABASE.Session.released():
-                outputs = await self._refresh_output_urls(
-                    outputs,
-                    historical_artifacts=historical_artifacts,
-                    current_attempt_artifacts=current_attempt_artifacts,
-                    organization_id=organization_id,
-                    workflow_run_id=workflow_run_id,
-                    attempt_rows=attempt_rows,
-                    attempt_number=current_attempt,
-                    comparison=comparison,
-                    canonical=downloaded_files or (),
-                    run_task_ids=frozenset(
-                        [task.task_id for task in workflow_run_tasks]
-                        + ([task_v2.observer_cruise_id] if task_v2 and task_v2.observer_cruise_id else [])
-                    ),
-                )
+            # A refreshed link can still be discarded by output selection or the expanded-value cap.
+            with defer_file_link_issuance(artifact_ids_by_url):
+                async with app.DATABASE.Session.released():
+                    outputs = await self._refresh_output_urls(
+                        outputs,
+                        historical_artifacts=historical_artifacts,
+                        current_attempt_artifacts=current_attempt_artifacts,
+                        organization_id=organization_id,
+                        workflow_run_id=workflow_run_id,
+                        attempt_rows=attempt_rows,
+                        attempt_number=current_attempt,
+                        comparison=comparison,
+                        canonical=downloaded_files or (),
+                        run_task_ids=frozenset(
+                            [task.task_id for task in workflow_run_tasks]
+                            + ([task_v2.observer_cruise_id] if task_v2 and task_v2.observer_cruise_id else [])
+                        ),
+                        remember_artifact_rows=remember_artifact_rows,
+                    )
             # The refresh expands artifact IDs into presigned URLs and FileInfo objects —
             # ~25x on an ID-dense value — so a value that fit before it can exceed the cap
             # after. Gating this on artifact IDs is not safe: the legacy `has_old_format`
@@ -17533,7 +17900,30 @@ class WorkflowService:
             script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,
             errors=errors,
         )
-        return access.redact_output(response)
+        response = access.redact_output(response)
+        if status_link_capture is not None and artifact_ids_by_url is not None:
+            # Start with the final response and independently verify any retained stored artifact address.
+            # The caller still filters the actorless handoff against its own DTO.
+            retained = await _retain_workflow_status_links(
+                response,
+                artifact_ids_by_url,
+                workflow_run.organization_id,
+                workflow_run_id,
+                task_v2.observer_cruise_id if task_v2 else None,
+                scoped_tasks,
+                chain(comparison.rows.values(), current_attempt_artifacts or (), status_artifact_rows.values()),
+            )
+            if retained:
+                status_link_capture.links = RunStatusLinks(
+                    workflow_run.organization_id,
+                    MappingProxyType(
+                        {
+                            digest: ArtifactLink("workflow_run", workflow_run_id, artifact_type, artifact_id)
+                            for digest, (artifact_type, artifact_id) in retained.items()
+                        }
+                    ),
+                )
+        return response
 
     async def _clean_up_workflow_browser(
         self,

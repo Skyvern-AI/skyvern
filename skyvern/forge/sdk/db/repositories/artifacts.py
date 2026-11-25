@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import datetime
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
-from sqlalchemy import and_, case, delete, false, func, or_, select, update
+from sqlalchemy import String, and_, case, delete, false, func, literal, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -449,6 +450,43 @@ class ArtifactsRepository(BaseRepository):
                 )
             ).all()
             return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
+
+    @db_operation("get_workflow_status_artifact_locators", log_errors=False)
+    async def get_workflow_status_artifact_locators(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        task_v2_id: str | None,
+        artifact_ids: Collection[str],
+        storage_uris: Collection[str],
+    ) -> list[tuple[str, str | None, str | None]]:
+        """Resolve requested addresses against host metadata for one workflow and its task artifacts."""
+        task_ids = select(TaskModel.task_id).where(
+            TaskModel.workflow_run_id == workflow_run_id, TaskModel.organization_id == organization_id
+        )
+        owners = [
+            ArtifactModel.workflow_run_id == workflow_run_id,
+            ArtifactModel.run_id == workflow_run_id,
+            ArtifactModel.task_id.in_(task_ids),
+            ArtifactModel.run_id.in_(task_ids),
+        ]
+        if task_v2_id is not None:
+            owners.extend((ArtifactModel.observer_cruise_id == task_v2_id, ArtifactModel.run_id == task_v2_id))
+        scope = (ArtifactModel.organization_id == organization_id, or_(*owners))
+        by_id = select(
+            ArtifactModel.artifact_id, ArtifactModel.artifact_type, literal(None, type_=String).label("storage_uri")
+        ).where(*scope, ArtifactModel.artifact_id.in_(artifact_ids))
+        # A raw object URL cannot distinguish duplicate registrations or a member inside a shared bundle.
+        by_uri = (
+            select(func.min(ArtifactModel.artifact_id), func.min(ArtifactModel.artifact_type), ArtifactModel.uri)
+            .where(*scope, ArtifactModel.uri.in_(storage_uris), ArtifactModel.bundle_key.is_(None))
+            .group_by(ArtifactModel.uri)
+            .having(func.count() == 1)
+        )
+        async with self.Session() as session:
+            rows = (await session.execute(by_id.union_all(by_uri))).tuples().all()
+            return [(artifact_id, artifact_type, storage_uri) for artifact_id, artifact_type, storage_uri in rows]
 
     @db_operation("get_artifacts_by_entity_id")
     async def get_artifacts_by_entity_id(
