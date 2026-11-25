@@ -37,14 +37,16 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     WORKFLOW_TASK_V3_AB_FLAG,
     WorkflowBlockEngineRouteReason,
 )
+from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.models.block import BlockType, V3AbIneligibleReason
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from skyvern.schemas.run_enums import RunEngine
+from skyvern.schemas.run_enums import RunEngine, RunType
 from tests.unit._workflow_block_engine_fakes import FakeExperimentationProvider, resolve_arm
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.helpers import make_step
 
 
 def _make_row(*, started: bool) -> MagicMock:
@@ -460,16 +462,23 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_type", "engine", "model_lookup_fails"),
+    [
+        (RunType.task_v1, RunEngine.skyvern_v1, False),
+        (RunType.openai_cua, RunEngine.openai_cua, False),
+        (RunType.anthropic_cua, RunEngine.anthropic_cua, False),
+        (RunType.ui_tars, RunEngine.ui_tars, False),
+        (RunType.openai_cua, RunEngine.openai_cua, True),
+    ],
+)
 async def test_duration_metrics_log_carries_task_run_type_for_a_bare_task(
     monkeypatch: pytest.MonkeyPatch,
     record_run_duration: AsyncMock,
+    run_type: RunType,
+    engine: RunEngine,
+    model_lookup_fails: bool,
 ) -> None:
-    # The v1-vs-v3 wall-time dashboard needs an engine discriminator on "Task duration metrics";
-    # a bare task resolves it from its own task_runs row (SKY-15499).
-    from structlog.testing import capture_logs
-
-    from skyvern.schemas.run_enums import RunType
-
     now = datetime.now(UTC)
     entry_task = _make_task(status=TaskStatus.running, started_at=now - timedelta(minutes=5))
     claimed_task = _make_task(status=TaskStatus.completed, started_at=now - timedelta(minutes=5), finished_at=now)
@@ -477,15 +486,37 @@ async def test_duration_metrics_log_carries_task_run_type_for_a_bare_task(
     monkeypatch.setattr(
         app.DATABASE.tasks, "update_task_and_claim_finish", AsyncMock(return_value=(claimed_task, True))
     )
-    monkeypatch.setattr(app.DATABASE.tasks, "get_run", AsyncMock(return_value=MagicMock(task_run_type=RunType.task_v3)))
+    monkeypatch.setattr(app.DATABASE.tasks, "get_run", AsyncMock(return_value=MagicMock(task_run_type=run_type)))
     monkeypatch.setattr(agent_module, "save_task_logs", AsyncMock())
+    monkeypatch.setattr(agent_module, "save_step_logs", AsyncMock())
+    step = make_step(now, entry_task, step_id="step_duration", status=StepStatus.running, order=0, output=None)
+    if model_lookup_fails:
+        step.last_llm_model = "fallback-model"
+    persisted_step = copy.deepcopy(step)
+    persisted_step.last_llm_model = "known-model"
+    monkeypatch.setattr(
+        app.DATABASE.tasks,
+        "get_step",
+        AsyncMock(
+            side_effect=RuntimeError("read unavailable") if model_lookup_fails else None,
+            return_value=persisted_step,
+        ),
+    )
+    monkeypatch.setattr(app.DATABASE.tasks, "update_step", AsyncMock(return_value=persisted_step))
+    context = SkyvernContext(task_id=entry_task.task_id, engine=engine)
 
-    with capture_logs() as logs:
+    with skyvern_context.scoped(context), capture_logs() as logs:
         await ForgeAgent().update_task(entry_task, status=TaskStatus.completed)
+        await ForgeAgent().update_step(step, status=StepStatus.failed)
 
     duration_logs = [e for e in logs if e.get("event") == "Task duration metrics"]
     assert len(duration_logs) == 1
-    assert duration_logs[0]["task_run_type"] == "task_v3"
+    assert duration_logs[0]["task_run_type"] == run_type.value
+    assert duration_logs[0]["engine"] == engine.value
+    step_logs = [e for e in logs if e.get("event") == "Step duration metrics"]
+    assert len(step_logs) == 1
+    assert step_logs[0]["engine"] == engine.value
+    assert step_logs[0]["model"] == ("fallback-model" if model_lookup_fails else "known-model")
 
 
 @pytest.mark.asyncio
@@ -521,6 +552,7 @@ async def test_duration_metrics_log_resolves_engine_from_the_block_for_a_workflo
     duration_logs = [e for e in logs if e.get("event") == "Task duration metrics"]
     assert len(duration_logs) == 1
     assert duration_logs[0]["task_run_type"] == "task_v1"
+    assert duration_logs[0]["engine"] == RunEngine.skyvern_v1.value
 
 
 @pytest.mark.asyncio
@@ -548,6 +580,7 @@ async def test_duration_metrics_log_survives_a_failed_run_type_resolution(
     duration_logs = [e for e in logs if e.get("event") == "Task duration metrics"]
     assert len(duration_logs) == 1
     assert duration_logs[0]["task_run_type"] is None
+    assert duration_logs[0]["engine"] is None
 
 
 def test_run_type_by_engine_mapping_is_exhaustive() -> None:

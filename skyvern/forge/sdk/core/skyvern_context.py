@@ -758,6 +758,7 @@ class SkyvernContext:
     org_age: int | None = None
     task_id: str | None = None
     step_id: str | None = None
+    engine: RunEngine | None = None
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
