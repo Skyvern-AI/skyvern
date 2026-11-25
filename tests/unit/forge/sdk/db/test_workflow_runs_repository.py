@@ -1943,6 +1943,28 @@ async def _assert_get_all_runs_v2_projects_and_filters_strict_reservation_as_que
     assert strict_reservation.workflow_run_id not in {row["run_id"] for row in running_rows}
     assert "tsk_v2_running_control" in {row["run_id"] for row in running_rows}
 
+    # A run with no task_runs row is listed only by the fallback merge, which a workflow filter turns on.
+    fallback_reservation = await sqlite_db.workflow_runs.create_workflow_run(
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        workflow_id=workflow.workflow_id,
+        organization_id=organization.organization_id,
+        otp_request_id="otpr_runs_v2_fallback_projection",
+    )
+    fallback_rows = {
+        status: {
+            row["run_id"]: row["status"]
+            for row in await sqlite_db.workflow_runs.get_all_runs_v2(
+                organization_id=organization.organization_id,
+                workflow_permanent_ids=[workflow.workflow_permanent_id],
+                status=[status] if status else None,
+            )
+        }
+        for status in (None, WorkflowRunStatus.queued.value, WorkflowRunStatus.running.value)
+    }
+    assert fallback_rows[None][fallback_reservation.workflow_run_id] == "queued"
+    assert fallback_rows[WorkflowRunStatus.queued.value][fallback_reservation.workflow_run_id] == "queued"
+    assert fallback_reservation.workflow_run_id not in fallback_rows[WorkflowRunStatus.running.value]
+
 
 @pytest.mark.asyncio
 async def test_repair_strengthens_provisional_but_never_touches_a_finished_row(sqlite_db: AgentDB) -> None:

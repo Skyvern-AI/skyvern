@@ -46,6 +46,7 @@ def _make_workflow_run(
     workflow_run_id: str = "wr_tmpl",
     organization_id: str = CALLER_ORG_ID,
     copilot_session_id: str | None = None,
+    otp_request_id: str | None = None,
 ) -> WorkflowRun:
     now = datetime.now(UTC)
     return WorkflowRun(
@@ -54,8 +55,10 @@ def _make_workflow_run(
         workflow_permanent_id="wpid_tmpl",
         organization_id=organization_id,
         copilot_session_id=copilot_session_id,
+        otp_request_id=otp_request_id,
         status=WorkflowRunStatus.running,
-        started_at=now,
+        # A marked run is stored as running before it starts; reads report it as queued.
+        started_at=None if otp_request_id else now,
         created_at=now,
         modified_at=now,
     )
@@ -97,14 +100,24 @@ def template_run_db(monkeypatch: pytest.MonkeyPatch) -> tuple[AsyncMock, AsyncMo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("copilot_session_id", [None, "wcc_123456"])
+@pytest.mark.parametrize(
+    ("copilot_session_id", "otp_request_id", "expected_status"),
+    [
+        (None, None, WorkflowRunStatus.running),
+        ("wcc_123456", None, WorkflowRunStatus.running),
+        (None, "otpr_reserved", WorkflowRunStatus.queued),
+    ],
+    ids=["run", "copilot-run", "unstarted-reservation"],
+)
 async def test_template_run_detail_resolves_via_run_join(
     monkeypatch: pytest.MonkeyPatch,
     template_run_db: tuple[AsyncMock, AsyncMock],
     copilot_session_id: str | None,
+    otp_request_id: str | None,
+    expected_status: WorkflowRunStatus,
 ) -> None:
     get_by_run, get_by_wpid = template_run_db
-    workflow_run = _make_workflow_run(copilot_session_id=copilot_session_id)
+    workflow_run = _make_workflow_run(copilot_session_id=copilot_session_id, otp_request_id=otp_request_id)
 
     # A real service instance: the stub app's WORKFLOW_SERVICE is a lazy auto-mock, so we must
     # exercise the actual build_workflow_run_status_response rather than app.WORKFLOW_SERVICE.
@@ -127,6 +140,7 @@ async def test_template_run_detail_resolves_via_run_join(
     assert response.workflow_run_id == "wr_tmpl"
     assert response.workflow_title == "Job Application Workflow"
     assert response.copilot_session_id == copilot_session_id
+    assert response.status == expected_status
 
     # Resolution must go through the run join (scoped by the run's org), not the caller-org
     # permanent-id lookup that returns None for cross-org template workflows.
@@ -152,6 +166,7 @@ async def test_template_run_detail_resolves_via_run_join(
 
     assert serialized.status_code == 200
     assert serialized.json()["copilot_session_id"] == copilot_session_id
+    assert serialized.json()["status"] == expected_status.value
     assert serialized.json()["workflow"]["organization_id"] == TEMPLATE_ORG_ID
 
 

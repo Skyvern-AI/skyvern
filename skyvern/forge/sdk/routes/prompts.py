@@ -90,7 +90,8 @@ async def improve_prompt(
         "Improving prompt",
         use_case=use_case,
         organization_id=current_org.organization_id,
-        context=request.context,
+        prompt_length=len(request.prompt),
+        context_keys_count=len(request.context or {}),
     )
 
     try:
@@ -119,7 +120,7 @@ async def improve_prompt(
             "Prompt improved",
             use_case=use_case,
             organization_id=current_org.organization_id,
-            prompt=request.prompt,
+            prompt_length=len(request.prompt),
             **llm_response_log_metadata(output),
         )
 

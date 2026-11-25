@@ -1732,14 +1732,16 @@ class RunSubmissionLab:
     workflow_permanent_id: str
     execute_workflow: AsyncMock
 
-    async def submit(self, route: str, parameters: dict[str, object], *, user_agent: str = "") -> httpx.Response:
+    async def submit(
+        self, route: str, parameters: dict[str, object], *, user_agent: str = "", otp_request_id: str | None = None
+    ) -> httpx.Response:
         headers = {"user-agent": user_agent}
-        if route == "run":
-            return await self.client.post(
-                "/v1/run/workflows",
-                json={"workflow_id": self.workflow_permanent_id, "parameters": parameters},
-                headers=headers,
-            )
+        if route in ("run", "otp-bound-run"):
+            body: dict[str, object] = {"workflow_id": self.workflow_permanent_id, "parameters": parameters}
+            if otp_request_id is not None:
+                body["otp_request_id"] = otp_request_id
+            path = "/v1/otp-bound/run/agents" if route == "otp-bound-run" else "/v1/run/workflows"
+            return await self.client.post(path, json=body, headers=headers)
         return await self.client.post(
             f"/api/v1/workflows/{self.workflow_permanent_id}/run", json={"data": parameters}, headers=headers
         )
@@ -1856,11 +1858,14 @@ async def run_submission_lab(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("otp_request_id", [None, "otpr_lab_submission"], ids=["unmarked", "marked"])
 async def test_run_submission_carries_user_agent_platform_through_real_prepare_and_post_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_engine: AsyncEngine,
+    otp_request_id: str | None,
 ) -> None:
     async with run_submission_lab(monkeypatch, sqlite_engine) as lab:
+        monkeypatch.setattr(app.AGENT_FUNCTION, "strict_otp_execution_available", lambda: True)
         apply_system_tags = AsyncMock()
         monkeypatch.setattr(lab.database.tags, "apply_system_run_tag_changes", apply_system_tags)
         setup_workflow_run = AsyncMock(wraps=lab.workflow_service.setup_workflow_run)
@@ -1871,12 +1876,18 @@ async def test_run_submission_carries_user_agent_platform_through_real_prepare_a
 
         lab.execute_workflow.side_effect = check_tag_is_deferred
         response = await lab.submit(
-            "run",
+            "otp-bound-run" if otp_request_id else "run",
             {"login": "cred_live", "email": "a@example.com"},
             user_agent="Make/production",
+            otp_request_id=otp_request_id,
         )
 
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
+        [stored] = await lab.run_rows()
+        # A marked run is stored as running before it starts; the create response reports it as queued.
+        assert (stored.status, stored.started_at, response.json()["status"]) == (
+            ("running", None, "queued") if otp_request_id else ("created", None, "created")
+        )
         setup_workflow_run.assert_awaited_once()
         assert setup_workflow_run.await_args.kwargs["integration_platform"] == "make"
         apply_system_tags.assert_awaited_once()

@@ -473,6 +473,7 @@ from skyvern.utils.templating import (
 from skyvern.utils.token_counter import count_tokens, decode_tokens, encode_tokens
 from skyvern.utils.url_validators import (
     prepend_scheme_and_validate_url,
+    redact_url_for_display,
     resolve_fetch_host_ips,
 )
 from skyvern.webeye import dialog_handler
@@ -16547,14 +16548,15 @@ class FileParserBlock(Block):
                 if extracted_url:
                     LOG.info(
                         "FileParserBlock Extracted file URL from block output parameter",
-                        extracted_url=extracted_url,
+                        extracted_url=redact_url_for_display(str(extracted_url)),
                         file_url_parameter_key=self.file_url,
                     )
                     self.file_url = extracted_url
                 else:
                     LOG.info(
                         "FileParserBlock File URL is parameterized, using parameter value",
-                        file_parameter_url=file_url_parameter_value,
+                        file_parameter_value_type=type(file_url_parameter_value).__name__,
+                        file_parameter_value_length=len(str(file_url_parameter_value)),
                         file_url_parameter_key=self.file_url,
                     )
                     self.file_url = file_url_parameter_value
@@ -16593,8 +16595,9 @@ class FileParserBlock(Block):
         if extracted_url:
             LOG.info(
                 "FileParserBlock Extracted file URL from rendered block output",
-                extracted_url=extracted_url,
-                rendered_value=self.file_url,
+                extracted_url=redact_url_for_display(str(extracted_url)),
+                rendered_value_type=type(self.file_url).__name__,
+                rendered_value_length=len(str(self.file_url)),
             )
             self.file_url = extracted_url
 
@@ -16871,7 +16874,8 @@ class PDFParserBlock(Block):
             if file_url_parameter_value:
                 LOG.info(
                     "PDFParserBlock File URL is parameterized, using parameter value",
-                    file_parameter_url=file_url_parameter_value,
+                    file_parameter_value_type=type(file_url_parameter_value).__name__,
+                    file_parameter_value_length=len(str(file_url_parameter_value)),
                     file_url_parameter_key=self.file_url,
                 )
                 self.file_url = file_url_parameter_value

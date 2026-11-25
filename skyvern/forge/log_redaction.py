@@ -47,6 +47,9 @@ SENSITIVE_HEADERS = {
     "x-ember-credential-recovery-token",
     "x-skyvern-signature",
     "stripe-signature",
+    "svix-id",
+    "svix-timestamp",
+    "svix-signature",
 }
 
 # Exact field names that are always redacted.  Use a set for O(1) lookup
