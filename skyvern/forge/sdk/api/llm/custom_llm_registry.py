@@ -8,10 +8,15 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from skyvern.forge.sdk.api.llm.exceptions import CustomLLMNeedsResaveError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
+from skyvern.forge.sdk.schemas.custom_llms import (
+    CustomLLMConfig,
+    CustomLLMProvider,
+    litellm_routing_extra_parameter_keys,
+)
 from skyvern.schemas.llm import LiteLLMParams, LLMConfig
 
 if TYPE_CHECKING:
@@ -34,6 +39,9 @@ class CustomLLMRegistryEntry:
 
 
 _custom_llm_configs: dict[str, CustomLLMRegistryEntry] = {}
+# custom_llm_id -> organization_id for stored configs refused at registration, kept apart from
+# "not registered" so callers stop instead of falling back to another model.
+_blocked_custom_llm_organizations: dict[str, str] = {}
 
 
 CUSTOM_LLM_KEY_PREFIX = "CUSTOM_LLM_"
@@ -126,10 +134,25 @@ def _build_llm_config(config: CustomLLMConfig) -> LLMConfig:
     )
 
 
-def register_custom_llm_config(custom_llm_id: str, organization_id: str, config: CustomLLMConfig) -> None:
+def register_custom_llm_config(custom_llm_id: str, organization_id: str, config: CustomLLMConfig) -> bool:
     from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry  # noqa: PLC0415
 
+    routing_keys = litellm_routing_extra_parameter_keys(config.extra_parameters)
+    if routing_keys:
+        # The stored key may belong to the routing override's endpoint, so this config is not dispatched
+        # until it is saved again without the override and with its credentials re-entered.
+        deregister_custom_llm_config(custom_llm_id)
+        _blocked_custom_llm_organizations[custom_llm_id] = organization_id
+        LOG.warning(
+            "Not registering custom LLM with litellm routing keys in extra_parameters",
+            custom_llm_id=custom_llm_id,
+            organization_id=organization_id,
+            routing_keys=routing_keys,
+        )
+        return False
+
     llm_key = custom_llm_key(custom_llm_id)
+    _blocked_custom_llm_organizations.pop(custom_llm_id, None)
     LLMConfigRegistry.deregister_config(llm_key)
     LLMConfigRegistry.register_config(llm_key, _build_llm_config(config))
     _custom_llm_configs[custom_llm_id] = CustomLLMRegistryEntry(organization_id=organization_id, config=config)
@@ -139,6 +162,7 @@ def register_custom_llm_config(custom_llm_id: str, organization_id: str, config:
         organization_id=organization_id,
         provider=config.provider.value,
     )
+    return True
 
 
 def deregister_custom_llm_config(custom_llm_id: str) -> None:
@@ -146,6 +170,17 @@ def deregister_custom_llm_config(custom_llm_id: str) -> None:
 
     LLMConfigRegistry.deregister_config(custom_llm_key(custom_llm_id))
     _custom_llm_configs.pop(custom_llm_id, None)
+    _blocked_custom_llm_organizations.pop(custom_llm_id, None)
+
+
+def is_custom_llm_blocked(llm_key: str, organization_id: str | None) -> bool:
+    custom_llm_id = llm_key.removeprefix(CUSTOM_LLM_KEY_PREFIX)
+    return organization_id is not None and _blocked_custom_llm_organizations.get(custom_llm_id) == organization_id
+
+
+def raise_if_custom_llm_blocked(llm_key: str, organization_id: str | None) -> None:
+    if is_custom_llm_blocked(llm_key, organization_id):
+        raise CustomLLMNeedsResaveError(llm_key)
 
 
 def is_custom_llm_owned_by_organization(custom_llm_id: str, organization_id: str) -> bool:
@@ -180,6 +215,9 @@ async def load_custom_llm_configs_for_organization(database: AgentDB, organizati
     for custom_llm_id, entry in list(_custom_llm_configs.items()):
         if entry.organization_id == organization_id and custom_llm_id not in active_ids:
             deregister_custom_llm_config(custom_llm_id)
+    for custom_llm_id, blocked_organization_id in list(_blocked_custom_llm_organizations.items()):
+        if blocked_organization_id == organization_id and custom_llm_id not in active_ids:
+            _blocked_custom_llm_organizations.pop(custom_llm_id, None)
 
     for token in tokens:
         try:
@@ -242,8 +280,7 @@ async def ensure_custom_llm_registered_for_org(
                 error_type=type(exc).__name__,
             )
             return False
-        register_custom_llm_config(token.id, token.organization_id, config)
-        return True
+        return register_custom_llm_config(token.id, token.organization_id, config)
     return False
 
 
@@ -286,5 +323,5 @@ async def load_custom_llm_configs_from_database(database: AgentDB) -> None:
         active_ids.add(token.id)
         register_custom_llm_config(token.id, token.organization_id, config)
 
-    for custom_llm_id in set(_custom_llm_configs) - active_ids:
+    for custom_llm_id in (set(_custom_llm_configs) | set(_blocked_custom_llm_organizations)) - active_ids:
         deregister_custom_llm_config(custom_llm_id)

@@ -1,4 +1,5 @@
 import gzip
+import json
 import os
 import socket
 import tempfile
@@ -14,6 +15,7 @@ from aiohttp.test_utils import TestServer
 
 from skyvern.exceptions import BlockedHost, HttpException
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.core import aiohttp_helper as aiohttp_helper_module
 from skyvern.forge.sdk.core.aiohttp_helper import (
     SSRFGuardedResolver,
     aiohttp_delete,
@@ -31,6 +33,25 @@ def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
 
     monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
+
+
+@pytest.fixture(autouse=True)
+def stream_mocked_aiohttp_responses(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_reader = aiohttp_helper_module.read_response_body_limited
+
+    async def read_response_body(response: aiohttp.ClientResponse, limit_bytes: int, url: str) -> bytes:
+        if not isinstance(response, AsyncMock):
+            return await original_reader(response, limit_bytes, url)
+        content_type = response.headers.get("Content-Type", "")
+        if "json" in content_type:
+            body = json.dumps(await response.json()).encode()
+        else:
+            body = (await response.text()).encode()
+        if len(body) > limit_bytes:
+            raise HttpException(413, url, "Response body exceeds its size limit")
+        return body
+
+    monkeypatch.setattr(aiohttp_helper_module, "read_response_body_limited", read_response_body)
 
 
 def allow_loopback_redirect_targets(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -646,40 +667,28 @@ RESPONSE_SIZE_LIMIT_BODIES: dict[str, tuple[bytes, str]] = {
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("route", "response_size_limit_enabled", "use_relay", "read_body", "expected"),
+    ("route", "use_relay", "read_body", "expected"),
     [
-        pytest.param("/compressed?sig=private-value", True, False, True, HttpException, id="compressed-on"),
-        pytest.param("/compressed", False, False, True, "a" * (2 * 1024 * 1024), id="compressed-off"),
-        pytest.param("/compressed", True, False, False, None, id="compressed-unread-on"),
-        pytest.param("/compressed", False, False, False, None, id="compressed-unread-off"),
-        pytest.param("/latin1-json", True, False, True, {"name": "caf\u00e9"}, id="latin1-json-on"),
-        pytest.param("/latin1-json", False, False, True, {"name": "caf\u00e9"}, id="latin1-json-off"),
-        pytest.param("/latin1-json", False, True, True, '{"name": "caf\u00e9"}', id="latin1-json-relay-off"),
-        pytest.param("/mislabelled-json", True, False, True, {"name": "caf\u00c3\u00a9"}, id="mislabelled-json-on"),
-        pytest.param("/mislabelled-json", False, False, True, {"name": "caf\u00c3\u00a9"}, id="mislabelled-json-off"),
-        pytest.param("/mislabelled-json", False, True, True, {"name": "caf\u00e9"}, id="mislabelled-json-relay-off"),
-        pytest.param("/bom-json", True, False, True, {"name": "caf\u00e9"}, id="bom-json-on"),
-        pytest.param("/bom-json", False, False, True, '\ufeff{"name": "caf\u00e9"}', id="bom-json-off"),
-        pytest.param("/bom-json", False, True, True, {"name": "caf\u00e9"}, id="bom-json-relay-off"),
-        pytest.param("/utf16be-json", True, False, True, {"id": "123"}, id="utf16be-json-on"),
-        pytest.param("/deep-json", True, False, True, DEEPLY_NESTED_JSON, id="deep-json-on"),
-        pytest.param("/deep-json", False, False, True, DEEPLY_NESTED_JSON, id="deep-json-off"),
+        pytest.param("/compressed?sig=private-value", False, True, HttpException, id="compressed"),
+        pytest.param("/compressed", False, False, None, id="compressed-unread"),
+        pytest.param("/latin1-json", False, True, {"name": "caf\u00e9"}, id="latin1-json"),
+        pytest.param("/latin1-json", True, True, '{"name": "caf\u00e9"}', id="latin1-json-relay"),
+        pytest.param("/mislabelled-json", False, True, {"name": "caf\u00c3\u00a9"}, id="mislabelled-json"),
+        pytest.param("/mislabelled-json", True, True, {"name": "caf\u00e9"}, id="mislabelled-json-relay"),
+        pytest.param("/bom-json", False, True, {"name": "caf\u00e9"}, id="bom-json"),
+        pytest.param("/bom-json", True, True, {"name": "caf\u00e9"}, id="bom-json-relay"),
+        pytest.param("/utf16be-json", False, True, {"id": "123"}, id="utf16be-json"),
+        pytest.param("/deep-json", False, True, DEEPLY_NESTED_JSON, id="deep-json"),
     ],
 )
 async def test_aiohttp_request_response_size_limit(
     monkeypatch: pytest.MonkeyPatch,
     route: str,
-    response_size_limit_enabled: bool,
     use_relay: bool,
     read_body: bool,
     expected: object,
 ) -> None:
     allow_loopback_redirect_targets(monkeypatch)
-
-    async def flag_enabled(feature_name: str, _distinct_id: str, properties: dict | None = None) -> bool:
-        return response_size_limit_enabled and feature_name == "OUTBOUND_RESPONSE_SIZE_LIMIT"
-
-    monkeypatch.setattr(forge_app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", flag_enabled)
 
     async def relay_hop(**_kwargs: object) -> GuardedHTTPHopResponse:
         body, content_type = RESPONSE_SIZE_LIMIT_BODIES[route]

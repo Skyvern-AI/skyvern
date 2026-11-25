@@ -16,8 +16,21 @@ from typing import Any, cast
 
 import grpc
 
-from skyvern.constants import PDF_OCR_MAX_PAGE_IMAGE_BYTES, PDF_OCR_MAX_PAGE_IMAGE_EDGE_PX
-from skyvern.file_parser.parser import ParserFailure, ParserLimits, ParserPart, ParserResult, parse_file_plain
+from skyvern.constants import (
+    FILE_PARSER_MAX_CELLS,
+    FILE_PARSER_MAX_DECODED_BYTES,
+    FILE_PARSER_MAX_ROWS,
+    PDF_OCR_MAX_PAGE_IMAGE_BYTES,
+    PDF_OCR_MAX_PAGE_IMAGE_EDGE_PX,
+)
+from skyvern.file_parser.parser import (
+    ParserFailure,
+    ParserLimits,
+    ParserPart,
+    ParserResult,
+    TableLimits,
+    parse_file_plain,
+)
 from skyvern.file_parser.proto import file_parser_pb2, file_parser_pb2_grpc
 from skyvern.file_parser.transport import (
     GRPC_OPTIONS,
@@ -99,8 +112,11 @@ def _part_chunks(part: ParserPart) -> AsyncIterator[bytes]:
 
 
 class FileParserService(FileParserServicerBase):
-    def __init__(self, scratch_root: Path) -> None:
+    def __init__(self, scratch_root: Path, table_limits: TableLimits | None = None) -> None:
         self._scratch_root = scratch_root
+        self._table_limits = table_limits or TableLimits(
+            FILE_PARSER_MAX_ROWS, FILE_PARSER_MAX_CELLS, FILE_PARSER_MAX_DECODED_BYTES
+        )
         self._admission = asyncio.Semaphore(1)
 
     async def Parse(
@@ -127,6 +143,9 @@ class FileParserService(FileParserServicerBase):
                     timeout_seconds=MAX_PARSER_TIMEOUT_SECONDS,
                     max_page_image_bytes=PDF_OCR_MAX_PAGE_IMAGE_BYTES,
                     max_page_image_edge_px=PDF_OCR_MAX_PAGE_IMAGE_EDGE_PX,
+                    max_table_rows=self._table_limits.max_rows,
+                    max_table_cells=self._table_limits.max_cells,
+                    max_table_decoded_bytes=self._table_limits.max_decoded_bytes,
                 )
                 cancel_event = threading.Event()
                 parse_task = asyncio.create_task(
@@ -233,6 +252,13 @@ class FileParserService(FileParserServicerBase):
                 self._admission.release()
 
 
+def _positive_env_int(name: str, default: int) -> int:
+    value = int(os.environ.get(name, default))
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return value
+
+
 async def serve() -> None:
     host = os.environ.get("FILE_PARSER_GRPC_HOST", "127.0.0.1")
     if host not in {"127.0.0.1", "0.0.0.0"}:
@@ -240,9 +266,16 @@ async def serve() -> None:
     port = int(os.environ.get("FILE_PARSER_GRPC_PORT", "7820"))
     scratch_root = Path(os.environ.get("FILE_PARSER_SCRATCH_DIR", "/tmp/skyvern-file-parser"))
     scratch_root.mkdir(parents=True, exist_ok=True)
+    # Same names and defaults as the worker's FILE_PARSER_MAX_* settings, read here because this process never loads
+    # skyvern.config.
+    table_limits = TableLimits(
+        max_rows=_positive_env_int("FILE_PARSER_MAX_ROWS", FILE_PARSER_MAX_ROWS),
+        max_cells=_positive_env_int("FILE_PARSER_MAX_CELLS", FILE_PARSER_MAX_CELLS),
+        max_decoded_bytes=_positive_env_int("FILE_PARSER_MAX_DECODED_BYTES", FILE_PARSER_MAX_DECODED_BYTES),
+    )
 
     server = grpc.aio.server(options=GRPC_OPTIONS)
-    _file_parser_pb2_grpc.add_FileParserServicer_to_server(FileParserService(scratch_root), server)
+    _file_parser_pb2_grpc.add_FileParserServicer_to_server(FileParserService(scratch_root, table_limits), server)
     server.add_insecure_port(f"{host}:{port}")
     await server.start()
     LOG.info("Isolated file parser listening", extra={"host": host, "port": port})

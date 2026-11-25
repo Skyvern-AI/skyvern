@@ -51,8 +51,17 @@ describe("extraParamsToRows / buildExtraParameters", () => {
     expect(params).toStrictEqual(extraParameters);
   });
 
-  it("rejects reserved keys advertised for passthrough", () => {
-    const { error } = buildExtraParameters([{ key: "tools", value: "[]" }]);
+  it.each([
+    "tools",
+    "base_url",
+    " Base_URL ",
+    "fallbacks",
+    "context_window_fallback_dict",
+    "model_list",
+    "deployment_id",
+    "azure",
+  ])("rejects reserved key %j advertised for passthrough", (key) => {
+    const { error } = buildExtraParameters([{ key, value: "[]" }]);
     expect(error).toContain("reserved");
   });
 });

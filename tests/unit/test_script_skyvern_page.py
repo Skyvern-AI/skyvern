@@ -30,6 +30,7 @@ import skyvern.forge.sdk.artifact.storage.base as storage_base_module
 import skyvern.forge.sdk.artifact.storage.local as local_storage_module
 import skyvern.forge.sdk.workflow.service as workflow_service_module
 import skyvern.library.embedded_server_factory as embedded_server_module
+import skyvern.webeye.utils.page as page_utils
 from skyvern.config import settings
 from skyvern.constants import NAVIGATION_MAX_RETRY_TIME
 from skyvern.core.script_generations import skyvern_page as skyvern_page_module
@@ -47,6 +48,7 @@ from skyvern.exceptions import (
     SkyvernHTTPException,
     StaleFrameSelectionError,
 )
+from skyvern.forge import app
 from skyvern.forge.sdk.api import files as files_module
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact
@@ -1019,9 +1021,17 @@ class _FillablePageStub(_PageStub):
     def __init__(self) -> None:
         super().__init__()
         self.events: list[str] = []
+        self.input_type = "text"
         self.field = MagicMock()
         self.field.wait_for = AsyncMock()
-        self.field.evaluate = AsyncMock(side_effect=lambda *_args, **_kwargs: self.events.append("mask"))
+
+        async def evaluate(script: str, *_args: Any, **_kwargs: Any) -> bool | None:
+            if script == page_utils._IS_PASSWORD_INPUT_SCRIPT:
+                return self.input_type == "password"
+            self.events.append("mask")
+            return None
+
+        self.field.evaluate = evaluate
         self.field.fill = AsyncMock(side_effect=lambda *_args, **_kwargs: self.events.append("fill"))
 
     def locator(self, _selector: str) -> SimpleNamespace:
@@ -1069,18 +1079,59 @@ async def test_cached_card_fill_masks_a_field_that_renders_late(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("field", "events"), [("card_number", ["mask", "fill"]), ("card_holder_name", ["fill"])])
-async def test_cached_fill_masks_a_vault_card_field_before_writing_it(
-    card_secret_run: dict[str, str], mock_scraped_page, mock_ai, field: str, events: list[str]
+@pytest.mark.parametrize(
+    ("field", "mask_secrets", "input_type", "events"),
+    [
+        pytest.param("card_number", False, "text", ["mask", "fill"], id="card-data-without-mask-secrets"),
+        pytest.param("card_holder_name", False, "text", ["fill"], id="credential-without-mask-secrets"),
+        pytest.param("card_holder_name", True, "text", ["mask", "fill"], id="credential-with-mask-secrets"),
+        pytest.param("card_holder_name", True, "password", ["fill"], id="credential-in-a-password-box"),
+        pytest.param("secret_parameter", False, "text", ["fill"], id="secret-parameter-without-mask-secrets"),
+        pytest.param("secret_parameter", True, "text", ["mask", "fill"], id="secret-parameter-with-mask-secrets"),
+        pytest.param("code_digit", False, "text", ["fill"], id="code-digit-without-mask-secrets"),
+        pytest.param("code_digit", True, "text", ["mask", "fill"], id="code-digit-with-mask-secrets"),
+        pytest.param("plain", True, "text", ["fill"], id="plain-text-with-mask-secrets"),
+        pytest.param("code_without_ai", True, "text", ["mask", "fill"], id="code-without-ai-with-mask-secrets"),
+        pytest.param("code_direct", True, "text", ["mask", "fill"], id="code-direct-with-mask-secrets"),
+        pytest.param("code_direct", False, "text", ["fill"], id="code-direct-without-mask-secrets"),
+    ],
+)
+async def test_cached_fill_masks_typed_secrets_before_writing_them(
+    card_secret_run: dict[str, str],
+    mock_scraped_page,
+    mock_ai,
+    field: str,
+    mask_secrets: bool,
+    input_type: str,
+    events: list[str],
 ) -> None:
     """A cached script fills by selector without the action handler and stores a screenshot right after, so
-    the fill itself has to mask card data when the workflow has not opted into Mask Secrets (SKY-19351)."""
+    the fill itself masks card data always, and under Mask Secrets what the step engine masks, minus password boxes."""
+    run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[CARD_SECRET_RUN_ID]
+    run_context.mask_secrets = mask_secrets
+    values = {
+        **card_secret_run,
+        "secret_parameter": run_context.register_secret_value("sk-test-parameter-value"),
+        "code_digit": ResolvedSensitiveValue("7"),
+        "plain": "Springfield",
+    }
     page = _FillablePageStub()
+    page.input_type = input_type
     with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
         script_page = ScriptSkyvernPage(scraped_page=mock_scraped_page, page=page, ai=mock_ai)
 
+    code_placeholder = "placeholder_AbCd_totp"
+    script_page._resolve_totp_placeholder_or_raise = AsyncMock(
+        side_effect=lambda value, **_kwargs: "654321" if value == code_placeholder else value
+    )
+
     with skyvern_context.scoped(SkyvernContext(workflow_run_id=CARD_SECRET_RUN_ID)):
-        await script_page._input_text("#field", card_secret_run[field], _skip_element_prep=True)
+        if field == "code_without_ai":
+            await script_page._input_text("#field", code_placeholder, ai=None, _skip_element_prep=True)
+        elif field == "code_direct":
+            await script_page.fill("#field", code_placeholder, mode="direct")
+        else:
+            await script_page._input_text("#field", values[field], _skip_element_prep=True)
 
     assert page.events == events
 

@@ -294,6 +294,7 @@ from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.otp_service import (
     OTPValue,
+    describe_sources_checked,
     describe_webhook_contract_failure,
     extract_totp_from_navigation_inputs,
     is_usable_credential_totp_placeholder,
@@ -1798,7 +1799,9 @@ class _BackgroundArtifactTaskTracker:
             LOG.warning("Background artifact task failed, continuing", exc_info=True)
 
 
-def _build_totp_timeout_reasoning(task: Task, webhook_diagnostics: str | None = None) -> str:
+def _build_totp_timeout_reasoning(
+    task: Task, webhook_diagnostics: str | None = None, sources_checked: str | None = None
+) -> str:
     # Mirror poll_otp_value's URL-then-identifier precedence so we only report the
     # source that was actually queried. URL goes through strip_query_params to keep
     # query-string tokens out of the customer-visible failure_reason.
@@ -1812,7 +1815,9 @@ def _build_totp_timeout_reasoning(task: Task, webhook_diagnostics: str | None = 
     else:
         polled = f"totp_identifier={task.totp_identifier}"
     reasoning = f"No TOTP verification code found. Going to terminate. Polled source: {polled}."
-    return reasoning + describe_webhook_contract_failure(webhook_diagnostics)
+    return (
+        reasoning + describe_webhook_contract_failure(webhook_diagnostics) + describe_sources_checked(sources_checked)
+    )
 
 
 VALIDATION_EVIDENCE_ROUTER_MODE_FLAG = "VALIDATION_EVIDENCE_ROUTER_MODE"
@@ -7474,7 +7479,7 @@ class ForgeAgent:
                     # Surface only the source poll_otp_value actually queried so
                     # the failure_reason tells the customer which delivery endpoint
                     # went silent.
-                    timeout_reasoning = _build_totp_timeout_reasoning(task, e.webhook_diagnostics)
+                    timeout_reasoning = _build_totp_timeout_reasoning(task, e.webhook_diagnostics, e.sources_checked)
                     LOG.warning(
                         "TOTP polling timed out — terminating task",
                         task_id=task.task_id,

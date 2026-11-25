@@ -425,7 +425,7 @@ async def test_downloads_matched_attachments_without_email_body_and_registers_fi
         "file_path": str(download_dir / "_invoice_1-0003-0002.pdf"),
         "url": file_info.url,
     }
-    save_downloaded_files.assert_awaited_once_with(organization_id="org_1", run_id="wr_test")
+    save_downloaded_files.assert_awaited_once_with(organization_id="org_1", run_id="wr_test", files=None)
 
 
 @pytest.mark.asyncio

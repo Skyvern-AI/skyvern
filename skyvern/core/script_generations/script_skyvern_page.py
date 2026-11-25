@@ -983,6 +983,12 @@ class ScriptSkyvernPage(SkyvernPage):
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
         return bool(workflow_run_context and workflow_run_context.get_original_secret_value_or_none(value) is not None)
 
+    def _mask_secrets_enabled(self) -> bool:
+        context = skyvern_context.current()
+        return context is not None and app.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run(
+            context.workflow_run_id
+        )
+
     def _is_card_secret_reference(self, value: str) -> bool:
         context = skyvern_context.current()
         return context is not None and app.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text(context.workflow_run_id, value)

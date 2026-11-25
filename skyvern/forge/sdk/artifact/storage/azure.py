@@ -1,6 +1,6 @@
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
 from functools import partial
 from typing import Any, BinaryIO
@@ -14,9 +14,9 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.azure import AzureUri, StandardBlobTier
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
+    downloads_to_save,
     get_download_dir,
     get_skyvern_temp_dir,
-    wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.api.real_azure import RealAsyncAzureStorageClient
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
@@ -31,7 +31,6 @@ from skyvern.forge.sdk.artifact.storage.base import (
     _file_infos_from_download_artifacts,
     dedupe_run_scoped_download_artifacts,
     download_checksums_by_uri,
-    is_file_from_retry_attempt,
     key_is_org_scoped,
     presign_with_sensitive_cap,
     resolve_download_attempt_fail_open,
@@ -614,6 +613,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
         run_id: str | None,
         *,
         attempt_number: int | None = None,
+        files: Mapping[str, str] | None = None,
     ) -> None:
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
@@ -626,6 +626,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
             tier=tier,
             tags=tags,
             attempt_number=attempt_number,
+            files=files,
         )
 
     async def _save_downloaded_files_from_local(
@@ -636,11 +637,11 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
         tier: StandardBlobTier,
         tags: dict[str, str] | None,
         attempt_number: int | None = None,
+        files: Mapping[str, str] | None = None,
     ) -> None:
         """Save files from local download directory to Azure."""
         download_dir = get_download_dir(run_id=run_id)
-        files = os.listdir(download_dir)
-        if not files:
+        if files is None and not os.listdir(download_dir):
             return
         retry_workflow_run_id, attempt_number, retry_attempt_started_at = await resolve_download_attempt_fail_open(
             organization_id, run_id, attempt_number=attempt_number
@@ -657,19 +658,10 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
         )
         skipped_files: list[str] = []
         unchanged_file_count = 0
-        for file in files:
-            if file.endswith(BROWSER_DOWNLOADING_SUFFIX):
-                continue
-            fpath = os.path.join(download_dir, file)
-            if not os.path.isfile(fpath):
-                continue
-            file = await wait_for_pending_extension_rename(download_dir, file)
-            fpath = os.path.join(download_dir, file)
-            if not os.path.isfile(fpath):
-                continue
-            if retry_attempt and not is_file_from_retry_attempt(fpath, retry_attempt_started_at):
-                continue
-            uri = f"{base_uri}/{file}"
+        entries = await downloads_to_save(download_dir, files, retry_attempt_started_at if retry_attempt else None)
+        for key, fpath in entries:
+            file = os.path.basename(key)
+            uri = f"{base_uri}/{key}"
             checksum = calculate_sha256_for_file(fpath)
             # Cleanup runs repeatedly over a growing download dir; re-sending bytes that are
             # already in the uploads bucket is what outgrows SAVE_DOWNLOADED_FILES_TIMEOUT.
@@ -738,7 +730,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
                 organization_id=organization_id,
                 run_id=run_id,
                 unchanged_file_count=unchanged_file_count,
-                total_file_count=len(files),
+                total_file_count=len(entries),
             )
         if skipped_files:
             raise DownloadSaveIncompleteError(skipped_files)

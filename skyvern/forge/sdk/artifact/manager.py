@@ -148,7 +148,7 @@ def _warn_if_run_context_missing(artifact_type: ArtifactType, workflow_run_id: s
     ):
         return
     try:
-        if app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+        if app.WORKFLOW_CONTEXT_MANAGER.redaction_inputs_for_run(workflow_run_id) is not None:
             return
     except Exception:
         return

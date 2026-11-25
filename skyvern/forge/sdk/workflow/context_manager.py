@@ -1,10 +1,12 @@
 import asyncio
 import copy
 import difflib
+import functools
 import json
 import os
 import re
 import string
+import threading
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
@@ -14,6 +16,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, Self, overload
 
 import structlog
+from cachetools import TTLCache
 from jinja2 import Template, TemplateError
 from jinja2 import meta as jinja2_meta
 from jinja2.sandbox import SandboxedEnvironment
@@ -42,10 +45,12 @@ from skyvern.forge import app
 from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AsyncAzureVaultClient
+from skyvern.forge.sdk.api.files import _sibling_filename, resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services.bitwarden import (
     BitwardenConstants,
@@ -120,6 +125,11 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunParameter
 
 LOG = structlog.get_logger()
+
+
+def file_url_of(value: object) -> str | None:
+    url = value.get("s3uri") if isinstance(value, dict) else value
+    return (url.strip() or None) if isinstance(url, str) else None
 
 
 def _is_platform_smtp_aws_key(aws_key: str, expected_key: str | None = None) -> bool:
@@ -1102,6 +1112,40 @@ class WorkflowRunContext:
 
     def get_block_outcome(self, label: str) -> BlockOutcome | None:
         return self.block_outcomes.get(label)
+
+    def file_url_parameter_keys(self) -> list[str]:
+        return [
+            key
+            for key, parameter in self.parameters.items()
+            if isinstance(parameter, WorkflowParameter)
+            and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
+        ]
+
+    async def run_files(self, reserved: Iterable[str] = ()) -> dict[str, FileInfo]:
+        """This run's files by name: FILE_URL parameters by key, then registered downloads by filename. A download
+        named like a parameter, a block output or a ``reserved`` name is left out, since those names resolve first."""
+        files: dict[str, FileInfo] = {}
+        for key in self.file_url_parameter_keys():
+            if url := file_url_of(self.values.get(key)):
+                files[key] = FileInfo(url=url, filename=key)
+        if not self.organization_id:
+            return files
+        taken = set(self.parameters) | set(self.workflow_run_outputs) | set(reserved)
+        run_download_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=self.workflow_run_id)
+        downloads = await app.STORAGE.get_current_attempt_downloaded_files(self.organization_id, run_download_id)
+        oldest_first = sorted(downloads, key=lambda file: file.modified_at.timestamp() if file.modified_at else 0.0)
+        for download in oldest_first:
+            if not download.filename:
+                continue
+            if download.filename in taken:
+                LOG.info("Download left out of the run's files: its name is in use", run_file=download.filename)
+                continue
+            name, attempt = download.filename, 0
+            while name in files:
+                attempt += 1
+                name = _sibling_filename(download.filename, attempt)
+            files[name] = download
+        return files
 
     def record_block_workflow_system_prompt(self, label: str, value: str | None) -> None:
         """Record the effective ``workflow_system_prompt`` a block resolved to.
@@ -3167,6 +3211,29 @@ class WorkflowRunContext:
         return []
 
 
+@dataclass(frozen=True)
+class RetiredRedactionInputs:
+    """What the secret scrub reads from a run's context, kept briefly after the context is removed."""
+
+    mask_secrets: bool
+    secrets: dict[str, Any]
+    runtime_otp_values: frozenset[str]
+
+
+# Work the run started can still write artifacts after its context is removed (a background model call is
+# capped at 20 s); this keeps their scrub for well past that.
+_RETIRED_REDACTION_INPUTS_TTL_SECONDS = 120
+
+
+class _RetiredRedactionStore:
+    def __init__(self) -> None:
+        self.inputs: TTLCache[str, RetiredRedactionInputs] = TTLCache(
+            maxsize=10_000, ttl=_RETIRED_REDACTION_INPUTS_TTL_SECONDS
+        )
+        # The log scrubber reads this from worker threads, and TTLCache is not thread-safe.
+        self.lock = threading.Lock()
+
+
 class WorkflowContextManager:
     aws_client: AsyncAWSClient
     workflow_run_contexts: dict[str, WorkflowRunContext]
@@ -3178,6 +3245,12 @@ class WorkflowContextManager:
     def __init__(self) -> None:
         self.aws_client = AsyncAWSClient()
         self.workflow_run_contexts = {}
+        # Built here so threads never race to create it; the property builds it for a manager made without __init__.
+        _ = self._retired_redaction
+
+    @functools.cached_property
+    def _retired_redaction(self) -> _RetiredRedactionStore:
+        return _RetiredRedactionStore()
 
     def _validate_workflow_run_context(self, workflow_run_id: str) -> None:
         if workflow_run_id not in self.workflow_run_contexts:
@@ -3283,6 +3356,10 @@ class WorkflowContextManager:
         return context.attempt_number if context is not None else 1
 
     def remove_workflow_run_context(self, workflow_run_id: str) -> None:
+        # The copy is published before the live entry goes, so a concurrent scrub always finds one of them.
+        context = self.workflow_run_contexts.get(workflow_run_id)
+        if context is not None:
+            self._retire_redaction_inputs(workflow_run_id, context)
         self.workflow_run_contexts.pop(workflow_run_id, None)
 
     def remove_workflow_run_context_if_current(
@@ -3290,8 +3367,34 @@ class WorkflowContextManager:
     ) -> bool:
         if self.workflow_run_contexts.get(workflow_run_id) is not workflow_run_context:
             return False
+        self._retire_redaction_inputs(workflow_run_id, workflow_run_context)
         del self.workflow_run_contexts[workflow_run_id]
         return True
+
+    def _retire_redaction_inputs(self, workflow_run_id: str, context: WorkflowRunContext) -> None:
+        inputs = RetiredRedactionInputs(
+            mask_secrets=context.mask_secrets,
+            secrets=dict(context.secrets),
+            runtime_otp_values=frozenset(context.runtime_otp_values),
+        )
+        store = self._retired_redaction
+        with store.lock:
+            store.inputs[workflow_run_id] = inputs
+
+    def redaction_inputs_for_run(
+        self, workflow_run_id: str | None
+    ) -> WorkflowRunContext | RetiredRedactionInputs | None:
+        """The live context, or what a recently removed one held for the secret scrub."""
+        if workflow_run_id is None:
+            return None
+        context = self.workflow_run_contexts.get(workflow_run_id)
+        if context is not None:
+            return context
+        store = self._retired_redaction
+        with store.lock:
+            # Purged on read as well, or an idle worker would keep its last run's secrets past the TTL.
+            store.inputs.expire()
+            return store.inputs.get(workflow_run_id)
 
     def has_workflow_run_context(self, workflow_run_id: str) -> bool:
         """Whether a run is live in THIS process. Initialized before any browser is acquired and
@@ -3301,9 +3404,7 @@ class WorkflowContextManager:
         return workflow_run_id in self.workflow_run_contexts
 
     def mask_secrets_enabled_for_run(self, workflow_run_id: str | None) -> bool:
-        if workflow_run_id is None:
-            return False
-        context = self.workflow_run_contexts.get(workflow_run_id)
+        context = self.redaction_inputs_for_run(workflow_run_id)
         return context is not None and context.mask_secrets
 
     def secret_redaction_enabled_for_run(self, workflow_run_id: str | None) -> bool:
@@ -3344,12 +3445,12 @@ class WorkflowContextManager:
             if current_context and not exclude_runtime_otp
             else set()
         )
-        if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
+        context = self.redaction_inputs_for_run(workflow_run_id)
+        if context is None:
             return task_secret_values
 
-        context = self.workflow_run_contexts[workflow_run_id]
         totp_values = _context_totp_values(current_context)
-        runtime_otp_values: set[str] = getattr(context, "runtime_otp_values", set())
+        runtime_otp_values = set(context.runtime_otp_values)
         secret_values = collect_redactable_secret_values(
             context.secrets, otp_values=[*totp_values, *runtime_otp_values]
         )
@@ -3388,11 +3489,12 @@ class WorkflowContextManager:
         anything shaped like an id survives — including a secret rendered right after the literal
         prefix (SKY-17864).
         """
-        if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
+        context = self.redaction_inputs_for_run(workflow_run_id)
+        if context is None:
             return frozenset()
         return frozenset(
             secret_id
-            for secret_id in self.workflow_run_contexts[workflow_run_id].secrets
+            for secret_id in context.secrets
             if isinstance(secret_id, str) and secret_id.startswith(RANDOM_SECRET_ID_PREFIX)
         )
 

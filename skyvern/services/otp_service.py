@@ -75,6 +75,12 @@ class RawOTPVerificationContext:
     # False until the stored-code queries return once, so a wait that times out first can say the
     # store went unchecked instead of claiming it was empty.
     store_queried: bool = False
+    # Rows the lookup passed over, by reason. Sets of row ids, so a row skipped on every tick counts once.
+    other_run_row_ids: set[str] = field(default_factory=set)
+    expired_row_ids: set[str] = field(default_factory=set)
+    rejected_row_ids: set[str] = field(default_factory=set)
+    # A strict request reads only codes bound to this run's request, so "nothing stored" would overstate.
+    strict_request: bool = False
 
 
 _OTP_NOUN_BY_TYPE = {
@@ -160,7 +166,8 @@ def otp_sources_checked(
                     else f"{inboxes} {label} inbox{plural} connected"
                 )
                 inbox_facts.append(f"{coverage}, {read_fact}")
-    rows = len(raw_context.seen_row_ids)
+    # Rows bound to another run come from a separate lookup, so "found" must count them too.
+    rows = len(raw_context.seen_row_ids | raw_context.other_run_row_ids)
     noun = _OTP_NOUN_BY_TYPE.get(expected_otp_type, "OTP")
     store_empty = raw_context.store_queried and not rows
     if not lead_facts and connected_everywhere_empty and store_empty:
@@ -172,9 +179,24 @@ def otp_sources_checked(
     elif rows:
         # "found", not "checked": the reparse budget stops the scan before every row is parsed.
         row_fact = f"{rows} stored OTP message{'s' if rows != 1 else ''} found"
+    elif raw_context.strict_request:
+        row_fact = f"no eligible {noun} bound to this run's request was found"
     else:
         row_fact = f"no {noun} has been stored"
-    return f"Sources checked: {'; '.join([*lead_facts, *inbox_facts, row_fact])}."
+    # The skipped rows are of every stored type, raw messages included, so they share the found count's noun.
+    skip_facts = [
+        f"{count} stored OTP message{'s' if count != 1 else ''} {reason}"
+        for count, reason in (
+            (len(raw_context.other_run_row_ids), "belonged to another run"),
+            (len(raw_context.expired_row_ids), "had expired"),
+            (
+                len(raw_context.rejected_row_ids),
+                "was already tried" if len(raw_context.rejected_row_ids) == 1 else "were already tried",
+            ),
+        )
+        if count
+    ]
+    return f"Sources checked: {'; '.join([*lead_facts, *inbox_facts, row_fact, *skip_facts])}."
 
 
 @dataclass(frozen=True)
@@ -562,6 +584,12 @@ def describe_webhook_contract_failure(webhook_diagnostics: str | None) -> str:
         f" The endpoint responded to every poll but never returned the expected "
         f"{TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE} body ({webhook_diagnostics})."
     )
+
+
+def describe_sources_checked(sources_checked: str | None) -> str:
+    """Failure_reason clause naming the sources a timed-out poll tried. Empty when there is none, so callers can
+    append it unconditionally."""
+    return f" {sources_checked}" if sources_checked else ""
 
 
 def redact_otp_identifier_for_log(totp_identifier: str | None) -> str | None:
@@ -1020,9 +1048,13 @@ def _exclude_rejected_otp(
         if normalized is None:
             return None
         otp_value = otp_value.model_copy(update={"value": normalized})
-    if otp_value and rejected_code_hash and hashlib.sha256(otp_value.value.encode()).hexdigest() == rejected_code_hash:
+    if otp_value and _matches_rejected_code(otp_value.value, rejected_code_hash):
         return None
     return otp_value
+
+
+def _matches_rejected_code(value: str, rejected_code_hash: str | None) -> bool:
+    return bool(rejected_code_hash) and hashlib.sha256(value.encode()).hexdigest() == rejected_code_hash
 
 
 async def resolve_otp_value(
@@ -1178,12 +1210,33 @@ async def poll_otp_value(
         now = datetime.utcnow()
         sleep_seconds = min(10.0, max(0.0, (timeout_datetime - now).total_seconds()))
         if now >= timeout_datetime:
+            if totp_identifier and workflow_run_id and otp_request_id is None and raw_otp_context.store_queried:
+                await _record_other_run_codes(
+                    organization_id,
+                    totp_identifier,
+                    workflow_run_id,
+                    raw_otp_context,
+                    include_raw=expected_otp_type is not None,
+                )
+            # The webhook-only poll never reads the store or the inboxes, so the webhook diagnostics cover it.
+            sources_checked = (
+                otp_sources_checked(
+                    totp_identifier,
+                    expected_otp_type or OTPType.TOTP,
+                    email_otp_context,
+                    raw_otp_context,
+                    webhook_checked=webhook_otp_context.responses > 0,
+                )
+                if totp_identifier
+                else None
+            )
             if consecutive_failures > 0 and last_error_reason is not None:
                 LOG.warning(
                     "Polling otp value timed out while webhook was still failing",
                     consecutive_failures=consecutive_failures,
                     last_error_reason=last_error_reason,
                     otp_poll_source=source,
+                    otp_sources_checked=sources_checked,
                 )
                 raise FailedToGetTOTPVerificationCode(
                     task_id=task_id,
@@ -1203,16 +1256,18 @@ async def poll_otp_value(
                     webhook_diagnostics=webhook_diagnostics,
                     expected_response_shape=TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE,
                     otp_poll_source=source,
+                    otp_sources_checked=sources_checked,
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
                 )
             else:
-                LOG.warning("Polling otp value timed out", otp_poll_source=source)
+                LOG.warning("Polling otp value timed out", otp_poll_source=source, otp_sources_checked=sources_checked)
             raise NoTOTPVerificationCodeFound(
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 workflow_id=workflow_id or workflow_permanent_id,
                 webhook_diagnostics=webhook_diagnostics,
+                sources_checked=sources_checked,
             )
         otp_value: OTPValue | None = None
         try:
@@ -1322,6 +1377,37 @@ async def poll_otp_value(
                 otp_length=len(otp_value.value),
             )
             return otp_value
+
+
+# The other-run lookup runs after the poll deadline, so it gets a short budget of its own.
+_OTHER_RUN_LOOKUP_TIMEOUT_SECONDS = 2.0
+
+
+async def _record_other_run_codes(
+    organization_id: str,
+    totp_identifier: str,
+    workflow_run_id: str,
+    raw_context: RawOTPVerificationContext,
+    *,
+    include_raw: bool,
+) -> None:
+    """Finds, for the timeout text only, codes another workflow run owns, which the run-scoped reads never return;
+    the window is the code lifespan, because an earlier run's live code is still another run's code. A failed or slow
+    lookup leaves the fact out rather than delaying or changing the timeout."""
+    try:
+        row_ids = await asyncio.wait_for(
+            app.DATABASE.otp.get_other_run_otp_code_ids(
+                organization_id=organization_id,
+                totp_identifier=totp_identifier,
+                workflow_run_id=workflow_run_id,
+                include_raw=include_raw,
+            ),
+            timeout=_OTHER_RUN_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        LOG.warning("Could not count one-time codes bound to other runs", exception_type=type(e).__name__)
+        return
+    raw_context.other_run_row_ids.update(row_ids)
 
 
 async def _get_otp_value_from_url(
@@ -1529,6 +1615,7 @@ async def _get_otp_value_from_db(
 ) -> OTPValue | None:
     context = raw_context or RawOTPVerificationContext()
     if otp_request_id is not None:
+        context.strict_request = True
         claimed = await app.DATABASE.otp.claim_otp_code(
             organization_id=organization_id,
             totp_identifier=totp_identifier,
@@ -1550,6 +1637,8 @@ async def _get_otp_value_from_db(
             task_id=task_id,
         )
         if claimed_value is None:
+            if _matches_rejected_code(claimed.code, rejected_code_hash):
+                context.rejected_row_ids.add(claimed.totp_code_id)
             await app.DATABASE.otp.reject_claimed_otp_code(
                 totp_code_id=claimed.totp_code_id,
                 organization_id=organization_id,
@@ -1602,13 +1691,15 @@ async def _get_otp_value_from_db(
     attempts = 0
     surfacing = surface_magic_link
     for row, is_raw in candidates:
-        if row.workflow_run_id and workflow_run_id and row.workflow_run_id != workflow_run_id:
-            continue
-        if row.workflow_id and workflow_id and row.workflow_id != workflow_id:
-            continue
-        if row.task_id and row.task_id != task_id:
+        if (
+            (row.workflow_run_id and workflow_run_id and row.workflow_run_id != workflow_run_id)
+            or (row.workflow_id and workflow_id and row.workflow_id != workflow_id)
+            or (row.task_id and row.task_id != task_id)
+        ):
+            context.other_run_row_ids.add(row.totp_code_id)
             continue
         if row.expired_at and row.expired_at < datetime.utcnow():
+            context.expired_row_ids.add(row.totp_code_id)
             continue
         link_to_surface: OTPValue | None = None
         if not is_raw:
@@ -1620,6 +1711,8 @@ async def _get_otp_value_from_db(
                 task_id=task_id,
             )
             if stored_otp_value is None:
+                if _matches_rejected_code(parsed_row.code, rejected_code_hash):
+                    context.rejected_row_ids.add(row.totp_code_id)
                 continue
             if expected_otp_type is None or stored_otp_value.get_otp_type() == expected_otp_type:
                 if not _forwarded_magic_link_matches_task_site(stored_otp_value, parsed_row.source, task_url):
@@ -1678,6 +1771,8 @@ async def _get_otp_value_from_db(
         if not _forwarded_magic_link_matches_task_site(otp_value, row.source, task_url):
             context.misses.add(cache_key)
             continue
+        if _matches_rejected_code(otp_value.value, rejected_code_hash):
+            context.rejected_row_ids.add(row.totp_code_id)
         otp_value = _exclude_rejected_otp(otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task_id)
         if otp_value is None:
             context.misses.add(cache_key)

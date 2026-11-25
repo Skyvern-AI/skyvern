@@ -4,7 +4,7 @@ import asyncio
 import logging
 import math
 import re
-from collections.abc import Callable, Coroutine, Generator, Iterator
+from collections.abc import Callable, Coroutine, Generator, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -21,6 +21,11 @@ _private_audit: ContextVar[bool] = ContextVar("private_request_audit", default=F
 _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "OTHER"})
 _OUTCOMES = frozenset({"complete", "failed", "stream_failed", "disconnected", "cancelled"})
 _STANDARD_RECORD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__)
+_OPERATIONAL_VALUE_MAX_LENGTH = 120
+# The log context processor appends correlation ids to a message after this separator.
+_LOG_CONTEXT_SEPARATOR = " | "
+# Per audit path, the log events a private route still emits and the scalar fields each one keeps.
+_operational_events: dict[str, dict[str, frozenset[str]]] = {}
 _Result = TypeVar("_Result")
 
 
@@ -39,10 +44,31 @@ class PrivateRequestPolicy:
     additional_policies: tuple[PrivateRequestPolicy, ...] = ()
 
 
-def register_private_request_classifier(app: Starlette, classifier: Callable[[str], bool], *, audit_path: str) -> None:
+def register_private_request_classifier(
+    app: Starlette,
+    classifier: Callable[[str], bool],
+    *,
+    audit_path: str,
+    operational_events: Mapping[str, Iterable[str]] | None = None,
+) -> None:
+    """``operational_events`` names the route's own log events that stay readable, each with the fields it keeps;
+    every other event in the request is still suppressed. Kept fields must never carry personal data."""
     if not callable(classifier) or re.fullmatch(r"/[a-z0-9_/-]{1,120}", audit_path) is None:
         raise ValueError("Private request classification requires a callable and a static audit path")
+    allowed = {event: frozenset(fields) for event, fields in (operational_events or {}).items()}
+    for event, fields in allowed.items():
+        if (
+            not isinstance(event, str)
+            or not 0 < len(event) <= 200
+            or _LOG_CONTEXT_SEPARATOR in event
+            or event in {"api.raw_request", "private.suppressed_log"}
+            or not all(isinstance(field, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", field) for field in fields)
+            or fields & {"event", "msg", "level"}
+        ):
+            raise ValueError("Operational events need a name and plain field names")
     policy = PrivateRequestPolicy(classifier, audit_path)
+    if allowed:
+        _operational_events.setdefault(audit_path, {}).update(allowed)
     try:
         existing = app.state.private_request_policy
     except AttributeError:
@@ -162,11 +188,31 @@ def private_request_audit() -> Iterator[None]:
         _private_audit.reset(token)
 
 
+def _is_operational_value(value: object) -> bool:
+    if value is None or type(value) in (bool, int):
+        return True
+    return type(value) is str and len(value) <= _OPERATIONAL_VALUE_MAX_LENGTH
+
+
 def redact_private_log_event(logger: object, method_name: str, event_dict: EventDict) -> EventDict:
-    if not _private_logging.get():
+    audit_path = _private_logging.get()
+    if not audit_path:
         return event_dict
     key = "event" if "event" in event_dict else "msg"
     safe: EventDict = {key: "private.suppressed_log"}
+    event = event_dict.get(key)
+    if isinstance(event, str) and not _private_audit.get():
+        name = str(event).split(_LOG_CONTEXT_SEPARATOR, 1)[0]
+        operational = _operational_events.get(audit_path, {}).get(name)
+        if operational is not None:
+            safe[key] = name
+            safe.update(
+                {
+                    field: event_dict[field]
+                    for field in operational
+                    if field in event_dict and _is_operational_value(event_dict[field])
+                }
+            )
     if _private_audit.get():
         safe[key] = "api.raw_request"
         safe["path"] = _private_logging.get()

@@ -2555,8 +2555,20 @@ async def delete_organization_credential(
         profile_id = credential.browser_profile_id
         if profile_id and await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(organization_id):
             try:
+                profile = await app.DATABASE.browser_sessions.get_browser_profile(
+                    profile_id=profile_id, organization_id=organization_id
+                )
+                # A profile tied to a workflow belongs to that workflow's folder, so deleting the credential
+                # only drops the link.
+                if profile is not None and profile.workflow_permanent_id is not None:
+                    LOG.warning(
+                        "browser_memory.credential_profile_kept",
+                        organization_id=organization_id,
+                        credential_id=credential_id,
+                        browser_profile_id=profile_id,
+                    )
                 # Narrow accepted race: a concurrent re-link between this check and the delete below.
-                if await app.DATABASE.browser_sessions.has_live_browser_profile_references(
+                elif await app.DATABASE.browser_sessions.has_live_browser_profile_references(
                     profile_id=profile_id,
                     organization_id=organization_id,
                     exclude_credential_id=credential_id,

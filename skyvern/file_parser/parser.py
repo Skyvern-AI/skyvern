@@ -73,6 +73,20 @@ class ParserLimits:
     timeout_seconds: float
     max_page_image_bytes: int
     max_page_image_edge_px: int
+    max_table_rows: int
+    max_table_cells: int
+    max_table_decoded_bytes: int
+
+    @property
+    def table(self) -> TableLimits:
+        return TableLimits(self.max_table_rows, self.max_table_cells, self.max_table_decoded_bytes)
+
+
+@dataclass(frozen=True)
+class TableLimits:
+    max_rows: int
+    max_cells: int
+    max_decoded_bytes: int
 
 
 @dataclass(frozen=True)
@@ -117,7 +131,8 @@ def _detect_encoding(file_path: Path) -> str:
     return "latin-1"
 
 
-def _sniff_csv_delimiter(file_path: Path) -> tuple[str, str]:
+def _sniff_csv_delimiter(file_path: Path, limits: TableLimits) -> tuple[str, str]:
+    check_csv_size_within_limits(file_path, limits)
     with file_path.open("rb") as file:
         raw_prefix = file.read(_CSV_BINARY_PREFIX_BYTES)
     if not raw_prefix.strip():
@@ -203,13 +218,55 @@ def _clean_dataframe_for_json(dataframe: pd.DataFrame) -> list[dict[str, Any]]:
     return records
 
 
-def _parse_csv(file_path: Path) -> list[dict[str, Any]]:
-    delimiter, encoding = _sniff_csv_delimiter(file_path)
+def _check_table_limit(file_kind: str, used: int, limit: int, unit: str) -> None:
+    if used > limit:
+        raise ParserFailure(
+            f"The {file_kind} file exceeds the parse limit of {limit:,} {unit}. "
+            "Split it into smaller files or remove unused rows and columns, then try again.",
+            code="parse_limit_exceeded",
+        )
+
+
+def check_csv_size_within_limits(file_path: Path, limits: TableLimits) -> None:
+    # Decoding never yields more characters than the file has bytes.
+    _check_table_limit("CSV", file_path.stat().st_size, limits.max_decoded_bytes, "bytes")
+
+
+def read_csv_rows_within_limits(reader: csv.DictReader[str], limits: TableLimits) -> list[dict[str, Any]]:
+    # Duplicate header names collapse into one dict key, so fields are counted from the header width.
+    width = len(reader.fieldnames or ())
+    rows: list[dict[str, Any]] = []
+    cells = 0
+    for row in reader:
+        overflow = row.get(None)
+        cells += width + (len(overflow) if isinstance(overflow, list) else 0)
+        _check_table_limit("CSV", len(rows) + 1, limits.max_rows, "rows")
+        _check_table_limit("CSV", cells, limits.max_cells, "cells")
+        rows.append(row)
+    return rows
+
+
+def check_workbook_within_limits(file_path: Path, limits: TableLimits) -> None:
+    # A zipped workbook (.xlsx, .xlsm, .xlsb, .ods) decodes to its members' total size; .xls is stored uncompressed.
+    if zipfile.is_zipfile(file_path):
+        try:
+            with zipfile.ZipFile(file_path) as archive:
+                decoded_bytes = sum(info.file_size for info in archive.infolist())
+        except zipfile.BadZipFile as exc:
+            raise ParserFailure(f"Invalid Excel file format: {exc}") from exc
+    else:
+        decoded_bytes = file_path.stat().st_size
+    _check_table_limit("Excel", decoded_bytes, limits.max_decoded_bytes, "bytes")
+
+
+def _parse_csv(file_path: Path, limits: TableLimits) -> list[dict[str, Any]]:
+    delimiter, encoding = _sniff_csv_delimiter(file_path, limits)
     with file_path.open(encoding=encoding, errors="replace", newline="") as file:
-        return list(csv.DictReader(file, delimiter=delimiter))
+        return read_csv_rows_within_limits(csv.DictReader(file, delimiter=delimiter), limits)
 
 
-def _parse_excel(file_path: Path, worksheet: str | None) -> list[dict[str, Any]]:
+def _parse_excel(file_path: Path, worksheet: str | None, limits: TableLimits) -> list[dict[str, Any]]:
+    check_workbook_within_limits(file_path, limits)
     if worksheet:
         with pd.ExcelFile(file_path, engine="calamine") as workbook:
             if worksheet not in workbook.sheet_names:
@@ -227,7 +284,38 @@ def _parse_excel(file_path: Path, worksheet: str | None) -> list[dict[str, Any]]
         raise
     except Exception as exc:
         raise ParserFailure(f"Failed to parse Excel file: {exc}") from exc
+    # pandas builds the frame from A1 to the last cell holding a value, so its shape is the sheet's full extent.
+    rows, columns = dataframe.shape
+    _check_table_limit("Excel", rows, limits.max_rows, "rows")
+    _check_table_limit("Excel", (rows + 1) * columns, limits.max_cells, "cells")
     return _clean_dataframe_for_json(dataframe)
+
+
+def _excel_json(file_path: Path, worksheet: str | None, limits: TableLimits) -> bytes:
+    data = json.dumps(_parse_excel(file_path, worksheet, limits), separators=(",", ":"), ensure_ascii=False).encode()
+    # Cells sharing one stored string each carry their own copy here, so the output can outgrow the file.
+    _check_table_limit("Excel", len(data), limits.max_decoded_bytes, "bytes")
+    return data
+
+
+def validate_excel_plain(file_path: str, limits: dict[str, int]) -> dict[str, Any]:
+    """Capped-subprocess entry: check the limits that need no parse, then read one row the way validation does."""
+    try:
+        check_workbook_within_limits(Path(file_path), TableLimits(**limits))
+        pd.read_excel(file_path, nrows=1, engine="calamine")
+    except ParserFailure as exc:
+        return {"error_code": exc.code, "error_message": str(exc)}
+    except Exception as exc:
+        return {"error_code": "invalid_file", "error_message": str(exc)}
+    return {}
+
+
+def parse_excel_plain(file_path: str, worksheet: str | None, limits: dict[str, int]) -> dict[str, Any]:
+    """Capped-subprocess entry: the parsed rows as JSON bytes, or the failure as plain data."""
+    try:
+        return {"data": _excel_json(Path(file_path), worksheet, TableLimits(**limits))}
+    except ParserFailure as exc:
+        return {"error_code": exc.code, "error_message": str(exc)}
 
 
 def _parse_docx(file_path: Path, max_tokens: int) -> tuple[str, bool, int]:
@@ -489,10 +577,10 @@ def parse_file(
     file_type, detection_source = _detect_file_type(file_name, file_path, configured_file_type)
 
     if file_type == "csv":
-        data = json.dumps(_parse_csv(file_path), separators=(",", ":"), ensure_ascii=False).encode()
+        data = json.dumps(_parse_csv(file_path, limits.table), separators=(",", ":"), ensure_ascii=False).encode()
         result = ParserResult(file_type, detection_source, "json", [ParserPart("content.json", data=data)])
     elif file_type == "excel":
-        data = json.dumps(_parse_excel(file_path, worksheet), separators=(",", ":"), ensure_ascii=False).encode()
+        data = _excel_json(file_path, worksheet, limits.table)
         result = ParserResult(file_type, detection_source, "json", [ParserPart("content.json", data=data)])
     elif file_type == "pdf":
         kind, parts, metadata = _parse_pdf(file_path, force_ocr, limits)

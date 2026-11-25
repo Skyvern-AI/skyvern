@@ -240,6 +240,7 @@ async def database(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, 
         workflow_run_id=RUN,
         aws_client=MagicMock(get_secret=AsyncMock(return_value=None)),
     )
+    run_context.organization_id = ORG
     run_context.secrets["api_token"] = SECRET
     run_context.values["api_token"] = SECRET
     app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN] = run_context
@@ -1442,6 +1443,8 @@ HTTP_UPLOAD = {
     "block_type": "http_request",
     "arguments": {"method": "POST", "url": "https://example.com", "files": {"document": "{{ fax_file }}"}},
 }
+REPORT_URL = "https://bucket.example.com/report.json?X-Amz-Signature=" + "0a1b2c3d4e5f6789" * 4
+REPORT = FileInfo(url=REPORT_URL, filename="report.json", checksum="abc", file_size=12)
 
 
 @pytest.mark.asyncio
@@ -1449,12 +1452,30 @@ HTTP_UPLOAD = {
     ("first_child", "call", "handed", "allowed"),
     [
         (None, ("browser_task", {**UPLOAD, "files": ["fax_file"]}), (["fax_file"], None), None),
-        (None, ("browser_task", {**UPLOAD, "files": ["nope"]}), None, ["fax_file"]),
-        (None, ("browser_task", {**UPLOAD, "files": ["login_credential"]}), None, ["fax_file"]),
+        (None, ("browser_task", {**UPLOAD, "files": ["nope"]}), None, ["fax_file", "report.json", "stale.json"]),
+        (
+            None,
+            ("browser_task", {**UPLOAD, "files": ["login_credential"]}),
+            None,
+            ["fax_file", "report.json", "stale.json"],
+        ),
         ("completed", ("browser_task", {**UPLOAD, "files": [CHILD_OUTPUT]}), ([CHILD_OUTPUT], None), None),
-        ("completed", ("browser_task", {**UPLOAD, "files": ["agent_text_prompt_1"]}), None, ["fax_file", CHILD_OUTPUT]),
-        ("failed", ("browser_task", {**UPLOAD, "files": [CHILD_OUTPUT]}), None, ["fax_file"]),
+        (
+            "completed",
+            ("browser_task", {**UPLOAD, "files": ["agent_text_prompt_1"]}),
+            None,
+            ["fax_file", "report.json", "stale.json", CHILD_OUTPUT],
+        ),
+        (
+            "failed",
+            ("browser_task", {**UPLOAD, "files": [CHILD_OUTPUT]}),
+            None,
+            ["fax_file", "report.json", "stale.json"],
+        ),
         (None, ("run_block", HTTP_UPLOAD), ([], HTTP_UPLOAD["arguments"]["files"]), None),
+        (None, ("browser_task", {**UPLOAD, "files": ["report.json"]}), (["report.json"], None), None),
+        # A download named like a value the run already holds can't become a parameter of that name.
+        (None, ("browser_task", {**UPLOAD, "files": ["stale.json"]}), None, "already has a value named 'stale.json'"),
     ],
 )
 async def test_browser_task_hands_over_only_this_runs_files_by_name(
@@ -1463,14 +1484,22 @@ async def test_browser_task_hands_over_only_this_runs_files_by_name(
     first_child: str | None,
     call: tuple[str, dict[str, Any]],
     handed: tuple[list[str], dict[str, str] | None] | None,
-    allowed: list[str] | None,
+    allowed: list[str] | str | None,
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
     context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
     context.parameters |= {"fax_file": _file_parameter("fax_file"), "login_credential": _credential_parameter()}
     # A value left by an earlier execution of this step, whose child labels repeat.
-    context.values |= {"fax_file": "file_123", CHILD_OUTPUT: {"llm_response": "stale"}}
+    context.values |= {"fax_file": "file_123", CHILD_OUTPUT: {"llm_response": "stale"}, "stale.json": "kept"}
     declared = dict(context.parameters)
+    stale = FileInfo(url="https://example.com/stale.json", filename="stale.json")
+    # report.json is registered after the step's first listing, so only a check made at call time accepts it.
+    listings = [[], [REPORT, stale]]
+
+    async def downloaded_files(organization_id: str, run_id: str | None) -> list[FileInfo]:
+        return listings.pop(0) if len(listings) > 1 else listings[0]
+
+    monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_current_attempt_downloaded_files=downloaded_files))
     if first_child == "failed":
 
         async def fail(*_: object, **__: object) -> NoReturn:
@@ -1478,10 +1507,12 @@ async def test_browser_task_hands_over_only_this_runs_files_by_name(
 
         monkeypatch.setattr(app, "SECONDARY_LLM_API_HANDLER", fail)
     handed_over: list[tuple[list[str], dict[str, str] | None]] = []
+    handed_values: dict[str, Any] = {}
 
     async def capture(block: TaskBlock | HttpRequestBlock, *_: object, **__: object) -> BlockResult:
         files = block.files if isinstance(block, HttpRequestBlock) else None
         handed_over.append(([parameter.key for parameter in block.parameters], files))
+        handed_values.update({parameter.key: context.values[parameter.key] for parameter in block.parameters})
         return BlockResult(
             success=True,
             output_parameter=block.output_parameter,
@@ -1491,23 +1522,34 @@ async def test_browser_task_hands_over_only_this_runs_files_by_name(
 
     monkeypatch.setattr(TaskBlock, "execute", capture)
     monkeypatch.setattr(HttpRequestBlock, "execute", capture)
-    script: list[_Turn] = [[scripted_call(*call, call_id="task")], VALID_FINISH]
+    script: list[_Turn] = [
+        [scripted_call("read_run_data", {}, call_id="index")],
+        [scripted_call(*call, call_id="task")],
+        [scripted_call("read_run_data", {}, call_id="index_after")],
+        VALID_FINISH,
+    ]
     if first_child:
         run = {"block_type": "text_prompt", "arguments": {"prompt": "Split the fax"}}
         script.insert(0, [scripted_call("run_block", run, call_id="split")])
     model = _ScriptedModel(script)
 
-    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["browser_task", "text_prompt", "http_request"])
+    await _run_agent_block(
+        monkeypatch, LUNA_MEDIUM, model, tools=["browser_task", "text_prompt", "http_request", "read_run_data"]
+    )
 
+    assert _tool_output(model, "index")["files"] == ["fax_file"]
+    assert {"fax_file", "report.json"} <= set(_tool_output(model, "index_after")["files"])
     report = json.loads(tool_outputs_for(model.inputs[-1][1], "task")[0])
     if allowed is None:
         assert report["status"] == "completed"
         assert handed_over == [handed]
+        assert handed_values.get("report.json", REPORT_URL) == REPORT_URL
     else:
         assert report["status"] == "invalid_arguments"
         assert str(allowed) in report["error"]
         assert handed_over == []
     assert context.parameters == declared
+    assert "report.json" not in context.values
 
 
 FORM_URL = "https://example.com/upload"
@@ -1864,7 +1906,9 @@ async def test_static_platform_email_and_unrelated_agent_run_without_exposing_sm
         "plaintext_snapshot": json.dumps({secret_key: "smtp-password"}),
         "count": 1587,
     }
-    monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_downloaded_files=AsyncMock(return_value=[])))
+    monkeypatch.setattr(
+        app, "STORAGE", SimpleNamespace(get_current_attempt_downloaded_files=AsyncMock(return_value=[]))
+    )
     child_system_prompts: list[str | None] = []
 
     async def child_llm(prompt: str, prompt_name: str, system_prompt: str | None = None, **_: object) -> dict[str, str]:
@@ -2037,7 +2081,9 @@ async def test_platform_alias_does_not_remove_nested_customer_keys(
         "status": "customer-status",
         "nested": {"status": "ready", "token": placeholder},
     }
-    monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_downloaded_files=AsyncMock(return_value=[])))
+    monkeypatch.setattr(
+        app, "STORAGE", SimpleNamespace(get_current_attempt_downloaded_files=AsyncMock(return_value=[]))
+    )
     model = _ScriptedModel(
         [
             [scripted_call("read_run_data", {}, call_id="index")],
@@ -2311,7 +2357,7 @@ async def test_read_run_data_returns_an_earlier_blocks_output_and_masks_secret_p
     async def downloaded_files(organization_id: str, run_id: str | None) -> list[FileInfo]:
         return [FileInfo(url="https://example.com/invoice.pdf", filename="invoice.pdf")]
 
-    monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_downloaded_files=downloaded_files))
+    monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_current_attempt_downloaded_files=downloaded_files))
     model = _ScriptedModel(
         [
             [scripted_call("read_run_data", {}, call_id="index")],
@@ -2327,7 +2373,7 @@ async def test_read_run_data_returns_an_earlier_blocks_output_and_masks_secret_p
     assert _tool_output(model, "index") == {
         "parameters": ["api_token"],
         "blocks": {"search": "completed"},
-        "downloaded_files": ["invoice.pdf"],
+        "files": ["invoice.pdf"],
     }
     search = _tool_output(model, "search")
     assert search["output"]["extracted_information"] == {"price": 42, "token": "*****"}

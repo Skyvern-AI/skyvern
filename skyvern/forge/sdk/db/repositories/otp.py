@@ -757,6 +757,33 @@ class OTPRepository(BaseRepository):
             rows = (await session.scalars(query)).all()
             return [RawTOTPCode.model_validate(row) for row in rows]
 
+    @db_operation("get_other_run_otp_code_ids")
+    async def get_other_run_otp_code_ids(
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        workflow_run_id: str,
+        valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+        include_raw: bool = True,
+        limit: int = 50,
+    ) -> list[str]:
+        """Ids of in-lifespan codes for this identifier that another workflow run owns. Never selects a code.
+        Raw rows count only when ``include_raw``, as the poll reads them only when it asked for a type."""
+        async with self.Session() as session:
+            query = (
+                select(TOTPCodeModel.totp_code_id)
+                .filter_by(organization_id=organization_id)
+                .filter(TOTPCodeModel.otp_request_id.is_(None))
+                .filter(_identifier_filter(totp_identifier))
+                .filter(TOTPCodeModel.parse_status.in_(("parsed", "raw") if include_raw else ("parsed",)))
+                .filter(TOTPCodeModel.workflow_run_id.is_not(None))
+                .filter(TOTPCodeModel.workflow_run_id != workflow_run_id)
+                .filter(TOTPCodeModel.created_at > naive_utc_now() - timedelta(minutes=valid_lifespan_minutes))
+                .order_by(TOTPCodeModel.created_at.desc())
+                .limit(limit)
+            )
+            return list((await session.scalars(query)).all())
+
     @db_operation("claim_otp_code")
     async def claim_otp_code(
         self,

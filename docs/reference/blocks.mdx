@@ -291,7 +291,7 @@ Send text to the LLM for processing without browser interaction. Useful for summ
 
 Parse PDFs, CSVs, Excel files, images, DOCX files, and ZIP archives.
 
-ZIP inputs are unzipped, and the block outputs the extracted file list as `file_name`, `file_path`, and `file_size`. Data Schema is ignored for ZIP inputs; loop over the file list and pass each `file_path` to another File Parser block to parse individual files.
+ZIP inputs are unzipped, and the block outputs the extracted file list as `file_name`, `file_path`, `file_size`, and `run_file`. Each extracted file becomes one of the run's downloaded files, named `run_file`. Data Schema is ignored for ZIP inputs; loop over the file list and pass each `file_path` to another File Parser block to parse individual files.
 
 For a CSV, Skyvern picks the delimiter from comma, tab, semicolon, pipe and colon. When none of them fits, it uses comma, or tab for a `.tsv` file. A one-column file stays one column, and a space-separated file parses as one column. The exception is a file whose lines, up to the first five, all hold the same number of colons, at least one, such as a list of URLs or times with no header row. Skyvern splits that file at the colons. A header row with no colon in it keeps the file in one column. A UTF-8 byte order mark is dropped, so the first column's name is the header the file shows.
 

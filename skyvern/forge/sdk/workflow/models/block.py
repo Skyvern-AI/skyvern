@@ -34,7 +34,7 @@ from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Executor
 from contextvars import ContextVar, copy_context
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
 from email.policy import SMTP as SMTP_EMAIL_POLICY
@@ -154,6 +154,14 @@ from skyvern.exceptions import (
     get_user_facing_exception_message,
 )
 from skyvern.file_parser.client import IsolatedParserResult, parse_file_remotely
+from skyvern.file_parser.parser import (
+    ParserFailure,
+    TableLimits,
+    check_csv_size_within_limits,
+    parse_excel_plain,
+    read_csv_rows_within_limits,
+    validate_excel_plain,
+)
 from skyvern.file_parser.transport import MAX_PARSER_INPUT_BYTES, MAX_PARSER_OUTPUT_BYTES
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import CLASSIFIER_LABEL_REASON_CODES, FailureCategory, is_v3_stop_entry
@@ -161,6 +169,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.files import (
+    _sibling_filename,
     calculate_sha256_for_file,
     classify_download_visibility,
     download_dir_path_for_run,
@@ -245,7 +254,11 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError
+from skyvern.forge.sdk.utils.capped_subprocess import (
+    MEMORY_CAP_ENFORCED,
+    CappedSubprocessError,
+    run_in_capped_subprocess,
+)
 from skyvern.forge.sdk.utils.pdf_parser import (
     PdfExtractStats,
     extract_pdf_file,
@@ -1014,15 +1027,24 @@ async def register_workflow_downloads(
     run_download_id: str | None,
     workflow_run_id: str,
     workflow_run_block_id: str,
+    files: Mapping[str, str] | None = None,
 ) -> list[FileInfo]:
+    """Saves the run's downloads, or only ``files`` (run-file name to local path), and returns this attempt's files."""
     if not organization_id:
         return []
+    retry = (
+        "workflow finalization will retry"
+        if files is None
+        else "workflow finalization retries only files at the top of the download directory"
+    )
     try:
         async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
-            await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=run_download_id)
+            await app.STORAGE.save_downloaded_files(
+                organization_id=organization_id, run_id=run_download_id, files=files
+            )
     except TimeoutError:
         LOG.warning(
-            "Timeout saving workflow downloads; workflow finalization will retry",
+            f"Timeout saving workflow downloads; {retry}",
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
         )
@@ -1031,7 +1053,7 @@ async def register_workflow_downloads(
         pass
     except Exception:
         LOG.warning(
-            "Failed to register workflow downloads; workflow finalization will retry",
+            f"Failed to register workflow downloads; {retry}",
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             exc_info=True,
@@ -1050,6 +1072,26 @@ async def register_workflow_downloads(
             exc_info=True,
         )
         return []
+
+
+def name_run_files(paths: list[str], held: list[FileInfo]) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
+    """Each path's run-file name and checksum, and the files to save (name to path). A name the run holds with the
+    same checksum is reused and not saved again; one held by other bytes or an earlier path becomes "name (n).ext"."""
+    known = {file.filename: file.checksum for file in held if file.filename}
+    named: dict[str, tuple[str, str]] = {}
+    to_save: dict[str, str] = {}
+    for path in paths:
+        base = os.path.basename(path)
+        checksum = calculate_sha256_for_file(path)
+        name, attempt = base, 0
+        while name in known and (known[name] != checksum or name in to_save):
+            attempt += 1
+            name = _sibling_filename(base, attempt)
+        if name not in known:
+            known[name] = checksum
+            to_save[name] = path
+        named[path] = (name, checksum)
+    return named, to_save
 
 
 class ParquetExportMixin:
@@ -1355,6 +1397,8 @@ class Block(BaseModel, abc.ABC):
     # An inline block a cached step's script starts (ai_validate, ai_prompt) reads that step's notes.
     _notes_label: str | None = PrivateAttr(default=None)
     _agent_smtp_isolation: bool = PrivateAttr(default=False)
+    # Names the parent agent step resolves before the run's files, so its code child's read_run_file hides them too.
+    _run_file_reserved_names: frozenset[str] = PrivateAttr(default=frozenset())
 
     # Fields this class renders as Jinja. Declared per class; the effective set is the
     # union over the MRO, so a subclass never shadows what its base renders.
@@ -7177,6 +7221,13 @@ async def _code_block_publish_file_builtin(*_args: object, **_kwargs: object) ->
     )
 
 
+async def _code_block_read_run_file_builtin(*_args: object, **_kwargs: object) -> NoReturn:
+    raise RuntimeError(
+        "read_run_file is only available when the code block runs on the secure code runner; "
+        "this run executed in-process, so no file was read."
+    )
+
+
 async def _clear_browser_data_in_context(page: Page | RecordingPage, replaced_origins: Sequence[str] = ()) -> None:
     """``replaced_origins`` are origins a worker destroyed on the way here, whose stored data is still
     clearable by origin even though no frame is left to name it. Their sessionStorage is not: that
@@ -7487,6 +7538,7 @@ _LATE_SAFE_GLOBALS = frozenset(
         "open_page",
         "publish_file",
         "read_document_text",
+        "read_run_file",
         "html",
         "datetime",
     }
@@ -7657,6 +7709,7 @@ class CodeBlock(Block):
             "open_page": _bind_code_block_open_page(None, []),
             "clear_browser_data": _code_block_clear_browser_data_builtin,
             "publish_file": _code_block_publish_file_builtin,
+            "read_run_file": _code_block_read_run_file_builtin,
             CODE_BLOCK_DIALOG_POLICY_HELPER_NAME: _bind_code_block_set_dialog_policy(None),
         }
 
@@ -15020,6 +15073,50 @@ async def _run_blocking_parse_step(
         )
 
 
+def _table_limits() -> TableLimits:
+    return TableLimits(
+        max_rows=settings.FILE_PARSER_MAX_ROWS,
+        max_cells=settings.FILE_PARSER_MAX_CELLS,
+        max_decoded_bytes=settings.FILE_PARSER_MAX_DECODED_BYTES,
+    )
+
+
+_EXCEL_VALIDATION_RESULT_BYTES = 64 * 1024
+# The parsed JSON is capped at max_decoded_bytes inside the child; the margin covers the pickled dict around it.
+_EXCEL_RESULT_MARGIN_BYTES = 1024 * 1024
+
+
+def _run_excel_child(func: Callable[..., dict[str, Any]], *args: Any, max_result_bytes: int) -> dict[str, Any]:
+    # calamine builds whole sheets (every sheet of an .xls) before any limit can see them, so the read runs capped.
+    # The pod must have room for max_result_bytes x result_memory_factor before the child starts, so the result is
+    # sized to what the child can return; JSON bytes and small dicts hold no more decoded than pickled.
+    try:
+        return run_in_capped_subprocess(
+            func,
+            *args,
+            memory_limit_bytes=settings.PDFPLUMBER_MAX_MEMORY_BYTES,
+            max_result_bytes=max_result_bytes,
+            timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS,
+            result_memory_factor=1,
+        )
+    except CappedSubprocessError as exc:
+        # Under the address-space cap, calamine's allocator aborts the child when it cannot get memory, and that
+        # reports as a crash by signal rather than as out_of_memory.
+        killed_at_cap = exc.kind == "crashed" and MEMORY_CAP_ENFORCED and (exc.returncode or 0) < 0
+        if exc.kind in ("out_of_memory", "result_too_large", "timeout") or killed_at_cap:
+            raise ParserFailure(
+                "The Excel file is too large or complex to parse within the parser's memory and time limits. "
+                "Split it into smaller files, then try again.",
+                code="parse_limit_exceeded",
+            ) from exc
+        if exc.kind == "no_headroom":
+            raise ParserFailure(
+                "The worker does not have enough free memory to parse this Excel file right now. Try again shortly.",
+                code="parse_unavailable",
+            ) from exc
+        raise ParserFailure(f"Excel parsing stopped: the parser process {exc}.", code="parse_failed") from exc
+
+
 def _page_image_over_ocr_caps(png: bytes) -> bool:
     # A PNG's IHDR chunk holds the width and height at bytes 16 to 24.
     width, height = int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")
@@ -15426,6 +15523,7 @@ class FileParserBlock(Block):
 
     def _sniff_csv_delimiter(self, file_path: str) -> tuple[str, str]:
         """Return (delimiter, encoding). Samples full lines to avoid mid-row truncation."""
+        check_csv_size_within_limits(Path(file_path), _table_limits())
         # Read small raw byte prefix to quickly detect empty binary files before attempting text decoding/sniffing
         with open(file_path, "rb") as f:
             raw_prefix = f.read(self._CSV_BINARY_PREFIX_BYTES)
@@ -15467,12 +15565,19 @@ class FileParserBlock(Block):
             except csv.Error as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
         elif self.file_type == FileType.EXCEL:
-            try:
-                # Try to read the file with pandas to validate it's a valid Excel file
-                pd.read_excel(file_path, nrows=1, engine="calamine")
-            except Exception as e:
+            outcome = _run_excel_child(
+                validate_excel_plain,
+                file_path,
+                asdict(_table_limits()),
+                max_result_bytes=_EXCEL_VALIDATION_RESULT_BYTES,
+            )
+            if outcome.get("error_code") == "parse_limit_exceeded":
+                raise ParserFailure(outcome["error_message"], code="parse_limit_exceeded")
+            if outcome.get("error_code"):
                 raise InvalidFileType(
-                    file_url=file_url_used, file_type=self.file_type, error=f"Invalid Excel file format: {str(e)}"
+                    file_url=file_url_used,
+                    file_type=self.file_type,
+                    error=f"Invalid Excel file format: {outcome['error_message']}",
                 )
         elif self.file_type == FileType.PDF:
             try:
@@ -15506,8 +15611,7 @@ class FileParserBlock(Block):
     def _parse_csv_file_sync(self, file_path: str) -> list[dict[str, Any]]:
         delimiter, encoding = self._sniff_csv_delimiter(file_path)
         with open(file_path, encoding=encoding, errors="replace", newline="") as file:
-            reader = csv.DictReader(file, delimiter=delimiter)
-            return list(reader)
+            return read_csv_rows_within_limits(csv.DictReader(file, delimiter=delimiter), _table_limits())
 
     def _clean_dataframe_for_json(self, df: pd.DataFrame) -> list[dict[str, Any]]:
         """Clean DataFrame to ensure it can be serialized to JSON."""
@@ -15536,28 +15640,22 @@ class FileParserBlock(Block):
         return await _run_blocking_parse_step("Excel parsing", self.file_url, self._parse_excel_file_sync, file_path)
 
     def _parse_excel_file_sync(self, file_path: str) -> list[dict[str, Any]]:
-        # Must stay outside the try below: that except would rewrap this as InvalidFileType.
-        if self.worksheet:
-            with pd.ExcelFile(file_path, engine="calamine") as xl:
-                if self.worksheet not in xl.sheet_names:
-                    raise WorksheetNotFound(file_url=self.file_url, worksheet=self.worksheet)
-        try:
-            # Read Excel file with pandas, specifying engine explicitly
-            # pandas' default NA list would turn literal "N/A"/"NULL" text into NaN; only blank cells are missing.
-            df = pd.read_excel(file_path, sheet_name=self.worksheet or 0, engine="calamine", keep_default_na=False)
-            df = df.replace("", pd.NA)
-            # Clean and convert DataFrame to list of dictionaries
-            return self._clean_dataframe_for_json(df)
-        except ImportError as e:
-            raise InvalidFileType(
-                file_url=self.file_url,
-                file_type=self.file_type,
-                error=f"Missing required dependency for Excel parsing: {str(e)}. Please install calamine: pip install python-calamine",
-            )
-        except Exception as e:
-            raise InvalidFileType(
-                file_url=self.file_url, file_type=self.file_type, error=f"Failed to parse Excel file: {str(e)}"
-            )
+        limits = _table_limits()
+        outcome = _run_excel_child(
+            parse_excel_plain,
+            file_path,
+            self.worksheet,
+            asdict(limits),
+            max_result_bytes=limits.max_decoded_bytes + _EXCEL_RESULT_MARGIN_BYTES,
+        )
+        error_code = outcome.get("error_code")
+        if error_code == "worksheet_not_found" and self.worksheet:
+            raise WorksheetNotFound(file_url=self.file_url, worksheet=self.worksheet)
+        if error_code == "parse_limit_exceeded":
+            raise ParserFailure(outcome["error_message"], code=error_code)
+        if error_code:
+            raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=outcome["error_message"])
+        return json.loads(outcome["data"])
 
     async def _parse_pdf_file(
         self,
@@ -16040,6 +16138,61 @@ class FileParserBlock(Block):
                 file_type=self.file_type,
                 error=f"ZIP archive uncompressed content exceeds the limit of {self._MAX_ZIP_UNCOMPRESSED_BYTES} bytes",
             )
+
+    async def _register_zip_members(
+        self,
+        members: str | list[dict[str, Any]],
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> str | list[dict[str, Any]]:
+        """Makes each extracted member a run file where it was unzipped; a member the run's files then hold by that
+        name and checksum gains run_file."""
+        if not organization_id or not isinstance(members, list):
+            return members
+        run_download_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id)
+        paths = [member["file_path"] for member in members if isinstance(member.get("file_path"), str)]
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                held = await app.STORAGE.get_current_attempt_downloaded_files(
+                    organization_id=organization_id, run_id=run_download_id
+                )
+        except Exception:
+            LOG.warning(
+                "Could not read the run's files; ZIP members are not run files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return members
+        named, to_save = await asyncio.to_thread(name_run_files, paths, held)
+        await register_workflow_downloads(
+            organization_id=organization_id,
+            run_download_id=run_download_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            files=to_save,
+        )
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                run_files = await workflow_run_context.run_files()
+        except Exception:
+            LOG.warning(
+                "Could not read the run's files; ZIP members are not run files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return members
+        # Checked against the run's file list, which hides a download named like a parameter or block output.
+        confirmed = {(name, file.checksum) for name, file in run_files.items()}
+        return [
+            {**member, "run_file": named[path][0]}
+            if isinstance(path := member.get("file_path"), str) and named[path] in confirmed
+            else member
+            for member in members
+        ]
 
     def _extract_zip_file(
         self, file_path: str, workflow_run_id: str, workflow_run_block_id: str
@@ -16611,7 +16764,9 @@ class FileParserBlock(Block):
                     "FileParserBlock json_schema is ignored for ZIP archives; returning extracted file list",
                     file_url=self.file_url,
                 )
-            final_data = parsed_data
+            final_data = await self._register_zip_members(
+                parsed_data, workflow_run_context, workflow_run_id, workflow_run_block_id, organization_id
+            )
         elif self.json_schema:
             try:
                 ai_extracted_data = await self._extract_with_ai(
@@ -18799,6 +18954,17 @@ class HttpRequestBlock(Block):
 
         return authorize
 
+    @staticmethod
+    async def _run_file_named_for(workflow_run_context: WorkflowRunContext, file_path: str) -> str | None:
+        """The name the run's files give these bytes, which a same-name file saved earlier can push off file_name."""
+        try:
+            checksum = await asyncio.to_thread(calculate_sha256_for_file, file_path)
+            files = await workflow_run_context.run_files()
+        except Exception:
+            LOG.warning("Could not read the run's files", exc_info=True)
+            return None
+        return next((name for name, file in files.items() if file.checksum == checksum), None)
+
     async def _execute_file_download(
         self,
         workflow_run_context: WorkflowRunContext,
@@ -18828,12 +18994,24 @@ class HttpRequestBlock(Block):
                 organization_id=organization_id,
                 authorize_redirect=self._authorize_redirect if self._confined_references else None,
             )
+            file_name = os.path.basename(file_path)
+            await register_workflow_downloads(
+                organization_id=organization_id,
+                run_download_id=resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id),
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                files={file_name: file_path},
+            )
 
             response_data = {
                 "file_path": file_path,
-                "file_name": os.path.basename(file_path),
+                "file_name": file_name,
                 "file_size": os.path.getsize(file_path),
             }
+            if run_file := await self._run_file_named_for(workflow_run_context, file_path):
+                response_data["run_file"] = run_file
+            elif organization_id:
+                LOG.warning("Saved HTTP response is not a run file yet", workflow_run_block_id=workflow_run_block_id)
 
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response_data)
 

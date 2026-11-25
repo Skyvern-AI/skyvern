@@ -63,6 +63,7 @@ RESERVED_PARAM_NAMES = frozenset(
         "solve_captcha",
         "search_web",
         "read_document_text",
+        "read_run_file",
         "open_page",
         "clear_browser_data",
         "attach_authorized_file",

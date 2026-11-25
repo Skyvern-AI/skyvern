@@ -14,6 +14,7 @@ def _setup_app(
     monkeypatch: pytest.MonkeyPatch,
     *,
     browser_profile_id: str | None,
+    profile_workflow: str | None = None,
     has_refs: bool = False,
     reap_raises: bool = False,
     db_raises: bool = False,
@@ -35,14 +36,34 @@ def _setup_app(
         )
     )
     has_live = AsyncMock(return_value=has_refs)
-    db_delete_profile = AsyncMock(side_effect=RuntimeError("db down") if db_raises else None)
+    profiles = (
+        {
+            browser_profile_id: SimpleNamespace(
+                browser_profile_id=browser_profile_id, workflow_permanent_id=profile_workflow
+            )
+        }
+        if browser_profile_id
+        else {}
+    )
+    archives = set(profiles)
+
+    async def get_profile(*, profile_id: str, organization_id: str) -> SimpleNamespace | None:
+        return profiles.get(profile_id)
+
+    async def delete_profile_row(*, profile_id: str, organization_id: str) -> None:
+        if db_raises:
+            raise RuntimeError("db down")
+        profiles.pop(profile_id, None)
+
+    db_delete_profile = AsyncMock(side_effect=delete_profile_row)
     # reap_raises fails the S3 erasure (the security-critical path), which must be best-effort.
 
-    async def delete_profile(**kwargs: object) -> None:
+    async def delete_profile(*, organization_id: str, profile_id: str, hard_delete: bool) -> None:
         if assert_lock_during_reap:
             assert lock_state["held"]
         if reap_raises:
             raise RuntimeError("boom")
+        archives.discard(profile_id)
 
     storage_delete_profile = AsyncMock(side_effect=delete_profile)
     vault_service = SimpleNamespace(delete_credential=AsyncMock(), post_delete_credential_item=AsyncMock())
@@ -61,6 +82,7 @@ def _setup_app(
             credentials=SimpleNamespace(get_credential=get_credential),
             browser_sessions=SimpleNamespace(
                 has_live_browser_profile_references=has_live,
+                get_browser_profile=get_profile,
                 delete_browser_profile=db_delete_profile,
             ),
         ),
@@ -82,6 +104,8 @@ def _setup_app(
         vault_service=vault_service,
         lock_state=lock_state,
         lock_calls=lock_calls,
+        profiles=profiles,
+        archives=archives,
     )
 
 
@@ -144,11 +168,19 @@ async def test_skips_reap_when_engine_off(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_keeps_profile_when_live_owner_references_it(monkeypatch: pytest.MonkeyPatch) -> None:
-    mocks = _setup_app(monkeypatch, browser_profile_id="bp_1", has_refs=True)
+@pytest.mark.parametrize(
+    ("has_refs", "profile_workflow"), [(True, None), (False, "wpid_1")], ids=["live_owner", "tied_to_a_workflow"]
+)
+async def test_keeps_profile_when_live_owner_references_it(
+    monkeypatch: pytest.MonkeyPatch, has_refs: bool, profile_workflow: str | None
+) -> None:
+    mocks = _setup_app(monkeypatch, browser_profile_id="bp_1", has_refs=has_refs, profile_workflow=profile_workflow)
 
     with structlog.testing.capture_logs() as logs:
         await _delete()
+
+    assert "bp_1" in mocks.profiles
+    assert "bp_1" in mocks.archives
 
     mocks.db_delete_profile.assert_not_awaited()
     mocks.storage_delete_profile.assert_not_awaited()

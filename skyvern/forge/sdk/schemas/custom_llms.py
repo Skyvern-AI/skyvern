@@ -43,6 +43,16 @@ RESERVED_EXTRA_PARAMETER_KEYS = frozenset(
     }
 )
 
+# litellm kwargs that send the call, with its api_key, somewhere other than api_base. Rejected when a
+# config is saved; a stored config holding one stays listable but is not registered for dispatch.
+LITELLM_ROUTING_EXTRA_PARAMETER_KEYS = frozenset(
+    {"base_url", "fallbacks", "context_window_fallback_dict", "model_list", "deployment_id", "azure"}
+)
+
+
+def litellm_routing_extra_parameter_keys(extra_parameters: dict[str, Any]) -> list[str]:
+    return sorted(key for key in extra_parameters if key.strip().lower() in LITELLM_ROUTING_EXTRA_PARAMETER_KEYS)
+
 
 class CustomLLMProvider(StrEnum):
     OPENAI_COMPATIBLE = "openai_compatible"

@@ -981,16 +981,18 @@ async def test_validate_browser_profile_id_rejects_managed(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_validate_browser_profile_id_rejects_other_workflow_owned(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A plain-looking profile still owned by a workflow (workflow_permanent_id set) is rejected.
+async def test_validate_browser_profile_id_accepts_source_bound_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A saved profile tied to its source workflow links; folder access is checked when a run uses it.
     monkeypatch.setattr(
         forge_app.DATABASE.browser_sessions,
         "get_browser_profile",
         AsyncMock(return_value=SimpleNamespace(is_managed=False, workflow_permanent_id="wpid_other")),
     )
-    with pytest.raises(HTTPException) as exc:
-        await credentials_routes._validate_credential_browser_profile_id("bp_x", "org_123")
-    assert exc.value.status_code == 400
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials, "get_browser_profile_credential_links", AsyncMock(return_value={})
+    )
+
+    assert await credentials_routes._validate_credential_browser_profile_id("bp_x", "org_123") is None
 
 
 @pytest.mark.asyncio

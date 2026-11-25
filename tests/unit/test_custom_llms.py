@@ -1,3 +1,4 @@
+import json
 import socket
 from collections.abc import Generator
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.api.llm import custom_llm_registry
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, get_org_aware_primary_llm_api_handler
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     custom_llm_key,
@@ -19,6 +20,7 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     get_custom_llm_model_mappings,
     register_custom_llm_config,
 )
+from skyvern.forge.sdk.api.llm.exceptions import CustomLLMNeedsResaveError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -241,48 +243,60 @@ async def test_custom_llm_routes_register_update_and_delete_config(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("update_fields", "expected_api_key"),
+    [
+        ({"api_key": CUSTOM_LLM_API_KEY_MASK}, "sk-fake-stored"),
+        ({"api_key": CUSTOM_LLM_API_KEY_MASK, "api_base": "https://llm-b.example.com/v1"}, None),
+        ({"api_key": CUSTOM_LLM_API_KEY_MASK, "provider": "openrouter", "api_base": None}, None),
+        ({"api_key": "sk-fake-new", "api_base": "https://llm-b.example.com/v1"}, "sk-fake-new"),
+    ],
+    ids=["same-destination-masked", "changed-api-base-masked", "changed-provider-masked", "changed-api-base-new-key"],
+)
 async def test_update_custom_llm_preserves_masked_api_key(
     monkeypatch: pytest.MonkeyPatch,
     fake_organizations: FakeOrganizationsRepository,
+    update_fields: dict[str, str | None],
+    expected_api_key: str | None,
 ) -> None:
-    validate_api_base = AsyncMock()
-    monkeypatch.setattr(routes, "_validate_custom_llm_api_base", validate_api_base)
+    monkeypatch.setattr(routes, "_validate_custom_llm_api_base", AsyncMock())
     org = _org()
+    stored_fields = {
+        "display_name": "Hosted Model",
+        "provider": "openai_compatible",
+        "model_name": "model-a",
+        "api_base": "https://llm-a.example.com/v1",
+        "api_key": "sk-fake-stored",
+    }
     create_response = await routes.create_custom_llm(
-        CustomLLMCreateRequest(
-            config=CustomLLMConfig(
-                display_name="OpenRouter Claude",
-                provider="openrouter",
-                model_name="anthropic/claude-3.5-sonnet",
-                api_key="sk-or",
-            )
-        ),
-        org,
+        CustomLLMCreateRequest(config=CustomLLMConfig(**stored_fields)), org
     )
     custom_llm_id = create_response.custom_llm.id
-
-    update_response = await routes.update_custom_llm(
-        CustomLLMUpdateRequest(
-            config=CustomLLMConfig(
-                display_name="OpenRouter GPT",
-                provider="openrouter",
-                model_name="openai/gpt-4.1",
-                api_key=CUSTOM_LLM_API_KEY_MASK,
-            )
-        ),
-        custom_llm_id,
-        org,
+    stored_token_before = fake_organizations.tokens[0].token
+    update_request = CustomLLMUpdateRequest(
+        config=CustomLLMConfig(**{**stored_fields, "model_name": "model-b", **update_fields})
     )
 
-    assert update_response.custom_llm.config.api_key == CUSTOM_LLM_API_KEY_MASK
-    stored_config = CustomLLMConfig.model_validate_json(fake_organizations.tokens[0].token)
-    assert stored_config.api_key == "sk-or"
-    registered_config = LLMConfigRegistry.get_config(custom_llm_key(custom_llm_id))
-    assert registered_config.litellm_params
-    assert registered_config.litellm_params["api_key"] == "sk-or"
-    assert validate_api_base.await_count == 2
+    try:
+        if expected_api_key is None:
+            with pytest.raises(routes.HTTPException) as exc_info:
+                await routes.update_custom_llm(update_request, custom_llm_id, org)
+            assert exc_info.value.status_code == 409
+            assert fake_organizations.tokens[0].token == stored_token_before
+            expected_registered_key = "sk-fake-stored"
+        else:
+            update_response = await routes.update_custom_llm(update_request, custom_llm_id, org)
+            assert update_response.custom_llm.config.api_key == CUSTOM_LLM_API_KEY_MASK
+            stored_config = CustomLLMConfig.model_validate_json(fake_organizations.tokens[0].token)
+            assert stored_config.api_key == expected_api_key
+            assert stored_config.model_name == "model-b"
+            expected_registered_key = expected_api_key
 
-    deregister_custom_llm_config(custom_llm_id)
+        registered_config = LLMConfigRegistry.get_config(custom_llm_key(custom_llm_id))
+        assert registered_config.litellm_params
+        assert registered_config.litellm_params["api_key"] == expected_registered_key
+    finally:
+        deregister_custom_llm_config(custom_llm_id)
 
 
 @pytest.mark.asyncio
@@ -343,6 +357,25 @@ async def test_custom_llm_masks_and_preserves_secret_extra_headers(
         registered_after = LLMConfigRegistry.get_config(custom_llm_key(custom_llm_id))
         assert registered_after.litellm_params
         assert registered_after.litellm_params["extra_headers"] == secret_headers
+
+        stored_token_before = fake_organizations.tokens[0].token
+        with pytest.raises(routes.HTTPException) as exc_info:
+            await routes.update_custom_llm(
+                CustomLLMUpdateRequest(
+                    config=CustomLLMConfig(
+                        display_name="Gemini Flex",
+                        provider="openai_compatible",
+                        model_name="gemini-3-flash-preview",
+                        api_base="https://llm-b.example.com/v1",
+                        api_key="sk-fake-new",
+                        extra_parameters={"extra_headers": dict(masked_headers)},
+                    )
+                ),
+                custom_llm_id,
+                org,
+            )
+        assert exc_info.value.status_code == 409
+        assert fake_organizations.tokens[0].token == stored_token_before
     finally:
         deregister_custom_llm_config(custom_llm_id)
 
@@ -700,15 +733,119 @@ async def test_cloud_custom_llm_create_blocks_private_dns_answer_before_write(
     assert fake_organizations.tokens == []
 
 
-def test_stored_custom_llm_validation_allows_legacy_api_base_without_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "routing_key",
+    ["base_url", " Base_URL ", "fallbacks", "context_window_fallback_dict", "model_list", "deployment_id", "azure"],
+)
+async def test_custom_llm_routing_extra_parameters_rejected_on_write_and_not_dispatched_from_storage(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_organizations: FakeOrganizationsRepository,
+    routing_key: str,
+) -> None:
     monkeypatch.setattr(SettingsManager.get_settings(), "ALLOW_CUSTOM_LLM_LOCAL_API_BASES", False, raising=False)
     resolver = MagicMock(side_effect=AssertionError("stored custom LLM reads must not resolve DNS"))
     monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolver)
-
-    CustomLLMConfig.model_validate_json(
-        '{"display_name":"Stored endpoint","provider":"openrouter","model_name":"example/model",'
-        '"api_base":"https://gateway.example.test/v1","api_key":"test-key"}'
+    monkeypatch.setattr(routes, "_validate_custom_llm_api_base", AsyncMock())
+    org = _org()
+    stored_fields = {
+        "display_name": "Stored endpoint",
+        "provider": "openrouter",
+        "model_name": "example/model",
+        "api_base": "https://gateway.example.test/v1",
+    }
+    stored_token = await fake_organizations.create_org_auth_token(
+        organization_id=org.organization_id,
+        token_type=OrganizationAuthTokenType.custom_llm,
+        token=json.dumps(
+            {
+                **stored_fields,
+                "api_key": "sk-fake-stored",
+                "extra_parameters": {routing_key: "https://other.example.test/v1", "service_tier": "flex"},
+            }
+        ),
     )
+
+    try:
+        with pytest.raises(routes.HTTPException) as exc_info:
+            await routes.create_custom_llm(
+                CustomLLMCreateRequest(
+                    config=CustomLLMConfig(
+                        **stored_fields,
+                        api_key="sk-fake-new",
+                        extra_parameters={routing_key: "https://other.example.test/v1"},
+                    )
+                ),
+                org,
+            )
+        assert exc_info.value.status_code == 400
+        assert len(fake_organizations.tokens) == 1
+
+        list_response = await routes.list_custom_llms(org)
+        assert [custom_llm.id for custom_llm in list_response.custom_llms] == [stored_token.id]
+
+        database = SimpleNamespace(organizations=fake_organizations)
+        clean_ids: list[str] = []
+        await custom_llm_registry.load_custom_llm_configs_for_organization(database, org.organization_id)
+        assert not LLMConfigRegistry.is_registered(custom_llm_key(stored_token.id))
+        assert not await custom_llm_registry.ensure_custom_llm_registered_for_org(
+            stored_token.id, org.organization_id, database
+        )
+        llm_key = custom_llm_key(stored_token.id)
+        fallback = AsyncMock()
+        skyvern_context.set(
+            skyvern_context.SkyvernContext(organization_id=org.organization_id, org_default_llm_key=llm_key)
+        )
+        blocked_default = get_org_aware_primary_llm_api_handler(default=fallback)
+        with pytest.raises(CustomLLMNeedsResaveError):
+            await blocked_default(prompt="p", prompt_name="test")
+        clean_response = await routes.create_custom_llm(
+            CustomLLMCreateRequest(config=CustomLLMConfig(**stored_fields, api_key="sk-fake-clean")), org
+        )
+        clean_ids.append(clean_response.custom_llm.id)
+        clean_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+            custom_llm_key(clean_response.custom_llm.id), default=blocked_default
+        )
+        assert clean_handler is not blocked_default
+        assert clean_handler is not fallback
+        skyvern_context.set(skyvern_context.SkyvernContext(organization_id=org.organization_id))
+        with pytest.raises(CustomLLMNeedsResaveError):
+            LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=fallback)
+
+        stored_token_before = fake_organizations.tokens[0].token
+        with pytest.raises(routes.HTTPException) as exc_info:
+            await routes.update_custom_llm(
+                CustomLLMUpdateRequest(
+                    config=CustomLLMConfig(
+                        **stored_fields, api_key=CUSTOM_LLM_API_KEY_MASK, extra_parameters={"service_tier": "flex"}
+                    )
+                ),
+                stored_token.id,
+                org,
+            )
+        assert exc_info.value.status_code == 409
+        assert fake_organizations.tokens[0].token == stored_token_before
+
+        await routes.update_custom_llm(
+            CustomLLMUpdateRequest(
+                config=CustomLLMConfig(
+                    **stored_fields, api_key="sk-fake-new", extra_parameters={"service_tier": "flex"}
+                )
+            ),
+            stored_token.id,
+            org,
+        )
+        repaired = json.loads(fake_organizations.tokens[0].token)
+        assert repaired["extra_parameters"] == {"service_tier": "flex"}
+        litellm_params = LLMConfigRegistry.get_config(custom_llm_key(stored_token.id)).litellm_params
+        assert litellm_params
+        assert litellm_params["api_key"] == "sk-fake-new"
+        assert LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=fallback) is not fallback
+    finally:
+        skyvern_context.reset()
+        deregister_custom_llm_config(stored_token.id)
+        for clean_id in clean_ids:
+            deregister_custom_llm_config(clean_id)
 
     resolver.assert_not_called()
 
@@ -1007,7 +1144,17 @@ def test_gemini_provider_requires_api_key() -> None:
 
 @pytest.mark.parametrize(
     "reserved_key",
-    ["model", "api_key", "api_base", "messages", "MODEL_INFO", " api_key ", "drop_params", "stream", "tools"],
+    [
+        "model",
+        "api_key",
+        "api_base",
+        "messages",
+        "MODEL_INFO",
+        " api_key ",
+        "drop_params",
+        "stream",
+        "tools",
+    ],
 )
 def test_custom_llm_extra_parameters_reject_reserved_keys(reserved_key: str) -> None:
     with pytest.raises(ValueError, match="reserved"):

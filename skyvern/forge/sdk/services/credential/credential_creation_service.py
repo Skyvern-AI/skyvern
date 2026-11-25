@@ -55,7 +55,7 @@ async def validate_credential_browser_profile_id(
     organization_id: str,
     current_credential_id: str | None = None,
 ) -> None:
-    """Only allow linking an unowned, unmanaged profile from the same organization."""
+    """Only allow linking an unmanaged profile from the same organization that no other credential links."""
     profile = await app.DATABASE.browser_sessions.get_browser_profile(
         profile_id=browser_profile_id, organization_id=organization_id
     )
@@ -63,7 +63,7 @@ async def validate_credential_browser_profile_id(
         raise HTTPException(
             status_code=400, detail=f"Browser profile not found, browser_profile_id={browser_profile_id}"
         )
-    if profile.is_managed or profile.workflow_permanent_id is not None:
+    if profile.is_managed:
         raise HTTPException(
             status_code=400,
             detail="A credential can only link a plain browser profile, not a workflow-managed one.",

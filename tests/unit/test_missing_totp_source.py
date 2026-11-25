@@ -1,19 +1,32 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+from collections.abc import Awaitable
+from datetime import datetime, timedelta
+from types import SimpleNamespace
+from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog.testing
 
 from skyvern.errors.errors import (
     MissingTOTPSourceError,
     TimeoutGetTOTPVerificationCodeError,
 )
-from skyvern.exceptions import SkyvernException
+from skyvern.exceptions import NoTOTPVerificationCodeFound, SkyvernException
 from skyvern.forge.agent import _build_totp_timeout_reasoning
+from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.models import TOTPCodeModel
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.services import otp_service
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import TerminateAction, VerificationCodeAction
 from skyvern.webeye.actions.parse_actions import generate_cua_fallback_actions
+from tests.unit.conftest import SqliteEngineFactory
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _make_task(
@@ -22,8 +35,10 @@ def _make_task(
     totp_identifier: str | None = None,
     organization_id: str | None = "o_test",
     workflow_run_id: str | None = "wr_test",
+    otp_request_id: str | None = None,
 ) -> MagicMock:
     task = MagicMock()
+    task.otp_request_id = otp_request_id
     task.task_id = "tsk_test"
     task.organization_id = organization_id
     task.workflow_run_id = workflow_run_id
@@ -294,28 +309,217 @@ async def test_get_magic_link_with_failed_delivery_emits_otp_error(
     assert "upstream 502" in action.reasoning
 
 
+# ---------- no code value in any diagnostic, reasoning or log ----------
+
+_CODE = "482913"
+_T = TypeVar("_T")
+_IDENTIFIER = "otp-user@example.test"
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = datetime.utcnow()
+
+    def utcnow(self) -> datetime:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+async def _install_otp_store(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine_factory: SqliteEngineFactory,
+    row_overrides: dict[str, Any] | None,
+) -> datetime:
+    """Real repository queries on SQLite, so the run and expiry filters the diagnostics describe actually apply.
+    Returns the fake run start, one minute before the clock's start."""
+    clock = _FakeClock()
+    engine = sqlite_engine_factory()
+    agent_db = AgentDB(database_string=str(engine.url), debug_enabled=True, db_engine=engine)
+    if row_overrides is not None:
+        expires_in = row_overrides.pop("expires_in", None)
+        created_ago = row_overrides.pop("created_ago", None)
+        lookup_hangs = row_overrides.pop("lookup_hangs", False)
+        if created_ago is not None:
+            row_overrides["created_at"] = clock.now - created_ago
+        async with agent_db.Session() as session:
+            session.add(
+                TOTPCodeModel(
+                    **{
+                        "totp_code_id": "otp_row",
+                        "organization_id": "o_test",
+                        "totp_identifier": _IDENTIFIER,
+                        "content": f"Your code is {_CODE}.",
+                        "code": _CODE,
+                        "otp_type": OTPType.TOTP,
+                        "parse_status": "parsed",
+                        "expired_at": clock.now + expires_in if expires_in is not None else None,
+                        **row_overrides,
+                    }
+                )
+            )
+            await session.commit()
+    if row_overrides is not None and lookup_hangs:
+
+        async def _never_answers(**_kwargs: object) -> list[str]:
+            await asyncio.Event().wait()
+            return []
+
+        monkeypatch.setattr(agent_db.otp, "get_other_run_otp_code_ids", _never_answers)
+        monkeypatch.setattr(otp_service, "_OTHER_RUN_LOOKUP_TIMEOUT_SECONDS", 0.01)
+    fake_app = MagicMock()
+    fake_app.DATABASE = agent_db
+    fake_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
+    fake_app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts = {}
+    monkeypatch.setattr(otp_service, "app", fake_app)
+    monkeypatch.setattr(otp_service, "datetime", SimpleNamespace(utcnow=clock.utcnow))
+    monkeypatch.setattr(otp_service, "asyncio", ScopedAsyncio(sleep=clock.sleep))
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_email", AsyncMock(return_value=None))
+    return clock.now - timedelta(minutes=1)
+
+
+async def _bounded(awaitable: Awaitable[_T]) -> _T:
+    # A poll that waits on a stalled lookup fails here instead of at the suite's per-test timeout.
+    return await asyncio.wait_for(awaitable, timeout=10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "row_overrides, strict, rejected, expected_fact",
+    [
+        pytest.param({"workflow_run_id": "wr_test"}, False, False, None, id="cua_code_received"),
+        pytest.param(
+            {"workflow_run_id": "wr_other"},
+            False,
+            False,
+            "1 stored OTP message belonged to another run",
+            id="other_run",
+        ),
+        pytest.param(
+            {"task_id": "tsk_other"}, False, False, "1 stored OTP message belonged to another run", id="other_task"
+        ),
+        pytest.param(
+            {"workflow_run_id": "wr_other", "created_ago": timedelta(minutes=2)},
+            False,
+            False,
+            "1 stored OTP message belonged to another run",
+            id="other_run_before_run_start",
+        ),
+        # The skip counts cover every stored message type, so a code poll must not call a sign-in link a code.
+        pytest.param(
+            {"workflow_run_id": "wr_other", "otp_type": OTPType.MAGIC_LINK},
+            False,
+            False,
+            "1 stored OTP message belonged to another run",
+            id="other_run_magic_link_under_code_poll",
+        ),
+        # The other-run lookup runs after the deadline, so a stalled one is dropped rather than waited on.
+        pytest.param(
+            {"workflow_run_id": "wr_other", "lookup_hangs": True},
+            False,
+            False,
+            "no code has been stored",
+            id="other_run_lookup_hangs",
+        ),
+        pytest.param(
+            {"expires_in": timedelta(minutes=-1)}, False, False, "1 stored OTP message had expired", id="expired"
+        ),
+        pytest.param(
+            {"workflow_run_id": "wr_test"}, False, True, "1 stored OTP message was already tried", id="already_tried"
+        ),
+        pytest.param(None, True, False, "no eligible code bound to this run's request was found", id="strict_request"),
+    ],
+)
+async def test_otp_diagnostics_never_carry_a_code_value(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine_factory: SqliteEngineFactory,
+    row_overrides: dict[str, Any] | None,
+    strict: bool,
+    rejected: bool,
+    expected_fact: str | None,
+) -> None:
+    run_started_at = await _install_otp_store(
+        monkeypatch, sqlite_engine_factory, dict(row_overrides) if row_overrides else row_overrides
+    )
+    _patch_cua_fallback_common(monkeypatch, "get_verification_code")
+    monkeypatch.setattr("skyvern.webeye.actions.parse_actions.has_credential_totp_candidate", lambda *_: False)
+    task = _make_task(totp_identifier=_IDENTIFIER, otp_request_id="otpreq_test" if strict else None)
+    texts: list[str] = []
+    sources_checked: str | None = None
+
+    with structlog.testing.capture_logs() as logs:
+        if expected_fact is not None:
+            with pytest.raises(NoTOTPVerificationCodeFound) as exc_info:
+                await _bounded(
+                    poll_otp_value(
+                        organization_id="o_test",
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                        otp_request_id=task.otp_request_id,
+                        totp_identifier=_IDENTIFIER,
+                        created_after=run_started_at,
+                        expected_otp_type=OTPType.TOTP,
+                        rejected_code_hash=hashlib.sha256(_CODE.encode()).hexdigest() if rejected else None,
+                    )
+                )
+            sources_checked = exc_info.value.sources_checked
+            assert sources_checked is not None
+            assert expected_fact in sources_checked
+            if "has been stored" not in expected_fact:
+                assert "has been stored" not in sources_checked
+            assert "stored code" not in sources_checked
+            assert _IDENTIFIER not in sources_checked
+            failure_reason = _build_totp_timeout_reasoning(
+                task, exc_info.value.webhook_diagnostics, exc_info.value.sources_checked
+            )
+            assert expected_fact in failure_reason
+            texts += [sources_checked, str(exc_info.value), failure_reason]
+        # The CUA path never passes a rejected hash, so for that row it would simply deliver the code.
+        if not rejected:
+            (action,) = await _bounded(
+                generate_cua_fallback_actions(task, _make_step(), assistant_message=None, reasoning=None)
+            )
+            if expected_fact is None:
+                assert isinstance(action, VerificationCodeAction)
+                assert action.verification_code == _CODE
+            else:
+                assert isinstance(action, TerminateAction)
+                assert expected_fact in (action.reasoning or "")
+            texts += [action.reasoning or "", action.intention or ""]
+
+    timeouts = [record for record in logs if record["event"].startswith("Polling otp value timed out")]
+    assert len(timeouts) == (0 if expected_fact is None else 1 if rejected else 2)
+    assert all(record["otp_sources_checked"] == sources_checked for record in timeouts)
+    for text in texts:
+        assert _CODE not in text
+    assert _CODE not in repr(logs)
+
+
 # ---------- agent.py _build_totp_timeout_reasoning helper ----------
 
 
-def test_non_cua_timeout_reasoning_uses_url_when_present() -> None:
-    # URL precedence mirrors poll_otp_value's if/elif. Query string stripped to
-    # avoid leaking auth tokens into webhook payloads.
-    task = _make_task(
-        totp_verification_url="https://example.invalid/totp?token=secret",
-        totp_identifier="user@example.com",
-    )
+@pytest.mark.parametrize(
+    "totp_verification_url, expected, absent",
+    [
+        # URL precedence mirrors poll_otp_value's if/elif. Query string stripped to
+        # avoid leaking auth tokens into webhook payloads.
+        (
+            "https://example.invalid/totp?token=secret",
+            "totp_verification_url=https://example.invalid/totp",
+            ["token=secret", "totp_identifier="],
+        ),
+        (None, "totp_identifier=user@example.com", ["totp_verification_url="]),
+    ],
+)
+def test_non_cua_timeout_reasoning_names_the_polled_source(
+    totp_verification_url: str | None, expected: str, absent: list[str]
+) -> None:
+    task = _make_task(totp_verification_url=totp_verification_url, totp_identifier="user@example.com")
     reasoning = _build_totp_timeout_reasoning(task)
-    assert "totp_verification_url=https://example.invalid/totp" in reasoning
-    assert "token=secret" not in reasoning
-    # Identifier is suppressed — only the URL was actually polled.
-    assert "totp_identifier=" not in reasoning
-
-
-def test_non_cua_timeout_reasoning_uses_identifier_when_url_absent() -> None:
-    task = _make_task(totp_identifier="user@example.com")
-    reasoning = _build_totp_timeout_reasoning(task)
-    assert "totp_identifier=user@example.com" in reasoning
-    assert "totp_verification_url=" not in reasoning
+    assert expected in reasoning
+    for text in absent:
+        assert text not in reasoning
 
 
 def test_non_cua_timeout_reasoning_raises_when_called_without_source() -> None:
