@@ -13194,7 +13194,7 @@ class FileDestinationBlock(Block):
 
             if google_access_token is None:
                 drive_access = await resolve_account_token(
-                    org_id, google_credential_id, list(google_oauth_service.GOOGLE_DRIVE_SCOPES), api="google"
+                    org_id, google_credential_id, list(google_oauth_service.GOOGLE_DRIVE_STEP_SCOPES), api="google"
                 )
                 if not drive_access:
                     raise ValueError("Google Drive credential is not connected or is missing required scopes")
@@ -17820,7 +17820,7 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
             raise ValueError("Google credential id is required")
 
         drive_access = await resolve_account_token(
-            org_id, google_credential_id, list(google_oauth_service.GOOGLE_DRIVE_SCOPES), api="google"
+            org_id, google_credential_id, list(google_oauth_service.GOOGLE_DRIVE_STEP_SCOPES), api="google"
         )
         if not drive_access:
             raise ValueError("Google Drive credential is not connected or is missing required scopes")

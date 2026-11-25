@@ -37,7 +37,7 @@ import {
 } from "@/hooks/useGoogleOAuthCredentials";
 import { useTwilioCredentialQuery } from "@/hooks/useTwilioIntegration";
 import {
-  GOOGLE_DRIVE_REQUIRED_SCOPES,
+  GOOGLE_DRIVE_STEP_SCOPES,
   GOOGLE_GMAIL_REQUIRED_SCOPES,
   GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES,
   gmailScopeProfile,
@@ -74,7 +74,7 @@ const integrations = [
     title: "Google Drive",
     description: "Upload generated files to connected Drive accounts.",
     scopeProfile: "google_drive",
-    capabilityScopes: GOOGLE_DRIVE_REQUIRED_SCOPES,
+    capabilityScopes: GOOGLE_DRIVE_STEP_SCOPES,
   },
 ] as const;
 

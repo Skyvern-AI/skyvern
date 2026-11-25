@@ -544,6 +544,13 @@ export interface CreateMicrosoftOAuthCallbackRequest {
   state: string;
 }
 
+export interface GoogleDriveFile {
+  id: string;
+  name: string;
+  modified_time: string | null;
+  web_view_link: string | null;
+}
+
 export interface GoogleSpreadsheetSummary {
   id: string;
   name: string;

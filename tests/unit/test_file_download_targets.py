@@ -244,7 +244,7 @@ async def test_google_drive_source_asks_only_google_for_a_non_google_account(tmp
     execution.get_google_workspace_credentials.assert_awaited_once_with(
         organization_id="organization-id",
         credential_id="msac_1",
-        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_STEP_SCOPES),
     )
 
 
@@ -290,7 +290,7 @@ async def test_google_drive_target_downloads_private_drive_source_without_browse
     execution.get_google_workspace_credentials.assert_awaited_once_with(
         organization_id="organization-id",
         credential_id="google-credential-id",
-        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_STEP_SCOPES),
     )
     execution.storage_save.assert_awaited_once_with(
         organization_id="organization-id",
@@ -1821,7 +1821,7 @@ async def test_google_drive_unwraps_credential_id_and_requests_drive_scopes(tmp_
     execution.get_google_workspace_credentials.assert_awaited_once_with(
         organization_id="organization-id",
         credential_id="actual-google-credential",
-        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_STEP_SCOPES),
     )
     destination = execution.upload.await_args.kwargs["destination"]
     assert destination.storage_type == FileStorageType.GOOGLE_DRIVE

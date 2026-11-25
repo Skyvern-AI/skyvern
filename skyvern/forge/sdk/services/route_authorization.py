@@ -198,6 +198,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.feedback.get_run_feedback": "feedback.read",
     "skyvern.forge.sdk.routes.feedback.submit_agent_feedback": "feedback.create",
     "skyvern.forge.sdk.routes.feedback.submit_run_feedback": "feedback.create",
+    "skyvern.forge.sdk.routes.google_drive.list_files": "google_drive.list",
     "skyvern.forge.sdk.routes.google_oauth.delete_google_oauth_client_config": "google_oauth.delete",
     "skyvern.forge.sdk.routes.google_oauth.delete_google_oauth_credential": "google_oauth.delete",
     "skyvern.forge.sdk.routes.google_oauth.get_google_oauth_client_config": "google_oauth.read",

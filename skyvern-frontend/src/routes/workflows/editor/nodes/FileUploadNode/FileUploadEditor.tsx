@@ -14,7 +14,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { GOOGLE_DRIVE_REQUIRED_SCOPES } from "@/util/googleScopes";
+import { GOOGLE_DRIVE_STEP_SCOPES } from "@/util/googleScopes";
+import { DriveFileInput } from "@/routes/workflows/components/DriveFileCombobox";
 
 import { helpTooltips } from "../../helpContent";
 import { SftpPrivateKeyField } from "../components/SftpPrivateKeyField";
@@ -314,7 +315,7 @@ function FileUploadEditorBody({
               nodeId={blockId}
               value={googleCredentialId ?? ""}
               onChange={(value) => update({ googleCredentialId: value })}
-              requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
+              requiredScopes={GOOGLE_DRIVE_STEP_SCOPES}
             />
           </div>
           <div className="space-y-2">
@@ -324,12 +325,13 @@ function FileUploadEditorBody({
               </Label>
               <HelpTooltip content={driveFolderHelp} />
             </div>
-            <WorkflowBlockInputTextarea
+            <DriveFileInput
               name="googleDriveFolderId"
               nodeId={blockId}
+              credentialId={googleCredentialId ?? ""}
+              kind="folder"
               onChange={(value) => update({ googleDriveFolderId: value })}
               value={googleDriveFolderId ?? ""}
-              className="nopan text-xs"
             />
           </div>
           {(saveAsSheetEnabled || googleDriveSaveAsSheet) && (
