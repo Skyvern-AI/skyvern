@@ -2365,6 +2365,19 @@ class AgentFunction:
         when the run was seeded from that profile (seed==sink). No-op in OSS; cloud overrides."""
         return None
 
+    async def capture_external_browser_state(self, workflow_run: WorkflowRun) -> None:
+        """Record an external browser's storage state before cleanup releases it. No-op in OSS."""
+        return None
+
+    async def persist_external_browser_profile(
+        self,
+        workflow_run: WorkflowRun,
+        browser_state: BrowserState | None,
+        workflow_run_status: WorkflowRunStatus,
+    ) -> bool:
+        """Save an external browser's state to the run's sink; True skips the directory write-back. OSS no-op."""
+        return False
+
     async def should_apply_banked_cookies(self, organization_id: str | None) -> bool:
         """Whether a profile's banked-cookie sidecar should be injected at boot. Default True (OSS
         never writes the sidecar, so this is moot there); cloud gates it on the browser_memory_engine

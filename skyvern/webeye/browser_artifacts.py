@@ -10,7 +10,7 @@ from typing import Any, Literal, Protocol
 
 import aiofiles
 import structlog
-from playwright.async_api import Page
+from playwright.async_api import Page, StorageState
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.webeye.native_downloads import NativeDownloads
@@ -131,6 +131,8 @@ class BrowserArtifacts(BaseModel):
     # _seed_load_failed flips true when a saved profile failed to launch (corruption/stale lock) and the
     # run fell back to a blank dir — its end-state is not this profile's, so write-back must be suppressed.
     _seed_load_failed: bool = PrivateAttr(default=False)
+    # Storage state an external browser held at cleanup, read before release detaches its driver.
+    _external_storage_state: StorageState | None = PrivateAttr(default=None)
     # _seed_capture_failed flips true when the seed fingerprint could not be captured — the guard then
     # treats the seed as UNKNOWN and never full-overwrites (a None etag would otherwise read "unchanged").
     _seed_capture_failed: bool = PrivateAttr(default=False)
