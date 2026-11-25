@@ -17407,6 +17407,7 @@ class WorkflowService:
         close_browser_on_completion = (
             close_browser_on_completion and browser_session_id is None and not workflow_run.browser_address
         )
+        await app.AGENT_FUNCTION.capture_external_browser_state(workflow_run)
         browser_cleanup_result = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
             workflow_run.workflow_run_id,
             all_workflow_task_ids,
@@ -17467,17 +17468,26 @@ class WorkflowService:
         if should_suppress_memory_write(workflow_run.start_fresh_browser):
             return
 
+        # Saved here, before the run's terminal status releases sequential dependents, so the next run
+        # loads this run's state; the local directory of an external browser holds none of it.
+        saved_external_browser = await app.AGENT_FUNCTION.persist_external_browser_profile(
+            workflow_run=workflow_run,
+            browser_state=browser_state,
+            workflow_run_status=effective_workflow_run_status,
+        )
+
         # Engine era: the seed resolver already decided this run's sink (the picked plain profile or the
         # workflow's own auto-profile, or None for read-only/heal-only/fresh runs). Consume it, never
         # re-derive from the seed. Flag-off orgs fall through to the byte-for-byte legacy write-back.
         if await app.AGENT_FUNCTION.is_browser_memory_engine_enabled(workflow_run):
-            await self._persist_run_sink_profile_if_needed(
-                workflow_run=workflow_run,
-                browser_state=browser_state,
-                close_browser_on_completion=close_browser_on_completion,
-                effective_workflow_run_status=effective_workflow_run_status,
-                first_credential_save=first_credential_save,
-            )
+            if not saved_external_browser:
+                await self._persist_run_sink_profile_if_needed(
+                    workflow_run=workflow_run,
+                    browser_state=browser_state,
+                    close_browser_on_completion=close_browser_on_completion,
+                    effective_workflow_run_status=effective_workflow_run_status,
+                    first_credential_save=first_credential_save,
+                )
             await self._materialize_own_profile_pick_if_needed(
                 workflow=workflow,
                 workflow_run=workflow_run,
@@ -17485,7 +17495,7 @@ class WorkflowService:
             )
             return
 
-        if not (
+        if saved_external_browser or not (
             browser_state and workflow.persist_browser_session and browser_state.browser_artifacts.browser_session_dir
         ):
             return
