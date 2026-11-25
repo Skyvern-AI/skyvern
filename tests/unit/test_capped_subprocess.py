@@ -52,7 +52,10 @@ def _hold_memory_then_wait(megabytes: int) -> int:
 
 
 def _write_pid_then_wait(path: str) -> None:
-    Path(path).write_text(str(os.getpid()))
+    # The test reads the pid as soon as the file exists, so the file must appear with the whole pid in it.
+    partial = Path(f"{path}.partial")
+    partial.write_text(str(os.getpid()))
+    os.replace(partial, path)
     time.sleep(60)
 
 
