@@ -44,11 +44,14 @@ from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
 from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
-from skyvern.forge.sdk.artifact.storage.browser_profile_archive import ProfilePublicationConflict
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
+    WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+    ProfilePublicationConflict,
+)
 from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.db.id import generate_artifact_id
-from skyvern.forge.sdk.encrypt.files import FILE_MAGIC, ArtifactDecryptionError
+from skyvern.forge.sdk.encrypt.files import FILE_MAGIC, ArtifactDecryptionError, encrypt_file
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
@@ -1848,28 +1851,115 @@ async def test_browser_profile_exists_propagates_non_not_found_errors() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "named",
+        "strict",
+        "403",
+        "404",
+        "5xx-probe",
+        "timeout",
+        "decrypt",
+        "extract",
+        "valid",
+        "recheck",
+        "legacy-missing",
+        "legacy-500",
+        "legacy-invalid",
+        "cancel",
+    ],
+)
 async def test_retrieve_browser_profile_extracts_sub_buffer_size_archive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
     # Regression: the archive used to be closed only AFTER unzipping, so anything smaller than the io
     # buffer (~8KB) — a cookie-only first bank — was still unflushed and ZipFile hit an empty file.
     zip_bytes = _build_zip({".skyvern_banked_cookies.json": b'[{"name":"session"}]'})
     assert len(zip_bytes) < 1024
 
-    storage = S3Storage()
-    storage.async_client = MagicMock()
-    storage.async_client.download_file = AsyncMock(
-        side_effect=lambda uri, **_: None if uri.endswith(".enc") else zip_bytes
-    )
+    storage, transport = S3Storage(), ProfileTransport()
+    legacy, sealed = storage._profile_uris("o", "bp") if case == "named" else storage._workflow_session_uris("o", "wp")
+    install_s3_profile_transport(storage, transport, monkeypatch)
+    temp = tmp_path / "runtime"
+    monkeypatch.setattr(settings, "TEMP_PATH", str(temp))
+    if case != "legacy-missing":
+        transport.objects[legacy] = b"not a zip" if case == "legacy-invalid" else zip_bytes
+    if case in {"timeout", "decrypt"}:
+        transport.objects[sealed] = b"invalid sealed bytes"
+    if case in {"extract", "valid", "recheck"}:
+        monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", (artifact_root(),))
+        plaintext, ciphertext = tmp_path / "fixture.zip", tmp_path / "fixture.enc"
+        plaintext.write_bytes(
+            b"invalid ZIP" if case == "extract" else _build_zip({".skyvern_banked_cookies.json": b"seal"})
+        )
+        encrypt_file(
+            plaintext, ciphertext, organization_id="o", purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE, object_id="wp"
+        )
+        if case != "recheck":
+            transport.objects[sealed] = ciphertext.read_bytes()
 
-    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
-    profile_dir = await storage.retrieve_browser_profile("o", "bp")
+    async def download(uri: str, **kwargs: object) -> bytes | None:
+        if uri == legacy:
+            if case == "legacy-500":
+                raise ClientError({"Error": {"Code": "InternalError"}}, "GetObject")
+            if case == "recheck":
+                transport.objects[sealed] = ciphertext.read_bytes()
+        else:
+            if case in {"403", "strict", "legacy-missing", "legacy-500", "legacy-invalid"} or (
+                case == "recheck" and sealed not in transport.objects
+            ):
+                raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+            if case == "404":
+                raise ClientError({"Error": {"Code": "404"}}, "GetObject")
+            if case == "5xx-probe":
+                raise ClientError(
+                    {"Error": {"Code": "InternalError"}, "ResponseMetadata": {"HTTPStatusCode": 503}}, "GetObject"
+                )
+            if case == "timeout":
+                raise TimeoutError()
+            if case == "cancel":
+                raise asyncio.CancelledError()
+        return await read(uri, **kwargs)
+
+    async def fail_probe(_: str) -> None:
+        raise OSError("metadata unavailable")
+
+    read = transport.download_file
+    monkeypatch.setattr(transport, "download_file", download)
+    if case == "5xx-probe":
+        monkeypatch.setattr(transport, "get_object_info", fail_probe)
+    if case == "strict":
+        with pytest.raises(ClientError, match="AccessDenied"):
+            await storage.retrieve_browser_session_snapshot("o", "wp")
+        assert not temp.exists()
+        return
+    if case in {"cancel", "legacy-invalid"}:
+        with pytest.raises(asyncio.CancelledError if case == "cancel" else zipfile.BadZipFile):
+            await storage.retrieve_browser_session_snapshot("o", "wp", allow_sealed_fallback=True)
+        if case == "cancel":
+            assert not temp.exists()
+        return
+
+    protected = case in {"valid", "recheck"}
+    if case == "named":
+        profile_dir = await storage.retrieve_browser_profile("o", "bp")
+    else:
+        snapshot = await storage.retrieve_browser_session_snapshot("o", "wp", allow_sealed_fallback=True)
+        if case in {"legacy-missing", "legacy-500"}:
+            assert snapshot is None
+            return
+        assert snapshot is not None and snapshot.encrypted is protected
+        assert snapshot.version == str(ProfileTransport._version(transport.objects[sealed if protected else legacy]))
+        profile_dir = snapshot.directory
 
     assert profile_dir is not None
-    assert (Path(profile_dir) / ".skyvern_banked_cookies.json").read_bytes() == b'[{"name":"session"}]'
+    assert (Path(profile_dir) / ".skyvern_banked_cookies.json").read_bytes() == (
+        b"seal" if protected else b'[{"name":"session"}]'
+    )
     # The extraction directory must be the ONLY thing left in TEMP_PATH — the downloaded archive is
     # written there under a suffixless temp name, so a leak would show up as a second entry.
-    assert [entry.name for entry in tmp_path.iterdir()] == [Path(profile_dir).name]
+    assert [entry.name for entry in temp.iterdir()] == [Path(profile_dir).name]
 
 
 _EXTENSION_ID = "a" * 32

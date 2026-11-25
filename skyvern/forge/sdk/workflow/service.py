@@ -5854,7 +5854,14 @@ class WorkflowService:
         storage_key = build_workflow_browser_session_storage_key(workflow.workflow_permanent_id, rendered_key)
         snapshot = None
         try:
-            snapshot = await app.STORAGE.retrieve_browser_session_snapshot(organization_id, storage_key)
+            storage = app.STORAGE
+            if isinstance(storage, S3Storage):
+                # The seed is published to a new managed profile, never to the legacy source key.
+                snapshot = await storage.retrieve_browser_session_snapshot(
+                    organization_id, storage_key, allow_sealed_fallback=True
+                )
+            else:
+                snapshot = await storage.retrieve_browser_session_snapshot(organization_id, storage_key)
             if snapshot is None:
                 return True
             await app.STORAGE.store_browser_profile(

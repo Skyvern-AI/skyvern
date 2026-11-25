@@ -306,6 +306,7 @@ async def retrieve_remote_profile(
     stat: Callable[[str], Awaitable[object | None]],
     parent_dir: str | None = None,
     purpose: str = PROFILE_ENCRYPTION_PURPOSE,
+    allow_sealed_fallback: bool = False,
 ) -> BrowserProfileSnapshot | None:
     uri, sealed_uri = uris
 
@@ -327,13 +328,42 @@ async def retrieve_remote_profile(
             return None
         return (data, versions[-1] if versions else None) if data is not None else None
 
+    async def restore(selected: tuple[bytes, str | None], *, encrypted: bool) -> BrowserProfileSnapshot:
+        data, version = selected
+        return await restore_profile_archive(
+            data,
+            organization_id,
+            profile_id,
+            encrypted=encrypted,
+            parent_dir=parent_dir,
+            purpose=purpose,
+            version=version,
+        )
+
+    if allow_sealed_fallback:
+        sealed_error_type: str | None = None
+
+        async def restore_sealed() -> BrowserProfileSnapshot | None:
+            nonlocal sealed_error_type
+            try:
+                sealed = await read(sealed_uri)
+                return await restore(sealed, encrypted=True) if sealed is not None else None
+            except Exception as exc:
+                sealed_error_type = type(exc).__name__
+                return None
+
+        if (snapshot := await restore_sealed()) is not None:
+            return snapshot
+        legacy = await read(uri)
+        # A usable seal published during the legacy read still takes precedence.
+        if (snapshot := await restore_sealed()) is not None:
+            return snapshot
+        if sealed_error_type is not None:
+            LOG.warning("Falling back to legacy workflow profile ZIP", error_type=sealed_error_type)
+        return await restore(legacy, encrypted=False) if legacy is not None else None
+
     selected, encrypted = await find_profile_object(uri, sealed_uri, read)
-    if selected is None:
-        return None
-    data, version = selected
-    return await restore_profile_archive(
-        data, organization_id, profile_id, encrypted=encrypted, parent_dir=parent_dir, purpose=purpose, version=version
-    )
+    return await restore(selected, encrypted=encrypted) if selected is not None else None
 
 
 def _transient_profile_error(error: Exception) -> bool:
