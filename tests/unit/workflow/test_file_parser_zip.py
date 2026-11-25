@@ -16,10 +16,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import docx
 import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
+from skyvern.file_parser.client import IsolatedParserResult
+from skyvern.forge import app
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import InvalidFileType
-from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock
+from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, FileUploadBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockResult, BlockStatus, FileType
 
@@ -290,6 +298,9 @@ class TestExecuteWithZipAndLocalPaths:
         workflow_run_context = MagicMock()
         workflow_run_context.resolve_block_notes_section.return_value = None
         workflow_run_context.has_parameter.return_value = False
+        run_context = WorkflowRunContext("Workflow", "w_test", "wpid_test", "wr_test", aws_client=MagicMock())
+        run_context.organization_id = "org-1"
+        workflow_run_context.run_files = run_context.run_files
         record_output_parameter_value = AsyncMock()
 
         async def fake_build_block_result(self: FileParserBlock, **kwargs: Any) -> BlockResult:
@@ -305,41 +316,75 @@ class TestExecuteWithZipAndLocalPaths:
         mp.setattr(settings, "DOWNLOAD_PATH", str(tmp_path / "downloads"))
         return record_output_parameter_value
 
-    async def test_execute_zip_without_schema_outputs_file_list(self, tmp_path: Path) -> None:
-        zip_path = _create_zip(tmp_path / "archive.zip", {"a.txt": b"hello", "b.txt": b"world"})
-        block = _make_file_parser_block("https://example.com/archive.zip")
-
-        with pytest.MonkeyPatch.context() as mp:
-            self._patch_execute_dependencies(mp, tmp_path)
-            mp.setattr("skyvern.forge.sdk.api.files.download_file", AsyncMock(return_value=str(zip_path)))
-
-            result = await block.execute("wr_test", "wrb_test", organization_id="org-1")
-
-        assert result.success is True
-        assert result.status == BlockStatus.completed
-        output = result.output_parameter_value
-        assert isinstance(output, list)
-        assert [f["file_name"] for f in output] == ["a.txt", "b.txt"]
-        for file_info in output:
-            assert Path(file_info["file_path"]).is_file()
-
-    async def test_execute_local_path_inside_download_dir(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("parser_service", [False, True], ids=["in_worker", "parser_service"])
+    async def test_zip_members_become_run_files_where_they_were_unzipped(
+        self, tmp_path: Path, sqlite_engine: AsyncEngine, parser_service: bool
+    ) -> None:
+        zip_path = _create_zip(
+            tmp_path / "bundle.zip", {"docs/a.csv": b"name\nAlice", "other/a.csv": b"name\nBob", "b.txt": b"plain"}
+        )
         run_dir = tmp_path / "downloads" / "wr_test"
         run_dir.mkdir(parents=True)
-        csv_path = run_dir / "data.csv"
-        csv_path.write_text("name,age\nAlice,30")
-        block = _make_file_parser_block(str(csv_path))
+        (run_dir / "report.txt").write_text("already here")
+        upload = FileUploadBlock(label="upload", output_parameter=_make_output_parameter("upload_output"))
+
+        def top_level_uploads() -> list[str]:
+            return upload._get_files_to_upload_from_download_dir(download_files_path=str(run_dir), max_file_count=10)
+
+        before = top_level_uploads()
+
+        async def remote_parse(_target: str, path: Path, *, output_dir: Path, **_: Any) -> IsolatedParserResult:
+            with zipfile.ZipFile(path) as archive:
+                archive.extractall(output_dir)
+                names = sorted(archive.namelist())
+            files = [
+                {
+                    "file_name": name,
+                    "file_path": str(output_dir / name),
+                    "file_size": (output_dir / name).stat().st_size,
+                }
+                for name in names
+            ]
+            return IsolatedParserResult(
+                file_type="zip", detection_source="magic", kind="files", metadata={}, files=files
+            )
+
+        async def parse(file_url: str, workflow_run_block_id: str) -> BlockResult:
+            block = _make_file_parser_block(file_url)
+            return await block.execute("wr_test", workflow_run_block_id, organization_id="org-1")
 
         with pytest.MonkeyPatch.context() as mp:
             self._patch_execute_dependencies(mp, tmp_path)
-            download_mock = AsyncMock(side_effect=AssertionError("download_file must not be called"))
-            mp.setattr("skyvern.forge.sdk.api.files.download_file", download_mock)
+            mp.setattr(app, "DATABASE", AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine))
+            mp.setattr(app, "ARTIFACT_MANAGER", ArtifactManager())
+            mp.setattr(app, "STORAGE", LocalStorage(str(tmp_path / "artifacts")))
+            mp.setattr("skyvern.forge.sdk.api.files.download_file", AsyncMock(return_value=str(zip_path)))
+            if parser_service:
+                mp.setattr(settings, "FILE_PARSER_SERVICE_TARGET", "file-parser.test.svc:7820")
+                mp.setattr(block_module, "parse_file_remotely", remote_parse)
+            first = await parse("https://example.com/bundle.zip", "wrb_first")
+            second = await parse("https://example.com/bundle.zip", "wrb_second")
+            listed = await app.STORAGE.get_downloaded_files("org-1", "wr_test")
+            member = next(entry for entry in first.output_parameter_value if entry["file_name"] == "docs/a.csv")
+            mp.setattr(settings, "FILE_PARSER_SERVICE_TARGET", "")
+            member_parse = await parse(member["file_path"], "wrb_member")
 
-            result = await block.execute("wr_test", "wrb_test", organization_id="org-1")
-
-        assert result.success is True
-        assert result.output_parameter_value == [{"name": "Alice", "age": "30"}]
-        download_mock.assert_not_awaited()
+        # Members keep their names and paths inside the zip, and same-named members with other bytes get "(n)".
+        expected = {"b.txt": "b.txt", "docs/a.csv": "a.csv", "other/a.csv": "a (1).csv"}
+        assert {entry["file_name"]: entry["run_file"] for entry in first.output_parameter_value} == expected
+        assert {entry["file_name"]: entry["run_file"] for entry in second.output_parameter_value} == expected
+        assert all(
+            Path(entry["file_path"]).is_relative_to(run_dir / "unzipped" / "bundle_wrb_first")
+            and Path(entry["file_path"]).is_file()
+            for entry in first.output_parameter_value
+        )
+        assert sorted(file.filename for file in listed if file.filename != "report.txt") == [
+            "a (1).csv",
+            "a.csv",
+            "b.txt",
+        ]
+        assert member_parse.output_parameter_value == [{"name": "Alice"}]
+        assert top_level_uploads() == before == [str(run_dir / "report.txt")]
 
     async def test_execute_zip_with_schema_outputs_file_list_without_llm(self, tmp_path: Path) -> None:
         zip_path = _create_zip(tmp_path / "archive.zip", {"data.csv": b"name,age\nAlice,30"})

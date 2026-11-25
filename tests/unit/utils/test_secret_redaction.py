@@ -990,6 +990,12 @@ def test_mask_secrets_enabled_for_run_truth_table(
     assert manager.mask_secrets_enabled_for_run("missing") is False
     assert manager.mask_secrets_enabled_for_run(None) is False
 
+    # A removed run keeps its setting for the scrub, until a retry's new context for the same run replaces it.
+    manager.remove_workflow_run_context("wr_enabled")
+    assert manager.mask_secrets_enabled_for_run("wr_enabled") is True
+    manager.workflow_run_contexts["wr_enabled"] = manager.workflow_run_contexts["wr_disabled"]
+    assert manager.mask_secrets_enabled_for_run("wr_enabled") is False
+
 
 def test_secret_redaction_enabled_for_run_requires_env_flag_and_workflow_opt_in(
     monkeypatch: pytest.MonkeyPatch,
@@ -1068,19 +1074,30 @@ def test_registered_placeholder_ids_for_run_names_only_placeholder_keys(
     assert manager.registered_placeholder_ids_for_run(None) == frozenset()
 
 
+@pytest.mark.parametrize("mask_secrets", [True, False], ids=["mask-secrets", "no-mask-secrets"])
+@pytest.mark.parametrize("context_removed", [False, True], ids=["live-context", "context-removed"])
 def test_artifact_redaction_exempts_the_runs_registered_placeholder_ids(
     monkeypatch: pytest.MonkeyPatch,
     workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+    mask_secrets: bool,
+    context_removed: bool,
 ) -> None:
     """The prompt artifact is the record of what crossed the model boundary, so it keeps the run's
-    own token — but a secret rendered behind an unregistered prefix is scrubbed (SKY-17864).
-    """
+    own token — but a secret rendered behind an unregistered prefix is scrubbed (SKY-17864). Work the
+    run started can still write one after the run's context is removed, and it keeps the same scrub."""
     monkeypatch.setattr(settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
     manager = workflow_context_manager_factory(
         workflow_run_id="wr_artifact",
+        mask_secrets=mask_secrets,
         secrets={"placeholder_ab12_password": "password"},
     )
     monkeypatch.setattr(artifact_manager.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    monkeypatch.setattr(artifact_manager, "_RUNS_WARNED_MISSING_CONTEXT", {})
+    if context_removed:
+        assert manager.remove_workflow_run_context_if_current(
+            "wr_artifact", manager.workflow_run_contexts["wr_artifact"]
+        )
+        assert manager.has_workflow_run_context("wr_artifact") is False
 
     with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_artifact")):
         redacted = artifact_manager._maybe_redact_artifact_data(
@@ -1088,6 +1105,7 @@ def test_artifact_redaction_exempts_the_runs_registered_placeholder_ids(
         )
 
     assert redacted == f"type placeholder_ab12_password, never placeholder_{REDACTED_SECRET_PLACEHOLDER}".encode()
+    assert artifact_manager._RUNS_WARNED_MISSING_CONTEXT == {}
 
 
 def test_get_secret_values_for_run_returns_empty_when_global_flag_disabled(

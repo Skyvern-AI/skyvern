@@ -646,7 +646,7 @@ _IDENTITY_FIELDS = (
 
 
 def _fetched_code_action(**overrides: Any) -> VerificationCodeAction:
-    # Shaped as parse_actions writes it, with the code in reasoning and intention.
+    # Stored rows can still quote the code in reasoning and intention, so the scrubber must handle them.
     reasoning = f"Received verification code: {ONE_TIME_CODE}"
     return VerificationCodeAction(
         verification_code=ONE_TIME_CODE,

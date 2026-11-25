@@ -4363,9 +4363,10 @@ class TestClearBrowserDataHelperBinding:
         assert await user_function() == {"value": "keep"}
 
     @pytest.mark.asyncio
-    async def test_publish_file_in_process_refuses_with_its_reason(self) -> None:
+    @pytest.mark.parametrize("call", ['publish_file("report.txt", text="hi")', 'read_run_file("report.txt")'])
+    async def test_secure_runner_file_helpers_in_process_refuse_with_their_reason(self, call: str) -> None:
         user_function = self._block().generate_async_user_function(
-            'await publish_file("report.txt", text="hi")\nreturn {}\n',
+            f"await {call}\nreturn {{}}\n",
             SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
         )
 

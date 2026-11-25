@@ -70,6 +70,10 @@ def _profile() -> BrowserProfile:
     )
 
 
+async def _stored_profile(*, workflow_permanent_id: str | None = None, **_kwargs: object) -> BrowserProfile:
+    return _profile().model_copy(update={"workflow_permanent_id": workflow_permanent_id})
+
+
 @pytest.fixture(autouse=True)
 def _restore_forge_app() -> Iterator[None]:
     previous_app = object.__getattribute__(forge_app, "_inst")
@@ -79,7 +83,7 @@ def _restore_forge_app() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _use_minimal_empty_profile_seed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(browser_profiles_route, "_default_browser_profile_template_candidates", lambda: [])
+    monkeypatch.setattr(browser_profiles_route, "_default_browser_profile_template_candidates", list)
 
 
 def _build_client(
@@ -102,7 +106,8 @@ def _build_client(
         get_session=AsyncMock(),
         get_workflow_run=AsyncMock(),
         get_workflow=AsyncMock(),
-        create_profile=AsyncMock(return_value=_profile()),
+        create_profile=AsyncMock(side_effect=_stored_profile),
+        session_workflow=AsyncMock(return_value=None),
         get_db_profile=AsyncMock(return_value=SimpleNamespace(is_managed=True, workflow_permanent_id="wp_1")),
         delete_db_profile=AsyncMock(),
         hard_delete_db_profile=AsyncMock(),
@@ -145,6 +150,7 @@ def _build_client(
             DATABASE=SimpleNamespace(
                 browser_sessions=SimpleNamespace(
                     get_persistent_browser_session=mocks.get_session,
+                    get_browser_session_workflow_permanent_id=mocks.session_workflow,
                     create_browser_profile=mocks.create_profile,
                     get_browser_profile=mocks.get_db_profile,
                     delete_browser_profile=mocks.delete_db_profile,
@@ -365,7 +371,7 @@ def test_create_empty_profile_falls_back_to_minimal_seed(monkeypatch: pytest.Mon
         assert (directory / "Default" / "Preferences").read_text(encoding="utf-8") == "{}"
         assert (directory / "Local State").read_text(encoding="utf-8") == "{}"
 
-    monkeypatch.setattr(browser_profiles_route, "_default_browser_profile_template_candidates", lambda: [])
+    monkeypatch.setattr(browser_profiles_route, "_default_browser_profile_template_candidates", list)
     mocks.store_profile.side_effect = _store_profile
 
     response = client.post("/v1/browser_profiles/", json={"name": "fresh profile"})
@@ -603,7 +609,8 @@ async def test_create_profile_from_workflow_run_still_stores_workflow_archive(
         workflow_run_id="wr_1",
     )
 
-    assert profile == _profile()
+    assert profile.workflow_permanent_id == "wp_1"
+    assert profile.is_managed is False
     mocks.retrieve_session.assert_awaited_once_with(
         organization_id="org_oss",
         workflow_permanent_id="wp_1",
@@ -679,7 +686,7 @@ async def test_create_profile_from_workflow_run_reads_managed_profile_blob(
         workflow_run_id="wr_1",
     )
 
-    assert profile == _profile()
+    assert profile == _profile().model_copy(update={"workflow_permanent_id": "wp_1"})
     mocks.retrieve_profile.assert_awaited_once_with(organization_id="org_oss", profile_id="bp_managed")
     mocks.retrieve_session.assert_not_awaited()
     mocks.store_profile.assert_awaited_once_with(
@@ -847,8 +854,9 @@ async def test_no_profile_is_saved_from_a_registered_external_session(
     mocks.observe_session.assert_not_awaited()
 
 
-def test_promote_inherits_session_proxy_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_promote_inherits_session_proxy_pin_and_source_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
     client, mocks = _build_client(monkeypatch)
+    mocks.session_workflow.return_value = "wp_1"
     mocks.get_session.return_value = _session(
         generate_browser_profile=True,
         proxy_location=ProxyLocation.RESIDENTIAL_ISP,
@@ -859,6 +867,7 @@ def test_promote_inherits_session_proxy_pin(monkeypatch: pytest.MonkeyPatch) -> 
     response = client.post("/v1/browser_profiles/", json={"name": "my profile", "browser_session_id": "pbs_1"})
 
     assert response.status_code == 200
+    assert response.json()["workflow_permanent_id"] == "wp_1"
     assert mocks.create_profile.await_args.kwargs["proxy_location"] == ProxyLocation.RESIDENTIAL_ISP
     assert mocks.create_profile.await_args.kwargs["proxy_session_id"] == "abc1234567"
 

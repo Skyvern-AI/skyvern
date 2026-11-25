@@ -62,6 +62,11 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.WORKFLOW_CONTEXT_MANAGER = _LazyNamespace()
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts = {}
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run = MagicMock(return_value=False)
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.redaction_inputs_for_run = (
+        lambda workflow_run_id: fake_app_module.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(workflow_run_id)
+        if workflow_run_id
+        else None
+    )
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run = MagicMock(return_value=False)
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled = MagicMock(return_value=False)
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = MagicMock(return_value=set())
