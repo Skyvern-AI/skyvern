@@ -1595,7 +1595,7 @@ class AgentFunction:
         return True
 
     async def browser_session_console_enabled(
-        self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str | None = None
     ) -> bool:
         """Whether this principal may run JavaScript in the session's page from the live view."""
         return False

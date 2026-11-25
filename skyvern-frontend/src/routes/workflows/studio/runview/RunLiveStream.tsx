@@ -102,6 +102,7 @@ function RunLiveStreamTransport({
         browserSessionId={browserSessionId}
         interactive={interactive}
         showControlButtons={interactive}
+        showConsole={interactive}
         onUrlChange={onUrlChange}
         onStreamStateChange={onStreamStateChange}
         forceCdp={vncFailed}
@@ -116,6 +117,7 @@ function RunLiveStreamTransport({
       alwaysShowStream
       interactive={interactive}
       showControlButtons={interactive}
+      showConsole={interactive}
       onUrlChange={onUrlChange}
       onStreamStateChange={onStreamStateChange}
       centered

@@ -205,6 +205,7 @@ function WorkflowRunOverviewAttempt() {
             browserSessionId={browserSessionId!}
             interactive={isPaused}
             showControlButtons={isPaused}
+            showConsole={isPaused}
             forceCdp={vncFailed}
             centered
           />
@@ -219,6 +220,7 @@ function WorkflowRunOverviewAttempt() {
           <WorkflowRunStream
             interactive={isPaused}
             showControlButtons={isPaused}
+            showConsole={isPaused}
           />
         )}
         {!isStreamActive && isAction(selection) && (

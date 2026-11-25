@@ -1033,6 +1033,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     ) -> ProxyLocationInput:
         return proxy_location
 
+    async def session_records_managed_egress(self, browser_session: PersistentBrowserSession) -> bool:
+        return True
+
     async def create_fresh_exit_session(
         self,
         *,

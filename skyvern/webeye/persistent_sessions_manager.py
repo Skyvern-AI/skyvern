@@ -258,6 +258,10 @@ class PersistentSessionsManager(Protocol):
         workflow_permanent_id: str | None = None,
     ) -> ProxyLocationInput: ...
 
+    async def session_records_managed_egress(self, browser_session: PersistentBrowserSession) -> bool:
+        """Whether the session records the egress its location names in this deployment; False when unverifiable."""
+        ...
+
     async def create_fresh_exit_session(
         self,
         *,

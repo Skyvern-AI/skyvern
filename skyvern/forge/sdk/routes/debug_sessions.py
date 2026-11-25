@@ -133,7 +133,11 @@ async def _claim_compatible_prewarm(
                 await _retire_prewarm(browser_session, organization_id, bound_key)
                 return None
         approved_location = resolved_location
-    if browser_session.proxy_location != approved_location:
+    # A matching stored location is not proof the browser egresses through it.
+    if browser_session.proxy_location != approved_location or (
+        approved_location not in (None, ProxyLocation.NONE)
+        and not await app.PERSISTENT_SESSIONS_MANAGER.session_records_managed_egress(browser_session)
+    ):
         await _retire_prewarm(browser_session, organization_id, bound_key)
         return None
 
