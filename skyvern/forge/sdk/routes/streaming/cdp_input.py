@@ -5,6 +5,7 @@ CDP input channel for interactive browser control via Chrome DevTools Protocol.
 import asyncio
 import base64
 import binascii
+import collections
 import contextlib
 import dataclasses
 import hashlib
@@ -41,6 +42,7 @@ from skyvern.forge.sdk.streaming.registries import (
 )
 from skyvern.forge.sdk.streaming.user_control import mark_user_control, release_user_control
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_errors import is_context_lost_message, is_target_closed_message
 from skyvern.webeye.browser_state import BrowserState
@@ -97,6 +99,8 @@ _MAX_CONSOLE_REQUEST_ID_CHARS = 64
 _MAX_CONSOLE_RESULT_CHARS = 64_000
 _CONSOLE_EVALUATE_TIMEOUT_MS = 30_000
 _CONSOLE_OBJECT_GROUP = "skyvern-console"
+_CONSOLE_RATE_LIMIT_WINDOW_SECONDS = 10.0
+_CONSOLE_RATE_LIMIT_MAX_REQUESTS = 20
 
 
 def _input_kind_label(kind: object) -> str:
@@ -113,6 +117,7 @@ class CdpInputChannel:
     console_authorization: t.Callable[[], t.Awaitable[bool]] | None = None
     principal: RequestPrincipal | None = None
     console_busy: bool = False
+    console_request_timestamps: collections.deque[float] = dataclasses.field(default_factory=collections.deque)
 
     def __post_init__(self) -> None:
         add_cdp_input_channel(self)
@@ -704,34 +709,41 @@ async def _run_console_request(
     log_id_value: str,
 ) -> None:
     started = time.monotonic()
+    status = "cancelled"
+    text = ""
+    cancelled = False
     try:
         status, text = await _evaluate_console_expression(cdp_session, expression)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except Exception as error:
         LOG.warning("Browser console evaluation failed", **{log_id_key: log_id_value}, error_type=type(error).__name__)
         status, text = "error", "Couldn't run the code in the page."
     finally:
         channel.console_busy = False
-
-    principal = channel.principal
-    # The expression and its result are page and user data: log their size and digest, never their text.
-    LOG.info(
-        "Browser console evaluation",
-        **{log_id_key: log_id_value},
-        organization_id=channel.organization_id,
-        user_id=principal.user_id if principal else None,
-        impersonator_user_id=principal.impersonator_user_id if principal else None,
-        api_key_token_id=principal.api_key_token_id if principal else None,
-        auth_kind=str(principal.auth_kind) if principal else None,
-        page_origin=_url_origin(page_url),
-        expression_chars=len(expression),
-        expression_sha256=hashlib.sha256(expression.encode()).hexdigest(),
-        status=status,
-        duration_ms=round((time.monotonic() - started) * 1000),
-    )
-    with contextlib.suppress(Exception):
-        await channel.websocket.send_json(
-            {"kind": "evaluateResult", "id": request_id, "status": status, "text": text, "url": page_url}
-        )
+        principal = channel.principal
+        # The expression and its result are page and user data: log their size and digest, never their text.
+        with contained_effect("browser console evaluation audit log", **{log_id_key: log_id_value}):
+            LOG.info(
+                "Browser console evaluation",
+                **{log_id_key: log_id_value},
+                organization_id=channel.organization_id,
+                user_id=principal.user_id if principal else None,
+                impersonator_user_id=principal.impersonator_user_id if principal else None,
+                api_key_token_id=principal.api_key_token_id if principal else None,
+                auth_kind=str(principal.auth_kind) if principal else None,
+                page_origin=_url_origin(page_url),
+                expression_chars=len(expression),
+                expression_sha256=hashlib.sha256(expression.encode()).hexdigest(),
+                status=status,
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+        if not cancelled:
+            with contextlib.suppress(Exception):
+                await channel.websocket.send_json(
+                    {"kind": "evaluateResult", "id": request_id, "status": status, "text": text, "url": page_url}
+                )
 
 
 async def _dispatch_event(
@@ -835,6 +847,14 @@ async def _run_input_loop(
         if channel.console_busy:
             await reject("rejected", "Wait for the previous code to finish.")
             return
+        now = time.monotonic()
+        cutoff = now - _CONSOLE_RATE_LIMIT_WINDOW_SECONDS
+        while channel.console_request_timestamps and channel.console_request_timestamps[0] < cutoff:
+            channel.console_request_timestamps.popleft()
+        if len(channel.console_request_timestamps) >= _CONSOLE_RATE_LIMIT_MAX_REQUESTS:
+            await reject("rejected", "Too many requests. Wait a moment and try again.")
+            return
+        channel.console_request_timestamps.append(now)
         # Availability was decided at connect, but a role change or flag flip must take effect on an
         # open socket, so every evaluation asks again.
         try:
@@ -973,6 +993,27 @@ async def _run_input_loop(
             await release_user_control(channel.organization_id, controlled_browser_session_id, control_holder)
 
 
+async def _configure_console_channel(
+    channel: CdpInputChannel,
+    websocket: WebSocket,
+    principal: RequestPrincipal | None,
+    organization_id: str,
+    resolve_browser_session_id: t.Callable[[], str | None],
+    **log_context: str,
+) -> None:
+    async def console_authorized() -> bool:
+        return await app.AGENT_FUNCTION.browser_session_console_enabled(
+            principal, organization_id, resolve_browser_session_id()
+        )
+
+    channel.console_authorization = console_authorized
+    try:
+        channel.console_enabled = await console_authorized()
+    except Exception:
+        LOG.warning("Browser console availability check failed", **log_context, exc_info=True)
+    await websocket.send_json({"kind": "console", "available": channel.console_enabled})
+
+
 @legacy_base_router.websocket("/stream/cdp_input/workflow_run/{workflow_run_id}")
 async def cdp_input_stream(
     websocket: WebSocket,
@@ -993,10 +1034,12 @@ async def cdp_input_stream(
         return
     assert client_id is not None
 
+    principal = get_request_principal()
     channel = CdpInputChannel(
         client_id=client_id,
         organization_id=organization_id,
         websocket=websocket,
+        principal=principal,
     )
 
     cdp_session: CDPSession | None = None
@@ -1041,7 +1084,6 @@ async def cdp_input_stream(
             await websocket.close(code=4408, reason="browser_state_timeout")
             return
 
-        principal = get_request_principal()
         last_browser_session_id: str | None = None
 
         async def resolve_browser_session_id() -> str | None:
@@ -1124,6 +1166,15 @@ async def cdp_input_stream(
             return
         LOG.info("CDP input channel ready", workflow_run_id=workflow_run_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
+
+        await _configure_console_channel(
+            channel,
+            websocket,
+            principal,
+            organization_id,
+            lambda: last_browser_session_id,
+            workflow_run_id=workflow_run_id,
+        )
 
         await _run_input_loop(
             websocket,
@@ -1269,19 +1320,14 @@ async def cdp_input_browser_session_stream(
         LOG.info("CDP input channel ready", browser_session_id=browser_session_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
 
-        async def console_authorized() -> bool:
-            return await app.AGENT_FUNCTION.browser_session_console_enabled(
-                principal, organization_id, browser_session_id
-            )
-
-        channel.console_authorization = console_authorized
-        try:
-            channel.console_enabled = await console_authorized()
-        except Exception:
-            LOG.warning(
-                "Browser console availability check failed", browser_session_id=browser_session_id, exc_info=True
-            )
-        await websocket.send_json({"kind": "console", "available": channel.console_enabled})
+        await _configure_console_channel(
+            channel,
+            websocket,
+            principal,
+            organization_id,
+            lambda: browser_session_id,
+            browser_session_id=browser_session_id,
+        )
 
         await _run_input_loop(
             websocket,
