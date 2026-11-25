@@ -130,6 +130,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON,
     UPDATE_WORKFLOW_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.otp_bound import OTP_BOUND_ROUTE, is_otp_bound_route
 from skyvern.forge.sdk.routes.pagination import MAX_INT4, MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.routes.trigger_type import (
@@ -396,18 +397,8 @@ async def _assert_files_attachable(file_ids: list[str] | None, organization_id: 
         raise HTTPException(status_code=422, detail=str(e)) from e
 
 
-def _is_otp_bound_route(request: Request) -> bool:
-    scope = getattr(request, "scope", None) or {}
-    route = scope.get("route")
-    route_path = getattr(route, "path", None)
-    if isinstance(route_path, str):
-        return "/otp-bound/" in route_path
-    request_path = scope.get("path")
-    return isinstance(request_path, str) and "/otp-bound/" in request_path
-
-
 def _require_unambiguous_otp_admission(request: Request, otp_request_id: str | None) -> None:
-    guarded = _is_otp_bound_route(request)
+    guarded = is_otp_bound_route(request)
     if guarded and otp_request_id is None:
         raise HTTPException(status_code=400, detail="otp_request_id is required on the otp-bound run endpoint")
     if not guarded and otp_request_id is not None:
@@ -469,8 +460,8 @@ def _require_strict_local_browser_inputs(run_request: object, otp_request_id: st
     },
 )
 @base_router.post("/run/tasks/", include_in_schema=False)
-@base_router.post("/otp-bound/run/tasks", include_in_schema=False)
-@base_router.post("/otp-bound/run/tasks/", include_in_schema=False)
+@base_router.post("/otp-bound/run/tasks", include_in_schema=False, dependencies=[OTP_BOUND_ROUTE])
+@base_router.post("/otp-bound/run/tasks/", include_in_schema=False, dependencies=[OTP_BOUND_ROUTE])
 async def run_task(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -847,8 +838,8 @@ def _hydrate_run_request_for_response(
     },
 )
 @base_router.post("/run/agents/", include_in_schema=False)
-@base_router.post("/otp-bound/run/agents", include_in_schema=False)
-@base_router.post("/otp-bound/run/agents/", include_in_schema=False)
+@base_router.post("/otp-bound/run/agents", include_in_schema=False, dependencies=[OTP_BOUND_ROUTE])
+@base_router.post("/otp-bound/run/agents/", include_in_schema=False, dependencies=[OTP_BOUND_ROUTE])
 # Backwards-compatible aliases: an agent is a workflow. These keep responding but are hidden from the
 # public schema in favor of /run/agents.
 @base_router.post("/run/workflows", include_in_schema=False)
@@ -4369,8 +4360,12 @@ async def models(
     response_model=CreateTaskResponse,
     include_in_schema=False,
 )
-@legacy_base_router.post("/otp-bound/tasks", response_model=CreateTaskResponse, include_in_schema=False)
-@legacy_base_router.post("/otp-bound/tasks/", response_model=CreateTaskResponse, include_in_schema=False)
+@legacy_base_router.post(
+    "/otp-bound/tasks", response_model=CreateTaskResponse, include_in_schema=False, dependencies=[OTP_BOUND_ROUTE]
+)
+@legacy_base_router.post(
+    "/otp-bound/tasks/", response_model=CreateTaskResponse, include_in_schema=False, dependencies=[OTP_BOUND_ROUTE]
+)
 async def run_task_v1(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -4753,8 +4748,12 @@ def _user_writable_run_metadata(run_metadata: dict[str, str] | None) -> dict[str
     },
 )
 @base_router.post("/workflows/runs/{workflow_run_id}/retry/", include_in_schema=False)
-@base_router.post("/otp-bound/workflows/runs/{workflow_run_id}/retry", include_in_schema=False)
-@base_router.post("/otp-bound/workflows/runs/{workflow_run_id}/retry/", include_in_schema=False)
+@base_router.post(
+    "/otp-bound/workflows/runs/{workflow_run_id}/retry", include_in_schema=False, dependencies=[OTP_BOUND_ROUTE]
+)
+@base_router.post(
+    "/otp-bound/workflows/runs/{workflow_run_id}/retry/", include_in_schema=False, dependencies=[OTP_BOUND_ROUTE]
+)
 async def retry_workflow_run(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -4792,7 +4791,7 @@ async def retry_workflow_run(
             status_code=http_status.HTTP_400_BAD_REQUEST,
             detail="Only terminal workflow runs can be retried",
         )
-    guarded_retry = _is_otp_bound_route(request)
+    guarded_retry = is_otp_bound_route(request)
     if guarded_retry and otp_request_id is None:
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
@@ -5797,11 +5796,13 @@ async def get_actions(
     "/otp-bound/workflows/{workflow_id}/run",
     response_model=RunWorkflowResponse,
     include_in_schema=False,
+    dependencies=[OTP_BOUND_ROUTE],
 )
 @legacy_base_router.post(
     "/otp-bound/workflows/{workflow_id}/run/",
     response_model=RunWorkflowResponse,
     include_in_schema=False,
+    dependencies=[OTP_BOUND_ROUTE],
 )
 async def run_workflow_legacy(
     request: Request,
@@ -7413,8 +7414,8 @@ async def get_file_signed_url(
     "/tasks/",
     include_in_schema=False,
 )
-@legacy_v2_router.post("/otp-bound/tasks", include_in_schema=False)
-@legacy_v2_router.post("/otp-bound/tasks/", include_in_schema=False)
+@legacy_v2_router.post("/otp-bound/tasks", include_in_schema=False, dependencies=[OTP_BOUND_ROUTE])
+@legacy_v2_router.post("/otp-bound/tasks/", include_in_schema=False, dependencies=[OTP_BOUND_ROUTE])
 async def run_task_v2(
     request: Request,
     background_tasks: BackgroundTasks,
