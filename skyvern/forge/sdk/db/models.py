@@ -2684,6 +2684,8 @@ class GoogleOAuthCredentialModel(Base):
     consent_app_origin = Column(String, nullable=True)
     consent_expires_at = Column(DateTime, nullable=True)
     client_id = Column(String, nullable=True)
+    # The user whose consent last made this row active; null when no signed-in person completed it.
+    initiating_user_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

@@ -3343,7 +3343,13 @@ async def test_mark_credential_expired_noop_when_not_active(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
-async def test_promote_pending_credential_encrypts_and_calls_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("initiator_id", "expected_initiator_id"),
+    [("user_1", "user_1"), ("org_1_user", None), (None, None)],
+)
+async def test_promote_pending_credential_encrypts_and_calls_repo(
+    monkeypatch: pytest.MonkeyPatch, initiator_id: str | None, expected_initiator_id: str | None
+) -> None:
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     encrypt_mock = AsyncMock(return_value="ENC::rt")
     monkeypatch.setattr(google_oauth_service, "encryptor", SimpleNamespace(encrypt=encrypt_mock))
@@ -3358,7 +3364,7 @@ async def test_promote_pending_credential_encrypts_and_calls_repo(monkeypatch: p
     result = await google_oauth_service.promote_pending_credential(
         organization_id="org_1",
         state="state-xyz",
-        initiator_id="user_1",
+        initiator_id=initiator_id,
         refresh_token="rt-plain",
         scopes_granted="https://a https://b",
     )
@@ -3368,11 +3374,12 @@ async def test_promote_pending_credential_encrypts_and_calls_repo(monkeypatch: p
     promote_mock.assert_awaited_once()
     kwargs = promote_mock.await_args.kwargs
     assert kwargs["organization_id"] == "org_1"
-    assert kwargs["nonce"] == oauth_consent.consent_nonce("state-xyz", "user_1")
+    assert kwargs["nonce"] == oauth_consent.consent_nonce("state-xyz", initiator_id)
     assert kwargs["nonce"] != "state-xyz"
     assert kwargs["encrypted_refresh_token"] == "ENC::rt"
     assert kwargs["encrypted_method"] == DEFAULT_ENCRYPT_METHOD
     assert kwargs["scopes_granted"] == ["https://a", "https://b"]
+    assert kwargs["initiating_user_id"] == expected_initiator_id
     # A re-auth reuses the credential id, so a token cached before rotation must be dropped.
     fake_cache.set.assert_awaited_once()
     cache_key = fake_cache.set.await_args.args[0]
