@@ -99,6 +99,7 @@ def _patch_clean_up_deps(monkeypatch: pytest.MonkeyPatch, browser_state: MagicMo
     # Engine off by default: the legacy own-memory write-back path runs byte-for-byte (flag-on tests
     # override this to True to exercise the sink-driven path).
     monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=False))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "persist_external_browser_profile", AsyncMock(return_value=False))
     monkeypatch.setattr(
         app.DATABASE.workflow_runs,
         "get_workflow_runs_by_parent_workflow_run_id",
