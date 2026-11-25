@@ -99,6 +99,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_CREDENTIAL_CODE_SAMPLE_PYTHON,
     UPDATE_CREDENTIAL_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.otp_bound import OTP_BOUND_ROUTE, is_otp_bound_route
 from skyvern.forge.sdk.routes.pagination import MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
@@ -556,21 +557,21 @@ def _cache_totp_code_preview(
     response_model=TOTPCode,
     responses={402: {"description": "Insufficient credits to parse OTP content"}},
     include_in_schema=False,
+    dependencies=[OTP_BOUND_ROUTE],
 )
 @base_router.post(
     "/otp-bound/credentials/totp/",
     response_model=TOTPCode,
     responses={402: {"description": "Insufficient credits to parse OTP content"}},
     include_in_schema=False,
+    dependencies=[OTP_BOUND_ROUTE],
 )
 async def send_totp_code(
     data: TOTPCodeCreate,
     curr_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     request: Request = None,  # type: ignore[assignment]
 ) -> TOTPCode:
-    route = request.scope.get("route") if request is not None else None
-    route_path = getattr(route, "path", "")
-    guarded = isinstance(route_path, str) and "/otp-bound/" in route_path
+    guarded = is_otp_bound_route(request)
     if guarded and data.otp_request_id is None:
         raise HTTPException(status_code=400, detail="otp_request_id is required on the otp-bound delivery endpoint")
     if not guarded and data.otp_request_id is not None:

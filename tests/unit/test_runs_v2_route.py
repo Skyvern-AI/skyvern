@@ -40,6 +40,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TaskRunRequest
+from tests.unit._otp_route_fakes import matched_route_request
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 from tests.unit.shared_route_app import shared_route_app
 from tests.unit.statement_timeout_fakes import statement_timeout_error
@@ -1009,7 +1010,7 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
 
     caller = _caller()
     request = (
-        SimpleNamespace(scope={"route": SimpleNamespace(path="/v1/otp-bound/workflows/runs/{workflow_run_id}/retry")})
+        matched_route_request("/v1/otp-bound/workflows/runs/{workflow_run_id}/retry", otp_bound=True)
         if guarded_retry
         else SimpleNamespace()
     )
@@ -1354,16 +1355,32 @@ async def test_retry_workflow_run_rejects_missing_workflow(monkeypatch: pytest.M
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "otp_request_id", "expected_detail"),
+    ("status", "otp_request_id", "route", "retry_otp_request_id", "expected_detail"),
     [
-        (WorkflowRunStatus.running, None, "Only terminal workflow runs can be retried"),
-        (WorkflowRunStatus.failed, "otpr_test", "otp-bound retry endpoint"),
+        (WorkflowRunStatus.running, None, None, None, "Only terminal workflow runs can be retried"),
+        (WorkflowRunStatus.failed, "otpr_test", None, None, "otp-bound retry endpoint"),
+        (
+            WorkflowRunStatus.failed,
+            None,
+            ("/v1/renamed/workflows/runs/{workflow_run_id}/retry", True),
+            None,
+            "otp_request_id is required on the otp-bound retry endpoint",
+        ),
+        (
+            WorkflowRunStatus.failed,
+            None,
+            ("/v1/otp-bound/workflows/runs/{workflow_run_id}/retry", False),
+            "otpr_new",
+            "otp_request_id is accepted only on the otp-bound retry endpoint",
+        ),
     ],
 )
 async def test_retry_workflow_run_rejects_active_run(
     monkeypatch: pytest.MonkeyPatch,
     status: WorkflowRunStatus,
     otp_request_id: str | None,
+    route: tuple[str, bool] | None,
+    retry_otp_request_id: str | None,
     expected_detail: str,
 ) -> None:
     mock_workflow_runs = SimpleNamespace(
@@ -1380,9 +1397,10 @@ async def test_retry_workflow_run_rejects_active_run(
 
     with pytest.raises(HTTPException) as exc_info:
         await agent_protocol.retry_workflow_run(
-            request=SimpleNamespace(),
+            request=SimpleNamespace() if route is None else matched_route_request(route[0], otp_bound=route[1]),
             background_tasks=BackgroundTasks(),
             workflow_run_id="wr_running",
+            otp_request_id=retry_otp_request_id,
             caller=_caller(),
             x_api_key=None,
             x_max_steps_override=None,
@@ -1475,7 +1493,7 @@ async def test_run_task_v1_uses_resolved_caller_type_with_ui_user_agent(monkeypa
     background_tasks = BackgroundTasks()
 
     response = await agent_protocol.run_task(
-        request=SimpleNamespace(scope={"route": SimpleNamespace(path="/v1/otp-bound/run/tasks")}),
+        request=matched_route_request("/v1/otp-bound/run/tasks", otp_bound=True),
         background_tasks=background_tasks,
         run_request=_task_run_request(RunEngine.skyvern_v1, otp_request_id="otpr_test"),
         caller=SimpleNamespace(
@@ -1513,7 +1531,7 @@ async def test_run_task_v2_schedules_run_created_hook(monkeypatch: pytest.Monkey
     background_tasks = BackgroundTasks()
 
     response = await agent_protocol.run_task(
-        request=SimpleNamespace(scope={"route": SimpleNamespace(path="/v1/otp-bound/run/tasks")}),
+        request=matched_route_request("/v1/otp-bound/run/tasks", otp_bound=True),
         background_tasks=background_tasks,
         run_request=_task_run_request(RunEngine.skyvern_v2, otp_request_id="otpr_test"),
         caller=SimpleNamespace(
@@ -1593,6 +1611,7 @@ async def test_run_task_does_not_schedule_run_created_hook_when_creation_fails(
     (
         "run_kind",
         "path",
+        "otp_bound",
         "otp_request_id",
         "resource_kwargs",
         "strict_otp_execution_available",
@@ -1600,11 +1619,12 @@ async def test_run_task_does_not_schedule_run_created_hook_when_creation_fails(
         "expected_detail",
     ),
     [
-        ("task_v1", "/v1/run/tasks", "otpr_test", {}, True, 400, "otp_request_id"),
-        ("task_v1", "/v1/otp-bound/run/tasks", None, {}, True, 400, "otp_request_id"),
+        ("task_v1", "/v1/run/tasks", False, "otpr_test", {}, True, 400, "otp_request_id"),
+        ("task_v1", "/v1/otp-bound/run/tasks", True, None, {}, True, 400, "otp_request_id"),
         (
             "task_v1",
             "/v1/otp-bound/run/tasks",
+            True,
             "otpr_test",
             {"browser_session_id": "pbs_existing"},
             True,
@@ -1614,6 +1634,7 @@ async def test_run_task_does_not_schedule_run_created_hook_when_creation_fails(
         (
             "task_v1",
             "/v1/otp-bound/run/tasks",
+            True,
             "otpr_test",
             {"browser_profile_id": "bp_existing"},
             True,
@@ -1623,21 +1644,25 @@ async def test_run_task_does_not_schedule_run_created_hook_when_creation_fails(
         (
             "task_v1",
             "/v1/otp-bound/run/tasks",
+            True,
             "otpr_test",
             {"browser_address": "wss://browser.example.test/devtools/browser/id"},
             True,
             400,
             "fresh local",
         ),
-        ("task_v1", "/v1/otp-bound/run/tasks", "otpr_test", {}, False, 501, "not supported"),
-        ("task_v2", "/v1/otp-bound/run/tasks", "otpr_test", {}, False, 501, "not supported"),
-        ("workflow", "/v1/otp-bound/run/agents", "otpr_test", {}, False, 501, "not supported"),
+        ("task_v1", "/v1/otp-bound/run/tasks", True, "otpr_test", {}, False, 501, "not supported"),
+        ("task_v2", "/v1/otp-bound/run/tasks", True, "otpr_test", {}, False, 501, "not supported"),
+        ("workflow", "/v1/otp-bound/run/agents", True, "otpr_test", {}, False, 501, "not supported"),
+        ("task_v1", "/v1/renamed/run/tasks", True, None, {}, True, 400, "otp_request_id is required"),
+        ("task_v1", "/v1/otp-bound/run/tasks", False, "otpr_test", {}, True, 400, "accepted only"),
     ],
 )
 async def test_run_task_refuses_ambiguous_strict_admission_before_creation(
     monkeypatch: pytest.MonkeyPatch,
     run_kind: str,
     path: str,
+    otp_bound: bool,
     otp_request_id: str | None,
     resource_kwargs: dict[str, object],
     strict_otp_execution_available: bool,
@@ -1662,7 +1687,7 @@ async def test_run_task_refuses_ambiguous_strict_admission_before_creation(
     with pytest.raises(HTTPException, match=expected_detail) as exc_info:
         if run_kind == "workflow":
             await agent_protocol.run_workflow(
-                request=SimpleNamespace(scope={"route": SimpleNamespace(path=path)}),
+                request=matched_route_request(path, otp_bound=otp_bound),
                 background_tasks=BackgroundTasks(),
                 workflow_run_request=SimpleNamespace(otp_request_id=otp_request_id, **resource_kwargs),
                 caller=SimpleNamespace(
@@ -1672,7 +1697,7 @@ async def test_run_task_refuses_ambiguous_strict_admission_before_creation(
             )
         else:
             await agent_protocol.run_task(
-                request=SimpleNamespace(scope={"route": SimpleNamespace(path=path)}),
+                request=matched_route_request(path, otp_bound=otp_bound),
                 background_tasks=BackgroundTasks(),
                 run_request=run_request,
                 caller=SimpleNamespace(
