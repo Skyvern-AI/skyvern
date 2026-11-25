@@ -103,7 +103,12 @@ from skyvern.schemas.workflow_run_groups import DEFAULT_RUN_GROUP_LIMITS, RunGro
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
 from skyvern.services.email.gmail import GmailSendResult
 from skyvern.services.email.gmail_client import GmailAPIError
-from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
+from skyvern.services.otp_email import (
+    EmailOTPSearchError,
+    EmailOTPSource,
+    EmailOTPVerificationContext,
+    build_email_otp_sources,
+)
 from skyvern.services.webhook_delivery import WebhookDeliveryAttempts, bound_webhook_request
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
 from skyvern.settings_manager import SettingsManager
@@ -3247,6 +3252,10 @@ class AgentFunction:
                 credential_id=credential_id,
             )
             return None
+
+    def get_extra_email_otp_sources(self) -> list[EmailOTPSource]:
+        """Email code sources a deployment adds after the built-in inbox sources."""
+        return []
 
     async def get_otp_value_from_email(
         self,

@@ -289,4 +289,5 @@ def build_email_otp_sources(agent_function: AgentFunction) -> list[EmailOTPSourc
     return [
         GmailOTPSource(agent_function.get_google_workspace_credentials),
         OutlookOTPSource(agent_function.get_microsoft_credentials),
+        *agent_function.get_extra_email_otp_sources(),
     ]
