@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import httpx
@@ -10,7 +10,7 @@ from skyvern.forge.sdk.services import google_sheets_service
 @pytest.fixture
 def mock_sheets_transport(
     monkeypatch: pytest.MonkeyPatch,
-) -> Callable[[Callable[[httpx.Request], httpx.Response]], None]:
+) -> Iterator[Callable[[Callable[[httpx.Request], httpx.Response]], None]]:
     def install(handler: Callable[[httpx.Request], httpx.Response]) -> None:
         transport = httpx.MockTransport(handler)
         real_client = httpx.AsyncClient
@@ -20,5 +20,7 @@ def mock_sheets_transport(
             return real_client(*args, **kwargs)
 
         monkeypatch.setattr(google_sheets_service.httpx, "AsyncClient", fake_async_client)
+        google_sheets_service.reset_shared_clients()
 
-    return install
+    yield install
+    google_sheets_service.reset_shared_clients()

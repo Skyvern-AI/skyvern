@@ -728,7 +728,7 @@ async def test_mark_active_mismatched_client_as_error_flips_only_mismatched_boun
             ).all()
         )
 
-    assert changed == 1
+    assert changed == ["gcred_flip"]
     assert states == {
         "gcred_flip": STATE_ERROR,
         "gcred_match": STATE_ACTIVE,
@@ -787,7 +787,7 @@ async def test_mark_active_mismatched_client_as_error_with_no_new_client_flips_a
             ).all()
         )
 
-    assert changed == 2
+    assert sorted(changed) == ["gcred_bound_1", "gcred_bound_2"]
     assert states == {
         "gcred_bound_1": STATE_ERROR,
         "gcred_bound_2": STATE_ERROR,

@@ -193,6 +193,8 @@ def create_forge_stub_app() -> ForgeApp:
         base_agent_function.get_task_v3_llm_route_treatment_key
     )
     fake_app_module.AGENT_FUNCTION.supports_image_captcha_ocr = base_agent_function.supports_image_captcha_ocr
+    # Auto-mocked, the read-through would hand the Sheets routes a mock instead of the minted token.
+    fake_app_module.AGENT_FUNCTION.get_or_mint_google_access_token = base_agent_function.get_or_mint_google_access_token
     fake_app_module.AGENT_FUNCTION.challenge_solve_recording = base_agent_function.challenge_solve_recording
     # Credential write-lock gating — _LazyNamespace would auto-mock these as truthy AsyncMocks,
     # forcing the update/delete credential routes down the lock path and handing `async with` a
