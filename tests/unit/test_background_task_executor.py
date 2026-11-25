@@ -3529,6 +3529,9 @@ async def test_scheduled_run_whose_initializer_fails_is_recovered_after_a_restar
     organization = SimpleNamespace(organization_id="org_test", default_llm_key=None, default_secondary_llm_key=None)
     monkeypatch.setattr(app, "DATABASE", sqlite_db)
     monkeypatch.setattr(sqlite_db.organizations, "get_organization", AsyncMock(return_value=organization))
+    monkeypatch.setattr(
+        sqlite_db.schedules, "get_workflow_schedule_by_id", AsyncMock(return_value=SimpleNamespace(enabled=True))
+    )
     monkeypatch.setattr(app.AGENT_FUNCTION, "get_workflow_run_execution_status", AsyncMock(return_value="absent"))
     monkeypatch.setattr(BackgroundTaskExecutor, "_get_valid_api_key", AsyncMock(return_value="token"))
     monkeypatch.setattr(

@@ -120,6 +120,7 @@ async def test_dispatch_due_schedules_launches_scheduled_workflow(monkeypatch: p
         DATABASE=SimpleNamespace(
             schedules=SimpleNamespace(
                 get_all_enabled_schedules=AsyncMock(return_value=[schedule]),
+                get_workflow_schedule_by_id=AsyncMock(return_value=schedule),
                 has_schedule_fired_since=AsyncMock(return_value=False),
             ),
             organizations=SimpleNamespace(get_organization=AsyncMock(return_value=fake_org)),
@@ -182,6 +183,7 @@ async def test_run_schedule_no_policy_initializer_failure_fails_the_run(
     get_attempts = AsyncMock(return_value=[SimpleNamespace(attempt_number=1)] if has_attempt_row else [])
     fake_app = SimpleNamespace(
         DATABASE=SimpleNamespace(
+            schedules=SimpleNamespace(get_workflow_schedule_by_id=AsyncMock(return_value=schedule)),
             organizations=SimpleNamespace(
                 get_organization=AsyncMock(return_value=SimpleNamespace(organization_id="org_test"))
             ),
@@ -270,44 +272,63 @@ async def test_a_late_one_time_schedule_dispatches_from_its_claimed_row_and_read
 
 
 @pytest.mark.asyncio
-async def test_a_one_time_fire_scanned_before_run_at_was_edited_starts_no_run(
-    agent_db: AgentDB, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("change", ["none", "disabled", "deleted", "one-time run_at edited"])
+async def test_a_fire_scanned_before_its_schedule_changed_starts_a_run_only_if_unchanged(
+    agent_db: AgentDB, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
-    run_at = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
-    with freeze_time(run_at - timedelta(hours=1), real_asyncio=True):
+    fire_at = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
+    one_time = change == "one-time run_at edited"
+    with freeze_time(fire_at - timedelta(hours=1), real_asyncio=True):
         schedule = await agent_db.schedules.create_workflow_schedule(
             organization_id="org_test",
             workflow_permanent_id="wpid_test",
-            cron_expression=None,
+            cron_expression=None if one_time else "0 * * * *",
             timezone="UTC",
             enabled=True,
-            run_at=run_at,
+            run_at=fire_at if one_time else None,
         )
-        await agent_db.schedules.update_workflow_schedule(
-            schedule.workflow_schedule_id,
-            "org_test",
-            cron_expression=None,
-            timezone="UTC",
-            run_at=run_at + timedelta(days=1),
-        )
-    prepare_workflow = AsyncMock()
+        if one_time:
+            await agent_db.schedules.update_workflow_schedule(
+                schedule.workflow_schedule_id,
+                "org_test",
+                cron_expression=None,
+                timezone="UTC",
+                run_at=fire_at + timedelta(days=1),
+            )
+        elif change == "disabled":
+            await agent_db.schedules.update_workflow_schedule_enabled(schedule.workflow_schedule_id, "org_test", False)
+        elif change == "deleted":
+            await agent_db.schedules.delete_workflow_schedule(schedule.workflow_schedule_id, "org_test")
+    started_runs: list[str] = []
+
+    async def prepare_workflow(*, workflow_run_id: str, **_kwargs: object) -> SimpleNamespace:
+        started_runs.append(workflow_run_id)
+        return SimpleNamespace(workflow_run_id=workflow_run_id, browser_session_id=None)
+
     fake_app = SimpleNamespace(
         DATABASE=SimpleNamespace(
             schedules=agent_db.schedules,
             organizations=SimpleNamespace(
                 get_organization=AsyncMock(return_value=SimpleNamespace(organization_id="org_test"))
             ),
+            workflow_runs=SimpleNamespace(queue_initial_dispatch=AsyncMock(return_value=True)),
         ),
+        WORKFLOW_SERVICE=SimpleNamespace(execute_workflow_with_retries=AsyncMock()),
     )
     monkeypatch.setattr(schedule_service, "app", fake_app)
+    monkeypatch.setattr(retry_policy_module, "app", fake_app)
     monkeypatch.setattr(schedule_service, "prepare_workflow", prepare_workflow)
+    monkeypatch.setattr(schedule_service, "initialize_skyvern_state_file", AsyncMock())
+    monkeypatch.setattr(schedule_service, "prepare_org_llm_runtime", AsyncMock())
     scheduler = schedule_service.LocalWorkflowScheduleScheduler(poll_interval_seconds=1, max_concurrent_runs=1)
 
-    with freeze_time(run_at + timedelta(days=2), real_asyncio=True):
+    with freeze_time(fire_at + timedelta(days=2), real_asyncio=True):
         await scheduler._run_schedule(
-            schedule_service.DueWorkflowSchedule(schedule=schedule, previous_fire_time=run_at)
+            schedule_service.DueWorkflowSchedule(schedule=schedule, previous_fire_time=fire_at)
         )
 
-    prepare_workflow.assert_not_awaited()
-    stored = await agent_db.schedules.get_workflow_schedule_by_id(schedule.workflow_schedule_id, "org_test")
-    assert stored is not None and stored.dispatch_status == OneTimeDispatchStatus.pending
+    expected_run_id = schedule_service.build_scheduled_workflow_run_id(schedule.workflow_schedule_id, fire_at)
+    assert started_runs == ([expected_run_id] if change == "none" else [])
+    if one_time:
+        stored = await agent_db.schedules.get_workflow_schedule_by_id(schedule.workflow_schedule_id, "org_test")
+        assert stored is not None and stored.dispatch_status == OneTimeDispatchStatus.pending

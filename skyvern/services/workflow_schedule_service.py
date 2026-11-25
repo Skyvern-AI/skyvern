@@ -68,8 +68,19 @@ def due_fire_time(schedule: WorkflowSchedule) -> datetime | None:
 async def claim_schedule_for_dispatch(
     schedule: WorkflowSchedule, workflow_run_id: str, fire_at: datetime
 ) -> WorkflowSchedule | None:
-    """Return the row to dispatch from, or None when a one-time schedule was not claimed for this fire."""
+    """Return the row to dispatch from, or None when the schedule is no longer live and enabled for this fire."""
     if not schedule.is_one_time:
+        current = await app.DATABASE.schedules.get_workflow_schedule_by_id(
+            schedule.workflow_schedule_id, schedule.organization_id
+        )
+        if current is None or not current.enabled:
+            LOG.info(
+                "Skipping scheduled fire; schedule was disabled or deleted after the scan",
+                workflow_schedule_id=schedule.workflow_schedule_id,
+                organization_id=schedule.organization_id,
+                workflow_run_id=workflow_run_id,
+            )
+            return None
         return schedule
     return await app.DATABASE.schedules.claim_one_time_dispatch(
         schedule.workflow_schedule_id, schedule.organization_id, workflow_run_id, fire_at
@@ -312,7 +323,7 @@ class LocalWorkflowScheduleScheduler:
         claimed = await claim_schedule_for_dispatch(schedule, workflow_run_id, due.previous_fire_time)
         if claimed is None:
             LOG.info(
-                "One-time schedule was not claimed for this fire; skipping",
+                "Schedule was not claimed for this fire; skipping",
                 workflow_schedule_id=schedule.workflow_schedule_id,
                 workflow_run_id=workflow_run_id,
             )
