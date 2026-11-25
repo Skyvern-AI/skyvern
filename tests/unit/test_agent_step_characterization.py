@@ -687,10 +687,20 @@ async def test_non_blank_scrape_failure_is_not_recovered(monkeypatch: pytest.Mon
     # A generic scrape failure (not a dead blank) must propagate untouched: recovery only ever adds a
     # path for the blank signature, never intercepts other terminal scrape errors.
     rig = make_agent_step_rig(monkeypatch)
-    rig.agent.build_and_record_step_prompt = AsyncMock(side_effect=ScrapingFailed())
+
+    async def refreshed_step(step: Step, status: StepStatus | None = None, **_: Any) -> Step:
+        return step.model_copy(update={"status": status})
+
+    async def fail_after_model(_task: Task, step: Step, *_args: Any, **_kwargs: Any) -> None:
+        step.last_llm_model = "known-model"
+        raise ScrapingFailed()
+
+    rig.agent.update_step = AsyncMock(side_effect=refreshed_step)
+    rig.agent.build_and_record_step_prompt = AsyncMock(side_effect=fail_after_model)
 
     with pytest.raises(ScrapingFailed):
         await rig.run()
+    assert rig.step.last_llm_model == "known-model"
     assert rig.action_handler.await_count == 0
     assert rig.task.task_id not in rig.context.empty_page_recovery_attempts
 

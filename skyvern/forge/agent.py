@@ -5403,6 +5403,10 @@ class ForgeAgent:
                 engine = RunEngine.skyvern_v1
                 context.engine = engine
 
+            if dispatched_as_v3 and task.workflow_run_id is None:
+                # The task_runs row keeps the requested arm; telemetry follows the step engine used below.
+                context.engine = RunEngine.skyvern_v1
+
             if page := await browser_state.get_working_page():
                 await self.register_async_operations(organization, task, page)
 
@@ -6628,6 +6632,7 @@ class ForgeAgent:
             # await here: this branch adds no cancellation point and cannot double-write the step.
             detailed_agent_step_output.step_exception = e.__class__.__name__
             handoff_step.output = detailed_agent_step_output.to_agent_step_output()
+            handoff_step.last_llm_model = step.last_llm_model
             raise
 
         except Exception as e:
@@ -11515,20 +11520,13 @@ class ForgeAgent:
             duration_seconds = (datetime.now(UTC) - step.created_at.replace(tzinfo=UTC)).total_seconds()
             context = skyvern_context.current()
             engine = context.engine if context and context.task_id == step.task_id else None
-            model = step.last_llm_model
-            try:
-                persisted_step = await app.DATABASE.tasks.get_step(step.step_id, organization_id=step.organization_id)
-                if persisted_step is not None:
-                    model = persisted_step.last_llm_model
-            except Exception:
-                LOG.warning("Step model lookup for duration metrics failed", step_id=step.step_id, exc_info=True)
             LOG.info(
                 "Step duration metrics",
                 duration_seconds=duration_seconds,
                 step_status=status,
                 organization_id=step.organization_id,
                 engine=engine.value if engine else None,
-                model=model,
+                model=step.last_llm_model,
             )
 
         await save_step_logs(step.step_id)
@@ -11633,6 +11631,9 @@ class ForgeAgent:
             except Exception:
                 LOG.warning("task_run_type resolution for duration metrics failed", task_id=task.task_id, exc_info=True)
             run_engine = _ENGINE_BY_RUN_TYPE.get(task_run_type) if task_run_type else None
+            context = skyvern_context.current()
+            if context and context.task_id == task.task_id and context.engine:
+                run_engine = context.engine
             LOG.info(
                 "Task duration metrics",
                 task_id=task.task_id,

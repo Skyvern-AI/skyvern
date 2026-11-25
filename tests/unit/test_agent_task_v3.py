@@ -2679,6 +2679,7 @@ async def _run_execute_step_gate(
     finally:
         skyvern_context.reset()
     v3_mock.task = task
+    v3_mock.context = context
     v3_mock.fail_task_mock = fail_task_mock
     return v3_mock, step_engine_mock
 
@@ -2769,6 +2770,7 @@ async def test_execute_step_v1_engine_block_unaffected() -> None:
 async def test_execute_step_bare_task_dispatch_unchanged() -> None:
     v3_mock, step_engine_mock = await _run_execute_step_gate(engine=agent_module.RunEngine.skyvern_v3, task_block=None)
     v3_mock.assert_awaited_once()
+    assert v3_mock.context.engine == agent_module.RunEngine.skyvern_v3
     assert v3_mock.await_args.kwargs["task_block"] is None
     step_engine_mock.assert_not_awaited()
 
@@ -2822,6 +2824,13 @@ async def test_disabled_v3_dispatch_is_not_credited_as_pure() -> None:
     v3_mock.assert_not_awaited()
     step_engine_mock.assert_awaited_once()
 
+    bare_v3_mock, _ = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=None,
+        experimentation_provider=provider,
+    )
+    assert bare_v3_mock.context.engine == agent_module.RunEngine.skyvern_v1
+
 
 @pytest.mark.asyncio
 async def test_an_unevaluable_kill_switch_runs_an_explicit_v3_block_on_the_step_engine() -> None:
@@ -2848,6 +2857,13 @@ async def test_an_unevaluable_kill_switch_runs_an_explicit_v3_block_on_the_step_
     assert any(
         log.get("route_reason") == "flag_error" and log.get("workflow_run_id") == "wr_task_v3_kill_down" for log in logs
     )
+
+    bare_v3_mock, _ = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=None,
+        experimentation_provider=provider,
+    )
+    assert bare_v3_mock.context.engine == agent_module.RunEngine.skyvern_v1
 
 
 @pytest.mark.asyncio

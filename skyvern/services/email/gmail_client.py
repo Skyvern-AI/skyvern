@@ -1,58 +1,33 @@
 import asyncio
 import base64
 import binascii
-from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
 import structlog
 
+from skyvern.forge.sdk.integrations.google.client import (
+    RATE_LIMIT_REASONS,
+    RETRYABLE_STATUSES,
+    GoogleAPIError,
+    error_from_response,
+    is_rate_limit_refusal,
+)
+from skyvern.forge.sdk.integrations.http import compute_backoff
+
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
-_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
-GMAIL_RATE_LIMIT_REASONS = {"rateLimitExceeded", "userRateLimitExceeded"}
+GMAIL_RATE_LIMIT_REASONS = RATE_LIMIT_REASONS
 _MAX_ATTEMPTS = 3
 _MAX_BACKOFF_SECONDS = 5.0
 LOG = structlog.get_logger()
 
 
-class GmailAPIError(RuntimeError):
-    def __init__(self, *, status: int, code: str | None, message: str) -> None:
-        super().__init__(message)
-        self.status = status
-        self.code = code
-        self.message = message
+class GmailAPIError(GoogleAPIError):
+    pass
 
 
 def _compute_backoff(attempt: int, retry_after: str | None) -> float:
-    if retry_after:
-        value = retry_after.strip()
-        try:
-            return min(max(0.0, float(value)), _MAX_BACKOFF_SECONDS)
-        except ValueError:
-            pass
-        try:
-            target = parsedate_to_datetime(value)
-        except (TypeError, ValueError):
-            target = None
-        if target is not None:
-            if target.tzinfo is None:
-                target = target.replace(tzinfo=UTC)
-            delta = (target - datetime.now(UTC)).total_seconds()
-            return min(max(0.0, delta), _MAX_BACKOFF_SECONDS)
-    return min(0.5 * (3 ** (attempt - 1)), _MAX_BACKOFF_SECONDS)
-
-
-def _error_reason(response: httpx.Response) -> str | None:
-    try:
-        error = response.json().get("error")
-        details = error.get("errors") if isinstance(error, dict) else None
-        reason = (
-            details[0].get("reason") if isinstance(details, list) and details and isinstance(details[0], dict) else None
-        )
-        return reason if isinstance(reason, str) else None
-    except (ValueError, AttributeError):
-        return None
+    return compute_backoff(attempt, retry_after, base_seconds=0.5, factor=3, max_seconds=_MAX_BACKOFF_SECONDS)
 
 
 async def get_json(
@@ -79,10 +54,12 @@ async def get_json(
                 ) from exc
             await asyncio.sleep(_compute_backoff(attempt, None))
             continue
-        retryable = response.status_code in _RETRYABLE_STATUSES or (
-            response.status_code == 403 and _error_reason(response) in GMAIL_RATE_LIMIT_REASONS
+        if response.is_success:
+            break
+        retryable = response.status_code in RETRYABLE_STATUSES or is_rate_limit_refusal(
+            response.status_code, response.text
         )
-        if response.is_success or not retryable or attempt == _MAX_ATTEMPTS:
+        if not retryable or attempt == _MAX_ATTEMPTS:
             break
         await asyncio.sleep(_compute_backoff(attempt, response.headers.get("Retry-After")))
 
@@ -91,20 +68,9 @@ async def get_json(
     if response.is_success:
         return response.json() or {}
 
-    code = None
-    message = response.text[:500] or "Gmail API error"
-    try:
-        err = (response.json() or {}).get("error")
-        if isinstance(err, dict):
-            message = err.get("message") or message
-            details = err.get("errors")
-            if isinstance(details, list) and details and isinstance(details[0], dict):
-                code = details[0].get("reason")
-    except ValueError:
-        pass
-    if response.status_code == 403 and code in {"insufficientPermissions", "insufficientScopes"}:
-        code = "reconnect_required"
-    raise GmailAPIError(status=response.status_code, code=code, message=message)
+    raise error_from_response(
+        response, GmailAPIError, default_message="Gmail API error", body_text_when_message_missing=True
+    )
 
 
 def decode(data: str | None) -> str:
