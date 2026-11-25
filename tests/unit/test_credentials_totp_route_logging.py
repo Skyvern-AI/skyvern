@@ -18,6 +18,7 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialNotConfiguredError
 from skyvern.services.otp_service import OTPValue
+from tests.unit._otp_route_fakes import matched_route_request
 from tests.unit.shared_route_app import shared_route_app
 
 
@@ -98,7 +99,7 @@ async def test_send_totp_code_save_log_redacts_identifier_and_normalizes_email_f
         otp_request_id="otpr_test",
         status=TaskStatus.running,
     )
-    strict_request = SimpleNamespace(scope={"route": SimpleNamespace(path="/v1/otp-bound/credentials/totp")})
+    strict_request = matched_route_request("/v1/otp-bound/credentials/totp", otp_bound=True)
     monkeypatch.setattr(
         credentials.app,
         "DATABASE",

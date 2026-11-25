@@ -14,6 +14,7 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.tags import CallerType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML, WorkflowRequest
+from tests.unit._otp_route_fakes import matched_route_request
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 
@@ -425,7 +426,7 @@ class TestRunCreatedHookWiring:
             run_workflow.side_effect = OTPRequestAlreadyBoundError(owner_type="workflow_run", owner_id="wr_owner")
             with pytest.raises(HTTPException, match="already bound") as legacy_conflict:
                 await agent_protocol.run_workflow_legacy(
-                    request=MagicMock(scope={"route": MagicMock(path="/v1/otp-bound/workflows/{workflow_id}/run")}),
+                    request=matched_route_request("/v1/otp-bound/workflows/{workflow_id}/run", otp_bound=True),
                     background_tasks=background_tasks,
                     workflow_id="wpid_1",
                     workflow_request=WorkflowRequestBody(otp_request_id="otpr_retry"),
@@ -509,8 +510,8 @@ class TestRunCreatedHookWiring:
             retry_workflow.side_effect = OTPRequestAlreadyBoundError(owner_type="workflow_run", owner_id="wr_owner")
             with pytest.raises(HTTPException, match="already bound") as retry_conflict:
                 await agent_protocol.retry_workflow_run(
-                    request=MagicMock(
-                        scope={"route": MagicMock(path="/v1/otp-bound/workflows/runs/{workflow_run_id}/retry")}
+                    request=matched_route_request(
+                        "/v1/otp-bound/workflows/runs/{workflow_run_id}/retry", otp_bound=True
                     ),
                     background_tasks=background_tasks,
                     workflow_run_id="wr_old",
