@@ -1427,10 +1427,26 @@ async def test_substitute_artifact_urls_keeps_legacy_screenshot_lookup_beside_sc
         "outputs": [7, {"task_id": "tsk_1", "task_screenshots": ["stale"], "extracted_information": {"k": "v"}}, "s"]
     }
 
-    with patch.object(service, "get_recent_task_screenshot_urls", AsyncMock(return_value=["fresh"])) as lookup:
+    now = datetime(2026, 11, 24, tzinfo=UTC)
+    screenshot = Artifact(
+        artifact_id="a_1",
+        artifact_type=ArtifactType.SCREENSHOT_FINAL,
+        uri="s3://bucket/a_1.png",
+        organization_id="o_1",
+        task_id="tsk_1",
+        workflow_run_id="wr_1",
+        created_at=now,
+        modified_at=now,
+    )
+    with (
+        patch.object(service, "get_recent_task_screenshot_artifacts", AsyncMock(return_value=[screenshot])),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.get_share_links_with_bundle_support",
+            AsyncMock(return_value=["fresh"]),
+        ),
+    ):
         await service._substitute_artifact_urls(value, {}, {}, "wr_1", "o_1")
 
-    lookup.assert_awaited_once_with(organization_id="o_1", task_id="tsk_1")
     assert value == {
         "outputs": [7, {"task_id": "tsk_1", "task_screenshots": ["fresh"], "extracted_information": {"k": "v"}}, "s"]
     }

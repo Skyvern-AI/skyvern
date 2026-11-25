@@ -18,15 +18,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.workflow.service import WorkflowService
 
 
-def _make_artifact(artifact_id: str, uri: str, checksum: str | None = "sha-x") -> Artifact:
+def _make_artifact(
+    artifact_id: str,
+    uri: str,
+    checksum: str | None = "sha-x",
+    artifact_type: ArtifactType = ArtifactType.DOWNLOAD,
+) -> Artifact:
     return Artifact(
         artifact_id=artifact_id,
-        artifact_type=ArtifactType.DOWNLOAD,
+        artifact_type=artifact_type,
         uri=uri,
         organization_id="o_1",
         run_id="wr_1",
@@ -328,30 +335,80 @@ async def test_refresh_with_only_the_database_stubbed_rebuilds_urls_in_place_and
 
 
 @pytest.mark.asyncio
-async def test_refresh_issues_one_batch_db_call_for_n_blocks():
-    """For N blocks with artifact IDs, _refresh_output_urls must call
-    get_artifacts_by_ids exactly ONCE (with all IDs combined) rather than
-    once per block — this is the core O(N) → O(1) reduction."""
-    from skyvern.forge.sdk.workflow.service import WorkflowService
+@pytest.mark.parametrize("foreign_readable", [True, False])
+@pytest.mark.parametrize("enforced", [True, False])
+async def test_refresh_signs_only_references_the_run_can_read(enforced: bool, foreign_readable: bool):
+    """A block output can name any artifact or task id of its organization. With the read check enforced, only the
+    run's own references of the expected kind and ones the run itself can read are shown; otherwise all resolve."""
 
-    # Three blocks, each with a screenshot artifact ID.
-    tree = {
-        "out_1": {"task_screenshot_artifact_ids": ["s_1"], "workflow_screenshot_artifact_ids": []},
-        "out_2": {"task_screenshot_artifact_ids": ["s_2"], "workflow_screenshot_artifact_ids": []},
-        "out_3": {"task_screenshot_artifact_ids": ["s_3"], "workflow_screenshot_artifact_ids": []},
+    def artifact(artifact_id: str, artifact_type: ArtifactType, workflow_run_id: str | None) -> Artifact:
+        return Artifact(
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            uri=f"s3://bucket/{artifact_id}",
+            organization_id="o_1",
+            workflow_run_id=workflow_run_id,
+            created_at="2026-11-23T00:00:00Z",
+            modified_at="2026-11-23T00:00:00Z",
+        )
+
+    rows = {
+        a.artifact_id: a
+        for a in (
+            artifact("s_own", ArtifactType.SCREENSHOT_FINAL, "wr_1"),
+            artifact("s_other_run", ArtifactType.SCREENSHOT_FINAL, "wr_other"),
+            artifact("s_wrong_kind", ArtifactType.LLM_PROMPT, "wr_1"),
+            # A run this run started through a block is part of it, whoever may read the child.
+            artifact("s_block_child", ArtifactType.SCREENSHOT_FINAL, "wr_block_child"),
+            artifact("d_other_run", ArtifactType.DOWNLOAD, "wr_other"),
+        )
     }
+    stored_download = {"url": "https://stale.example/d_other_run.pdf", "filename": "d_other_run.pdf"}
+    block = {
+        "task_screenshot_artifact_ids": ["s_own", "s_other_run", "s_wrong_kind", "s_block_child"],
+        "workflow_screenshot_artifact_ids": [],
+        "downloaded_file_artifact_ids": ["d_other_run"],
+        "downloaded_files": [{**stored_download, "artifact_id": "d_other_run"}],
+        "downloaded_file_urls": [stored_download["url"]],
+    }
+    legacy_block = {"task_id": "tsk_other_run", "task_screenshots": ["https://stale.example/shot.png"]}
+    # Older screenshot rows carry no run id; the run's own task still makes them the run's.
+    own_legacy_block = {"task_id": "tsk_own", "task_screenshots": ["https://stale.example/own.png"]}
+    child_legacy_block = {"task_id": "tsk_child", "task_screenshots": ["https://stale.example/child.png"]}
+    # A task whose lookup fails is treated as outside the run.
+    unknown_legacy_block = {"task_id": "tsk_unknown", "task_screenshots": ["https://stale.example/unknown.png"]}
+    tree = {
+        "block": block,
+        "legacy": legacy_block,
+        "own_legacy": own_legacy_block,
+        "child_legacy": child_legacy_block,
+        "unknown_legacy": unknown_legacy_block,
+    }
+    legacy_screenshots = {
+        "tsk_other_run": artifact("s_legacy", ArtifactType.SCREENSHOT_FINAL, "wr_other"),
+        "tsk_own": artifact("s_own_legacy", ArtifactType.SCREENSHOT_FINAL, None),
+        "tsk_child": artifact("s_child_legacy", ArtifactType.SCREENSHOT_FINAL, "wr_child"),
+        "tsk_unknown": artifact("s_unknown_legacy", ArtifactType.SCREENSHOT_FINAL, None),
+    }
+    # The run's own tasks come from the status read's task list, so they need no task lookup.
+    tasks = {
+        task_id: MagicMock(task_id=task_id, workflow_run_id=run)
+        for task_id, run in (("tsk_other_run", "wr_other"), ("tsk_child", "wr_child"))
+    }
+    runs = {"wr_child": MagicMock(parent_workflow_run_id="wr_1"), "wr_other": MagicMock(parent_workflow_run_id=None)}
 
-    artifacts = [
-        _make_artifact("s_1", "s3://bucket/s1.png"),
-        _make_artifact("s_2", "s3://bucket/s2.png"),
-        _make_artifact("s_3", "s3://bucket/s3.png"),
-    ]
-    mock_get_artifacts = AsyncMock(return_value=artifacts)
+    def signed(artifact_id: str) -> str:
+        return f"https://api.skyvern.com/v1/artifacts/{artifact_id}/content"
+
+    def readable(
+        _organization_id: str, _workflow_run_id: str, artifacts: list[Artifact], *, task_id: str | None = None
+    ) -> set[str]:
+        return {a.artifact_id for a in artifacts} if foreign_readable else set()
 
     with (
         patch(
             "skyvern.forge.sdk.workflow.service.app.DATABASE.artifacts.get_artifacts_by_ids",
-            mock_get_artifacts,
+            new=AsyncMock(side_effect=lambda ids, _org: [rows[i] for i in ids if i in rows]),
         ),
         patch(
             "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds",
@@ -359,18 +416,52 @@ async def test_refresh_issues_one_batch_db_call_for_n_blocks():
         ),
         patch(
             "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_share_url",
-            new=AsyncMock(
-                side_effect=lambda artifact, **_: f"https://api.skyvern.com/v1/artifacts/{artifact.artifact_id}/content"
-            ),
+            new=AsyncMock(side_effect=lambda a, **_: signed(a.artifact_id)),
         ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.get_share_links_with_bundle_support",
+            new=AsyncMock(side_effect=lambda artifacts: [signed(a.artifact_id) for a in artifacts]),
+        ),
+        patch.object(
+            WorkflowService,
+            "get_recent_task_screenshot_artifacts",
+            new=AsyncMock(side_effect=lambda **kwargs: [legacy_screenshots[kwargs["task_id"]]]),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.tasks.get_task",
+            new=AsyncMock(side_effect=lambda task_id, **_: tasks[task_id]),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.workflow_runs.get_workflow_run",
+            new=AsyncMock(side_effect=lambda workflow_run_id, **_: runs.get(workflow_run_id)),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.observer.get_child_workflow_run_ids",
+            new=AsyncMock(return_value={"wr_block_child"}),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.AGENT_FUNCTION.readable_run_artifact_ids",
+            new=AsyncMock(side_effect=readable),
+        ),
+        patch.object(settings, "ARTIFACT_REFERENCE_READ_CHECK", enforced),
     ):
-        service = WorkflowService()
-        await service._refresh_output_urls(tree, organization_id="o_1", workflow_run_id="wr_1")
+        await WorkflowService()._refresh_output_urls(
+            tree, organization_id="o_1", workflow_run_id="wr_1", run_task_ids=frozenset({"tsk_own"})
+        )
 
-    # Exactly one DB call, containing all three IDs.
-    mock_get_artifacts.assert_awaited_once()
-    called_ids = set(mock_get_artifacts.call_args.args[0])
-    assert called_ids == {"s_1", "s_2", "s_3"}
+    assert own_legacy_block["task_screenshots"] == [signed("s_own_legacy")]
+    assert child_legacy_block["task_screenshots"] == [signed("s_child_legacy")]
+    # A legacy task outside the run and its children is never the run's to show.
+    assert legacy_block["task_screenshots"] == ([] if enforced else [signed("s_legacy")])
+    assert unknown_legacy_block["task_screenshots"] == ([] if enforced else [signed("s_unknown_legacy")])
+    if enforced and not foreign_readable:
+        assert block["task_screenshots"] == [signed("s_own"), signed("s_block_child")]
+        assert "d_other_run" not in str(tree)
+        return
+    shown = ["s_own", "s_other_run"] if enforced else ["s_own", "s_other_run", "s_wrong_kind"]
+    shown.append("s_block_child")
+    assert block["task_screenshots"] == [signed(artifact_id) for artifact_id in shown]
+    assert block["downloaded_file_urls"] == [signed("d_other_run")]
 
 
 @pytest.mark.asyncio
@@ -386,9 +477,9 @@ async def test_refresh_substitutes_screenshot_urls_from_map():
     }
 
     artifacts = [
-        _make_artifact("s_1", "s3://bucket/s1.png"),
-        _make_artifact("s_2", "s3://bucket/s2.png"),
-        _make_artifact("ws_1", "s3://bucket/ws1.png"),
+        _make_artifact("s_1", "s3://bucket/s1.png", artifact_type=ArtifactType.SCREENSHOT_FINAL),
+        _make_artifact("s_2", "s3://bucket/s2.png", artifact_type=ArtifactType.SCREENSHOT_FINAL),
+        _make_artifact("ws_1", "s3://bucket/ws1.png", artifact_type=ArtifactType.SCREENSHOT_FINAL),
     ]
 
     with (
@@ -431,9 +522,9 @@ async def test_refresh_scopes_screenshots_to_the_current_attempt():
         "downloaded_file_artifact_ids": [],
     }
     artifacts = {
-        "s_1": _make_artifact("s_1", "s3://bucket/s1.png"),
-        "s_2": _make_artifact("s_2", "s3://bucket/s2.png"),
-        "ws_1": _make_artifact("ws_1", "s3://bucket/ws1.png"),
+        "s_1": _make_artifact("s_1", "s3://bucket/s1.png", artifact_type=ArtifactType.SCREENSHOT_FINAL),
+        "s_2": _make_artifact("s_2", "s3://bucket/s2.png", artifact_type=ArtifactType.SCREENSHOT_FINAL),
+        "ws_1": _make_artifact("ws_1", "s3://bucket/ws1.png", artifact_type=ArtifactType.SCREENSHOT_FINAL),
     }
     get_artifacts_by_ids = AsyncMock(side_effect=lambda ids, _org: [artifacts[aid] for aid in ids])
 

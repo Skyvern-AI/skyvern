@@ -35,6 +35,7 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.services.artifact_reference_access import check_run_artifact_reference
 from skyvern.utils.secret_redaction import (
     MIN_UNANCHORED_SECRET_LENGTH,
     REDACTION_FAILED_STUB,
@@ -1735,7 +1736,9 @@ class ArtifactManager:
         the artifact, hand back a freshly signed URL.
 
         Returns None when the signature still verifies or the URL names an artifact this
-        organization cannot read; the caller then keeps the URL it already had.
+        organization cannot read; the caller then keeps the URL it already had. Inside a workflow
+        run, or a task that runs outside one, raises PermissionError when that run's artifact read
+        check withholds the artifact.
         """
         if not organization_id:
             return None
@@ -1757,6 +1760,7 @@ class ArtifactManager:
         )
         if artifact is None:
             return None
+        await check_run_artifact_reference(organization_id, artifact, source="content_url_input")
         expiry_seconds = await self.resolve_artifact_url_expiry_seconds(organization_id)
         reminted = await self.resolve_share_url(artifact, expiry_seconds=expiry_seconds)
         if reminted is None:

@@ -1069,6 +1069,12 @@ class Settings(BaseSettings):
     The secret used to sign the email/identity of the user.
     """
 
+    ARTIFACT_REFERENCE_READ_CHECK: bool = True
+    """
+    Withhold the artifacts a workflow run's outputs and file inputs name when that run cannot read them, and the
+    file inputs of a task that runs outside a workflow run. False only logs each decision.
+    """
+
     ARTIFACT_CONTENT_HMAC_KEYRING: str | None = None
     """
     JSON keyring for HMAC-SHA256 signing of bundled-artifact content URLs.
