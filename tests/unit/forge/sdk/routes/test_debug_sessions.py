@@ -30,6 +30,7 @@ def _patched_app(app_mock: MagicMock) -> Iterator[None]:
     app_mock.PERSISTENT_SESSIONS_MANAGER.resolve_session_proxy_location = AsyncMock(
         side_effect=lambda session, location, **kwargs: location
     )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.session_records_managed_egress = AsyncMock(return_value=True)
     with patch.object(debug_sessions_mod, "app", app_mock), patch.object(debug_session_browser_mod, "app", app_mock):
         yield
 

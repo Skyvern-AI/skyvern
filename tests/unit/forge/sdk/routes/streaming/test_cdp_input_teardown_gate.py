@@ -342,6 +342,7 @@ async def test_workflow_run_route_authorizes_only_resolved_persistent_sessions(
         browser_session_stream_reauthorization_required=AsyncMock(return_value=True),
         reauthorize_browser_session_stream=AsyncMock(return_value=False),
         reauthorize_workflow_run_stream=AsyncMock(return_value=False),
+        browser_session_console_enabled=AsyncMock(return_value=False),
     )
 
     async def close(*, code: int = 1000, reason: str = "") -> None:
@@ -376,7 +377,7 @@ async def test_workflow_run_route_authorizes_only_resolved_persistent_sessions(
         async def close(self) -> None:
             return None
 
-    channel = SimpleNamespace(client_id="client_run_auth", interactor="agent", close=AsyncMock())
+    channel = SimpleNamespace(client_id="client_run_auth", interactor="agent", console_enabled=False, close=AsyncMock())
     monkeypatch.setattr(cdp_input, "app", fake_app)
     monkeypatch.setattr(cdp_input, "auth", AsyncMock(return_value="org_stream"))
     monkeypatch.setattr(cdp_input, "get_request_principal", lambda: principal)
