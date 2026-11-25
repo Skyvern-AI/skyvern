@@ -177,6 +177,7 @@ from tests.unit.ember_route_test_support import (
 )
 from tests.unit.ember_test_helpers import (
     RECEIPT_WORKFLOW_YAML,
+    STUDIO_CANVAS_SETTINGS,
     all_blocks_tested_message,
     make_ember_ctx,
     receipt_coverage_after,
@@ -3499,11 +3500,8 @@ async def test_route_error_on_a_barred_turn_keeps_the_proposal(
         proposed_workflow=screen_interrupted_proposal(),
         auto_accept=False,
     )
-    original_workflow = SimpleNamespace(
-        workflow_id="wf-canonical",
-        title="Original",
-        description="Original description",
-        workflow_definition=None,
+    original_workflow = _make_ember_workflow("Original", _NOW).model_copy(
+        update={"workflow_id": "wf-canonical", "description": "Original description"}
     )
     policy = await authoring_barred_policy("screen_unavailable", ctx=make_ember_context(), organization_id="org-1")
     agent_result = agent_module._build_request_policy_clarification_result(
@@ -5508,27 +5506,52 @@ async def test_a_saved_workflow_with_inputs_but_no_blocks_is_the_review_baseline
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("canvas", "saved_settings", "proposal_settings"),
+    [
+        ("saved", {}, {}),
+        ("studio_shows_the_proposal", {}, {}),
+        ("studio_shows_the_proposal", {"pin_saved_session_ip": True}, {}),
+        ("studio_shows_the_proposal", {"ai_fallback": False}, {}),
+        ("studio_shows_the_proposal", {}, {"enable_self_healing": True}),
+        ("studio_mask_secrets_off", {}, {}),
+    ],
+)
 async def test_a_pending_proposal_restores_over_the_canvas_of_a_blank_saved_workflow(
     monkeypatch: pytest.MonkeyPatch,
     api_key_request: MagicMock,
     ember_stream: MagicMock,
     organization: SimpleNamespace,
+    canvas: str,
+    saved_settings: dict[str, bool],
+    proposal_settings: dict[str, bool],
 ) -> None:
-    original_workflow = _make_ember_workflow("Blank", _NOW)
-    proposal_yaml = yaml.safe_dump(
-        {
-            "title": "Blank",
-            "workflow_definition": {
-                "parameters": [],
-                "blocks": [{"block_type": "code", "label": "Seed_Rows", "code": "return {}"}],
-            },
-        }
+    original_workflow = _make_ember_workflow("Blank", _NOW).model_copy(
+        update={"mask_secrets": True, "code_version": 2, **saved_settings}
     )
+    proposal_document = {
+        "title": "Blank",
+        "max_elapsed_time_minutes": 15,
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [{"block_type": "code", "label": "Seed_Rows", "code": "return {}"}],
+        },
+    }
+    proposal_yaml = yaml.safe_dump({**proposal_document, **proposal_settings})
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
         workflow_permanent_id="wpid-1",
         organization_id="org-1",
-        proposed_workflow={"workflow_id": "pending-build", "_copilot_yaml": proposal_yaml},
+        proposed_workflow={
+            "workflow_id": "pending-build",
+            "_copilot_yaml": proposal_yaml,
+            EMBER_PROPOSAL_METADATA_KEY: {
+                "owner_turn_id": "turn-tested",
+                "revision": 1,
+                "canonical_fingerprint": workflow_update.proposal_workflow_fingerprint(original_workflow),
+                "disposition": "review_tested",
+            },
+        },
         auto_accept=False,
     )
     agent_result = AgentResult(user_response="done", updated_workflow=None, global_llm_context=None)
@@ -5537,13 +5560,34 @@ async def test_a_pending_proposal_restores_over_the_canvas_of_a_blank_saved_work
     agent_mock = AsyncMock(return_value=agent_result)
     monkeypatch.setattr(ember_route, "run_ember_agent", agent_mock)
     request = _make_chat_request(mode="build")
-    request.workflow_yaml = ember_route.workflow_to_authoring_yaml(original_workflow)
+    request.workflow_yaml = (
+        ember_route.workflow_to_authoring_yaml(original_workflow)
+        if canvas == "saved"
+        else yaml.safe_dump(
+            {
+                **proposal_document,
+                **STUDIO_CANVAS_SETTINGS,
+                **saved_settings,
+                "description": original_workflow.description,
+                "mask_secrets": canvas == "studio_shows_the_proposal",
+            }
+        )
+    )
 
-    await ember_chat_post(api_key_request, request, organization)
-    await captured["handler"](ember_stream)
+    with capture_logs() as logs:
+        await ember_chat_post(api_key_request, request, organization)
+        await captured["handler"](ember_stream)
 
     assert agent_mock.await_args is not None
-    assert "Seed_Rows" in (agent_mock.await_args.kwargs["prior_ember_workflow_yaml"] or "")
+    decisions = [
+        log.get("reason", log.get("proposal_revision"))
+        for log in logs
+        if log["event"] in ("ember_pending_proposal_restore_rejected", "ember_pending_proposal_restored")
+    ]
+    restored = "Seed_Rows" in (agent_mock.await_args.kwargs["prior_ember_workflow_yaml"] or "")
+    assert (restored, decisions) == (
+        (False, ["canvas_custody_mismatch"]) if canvas == "studio_mask_secrets_off" else (True, [1])
+    )
 
 
 @pytest.mark.asyncio
@@ -9215,15 +9259,8 @@ async def test_test_end_to_end_route_hands_the_proposal_bound_account_to_the_age
         proposed_workflow={"workflow_id": "pending-build", "_copilot_yaml": proposal_yaml},
         auto_accept=False,
     )
-    original_workflow = SimpleNamespace(
-        workflow_id="wf-canonical",
-        title="Original",
-        description="Original description",
-        workflow_definition=None,
-        proxy_location=None,
-        code_version=None,
-        extra_http_headers=None,
-        cdp_connect_headers=None,
+    original_workflow = _make_ember_workflow("Original", _NOW).model_copy(
+        update={"workflow_id": "wf-canonical", "description": "Original description"}
     )
     agent_result = AgentResult(
         user_response="done",

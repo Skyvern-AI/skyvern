@@ -130,6 +130,29 @@ from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.conftest import requires_chromium
 
+# The root settings Studio sends with every Ember turn for a new agent, as a captured request carried them.
+STUDIO_CANVAS_SETTINGS = {
+    "description": None,
+    "proxy_location": None,
+    "persist_browser_session": False,
+    "reuse_browser_session": False,
+    "pin_saved_session_ip": False,
+    "browser_profile_id": None,
+    "browser_profile_key": None,
+    "model": None,
+    "max_screenshot_scrolls": None,
+    "adaptive_caching": False,
+    "generate_script_on_terminal": False,
+    "run_with": "agent",
+    "browser_type": None,
+    "cache_key": "default",
+    "ai_fallback": True,
+    "mask_secrets": True,
+    "code_version": 2,
+    "run_sequentially": False,
+    "sequential_key": None,
+}
+
 DISPATCHED_LOGIN_GATE_HTML = (
     "<html><head><title>Sign in</title></head><body><main>"
     "<h1>Sign in to continue</h1>"

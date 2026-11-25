@@ -45,7 +45,7 @@ from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowStatus
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit.conftest import invoke_ember_tool
 from tests.unit.ember_route_test_support import install_candidate_store
-from tests.unit.ember_test_helpers import make_ember_ctx, stub_ember_agent_loop
+from tests.unit.ember_test_helpers import STUDIO_CANVAS_SETTINGS, make_ember_ctx, stub_ember_agent_loop
 
 
 @pytest.mark.asyncio
@@ -1506,18 +1506,86 @@ async def test_a_proposal_kept_out_only_by_a_canvas_edit_is_recorded_for_the_not
     assert await workflow_update_module._validated_pending_workflow_proposal(ctx) is None
     assert ctx.canvas_rejected_proposal_yaml == proposal_yaml
 
+    now = datetime.now(UTC)
+    saved = Workflow(
+        workflow_id="w",
+        organization_id="o",
+        workflow_permanent_id="wp",
+        title="Named agent",
+        description="",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+        mask_secrets=True,
+        code_version=2,
+        run_with="agent",
+        created_at=now,
+        modified_at=now,
+    )
+    # A new agent saves mask_secrets on, the proposal omits it, and Studio sends the value it shows.
+    tested_yaml = "max_elapsed_time_minutes: 15\n" + _COLD_START_STORED_YAML.replace(
+        "title: Seeded export", "title: Proposed title"
+    )
+    chat.proposed_workflow = {
+        "_copilot_yaml": tested_yaml,
+        "_copilot_proposal": {
+            "owner_turn_id": "turn-1",
+            "revision": 1,
+            "canonical_fingerprint": workflow_update_module.proposal_workflow_fingerprint(saved),
+            "disposition": "review_tested",
+        },
+    }
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", AsyncMock(return_value=saved))
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=saved))
+    for name in ("create_workflow", "update_workflow"):
+        monkeypatch.setattr(
+            app.DATABASE.workflows, name, AsyncMock(side_effect=AssertionError("saved workflow written"))
+        )
+
+    def studio_ctx(**fields: object) -> EmberContext:
+        canvas = {**safe_load_no_dates(tested_yaml), **STUDIO_CANVAS_SETTINGS, **fields}
+        follow_up = _authoring_ctx(yaml.safe_dump(canvas))
+        follow_up.organization_id, follow_up.workflow_id, follow_up.workflow_permanent_id = "o", "w", "wp"
+        follow_up.workflow_copilot_chat_id = "chat"
+        return follow_up
+
+    shown = studio_ctx()
+    await workflow_update_module.restore_pending_workflow_proposal(shown)
+    snapshot = await run_execution_module._select_execution_snapshot(shown, ["Seed_Rows"])
+
+    assert shown.canvas_rejected_proposal_yaml is None
+    assert snapshot is not None and snapshot.provenance == "staged"
+    assert (snapshot.workflow_yaml, shown.proposal_owner_turn_id, shown.proposal_revision) == (tested_yaml, "turn-1", 1)
+    assert snapshot.workflow.get_output_parameter("Seed_Rows") is not None
+    assert snapshot.workflow.mask_secrets is True
+    assert shown.settings_diverged_proposal_token is None
+    for control in ({"mask_secrets": False}, {"workflow_definition": {"parameters": [], "blocks": []}}):
+        rejected = studio_ctx(**control)
+        await workflow_update_module.restore_pending_workflow_proposal(rejected)
+        assert rejected.staged_workflow is None
+        assert rejected.canvas_rejected_proposal_yaml == tested_yaml
+        assert rejected.settings_diverged_proposal_token is None
+
+    diverged = studio_ctx()
+    diverged.private_workflow_settings = {"webhook_callback_url": "https://hooks.invalid/changed"}
+    await workflow_update_module.restore_pending_workflow_proposal(diverged)
+    assert diverged.staged_workflow is not None
+    assert diverged.canvas_rejected_proposal_yaml is None
+    assert diverged.settings_diverged_proposal_token == ("turn-1", 1)
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "canvas_edit",
+    ("canvas_edit", "with_metadata"),
     [
-        {"blocks": [{"block_type": "code", "label": "typed_on_canvas", "code": "return {}"}]},
-        {"description": "Pulls the monthly statement"},
-        {"enable_self_healing": True},
+        ({"blocks": [{"block_type": "code", "label": "typed_on_canvas", "code": "return {}"}]}, True),
+        ({"description": "Pulls the monthly statement"}, True),
+        ({"enable_self_healing": True}, True),
+        ({"ai_fallback": False}, False),
     ],
 )
 async def test_a_follow_up_turn_on_a_blank_saved_workflow_deletes_a_block_from_the_retitling_proposal(
-    dispatch: AsyncMock, monkeypatch: pytest.MonkeyPatch, canvas_edit: dict[str, Any]
+    dispatch: AsyncMock, monkeypatch: pytest.MonkeyPatch, canvas_edit: dict[str, Any], with_metadata: bool
 ) -> None:
     now = datetime.now(UTC)
     stored = Workflow(
@@ -1580,7 +1648,10 @@ async def test_a_follow_up_turn_on_a_blank_saved_workflow_deletes_a_block_from_t
     assert [b.label for b in definition.blocks] == ["Read_Account"]
     assert "seed_rows" not in {p.key for p in definition.parameters}
 
+    if not with_metadata:
+        chat.proposed_workflow = {"_copilot_yaml": proposal_yaml}
     edited = ctx(**{"blocks": [], **canvas_edit})
+    edited.saved_workflow = stored
     await workflow_update_module.restore_pending_workflow_proposal(edited)
     assert edited.staged_workflow is None
     assert edited.canvas_rejected_proposal_yaml == proposal_yaml
