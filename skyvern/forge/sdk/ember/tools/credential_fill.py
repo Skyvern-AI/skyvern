@@ -89,6 +89,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     TotpType,
 )
 from skyvern.forge.sdk.schemas.ember import CredentialRegistration, EmberCredentialRegistration
+from skyvern.forge.sdk.services.audit_events import AuditEvent
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
@@ -1161,11 +1162,12 @@ _READ_ONLY_VAULT_NAMES = {
 async def _load_vault_credential_item(
     ember_ctx: AgentContext, credential_id: str, *, for_update_card: bool = False
 ) -> tuple[CredentialItem | None, str]:
+    principal = get_request_principal()
     try:
         await app.AGENT_FUNCTION.enforce_credential_use(
             ember_ctx.organization_id,
             credential_id,
-            principal=get_request_principal(),
+            principal=principal,
         )
     except PermissionError:
         return None, "Credential not accessible."
@@ -1203,6 +1205,25 @@ async def _load_vault_credential_item(
             exc_info=True,
         )
         return None, f"Could not fetch credential `{credential_id}` from the vault: {type(exc).__name__}."
+    try:
+        await app.AGENT_FUNCTION.record_audit_event(
+            principal,
+            AuditEvent(
+                ember_ctx.organization_id,
+                "credential.use",
+                "credential",
+                credential_id,
+                metadata={"source": "ember"},
+                data_access="read",
+            ),
+        )
+    except Exception as exc:
+        LOG.warning(
+            "Failed to record Ember credential use",
+            credential_id=credential_id,
+            organization_id=ember_ctx.organization_id,
+            error_type=type(exc).__name__,
+        )
     if credential_item.login_sites is not None:
         ember_ctx.scoped_login_sites_by_credential_id[credential_id] = credential_item.login_sites
     return credential_item, ""

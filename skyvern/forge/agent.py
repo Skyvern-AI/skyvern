@@ -18,6 +18,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Concatenate, Literal, NamedTuple, ParamSpec, Sequence, Tuple, cast
 
 import pyotp
@@ -222,7 +223,17 @@ from skyvern.forge.sdk.services.browser_session_artifacts import (
     redact_descendant_entity,
 )
 from skyvern.forge.sdk.services.credentials import live_totp_codes, parse_totp_config
-from skyvern.forge.sdk.services.request_principal import RequestPrincipal, task_requester_id
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal, task_requester_id
+from skyvern.forge.sdk.services.request_reads import (
+    ArtifactLink,
+    RunStatusLinks,
+    artifact_link_digest,
+    defer_file_link_issuance,
+    note_returned_file_links,
+    note_run_status_links,
+    request_reads,
+    run_status_link_capture,
+)
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced, traced_span
 from skyvern.forge.sdk.workflow.block_goal_wrapping import unwrap_goal_fields
@@ -11193,101 +11204,125 @@ class ForgeAgent:
         latest_action_screenshot_urls: list[str] | None = None
         downloaded_files: list[FileInfo] | None = None
 
-        # get the artifact of the screenshot and get the screenshot_url
-        if need_final_screenshot and artifacts_accessible:
-            screenshot_artifact = await app.DATABASE.artifacts.get_artifact(
-                task_id=task.task_id,
-                step_id=last_step.step_id,
-                artifact_type=ArtifactType.SCREENSHOT_FINAL,
-                organization_id=task.organization_id,
-            )
-            if screenshot_artifact:
-                screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
-
-        # Get recording url from browser session first,
-        # if not found, get the recording url from the first step
-        recording_artifact = None
-        if artifacts_accessible and task.browser_session_id:
-            try:
-                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                    recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
-                        organization_id=task.organization_id,
-                        browser_session_id=task.browser_session_id,
-                    )
-                    # FIXME: we only support one recording for now
-                    recording_url = recordings[0].url if recordings else None
-            except asyncio.TimeoutError:
-                LOG.warning("Timeout getting recordings", browser_session_id=task.browser_session_id)
-
-        if artifacts_accessible and recording_url is None:
-            first_step = await app.DATABASE.tasks.get_first_step(
-                task_id=task.task_id, organization_id=task.organization_id
-            )
-            if first_step:
-                recording_artifact = await app.DATABASE.artifacts.get_artifact(
+        status_link_capture = run_status_link_capture.get()
+        links_by_url: dict[str, ArtifactLink] | None = (
+            {}
+            if artifacts_accessible and (status_link_capture is not None or request_reads.get() is not None)
+            else None
+        )
+        with defer_file_link_issuance(links_by_url):
+            # get the artifact of the screenshot and get the screenshot_url
+            if need_final_screenshot and artifacts_accessible:
+                screenshot_artifact = await app.DATABASE.artifacts.get_artifact(
                     task_id=task.task_id,
-                    step_id=first_step.step_id,
-                    artifact_type=ArtifactType.RECORDING,
+                    step_id=last_step.step_id,
+                    artifact_type=ArtifactType.SCREENSHOT_FINAL,
                     organization_id=task.organization_id,
                 )
-                if recording_artifact:
-                    recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(recording_artifact)
-                    if not recording_archived:
-                        recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+                if screenshot_artifact:
+                    screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
 
-        # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
-        if artifacts_accessible:
-            latest_action_screenshot_artifacts = await app.DATABASE.artifacts.get_latest_n_artifacts(
-                task_id=task.task_id,
-                organization_id=task.organization_id,
-                artifact_types=[ArtifactType.SCREENSHOT_ACTION],
-                n=settings.TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
-            )
-            if latest_action_screenshot_artifacts:
-                raw_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(
-                    latest_action_screenshot_artifacts
+            # Get recording url from browser session first,
+            # if not found, get the recording url from the first step
+            recording_artifact = None
+            if artifacts_accessible and task.browser_session_id:
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        with defer_file_link_issuance():
+                            recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
+                                organization_id=task.organization_id,
+                                browser_session_id=task.browser_session_id,
+                            )
+                        # FIXME: we only support one recording for now
+                        recording_url = recordings[0].url if recordings else None
+                        if recording_url:
+                            note_returned_file_links(
+                                "browser_session",
+                                task.browser_session_id,
+                                ArtifactType.RECORDING,
+                                ((recording_url, recordings[0].artifact_id),),
+                            )
+                except asyncio.TimeoutError:
+                    LOG.warning("Timeout getting recordings", browser_session_id=task.browser_session_id)
+
+            if artifacts_accessible and recording_url is None:
+                first_step = await app.DATABASE.tasks.get_first_step(
+                    task_id=task.task_id, organization_id=task.organization_id
                 )
-                filtered_urls = [url for url in raw_urls if url is not None]
-                latest_action_screenshot_urls = filtered_urls if filtered_urls else None
-
-        if artifacts_accessible and task.organization_id:
-            download_run_id = (
-                resolve_run_download_id(skyvern_context.current(), fallback_run_id=task.workflow_run_id) or task.task_id
-            )
-            # Listing and the PDF comparison share one download budget instead of each getting a full one.
-            comparison = ResponseComparison()
-            try:
-                async with asyncio.timeout_at(comparison.deadline):
-                    downloaded_files = await app.STORAGE.get_downloaded_files(
+                if first_step:
+                    recording_artifact = await app.DATABASE.artifacts.get_artifact(
+                        task_id=task.task_id,
+                        step_id=first_step.step_id,
+                        artifact_type=ArtifactType.RECORDING,
                         organization_id=task.organization_id,
-                        run_id=download_run_id,
                     )
-            except asyncio.TimeoutError:
-                LOG.warning(
-                    "Timeout to get downloaded files",
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to get downloaded files",
-                    exc_info=True,
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-            if downloaded_files and len(downloaded_files) > 1:
-                downloaded_files = await app.WORKFLOW_SERVICE.unique_task_pdf_file_infos(
-                    downloaded_files, task, download_run_id, comparison
-                )
+                    if recording_artifact:
+                        recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(recording_artifact)
+                        if not recording_archived:
+                            recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
-        if need_browser_log and artifacts_accessible:
-            browser_console_log = await app.DATABASE.artifacts.get_latest_artifact(
-                task_id=task.task_id,
-                artifact_types=[ArtifactType.BROWSER_CONSOLE_LOG],
-                organization_id=task.organization_id,
-            )
-            if browser_console_log:
-                browser_console_log_url = await app.ARTIFACT_MANAGER.get_share_link(browser_console_log)
+            # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
+            if artifacts_accessible:
+                latest_action_screenshot_artifacts = await app.DATABASE.artifacts.get_latest_n_artifacts(
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    artifact_types=[ArtifactType.SCREENSHOT_ACTION],
+                    n=settings.TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
+                )
+                if latest_action_screenshot_artifacts:
+                    raw_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(
+                        latest_action_screenshot_artifacts
+                    )
+                    filtered_urls = [url for url in raw_urls if url is not None]
+                    latest_action_screenshot_urls = filtered_urls if filtered_urls else None
+
+            if artifacts_accessible and task.organization_id:
+                download_run_id = (
+                    resolve_run_download_id(skyvern_context.current(), fallback_run_id=task.workflow_run_id)
+                    or task.task_id
+                )
+                # Listing and the PDF comparison share one download budget instead of each getting a full one.
+                comparison = ResponseComparison()
+                try:
+                    async with asyncio.timeout_at(comparison.deadline):
+                        with defer_file_link_issuance():
+                            downloaded_files = await app.STORAGE.get_downloaded_files(
+                                organization_id=task.organization_id,
+                                run_id=download_run_id,
+                            )
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "Timeout to get downloaded files",
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to get downloaded files",
+                        exc_info=True,
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
+                if downloaded_files and len(downloaded_files) > 1:
+                    downloaded_files = await app.WORKFLOW_SERVICE.unique_task_pdf_file_infos(
+                        downloaded_files, task, download_run_id, comparison
+                    )
+                if downloaded_files:
+                    note_returned_file_links(
+                        "task",
+                        task.task_id,
+                        ArtifactType.DOWNLOAD,
+                        ((file_info.url, file_info.artifact_id) for file_info in downloaded_files),
+                    )
+
+            if need_browser_log and artifacts_accessible:
+                browser_console_log = await app.DATABASE.artifacts.get_latest_artifact(
+                    task_id=task.task_id,
+                    artifact_types=[ArtifactType.BROWSER_CONSOLE_LOG],
+                    organization_id=task.organization_id,
+                )
+                if browser_console_log:
+                    browser_console_log_url = await app.ARTIFACT_MANAGER.get_share_link(browser_console_log)
 
         # get the latest task from the db to get the latest status, extracted_information, and failure_reason
         task_from_db = await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id)
@@ -11308,7 +11343,27 @@ class ForgeAgent:
         )
         if not artifacts_accessible:
             response.errors = task.errors
-        return access.redact_output(response)
+        response = access.redact_output(response)
+        if links_by_url and task.organization_id:
+            returned_urls = (
+                response.screenshot_url,
+                response.recording_url,
+                response.browser_console_log_url,
+                *(response.action_screenshot_urls or ()),
+                *(file.url for file in response.downloaded_files or ()),
+                *(response.downloaded_file_urls or ()),
+            )
+            retained = {
+                artifact_link_digest(url): links_by_url[url] for url in returned_urls if url and url in links_by_url
+            }
+            if retained:
+                links = RunStatusLinks(task.organization_id, MappingProxyType(retained))
+                if status_link_capture is not None:
+                    status_link_capture.links = links
+                else:
+                    principal = get_request_principal()
+                    note_run_status_links(links, principal.organization_id if principal else None, returned_urls)
+        return response
 
     async def cleanup_browser_and_create_artifacts(
         self,

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.forge import app
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     seconds_until_external_deadline,
 )
 from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.request_reads import defer_file_link_issuance, note_returned_file_links
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt
 
 LOG = structlog.get_logger()
@@ -169,10 +171,11 @@ class BrowserSessionResponse(BaseModel):
             async def list_downloads() -> list[FileInfo]:
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        return await storage.get_shared_downloaded_files_in_browser_session(
-                            organization_id=browser_session.organization_id,
-                            browser_session_id=browser_session.persistent_browser_session_id,
-                        )
+                        with defer_file_link_issuance():
+                            return await storage.get_shared_downloaded_files_in_browser_session(
+                                organization_id=browser_session.organization_id,
+                                browser_session_id=browser_session.persistent_browser_session_id,
+                            )
                 except asyncio.TimeoutError:
                     LOG.warning(
                         "Timeout getting downloaded files",
@@ -188,10 +191,11 @@ class BrowserSessionResponse(BaseModel):
             async def list_recordings() -> list[FileInfo]:
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        listed = await storage.get_shared_recordings_in_browser_session(
-                            organization_id=browser_session.organization_id,
-                            browser_session_id=browser_session.persistent_browser_session_id,
-                        )
+                        with defer_file_link_issuance():
+                            listed = await storage.get_shared_recordings_in_browser_session(
+                                organization_id=browser_session.organization_id,
+                                browser_session_id=browser_session.persistent_browser_session_id,
+                            )
                         if listed:
                             listed = await app.AGENT_FUNCTION.select_browser_session_recordings(
                                 organization_id=browser_session.organization_id,
@@ -226,6 +230,18 @@ class BrowserSessionResponse(BaseModel):
             # Sort recordings by modified_at in descending order (newest first)
             # Treat None as "oldest".
             recordings.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
+            note_returned_file_links(
+                "browser_session",
+                browser_session.persistent_browser_session_id,
+                ArtifactType.RECORDING,
+                ((file_info.url, file_info.artifact_id) for file_info in recordings),
+            )
+            note_returned_file_links(
+                "browser_session",
+                browser_session.persistent_browser_session_id,
+                ArtifactType.DOWNLOAD,
+                ((file_info.url, file_info.artifact_id) for file_info in downloaded_files),
+            )
 
         browser_address = None
         if artifacts_accessible:

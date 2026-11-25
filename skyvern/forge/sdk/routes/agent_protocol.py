@@ -185,6 +185,7 @@ from skyvern.forge.sdk.services.request_principal import (
     get_request_principal,
     reject_non_admin_api_key_secret_access,
 )
+from skyvern.forge.sdk.services.request_reads import capture_run_status_links, note_artifact_reads
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key_from_digest
@@ -217,6 +218,7 @@ from skyvern.forge.sdk.workflow.service import (
     cap_action_payloads,
     capped_task_v1_response,
     capped_task_v2,
+    note_returned_run_status_links,
     one_time_code_markers,
     redact_one_time_code_actions,
     redact_one_time_code_step,
@@ -981,7 +983,7 @@ async def get_run(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> RunResponse:
-    with browser_session_artifact_read(get_request_principal()):
+    with browser_session_artifact_read(get_request_principal()), capture_run_status_links() as captured:
         run_response = await run_service.get_run_response_coalesced(
             run_id,
             organization_id=current_org.organization_id,
@@ -997,6 +999,7 @@ async def get_run(
     isolated_run_request = run_request.model_copy() if run_request is not None else None
     run_response = run_response.model_copy(update={"run_request": isolated_run_request})
     await _redact_browser_session_addresses([run_response], current_org.organization_id)
+    note_returned_run_status_links(run_response, captured.links)
     return run_response
 
 
@@ -3923,7 +3926,10 @@ async def get_artifact_content(
         headers["Content-Security-Policy"] = _HTML_ARTIFACT_CSP
     storage = app.STORAGE
     if isinstance(storage, StreamingArtifactStorage) and storage.can_stream_artifact(artifact):
-        return await _stream_artifact_content(storage, artifact, request.headers.get("range"), media_type, headers)
+        response = await _stream_artifact_content(storage, artifact, request.headers.get("range"), media_type, headers)
+        if not is_signed and response.status_code in (http_status.HTTP_200_OK, http_status.HTTP_206_PARTIAL_CONTENT):
+            note_artifact_reads((artifact,))
+        return response
     content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
     if content is None:
         raise HTTPException(
@@ -3938,6 +3944,8 @@ async def get_artifact_content(
             status_code=http_status.HTTP_416_RANGE_NOT_SATISFIABLE,
             headers=headers,
         )
+    if not is_signed:
+        note_artifact_reads((artifact,))
     if parsed_range is not None:
         start, end = parsed_range
         headers["Content-Range"] = f"bytes {start}-{end}/{content_length}"
@@ -6381,7 +6389,7 @@ async def get_workflow_run_with_workflow_id(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
-    with browser_session_artifact_read(get_request_principal()):
+    with browser_session_artifact_read(get_request_principal()), capture_run_status_links() as captured:
         response = await run_service.coalesce_in_flight(
             _build_workflow_run_with_workflow_id,
             current_org.organization_id,
@@ -6391,7 +6399,9 @@ async def get_workflow_run_with_workflow_id(
         )
     response = response.model_copy(deep=True)
     await _redact_browser_session_addresses([response], current_org.organization_id)
-    return response.model_dump(by_alias=True)
+    result = response.model_dump(by_alias=True)
+    note_returned_run_status_links(response, captured.links)
+    return result
 
 
 async def _build_workflow_run_with_workflow_id(
@@ -6432,7 +6442,7 @@ async def get_workflow_and_run_from_workflow_run_id(
     # The route needs run read access; the agent definition it also returns needs agent read access.
     if not await app.AGENT_FUNCTION.role_allows(get_request_principal(), "workflow.read"):
         raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="Your role can't read this agent.")
-    with browser_session_artifact_read(get_request_principal()):
+    with browser_session_artifact_read(get_request_principal()), capture_run_status_links() as captured:
         response = await run_service.coalesce_in_flight(
             run_service.build_workflow_and_run_from_workflow_run_id,
             current_org.organization_id,
@@ -6443,6 +6453,7 @@ async def get_workflow_and_run_from_workflow_run_id(
     await _redact_browser_session_addresses([response], current_org.organization_id)
     await _redact_inaccessible_workflow_credential_ids([response.workflow])
     response = response.model_copy(update={"workflow": mask_workflow_for_api(response.workflow)})
+    note_returned_run_status_links(response, captured.links)
     return response
 
 
@@ -6488,7 +6499,7 @@ async def get_workflow_run(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunResponseBase:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
-    with browser_session_artifact_read(get_request_principal()):
+    with browser_session_artifact_read(get_request_principal()), capture_run_status_links() as captured:
         response = await run_service.coalesce_in_flight(
             _build_workflow_run,
             current_org.organization_id,
@@ -6497,6 +6508,7 @@ async def get_workflow_run(
         )
     response = response.model_copy(deep=True)
     await _redact_browser_session_addresses([response], current_org.organization_id)
+    note_returned_run_status_links(response, captured.links)
     return response
 
 

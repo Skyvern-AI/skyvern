@@ -17,6 +17,13 @@ from skyvern.forge.sdk.services.browser_session_artifacts import (
     browser_session_artifact_read_scope,
 )
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal
+from skyvern.forge.sdk.services.request_reads import (
+    RunStatusLinks,
+    capture_run_status_links,
+    defer_file_link_issuance,
+    request_reads,
+    run_status_link_capture,
+)
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus, WorkflowRunWithWorkflowResponse
 from skyvern.forge.sdk.workflow.response_value_caps import (
     truncate_oversized_response_text,
@@ -94,10 +101,21 @@ async def coalesce_in_flight(build: Callable[[*Ts], Coroutine[Any, Any, T]], *ar
     key = (build, browser_session_artifact_read_scope(), *args)
     task = _IN_FLIGHT.get(key)
     if task is None or task.done():
-        task = asyncio.create_task(build(*args))
+
+        async def build_with_status_links() -> tuple[T, RunStatusLinks | None]:
+            # create_task copies the creator's context. Only the individual waiters own collectors.
+            token = request_reads.set(None)
+            try:
+                with capture_run_status_links() as capture, defer_file_link_issuance():
+                    result = await build(*args)
+                return result, capture.links
+            finally:
+                request_reads.reset(token)
+
+        task = asyncio.create_task(build_with_status_links())
         _IN_FLIGHT[key] = task
 
-        def _forget(done: asyncio.Task[T]) -> None:
+        def _forget(done: asyncio.Task[tuple[T, RunStatusLinks | None]]) -> None:
             if _IN_FLIGHT.get(key) is done:
                 del _IN_FLIGHT[key]
             if not done.cancelled():
@@ -106,7 +124,11 @@ async def coalesce_in_flight(build: Callable[[*Ts], Coroutine[Any, Any, T]], *ar
 
         task.add_done_callback(_forget)
     # Shielded so one poller disconnecting does not cancel the build the other pollers are waiting on.
-    return await asyncio.shield(task)
+    result, links = await asyncio.shield(task)
+    capture = run_status_link_capture.get()
+    if capture is not None:
+        capture.links = links
+    return result
 
 
 async def get_run_response_coalesced(run_id: str, organization_id: str, cap_output_values: bool) -> RunResponse | None:

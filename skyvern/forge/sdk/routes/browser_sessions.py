@@ -52,6 +52,7 @@ from skyvern.forge.sdk.services.browser_session_redaction import (
     redact_browser_session_addresses,
 )
 from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.request_reads import note_artifact_reads
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.action_log import (
     ACTION_LOG_DEFAULT_PAGE_SIZE,
@@ -909,6 +910,7 @@ async def get_browser_session_action_logs(
                 continue
             seen_event_ids.add(event_id)
             events.append(event)
+            note_artifact_reads((artifact,))
         except ValidationError:
             LOG.warning(
                 "Browser session action log artifact is invalid",

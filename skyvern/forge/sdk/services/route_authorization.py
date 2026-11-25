@@ -11,6 +11,7 @@ from skyvern.forge.sdk.services.request_principal import (
     pending_route_action,
     pending_stream_authorization,
 )
+from skyvern.forge.sdk.services.request_reads import RequestReads, request_reads
 
 LOG = structlog.get_logger()
 
@@ -364,6 +365,25 @@ async def _authorize_connection(connection: HTTPConnection) -> None:
         )
 
 
+async def _record_request_reads(connection: HTTPConnection, reads: RequestReads) -> None:
+    if connection.scope.get("type") != "http":
+        return
+    try:
+        principal = get_request_principal()
+        if not reads.artifacts and not (principal and principal.impersonator_user_id):
+            return
+        action, resource = _route_action(connection)
+        await app.AGENT_FUNCTION.record_request_reads(
+            principal,
+            method=connection.scope.get("method", ""),
+            action=action,
+            resource=resource,
+            reads=reads,
+        )
+    except Exception as exc:
+        LOG.warning("Request read recording failed", error_type=type(exc).__name__, exc_info=True)
+
+
 async def observe_request_authorization(connection: HTTPConnection) -> AsyncIterator[None]:
     try:
         action, _ = _route_action(connection)
@@ -381,12 +401,19 @@ async def observe_request_authorization(connection: HTTPConnection) -> AsyncIter
         and action in {"browser_session.connect", "stream.connect"}
         and not task_screenshot
     )
+    reads = RequestReads()
+    reads_token = request_reads.set(reads)
+    handler_returned = False
     try:
         yield
+        handler_returned = True
     finally:
+        request_reads.reset(reads_token)
         pending_stream_authorization.reset(stream_token)
         pending_route_action.reset(token)
         await _authorize_connection(connection)
+        if handler_returned:
+            await _record_request_reads(connection, reads)
 
 
 ROUTE_AUTHORIZATION_DEPENDENCY = Depends(observe_request_authorization, scope="function")
