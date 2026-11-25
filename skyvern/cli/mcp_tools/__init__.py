@@ -489,7 +489,7 @@ mcp.tool(tags={"credential", "onepassword"}, annotations=_ro("List 1Password Ite
 mcp.tool(tags={"credential", "onepassword"}, annotations=_ro("Get 1Password Configuration"))(
     skyvern_onepassword_config_get
 )
-mcp.tool(tags={"credential", "onepassword"}, annotations=_mut("Set 1Password Configuration"))(
+mcp.tool(tags={"credential", "onepassword"}, annotations=_dest("Set 1Password Configuration"))(
     skyvern_onepassword_config_set
 )
 mcp.tool(tags={"credential", "onepassword"}, annotations=_dest("Clear 1Password Configuration"))(
@@ -497,7 +497,7 @@ mcp.tool(tags={"credential", "onepassword"}, annotations=_dest("Clear 1Password 
 )
 mcp.tool(tags={"credential", "bitwarden"}, annotations=_ro("List Bitwarden Items"))(skyvern_bitwarden_items)
 mcp.tool(tags={"credential", "bitwarden"}, annotations=_ro("Get Bitwarden Configuration"))(skyvern_bitwarden_config_get)
-mcp.tool(tags={"credential", "bitwarden"}, annotations=_mut("Set Bitwarden Configuration"))(
+mcp.tool(tags={"credential", "bitwarden"}, annotations=_dest("Set Bitwarden Configuration"))(
     skyvern_bitwarden_config_set
 )
 mcp.tool(tags={"credential", "bitwarden"}, annotations=_dest("Clear Bitwarden Configuration"))(
@@ -578,7 +578,7 @@ mcp.tool(tags={"page_read", "lean"}, annotations=_web_ro("Read Page"))(size_capp
 mcp.tool(tags={"ember"}, annotations=_web_dest("Ember: Send Message"))(size_capped(skyvern_ember_send))
 mcp.tool(tags={"ember"}, annotations=_ro("Ember: Check Chat"))(size_capped(skyvern_ember_check))
 mcp.tool(tags={"ember"}, annotations=_ro("Ember: List Chats"))(size_capped(skyvern_ember_list))
-mcp.tool(tags={"ember"}, annotations=_mut("Ember: Stop Turn"))(size_capped(skyvern_ember_stop))
+mcp.tool(tags={"ember"}, annotations=_dest("Ember: Stop Turn"))(size_capped(skyvern_ember_stop))
 mcp.tool(tags={"ember"}, annotations=_web_mut("Ember: Answer"))(size_capped(skyvern_ember_answer))
 mcp.tool(tags={"ember"}, annotations=_web_dest("Ember: Decide"))(size_capped(skyvern_ember_decide))
 
