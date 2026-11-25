@@ -1606,6 +1606,7 @@ async def test_handler_persists_response_model_not_router_group(monkeypatch: pyt
 
     # The persisted model should be the bare response.model, not the router group key
     assert captured_kwargs.get("last_llm_model") == "gemini-3-flash-preview"
+    assert step.last_llm_model == "gemini-3-flash-preview"
 
 
 @pytest.mark.asyncio
@@ -3702,6 +3703,7 @@ async def test_router_speculative_call_cost_reaches_its_step(
     await handler(prompt='{"actions": []}', prompt_name="extract-actions", step=step)
 
     assert costs == [0.0042]
+    assert step.last_llm_model == "gpt-5.6-luna"
     _assert_speculative_stash(step, secret_lookup_fails=secret_lookup_fails)
 
 
@@ -3735,6 +3737,7 @@ async def test_single_model_speculative_call_cost_reaches_its_step(
     await handler(prompt="test", prompt_name=EXTRACT_ACTION_PROMPT_NAME, step=step)
 
     assert costs == [0.01]
+    assert step.last_llm_model == "gemini-3-flash-preview"
     _assert_speculative_stash(step, secret_lookup_fails=secret_lookup_fails)
 
 
@@ -3757,6 +3760,7 @@ async def test_llm_caller_speculative_call_cost_reaches_its_step(
     await caller.call(prompt="test", prompt_name="extract-actions", step=_step())
 
     assert costs == [0.25, 0.25]
+    assert step.last_llm_model == "gpt-4.1"
     _assert_speculative_stash(step, secret_lookup_fails=secret_lookup_fails)
     # The non-speculative call stores its LLM artifacts only when its text could be scrubbed.
     assert (ArtifactType.LLM_PROMPT in stored_artifact_types) is not secret_lookup_fails

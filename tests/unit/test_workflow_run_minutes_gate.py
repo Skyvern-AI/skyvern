@@ -463,13 +463,14 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("run_type", "engine", "model_lookup_fails"),
+    ("run_type", "engine", "model"),
     [
-        (RunType.task_v1, RunEngine.skyvern_v1, False),
-        (RunType.openai_cua, RunEngine.openai_cua, False),
-        (RunType.anthropic_cua, RunEngine.anthropic_cua, False),
-        (RunType.ui_tars, RunEngine.ui_tars, False),
-        (RunType.openai_cua, RunEngine.openai_cua, True),
+        (RunType.task_v1, RunEngine.skyvern_v1, "known-model"),
+        (RunType.openai_cua, RunEngine.openai_cua, "known-model"),
+        (RunType.anthropic_cua, RunEngine.anthropic_cua, "known-model"),
+        (RunType.ui_tars, RunEngine.ui_tars, "known-model"),
+        (RunType.openai_cua, RunEngine.openai_cua, None),
+        (RunType.task_v3, RunEngine.skyvern_v1, "known-model"),
     ],
 )
 async def test_duration_metrics_log_carries_task_run_type_for_a_bare_task(
@@ -477,7 +478,7 @@ async def test_duration_metrics_log_carries_task_run_type_for_a_bare_task(
     record_run_duration: AsyncMock,
     run_type: RunType,
     engine: RunEngine,
-    model_lookup_fails: bool,
+    model: str | None,
 ) -> None:
     now = datetime.now(UTC)
     entry_task = _make_task(status=TaskStatus.running, started_at=now - timedelta(minutes=5))
@@ -490,19 +491,9 @@ async def test_duration_metrics_log_carries_task_run_type_for_a_bare_task(
     monkeypatch.setattr(agent_module, "save_task_logs", AsyncMock())
     monkeypatch.setattr(agent_module, "save_step_logs", AsyncMock())
     step = make_step(now, entry_task, step_id="step_duration", status=StepStatus.running, order=0, output=None)
-    if model_lookup_fails:
-        step.last_llm_model = "fallback-model"
-    persisted_step = copy.deepcopy(step)
-    persisted_step.last_llm_model = "known-model"
-    monkeypatch.setattr(
-        app.DATABASE.tasks,
-        "get_step",
-        AsyncMock(
-            side_effect=RuntimeError("read unavailable") if model_lookup_fails else None,
-            return_value=persisted_step,
-        ),
-    )
-    monkeypatch.setattr(app.DATABASE.tasks, "update_step", AsyncMock(return_value=persisted_step))
+    step.last_llm_model = model
+    monkeypatch.setattr(app.DATABASE.tasks, "get_step", AsyncMock(side_effect=AssertionError("unexpected step read")))
+    monkeypatch.setattr(app.DATABASE.tasks, "update_step", AsyncMock(return_value=step))
     context = SkyvernContext(task_id=entry_task.task_id, engine=engine)
 
     with skyvern_context.scoped(context), capture_logs() as logs:
@@ -516,7 +507,7 @@ async def test_duration_metrics_log_carries_task_run_type_for_a_bare_task(
     step_logs = [e for e in logs if e.get("event") == "Step duration metrics"]
     assert len(step_logs) == 1
     assert step_logs[0]["engine"] == engine.value
-    assert step_logs[0]["model"] == ("fallback-model" if model_lookup_fails else "known-model")
+    assert step_logs[0]["model"] == model
 
 
 @pytest.mark.asyncio
