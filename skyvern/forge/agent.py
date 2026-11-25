@@ -784,6 +784,7 @@ _RUN_TYPE_BY_ENGINE: dict[RunEngine, str] = {
     RunEngine.anthropic_cua: "anthropic_cua",
     RunEngine.ui_tars: "ui_tars",
 }
+_ENGINE_BY_RUN_TYPE = {run_type: engine for engine, run_type in _RUN_TYPE_BY_ENGINE.items()}
 
 
 _PAGE_FINGERPRINT_PROBE_JS = (
@@ -5112,6 +5113,7 @@ class ForgeAgent:
         context.step_id = step.step_id
         context.step_retry_index = step.retry_index
         context.task_id = task.task_id
+        context.engine = engine
         context.navigation_goal = task.navigation_goal
         context.navigation_payload = task.navigation_payload
         if download_baseline_files is None:
@@ -5328,6 +5330,7 @@ class ForgeAgent:
                     # A raised read is not cached, so pin v1 for the recursion or a later step
                     # could re-read the flag successfully and restart the task on v3.
                     engine = RunEngine.skyvern_v1
+                    context.engine = engine
             if task_v3_available:
                 try:
                     step, task = await self._execute_task_v3(
@@ -5398,6 +5401,7 @@ class ForgeAgent:
                     )
                 # Later steps recurse with this engine; pinning v1 keeps them off the gate and this write.
                 engine = RunEngine.skyvern_v1
+                context.engine = engine
 
             if page := await browser_state.get_working_page():
                 await self.register_async_operations(organization, task, page)
@@ -11509,11 +11513,22 @@ class ForgeAgent:
         # Track step duration when step is completed or failed
         if status in [StepStatus.completed, StepStatus.failed]:
             duration_seconds = (datetime.now(UTC) - step.created_at.replace(tzinfo=UTC)).total_seconds()
+            context = skyvern_context.current()
+            engine = context.engine if context and context.task_id == step.task_id else None
+            model = step.last_llm_model
+            try:
+                persisted_step = await app.DATABASE.tasks.get_step(step.step_id, organization_id=step.organization_id)
+                if persisted_step is not None:
+                    model = persisted_step.last_llm_model
+            except Exception:
+                LOG.warning("Step model lookup for duration metrics failed", step_id=step.step_id, exc_info=True)
             LOG.info(
                 "Step duration metrics",
                 duration_seconds=duration_seconds,
                 step_status=status,
                 organization_id=step.organization_id,
+                engine=engine.value if engine else None,
+                model=model,
             )
 
         await save_step_logs(step.step_id)
@@ -11617,6 +11632,7 @@ class ForgeAgent:
                     task_run_type = _RUN_TYPE_BY_ENGINE.get(block_engine) if block_engine else None
             except Exception:
                 LOG.warning("task_run_type resolution for duration metrics failed", task_id=task.task_id, exc_info=True)
+            run_engine = _ENGINE_BY_RUN_TYPE.get(task_run_type) if task_run_type else None
             LOG.info(
                 "Task duration metrics",
                 task_id=task.task_id,
@@ -11627,6 +11643,7 @@ class ForgeAgent:
                 organization_id=task.organization_id,
                 failure_reason=skyvern_context.mask_multi_field_totp_data(failure_reason, task_id=task.task_id),
                 task_run_type=task_run_type,
+                engine=run_engine.value if run_engine else None,
             )
         await save_task_logs(task.task_id)
         LOG.info(
