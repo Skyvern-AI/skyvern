@@ -644,9 +644,17 @@ class TestSanitizeResponseBody:
             assert _sanitize_response_body(request, body, "application/json") == REDACTED
         parse.assert_not_called()
 
-    def test_sensitive_endpoint_fully_redacted(self) -> None:
-        request = _make_request("POST", "/api/v1/credentials")
-        result = _sanitize_response_body(request, '{"token": "abc"}', "application/json")
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/v1/credentials",
+            "/v1/integrations/google/drive/picker-token",
+            "/api/v1/integrations/google/drive/picker-token",
+        ],
+    )
+    def test_sensitive_endpoint_fully_redacted(self, path: str) -> None:
+        request = _make_request("POST", path)
+        result = _sanitize_response_body(request, '{"public_canary": "must-not-be-logged"}', "application/json")
         assert result == REDACTED
 
     def test_empty_body(self) -> None:

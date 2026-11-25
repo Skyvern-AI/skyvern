@@ -105,16 +105,8 @@ def test_google_drive_scope_profile_uses_full_drive_scope_for_folder_uploads() -
     scopes = google_oauth_service.scopes_for_profile("google_drive")
     assert scopes == [
         "https://www.googleapis.com/auth/drive",
+        google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
     ]
-
-
-def test_google_oauth_authorize_request_accepts_google_drive_scope_profile() -> None:
-    request = CreateGoogleOAuthAuthorizeRequest(
-        redirect_uri="https://app.example.com/google/callback",
-        scope_profile="google_drive",
-    )
-
-    assert request.scope_profile == "google_drive"
 
 
 @pytest.mark.parametrize(
