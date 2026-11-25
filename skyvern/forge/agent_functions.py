@@ -41,6 +41,7 @@ from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
 from skyvern.forge.sdk.core import aiohttp_helper, skyvern_context
 from skyvern.forge.sdk.core.http_request_authorization import GuardedHTTPHopResponse, GuardedHTTPHopStream
@@ -1345,6 +1346,20 @@ class AgentFunction:
         self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str
     ) -> bool:
         return True
+
+    async def readable_run_artifact_ids(
+        self,
+        organization_id: str,
+        workflow_run_id: str | None,
+        artifacts: Sequence[Artifact],
+        *,
+        task_id: str | None = None,
+    ) -> set[str]:
+        """Ids of the artifacts the run's own subject may read; OSS has no folder or session ACLs.
+
+        ``task_id`` names a task that runs outside a workflow run, when there is no ``workflow_run_id``.
+        """
+        return {artifact.artifact_id for artifact in artifacts}
 
     async def role_allows(self, principal: RequestPrincipal | None, action: str) -> bool:
         """Whether an enforced role grant allows ``action``; deployments without roles allow everything."""

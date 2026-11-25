@@ -137,7 +137,12 @@ from skyvern.forge.sdk.db.enums import (
     WorkflowBuildSource,
     WorkflowRunTriggerType,
 )
-from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workflow_id, generate_workflow_parameter_id
+from skyvern.forge.sdk.db.id import (
+    WORKFLOW_RUN_PREFIX,
+    generate_output_parameter_id,
+    generate_workflow_id,
+    generate_workflow_parameter_id,
+)
 from skyvern.forge.sdk.db.models import PersistentBrowserSessionModel, WorkflowRunAttemptModel, WorkflowRunModel
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import (
     ATTEMPT_RECOVERY_BATCH_SIZE,
@@ -202,6 +207,12 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.schemas.workflow_schedules import OneTimeDispatchStatus
+from skyvern.forge.sdk.services.artifact_reference_access import (
+    bound_to_run,
+    drop_withheld_downloads,
+    unreadable_output_artifact_ids,
+    withhold_unreadable_references,
+)
 from skyvern.forge.sdk.services.browser_session_artifacts import (
     REDACTED_ARTIFACT,
     TASK_V2_METADATA,
@@ -565,6 +576,8 @@ _VersionWrite = TypeVar("_VersionWrite")
 
 
 _USER_DEFINED_ERROR_KEYS = {"error_code", "reasoning", "confidence_float", "error_type"}
+# How many parent links a referenced run may sit below the run whose output names it.
+_RUN_TREE_DEPTH = 8
 
 
 class _SavedProfileWithoutCredential(NamedTuple):
@@ -3195,6 +3208,7 @@ class WorkflowService:
         current_attempt_artifacts: list[Artifact] | None = None,
         comparison: ResponseComparison | None = None,
         canonical: Sequence[FileInfo] = (),
+        run_task_ids: frozenset[str] | None = None,
     ) -> Any:
         """Two-pass batch URL refresh: scan artifact IDs (sync), fetch all in 2 parallel DB calls, substitute in-place."""
         if not organization_id:
@@ -3240,6 +3254,23 @@ class WorkflowService:
             download_id_set = set(download_ids)
             comparison.remember_rows(fetched, organization_id)
             artifacts = [comparison.rows[aid] for aid in all_ids if aid in comparison.rows]
+            unreadable = await unreadable_output_artifact_ids(
+                organization_id,
+                workflow_run_id,
+                artifacts,
+                screenshot_ids=set(screenshot_ids),
+                download_ids=download_id_set,
+                run_ids=await self._run_tree_ids(
+                    artifacts,
+                    organization_id,
+                    workflow_run_id,
+                    {workflow_run_id, download_run_id} | (run_task_ids or set()),
+                ),
+            )
+            if withhold_unreadable_references(organization_id, workflow_run_id, len(unreadable), source="run_output"):
+                artifacts = [artifact for artifact in artifacts if artifact.artifact_id not in unreadable]
+                if withheld_downloads := frozenset(unreadable & download_id_set):
+                    drop_withheld_downloads(value, withheld_downloads)
             for artifact in artifacts:
                 url = await app.ARTIFACT_MANAGER.resolve_share_url(artifact, expiry_seconds=expiry_seconds)
                 if url is None:
@@ -3270,6 +3301,7 @@ class WorkflowService:
             unresolved=unresolved,
             download_run_id=download_run_id,
             canonical=canonical,
+            run_task_ids=run_task_ids,
         )
 
     async def _substitute_artifact_urls(
@@ -3287,6 +3319,7 @@ class WorkflowService:
         unresolved: frozenset[str] = frozenset(),
         download_run_id: str | None = None,
         canonical: Sequence[FileInfo] = (),
+        run_task_ids: frozenset[str] | None = None,
     ) -> Any:
         """Substitute artifact IDs with pre-built URLs and FileInfos (no DB in the common path).
 
@@ -3378,9 +3411,8 @@ class WorkflowService:
                             ],
                         )
                     else:
-                        value["task_screenshots"] = await self.get_recent_task_screenshot_urls(
-                            organization_id=organization_id,
-                            task_id=task_id,
+                        value["task_screenshots"] = await self._legacy_task_screenshot_urls(
+                            task_id, organization_id, workflow_run_id, run_task_ids
                         )
                 if value.get("workflow_screenshots"):
                     value["workflow_screenshots"] = await self.get_recent_workflow_screenshot_urls(
@@ -3413,6 +3445,7 @@ class WorkflowService:
                         unresolved=unresolved,
                         download_run_id=download_run_id,
                         canonical=canonical,
+                        run_task_ids=run_task_ids,
                     )
         elif isinstance(value, list):
             for i, item in enumerate(value):
@@ -3433,6 +3466,7 @@ class WorkflowService:
                     unresolved=unresolved,
                     download_run_id=download_run_id,
                     canonical=canonical,
+                    run_task_ids=run_task_ids,
                 )
         return value
 
@@ -16636,6 +16670,99 @@ class WorkflowService:
 
         return artifacts
 
+    async def _legacy_task_screenshot_urls(
+        self,
+        task_id: str | None,
+        organization_id: str | None,
+        workflow_run_id: str,
+        run_task_ids: frozenset[str] | None = None,
+    ) -> list[str]:
+        artifacts = await self.get_recent_task_screenshot_artifacts(organization_id=organization_id, task_id=task_id)
+        if (
+            organization_id
+            and artifacts
+            and not all(bound_to_run(artifact, {workflow_run_id}) for artifact in artifacts)
+            and not await self._task_in_run_tree(task_id, organization_id, workflow_run_id, run_task_ids)
+            and withhold_unreadable_references(
+                organization_id, workflow_run_id, len(artifacts), source="run_output_task"
+            )
+        ):
+            return []
+        if not artifacts:
+            return []
+        urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
+        return [url for url in urls if url is not None]
+
+    async def _task_in_run_tree(
+        self, task_id: str | None, organization_id: str, workflow_run_id: str, run_task_ids: frozenset[str] | None
+    ) -> bool:
+        """Whether a legacy output's task belongs to this run or to one of the runs it started."""
+        if not task_id:
+            return False
+        if run_task_ids is not None and task_id in run_task_ids:
+            return True
+        try:
+            task = await app.DATABASE.tasks.get_task(task_id, organization_id=organization_id)
+        except Exception:
+            LOG.warning("Task reference lookup failed", workflow_run_id=workflow_run_id, exc_info=True)
+            return False
+        if task is None or not task.workflow_run_id:
+            return False
+        return await self._in_run_tree(task.workflow_run_id, organization_id, workflow_run_id)
+
+    async def _run_tree_ids(
+        self, artifacts: Sequence[Artifact], organization_id: str, workflow_run_id: str, own_ids: set[str]
+    ) -> set[str]:
+        """``own_ids`` plus the runs this run started that the artifacts were written by."""
+        candidates = {
+            run_id
+            for artifact in artifacts
+            if not bound_to_run(artifact, own_ids)
+            for run_id in (artifact.workflow_run_id, artifact.run_id)
+            if run_id and run_id.startswith(WORKFLOW_RUN_PREFIX + "_")
+        }
+        if not candidates:
+            return own_ids
+        try:
+            block_children = await app.DATABASE.observer.get_child_workflow_run_ids(workflow_run_id, organization_id)
+        except Exception:
+            LOG.warning("Run tree lookup failed", workflow_run_id=workflow_run_id, exc_info=True)
+            return own_ids
+        return own_ids | {
+            run_id
+            for run_id in candidates
+            if await self._in_run_tree(run_id, organization_id, workflow_run_id, block_children)
+        }
+
+    async def _in_run_tree(
+        self,
+        candidate_run_id: str,
+        organization_id: str,
+        workflow_run_id: str,
+        block_children: set[str] | None = None,
+    ) -> bool:
+        """Whether ``candidate_run_id`` is ``workflow_run_id`` or a run it started, through parent or block links."""
+        try:
+            if block_children is None:
+                block_children = await app.DATABASE.observer.get_child_workflow_run_ids(
+                    workflow_run_id, organization_id
+                )
+            if candidate_run_id == workflow_run_id or candidate_run_id in block_children:
+                return True
+            current, seen = candidate_run_id, {candidate_run_id}
+            for _ in range(_RUN_TREE_DEPTH):
+                run = await app.DATABASE.workflow_runs.get_workflow_run(current, organization_id=organization_id)
+                parent = run.parent_workflow_run_id if run else None
+                if parent is None or parent in seen:
+                    return False
+                if parent == workflow_run_id:
+                    return True
+                seen.add(parent)
+                current = parent
+        except Exception:
+            LOG.warning("Run tree lookup failed", workflow_run_id=workflow_run_id, exc_info=True)
+        return False
+
     async def get_recent_task_screenshot_urls(
         self,
         *,
@@ -17253,6 +17380,10 @@ class WorkflowService:
                     attempt_number=current_attempt,
                     comparison=comparison,
                     canonical=downloaded_files or (),
+                    run_task_ids=frozenset(
+                        [task.task_id for task in workflow_run_tasks]
+                        + ([task_v2.observer_cruise_id] if task_v2 and task_v2.observer_cruise_id else [])
+                    ),
                 )
             # The refresh expands artifact IDs into presigned URLs and FileInfo objects —
             # ~25x on an ID-dense value — so a value that fit before it can exceed the cap

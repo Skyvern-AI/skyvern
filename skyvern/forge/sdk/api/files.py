@@ -54,6 +54,7 @@ from skyvern.forge.sdk.core.http_request_authorization import (
     authorize_request_hop_once,
 )
 from skyvern.forge.sdk.db.id import is_uploaded_file_id
+from skyvern.forge.sdk.services.artifact_reference_access import check_managed_file_reference
 from skyvern.services import uploaded_file_service
 from skyvern.utils.url_validators import (
     MAX_SAFE_REDIRECTS,
@@ -722,6 +723,7 @@ async def download_file(
                 raise PermissionError(f"No permission to access storage URI: {url}")
 
             app.STORAGE.assert_managed_file_access(url, organization_id)
+            await check_managed_file_reference(url, organization_id)
             managed_limit_mb = max_size_mb if limit_managed_file_size else None
             if managed_limit_mb:
                 # Checked from storage metadata so an oversized object is refused before its bytes are loaded.
