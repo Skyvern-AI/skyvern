@@ -1902,7 +1902,7 @@ async def test_agent_step_is_served_listed_and_saved_only_with_the_org_grant_and
             for name in ("prompt", "data_schema", "max_turns", "parameter_keys", "tools")
         )
         step_tools = schema["data"]["tools_the_step_can_call"]
-        assert {"browser_task", "web_search", "file_download", "http_request", "finish"} <= set(step_tools)
+        assert {"browser_task", "web_search", "file_download", "http_request", "finish", "fail"} <= set(step_tools)
         assert "run_block" not in step_tools
         assert ctx.workflow_yaml == _AGENT_STEP_THEN_BRANCH
     else:
