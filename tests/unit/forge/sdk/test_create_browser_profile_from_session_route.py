@@ -12,12 +12,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from botocore.exceptions import ClientError
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr, ValidationError
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+import skyvern.forge.sdk.db.repositories.browser_sessions as browser_sessions_repository
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
@@ -26,6 +31,8 @@ from skyvern.forge.sdk.artifact.storage.browser_profile_archive import ProfilePu
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.cache.local import LocalCache
+from skyvern.forge.sdk.db.models import BrowserProfileModel
+from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.encrypt.files import FILE_MAGIC
 from skyvern.forge.sdk.routes import browser_profiles as browser_profiles_route
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile, CreateBrowserProfileRequest
@@ -35,7 +42,9 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_snapshot
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_profile_utils import operator_profile_generation, write_operator_profile_marker
 from skyvern.webeye.profile_cookie_merge import SIGNIN_COOKIES_FILENAME
@@ -599,16 +608,446 @@ def test_create_empty_profile_preserves_duplicate_name_handling(monkeypatch: pyt
     mocks.store_profile.assert_not_awaited()
 
 
+async def _promote_persisted_workflow_archive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sqlite_engine: AsyncEngine, mode: str
+) -> None:
+    client, mocks = _build_client(monkeypatch)
+    forge = object.__getattribute__(forge_app, "_inst")
+    repository = BrowserSessionsRepository(async_sessionmaker(sqlite_engine, expire_on_commit=False))
+    service = WorkflowService()
+    session = _encrypted_session_export_source(monkeypatch, tmp_path)
+    source = tmp_path / "temp" / "session"
+    source.parent.mkdir()
+    session.rename(source)
+    transport = ProfileTransport()
+    storage: S3Storage | LocalStorage
+    if mode in {"sealed-local", "plain-local"}:
+        monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(tmp_path / "durable"))
+        storage = LocalStorage(artifact_path=str(tmp_path / "artifacts"))
+    else:
+        monkeypatch.setattr(settings, "AWS_S3_BUCKET_BROWSER_SESSIONS", "fixture-profiles")
+        storage = S3Storage(bucket="fixture-profiles")
+        install_s3_profile_transport(storage, transport, monkeypatch)
+    post_stat_failure = mode in {
+        "upload-unconfirmed",
+        "post-stat-competing",
+        "post-stat-forbidden",
+        "upload-cancelled-conflict",
+    }
+    encrypted = not post_stat_failure and mode not in {"plain-local", "closed-edge-plaintext"}
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", encrypted)
+    forge.DATABASE.browser_sessions = repository
+    forge.STORAGE = storage
+    forge.WORKFLOW_SERVICE = service
+    forge.AGENT_FUNCTION.bank_credential_profile_on_healthy_run = AsyncMock()
+    forge.AGENT_FUNCTION.hidden_workflow_permanent_ids = AsyncMock(return_value=None)
+    forge.AGENT_FUNCTION.should_skip_debug_profile_writeback = AsyncMock(return_value=False)
+    forge.AGENT_FUNCTION.persist_external_browser_profile = AsyncMock(return_value=False)
+    engine_run = mode in {"closed-stealth", "unmarked-managed"}
+    memory_engine = forge.AGENT_FUNCTION.is_browser_memory_engine_enabled = AsyncMock(return_value=engine_run)
+    workflow = SimpleNamespace(
+        workflow_permanent_id="wp_1",
+        persist_browser_session=True,
+        browser_profile_key="fixture",
+        browser_profile_id=None,
+    )
+    run = _workflow_run(
+        organization_id="org_oss",
+        browser_type="chrome",
+        status=WorkflowRunStatus.completed,
+        start_fresh_browser=False,
+        browser_session_id="pbs_attached" if mode == "attached" else None,
+    )
+    mocks.get_workflow.return_value = workflow
+    mocks.get_workflow_run.return_value = run
+    forge.DATABASE.workflow_runs.get_workflow_run_parameters = AsyncMock(return_value=[])
+    storage_key = await service.get_workflow_browser_session_storage_key(workflow=workflow, workflow_run=run)
+    expected_payload = b"synthetic-session-state"
+    expected_writer: str | None = "msedge"
+    org = run.organization_id
+    artifacts = BrowserArtifacts(browser_session_dir=str(source))
+    artifacts._credential_profile_writer = "msedge"
+    if mode == "closed-chrome":
+        artifacts._credential_profile_writer = expected_writer = "chrome"
+    elif engine_run:
+        artifacts._credential_profile_writer = expected_writer = "stealth-chromium"
+    elif mode in {"attached", "channel-less", "old-worker", "plain-local"}:
+        expected_writer = None
+        if mode == "channel-less":
+            artifacts._credential_profile_writer = None
+
+    if mode in {"closed-chrome", "closed-stealth", "unmarked-managed", "seed-copy"}:
+        async with repository.Session() as db:
+            db.add(
+                BrowserProfileModel(
+                    browser_profile_id="bp_managed",
+                    organization_id=org,
+                    name="Managed source",
+                    is_managed=True,
+                    workflow_permanent_id="wp_1",
+                    source_browser_type="msedge",
+                )
+            )
+            await db.commit()
+        if mode != "seed-copy":
+            run.browser_profile_id = "bp_managed"
+            run.browser_sink_profile_id = "bp_sink"
+            run.browser_seed_source = None
+            artifacts.applied_browser_profile_id = "bp_managed"
+        decoy = tmp_path / "decoy"
+        (decoy / "Default").mkdir(parents=True)
+        (decoy / "Default" / "Cookies").write_bytes(b"distinct fallback")
+        await storage.store_browser_session(org, storage_key, str(decoy), source_browser_type="chrome")
+        if mode == "closed-chrome":
+            await storage.store_browser_profile(org, "bp_sink", str(decoy), source_browser_type="msedge")
+
+    async def persist_workflow_capture() -> None:
+        await service._persist_workflow_browser_session_if_needed(
+            workflow, run, SimpleNamespace(browser_artifacts=artifacts), close_browser_on_completion=True
+        )
+
+    await persist_workflow_capture()
+    if mode in {"closed-chrome", "unmarked-managed"}:
+        memory_engine.return_value = True
+    if mode == "unmarked-managed":
+        expected_payload = b"unmarked managed payload"
+        expected_writer = None
+        (decoy / "Default" / "Cookies").write_bytes(expected_payload)
+        await storage.store_browser_profile(org, "bp_managed", str(decoy))
+    elif mode == "seed-copy":
+        assert await service._seed_managed_browser_profile_from_legacy_session(
+            workflow=workflow, organization_id=org, rendered_key="fixture", browser_profile_id="bp_managed"
+        )
+        run.browser_profile_id = "bp_managed"
+        await storage.store_browser_session(org, storage_key, str(decoy), source_browser_type="chrome")
+    elif mode == "old-worker":
+        extracted = await storage.retrieve_browser_session(org, storage_key)
+        assert extracted is not None
+        await storage.store_browser_session(org, storage_key, extracted)
+    elif mode == "failed-overwrite":
+        original = dict(transport.objects)
+        transport.error = OSError("fixture upload failed")
+        artifacts._credential_profile_writer = "chrome"
+        (source / "Default" / "Cookies").write_bytes(b"failed source generation")
+        with pytest.raises(OSError):
+            await persist_workflow_capture()
+        transport.error = None
+        assert transport.objects == original
+
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
+    request = {"name": "promoted", "workflow_run_id": "wr_1", "proxy_session_id": "fixture-pin"}
+    original = dict(transport.objects)
+    uploads_before = len(transport.paths)
+    cancelled = mode.startswith("upload-cancelled")
+    absent_after_failure = mode in {"upload-failed", "upload-cancelled-before-put"}
+    delete_uris: list[str] = []
+    original_delete = transport.delete_file
+
+    async def record_delete(uri: str) -> None:
+        delete_uris.append(uri)
+        await original_delete(uri)
+
+    monkeypatch.setattr(transport, "delete_file", record_delete)
+    confirmation_started = asyncio.Event()
+    confirmation_released = asyncio.Event()
+    competing_seal = b"competing sealed bytes"
+    if absent_after_failure or mode == "upload-probe-unreadable":
+        transport.error = OSError("fixture upload failed")
+        if mode == "upload-probe-unreadable":
+            original_stat = transport.get_object_info
+
+            async def unreadable_after_put_attempt(uri: str) -> dict | None:
+                if "/profiles/" in uri and len(transport.paths) > uploads_before:
+                    raise ClientError({"Error": {"Code": "AccessDenied"}}, "HeadObject")
+                return await original_stat(uri)
+
+            monkeypatch.setattr(transport, "get_object_info", unreadable_after_put_attempt)
+    elif mode == "upload-failed-present":
+        original_upload = transport.upload_file_from_path
+
+        async def upload_then_fail(uri: str, file_path: str, **policy: object) -> None:
+            await original_upload(uri, file_path, **policy)
+            raise OSError("fixture PUT acknowledgement lost")
+
+        monkeypatch.setattr(transport, "upload_file_from_path", upload_then_fail)
+    elif post_stat_failure:
+        original_stat = transport.get_object_info
+
+        async def post_upload_stat(uri: str) -> dict | None:
+            if not (uri.endswith(".zip.enc") and "/profiles/" in uri and uri.removesuffix(".enc") in transport.objects):
+                return await original_stat(uri)
+            confirmation_started.set()
+            if mode == "upload-cancelled-conflict":
+                await confirmation_released.wait()
+            if mode in {"post-stat-competing", "post-stat-forbidden"}:
+                transport.objects[uri] = competing_seal
+                if mode == "post-stat-forbidden":
+                    raise ClientError({"Error": {"Code": "AccessDenied"}}, "HeadObject")
+                return await original_stat(uri)
+            raise TimeoutError("fixture seal confirmation failed")
+
+        monkeypatch.setattr(transport, "get_object_info", post_upload_stat)
+    elif mode in {"duplicate", "duplicate-id"}:
+        if mode == "duplicate-id":
+            existing_profile = await repository.create_browser_profile(
+                org, name="Different name", browser_profile_id="bp_collision"
+            )
+            assert isinstance(storage, S3Storage)
+            _, occupied_seal = storage._profile_uris(org, existing_profile.browser_profile_id)
+            transport.objects[occupied_seal] = original[occupied_seal] = b"existing sealed bytes"
+            monkeypatch.setattr(browser_sessions_repository, "generate_browser_profile_id", lambda: "bp_collision")
+            monkeypatch.setattr(
+                browser_profiles_route, "generate_browser_profile_id", lambda: "bp_collision", raising=False
+            )
+        else:
+            existing_profile = await repository.create_browser_profile(org, name=request["name"])
+    elif mode == "writer-update-failed":
+
+        @event.listens_for(sqlite_engine.sync_engine, "before_cursor_execute")
+        def fail_writer_update(conn, cursor, statement, parameters, context, executemany) -> None:
+            if statement.startswith("UPDATE browser_profiles SET source_browser_type="):
+                raise ConnectionError("fixture writer UPDATE failed")
+    elif mode in {"initial-commit-uncertain", "commit-uncertain"}:
+        commits = 0
+        failing_commit = 1 if mode == "initial-commit-uncertain" else 2
+
+        class CommitThenDisconnectSession(AsyncSession):
+            async def commit(self) -> None:
+                nonlocal commits
+                await super().commit()
+                commits += 1
+                if commits == failing_commit:
+                    raise ConnectionError("fixture lost the database response")
+
+        repository.Session = async_sessionmaker(
+            sqlite_engine, class_=CommitThenDisconnectSession, expire_on_commit=False
+        )
+
+    if mode == "upload-unconfirmed":
+        forge.AGENT_FUNCTION.browser_profile_source_rules_apply = AsyncMock(return_value=True)
+        forge.AGENT_FUNCTION.hidden_browser_profile_ids = AsyncMock(return_value=set())
+        forge.AGENT_FUNCTION.credential_folders_restricted = AsyncMock(return_value=False)
+        client.app.add_api_route("/v1/browser_profiles", browser_profiles_route.list_browser_profiles, methods=["GET"])
+        client.app.add_api_route(
+            "/v1/browser_profiles/{profile_id}",
+            browser_profiles_route.delete_browser_profile,
+            methods=["DELETE"],
+            status_code=204,
+        )
+
+    publication_failed = (
+        cancelled or post_stat_failure or mode in {"upload-failed", "upload-probe-unreadable", "upload-failed-present"}
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=client.app, raise_app_exceptions=False), base_url="http://test"
+    ) as api:
+        if mode in {"closed-edge-plaintext", "deleted-during-upload"}:
+            transport.upload_started.clear()
+            transport.pause_upload = True
+            promotion = asyncio.create_task(api.post("/v1/browser_profiles", json=request))
+            duplicate = None
+            try:
+                await asyncio.wait_for(transport.upload_started.wait(), 5)
+                assert sqlite_engine.pool.checkedout() == 0
+                (visible,) = await repository.list_browser_profiles(organization_id=org, managed=False)
+                assert visible.name == request["name"] and visible.source_browser_type is None
+                assert await repository.get_browser_profile_sources(
+                    organization_id=org, browser_profile_ids={visible.browser_profile_id}
+                ) == {visible.browser_profile_id: (run.browser_session_id, run.workflow_run_id)}
+                if mode == "deleted-during-upload":
+                    await repository.delete_browser_profile(visible.browser_profile_id, organization_id=org)
+                else:
+                    duplicate = asyncio.create_task(api.post("/v1/browser_profiles", json=request))
+                    done, _pending = await asyncio.wait({duplicate}, timeout=2)
+                    assert done and duplicate.result().status_code == 409
+                assert len(transport.paths) == uploads_before + 1
+                assert not promotion.done()
+            finally:
+                transport.upload_released.set()
+                response = await promotion
+                if duplicate is not None:
+                    await duplicate
+        elif cancelled:
+            transport.upload_started.clear()
+            transport.pause_upload = not post_stat_failure
+            reached_storage = confirmation_started if post_stat_failure else transport.upload_started
+            promotion = asyncio.create_task(api.post("/v1/browser_profiles", json=request))
+            try:
+                await asyncio.wait_for(reached_storage.wait(), 5)
+            finally:
+                promotion.cancel()
+                await asyncio.sleep(0)
+                transport.upload_released.set()
+                confirmation_released.set()
+                with pytest.raises(asyncio.CancelledError) as error:
+                    await promotion
+                if post_stat_failure:
+                    assert isinstance(error.value.__cause__, ProfilePublicationConflict)
+        else:
+            response = await api.post("/v1/browser_profiles", json=request)
+            if publication_failed:
+                assert response.status_code == 500
+
+        if absent_after_failure:
+            assert transport.objects == original
+            assert delete_uris == []
+            assert not await repository.list_browser_profiles(organization_id=org, managed=False)
+            transport.error = None
+            response = await api.post("/v1/browser_profiles", json=request)
+            publication_failed = False
+
+        if publication_failed:
+            (retained,) = await repository.list_browser_profiles(organization_id=org, managed=False)
+            assert retained.name == request["name"] and retained.source_browser_type is None
+            assert await repository.get_browser_profile_sources(
+                organization_id=org, browser_profile_ids={retained.browser_profile_id}
+            ) == {retained.browser_profile_id: (run.browser_session_id, run.workflow_run_id)}
+            assert all(transport.objects.get(uri) == contents for uri, contents in original.items())
+            destination = {uri: body for uri, body in transport.objects.items() if uri not in original}
+            if mode == "upload-probe-unreadable":
+                assert not destination
+                assert delete_uris == []
+                return
+            assert isinstance(storage, S3Storage)
+            plain_uri, sealed_uri = storage._profile_uris(org, retained.browser_profile_id)
+            if mode in {"post-stat-competing", "post-stat-forbidden"}:
+                assert destination[sealed_uri] == competing_seal
+                if mode == "post-stat-competing":
+                    assert set(destination) == {sealed_uri}
+                    return
+                assert set(destination) == {plain_uri, sealed_uri}
+                return
+            assert set(destination) == {sealed_uri if encrypted else plain_uri}
+            if mode == "upload-failed-present":
+                assert delete_uris == []
+            restored = await storage.retrieve_browser_profile_snapshot(org, retained.browser_profile_id)
+            assert restored is not None and restored.encrypted is encrypted
+            assert (Path(restored.directory) / "Default" / "Cookies").read_bytes() == expected_payload
+            if mode == "upload-unconfirmed":
+                listed = await api.get("/v1/browser_profiles")
+                assert listed.status_code == 200
+                assert [BrowserProfile.model_validate(item) for item in listed.json()] == [retained]
+                uploads_before_retry = len(transport.paths)
+                retry = await api.post("/v1/browser_profiles", json=request)
+                assert retry.status_code == 409
+                assert len(transport.paths) == uploads_before_retry
+                deleted = await api.delete(f"/v1/browser_profiles/{retained.browser_profile_id}")
+                assert deleted.status_code == 204
+                assert not await repository.list_browser_profiles(organization_id=org, managed=False)
+                assert transport.objects == original
+            return
+
+    if mode == "deleted-during-upload":
+        assert response.status_code == 404
+        assert await repository.get_browser_profile(visible.browser_profile_id, organization_id=org) is None
+        return
+    if mode in {"duplicate", "duplicate-id"}:
+        assert response.status_code == 409
+        assert await repository.list_browser_profiles(organization_id=org, managed=False) == [existing_profile]
+        assert transport.objects == original
+        assert len(transport.paths) == uploads_before
+        return
+    if mode in {"initial-commit-uncertain", "commit-uncertain", "writer-update-failed"}:
+        assert response.status_code == 500
+        (profile,) = await repository.list_browser_profiles(organization_id=org, managed=False)
+        if mode == "initial-commit-uncertain":
+            assert commits == 1
+            assert profile.source_browser_type is None
+            assert transport.objects == original
+            assert len(transport.paths) == uploads_before
+            return
+        if mode == "commit-uncertain":
+            assert commits == 2
+    else:
+        assert response.status_code == 200, response.text
+        profile = BrowserProfile.model_validate(response.json())
+    persisted = await repository.get_browser_profile(profile.browser_profile_id, organization_id=org)
+    assert persisted is not None
+    assert persisted == profile
+    assert persisted.workflow_permanent_id == "wp_1" and persisted.is_managed is False
+    assert persisted.proxy_session_id == "fixture-pin"
+    assert await repository.get_browser_profile_sources(
+        organization_id=org, browser_profile_ids={profile.browser_profile_id}
+    ) == {profile.browser_profile_id: (run.browser_session_id, run.workflow_run_id)}
+    restored = await storage.retrieve_browser_profile_snapshot(org, profile.browser_profile_id)
+    assert restored is not None and restored.encrypted is encrypted
+    assert (Path(restored.directory) / "Default" / "Cookies").read_bytes() == expected_payload
+    assert restored.source_browser_type == expected_writer
+    assert persisted.source_browser_type == (None if mode == "writer-update-failed" else expected_writer)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("run_session_id", "saver_may_access_session"),
-    [(None, True), ("pbs_run", True), ("pbs_run", False)],
-    ids=["no_session", "session_accessible", "session_not_accessible"],
+    "mode",
+    [
+        "legacy-call",
+        "legacy-session-accessible",
+        "legacy-session-denied",
+        "closed-edge",
+        "closed-edge-plaintext",
+        "deleted-during-upload",
+        "closed-chrome",
+        "closed-stealth",
+        "attached",
+        "channel-less",
+        "old-worker",
+        "unmarked-managed",
+        "seed-copy",
+        "failed-overwrite",
+        "upload-failed",
+        "upload-failed-present",
+        "upload-probe-unreadable",
+        "upload-cancelled",
+        "upload-cancelled-before-put",
+        "upload-cancelled-conflict",
+        "upload-unconfirmed",
+        "post-stat-competing",
+        "post-stat-forbidden",
+        "duplicate",
+        "duplicate-id",
+        "initial-commit-uncertain",
+        "commit-uncertain",
+        "writer-update-failed",
+        "sealed-local",
+        "plain-local",
+    ],
 )
 async def test_create_profile_from_workflow_run_still_stores_workflow_archive(
-    monkeypatch: pytest.MonkeyPatch, run_session_id: str | None, saver_may_access_session: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    sqlite_engine: AsyncEngine,
+    mode: str,
 ) -> None:
+    if not mode.startswith("legacy-"):
+        await _promote_persisted_workflow_archive(monkeypatch, tmp_path, sqlite_engine, mode)
+        return
     _client, mocks = _build_client(monkeypatch)
+    run_session_id = None if mode == "legacy-call" else "pbs_run"
+    saver_may_access_session = mode != "legacy-session-denied"
+
+    async def create_legacy_profile(
+        *,
+        organization_id: str,
+        name: str,
+        description: str | None,
+        proxy_location: ProxyLocationInput,
+        proxy_session_id: str | None,
+        workflow_permanent_id: str,
+        source_browser_session_id: str | None,
+        source_workflow_run_id: str,
+    ) -> BrowserProfile:
+        return await _stored_profile(
+            organization_id=organization_id,
+            name=name,
+            description=description,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+            workflow_permanent_id=workflow_permanent_id,
+            source_browser_session_id=source_browser_session_id,
+            source_workflow_run_id=source_workflow_run_id,
+        )
+
+    mocks.create_profile.side_effect = create_legacy_profile
     if not saver_may_access_session:
         mocks.enforce_folder_access_for_ids.side_effect = HTTPException(status_code=403, detail="denied")
     mocks.get_workflow_run.return_value = SimpleNamespace(
