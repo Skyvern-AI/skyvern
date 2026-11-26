@@ -144,6 +144,14 @@ await browser.close();                          // Close browser and cloud sessi
 ```
 </CodeGroup>
 
+### Attach to an existing remote browser
+
+The Python CDP client requires `pip install "skyvern[local]"`, even when Chrome runs remotely. Use an HTTP discovery URL for a browser that exposes `/json/version` or pass its complete browser-level `wss://` endpoint directly. Keep the URL in an environment variable if it grants access to the browser.
+
+For an example of getting a browser-level CDP link from a hosted Chrome desktop, see the [Cloudbrowser virtual browser guide](https://cloudbrowser.tv/virtual-browser). Use the CDP link from the browser settings. The Live View sharing URL opens the desktop in a browser tab.
+
+When attaching to a browser owned by another process, close any test tab you created, then use `await client.aclose()` to disconnect the Python SDK and leave the upstream browser running.
+
 ### SkyvernPage
 
 AI-enhanced Playwright methods - pass a selector for standard Playwright, add a prompt for AI fallback, or use prompt alone for pure AI.

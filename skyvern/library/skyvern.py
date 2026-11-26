@@ -604,10 +604,12 @@ class Skyvern(AsyncSkyvern):
         """Connect to an existing browser instance via Chrome DevTools Protocol (CDP).
 
         Use this to connect to a browser that's already running with CDP enabled,
-        whether local or remote.
+        whether local or remote. The Python SDK requires the `skyvern[local]` extra
+        because Playwright runs in the SDK process even for a remote browser.
 
         Args:
-            cdp_url: The CDP WebSocket URL (e.g., "http://localhost:9222").
+            cdp_url: An HTTP discovery URL (e.g., "http://localhost:9222") or the
+                full browser-level CDP WebSocket URL (e.g., a hosted `wss://` URL).
 
         Returns:
             SkyvernBrowser: A browser instance connected to the existing browser.
