@@ -742,6 +742,9 @@ Deploy the keys to every server before you turn encryption on. A profile that is
 |---|---|---|
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. Any other value means `INFO`. |
 | `CODE_BLOCK_MODE` | `enabled` | `enabled`, `disabled` or `entitlement`. On a self-hosted server, `disabled` and `entitlement` both reject [Code blocks](/reference/blocks) in runs. While it is unset, the older `DISABLE_CODE_BLOCK_EXECUTION=true` or `ENABLE_CODE_BLOCK=false` still turns them off. Under Docker Compose, `ENABLE_CODE_BLOCK=false` in `.env` has no effect: `docker-compose.yml` sets `ENABLE_CODE_BLOCK=true`, which wins over `.env`. Set `CODE_BLOCK_MODE=disabled` in `.env` instead. |
+| `FILE_PARSER_MAX_ROWS` | `250000` | Most rows a CSV or Excel input to a [File Parser block](/reference/blocks) may have. A larger file fails the block. |
+| `FILE_PARSER_MAX_CELLS` | `5000000` | Most cells a CSV or Excel input to a File Parser block may have. |
+| `FILE_PARSER_MAX_DECODED_BYTES` | `209715200` (200 MiB) | Largest CSV, or Excel workbook once unzipped, that a File Parser block reads. |
 | `TOTP_LIFESPAN_MINUTES` | `10` | How long a 2FA code sent to Skyvern stays usable. Older codes are ignored. |
 | `RUN_HEARTBEAT_TIMEOUT_MINUTES` | `30` | Minutes without a heartbeat from the server process that executes a run. After this time, a server marks the run `failed` and sends its failure webhook, or starts a retry under the workflow's retry policy. This can be the same server after a restart, or another server on the same database. This check applies when the API server executes runs itself (the default). |
 | `ENABLE_URL_VALIDATION` | `false` | `true` makes Skyvern refuse URLs that point at loopback, private-network or cloud-metadata addresses. Off by default. See [URL validation](#url-validation). |
