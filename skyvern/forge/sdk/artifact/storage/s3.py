@@ -37,7 +37,12 @@ from skyvern.forge.sdk.api.files import (
     get_skyvern_temp_dir,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
-from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
+from skyvern.forge.sdk.artifact.signing import (
+    ARTIFACT_URL_EXPIRY_SECONDS_MIN,
+    SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS,
+    parse_keyring,
+    sign_s3_download_fallback_url,
+)
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
@@ -1189,7 +1194,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         # With the keyring set, the run's DOWNLOAD rows are the source of truth: each row carries the SHA-256 and
         # what a signed /v1/artifacts/{id}/content URL needs, so there is no S3 LIST or per-file HEAD, and a run with
         # no rows has no downloads. Without a keyring (OSS default) the signed endpoint needs an API key that webhook
-        # consumers lack, so this lists and presigns even when rows exist, as it also does when the row lookup fails.
+        # consumers lack, so this lists S3 when the keyring is unset or the row lookup fails.
 
         # ``download_row_count`` stays None when the rows were never queried (no keyring, no run id,
         # or the lookup failed), so an unqueried read is never reported as a read that found nothing.
@@ -1274,7 +1279,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             )
         except Exception:
             LOG.warning(
-                "Failed to look up download artifacts; falling back to presigned S3 URLs",
+                "Failed to look up download artifacts; falling back to S3 listing",
                 organization_id=organization_id,
                 run_id=run_id,
                 exc_info=True,
@@ -1289,6 +1294,13 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         run_id: str | None,
         download_artifacts: list[Artifact] | None = None,
     ) -> list[FileInfo]:
+        standalone = settings.INFRA_PROVIDER == "standalone"
+        keyring = None
+        if standalone:
+            if run_id is None or not settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+                LOG.warning("Standalone download fallback requires a run and artifact signing")
+                return []
+            keyring = parse_keyring(settings.ARTIFACT_CONTENT_HMAC_KEYRING)
         if download_artifacts is None and run_id is not None:
             download_artifacts, _ = await self._list_download_artifacts_safe(
                 organization_id=organization_id,
@@ -1296,14 +1308,24 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             )
         artifacts_by_uri = {artifact.uri: artifact for artifact in download_artifacts or []}
         bucket = settings.AWS_S3_BUCKET_UPLOADS
-        uri = f"s3://{bucket}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
-        object_keys = await self.async_client.list_files(uri=uri)
+        key_prefix = f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
+        uri = f"s3://{bucket}/{key_prefix}"
+        object_keys = await self.async_client.list_files(uri=f"{uri}/" if standalone else uri)
         if len(object_keys) == 0:
             return []
+
+        expiry_seconds = ARTIFACT_URL_EXPIRY_SECONDS_MIN
+        if keyring is not None:
+            try:
+                expiry_seconds = await app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds(organization_id)
+            except Exception as error:
+                LOG.warning("Using minimum standalone download link expiry", error_type=type(error).__name__)
 
         file_infos: list[FileInfo] = []
         for key in object_keys:
             if key.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
+            if standalone and not key.startswith(f"{key_prefix}/"):
                 continue
             object_uri = f"s3://{bucket}/{key}"
 
@@ -1322,15 +1344,26 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             display_name = metadata.get("original_filename", filename) if metadata else filename
             artifact = artifacts_by_uri.get(object_uri)
 
-            presigned_urls = await self.async_client.create_presigned_urls(
-                [object_uri], attachment_filenames=[display_name]
-            )
-            if not presigned_urls:
-                continue
+            if keyring is not None:
+                url = sign_s3_download_fallback_url(
+                    settings.SKYVERN_BASE_URL,
+                    bucket=bucket,
+                    key=key,
+                    filename=display_name,
+                    keyring=keyring,
+                    expiry_seconds=expiry_seconds,
+                )
+            else:
+                presigned_urls = await self.async_client.create_presigned_urls(
+                    [object_uri], attachment_filenames=[display_name]
+                )
+                if not presigned_urls:
+                    continue
+                url = presigned_urls[0]
 
             file_infos.append(
                 FileInfo(
-                    url=presigned_urls[0],
+                    url=url,
                     checksum=checksum,
                     filename=display_name,
                     file_size=content_length,
