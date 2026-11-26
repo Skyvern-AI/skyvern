@@ -58,6 +58,7 @@ from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
     WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
     find_profile_object,
     profile_archive_uris,
+    profile_writer_options,
     retrieve_remote_profile,
     store_remote_profile,
     workflow_session_archive_uris,
@@ -599,6 +600,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         *,
         require_encryption: bool = False,
         strict_traversal: bool = False,
+        source_browser_type: str | None = None,
     ) -> None:
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_BROWSER_SESSIONS)
         await store_remote_profile(
@@ -612,6 +614,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             require_encryption=require_encryption,
             strict_traversal=strict_traversal,
             purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+            **profile_writer_options(source_browser_type),
         )
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
@@ -652,6 +655,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         require_encryption: bool = False,
         confirm_creation: bool = False,
         strict_traversal: bool = False,
+        source_browser_type: str | None = None,
     ) -> None:
         """Store browser profile to S3."""
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_BROWSER_SESSIONS)
@@ -680,6 +684,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             require_encryption=require_encryption,
             confirm_creation=confirm_creation,
             strict_traversal=strict_traversal,
+            **profile_writer_options(source_browser_type),
         )
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:

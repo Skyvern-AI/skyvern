@@ -404,6 +404,7 @@ class BrowserProfileSnapshot:
     encrypted: bool = False
     legacy_local_copy: bool = False
     version: str | None = None
+    source_browser_type: str | None = None
 
 
 class BaseStorage(ABC):
@@ -521,7 +522,13 @@ class BaseStorage(ABC):
 
     @abstractmethod
     async def store_browser_session(
-        self, organization_id: str, workflow_permanent_id: str, directory: str, *, require_encryption: bool = False
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        directory: str,
+        *,
+        require_encryption: bool = False,
+        source_browser_type: str | None = None,
     ) -> None:
         pass
 
@@ -541,7 +548,14 @@ class BaseStorage(ABC):
 
     @abstractmethod
     async def store_browser_profile(
-        self, organization_id: str, profile_id: str, directory: str, *, require_encryption: bool = False
+        self,
+        organization_id: str,
+        profile_id: str,
+        directory: str,
+        *,
+        require_encryption: bool = False,
+        confirm_creation: bool = False,
+        source_browser_type: str | None = None,
     ) -> None:
         """Store a browser profile from a directory."""
 

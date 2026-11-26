@@ -120,6 +120,7 @@ from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_ar
 from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
     ProfilePublicationConflict,
     ProfilePublicationUnconfirmed,
+    profile_writer_options,
 )
 from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
@@ -2038,12 +2039,12 @@ class WorkflowBrowserCleanupResult:
     browser_session_write_back_attempted: bool = False
 
 
-def _owned_credential_capture(
-    cleanup: WorkflowBrowserCleanupResult, browser_session_id: str | None
+def _owned_closed_profile_capture(
+    browser_state: BrowserState | None, close_browser_on_completion: bool, browser_session_id: str | None = None
 ) -> BrowserArtifacts | None:
-    if browser_session_id or not cleanup.close_browser_on_completion or cleanup.browser_state is None:
+    if browser_session_id or not close_browser_on_completion or browser_state is None:
         return None
-    artifacts = cleanup.browser_state.browser_artifacts
+    artifacts = browser_state.browser_artifacts
     if (
         artifacts._credential_profile_writer
         and artifacts.browser_session_dir
@@ -2051,6 +2052,13 @@ def _owned_credential_capture(
     ):
         return artifacts
     return None
+
+
+def _workflow_archive_writer(
+    workflow_run: WorkflowRun, browser_state: BrowserState, close_browser_on_completion: bool
+) -> str | None:
+    capture = _owned_closed_profile_capture(browser_state, close_browser_on_completion)
+    return capture._credential_profile_writer if capture is not None and not workflow_run.browser_session_id else None
 
 
 @dataclass
@@ -6182,6 +6190,7 @@ class WorkflowService:
                 profile_id=browser_profile_id,
                 directory=snapshot.directory,
                 require_encryption=snapshot.encrypted,
+                **profile_writer_options(snapshot.source_browser_type),
             )
         except Exception as exc:
             publication = exc if isinstance(exc, ProfilePublicationConflict) else exc.__cause__
@@ -9651,8 +9660,9 @@ class WorkflowService:
                             if current_workflow_run.status.is_final():
                                 browser_persistence_status = current_workflow_run.status
                                 break
-                            if credential_profile_finalizer is not None and _owned_credential_capture(
-                                browser_cleanup_result,
+                            if credential_profile_finalizer is not None and _owned_closed_profile_capture(
+                                browser_cleanup_result.browser_state,
+                                browser_cleanup_result.close_browser_on_completion,
                                 browser_session_id or owned_browser_session_id or workflow_run.browser_session_id,
                             ):
                                 # The untyped fallback can see the session as soon as completion is durable.
@@ -18070,6 +18080,9 @@ class WorkflowService:
             )
             return
 
+        writer = profile_writer_options(
+            _workflow_archive_writer(workflow_run, browser_state, close_browser_on_completion)
+        )
         browser_profile = None
         if workflow_run.browser_profile_id:
             browser_profile = await app.DATABASE.browser_sessions.get_browser_profile(
@@ -18098,6 +18111,7 @@ class WorkflowService:
                 profile_id=browser_profile.browser_profile_id,
                 directory=browser_state.browser_artifacts.browser_session_dir,
                 require_encryption=browser_state.browser_artifacts._seed_profile_encrypted,
+                **writer,
             )
             LOG.info(
                 "Persisted managed browser profile for workflow run",
@@ -18135,6 +18149,7 @@ class WorkflowService:
                 browser_session_storage_key,
                 browser_state.browser_artifacts.browser_session_dir,
                 require_encryption=browser_state.browser_artifacts._seed_profile_encrypted,
+                **writer,
             )
             LOG.info(
                 "Persisted browser session for workflow run",
@@ -18262,6 +18277,9 @@ class WorkflowService:
             profile_id=sink_profile_id,
             directory=browser_state.browser_artifacts.browser_session_dir,
             require_encryption=browser_state.browser_artifacts._seed_profile_encrypted,
+            **profile_writer_options(
+                _workflow_archive_writer(workflow_run, browser_state, close_browser_on_completion)
+            ),
         )
         LOG.info(
             "Persisted resolved sink browser profile for workflow run",
@@ -18344,6 +18362,7 @@ class WorkflowService:
                 profile_id=sink_profile_id,
                 directory=current_dir,
                 require_encryption=artifacts._seed_profile_encrypted or snapshot.encrypted,
+                **profile_writer_options(snapshot.source_browser_type),
             )
         finally:
             # retrieve_browser_profile_snapshot extracts a cookie-bearing archive into TEMP_PATH; drop it so a
@@ -18545,8 +18564,9 @@ class WorkflowService:
                     and final_diagnostic_owner.status == WorkflowRunStatus.completed
                     and workflow_run.status == WorkflowRunStatus.completed
                     and (
-                        capture := _owned_credential_capture(
-                            browser_cleanup_result,
+                        capture := _owned_closed_profile_capture(
+                            browser_state,
+                            close_browser_on_completion,
                             browser_session_id or owned_browser_session_id or workflow_run.browser_session_id,
                         )
                     )
