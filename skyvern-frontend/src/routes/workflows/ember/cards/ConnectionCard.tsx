@@ -663,7 +663,7 @@ function ConnectionCardBody({
           >
             {connectedDrive.busy
               ? "Waiting for sign-in…"
-              : "Connect with Nango"}
+              : "Connect Connected Google Drive"}
           </button>
         ) : null}
       </div>

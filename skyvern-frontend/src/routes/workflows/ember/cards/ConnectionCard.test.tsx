@@ -540,7 +540,7 @@ describe("ConnectionCard", () => {
       </PageSlotsProvider>,
     );
     expect(
-      screen.getByRole("button", { name: "Connect with Nango" }),
+      screen.getByRole("button", { name: "Connect Connected Google Drive" }),
     ).toBeTruthy();
     expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
     expect(screen.getByText("Broker Drive")).toBeTruthy();
@@ -563,7 +563,7 @@ describe("ConnectionCard", () => {
     );
     expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
     expect(
-      screen.queryByRole("button", { name: "Connect with Nango" }),
+      screen.queryByRole("button", { name: "Connect Connected Google Drive" }),
     ).toBeNull();
     expect(screen.queryByText("Broker Drive")).toBeNull();
 

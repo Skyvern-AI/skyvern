@@ -883,6 +883,14 @@ async def test_request_connection_builds_one_card_from_the_list_entry_without_to
             "google_drive", None, make_ember_ctx(organization_id=ORGANIZATION_ID), "list_folder"
         )
         assert "connected_gmail_limit" not in broker_only_drive["data"]
+        # A single-backend entry, such as a credential-form vault, offers every account the catalog lists for it.
+        org.configured = {OrganizationAuthTokenType.bitwarden_credential}
+        monkeypatch.setattr(app.AGENT_FUNCTION, "integration_setup_path", lambda entry: f"/integrations/{entry.id}")
+        vault = await _request_connection("bitwarden", None, make_ember_ctx(organization_id=ORGANIZATION_ID))
+        assert (vault["data"]["status"], vault["data"]["accounts"]) == (
+            "setup_page",
+            [{"provider": "bitwarden", "state": "active"}],
+        )
 
 
 @pytest.mark.asyncio

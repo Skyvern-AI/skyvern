@@ -45,6 +45,7 @@ vi.mock("@/hooks/useMicrosoftOAuthCredentials", async (importOriginal) => ({
 }));
 
 import { IntegrationAccountPicker } from "./IntegrationAccountPicker";
+import { knownAccountBackends } from "./knownAccounts";
 import type { IntegrationCatalogEntryWithActions } from "./types";
 
 describe("integration account picker", () => {
@@ -166,5 +167,10 @@ describe("integration account picker", () => {
         name: "Team Drive (o***r@example.test)",
       }),
     ).toBeNull();
+    // Action changes and save validation look up the accounts the picker loaded.
+    expect(Object.fromEntries(knownAccountBackends())).toEqual({
+      goc_1: "native",
+      ngc_drive: "nango",
+    });
   });
 });

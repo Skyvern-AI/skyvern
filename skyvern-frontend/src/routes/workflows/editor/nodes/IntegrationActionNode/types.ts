@@ -25,7 +25,7 @@ export type IntegrationActionSpec = {
   inputs: JsonSchema;
   needs?: string[];
   acts?: boolean;
-  credentialBackends?: ("native" | "nango")[];
+  credentialBackends?: CredentialBackend[];
   runsVia?: string;
 };
 
@@ -143,6 +143,18 @@ export function editableInputs(
 // Text that is a template is resolved at run time, so it is never checked as JSON or a number here.
 export function isTemplate(value: unknown): boolean {
   return typeof value === "string" && /\{\{|\{%/.test(value);
+}
+
+export type CredentialBackend = "native" | "nango";
+
+// An account's backend comes from looking it up among loaded accounts, never from its id (ADR 0033 rule 3).
+// An unknown account, or an action that declares no credentialBackends, is left to the server.
+export function actionAcceptsAccount(
+  action: IntegrationActionSpec | undefined,
+  backend: CredentialBackend | undefined,
+): boolean {
+  const backends = action?.credentialBackends;
+  return !backends || backend === undefined || backends.includes(backend);
 }
 
 export type AccountFit = "yes" | "no" | "unknown";
