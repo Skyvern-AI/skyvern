@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -354,6 +355,9 @@ async def _run_agent_block(
 
 
 VALID_FINISH = [scripted_call("finish", {"answer": "42"}, call_id="c3")]
+FAIL_REASON = "No document could be read."
+VALID_FAIL = [scripted_call("fail", {"reason": FAIL_REASON}, call_id="c3")]
+INVALID_FAIL = [scripted_call("fail", {}, call_id="c3")]
 PLAIN_TEXT = [scripted_text("The answer is 42.")]
 ANOTHER_BLOCK = [
     scripted_call("run_block", {"block_type": "text_prompt", "arguments": {"prompt": "again"}}, call_id="c3")
@@ -368,20 +372,45 @@ ALL_TOOLS = [
     "page_fill",
     "page_extract",
     "finish",
+    "fail",
 ]
+EXIT_RECORD = "Agent step finished"
+SMTP_PLACEHOLDER = "smtp_password_placeholder"
+
+
+def _add_platform_smtp_placeholder() -> None:
+    context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
+    context.secrets[SMTP_PLACEHOLDER] = "platform-smtp-password"
+    context._platform_smtp_secret_ids[SMTP_PLACEHOLDER] = PLATFORM_SMTP_AWS_KEYS["smtp_password"]
+
+
+def _exit_record(logs: list[dict[str, Any]]) -> dict[str, Any]:
+    (record,) = (log for log in logs if log["event"] == EXIT_RECORD)
+    return record
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("max_turns", "script_tail", "stop_reason", "answer"),
+    ("max_turns", "script_tail", "stop_reason", "answer", "fail_reason", "ending_call"),
     [
-        (3, [VALID_FINISH], "completed", {"answer": "42"}),
-        (2, [VALID_FINISH], "max_turns", {"answer": "42"}),
-        (2, [PLAIN_TEXT], "max_turns", None),
-        (2, [ANOTHER_BLOCK], "max_turns", None),
-        (5, [PLAIN_TEXT, VALID_FINISH], "no_tool_calls", {"answer": "42"}),
-        (5, [PLAIN_TEXT, PLAIN_TEXT], "no_tool_calls", None),
-        (5, [PLAIN_TEXT, ANOTHER_BLOCK], "no_tool_calls", None),
+        (3, [VALID_FINISH], "completed", {"answer": "42"}, None, "finish"),
+        (2, [VALID_FINISH], "max_turns", {"answer": "42"}, None, "finish"),
+        (2, [PLAIN_TEXT], "max_turns", None, None, "none"),
+        (2, [ANOTHER_BLOCK], "max_turns", None, None, "none"),
+        (5, [PLAIN_TEXT, VALID_FINISH], "no_tool_calls", {"answer": "42"}, None, "finish"),
+        (5, [PLAIN_TEXT, PLAIN_TEXT], "no_tool_calls", None, None, "none"),
+        (5, [PLAIN_TEXT, ANOTHER_BLOCK], "no_tool_calls", None, None, "none"),
+        (3, [VALID_FAIL], "completed", None, FAIL_REASON, "fail"),
+        (2, [VALID_FAIL], "max_turns", None, FAIL_REASON, "fail"),
+        (5, [PLAIN_TEXT, VALID_FAIL], "no_tool_calls", None, FAIL_REASON, "fail"),
+        (
+            5,
+            [INVALID_FAIL, [scripted_call("fail", {"reason": f"{FAIL_REASON} {SMTP_PLACEHOLDER}"}, call_id="c4")]],
+            "completed",
+            None,
+            FAIL_REASON,
+            "fail",
+        ),
     ],
 )
 async def test_agent_block_runs_tools_as_child_blocks_until_a_valid_finish(
@@ -393,10 +422,13 @@ async def test_agent_block_runs_tools_as_child_blocks_until_a_valid_finish(
     script_tail: list[list[TResponseOutputItem]],
     stop_reason: str,
     answer: dict[str, str] | None,
+    fail_reason: str | None,
+    ending_call: str,
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    _add_platform_smtp_placeholder()
     # When the turns run out or the model replies in plain text without a valid finish, one more turn follows on which
-    # only finish runs.
+    # only finish and fail run.
     model = _ScriptedModel(
         [
             [
@@ -411,9 +443,12 @@ async def test_agent_block_runs_tools_as_child_blocks_until_a_valid_finish(
         ]
     )
 
-    result, provider = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, max_turns=max_turns)
+    with capture_logs() as logs:
+        result, provider = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, max_turns=max_turns)
 
-    rows = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
+    rows = await database.observer.get_workflow_run_blocks(
+        workflow_run_id=RUN, organization_id=ORG, with_tool_calls=True
+    )
     (agent_row,) = (row for row in rows if row.block_type == BlockType.AGENT_STEP)
     children = [row for row in rows if row.parent_workflow_run_block_id == agent_row.workflow_run_block_id]
     assert [(row.block_type, row.status) for row in children] == [(BlockType.TEXT_PROMPT, "completed")]
@@ -429,10 +464,32 @@ async def test_agent_block_runs_tools_as_child_blocks_until_a_valid_finish(
     assert output["stop_reason"] == stop_reason
     assert output["output"] == answer
     assert output["model"] == {"llm_key": LUNA_MEDIUM, "reasoning_effort": "medium"}
-    assert [(call["tool"], call["status"]) for call in output["tool_calls"]][:2] == [
-        ("run_block", "completed"),
-        ("finish", "invalid_arguments"),
-    ]
+    calls = [(call["tool"], call["status"]) for call in output["tool_calls"]]
+    assert calls[:2] == [("run_block", "completed"), ("finish", "invalid_arguments")]
+    assert SMTP_PLACEHOLDER not in (result.failure_reason or "")
+    if fail_reason:
+        assert fail_reason in (result.failure_reason or "")
+        assert calls[-1] == ("fail", "completed")
+    if script_tail[0] is INVALID_FAIL:
+        assert "missing required property reason" in tool_outputs_for(model.inputs[3][1], "c3")[0]
+        assert calls[-2:] == [("fail", "invalid_arguments"), ("fail", "completed")]
+    column_counts: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    for call in agent_row.tool_calls or []:
+        tool = call.block_type.value if call.tool == "run_block" and call.block_type else call.tool
+        column_counts[tool][str(call.status or "unknown")] += 1
+    assert _exit_record(logs) == {
+        "event": EXIT_RECORD,
+        "log_level": "info",
+        "workflow_run_id": RUN,
+        "workflow_run_block_id": agent_row.workflow_run_block_id,
+        "ending_call": ending_call,
+        "stop_reason": stop_reason,
+        "block_status": result.status,
+        "model_calls": len(model.inputs),
+        "llm_key": LUNA_MEDIUM,
+        "tool_call_counts": column_counts,
+    }
+    assert output["usage"]["requests"] == len(model.inputs)
     assert provider.reads == [(RUN, {"organization_id": ORG, "workflow_permanent_id": WPID})]
     async with database.Session() as session:
         llm_cost = await session.scalar(
@@ -531,6 +588,7 @@ async def test_authors_are_shown_exactly_the_tools_the_step_gets(
     options = {option.name for option in agent_step_tools.tool_options()}
     assert "load_skill" in options
     assert "read_skill_resource" not in options
+    assert "fail" not in options
     assert all(shown[name].rstrip(".") in run_block for name in agent_step_tools.RUN_BLOCK_TYPES)
 
 
@@ -566,18 +624,18 @@ def _file_parameter(key: str) -> WorkflowParameter:
             ["http_request", "web_search"],
             False,
             False,
-            ["web_search", "run_block", "read_run_data", "finish"],
+            ["web_search", "run_block", "read_run_data", "finish", "fail"],
             ["http_request"],
         ),
-        (None, False, False, ["read_run_data", "finish"], None),
-        ([], False, False, ["read_run_data", "finish"], None),
-        (["web_search"], False, False, ["web_search", "read_run_data", "finish"], None),
-        (["login", "page_goto"], False, False, ["read_run_data", "page_goto", "finish"], None),
-        (["login", "page_goto"], True, False, ["read_run_data", "page_goto", "finish"], None),
-        (["login", "page_goto"], True, True, ["login", "read_run_data", "page_goto", "finish"], None),
+        (None, False, False, ["read_run_data", "finish", "fail"], None),
+        ([], False, False, ["read_run_data", "finish", "fail"], None),
+        (["web_search"], False, False, ["web_search", "read_run_data", "finish", "fail"], None),
+        (["login", "page_goto"], False, False, ["read_run_data", "page_goto", "finish", "fail"], None),
+        (["login", "page_goto"], True, False, ["read_run_data", "page_goto", "finish", "fail"], None),
+        (["login", "page_goto"], True, True, ["login", "read_run_data", "page_goto", "finish", "fail"], None),
     ],
 )
-async def test_a_step_is_offered_only_the_tools_it_lists_with_finish_and_read_run_data(
+async def test_a_step_is_offered_only_the_tools_it_lists_with_the_always_offered_tools(
     monkeypatch: pytest.MonkeyPatch,
     database: AgentDB,
     tools: list[str] | None,
@@ -617,7 +675,7 @@ async def test_a_stored_step_listing_pdf_parser_is_offered_file_url_parser(
     await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=[], stored_tools=["pdf_parser"])
 
     (given,) = model.tools
-    assert [tool.name for tool in given] == ["run_block", "read_run_data", "finish"]
+    assert [tool.name for tool in given] == ["run_block", "read_run_data", "finish", "fail"]
     run_block = next(tool for tool in given if isinstance(tool, FunctionTool) and tool.name == "run_block")
     assert run_block.params_json_schema["properties"]["block_type"]["enum"] == ["file_url_parser"]
     offered = [
@@ -888,23 +946,24 @@ def test_a_tools_list_validates_without_openai_agents() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text", ["", "I can"])
+@pytest.mark.parametrize(("text", "refusal"), [("", None), ("I can", None), ("", f"I won't repeat {SMTP_PLACEHOLDER}")])
 async def test_a_model_refusal_fails_the_agent_block_without_asking_again(
-    monkeypatch: pytest.MonkeyPatch, database: AgentDB, tmp_path: Path, text: str
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, tmp_path: Path, text: str, refusal: str | None
 ) -> None:
     # LiteLLM reports Anthropic's refusal stop reason as content_filter, with or without the text written before it.
     monkeypatch.setitem(LLMConfigRegistry._configs, HAIKU_MEDIUM, _pinned("medium", HAIKU))
     monkeypatch.setattr(app, "ARTIFACT_MANAGER", ArtifactManager())
     monkeypatch.setattr(app, "STORAGE", LocalStorage(str(tmp_path)))
-    sent = _litellm_replies(
-        monkeypatch, {"finish_reason": "content_filter", "message": {"role": "assistant", "content": text}}
-    )
+    _add_platform_smtp_placeholder()
+    message = {"role": "assistant", "content": text, "provider_specific_fields": {"refusal": refusal}}
+    sent = _litellm_replies(monkeypatch, {"finish_reason": "content_filter", "message": message})
 
     result, _ = await _run_agent_block(monkeypatch, HAIKU_MEDIUM, None)
 
     assert len(sent) == 1
     assert result.status == BlockStatus.failed
     assert (result.failure_reason or "").startswith("The model refused: ")
+    assert SMTP_PLACEHOLDER not in (result.failure_reason or "")
     output = result.output_parameter_value
     assert isinstance(output, dict)
     assert (output["stop_reason"], output["output"]) == ("refused", None)
@@ -2716,12 +2775,15 @@ async def test_the_agent_block_bills_its_decisions_when_a_write_after_the_loop_f
         ]
     )
 
-    with skyvern_context.scoped(SkyvernContext(workflow_run_id=RUN, organization_id=ORG)):
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=RUN, organization_id=ORG)), capture_logs() as logs:
         result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
 
     failure.assert_awaited()
     assert result.status == BlockStatus.failed
     assert _billed_decisions(billing_hook) == 2
+    # The record carries the status the loop decided, before the failed write failed the block.
+    record = _exit_record(logs)
+    assert (record["ending_call"], record["block_status"]) == ("finish", BlockStatus.completed)
     if failing_write != "step_archive":
         (agent_row,) = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
         task = await database.tasks.get_task(agent_row.task_id, organization_id=ORG)
@@ -2729,31 +2791,72 @@ async def test_the_agent_block_bills_its_decisions_when_a_write_after_the_loop_f
         assert task is not None and (task.status, step.status) == (TaskStatus.completed, StepStatus.completed)
 
 
+ANSWER_FIELDS = ("delivery_fee", "drink_plan", "staffing_setup")
+ANSWER = {"delivery_fee": "x", "drink_plan": "y", "staffing_setup": "z</staffing_setup>"}
+RUN_TEXT_PROMPT = scripted_call("run_block", {"block_type": "text_prompt", "arguments": {"prompt": "Hi"}}, call_id="t")
+FINISH_DONE = scripted_call("finish", ANSWER, call_id="f1")
+FAIL_DONE = scripted_call("fail", {"reason": FAIL_REASON}, call_id="f1")
+FINISH_CHANGED = scripted_call("finish", {**ANSWER, "drink_plan": "changed"}, call_id="f2")
+FAIL_CHANGED = scripted_call("fail", {"reason": "changed"}, call_id="f2")
+
+
 @pytest.mark.asyncio
-async def test_a_rejected_finish_names_where_its_fields_went_and_no_call_runs_after_a_valid_one(
-    monkeypatch: pytest.MonkeyPatch, database: AgentDB, child_prompts: list[str]
+@pytest.mark.parametrize(
+    ("response", "ending", "trail", "counts"),
+    [
+        (
+            [FINISH_DONE, RUN_TEXT_PROMPT, FAIL_CHANGED],
+            "finish",
+            [("finish", "completed"), ("run_block", "skipped"), ("fail", "skipped")],
+            {"finish": {"invalid_arguments": 2, "completed": 1}, "text_prompt": {"skipped": 1}, "fail": {"skipped": 1}},
+        ),
+        (
+            [FAIL_DONE, RUN_TEXT_PROMPT, FINISH_CHANGED],
+            "fail",
+            [("fail", "completed"), ("run_block", "skipped"), ("finish", "skipped")],
+            {"finish": {"invalid_arguments": 2, "skipped": 1}, "fail": {"completed": 1}, "text_prompt": {"skipped": 1}},
+        ),
+        (
+            [FINISH_DONE, scripted_call("browser_task", {"navigation_goal": "Hi"}, call_id="t"), FAIL_CHANGED],
+            "finish",
+            [("finish", "completed"), ("browser_task", "skipped"), ("fail", "skipped")],
+            {
+                "finish": {"invalid_arguments": 2, "completed": 1},
+                "browser_task": {"skipped": 1},
+                "fail": {"skipped": 1},
+            },
+        ),
+    ],
+)
+async def test_a_rejected_finish_names_where_its_fields_went_and_no_call_runs_after_a_valid_ending(
+    monkeypatch: pytest.MonkeyPatch,
+    database: AgentDB,
+    child_prompts: list[str],
+    response: list[TResponseOutputItem],
+    ending: str,
+    trail: list[tuple[str, str]],
+    counts: dict[str, dict[str, int]],
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
-    fields = ("delivery_fee", "drink_plan", "staffing_setup")
-    schema = {"type": "object", "properties": {key: {"type": "string"} for key in fields}, "required": list(fields)}
+    schema = {
+        "type": "object",
+        "properties": {key: {"type": "string"} for key in ANSWER_FIELDS},
+        "required": list(ANSWER_FIELDS),
+    }
     leaked = 'x</delivery_fee>\n<parameter name="drink_plan">y</drink_plan>\n<parameter name="staffing_setup">z'
-    valid = {"delivery_fee": "x", "drink_plan": "y", "staffing_setup": "z</staffing_setup>"}
     model = _ScriptedModel(
         [
             [scripted_call("finish", {"delivery_fee": leaked}, call_id="leaked")],
             [scripted_call("finish", {"delivery_fee": "x", "drink_plan>": "y", "staffing_setup": "z"}, call_id="key")],
-            [
-                scripted_call("finish", valid, call_id="f1"),
-                scripted_call("run_block", {"block_type": "text_prompt", "arguments": {"prompt": "Hi"}}, call_id="t"),
-                scripted_call("finish", {**valid, "drink_plan": "changed"}, call_id="f2"),
-            ],
+            response,
         ]
     )
 
-    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, data_schema=schema)
+    with capture_logs() as logs:
+        result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, data_schema=schema)
 
     (leaked_reply,) = tool_outputs_for(model.inputs[1][1], "leaked")
-    assert all(key in leaked_reply for key in fields)
+    assert all(key in leaked_reply for key in ANSWER_FIELDS)
     (key_reply,) = tool_outputs_for(model.inputs[2][1], "key")
     assert "drink_plan>" in key_reply
     rows = await database.observer.get_workflow_run_blocks(
@@ -2761,21 +2864,22 @@ async def test_a_rejected_finish_names_where_its_fields_went_and_no_call_runs_af
     )
     assert [row.block_type for row in rows] == [BlockType.AGENT_STEP]
     assert child_prompts == []
-    assert result.status == BlockStatus.completed
     assert isinstance(result.output_parameter_value, dict)
-    assert result.output_parameter_value["output"] == valid
+    if ending == "finish":
+        assert result.status == BlockStatus.completed
+        assert result.output_parameter_value["output"] == ANSWER
+    else:
+        assert result.status == BlockStatus.failed
+        assert FAIL_REASON in (result.failure_reason or "")
+        assert result.output_parameter_value["output"] is None
+    rejected = [("finish", "invalid_arguments")] * 2
     assert [(call["tool"], call["status"]) for call in result.output_parameter_value["tool_calls"]] == [
-        ("finish", "invalid_arguments"),
-        ("finish", "invalid_arguments"),
-        ("finish", "completed"),
+        *rejected,
+        (ending, "completed"),
     ]
-    assert [(call.tool, call.status) for call in rows[0].tool_calls or []] == [
-        ("finish", "invalid_arguments"),
-        ("finish", "invalid_arguments"),
-        ("finish", "completed"),
-        ("run_block", "skipped"),
-        ("finish", "skipped"),
-    ]
+    assert [(call.tool, call.status) for call in rows[0].tool_calls or []] == [*rejected, *trail]
+    record = _exit_record(logs)
+    assert (record["ending_call"], record["tool_call_counts"]) == (ending, counts)
 
 
 def _bare_state(workflow_run_block_id: str = "wrb_agent") -> agent_step_loop._RunState:
@@ -3133,17 +3237,27 @@ async def test_a_tool_calls_column_reads_only_its_valid_calls(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("cut_off", "status"), [("invalid_definition", "failed"), ("cancelled", "canceled")])
+@pytest.mark.parametrize(
+    ("cut_off", "status", "stop_reason", "block_status"),
+    [("invalid_definition", "failed", "error", BlockStatus.failed), ("cancelled", "canceled", "run_ended", None)],
+)
 async def test_a_call_cut_off_mid_run_keeps_its_entry_and_the_final_tool_calls_has_no_running_call(
-    monkeypatch: pytest.MonkeyPatch, database: AgentDB, billing_hook: AsyncMock, cut_off: str, status: str
+    monkeypatch: pytest.MonkeyPatch,
+    database: AgentDB,
+    billing_hook: AsyncMock,
+    cut_off: str,
+    status: str,
+    stop_reason: str,
+    block_status: BlockStatus | None,
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    _add_platform_smtp_placeholder()
     block_task = asyncio.current_task()
     assert block_task is not None
 
     async def cut_off_read(state: agent_step_loop._RunState, name: str | None = None) -> object:
         if cut_off == "invalid_definition":
-            raise InvalidWorkflowDefinition("bad definition")
+            raise InvalidWorkflowDefinition(f"bad definition {SMTP_PLACEHOLDER}")
         block_task.cancel()
         await asyncio.sleep(1)
         return None
@@ -3151,13 +3265,15 @@ async def test_a_call_cut_off_mid_run_keeps_its_entry_and_the_final_tool_calls_h
     monkeypatch.setattr(agent_step_loop, "_read_run_data", cut_off_read)
     model = _ScriptedModel([[scripted_call("read_run_data", {"name": "x"}, call_id="read")], VALID_FINISH])
 
-    if cut_off == "cancelled":
-        with pytest.raises(asyncio.CancelledError):
-            await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
-        block_task.uncancel()
-    else:
-        result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
-        assert result.status == BlockStatus.failed
+    with capture_logs() as logs:
+        if cut_off == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
+            block_task.uncancel()
+        else:
+            result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
+            assert result.status == BlockStatus.failed
+            assert SMTP_PLACEHOLDER not in (result.failure_reason or "")
 
     (agent_row,) = await database.observer.get_workflow_run_blocks(
         workflow_run_id=RUN, organization_id=ORG, with_tool_calls=True
@@ -3167,6 +3283,9 @@ async def test_a_call_cut_off_mid_run_keeps_its_entry_and_the_final_tool_calls_h
     ]
     output = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].values["agent_output"]
     assert output["tool_calls"] == []
+    record = _exit_record(logs)
+    assert (record["stop_reason"], record["block_status"], record["ending_call"]) == (stop_reason, block_status, "none")
+    assert record["tool_call_counts"] == {"read_run_data": {status: 1}}
     assert _billed_decisions(billing_hook) == 0
 
 
@@ -3231,7 +3350,7 @@ async def test_a_step_gets_the_skill_list_and_skill_tools_only_when_it_lists_loa
     if offered and not ignore_workflow_system_prompt:
         assert system.index("Answer in French.") < min(system.index(description) for description in descriptions)
     skill_tools = ["load_skill", "read_skill_resource"] if offered else []
-    assert model.tool_names == [["read_run_data", "page_goto", *skill_tools, "finish"]]
+    assert model.tool_names == [["read_run_data", "page_goto", *skill_tools, "finish", "fail"]]
 
 
 def _largest_skill_with_secret() -> tuple[AvailableSkill, str]:

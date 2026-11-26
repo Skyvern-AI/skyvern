@@ -1666,7 +1666,7 @@ class AgentStepBlockYAML(BlockYAML):
         ge=1,
         le=200,
         description="Model turns the step may take. When they run out, the step gets one more turn in which only "
-        "finish runs.",
+        "finish and fail run.",
     )
     parameter_keys: list[str] | None = Field(
         default=None, description="Keys of the workflow parameters and earlier block outputs the step uses."
@@ -1675,7 +1675,7 @@ class AgentStepBlockYAML(BlockYAML):
         default=None,
         description="The tools the step may call. A block it runs through run_block is named by its block type, such "
         "as http_request, and an integration action by <integration id>__<action id>, such as gmail__read_inbox. "
-        "finish and read_run_data are always offered, and login only when parameter_keys lists a credential "
+        "finish, fail and read_run_data are always offered, and login only when parameter_keys lists a credential "
         "parameter. load_skill also offers read_skill_resource, and both are offered only when the run has skills. "
         "Without a list the step has no other tools.",
     )

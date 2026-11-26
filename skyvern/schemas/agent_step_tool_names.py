@@ -5,6 +5,7 @@ AGENT_STEP_TOOL_NAMES = frozenset(
         "data_export",
         "download_to_s3",
         "email_inbox",
+        "fail",
         "file_download",
         "file_upload",
         "file_url_parser",
@@ -28,8 +29,8 @@ AGENT_STEP_TOOL_NAMES = frozenset(
         "web_search",
     }
 )
-# Offered whatever the step's list says: neither changes anything outside the step.
-ALWAYS_OFFERED_TOOLS = frozenset({"finish", "read_run_data"})
+# Offered whatever the step's list says: none runs a block or acts on the page.
+ALWAYS_OFFERED_TOOLS = frozenset({"fail", "finish", "read_run_data"})
 LEGACY_AGENT_STEP_TOOL_NAMES = {
     "pdf_parser": "file_url_parser",
     "google_sheets_read": "google_sheets__read_rows",
