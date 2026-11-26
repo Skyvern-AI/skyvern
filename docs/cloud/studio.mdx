@@ -25,7 +25,7 @@ To open Studio, click an agent on **Agents** → **All Agents**, or create one w
 
 ## The layout
 
-Studio has four panes. Toggle each one from the center of the top bar. You can open several side by side.
+Studio has five panes. Toggle each one from the top bar, next to the agent's title, and open several side by side. Under 720 pixels wide, Studio shows one pane at a time: pick it from the switch below the pane, while the top bar keeps only the control for the **Run** pane.
 
 | Pane | What it does |
 |---|---|
@@ -33,15 +33,15 @@ Studio has four panes. Toggle each one from the center of the top bar. You can o
 | **Editor** | The agent's blocks as a flow you edit by hand, in **Visual** or **YAML** view |
 | **Browser** | The browser the agent drives: **Live** while something runs, then **Recording** and **Screenshots** |
 | **Run** | One run's **Timeline**, **Inputs** and **Outputs**. With no run open, the control reads **Past Runs** and lists earlier runs. |
+| **Triggers** (lightning icon) | This agent's event triggers, which start it from a signed HTTP request. Shown only for an agent you can change: not a deleted agent, and not a read-only one that offers **Make a Copy to Edit**. See [Event triggers](/developers/event-triggers). |
 
-The right side of the top bar holds the agent's controls:
+The right side of the top bar holds the agent's controls. **Schedule**, **More actions** and **Inputs** show while the Copilot or Editor pane is open, and Save shows then or whenever you have unsaved changes. Under 720 pixels wide, **Schedule** and **Inputs** move into **More actions**.
 
 | Control | What it does |
 |---|---|
 | Save (disk icon) | Saves your hand edits. A dot on the icon means unsaved changes. It is disabled, and its tooltip says why, while Copilot is working on a request or applying changes and while YAML edits are being applied. When Copilot pauses saving so you don't overwrite a newer change (for example, the agent changed after Copilot proposed its changes), Save stays clickable and opens **Save is paused**, which explains why and offers **Reload and discard my edits**. |
 | **Schedule** (calendar icon) | Lists this agent's schedules and adds new ones. See [Runs and schedules](/cloud/runs#schedule-an-agent). |
-| **Triggers** (lightning icon) | Starts this agent from a signed HTTP request. See [Event triggers](/developers/event-triggers). |
-| **More actions** (⋯) | **Code**, **Version history**, **Save as Template**, **Take a tour** |
+| **More actions** (⋯) | **Version history**, **Save as Template**, **Take a tour** |
 | **Inputs** | The values the agent takes on each run. See [Inputs](#inputs). |
 | **Run** | Opens the run form. Shows **Stop** while a run is in progress and **Re-run** after one ends. See [Runs and schedules](/cloud/runs). |
 
@@ -53,7 +53,7 @@ Type what you want in the Copilot message box ("Ask Copilot to build or change y
 
 Every change Copilot makes arrives as a **Proposed changes** card:
 
-- The card lists each block **Added**, **Changed** or **Removed**, and shows **Tested**, **Untested** or **Test failed**.
+- The card lists each block **Added**, **Changed** or **Removed**, and shows **Tested**, **Untested**, **Test failed** or **Couldn't test**. **Couldn't test** means the test wasn't allowed to use a connected account, so it says nothing about the blocks; the card offers to run it once with your account.
 - **Accept** applies the changes and saves them to the agent.
 - **Review** compares the proposed agent with the previous version before you decide.
 - **Reject** discards them and puts the agent back to the previous version.
@@ -63,6 +63,8 @@ Every change Copilot makes arrives as a **Proposed changes** card:
 <Warning>
 **Test end-to-end** performs real actions. It can submit forms, place orders or send messages.
 </Warning>
+
+When a block uses a [Connected Gmail account](/cloud/integrations#google-and-microsoft-accounts), the **Test end-to-end** confirmation says so: that one run is allowed to use the account. Tests Copilot starts on its own, and tests started through the API or an MCP client, are not; save the agent and run it to use the account.
 
 Other things you can do in the Copilot pane:
 
@@ -79,7 +81,7 @@ If a run fails, the Run pane offers **Fix with Copilot**, which sends the failur
 
 When a site is easier to show than to describe, do the steps yourself and let Copilot build the blocks from them. Start with **Demonstrate task** in the **+** menu of the message box or in the Editor's add menu. The browser has to be ready first. When you tell Copilot you would rather show it, its reply carries a **Show Copilot how in the browser** card with **Start demonstration**.
 
-While you drive the browser, the message box reads **Demonstrating** with the number of actions recorded so far, and each action becomes a step: clicks, typing, dropdown choices, key presses, navigation, and dragging one element onto another. A freehand stroke on a canvas or on a slider the page builds itself, and a drag inside an embedded page, read **Drag not recorded** instead. A browser's built-in slider or color picker reads **Step not recorded**.
+While you drive the browser, the message box reads **Demonstrating** with the number of actions recorded so far, and each action becomes a step: clicks, typing, dropdown choices, key presses, navigation, dragging one element onto another, and a hover that reveals the control your next step uses, such as one that opens a hover menu. A nested menu records a hover for each level on the way down. A hover that reveals nothing your next step uses is not recorded. A freehand stroke on a canvas or on a slider the page builds itself, and a drag inside an embedded page, read **Drag not recorded** instead. A browser's built-in slider or color picker reads **Step not recorded**. When a step acts on a control that an earlier moment in the recording saw hidden and no recorded hover explains it, the step before it reads **Reveal not attributed**. On a page too large to check for reveals, a step reads **Reveal check skipped**.
 
 Two requests come to the chat instead of the browser:
 
@@ -110,15 +112,15 @@ Open the **Editor** pane. Blocks run top to bottom in the order shown.
 
 The library holds browser blocks (such as **Browser Task**, **Extraction** and **Login**), data blocks (such as **Text Prompt**, **File Parser** and **Code**), control flow (**Loop**, **Conditional**, **Wait**, **Terminate**) and integrations (**Send Email**, **HTTP Request**, **Google Sheets Read** and **Write**, and others). The [blocks reference](/reference/blocks) documents every block and its fields.
 
-Below the blocks, the **Apps** group lists the [integrations](/cloud/integrations) that offer actions: Gmail (**Read inbox**, **Send email**), Outlook (**Read inbox**), Google Sheets (**Read rows**, **Write rows**) and Google Drive (**Upload files**). Apps with an account you have already connected come first, marked **Connected**. Click an app to show its actions, then click an action to insert it as a block. A search also matches app actions by app and action name, so `send email` finds Gmail's **Send email**. **Browse all apps** opens Integrations in a new tab.
+Below the blocks, the **Apps** group lists the [integrations](/cloud/integrations) that offer actions: Gmail (**Read inbox**, **Send email**), Outlook (**Read inbox**), Google Sheets (**Read rows**, **Write rows**) and Google Drive (**Upload files**, **Save website downloads to Drive**, **List folder**, **Create subfolder**, **Move file** and **Download from Google Drive**). Apps with an account you have already connected come first, marked **Connected**. Click an app to show its actions, then click an action to insert it as a block. A search also matches app actions by app and action name, so `send email` finds Gmail's **Send email**. **Browse all apps** opens Integrations in a new tab.
 
-An app action block shows an **Account** picker with the app's connected accounts, followed by the action's own fields. It runs the same way as the matching built-in block. Its label defaults to the app and action IDs, such as `gmail_send_email`, so later blocks read its output as `{{ gmail_send_email_output }}`.
+An app action block shows an **Account** picker with the app's connected accounts, followed by the action's own fields. In Google Drive actions, folder and file fields open a Drive picker. It runs the same way as the matching built-in block. Its label defaults to the app and action IDs, such as `gmail_send_email`, so later blocks read its output as `{{ gmail_send_email_output }}`.
 
 ### Configure a block
 
 Click a block to open its settings in the block config sidebar. Every block has a **Label**. The label also names the block's output, which later blocks read as `{{ <label>_output }}`.
 
-Click **Start** at the top of the flow to open **Agent Settings**, the settings that apply to the whole agent. They include **Webhook Callback URL**, **Proxy Location**, **Run With**, **Prevent Overlapping Runs** and **Max Run Time (minutes)**. The run form can override some of them per run.
+Click **Start** at the top of the flow to open **Agent Settings**, the settings that apply to the whole agent. They include **Webhook Callback URL**, **Proxy Location**, **Prevent Overlapping Runs** and **Max Run Time (minutes)**. The run form can override some of them per run.
 
 <img src="/images/cloud/cloud-studio-block-config.png" alt="A Browser Task block with URL, Prompt, the Engine selector and Advanced Settings" />
 

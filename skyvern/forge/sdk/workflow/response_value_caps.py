@@ -5,8 +5,8 @@ jsonb write path (``db/utils.py``) can consume these without creating a cycle.
 """
 
 import json
-from collections.abc import Iterable
-from typing import Any, overload
+from collections.abc import Iterable, Mapping
+from typing import Any, TypeGuard, overload
 
 import structlog
 
@@ -44,6 +44,7 @@ def _response_value_size_bytes(value: Any, log_context: dict[str, Any]) -> int |
 _TRUNCATION_MARKER_RESERVE_BYTES = 512
 
 TRUNCATION_MARKER_KEY = "_truncated"
+TRUNCATION_REASON = "exceeded_max_run_response_value_size"
 
 
 def _truncation_marker(
@@ -56,7 +57,7 @@ def _truncation_marker(
     effective_limit = RUN_RESPONSE_MAX_VALUE_BYTES if limit_bytes is None else limit_bytes
     marker = {
         "truncated": True,
-        "reason": "exceeded_max_run_response_value_size",
+        "reason": TRUNCATION_REASON,
         "original_size_bytes": size_bytes,
         "limit_bytes": effective_limit,
     }
@@ -374,6 +375,35 @@ def truncate_oversized_response_value(
     return _truncation_marker(size_bytes, limit_bytes=effective_limit)
 
 
+# The keys TaskOutput and task_v2 outputs share, and TaskStatus's final non-completed values; copied because
+# this module takes no project imports.
+_TASK_ENVELOPE_KEYS = frozenset({"task_id", "status", "extracted_information", "failure_reason"})
+_NON_COMPLETED_TERMINAL_STATUSES = frozenset({"failed", "terminated", "canceled", "timed_out"})
+
+
+def is_non_completed_envelope(value: object) -> TypeGuard[Mapping[str, object]]:
+    """A finished task block's envelope that did not complete. Its payload is a partial that only means
+    something beside its status, so readers that merge many blocks' payloads leave it out."""
+    if not isinstance(value, Mapping) or not _TASK_ENVELOPE_KEYS <= value.keys():
+        return False
+    status = value["status"]
+    return isinstance(status, str) and status in _NON_COMPLETED_TERMINAL_STATUSES
+
+
+def without_non_completed_envelopes(value: object) -> object:
+    """``value`` with ``extracted_information`` set to None on every non-completed envelope at any depth,
+    such as a failed iteration inside a loop block's output. Files, URLs and list positions are kept."""
+    if isinstance(value, dict):
+        nulled = is_non_completed_envelope(value)
+        return {
+            key: None if nulled and key == "extracted_information" else without_non_completed_envelopes(nested)
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [without_non_completed_envelopes(item) for item in value]
+    return value
+
+
 def collect_extracted_information(value: Any) -> list[Any]:
     """Recursively collect extracted_information values from nested outputs.
 
@@ -382,6 +412,8 @@ def collect_extracted_information(value: Any) -> list[Any]:
     this has to run against the whole value — on the write path when the value is oversized.
     """
     results: list[Any] = []
+    if is_non_completed_envelope(value):
+        return results
     if isinstance(value, dict):
         if "extracted_information" in value and value["extracted_information"] is not None:
             extracted = value["extracted_information"]
@@ -391,10 +423,12 @@ def collect_extracted_information(value: Any) -> list[Any]:
                 results.append(extracted)
         else:
             for nested in value.values():
-                results.extend(collect_extracted_information(nested))
+                if isinstance(nested, (dict, list)):
+                    results.extend(collect_extracted_information(nested))
     elif isinstance(value, list):
         for item in value:
-            results.extend(collect_extracted_information(item))
+            if isinstance(item, (dict, list)):
+                results.extend(collect_extracted_information(item))
     return results
 
 

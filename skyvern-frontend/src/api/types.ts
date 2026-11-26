@@ -488,6 +488,9 @@ export interface CreateGoogleOAuthAuthorizeRequest {
 export interface GoogleOAuthAuthorizeResponse {
   authorize_url: string;
   state: string;
+  // The connection this sign-in creates or reconnects. Absent from an older server, which leaves the attempt
+  // unattributed.
+  credential_id?: string;
 }
 
 export interface CreateGoogleOAuthCallbackRequest {
@@ -527,6 +530,8 @@ export interface CreateMicrosoftOAuthAuthorizeRequest {
   credential_name?: string;
   scope_profile?: MicrosoftOAuthScopeProfile;
   app_origin?: string;
+  // Existing credential to re-authenticate in place, preserving its id.
+  credential_id?: string;
 }
 
 export interface MicrosoftOAuthAuthorizeResponse {
@@ -539,6 +544,13 @@ export interface CreateMicrosoftOAuthCallbackRequest {
   state: string;
 }
 
+export interface GoogleDriveFile {
+  id: string;
+  name: string;
+  modified_time: string | null;
+  web_view_link: string | null;
+}
+
 export interface GoogleSpreadsheetSummary {
   id: string;
   name: string;
@@ -549,6 +561,7 @@ export interface GoogleSpreadsheetSummary {
 export interface PagedGoogleSpreadsheets {
   spreadsheets: GoogleSpreadsheetSummary[];
   next_page_token: string | null;
+  incomplete_search?: boolean;
 }
 
 export interface GoogleSheetTab {
@@ -672,7 +685,8 @@ export interface BitwardenCredentialSafe {
 export interface BitwardenOrganizationAuthToken {
   id: string;
   organization_id: string;
-  credential: BitwardenCredentialSafe;
+  // Omitted when the caller cannot read vault provider settings.
+  credential?: BitwardenCredentialSafe;
   created_at: string;
   modified_at: string;
   token_type: string;

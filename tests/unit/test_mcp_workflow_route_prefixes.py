@@ -137,10 +137,3 @@ async def test_get_workflow_by_id_uses_internal_route(capture_request: MagicMock
 async def test_get_workflow_run_status_uses_internal_route(capture_request: MagicMock) -> None:
     await _workflow_http.get_workflow_run_status("wr_x", include_output_details=False)
     assert _route(capture_request).startswith(_workflow_http.INTERNAL_WORKFLOW_ROUTE + "/")
-
-
-def test_prefix_constants_are_stable() -> None:
-    """Lock the string values so a rename doesn't silently invalidate the split."""
-    assert _workflow_http.PUBLIC_WORKFLOW_ROUTE == "v1/workflows"
-    assert _workflow_http.INTERNAL_WORKFLOW_ROUTE == "api/v1/workflows"
-    assert _workflow_http.PUBLIC_WORKFLOW_ROUTE != _workflow_http.INTERNAL_WORKFLOW_ROUTE

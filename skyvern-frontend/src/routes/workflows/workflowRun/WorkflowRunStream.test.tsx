@@ -1,5 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
@@ -43,20 +49,36 @@ vi.mock("@/components/ui/use-toast", () => ({
   toast: vi.fn(),
 }));
 
+const interactiveStreamState = vi.hoisted(() => ({
+  setUserIsControlling: undefined as ((v: boolean) => void) | undefined,
+}));
+
 vi.mock("@/routes/streaming/InteractiveStreamView", () => ({
-  InteractiveStreamView: ({ streamImgSrc }: { streamImgSrc: string }) => (
-    <div data-frame={streamImgSrc} data-testid="stream-frame" />
-  ),
+  InteractiveStreamView: ({
+    streamImgSrc,
+    setUserIsControlling,
+  }: {
+    streamImgSrc: string;
+    setUserIsControlling?: (v: boolean) => void;
+  }) => {
+    interactiveStreamState.setUserIsControlling = setUserIsControlling;
+    return <div data-frame={streamImgSrc} data-testid="stream-frame" />;
+  },
 }));
 
 class FakeStreamSocket {
+  static readonly OPEN = 1;
   static instances: FakeStreamSocket[] = [];
 
+  readonly readyState = FakeStreamSocket.OPEN;
+  url: string;
+  send = vi.fn();
   close = vi.fn();
 
   private listeners: Record<string, Array<(event: unknown) => void>> = {};
 
-  constructor() {
+  constructor(url: string) {
+    this.url = url;
     FakeStreamSocket.instances.push(this);
   }
 
@@ -110,6 +132,8 @@ describe("WorkflowRunStream lifecycle", () => {
   });
 
   afterEach(() => {
+    cleanup();
+    interactiveStreamState.setUserIsControlling = undefined;
     vi.useRealTimers();
     vi.unstubAllGlobals();
   });
@@ -182,5 +206,68 @@ describe("WorkflowRunStream lifecycle", () => {
       });
     });
     expect(screen.getByTestId("stream-frame")).toBeTruthy();
+  });
+
+  it("renders the console and evaluates expressions over the workflow_run input channel when enabled", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <WorkflowRunStream
+          workflowRunId="wr_test"
+          alwaysShowStream
+          interactive
+          showControlButtons
+          showConsole
+        />
+      </QueryClientProvider>,
+    );
+    await act(async () => Promise.resolve());
+
+    const streamSocket = FakeStreamSocket.instances.find((s) =>
+      s.url.includes("/stream/workflow_runs/wr_test"),
+    )!;
+    const inputSocket = FakeStreamSocket.instances.find((s) =>
+      s.url.includes("/stream/cdp_input/workflow_run/wr_test"),
+    )!;
+    expect(inputSocket).toBeTruthy();
+
+    act(() => {
+      streamSocket.emitStreamMessage({
+        status: "running",
+        screenshot: "live-frame",
+      });
+      inputSocket.emitStreamMessage({ kind: "ready" });
+      inputSocket.emitStreamMessage({ kind: "console", available: true });
+    });
+
+    const toggle = screen.getByRole("button", { name: /console/i });
+    fireEvent.click(toggle);
+    act(() => interactiveStreamState.setUserIsControlling?.(true));
+
+    const textarea = screen.getByLabelText("JavaScript to run in the page");
+    fireEvent.change(textarea, { target: { value: "document.title" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+
+    const evalMessage = inputSocket.send.mock.calls
+      .map((call) => JSON.parse(String(call[0])))
+      .find((msg) => msg.kind === "evaluate");
+    expect(evalMessage).toMatchObject({
+      kind: "evaluate",
+      expression: "document.title",
+    });
+
+    await act(async () => {
+      inputSocket.emitStreamMessage({
+        kind: "evaluateResult",
+        id: evalMessage.id,
+        status: "ok",
+        text: '"Example Title"',
+        url: "https://example.test/",
+      });
+    });
+
+    expect(screen.getByText('"Example Title"')).toBeTruthy();
   });
 });

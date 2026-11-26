@@ -337,7 +337,7 @@ describe("EmberChat — run grounding bridge", () => {
 
     expect(
       screen.getByText(
-        "The connection dropped, so Copilot is checking whether this turn finished.",
+        "The connection dropped, so Ember is checking whether this turn finished.",
       ),
     ).toBeTruthy();
 
@@ -582,16 +582,16 @@ describe("EmberChat — run grounding bridge", () => {
     ).not.toBeNull();
     await act(async () => vi.advanceTimersByTimeAsync(1_499_999));
     expect(
-      screen.getByText(/Copilot is checking whether this turn finished/),
+      screen.getByText(/Ember is checking whether this turn finished/),
     ).toBeTruthy();
 
     await act(async () => vi.advanceTimersByTimeAsync(1));
 
     expect(
-      screen.queryByText(/Copilot is checking whether this turn finished/),
+      screen.queryByText(/Ember is checking whether this turn finished/),
     ).toBeNull();
     expect(
-      screen.getByText(/Could not confirm whether Copilot saved changes/),
+      screen.getByText(/Could not confirm whether Ember saved changes/),
     ).toBeTruthy();
     expect(
       useWorkflowYamlEditorStore.getState().emberAcceptance,
@@ -629,16 +629,16 @@ describe("EmberChat — run grounding bridge", () => {
 
     await act(async () => vi.advanceTimersByTimeAsync(1_497_999));
     expect(
-      screen.getByText(/Copilot is checking whether this turn finished/),
+      screen.getByText(/Ember is checking whether this turn finished/),
     ).toBeTruthy();
 
     await act(async () => vi.advanceTimersByTimeAsync(1));
 
     expect(
-      screen.queryByText(/Copilot is checking whether this turn finished/),
+      screen.queryByText(/Ember is checking whether this turn finished/),
     ).toBeNull();
     expect(
-      screen.getByText(/Could not confirm whether Copilot saved changes/),
+      screen.getByText(/Could not confirm whether Ember saved changes/),
     ).toBeTruthy();
     expect(
       useWorkflowYamlEditorStore.getState().emberAcceptance,
@@ -700,7 +700,7 @@ describe("EmberChat — run grounding bridge", () => {
 
     expect(
       screen.getAllByText(
-        "The connection dropped, so Copilot is checking whether this turn finished.",
+        "The connection dropped, so Ember is checking whether this turn finished.",
       ),
     ).toHaveLength(1);
     expect(screen.getAllByText("First request finished")).toHaveLength(1);
@@ -742,7 +742,7 @@ describe("EmberChat — run grounding bridge", () => {
     expect(postStreaming).toHaveBeenCalledTimes(1);
     expect(cancelPost).not.toHaveBeenCalled();
     expect(toast).toHaveBeenCalledWith({
-      title: "Wait for the Copilot change to finish",
+      title: "Wait for the Ember change to finish",
       variant: "destructive",
     });
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
@@ -905,16 +905,16 @@ describe("EmberChat — run grounding bridge", () => {
     ).not.toBeNull();
     await act(async () => vi.advanceTimersByTimeAsync(1_499_999));
     expect(
-      screen.getByText(/Copilot is checking whether this turn finished/),
+      screen.getByText(/Ember is checking whether this turn finished/),
     ).toBeTruthy();
 
     await act(async () => vi.advanceTimersByTimeAsync(1));
 
     expect(
-      screen.queryByText(/Copilot is checking whether this turn finished/),
+      screen.queryByText(/Ember is checking whether this turn finished/),
     ).toBeNull();
     expect(
-      screen.getByText(/Could not confirm whether Copilot saved changes/),
+      screen.getByText(/Could not confirm whether Ember saved changes/),
     ).toBeTruthy();
     expect(
       useWorkflowYamlEditorStore.getState().emberAcceptance,
@@ -953,16 +953,16 @@ describe("EmberChat — run grounding bridge", () => {
 
     await act(async () => vi.advanceTimersByTimeAsync(1_497_999));
     expect(
-      screen.getByText(/Copilot is checking whether this turn finished/),
+      screen.getByText(/Ember is checking whether this turn finished/),
     ).toBeTruthy();
 
     await act(async () => vi.advanceTimersByTimeAsync(1));
 
     expect(
-      screen.queryByText(/Copilot is checking whether this turn finished/),
+      screen.queryByText(/Ember is checking whether this turn finished/),
     ).toBeNull();
     expect(
-      screen.getByText(/Could not confirm whether Copilot saved changes/),
+      screen.getByText(/Could not confirm whether Ember saved changes/),
     ).toBeTruthy();
     expect(
       useWorkflowYamlEditorStore.getState().emberAcceptance,
@@ -1010,7 +1010,7 @@ describe("EmberChat — run grounding bridge", () => {
 
     expect(
       screen.getAllByText(
-        "The connection dropped, so Copilot is checking whether this turn finished.",
+        "The connection dropped, so Ember is checking whether this turn finished.",
       ),
     ).toHaveLength(1);
     expect(

@@ -93,24 +93,48 @@ vi.mock("react-router-dom", async (importOriginal) => {
   };
 });
 
-vi.mock("./cards/ConnectionCard", () => ({
-  ConnectionCard: ({
-    card,
-    disabled,
-    onSelect,
-  }: {
-    card: { integrationId: string };
-    disabled?: boolean;
-    onSelect?: (id: string) => void;
-  }) => (
-    <div data-testid={`card-${card.integrationId}`}>
-      Connection card
-      <button disabled={disabled} onClick={() => onSelect?.("goac_notice")}>
-        Select notice account
-      </button>
-    </div>
-  ),
-}));
+vi.mock("./cards/ConnectionCard", async () => {
+  const { useEffect } = await import("react");
+  return {
+    ConnectionCard: ({
+      card,
+      disabled,
+      onSelect,
+      selectedConnectionId,
+      onSelectionShown,
+    }: {
+      card: { integrationId: string };
+      disabled?: boolean;
+      onSelect?: (id: string) => void;
+      selectedConnectionId?: string | null;
+      onSelectionShown?: (choice: {
+        connection_id: string;
+        name: string;
+        state: string;
+        email_address: string | null;
+      }) => void;
+    }) => {
+      // The real card names the picked account from its credential rows.
+      useEffect(() => {
+        if (selectedConnectionId)
+          onSelectionShown?.({
+            connection_id: selectedConnectionId,
+            name: "Mail",
+            state: "active",
+            email_address: "m***@example.com",
+          });
+      }, [selectedConnectionId, onSelectionShown]);
+      return (
+        <div data-testid={`card-${card.integrationId}`}>
+          Connection card
+          <button disabled={disabled} onClick={() => onSelect?.("goac_notice")}>
+            Select notice account
+          </button>
+        </div>
+      );
+    },
+  };
+});
 
 const saveData = {
   title: "Test WF",
@@ -176,7 +200,7 @@ const choices = [
   },
 ];
 
-function narrativePayload(includeChoices = true) {
+function narrativePayload(includeChoices = true, accountChoices = choices) {
   return {
     turnId: "turn-choice",
     turnIndex: 0,
@@ -192,7 +216,7 @@ function narrativePayload(includeChoices = true) {
     designActivity: [],
     startedAt: "2026-08-15T00:00:00Z",
     endedAt: "2026-08-15T00:00:01Z",
-    ...(includeChoices ? { connectedAccountChoices: choices } : {}),
+    ...(includeChoices ? { connectedAccountChoices: accountChoices } : {}),
   };
 }
 
@@ -219,7 +243,7 @@ async function submit(message: string) {
   await act(async () => fireEvent.keyDown(textbox, { key: "Enter" }));
 }
 
-async function finishChoiceAsk() {
+async function finishChoiceAsk(accountChoices = choices) {
   await submit("build a Sheets workflow");
   await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
   await act(async () => {
@@ -230,7 +254,7 @@ async function finishChoiceAsk() {
       updated_workflow: null,
       response_time: "2026-08-15T00:00:01Z",
       proposal_disposition: "no_proposal",
-      narrative_payload: narrativePayload(),
+      narrative_payload: narrativePayload(true, accountChoices),
     });
     streamCalls[0]!.resolve();
   });
@@ -338,7 +362,9 @@ describe("EmberChat connected account choices", () => {
       ],
     };
     await renderChat();
-    expect(screen.getByText("Selected connection …86375772")).toBeTruthy();
+    expect(
+      await screen.findByText("Selected \u2068Mail\u2069 (m***@example.com)"),
+    ).toBeTruthy();
     expect(screen.queryByText("moac_587307069786375772")).toBeNull();
     // A one-word reply that is not a connection id keeps its own text.
     expect(screen.getByText("continue")).toBeTruthy();
@@ -408,7 +434,7 @@ describe("EmberChat connected account choices", () => {
       ).toBe(true);
       if (accountQuestion) {
         expect(
-          screen.getByRole("group", { name: "Connected Google accounts" }),
+          screen.getByRole("group", { name: "Connected accounts" }),
         ).toBeTruthy();
         expect(
           screen.getByRole<HTMLButtonElement>("button", {
@@ -467,12 +493,12 @@ describe("EmberChat connected account choices", () => {
     await renderChat();
     await finishChoiceAsk();
     const tray = screen.getByRole("group", {
-      name: "Connected Google accounts",
+      name: "Connected accounts",
     });
     expect(
       Boolean(
         screen
-          .getByText("Copilot needs a Google account")
+          .getByText("Ember needs an account")
           .compareDocumentPosition(tray) & Node.DOCUMENT_POSITION_FOLLOWING,
       ),
     ).toBe(true);
@@ -485,6 +511,30 @@ describe("EmberChat connected account choices", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
     expect(streamCalls[1]?.body.selected_connected_account_id).toBe("goac_1");
   });
+
+  it.each([
+    ["a lone Connected Gmail account", ["ngc_own"]],
+    ["two accounts", ["ngc_own", "goac_1"]],
+    ["a lone organization Google account", ["goac_1"]],
+  ])(
+    "asks with the picker for %s and sends nothing on its own",
+    async (_, ids) => {
+      const offered = ids.map((connection_id) => ({
+        connection_id,
+        name: "Connected Gmail",
+        state: "active",
+        email_address: `${connection_id}@example.test`,
+      }));
+      await renderChat();
+      await finishChoiceAsk(offered);
+
+      expect(
+        screen.getByRole("group", { name: "Connected accounts" }),
+      ).toBeTruthy();
+      expect(screen.getByText(`${ids[0]}@example.test`)).toBeTruthy();
+      expect(postStreaming).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("renders canonical rows and sends one exact active id despite a same-tick double click", async () => {
     await renderChat();
@@ -509,7 +559,9 @@ describe("EmberChat connected account choices", () => {
     );
     expect(screen.queryByText("goac_1")).toBeNull();
     expect(
-      screen.getByText("Selected Google Sheets — Connection …goac_1"),
+      screen.getByText(
+        "Selected \u2068Google Sheets\u2069 (Connection …goac_1)",
+      ),
     ).toBeTruthy();
     expect(screen.getByText("Selected")).toBeTruthy();
   });
@@ -674,7 +726,7 @@ describe("EmberChat connected account choices", () => {
 
     await renderChat();
 
-    expect(screen.getByText("Choose a Google account")).toBeTruthy();
+    expect(screen.getByText("Choose an account")).toBeTruthy();
     expect(screen.getAllByText("Google Sheets")).toHaveLength(2);
     expect(screen.getByText("Selected")).toBeTruthy();
     expect(
@@ -802,7 +854,7 @@ describe("EmberChat connected account choices", () => {
 
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     expect(streamCalls[0]?.body.message).toBe("ordinary free text");
-    expect(screen.queryByLabelText("Connected Google accounts")).toBeNull();
+    expect(screen.queryByLabelText("Connected accounts")).toBeNull();
   });
 
   // A run_lifecycle / status_notice row is synthetic — never an answer. When one
@@ -871,7 +923,9 @@ describe("EmberChat connected account choices", () => {
     // must resolve across it — the transcript must never expose the raw id.
     await waitFor(() =>
       expect(
-        screen.getByText("Selected Google Sheets — Connection …goac_1"),
+        screen.getByText(
+          "Selected \u2068Google Sheets\u2069 (Connection …goac_1)",
+        ),
       ).toBeTruthy(),
     );
     expect(screen.queryByText("goac_1")).toBeNull();

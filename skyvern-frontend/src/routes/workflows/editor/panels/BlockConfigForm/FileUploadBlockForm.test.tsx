@@ -70,6 +70,19 @@ vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
   ),
 }));
 
+vi.mock("@/routes/workflows/components/DriveFileCombobox", async () => {
+  const { WorkflowBlockInputTextarea } =
+    await import("@/components/WorkflowBlockInputTextarea");
+  return {
+    DriveFileInput: (props: {
+      name: string;
+      nodeId: string;
+      value: string;
+      onChange: (value: string) => void;
+    }) => <WorkflowBlockInputTextarea {...props} />,
+  };
+});
+
 vi.mock("@/routes/workflows/components/GoogleOAuthCredentialSelector", () => ({
   GoogleOAuthCredentialSelector: (props: {
     value: string;

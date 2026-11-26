@@ -40,6 +40,7 @@ from google.auth.transport import requests as google_auth_requests
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_UI_USER_AGENT
+from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.api import real_gcp
@@ -71,6 +72,7 @@ from skyvern.services import run_service, webhook_service
 from skyvern.webeye import browser_factory
 from skyvern.webeye.actions import handler as handler_module
 from tests.unit.conftest import SqliteEngineFactory, requires_full_chromium
+from tests.unit.force_stub_app import released_session_stub
 from tests.unit.helpers import StreamedDownloadObjects, make_organization, make_pdf, make_step, make_task
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.shared_route_app import shared_route_app
@@ -486,14 +488,50 @@ async def test_task_webhook_payload_keeps_the_current_attempts_pdf_beside_an_ear
     owners, listing = _retried_run(rows)
     _Attempts(monkeypatch, rows, owners)
     _use_storage(monkeypatch, rows, listing)
-    monkeypatch.setattr(run_service, "get_run_response", AsyncMock(return_value=None))
-    await _task_response(monkeypatch, 2, status=TaskStatus.completed)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "should_check_browser_session_artifacts", AsyncMock(return_value=False))
+    task_response = await _task_response(
+        monkeypatch, 2, status=TaskStatus.completed, webhook_callback_url="https://example.com/hook"
+    )
+    monkeypatch.setattr(app.DATABASE, "Session", released_session_stub())
+    monkeypatch.setattr(
+        app.DATABASE.tasks,
+        "get_run",
+        AsyncMock(return_value=SimpleNamespace(run_id="tsk_1", task_run_type=RunType.task_v1)),
+    )
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task_step_count", AsyncMock(return_value=1))
+    monkeypatch.setattr(app.DATABASE.tasks, "update_task", AsyncMock())
+    monkeypatch.setattr(app.DATABASE.artifacts, "get_latest_artifact", AsyncMock(return_value=None))
 
-    payload = await webhook_service._build_task_payload("o_1", "tsk_1", "task_v1", None)
+    run_response = await run_service.get_run_response("tsk_1", organization_id="o_1")
+    assert run_response is not None
+    expected = json.loads(task_response.model_dump_json(exclude={"request"}))
+    expected.update(json.loads(run_response.model_dump_json(exclude={"run_request"})))
 
-    listed = [f["artifact_id"] for f in payload.payload["downloaded_files"]]
+    monkeypatch.setattr(
+        app.DATABASE.artifacts, "get_latest_artifact", AsyncMock(side_effect=RuntimeError("console lookup failed"))
+    )
+    with pytest.raises(RuntimeError, match="console lookup failed"):
+        await run_service.get_run_response("tsk_1", organization_id="o_1")
+
+    delivered_payloads: list[dict[str, Any]] = []
+
+    async def deliver(*, payload: str, **_: Any) -> httpx.Response:
+        delivered_payloads.append(json.loads(payload))
+        return httpx.Response(200)
+
+    monkeypatch.setattr(agent_module, "deliver_webhook_with_retries", deliver)
+    monkeypatch.setattr(webhook_service, "_get_api_key", AsyncMock(return_value="test-key"))
+    task = await app.DATABASE.tasks.get_task("tsk_1", organization_id="o_1")
+    assert task is not None
+    await ForgeAgent.execute_task_webhook(app.agent, task=task, api_key="test-key")
+    preview = await webhook_service.build_run_preview("o_1", "tsk_1")
+    payload = json.loads(preview.payload)
+
+    assert delivered_payloads == [expected]
+    assert payload == expected
+    listed = [f["artifact_id"] for f in payload["downloaded_files"]]
     assert listed == ["old_1", "old_2", "new_1"]
-    assert payload.payload["downloaded_file_urls"] == [f["url"] for f in payload.payload["downloaded_files"]]
+    assert payload["downloaded_file_urls"] == [f["url"] for f in payload["downloaded_files"]]
 
 
 @pytest.mark.parametrize("unknown", ["attempt_lookup_fails", "row_without_attempt_or_time"])
@@ -626,7 +664,9 @@ async def test_a_task_v2_response_looks_up_and_reads_each_download_once_and_keep
         "second_copy_only": _download_output(["a_2"]),
         "mixed_runs": _download_output(["a_1", "o_1"]),
     }
-    refreshed = await service._refresh_output_urls(outputs, "o_1", "wr_1", comparison=comparison)
+    refreshed = await service._refresh_output_urls(
+        outputs, "o_1", "wr_1", comparison=comparison, run_task_ids=frozenset({"oc_1"})
+    )
 
     assert [f.artifact_id for f in files or []] == ["a_1", "b_1"]
     assert refreshed["task"]["downloaded_file_artifact_ids"] == ["a_1", "b_1"]
@@ -2410,7 +2450,7 @@ def test_upload_scan_sends_each_pdf_content_once_and_leaves_the_files(tmp_path: 
         for name, data in [("cut", CUT_OFF), ("header", HEADER_ONLY), ("report", NOT_PDF), ("empty", b"")]
         for i in range(2)
     ]
-    in_progress = _write(tmp_path / "invoice.pdf.crdownload", INVOICE, 0)
+    _write(tmp_path / "invoice.pdf.crdownload", INVOICE, 0)
     text = [_write(tmp_path / f"notes{i}.txt", b"same notes", 6 + i) for i in range(2)]
     link = tmp_path / "invoice-link.pdf"
     link.symlink_to(first)
@@ -2419,7 +2459,7 @@ def test_upload_scan_sends_each_pdf_content_once_and_leaves_the_files(tmp_path: 
         download_files_path=str(tmp_path), max_file_count=300
     )
 
-    assert sorted(files) == sorted(str(p) for p in [first, statement, *kept_pairs, in_progress, *text, link])
+    assert sorted(files) == sorted(str(p) for p in [first, statement, *kept_pairs, *text, link])
     assert late.read_bytes() == INVOICE
 
 

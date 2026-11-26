@@ -47,7 +47,12 @@ else:
 
 from skyvern.cli.mcp_tools.browser import EITHER_STATE_OUTPUT_SCHEMA
 
-from .agent_skill import skyvern_agent_skill_delete, skyvern_agent_skill_get, skyvern_agent_skill_list
+from .agent_skill import (
+    skyvern_agent_skill_delete,
+    skyvern_agent_skill_get,
+    skyvern_agent_skill_list,
+    skyvern_agent_skill_save,
+)
 from .blocks import (
     skyvern_block_schema,
     skyvern_block_validate,
@@ -106,6 +111,14 @@ from .credential import (
     skyvern_onepassword_config_get,
     skyvern_onepassword_config_set,
     skyvern_onepassword_items,
+)
+from .ember import (
+    skyvern_ember_answer,
+    skyvern_ember_check,
+    skyvern_ember_decide,
+    skyvern_ember_list,
+    skyvern_ember_send,
+    skyvern_ember_stop,
 )
 from .feedback import skyvern_feedback
 from .folder import (
@@ -465,6 +478,7 @@ mcp.tool(tags={"settings"}, annotations=_mut("Update Organization Settings"))(sk
 # Cloud-only routes; the agent_skill tag is in no named scope, so only the 'all' scope exposes these tools.
 mcp.tool(tags={"agent_skill"}, annotations=_ro("List Agent Skills"))(size_capped(skyvern_agent_skill_list))
 mcp.tool(tags={"agent_skill"}, annotations=_ro("Get Agent Skill"))(size_capped(skyvern_agent_skill_get))
+mcp.tool(tags={"agent_skill"}, annotations=_mut("Save Agent Skill"))(skyvern_agent_skill_save)
 mcp.tool(tags={"agent_skill"}, annotations=_dest("Delete Agent Skill"))(skyvern_agent_skill_delete)
 
 # -- Credential lookup (no browser needed) --
@@ -475,7 +489,7 @@ mcp.tool(tags={"credential", "onepassword"}, annotations=_ro("List 1Password Ite
 mcp.tool(tags={"credential", "onepassword"}, annotations=_ro("Get 1Password Configuration"))(
     skyvern_onepassword_config_get
 )
-mcp.tool(tags={"credential", "onepassword"}, annotations=_mut("Set 1Password Configuration"))(
+mcp.tool(tags={"credential", "onepassword"}, annotations=_dest("Set 1Password Configuration"))(
     skyvern_onepassword_config_set
 )
 mcp.tool(tags={"credential", "onepassword"}, annotations=_dest("Clear 1Password Configuration"))(
@@ -483,7 +497,7 @@ mcp.tool(tags={"credential", "onepassword"}, annotations=_dest("Clear 1Password 
 )
 mcp.tool(tags={"credential", "bitwarden"}, annotations=_ro("List Bitwarden Items"))(skyvern_bitwarden_items)
 mcp.tool(tags={"credential", "bitwarden"}, annotations=_ro("Get Bitwarden Configuration"))(skyvern_bitwarden_config_get)
-mcp.tool(tags={"credential", "bitwarden"}, annotations=_mut("Set Bitwarden Configuration"))(
+mcp.tool(tags={"credential", "bitwarden"}, annotations=_dest("Set Bitwarden Configuration"))(
     skyvern_bitwarden_config_set
 )
 mcp.tool(tags={"credential", "bitwarden"}, annotations=_dest("Clear Bitwarden Configuration"))(
@@ -559,6 +573,14 @@ mcp.tool(description=FINISH_DESCRIPTION, tags={"lean"}, annotations=_ro("Declare
 )
 # Additive page-read surface; intentionally excluded from every existing scope.
 mcp.tool(tags={"page_read", "lean"}, annotations=_web_ro("Read Page"))(size_capped(skyvern_page))
+
+# -- Ember --
+mcp.tool(tags={"ember"}, annotations=_web_dest("Ember: Send Message"))(size_capped(skyvern_ember_send))
+mcp.tool(tags={"ember"}, annotations=_ro("Ember: Check Chat"))(size_capped(skyvern_ember_check))
+mcp.tool(tags={"ember"}, annotations=_ro("Ember: List Chats"))(size_capped(skyvern_ember_list))
+mcp.tool(tags={"ember"}, annotations=_dest("Ember: Stop Turn"))(size_capped(skyvern_ember_stop))
+mcp.tool(tags={"ember"}, annotations=_web_mut("Ember: Answer"))(size_capped(skyvern_ember_answer))
+mcp.tool(tags={"ember"}, annotations=_web_dest("Ember: Decide"))(size_capped(skyvern_ember_decide))
 
 # -- Feedback --
 mcp.tool(tags={"feedback"}, annotations=_mut("Send Feedback to Skyvern"))(skyvern_feedback)
@@ -649,6 +671,7 @@ __all__ = [
     "skyvern_org_update",
     "skyvern_agent_skill_list",
     "skyvern_agent_skill_get",
+    "skyvern_agent_skill_save",
     "skyvern_agent_skill_delete",
     # Credential lookup
     "skyvern_credential_list",
@@ -707,6 +730,13 @@ __all__ = [
     # Schema-constrained output
     "skyvern_extract_structured",
     "skyvern_finish",
+    # Ember
+    "skyvern_ember_send",
+    "skyvern_ember_check",
+    "skyvern_ember_list",
+    "skyvern_ember_stop",
+    "skyvern_ember_answer",
+    "skyvern_ember_decide",
     # Feedback
     "skyvern_feedback",
 ]

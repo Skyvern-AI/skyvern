@@ -331,7 +331,7 @@ describe("WorkflowSettingsEditor mask secrets setting", () => {
     const label = screen.getByText("Mask Secrets");
     expect(
       screen.getByText(
-        "Mask secret values in this workflow's runs. Secrets are hidden while they are typed (screenshots, recordings, live browser view) and redacted from stored artifacts, network logs, and LLM prompts. Turning this on can make debugging harder because secret values are hidden.",
+        "Mask secret values in this workflow's runs. Even with this off, stored page HTML, LLM prompts and responses, logs and network logs are scrubbed of known secret values that are 8 or more characters long. Turning it on also scrubs shorter secret values, hides secrets while they are typed (screenshots, recordings, live browser view), and redacts them from text sent to the LLM and from failure reasons. Turning this on can make debugging harder because secret values are hidden.",
       ),
     ).toBeDefined();
 
@@ -348,7 +348,7 @@ describe("WorkflowSettingsEditor mask secrets setting", () => {
 describe("WorkflowSettingsEditor code block AI fallback", () => {
   test("has no per-workflow switch on an Ember-authored workflow in Studio", () => {
     vi.mocked(useWorkflowQuery).mockReturnValue({
-      data: { title: "Copilot workflow", copilot_authored: true },
+      data: { title: "Ember workflow", copilot_authored: true },
     } as unknown as ReturnType<typeof useWorkflowQuery>);
     renderSettings();
 

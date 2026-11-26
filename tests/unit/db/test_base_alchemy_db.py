@@ -271,7 +271,7 @@ async def test_a_stalled_session_close_does_not_outlive_the_read() -> None:
 async def test_a_write_that_hit_the_same_outage_reads_as_a_dependency_failure() -> None:
     """A write has no recovery of its own, so during an outage it reaches the copilot's failure
     classifier as the raw driver error rather than the typed one."""
-    from skyvern.forge.sdk.copilot.recoverable_failure import _failure_kind_for_exception
+    from skyvern.forge.sdk.ember.recoverable_failure import _failure_kind_for_exception
 
     dropped = OperationalError("INSERT", {}, psycopg.errors.ConnectionFailure("server closed the connection"))
     server_raised = OperationalError("SELECT", {}, psycopg.errors.QueryCanceled("statement timeout"))

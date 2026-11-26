@@ -29,14 +29,14 @@ from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, NO_ADDRESS_RE
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CodeBlockEngineFailure, CodeBlockEngineResult
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result, validate_schema
-from skyvern.forge.sdk.copilot.nav_attribution import (
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
+from skyvern.forge.sdk.ember.nav_attribution import (
     block_nav_error_codes,
     proxy_owns_nav_codes,
     target_owns_nav_codes,
 )
-from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.code_block_steps import derive_code_block_steps
@@ -863,7 +863,7 @@ def _install_db_fakes(
     organization: object | None = SimpleNamespace(organization_id="o_test", max_steps_per_run=None),
     downloaded_files: list[FileInfo] | None = None,
     extracted_information: ExtractedInformation | _Unset = _UNSET,
-    copilot_lineage: bool = False,
+    ember_lineage: bool = False,
 ) -> dict[str, Any]:
     created_task = _FakeTask("tsk_escalation", TaskStatus.running)
     updated_after_run = _FakeTask("tsk_escalation", final_status, extracted_information=extracted_information)
@@ -920,7 +920,7 @@ def _install_db_fakes(
     monkeypatch.setattr(app.DATABASE.tasks, "get_task", AsyncMock(side_effect=_get_task))
     monkeypatch.setattr(app.DATABASE.tasks, "get_task_actions", AsyncMock(side_effect=_get_task_actions))
     monkeypatch.setattr(app.DATABASE.organizations, "get_organization", AsyncMock(side_effect=_get_organization))
-    monkeypatch.setattr(app.DATABASE.workflows, "is_workflow_copilot_authored", AsyncMock(return_value=copilot_lineage))
+    monkeypatch.setattr(app.DATABASE.workflows, "is_ember_authored", AsyncMock(return_value=ember_lineage))
     monkeypatch.setattr(
         "skyvern.forge.sdk.workflow.models.block.BaseTaskBlock.get_task_order",
         AsyncMock(side_effect=_get_task_order),
@@ -1409,7 +1409,7 @@ async def test_legacy_workflow_toggle_does_not_enable_heal_when_org_flag_off(
     monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
 ) -> None:
     ai_fallback_flag(None)
-    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, copilot_lineage=True)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, ember_lineage=True)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     exc = RuntimeError("rotted selector")
     context = _make_context()
@@ -1522,9 +1522,7 @@ async def test_ai_fallback_enabled_follows_only_the_org_flag(
     copilot_authored: bool,
 ) -> None:
     ai_fallback_flag("o_test" if flag_on else None)
-    monkeypatch.setattr(
-        app.DATABASE.workflows, "is_workflow_copilot_authored", AsyncMock(return_value=copilot_authored)
-    )
+    monkeypatch.setattr(app.DATABASE.workflows, "is_ember_authored", AsyncMock(return_value=copilot_authored))
     created_by = "copilot" if copilot_authored else "user@example.com"
     context = _make_context(created_by=created_by, edited_by=created_by)
     context.workflow.enable_self_healing = legacy_toggle
@@ -1559,12 +1557,12 @@ async def test_ai_fallback_enabled_flag_provider_raises_fails_closed(monkeypatch
 async def test_lineage_lookup_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         app.DATABASE.workflows,
-        "is_workflow_copilot_authored",
+        "is_ember_authored",
         AsyncMock(side_effect=RuntimeError("db unavailable")),
     )
     context = _make_context(created_by="user@example.com", edited_by="user@example.com")
 
-    assert await _make_code_block()._workflow_is_copilot_authored(context) is False
+    assert await _make_code_block()._workflow_is_ember_authored(context) is False
 
 
 @pytest.mark.asyncio
@@ -6034,7 +6032,7 @@ async def test_recovery_enforces_vault_login_sites_as_the_code_block_does(
     # The recovery task has no workflow lineage of its own, so the block's decision travels with it.
     ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
-    monkeypatch.setattr(CodeBlock, "_workflow_copilot_lineage", AsyncMock(return_value=lineage))
+    monkeypatch.setattr(CodeBlock, "_ember_lineage", AsyncMock(return_value=lineage))
     block = _make_code_block()
 
     await _heal(block, _make_context(), PlaywrightTimeoutError("timeout"), _recording_page(None))

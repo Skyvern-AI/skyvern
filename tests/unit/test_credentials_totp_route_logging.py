@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,9 +13,12 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.routes import credentials
 from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, TotpType
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialNotConfiguredError
 from skyvern.services.otp_service import OTPValue
+from tests.unit._otp_route_fakes import matched_route_request
 from tests.unit.shared_route_app import shared_route_app
 
 
@@ -82,6 +85,119 @@ async def test_send_totp_code_save_log_redacts_identifier_and_normalizes_email_f
     assert storage_kwargs["totp_identifier"] == "qa-email-otp@example.test"
     assert storage_kwargs["content"] == raw_content
     assert storage_kwargs["code"] == raw_content
+
+    strict_calls: list[dict[str, object]] = []
+
+    async def create_strict_otp_code(**kwargs: object) -> SimpleNamespace:
+        strict_calls.append(kwargs)
+        return SimpleNamespace(totp_code_id="otp_strict")
+
+    strict_task = SimpleNamespace(
+        task_id="tsk_test",
+        organization_id="o_test",
+        workflow_run_id=None,
+        otp_request_id="otpr_test",
+        status=TaskStatus.running,
+    )
+    strict_request = matched_route_request("/v1/otp-bound/credentials/totp", otp_bound=True)
+    monkeypatch.setattr(
+        credentials.app,
+        "DATABASE",
+        SimpleNamespace(
+            otp=SimpleNamespace(
+                create_otp_code=create_strict_otp_code,
+                create_otp_code_if_new=create_strict_otp_code,
+                create_raw_otp_code=AsyncMock(),
+            ),
+            tasks=SimpleNamespace(get_task=AsyncMock(return_value=strict_task)),
+        ),
+    )
+    strict_result = await credentials.send_totp_code(
+        TOTPCodeCreate(
+            totp_identifier=raw_identifier,
+            content=raw_content,
+            task_id="tsk_test",
+            otp_request_id="otpr_test",
+        ),
+        curr_org=SimpleNamespace(organization_id="o_test"),
+        request=strict_request,
+    )
+
+    assert strict_result.totp_code_id == "otp_strict"
+    assert len(strict_calls) == 1
+    assert strict_calls[0]["otp_request_id"] == "otpr_test"
+
+    strict_task.status = TaskStatus.completed
+    with pytest.raises(HTTPException, match="terminal"):
+        await credentials.send_totp_code(
+            TOTPCodeCreate(
+                totp_identifier=raw_identifier,
+                content=raw_content,
+                task_id="tsk_test",
+                otp_request_id="otpr_test",
+            ),
+            curr_org=SimpleNamespace(organization_id="o_test"),
+            request=strict_request,
+        )
+
+    strict_task.status = TaskStatus.running
+    with pytest.raises(HTTPException, match="expired"):
+        await credentials.send_totp_code(
+            TOTPCodeCreate(
+                totp_identifier=raw_identifier,
+                content=raw_content,
+                task_id="tsk_test",
+                otp_request_id="otpr_test",
+                expired_at=datetime(2020, 1, 1, tzinfo=UTC),
+            ),
+            curr_org=SimpleNamespace(organization_id="o_test"),
+            request=strict_request,
+        )
+
+    monkeypatch.setattr(credentials, "parse_otp_login", AsyncMock(return_value=None))
+    with pytest.raises(HTTPException, match="parseable"):
+        await credentials.send_totp_code(
+            TOTPCodeCreate(
+                totp_identifier=raw_identifier,
+                content="This marked delivery has no parseable verification code.",
+                task_id="tsk_test",
+                otp_request_id="otpr_test",
+            ),
+            curr_org=SimpleNamespace(organization_id="o_test"),
+            request=strict_request,
+        )
+    assert len(strict_calls) == 1
+
+    strict_task_v2 = SimpleNamespace(
+        observer_cruise_id="tsk_v2_test",
+        workflow_run_id="wr_v2_test",
+        otp_request_id="otpr_v2_test",
+        status=TaskV2Status.running,
+    )
+    strict_workflow_run = SimpleNamespace(
+        workflow_run_id="wr_v2_test",
+        workflow_id="wf_v2_test",
+        otp_request_id="otpr_v2_test",
+        status=TaskStatus.running,
+    )
+    credentials.app.DATABASE.tasks.get_task.return_value = None
+    credentials.app.DATABASE.observer = SimpleNamespace(get_task_v2=AsyncMock(return_value=strict_task_v2))
+    credentials.app.DATABASE.workflow_runs = SimpleNamespace(
+        get_workflow_run=AsyncMock(return_value=strict_workflow_run)
+    )
+    await credentials.send_totp_code(
+        TOTPCodeCreate(
+            totp_identifier=raw_identifier,
+            content=raw_content,
+            task_id="tsk_v2_test",
+            otp_request_id="otpr_v2_test",
+        ),
+        curr_org=SimpleNamespace(organization_id="o_test"),
+        request=strict_request,
+    )
+    assert len(strict_calls) == 2
+    assert strict_calls[1]["task_id"] is None
+    assert strict_calls[1]["workflow_run_id"] == "wr_v2_test"
 
 
 @pytest.mark.asyncio
@@ -395,6 +511,10 @@ async def test_send_totp_code_raw_fallback_body_validates_vendored_totp_code(
     parsed = VendoredTotpCode.model_validate(body)
     assert parsed.totp_code_id == "otp_raw"
     assert parsed.code == ""
+    assert parsed.claimed_by_task_id is None
+    assert parsed.claimed_by_workflow_run_id is None
+    assert parsed.claimed_at is None
+    assert parsed.rejected_at is None
     assert (parsed.model_extra or {})["status"] == "raw_pending"
     create_otp_code.assert_not_awaited()
     create_raw_otp_code.assert_awaited_once()

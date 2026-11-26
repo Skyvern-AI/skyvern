@@ -69,6 +69,16 @@ class WorkflowRequestBody(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    otp_request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^otpr_[A-Za-z0-9_-]+$",
+        description=(
+            "Explicit request marker for strict run-bound OTP delivery. This field is accepted only "
+            "on the otp-bound run endpoint; omit it to retain legacy behavior."
+        ),
+    )
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
     start_fresh_browser: bool = False
@@ -234,7 +244,7 @@ class WorkflowDefinition(BaseModel):
                     raise NonTerminalFinallyBlock(self.finally_block_label)
 
 
-COPILOT_TEST_WORKFLOW_CREATOR = "copilot_test"
+EMBER_TEST_WORKFLOW_CREATOR = "copilot_test"
 
 
 class Workflow(BaseModel):
@@ -289,7 +299,10 @@ class Workflow(BaseModel):
     edited_for: str | None = Field(default=None, exclude=True)
     build_source: WorkflowBuildSource | None = Field(
         default=None,
-        description="Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began.",
+        description=(
+            "Which surface wrote this version: ui, copilot (Ember), mcp, cli, api, or internal. "
+            "Null before tracking began."
+        ),
     )
     # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
     # user saves re-stamp created_by/edited_by, so the current version alone is not durable.
@@ -303,8 +316,10 @@ class Workflow(BaseModel):
     _effective_default_engine_computed: bool = PrivateAttr(default=False)
     original_created_by: str | None = Field(
         default=None,
-        description="Who created the agent's first version. Populated by the list endpoint only.",
+        description="Who created the agent's first version. Populated by the list and detail endpoints only.",
     )
+    # Elsewhere the key is omitted: a null claims no user created the agent, which denies an own-agent delete.
+    _original_created_by_computed: bool = PrivateAttr(default=False)
     original_created_at: datetime | None = Field(
         default=None,
         description="When the agent's first version was created. Populated by the list endpoint only.",
@@ -321,15 +336,21 @@ class Workflow(BaseModel):
 
     # No return annotation: pydantic would publish it as the response schema in place of the model's fields.
     @model_serializer(mode="wrap")
-    def _omit_uncomputed_engine(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+    def _omit_uncomputed_fields(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
         data = handler(self)
         if not self._effective_default_engine_computed:
             data.pop("effective_default_engine", None)
+        if not self._original_created_by_computed:
+            data.pop("original_created_by", None)
         return data
 
     def set_effective_default_engine(self, engine: RunEngine | None) -> None:
         self.effective_default_engine = engine
         self._effective_default_engine_computed = True
+
+    def set_original_created_by(self, created_by: str | None) -> None:
+        self.original_created_by = created_by
+        self._original_created_by_computed = True
 
     created_at: datetime
     modified_at: datetime
@@ -388,6 +409,7 @@ class WorkflowRun(BaseModel):
     webhook_failure_reason: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    otp_request_id: str | None = Field(default=None, exclude=True)
     failure_reason: str | None = None
     failure_category: list[dict[str, Any]] | None = None
     retried_from_workflow_run_id: str | None = None
@@ -435,6 +457,14 @@ class WorkflowRun(BaseModel):
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
 
+    @field_serializer("status", when_used="json")
+    def _serialize_status_for_reads(self, status: WorkflowRunStatus) -> WorkflowRunStatus:
+        return workflow_run_status_for_reads(
+            status=status,
+            otp_request_id=self.otp_request_id,
+            started_at=self.started_at,
+        )
+
     # Every JSON payload of a run (list and detail routes, webhooks) omits the final match's bookkeeping; in-process
     # readers keep the raw carrier, which the errors[] projection reads.
     @field_serializer("failure_category", when_used="json")
@@ -452,6 +482,14 @@ class WorkflowRun(BaseModel):
         return self.debug_session_id is not None
 
     @property
+    def status_for_reads(self) -> WorkflowRunStatus:
+        return workflow_run_status_for_reads(
+            status=self.status,
+            otp_request_id=self.otp_request_id,
+            started_at=self.started_at,
+        )
+
+    @property
     def row_write_unconfirmed(self) -> bool:
         return self._row_write_unconfirmed
 
@@ -461,6 +499,18 @@ class WorkflowRun(BaseModel):
 
 # Stored when attempts of one run executed different definitions; it never equals a real digest.
 MIXED_RUN_DEFINITION_DIGEST = "mixed"
+
+
+def workflow_run_status_for_reads(
+    *,
+    status: WorkflowRunStatus,
+    otp_request_id: str | None,
+    started_at: datetime | None,
+) -> WorkflowRunStatus:
+    """Project a protected strict dispatch reservation as queued without changing its stored fence."""
+    if status == WorkflowRunStatus.running and otp_request_id is not None and started_at is None:
+        return WorkflowRunStatus.queued
+    return status
 
 
 def workflow_definition_sha256(definition: WorkflowDefinition) -> str:

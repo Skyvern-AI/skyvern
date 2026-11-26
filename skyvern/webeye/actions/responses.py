@@ -1,8 +1,55 @@
+import re
 from typing import Any
 
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.webeye.string_util import remove_whitespace
+
+# The driver's actionability lines, in its own wording. Only these survive from a call log: any other line can quote
+# the value being typed (`fill("...")`, `elementHandle.type("...")`) or page markup.
+_DRIVER_REASONS = (
+    "element is not visible",
+    "element is not enabled",
+    "element is not stable",
+    "element is not editable",
+    "element is outside of the viewport",
+    "element was detached from the DOM",
+    "did not find some options",
+    "option being selected is not enabled",
+)
+
+
+_IN_FLIGHT_REASON = "the driver had started the action when the timeout came, so it may have gone through"
+_ACTION_DONE_REASON = "the action was performed, and the timeout came after it"
+_DRIVER_TIMEOUT = re.compile(r"Timeout \d+ms exceeded")
+
+
+def _without_driver_call_log(message: str) -> str:
+    head, marker, call_log = message.partition("Call log:")
+    if not marker:
+        return message
+    # The lines after the first can list page markup (a strict-mode violation lists every match).
+    head = head.strip().partition("\n")[0].rstrip()
+    # Both progress sentences speak of the timeout; an error that failed outright states neither.
+    timed_out = bool(_DRIVER_TIMEOUT.search(head))
+    reason = None
+    for line in call_log.split("\n"):
+        entry = line.strip().removeprefix("- ")
+        count, times, rest = entry.partition(" × ")
+        if times and count.isdigit():
+            entry = rest
+        # Last wins: a later attempt that got past a blocker, or reached the page, supersedes it.
+        if entry.startswith("element is visible"):
+            reason = None
+        elif entry.startswith(("performing ", 'elementHandle.press("')):
+            reason = _IN_FLIGHT_REASON if timed_out else None
+        elif entry.endswith(" action done"):
+            reason = _ACTION_DONE_REASON if timed_out else None
+        elif entry.endswith("intercepts pointer events"):
+            reason = "another element intercepts pointer events"
+        elif listed := next((r for r in _DRIVER_REASONS if entry.startswith(r)), None):
+            reason = listed
+    return f"{head} The driver last reported: {reason}." if reason else head
 
 
 class ActionResult(BaseModel):
@@ -128,7 +175,7 @@ class ActionFailure(ActionResult):
             success=False,
             exception_type=type(exception).__name__,
             stop_execution_on_failure=stop_execution_on_failure,
-            exception_message=remove_whitespace(str(exception)),
+            exception_message=remove_whitespace(_without_driver_call_log(str(exception))),
             download_triggered=download_triggered,
             interacted_with_sibling=interacted_with_sibling,
             interacted_with_parent=interacted_with_parent,

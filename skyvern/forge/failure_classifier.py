@@ -609,6 +609,74 @@ def classify_from_failure_reason(
     return categories
 
 
+# (keywords, case-sensitive, category, confidence, evidence_source), in the order classify_from_failure_reason appends
+# entries when the failure reason is a fixed message naming the exception, so both give the same list.
+_EXCEPTION_NAME_RULES: tuple[tuple[tuple[str, ...], bool, FailureCategory, float, str], ...] = (
+    (("captcha", "cloudflare", "turnstile"), False, FailureCategory.ANTI_BOT_DETECTION, 0.7, "keyword_only"),
+    (("NoProxy", "ProxyError", "GetOutboundIP"), True, FailureCategory.PROXY_ERROR, 0.9, "exception_type"),
+    (("Browser", "CDP", "TargetClosed"), True, FailureCategory.BROWSER_ERROR, 0.9, "exception_type"),
+    (("FailedToNavigateToUrl",), True, FailureCategory.NAVIGATION_FAILURE, 0.9, "exception_type"),
+    (("404",), False, FailureCategory.NAVIGATION_FAILURE, 0.9, "keyword_match"),
+    (("Timeout",), True, FailureCategory.PAGE_LOAD_TIMEOUT, 0.8, "exception_type"),
+    (("timeout",), False, FailureCategory.PAGE_LOAD_TIMEOUT, 0.8, "keyword_match"),
+    (("password", "mfa"), False, FailureCategory.AUTH_FAILURE, 0.7, "keyword_match"),
+    (("Bitwarden",), True, FailureCategory.CREDENTIAL_ERROR, 0.8, "exception_type"),
+    (("LLM", "APIError", "RateLimit"), True, FailureCategory.LLM_ERROR, 0.9, "exception_type"),
+    (("Scraping",), True, FailureCategory.DATA_EXTRACTION_FAILURE, 0.7, "exception_type"),
+    (("scraping",), False, FailureCategory.DATA_EXTRACTION_FAILURE, 0.7, "keyword_match"),
+    (("ElementNotFound",), True, FailureCategory.ELEMENT_NOT_FOUND, 0.8, "exception_type"),
+    (("hallucin",), False, FailureCategory.LLM_REASONING_ERROR, 0.6, "keyword_match"),
+)
+
+
+_KEYWORD_REASONING = {
+    FailureCategory.ANTI_BOT_DETECTION: "Keywords matched in failure reason",
+    FailureCategory.PAGE_LOAD_TIMEOUT: "Timeout in failure reason",
+}
+
+
+def failure_category_for_exception_name(exception_name: str) -> list[dict]:
+    """Categories for a failure known only by its exception class name or typed cause code, read from the name alone.
+
+    For finalizers whose failure reason is a fixed message about that cause, such as an activity failure that
+    crossed the Temporal boundary or a run whose worker restarted."""
+    entries: list[dict] = []
+    seen: set[FailureCategory] = set()
+    for keywords, case_sensitive, category, confidence, evidence_source in _EXCEPTION_NAME_RULES:
+        name = exception_name if case_sensitive else exception_name.lower()
+        # One entry per category, and a proxy name is not also a browser failure.
+        if category in seen or (category is FailureCategory.BROWSER_ERROR and FailureCategory.PROXY_ERROR in seen):
+            continue
+        if any(kw in name for kw in keywords):
+            seen.add(category)
+            entries.append(
+                {
+                    "category": category.value,
+                    "confidence_float": confidence,
+                    "reasoning": f"Exception: {exception_name}"
+                    if evidence_source == "exception_type"
+                    else _KEYWORD_REASONING.get(category, "Keywords matched"),
+                    "evidence_source": evidence_source,
+                }
+            )
+    if exception_name == WORKER_CONTAINER_RESTARTED_REASON_CODE:
+        entries.append(
+            {
+                "category": FailureCategory.INFRASTRUCTURE_ERROR.value,
+                "confidence_float": 0.95,
+                "reason_code": WORKER_CONTAINER_RESTARTED_REASON_CODE,
+                "reasoning": "Worker container restarted mid-run",
+                "evidence_source": "reason_code",
+            }
+        )
+    if not entries:
+        return [
+            {"category": FailureCategory.UNKNOWN.value, "confidence_float": 0.5, "reasoning": "No keyword match found"}
+        ]
+    entries.sort(key=lambda entry: entry["confidence_float"], reverse=True)
+    return entries
+
+
 # ── Infra-failure attribution (SKY-16588) ─────────────────────────────────────
 # Derives one bounded internal attribution document from the typed failure_category
 # above; introduces no second classifier. Persisted to workflow_runs.failure_attribution
@@ -717,6 +785,34 @@ OUTPUT_ONLY_LABEL_REASON_CODES = frozenset(
         FAILURE_CLASSIFIER_TEXT_REASON_CODE,
     }
 )
+
+
+V3_MODEL_VERDICT_REASON_CODE = "model_verdict"
+V3_EXTRACTION_MISSING_REASON_CODE = "extraction_missing"
+V3_BROWSER_CONNECTION_LOST_REASON_CODE = "browser_connection_lost"
+V3_BLANK_PAGE_REASON_CODE = "blank_page"
+# The check, or the model's own verdict, that ended a Task V3 task, by name. Only the task records it: a task block's
+# output, which the workflow run, templates and Ember read, carries the reason's classification in its place.
+V3_STOP_CATEGORIES: dict[str, FailureCategory] = {
+    V3_MODEL_VERDICT_REASON_CODE: FailureCategory.UNKNOWN,
+    "perception_stall": FailureCategory.UNKNOWN,
+    "action_loop": FailureCategory.UNKNOWN,
+    "page_refresh_exhausted": FailureCategory.UNKNOWN,
+    "answer_basis_hold_bound": FailureCategory.UNKNOWN,
+    "no_outcome": FailureCategory.UNKNOWN,
+    "completion_gate": FailureCategory.UNKNOWN,
+    "navigation_dead_end": FailureCategory.NAVIGATION_FAILURE,
+    "browser_lost": FailureCategory.BROWSER_ERROR,
+    V3_BROWSER_CONNECTION_LOST_REASON_CODE: FailureCategory.BROWSER_ERROR,
+    "llm_call_failed": FailureCategory.LLM_ERROR,
+    V3_BLANK_PAGE_REASON_CODE: FailureCategory.WRONG_PAGE_STATE,
+    V3_EXTRACTION_MISSING_REASON_CODE: FailureCategory.DATA_EXTRACTION_FAILURE,
+}
+V3_STOP_REASON_CODES = frozenset(V3_STOP_CATEGORIES)
+
+
+def is_v3_stop_entry(category: object) -> bool:
+    return isinstance(category, dict) and category.get("reason_code") in V3_STOP_REASON_CODES
 
 
 def with_sign_in_form_visible(categories: list[dict] | None) -> list[dict]:

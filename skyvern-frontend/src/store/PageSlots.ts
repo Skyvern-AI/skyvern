@@ -10,12 +10,12 @@ export type WorkflowAnalyticsPanelProps = {
 };
 export type WorkflowTriggersPanelProps = Readonly<{
   workflowPermanentId: string;
-  onClose: () => void;
   // Opens this trigger's detail with its on switch highlighted.
   focusTriggerId?: string;
   // Changes on every request to focus, so asking again for the same trigger reopens it.
   focusRequest?: number;
 }>;
+export type AgentStartsBadgeProps = Readonly<{ workflowPermanentId: string }>;
 export type TriggerCreatedCardSlotProps = Readonly<{
   trigger: CreatedTrigger;
   onOpen?: () => void;
@@ -38,13 +38,15 @@ type BrokerCredentialSelectorBase = Readonly<{
 
 export type BrokerCredentialSelectorProps = BrokerCredentialSelectorBase &
   (
-    | Readonly<{ provider: "powerbi" }>
+    | Readonly<{ provider: "powerbi"; nodeId?: string }>
     | Readonly<{
         provider: "gmail";
         nodeId: string;
         credentialId: string;
         // send filters the native accounts to those that can send; reply also omits connected accounts.
         purpose?: "read" | "send" | "reply";
+        // false hides "Use template expression" where a real account is required.
+        allowTemplates?: boolean;
       }>
   );
 
@@ -56,8 +58,16 @@ export type ConnectedGmailFlow = Readonly<{
   busy: boolean;
   // A message to show for a failed attempt; a cancelled sign-in has none.
   failure: string | null;
-  // Active connections, named as the Integrations page names them.
-  connections: ReadonlyArray<Readonly<{ connection_id: string; name: string }>>;
+  // Active connections: the user's name for one, or the Connected Gmail name, beside its masked account.
+  connections: ReadonlyArray<
+    Readonly<{
+      connection_id: string;
+      name: string;
+      email_address?: string | null;
+    }>
+  >;
+  // The connection this flow's own sign-in finished with; one added anywhere else never appears here.
+  completedConnectionId?: string | null;
   start: () => void;
 }>;
 
@@ -93,6 +103,7 @@ export type PermissionsState =
 export type PageSlots = {
   powerBIDatasetPicker?: React.ComponentType<
     Readonly<{
+      credentialSource?: "native" | "nango";
       connectionId: string;
       value: string;
       disabled: boolean;
@@ -100,7 +111,22 @@ export type PageSlots = {
     }>
   >;
   brokerCredentialSelector?: React.ComponentType<BrokerCredentialSelectorProps>;
+  powerBIDaxAssist?: React.ComponentType<
+    Readonly<{
+      credentialSource: "native" | "nango" | undefined;
+      connectionId: string;
+      datasetId: string;
+      currentQuery: string;
+      maxRows: number;
+      disabled: boolean;
+      // False when the editor refused the change, so the assist keeps its suggestion.
+      onUse: (query: string) => boolean;
+    }>
+  >;
   connectedGmailFlow?: React.ComponentType<
+    Readonly<{ children: (flow: ConnectedGmailFlow) => React.ReactNode }>
+  >;
+  connectedGoogleDriveFlow?: React.ComponentType<
     Readonly<{ children: (flow: ConnectedGmailFlow) => React.ReactNode }>
   >;
   workflowFindingsScope?: React.ComponentType<
@@ -122,6 +148,8 @@ export type PageSlots = {
   >;
   workflowAnalyticsPanel?: React.ComponentType<WorkflowAnalyticsPanelProps>;
   workflowTriggersPanel?: React.ComponentType<WorkflowTriggersPanelProps>;
+  // How an agent starts (triggers, schedule, manual), on the Agents list.
+  agentStartsBadge?: React.ComponentType<AgentStartsBadgeProps>;
   // The Ember trigger card with the trigger's live state and a Turn on switch.
   triggerCreatedCard?: React.ComponentType<TriggerCreatedCardSlotProps>;
   workflowRunsFilterControls?: React.ComponentType;

@@ -6,6 +6,7 @@ import ssl
 import time
 import types
 import weakref
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -583,18 +584,24 @@ async def test_upload_file_from_path_cancelled_mid_multipart_aborts_upload_and_s
 
 @contextlib.asynccontextmanager
 async def _local_s3(  # type: ignore[no-untyped-def]
-    barrier: asyncio.Barrier | None = None, port: int = 0, body: bytes = b"payload"
+    barrier: asyncio.Barrier | None = None,
+    port: int = 0,
+    body: bytes = b"payload",
+    *,
+    respond: Callable[[web.Request], Awaitable[web.StreamResponse]] | None = None,
 ):
     """A plain-HTTP stand-in for S3 that records which connection and credential served each request."""
     seen: list[tuple[int, str, asyncio.BaseTransport]] = []
 
-    async def handler(request: web.Request) -> web.Response:
+    async def handler(request: web.Request) -> web.StreamResponse:
         await request.read()
         transport = request.transport
         assert transport is not None
         seen.append((transport.get_extra_info("peername")[1], request.headers.get("Authorization", ""), transport))
         if barrier is not None:
             await barrier.wait()
+        if respond is not None:
+            return await respond(request)
         return web.Response(body=body if request.method == "GET" else b"")
 
     app = web.Application()

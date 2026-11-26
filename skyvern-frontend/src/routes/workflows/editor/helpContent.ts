@@ -217,7 +217,7 @@ export const helpTooltips = {
     fileUrl:
       "Since we're in beta this section isn't fully customizable yet, contact us if you'd like to integrate it into your workflow.",
     fileType:
-      "The format of the file to parse. Auto-detected from the URL extension when possible. ZIP archives are always unzipped, and the block outputs the extracted files as file_name, file_path, and file_size. Data Schema is ignored for ZIPs. To parse contained files, loop over the output and pass each file_path to another File Parser block.",
+      "The format of the file to parse. Auto-detected from the URL extension when possible. ZIP archives are always unzipped, and the block outputs the extracted files as file_name, file_path, file_size, and run_file. Each extracted file becomes one of the run's downloaded files, named run_file. Data Schema is ignored for ZIPs. To parse contained files, loop over the output and pass each file_path to another File Parser block.",
     worksheet:
       "Excel only: the exact name of the worksheet to read. Leave empty to read the first worksheet. The run fails if the named worksheet is not in the workbook.",
     forceOcr:

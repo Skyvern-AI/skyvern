@@ -185,7 +185,7 @@ async function submit(value: string) {
   await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 }
 
-const ACK = "Copilot is working on your request…";
+const ACK = "Ember is working on your request…";
 
 function expectNoAckLines() {
   expect(screen.queryByText(ACK)).toBeNull();

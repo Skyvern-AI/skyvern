@@ -87,6 +87,10 @@ export interface TaskRunRequestInput {
      */
     totp_url?: string;
     /**
+     * Explicit request marker for strict run-bound OTP delivery. When present, only codes carrying the exact same marker are accepted.
+     */
+    otp_request_id?: string;
+    /**
      * Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
      */
     browser_session_id?: string;

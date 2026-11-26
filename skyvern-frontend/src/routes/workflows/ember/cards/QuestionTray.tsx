@@ -91,7 +91,7 @@ export function QuestionTray({
       aria-describedby={titleId}
       data-interaction-id={interaction.interaction_id}
       onKeyDown={onKeyDown}
-      title="Copilot needs your answer"
+      title="Ember needs your answer"
       titleId={titleId}
       meta={
         total > 1 ? (
@@ -100,7 +100,7 @@ export function QuestionTray({
           </span>
         ) : null
       }
-      collapsedTitle={`Copilot is waiting on ${total} ${noun}`}
+      collapsedTitle={`Ember is waiting on ${total} ${noun}`}
       collapsed={collapsed}
       onCollapsedChange={onCollapsedChange}
       minimizeLabel="Minimize question"

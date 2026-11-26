@@ -1,0 +1,4317 @@
+"""Tests for CopilotRunHooks.on_tool_end activity recording."""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import time
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, get_args
+from unittest.mock import AsyncMock, MagicMock, call
+
+import pytest
+import yaml
+from PIL import Image
+from structlog.testing import capture_logs
+
+from skyvern.cli.core import ember_sessions
+from skyvern.cli.core.browser_ops import ScreenshotResult
+from skyvern.config import settings
+from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.ember import tools as tools_module
+from skyvern.forge.sdk.ember.agent_context import OriginRunRedactionRegistry, PendingBrowserInteractionObservation
+from skyvern.forge.sdk.ember.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
+from skyvern.forge.sdk.ember.code_block_synthesis import synthesize_code_block
+from skyvern.forge.sdk.ember.config import AGENT_BLOCKS_ONLY, CODE_BLOCKS_ONLY, BlockAuthoringPolicy
+from skyvern.forge.sdk.ember.connected_accounts import listed_connection_ids
+from skyvern.forge.sdk.ember.context import StructuredContext
+from skyvern.forge.sdk.ember.hooks import EmberRunHooks
+from skyvern.forge.sdk.ember.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
+from skyvern.forge.sdk.ember.result_evidence import EVALUATE_TOOL_NAME
+from skyvern.forge.sdk.ember.runtime import AgentContext
+from skyvern.forge.sdk.ember.secret_scrub import (
+    register_secret_scrub_value,
+    register_secret_scrub_values_from_structure,
+)
+from skyvern.forge.sdk.ember.tools import (
+    _capture_scout_pre_action,
+    _click_post_hook,
+    _click_pre_hook,
+    _prenav_ambiguity_for_selector,
+    _verify_scout_type_landed,
+    mcp_hooks,
+)
+from skyvern.forge.sdk.ember.tools import scouting as scouting_module
+from skyvern.forge.sdk.ember.tools.credential_fill import _fill_observed_effects
+from skyvern.forge.sdk.ember.tools.integrations import _list_integrations
+from skyvern.forge.sdk.ember.tools.mcp_hooks import (
+    ScoutReadbackOutcome,
+    _get_block_schema_post_hook,
+    _scout_readback_outcome,
+    _scout_type_landing_failure,
+)
+from skyvern.forge.sdk.ember.tools.run_execution import _halt_turn_if_superseded
+from skyvern.forge.sdk.ember.tools.scouting import (
+    _build_scout_page_summary,
+    _page_evidence_names_obstruction,
+    _summary_disclosure_control,
+    _summary_entry,
+)
+from skyvern.forge.sdk.ember.tools.workflow_update import proposal_workflow_fingerprint
+from skyvern.forge.sdk.ember.turn_halt import EmberTurnHalt, TurnHaltKind
+from skyvern.forge.sdk.integrations import catalog
+from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
+from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
+from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
+from skyvern.forge.sdk.workflow.web_search_client import SearchProvider, SearchResponse, SearchResult
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER, clear_session_scrub_values
+from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
+from skyvern.webeye.utils import challenge_signature as challenge_signature_module
+from tests.unit._mcp_browser_fakes import crash_free_browser_state
+from tests.unit.ember_test_helpers import fake_tool, make_ember_ctx
+from tests.unit.scoped_asyncio import ScopedAsyncio
+
+READBACK_OUTCOME_CASES = yaml.safe_load((Path(__file__).parent / "credential_readback_outcome_cases.yaml").read_text())[
+    "cases"
+]
+
+
+@dataclass
+class _FakeContext:
+    check_model_work_deadline: Callable[[], None] | None = None
+    tool_activity: list[dict[str, Any]] = field(default_factory=list)
+    tool_calls_this_turn: int = 0
+    workflow_permanent_id: str = "wpid_example"
+    turn_id: str = "turn_example"
+    workflow_copilot_chat_id: str = "chat_example"
+    total_tokens_used: int | None = None
+    last_artifact_health_blocker_reason: str | None = None
+    completion_verification_result: Any = None
+    turn_ownership: Any = None
+    blocker_signal_claimant: Any = None
+    gate_precedence_conflict_events: list[Any] = field(default_factory=list)
+
+
+_ON_SCREEN_AREA = 300.0 * 65.0
+
+
+class _ListenerFrameElement:
+    def __init__(self, frame: _ListenerFrame) -> None:
+        self._frame = frame
+
+    async def evaluate(self, script: str) -> list[float] | bool | None:
+        if self._frame.unresponsive:
+            await asyncio.Event().wait()
+        if script == challenge_signature_module._ELEMENT_STYLE_VISIBLE_JS:
+            if self._frame.style_visible is None:
+                raise RuntimeError("Frame was detached")
+            return self._frame.style_visible
+        return None if self._frame.area is None else [self._frame.area, 1.0]
+
+
+class _ListenerFrame:
+    """Answers the shipped on-screen measure with a set area, so the real helper runs against it."""
+
+    def __init__(
+        self,
+        url: str,
+        parent_frame: _ListenerFrame | None,
+        area: float | None = _ON_SCREEN_AREA,
+        style_visible: bool | None = True,
+        unresponsive: bool = False,
+    ) -> None:
+        self.url = url
+        self.parent_frame = parent_frame
+        self.area = area
+        self.style_visible = style_visible
+        self.unresponsive = unresponsive
+
+    async def frame_element(self) -> _ListenerFrameElement:
+        return _ListenerFrameElement(self)
+
+
+class _ScopedClock:
+    """A monotonic clock bound to one module, leaving the event loop's own clock running."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+
+class _ListenerPage:
+    def __init__(self, child_frame_urls: list[str] | None = None) -> None:
+        self.listeners: dict[str, list[Callable[[Any], None]]] = {}
+        self.removed: list[str] = []
+        main = _ListenerFrame("https://records.example.test/search", None)
+        self.frames = [main, *(_ListenerFrame(url, main) for url in child_frame_urls or [])]
+
+    async def title(self) -> str:
+        return "Search"
+
+    def on(self, event: str, handler: Callable[[Any], None]) -> None:
+        self.listeners.setdefault(event, []).append(handler)
+
+    def remove_listener(self, event: str, handler: Callable[[Any], None]) -> None:
+        self.listeners[event].remove(handler)
+        self.removed.append(event)
+
+    def _dispatch(self, frame: _ListenerFrame) -> None:
+        for handler in list(self.listeners.get("framenavigated", [])):
+            handler(frame)
+
+    def navigate_frame(self, url: str, *, child_frame: bool, area: float | None = _ON_SCREEN_AREA) -> None:
+        frame = _ListenerFrame(url, self.frames[0] if child_frame else None, area)
+        self.frames.append(frame)
+        self._dispatch(frame)
+
+    def renavigate_child_frame(self, index: int, url: str) -> None:
+        """Playwright fires framenavigated on the same Frame object when an existing frame reloads."""
+        frame = self.frames[1 + index]
+        frame.url = url
+        self._dispatch(frame)
+
+
+# `on_tool_end(context, agent, tool, result)` only reads `tool` and `result`;
+# `context` and `agent` are unused by CopilotRunHooks, so a single sentinel
+# mock stands in for both across every test.
+_UNUSED = MagicMock()
+
+
+def _mcp_text_output(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Shape that `parse_tool_output` expects from FastMCP tool calls."""
+    return [{"type": "text", "text": json.dumps(payload)}]
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_appends_generic_tool_entry() -> None:
+    ctx = _FakeContext()
+    hooks = EmberRunHooks(ctx)
+
+    output = _mcp_text_output({"ok": True, "data": {"url": "https://example.com"}})
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("navigate_browser"), output)
+
+    assert len(ctx.tool_activity) == 1
+    entry = ctx.tool_activity[0]
+    assert entry["tool"] == "navigate_browser"
+    assert "summary" in entry
+    assert "output_preview" not in entry  # non-whitelisted tool
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_logs_ember_turn_identifiers() -> None:
+    ctx = _FakeContext(total_tokens_used=123)
+    hooks = EmberRunHooks(ctx)
+
+    output = _mcp_text_output({"ok": True, "data": {"url": "https://example.com"}})
+    with capture_logs() as logs:
+        await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("navigate_browser"), output)
+
+    completed = next(log for log in logs if log["event"] == "ember tool completed")
+    assert completed["workflow_permanent_id"] == "wpid_example"
+    assert completed["turn_id"] == "turn_example"
+    assert completed["workflow_copilot_chat_id"] == "chat_example"
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_whitelisted_tool_produces_output_preview() -> None:
+    ctx = _FakeContext()
+    hooks = EmberRunHooks(ctx)
+
+    output = _mcp_text_output(
+        {
+            "ok": True,
+            "data": {
+                "blocks": [
+                    {"label": "extract_prices", "output": {"prices": [10, 20]}},
+                    {"label": "extract_names", "extracted_data": ["alice"]},
+                ]
+            },
+        }
+    )
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("run_blocks_and_collect_debug"), output)
+
+    entry = ctx.tool_activity[0]
+    assert entry["tool"] == "run_blocks_and_collect_debug"
+    assert "output_preview" in entry
+    assert "extract_prices" in entry["output_preview"]
+    assert "extract_names" in entry["output_preview"]
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_truncates_output_preview_at_500_chars() -> None:
+    ctx = _FakeContext()
+    hooks = EmberRunHooks(ctx)
+
+    huge_output = {"values": ["x" * 1000]}
+    output = _mcp_text_output({"ok": True, "data": {"blocks": [{"label": "big", "output": huge_output}]}})
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("get_run_results"), output)
+
+    entry = ctx.tool_activity[0]
+    preview = entry["output_preview"]
+    _prefix, _sep, value = preview.partition(": ")
+    assert value.endswith("...")
+    assert len(value) <= 503
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_whitelisted_tool_without_block_outputs_skips_preview() -> None:
+    ctx = _FakeContext()
+    hooks = EmberRunHooks(ctx)
+
+    output = _mcp_text_output({"ok": True, "data": {"blocks": [{"label": "noop"}]}})
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("update_and_run_blocks"), output)
+
+    entry = ctx.tool_activity[0]
+    assert entry["tool"] == "update_and_run_blocks"
+    assert "output_preview" not in entry
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_failed_whitelisted_tool_skips_preview() -> None:
+    ctx = _FakeContext()
+    hooks = EmberRunHooks(ctx)
+
+    output = _mcp_text_output({"ok": False, "error": "workflow exploded"})
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("run_blocks_and_collect_debug"), output)
+
+    entry = ctx.tool_activity[0]
+    assert "output_preview" not in entry
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_list_credentials_records_resolved_ids() -> None:
+    ctx = _FakeContext()
+    hooks = EmberRunHooks(ctx)
+
+    output = _mcp_text_output(
+        {
+            "ok": True,
+            "data": {
+                "credentials": [
+                    {"credential_id": "cred_amazon", "name": "Amazon", "username": "shopper@example.test"},
+                    {"credential_id": "cred_quicken", "name": "Quicken Classic"},
+                ],
+                "count": 2,
+            },
+        }
+    )
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("list_credentials"), output)
+
+    entry = ctx.tool_activity[0]
+    assert entry["credentials"] == [
+        {"credential_id": "cred_amazon", "name": "Amazon"},
+        {"credential_id": "cred_quicken", "name": "Quicken Classic"},
+    ]
+
+
+def _listed_google_credential(
+    *,
+    credential_id: str,
+    scopes_requested: list[str] | None = None,
+    scopes_granted: list[str] | None = None,
+    state: str = "active",
+) -> GoogleOAuthCredentialBase:
+    sheets_scope = ["https://www.googleapis.com/auth/spreadsheets"]
+    return GoogleOAuthCredentialBase(
+        id=credential_id,
+        organization_id="org-1",
+        credential_name="Google account",
+        state=state,
+        scopes_requested=sheets_scope if scopes_requested is None else scopes_requested,
+        scopes_granted=sheets_scope if scopes_granted is None else scopes_granted,
+        created_at=datetime(2026, 6, 19),
+        modified_at=datetime(2026, 6, 19),
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_list_integrations_keeps_the_sheets_connections_a_flat_listing_admitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sheets_scope = "https://www.googleapis.com/auth/spreadsheets"
+    drive_metadata_scope = "https://www.googleapis.com/auth/drive.metadata.readonly"
+    drive_scope = "https://www.googleapis.com/auth/drive"
+    gmail_read_scope = "https://www.googleapis.com/auth/gmail.readonly"
+    google_credentials = [
+        _listed_google_credential(
+            credential_id="goac_requested_sheets_only", scopes_requested=[sheets_scope], scopes_granted=[sheets_scope]
+        ),
+        _listed_google_credential(
+            credential_id="goac_full_sheets",
+            scopes_requested=[sheets_scope, drive_metadata_scope],
+            scopes_granted=[sheets_scope],
+        ),
+        _listed_google_credential(
+            credential_id="goac_drive_and_sheets",
+            scopes_requested=[drive_scope],
+            scopes_granted=[drive_scope, sheets_scope],
+        ),
+        _listed_google_credential(credential_id="goac_expired_sheets", state="error"),
+        _listed_google_credential(
+            credential_id="goac_gmail", scopes_requested=[gmail_read_scope], scopes_granted=[gmail_read_scope]
+        ),
+    ]
+    outlook = MicrosoftOAuthCredentialBase(
+        id="msoac_1",
+        organization_id="org-1",
+        credential_name="Outlook account",
+        state="active",
+        scopes_requested=["Mail.Read"],
+        scopes_granted=["Mail.Read"],
+        created_at=datetime(2026, 6, 19),
+        modified_at=datetime(2026, 6, 19),
+    )
+    monkeypatch.setattr(
+        catalog.google_oauth_service, "get_visible_credentials_for_org", AsyncMock(return_value=google_credentials)
+    )
+    monkeypatch.setattr(
+        catalog.microsoft_oauth_service, "get_visible_credentials_for_org", AsyncMock(return_value=[outlook])
+    )
+    monkeypatch.setattr(app.DATABASE.organizations, "has_valid_org_auth_token", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    ctx = make_ember_ctx()
+    result = await _list_integrations({}, ctx)
+
+    await EmberRunHooks(ctx).on_tool_end(_UNUSED, _UNUSED, fake_tool("list_integrations"), json.dumps(result))
+
+    [activity] = ctx.tool_activity
+    assert sorted(row["connection_id"] for row in activity["integrations"]) == sorted(
+        [credential.id for credential in google_credentials] + ["msoac_1"]
+    )
+    assert listed_connection_ids(ctx.tool_activity) == {
+        credential.id for credential in google_credentials if credential.state == "active"
+    } | {"msoac_1"}
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_exact_credential_preserves_identity_for_structured_context() -> None:
+    ctx = _FakeContext()
+    hooks = EmberRunHooks(ctx)
+
+    output = _mcp_text_output(
+        {
+            "ok": True,
+            "data": {
+                "status": "resolved",
+                "credential": {"credential_id": "cred_saved_login", "name": "Saved Login"},
+            },
+        }
+    )
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("list_credentials"), output)
+
+    structured_context = StructuredContext()
+    structured_context.merge_turn_summary(ctx.tool_activity)
+
+    assert ctx.tool_activity[0]["credentials"] == [{"credential_id": "cred_saved_login", "name": "Saved Login"}]
+    assert structured_context.credentials_checked[-1].model_dump() == {
+        "credential_name": "Saved Login",
+        "credential_id": "cred_saved_login",
+        "found": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_list_credentials_empty_skips_field() -> None:
+    ctx = _FakeContext()
+    hooks = EmberRunHooks(ctx)
+
+    output = _mcp_text_output({"ok": True, "data": {"credentials": [], "count": 0}})
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("list_credentials"), output)
+
+    assert "credentials" not in ctx.tool_activity[0]
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_list_integrations_records_server_owned_binding_evidence() -> None:
+    ctx = _FakeContext()
+    hooks = EmberRunHooks(ctx)
+    sheets_account = {
+        "connection_id": "goac_sheets",
+        "provider": "google",
+        "name": "Sheets account",
+        "state": "active",
+        "scopes_granted": ["https://www.googleapis.com/auth/spreadsheets"],
+    }
+    output = _mcp_text_output(
+        {
+            "ok": True,
+            "data": {
+                "integrations": [
+                    {"id": "google_sheets", "accounts": [sheets_account]},
+                    {"id": "google_drive", "accounts": [sheets_account]},
+                    {
+                        "id": "outlook",
+                        "accounts": [
+                            {
+                                "connection_id": "msoac_mail",
+                                "provider": "microsoft",
+                                "name": "Mail account",
+                                "state": "active",
+                                "scopes_granted": [],
+                            }
+                        ],
+                    },
+                    {"id": "bitwarden", "accounts": [{"provider": "bitwarden", "state": "active"}]},
+                    {
+                        "id": "skyvern-sms-number",
+                        "accounts": [{"connection_id": "pn_1", "provider": "skyvern", "state": "active"}],
+                    },
+                    {"id": "mcp", "accounts": None},
+                ]
+            },
+        }
+    )
+
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("list_integrations"), output)
+
+    assert ctx.tool_activity[0]["integrations"] == [
+        {
+            "connection_id": "goac_sheets",
+            "provider": "google",
+            "state": "active",
+            "scopes_granted": ["https://www.googleapis.com/auth/spreadsheets"],
+        },
+        {
+            "connection_id": "msoac_mail",
+            "provider": "microsoft",
+            "state": "active",
+            "scopes_granted": [],
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_swallows_unserializable_output() -> None:
+    # json.dumps(default=str) can still raise if str() on the value raises --
+    # on_tool_end must never propagate that into the agent loop.
+    ctx = _FakeContext()
+    hooks = EmberRunHooks(ctx)
+
+    class _Unserializable:
+        def __str__(self) -> str:
+            raise RuntimeError("str boom")
+
+    payload = {"ok": True, "data": {"blocks": [{"label": "bad", "output": _Unserializable()}]}}
+    with capture_logs() as logs:
+        await hooks.on_tool_start(_UNUSED, _UNUSED, fake_tool("run_blocks_and_collect_debug"))
+        await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("run_blocks_and_collect_debug"), payload)
+
+    # The recording path raised inside json.dumps before append. The guard
+    # swallowed it, so the invariant is "the run did not crash" -- and the
+    # activity entry was dropped. That is the acceptable trade for observability.
+    assert ctx.tool_activity == []
+    assert ctx.tool_calls_this_turn == 1
+    warning = next(log for log in logs if log["event"] == "EmberRunHooks.on_tool_end recording failed, skipping entry")
+    assert warning["workflow_permanent_id"] == "wpid_example"
+    assert warning["turn_id"] == "turn_example"
+    assert warning["workflow_copilot_chat_id"] == "chat_example"
+
+
+class TestEmberToCallToolResult:
+    @staticmethod
+    def _build(d: dict) -> Any:
+        from skyvern.forge.sdk.ember.mcp_adapter import _ember_to_call_tool_result
+
+        return _ember_to_call_tool_result(d)
+
+    def test_text_only_result(self) -> None:
+        result = self._build({"ok": True, "data": "done"})
+        assert len(result.content) == 1
+        assert result.content[0].type == "text"
+        assert result.isError is False
+
+    def test_screenshot_payload_always_text_only(self) -> None:
+        """Tool results never include images — screenshots are injected
+        as synthetic user messages by the enforcement loop instead."""
+        result = self._build({"ok": True, "data": {"screenshot_base64": "iVBOR"}})
+        assert len(result.content) == 1
+        assert result.content[0].type == "text"
+        parsed = json.loads(result.content[0].text)
+        assert parsed["data"]["screenshot_base64"].startswith("[base64 image omitted")
+
+    def test_error_result(self) -> None:
+        result = self._build({"ok": False, "error": "fail"})
+        assert result.isError is True
+        parsed = json.loads(result.content[0].text)
+        assert parsed["ok"] is False
+        assert parsed["error"] == "fail"
+
+    def test_text_content_is_json(self) -> None:
+        data = {"ok": True, "data": {"count": 5}}
+        result = self._build(data)
+        parsed = json.loads(result.content[0].text)
+        assert parsed == {**data, MCP_RESULT_PROVENANCE_KEY: MCP_RESULT_PROVENANCE_VALUE}
+
+
+class TestSchemaOverlay:
+    def test_apply_schema_overlay_hides_params(self) -> None:
+        from skyvern.forge.sdk.ember.mcp_adapter import SchemaOverlay, _apply_schema_overlay
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "session_id": {"type": "string"},
+                "cdp_url": {"type": "string"},
+            },
+            "required": ["url", "session_id"],
+        }
+        overlay = SchemaOverlay(
+            hide_params=frozenset({"session_id", "cdp_url"}),
+        )
+        result = _apply_schema_overlay(schema, overlay)
+        assert "session_id" not in result["properties"]
+        assert "cdp_url" not in result["properties"]
+        assert "url" in result["properties"]
+        assert "session_id" not in result["required"]
+
+    def test_apply_schema_overlay_renames_args(self) -> None:
+        from skyvern.forge.sdk.ember.mcp_adapter import SchemaOverlay, _apply_schema_overlay
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "clear": {"type": "boolean"},
+                "text": {"type": "string"},
+            },
+            "required": ["clear", "text"],
+        }
+        overlay = SchemaOverlay(
+            arg_transforms={"clear_first": "clear"},
+        )
+        result = _apply_schema_overlay(schema, overlay)
+        assert "clear_first" in result["properties"]
+        assert "clear" not in result["properties"]
+        assert "clear_first" in result["required"]
+
+    def test_transform_args_reverses_and_injects(self) -> None:
+        from skyvern.forge.sdk.ember.mcp_adapter import SchemaOverlay, _transform_args
+
+        overlay = SchemaOverlay(
+            arg_transforms={"clear_first": "clear"},
+            forced_args={"inline": True},
+        )
+        args = {"clear_first": True, "text": "hello", "_summarized": "older tool call"}
+        result = _transform_args(args, overlay)
+        assert result == {"clear": True, "text": "hello", "inline": True}
+        assert "clear_first" not in result
+
+
+class TestMCPFailedStepLoopDetection:
+    @pytest.mark.asyncio
+    async def test_post_hook_exception_preserves_successful_tool_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.ember import mcp_adapter
+        from skyvern.forge.sdk.ember.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+        from skyvern.forge.sdk.ember.output_utils import summarize_tool_result
+
+        class FakeRawResult:
+            structured_content = {
+                "ok": True,
+                "data": {"selector": None, "resolved_selector": "xpath=//button[2]", "status": "clicked"},
+            }
+            is_error = False
+            content: list[Any] = []
+
+        class FakeClient:
+            async def call_tool(
+                self,
+                name: str,
+                args: dict[str, Any],
+                raise_on_error: bool = False,
+            ) -> FakeRawResult:
+                return FakeRawResult()
+
+        async def raising_post_hook(
+            result: dict[str, Any],
+            raw: dict[str, Any],
+            ctx: Any,
+        ) -> dict[str, Any]:
+            ctx.scouted_interactions.append({"tool_name": "click", "selector": "#partial"})
+            ctx.scout_trajectory.append({"tool_name": "click", "selector": "#partial", "trajectory_index": 1})
+            ctx.flow_evidence.append({"step": 2, "evidence": {"source_tool": "partial"}})
+            ctx.pending_browser_interaction_observation = SimpleNamespace(tool_name="click", url="https://partial")
+            ctx.pending_scout_source_url = None
+            ctx.pending_scout_input_value = "partial"
+            raise AttributeError("'NoneType' object has no attribute 'strip'")
+
+        recorded: list[dict[str, Any]] = []
+        screenshots: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            mcp_adapter,
+            "record_tool_step_result_for_ctx",
+            lambda _ctx, _tool, _args, result: recorded.append(dict(result)),
+        )
+        monkeypatch.setattr(
+            mcp_adapter,
+            "enqueue_screenshot_from_result",
+            lambda _ctx, result, **_kwargs: screenshots.append(dict(result)),
+        )
+
+        initial_scouted_interactions = [{"tool_name": "click", "selector": "#existing"}]
+        initial_scout_trajectory = [{"tool_name": "click", "selector": "#existing", "trajectory_index": 0}]
+        initial_flow_evidence = [{"step": 1, "evidence": {"source_tool": "existing"}}]
+        initial_pending_observation = SimpleNamespace(tool_name="click", url="https://existing")
+        ctx = SimpleNamespace(
+            organization_id="o_test",
+            workflow_permanent_id="wpid_test",
+            browser_session_continuity_generation=0,
+            consecutive_tool_tracker=[],
+            failed_tool_step_tracker={},
+            scouted_interactions=list(initial_scouted_interactions),
+            scout_trajectory=list(initial_scout_trajectory),
+            flow_evidence=list(initial_flow_evidence),
+            pending_browser_interaction_observation=initial_pending_observation,
+            pending_scout_source_url="https://source",
+            pending_scout_input_value="typed",
+            completion_criteria_turn_state=None,
+            last_code_authoring_repair_context=None,
+            scouted_output_covered_paths=set(),
+            request_policy=None,
+        )
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"click": SchemaOverlay(post_hook=raising_post_hook)},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: ctx,
+        )
+        server._client = FakeClient()
+
+        result = await server.call_tool("click", {"intent": "click the add button"})
+
+        parsed = json.loads(result.content[0].text)
+        assert result.isError is False
+        preserved = {
+            "ok": True,
+            "data": {"selector": None, "resolved_selector": "xpath=//button[2]", "status": "clicked"},
+        }
+        assert parsed == {**preserved, MCP_RESULT_PROVENANCE_KEY: MCP_RESULT_PROVENANCE_VALUE}
+        assert summarize_tool_result("click", parsed) == "Clicked 'xpath=//button[2]'"
+        # The untrusted marker is model-facing only; the loop context records the result itself.
+        assert recorded == [preserved]
+        assert screenshots == [preserved]
+        assert ctx.scouted_interactions == initial_scouted_interactions
+        assert ctx.scout_trajectory == initial_scout_trajectory
+        assert ctx.flow_evidence == initial_flow_evidence
+        assert ctx.pending_browser_interaction_observation == initial_pending_observation
+        assert ctx.pending_scout_source_url == "https://source"
+        assert ctx.pending_scout_input_value == "typed"
+
+    @pytest.mark.asyncio
+    async def test_post_hook_exception_preserves_failing_tool_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.ember import mcp_adapter
+        from skyvern.forge.sdk.ember.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+
+        class FakeRawResult:
+            structured_content = {"ok": False, "error": "element not found"}
+            is_error = True
+            content: list[Any] = []
+
+        class FakeClient:
+            async def call_tool(
+                self,
+                name: str,
+                args: dict[str, Any],
+                raise_on_error: bool = False,
+            ) -> FakeRawResult:
+                return FakeRawResult()
+
+        async def raising_post_hook(
+            result: dict[str, Any],
+            raw: dict[str, Any],
+            ctx: Any,
+        ) -> dict[str, Any]:
+            raise RuntimeError("post-hook failed")
+
+        recorded: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            mcp_adapter,
+            "record_tool_step_result_for_ctx",
+            lambda _ctx, _tool, _args, result: recorded.append(dict(result)),
+        )
+
+        ctx = MagicMock()
+        ctx.consecutive_tool_tracker = []
+        ctx.failed_tool_step_tracker = {}
+        ctx.turn_ownership = None
+        ctx.blocker_signal_claimant = None
+        ctx.gate_precedence_conflict_events = []
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"click": SchemaOverlay(post_hook=raising_post_hook)},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: ctx,
+        )
+        server._client = FakeClient()
+
+        result = await server.call_tool("click", {"selector": "#missing"})
+
+        parsed = json.loads(result.content[0].text)
+        assert result.isError is True
+        preserved = {"ok": False, "error": "element not found"}
+        assert parsed == {**preserved, MCP_RESULT_PROVENANCE_KEY: MCP_RESULT_PROVENANCE_VALUE}
+        assert recorded == [preserved]
+
+    @pytest.mark.asyncio
+    async def test_browser_tool_call_is_created_inside_ember_browser_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.ember import mcp_adapter
+        from skyvern.forge.sdk.ember.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+
+        class FakeRawResult:
+            structured_content = {"ok": True, "data": {}}
+            is_error = False
+            content: list[Any] = []
+
+        in_context = False
+        calls: list[tuple[str, dict[str, Any], bool]] = []
+
+        class FakeClient:
+            async def call_tool(
+                self,
+                name: str,
+                args: dict[str, Any],
+                raise_on_error: bool = False,
+            ) -> FakeRawResult:
+                calls.append((name, args, in_context))
+                return FakeRawResult()
+
+        async def fake_ensure_browser_session(ctx: Any) -> None:
+            ctx.browser_session_id = "pbs_copilot"
+
+        @asynccontextmanager
+        async def fake_mcp_browser_context(ctx: Any, *, session_id_override: str | None = None) -> Any:
+            nonlocal in_context
+            in_context = True
+            try:
+                yield
+            finally:
+                in_context = False
+
+        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", fake_ensure_browser_session)
+        monkeypatch.setattr(mcp_adapter, "mcp_browser_context", fake_mcp_browser_context)
+
+        ctx = MagicMock()
+        ctx.consecutive_tool_tracker = []
+        ctx.failed_tool_step_tracker = {}
+        ctx.turn_ownership = None
+        ctx.blocker_signal_claimant = None
+        ctx.gate_precedence_conflict_events = []
+        ctx.browser_session_id = None
+        ctx.browser_session_continuity_generation = 0
+        ctx.browser_session_recovery_lock = asyncio.Lock()
+        ctx.browser_session_recovery_owner = None
+        ctx.browser_session_recovery_depth = 0
+        ctx.request_policy = None
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"get_browser_screenshot": SchemaOverlay(requires_browser=True)},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: ctx,
+        )
+        server._client = FakeClient()
+
+        result = await server.call_tool("get_browser_screenshot", {})
+
+        assert result.isError is False
+        assert calls == [("get_browser_screenshot", {"session_id": "pbs_copilot"}, True)]
+
+    @pytest.mark.asyncio
+    async def test_browser_overlay_reaches_fastmcp_tool_with_registered_ember_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.cli.core import client as client_mod
+        from skyvern.cli.core import session_manager
+        from skyvern.cli.mcp_tools import browser as browser_tools
+        from skyvern.cli.mcp_tools import mcp
+        from skyvern.forge.sdk.ember import runtime
+        from skyvern.forge.sdk.ember.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+        from skyvern.forge.sdk.ember.runtime import AgentContext
+        from skyvern.forge.sdk.ember.tools import _screenshot_post_hook
+
+        client_mod._skyvern_instance.set(None)
+        client_mod._api_key_override.set(None)
+        client_mod._global_skyvern_instance = None
+        client_mod._api_key_clients.clear()
+        session_manager._current_session.set(None)
+        session_manager._global_session = None
+        ember_sessions._ember_sessions.clear()
+        session_manager.set_stateless_http_mode(False)
+
+        raw_page = MagicMock()
+        raw_page.is_closed.return_value = False
+        raw_page.on = MagicMock()
+        raw_page.url = "https://example.com"
+        browser_context = SimpleNamespace(
+            pages=[raw_page],
+            on=MagicMock(),
+            _impl_obj=SimpleNamespace(_close_was_called=False, _closed=False),
+            browser=SimpleNamespace(is_connected=lambda: True),
+        )
+        browser_state = crash_free_browser_state(
+            browser_context=browser_context,
+            get_working_page=AsyncMock(return_value=None),
+        )
+
+        @asynccontextmanager
+        async def _browser_operation(_session_id: str, state: Any) -> AsyncIterator[BrowserOperation]:
+            yield BrowserOperation(state, BrowserRetirement())
+
+        persistent_session_manager = SimpleNamespace(
+            get_browser_state=AsyncMock(return_value=browser_state),
+            browser_operation=_browser_operation,
+        )
+        monkeypatch.setattr(runtime.app, "PERSISTENT_SESSIONS_MANAGER", persistent_session_manager)
+        monkeypatch.setattr(runtime.settings, "ENV", "local")
+
+        runtime_skyvern = MagicMock()
+        monkeypatch.setattr(runtime, "get_skyvern", lambda: runtime_skyvern)
+
+        class FakeSkyvernBrowser:
+            def __init__(
+                self,
+                skyvern: Any,
+                browser_context: Any,
+                *,
+                browser_session_id: str | None = None,
+                browser_address: str | None = None,
+            ) -> None:
+                del skyvern, browser_address
+                self._browser_context = browser_context
+                self._browser_session_id = browser_session_id
+
+            async def get_working_page(self) -> Any:
+                return SimpleNamespace(page=raw_page, is_closed=lambda: False)
+
+        monkeypatch.setattr(runtime, "SkyvernBrowser", FakeSkyvernBrowser)
+
+        fallback_skyvern = MagicMock()
+        fallback_skyvern.connect_to_cloud_browser_session = AsyncMock(
+            side_effect=AssertionError("unexpected SDK reconnect")
+        )
+        monkeypatch.setattr(session_manager, "get_skyvern", lambda: fallback_skyvern)
+
+        observed_session_ids: list[str | None] = []
+        observed_localhost_access: list[bool | None] = []
+
+        async def fake_do_screenshot(page: Any, full_page: bool = False, selector: str | None = None) -> Any:
+            del page, full_page, selector
+            current = session_manager.get_current_session()
+            observed_session_ids.append(current.context.session_id if current.context else None)
+            observed_localhost_access.append(current.context.can_access_localhost if current.context else None)
+            assert current.api_key_hash == session_manager._api_key_hash("sk-copilot-org")
+            png = io.BytesIO()
+            Image.new("RGB", (1920, 947)).save(png, format="PNG")
+            return ScreenshotResult(data=png.getvalue(), viewport_css_px=(1920, 947))
+
+        monkeypatch.setattr(browser_tools, "do_screenshot", fake_do_screenshot)
+
+        ctx = AgentContext(
+            organization_id="org-1",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_yaml="",
+            browser_session_id="pbs_copilot",
+            stream=MagicMock(is_disconnected=AsyncMock(return_value=False)),
+            api_key="sk-copilot-org",
+        )
+
+        server = SkyvernOverlayMCPServer(
+            transport=mcp,
+            overlays={
+                "get_browser_screenshot": SchemaOverlay(
+                    requires_browser=True,
+                    forced_args={"inline": True},
+                    post_hook=_screenshot_post_hook,
+                )
+            },
+            alias_map={"get_browser_screenshot": "skyvern_screenshot"},
+            allowlist=frozenset({"skyvern_screenshot"}),
+            context_provider=lambda: ctx,
+        )
+
+        await server.connect()
+        try:
+            result = await server.call_tool("get_browser_screenshot", {})
+        finally:
+            await server.cleanup()
+            ember_sessions._ember_sessions.clear()
+
+        parsed = json.loads(result.content[0].text)
+        assert result.isError is False
+        assert parsed["ok"] is True
+        assert parsed["data"]["screenshot_base64"]
+        assert [entry.provenance.viewport_css_px for entry in ctx.pending_screenshots] == [(1920, 947)]
+        assert observed_session_ids == ["pbs_copilot"]
+        assert observed_localhost_access == [True]
+        fallback_skyvern.connect_to_cloud_browser_session.assert_not_awaited()
+        persistent_session_manager.get_browser_state.assert_any_await(
+            session_id="pbs_copilot",
+            organization_id="org-1",
+        )
+        assert persistent_session_manager.get_browser_state.await_args_list[0] == call(
+            session_id="pbs_copilot",
+            organization_id="org-1",
+        )
+
+
+class TestMCPToolOverlayCompleteness:
+    """Verify alias map and overlay configs are in sync and complete."""
+
+    def test_alias_map_covers_expected_tools(self) -> None:
+        from skyvern.forge.sdk.ember.tools import get_skyvern_mcp_alias_map
+
+        alias_map = get_skyvern_mcp_alias_map()
+        expected_aliases = {
+            "get_workflow_knowledge",
+            "get_block_schema",
+            "validate_block",
+            "list_org_workflows",
+            "get_org_workflow",
+            "navigate_browser",
+            "get_browser_screenshot",
+            "evaluate",
+            "click",
+            "type_text",
+            "scroll",
+            "console_messages",
+            "select_option",
+            "press_key",
+            "drag",
+            "hover",
+            "wait_for_either_state",
+            "skyvern_frame_list",
+            "skyvern_frame_switch",
+            "skyvern_frame_main",
+            "skyvern_tab_list",
+            "skyvern_tab_new",
+            "skyvern_tab_switch",
+            "skyvern_tab_close",
+            "list_workflow_schedules",
+            "get_workflow_schedule",
+            "create_workflow_schedule",
+            "update_workflow_schedule",
+            "enable_workflow_schedule",
+            "disable_workflow_schedule",
+            "cancel_workflow_schedule",
+            "delete_workflow_schedule",
+            "list_workflow_runs",
+            "list_browser_profiles",
+            "get_browser_profile",
+            "create_browser_profile",
+        }
+        assert set(alias_map.keys()) == expected_aliases
+        assert all(v.startswith("skyvern_") for v in alias_map.values())
+        assert "skyvern_browser_profile_update" not in alias_map.values()
+        assert "skyvern_browser_profile_delete" not in alias_map.values()
+        assert "query" in tools_module._build_skyvern_mcp_overlays()["list_org_workflows"].hide_params
+
+    def test_every_alias_has_overlay(self) -> None:
+        from skyvern.forge.sdk.ember.tools import (
+            _build_skyvern_mcp_overlays,
+            get_skyvern_mcp_alias_map,
+        )
+
+        alias_map = get_skyvern_mcp_alias_map()
+        overlays = _build_skyvern_mcp_overlays()
+        missing = set(alias_map.keys()) - set(overlays.keys())
+        assert not missing, f"Alias map keys missing overlay configs: {missing}"
+
+    def test_browser_tools_require_browser(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _build_skyvern_mcp_overlays
+
+        overlays = _build_skyvern_mcp_overlays()
+        browser_tools = {
+            "navigate_browser",
+            "get_browser_screenshot",
+            "evaluate",
+            "click",
+            "type_text",
+            "scroll",
+            "console_messages",
+            "select_option",
+            "press_key",
+            "wait_for_either_state",
+        }
+        for name in browser_tools:
+            assert overlays[name].requires_browser, f"{name} should have requires_browser=True"
+
+    def test_wait_for_either_state_exposes_the_two_selector_branch(self) -> None:
+        """Without selector_or the copilot must guess one state and pay the timeout when it is wrong."""
+        from skyvern.forge.sdk.ember.tools import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
+
+        assert get_skyvern_mcp_alias_map()["wait_for_either_state"] == "skyvern_wait_for_either_state"
+        overlay = _build_skyvern_mcp_overlays()["wait_for_either_state"]
+
+        # Both states are required by the tool itself, so a single-selector call — the shape that
+        # spends the whole ceiling on a wrong guess — is not expressible here at all.
+        assert not overlay.hide_params & {"selector_a", "selector_b"}
+
+    def test_intent_hidden_on_element_action_tools(self) -> None:
+        """An `intent` runs a second LLM agent to pick the element, duplicating reasoning the
+        copilot loop already did. The element-action tools take a selector only."""
+        from skyvern.forge.sdk.ember.tools import _build_skyvern_mcp_overlays
+
+        overlays = _build_skyvern_mcp_overlays()
+        for name in ("click", "type_text", "select_option", "press_key"):
+            hidden = overlays[name].hide_params or frozenset()
+            assert "intent" in hidden, f"{name} should hide intent"
+
+        # `scroll` deliberately keeps it: scrolling a named element into view is not the
+        # element-picking this removes, and the agent prompt still offers it.
+        assert "intent" not in (overlays["scroll"].hide_params or frozenset())
+
+
+class TestNewToolOverlayConfigs:
+    """Verify the 4 new tool overlay configs are correct."""
+
+    def test_scroll_overlay(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _build_skyvern_mcp_overlays
+
+        overlay = _build_skyvern_mcp_overlays()["scroll"]
+        assert overlay.hide_params == frozenset({"session_id", "cdp_url"})
+        assert overlay.requires_browser is True
+        assert overlay.post_hook is not None
+
+    def test_console_messages_overlay(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _build_skyvern_mcp_overlays
+
+        overlay = _build_skyvern_mcp_overlays()["console_messages"]
+        assert overlay.hide_params == frozenset({"session_id", "cdp_url"})
+        assert overlay.requires_browser is True
+
+    def test_tab_control_overlays_wire_their_pre_hooks(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _build_skyvern_mcp_overlays
+
+        overlays = _build_skyvern_mcp_overlays()
+
+        assert overlays["skyvern_tab_switch"].pre_hook is mcp_hooks._tab_switch_pre_hook
+        assert overlays["skyvern_tab_new"].pre_hook is mcp_hooks._tab_new_pre_hook
+        assert "skyvern_tab_wait_for_new" not in overlays
+
+    def test_select_option_overlay(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _build_skyvern_mcp_overlays
+
+        overlay = _build_skyvern_mcp_overlays()["select_option"]
+        assert overlay.hide_params == frozenset({"session_id", "cdp_url", "timeout", "intent"})
+        assert overlay.required_overrides == ["value"]
+        assert overlay.requires_browser is True
+        assert overlay.post_hook is not None
+
+    def test_press_key_overlay(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _build_skyvern_mcp_overlays
+
+        overlay = _build_skyvern_mcp_overlays()["press_key"]
+        assert overlay.hide_params == frozenset({"session_id", "cdp_url", "intent"})
+        assert overlay.required_overrides == ["key"]
+        assert overlay.requires_browser is True
+        assert overlay.post_hook is not None
+
+    def test_click_and_type_overlays_are_selector_only(self) -> None:
+        # Acting by selector is deterministic; an `intent` would spawn a second LLM agent to
+        # choose the element. The parameter is off the schema, so the description must not
+        # reference it and must point at re-observing when a selector fails (regression guard).
+        from skyvern.forge.sdk.ember.tools import _build_skyvern_mcp_overlays
+
+        overlays = _build_skyvern_mcp_overlays()
+        for name in ("click", "type_text"):
+            desc = overlays[name].description or ""
+            assert "selector" in desc, f"{name} should name the selector contract"
+            assert "intent" not in desc, f"{name} description must not reference intent"
+            assert "inspect the page again" in desc, f"{name} should steer to re-observation on failure"
+            assert "intent" in overlays[name].hide_params
+
+    def test_browser_action_overlays_force_direct_selector_mode(self) -> None:
+        # The copilot keeps deterministic selector actions by binding selector_mode="direct"
+        # via forced_args, even though the shared MCP default is resilient (SKY-10562).
+        from skyvern.forge.sdk.ember.tools import _build_skyvern_mcp_overlays
+
+        overlays = _build_skyvern_mcp_overlays()
+        for name in ("click", "type_text", "select_option"):
+            assert overlays[name].forced_args.get("selector_mode") == "direct", (
+                f"{name} overlay must force selector_mode=direct"
+            )
+
+    @pytest.mark.asyncio
+    async def test_discovery_click_anchor_forces_direct_selector_mode(self) -> None:
+        # call_internal_tool bypasses overlays, so the discovery path must pass selector_mode
+        # explicitly; without it the anchor click would silently regress to the resilient default.
+        from skyvern.forge.sdk.ember.tools import _discovery_click_anchor
+
+        call_internal_tool = AsyncMock(return_value={"ok": True})
+        ctx = SimpleNamespace(discovery_mcp_server=SimpleNamespace(call_internal_tool=call_internal_tool))
+
+        await _discovery_click_anchor(ctx, {"href": "https://example.com/cart"})
+
+        call_internal_tool.assert_awaited_once()
+        tool_name, tool_args = call_internal_tool.await_args.args
+        assert tool_name == "skyvern_click"
+        assert tool_args.get("selector_mode") == "direct"
+
+
+class TestNewToolSummaries:
+    """Verify summarize_tool_result handles the 4 new tools."""
+
+    @staticmethod
+    def _summarize(name: str, result: dict[str, Any]) -> str:
+        from skyvern.forge.sdk.ember.output_utils import summarize_tool_result
+
+        return summarize_tool_result(name, result)
+
+    def test_scroll_summary(self) -> None:
+        result = {"ok": True, "data": {"direction": "down", "amount": 500}}
+        assert "down" in self._summarize("scroll", result)
+
+    def test_console_messages_summary(self) -> None:
+        result = {"ok": True, "data": {"count": 3}}
+        summary = self._summarize("console_messages", result)
+        assert "3" in summary
+        assert "console" in summary.lower()
+
+    def test_select_option_summary(self) -> None:
+        result = {"ok": True, "data": {"value": "USD", "selector": "#currency"}}
+        assert "USD" in self._summarize("select_option", result)
+
+    def test_press_key_summary(self) -> None:
+        result = {"ok": True, "data": {"key": "Enter"}}
+        assert "Enter" in self._summarize("press_key", result)
+
+
+class TestObservationToolsSet:
+    """Verify _OBSERVATION_TOOLS includes all browser interaction tools."""
+
+    def test_contains_new_tools(self) -> None:
+        from skyvern.forge.sdk.ember.streaming_adapter import _OBSERVATION_TOOLS
+
+        expected = {"scroll", "console_messages", "select_option", "press_key"}
+        assert expected.issubset(_OBSERVATION_TOOLS)
+
+
+class TestScoutReadbackOutcome:
+    """The readback is reported as what was observed; nothing here decides where the value belongs."""
+
+    @pytest.mark.parametrize("case", READBACK_OUTCOME_CASES, ids=[case["name"] for case in READBACK_OUTCOME_CASES])
+    def test_the_shared_case_table_pins_the_outcome_the_failure_and_the_landing_record(
+        self, case: dict[str, Any]
+    ) -> None:
+        outcome = _scout_readback_outcome(case["readback"], case["typed_value"])
+        failure = _scout_type_landing_failure(outcome, tool_name="fill_credential_field", selector="#field")
+        effects = _fill_observed_effects(outcome, landing_inferred_from_navigation=False)
+
+        assert outcome.value == case["outcome"]
+        assert (failure is not None) is case["fails"]
+        assert ("value_landed" in effects) is case["records_value_landed"]
+
+    def test_a_landing_inferred_from_navigation_records_the_inference_and_not_a_sighting(self) -> None:
+        effects = _fill_observed_effects(ScoutReadbackOutcome.EMPTY, landing_inferred_from_navigation=True)
+
+        assert effects == {"landing_inferred_from_navigation": True}
+
+    @pytest.mark.parametrize(
+        "verdict",
+        [ScoutReadbackOutcome.EXACT_MATCH, ScoutReadbackOutcome.DIFFERENT, ScoutReadbackOutcome.UNAVAILABLE],
+    )
+    def test_only_an_empty_field_fails_the_fill(self, verdict: ScoutReadbackOutcome) -> None:
+        assert _scout_type_landing_failure(verdict, tool_name="fill_credential_field", selector="#totp") is None
+
+    def test_an_empty_field_fails_and_names_the_route_back(self) -> None:
+        failure = _scout_type_landing_failure(
+            ScoutReadbackOutcome.EMPTY, tool_name="fill_credential_field", selector="#totp"
+        )
+
+        assert failure is not None
+        assert failure["ok"] is False
+        assert "retry fill_credential_field" in failure["error"]
+
+
+class TestVerifyScoutTypeLanded:
+    """A scout type that an overlay silently consumed must surface as a failure."""
+
+    def _ctx_with_value(self, value: Any) -> SimpleNamespace:
+        server = SimpleNamespace()
+        server.call_internal_tool = AsyncMock(return_value={"ok": True, "data": {"value": value}})
+        return SimpleNamespace(discovery_mcp_server=server)
+
+    @pytest.mark.asyncio
+    async def test_empty_field_after_nonempty_type_returns_failure(self) -> None:
+        ctx = self._ctx_with_value("")
+        result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=12)
+
+        assert result is not None
+        assert result["ok"] is False
+        assert "still empty" in result["error"]
+        # an empty read settles and re-reads once before declaring the type lost
+        assert ctx.discovery_mcp_server.call_internal_tool.await_count == 2
+        ctx.discovery_mcp_server.call_internal_tool.assert_awaited_with(
+            "skyvern_get_value", {"selector": "#search-input"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_then_filled_on_reread_passes(self) -> None:
+        server = SimpleNamespace()
+        server.call_internal_tool = AsyncMock(
+            side_effect=[
+                {"ok": True, "data": {"value": ""}},
+                {"ok": True, "data": {"value": "hello world"}},
+            ]
+        )
+        ctx = SimpleNamespace(discovery_mcp_server=server)
+
+        result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=12)
+
+        assert result is None
+        assert server.call_internal_tool.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_selector_skips_readback(self) -> None:
+        ctx = self._ctx_with_value("")
+        result = await _verify_scout_type_landed(ctx, selector="", typed_length=12)
+
+        assert result is None
+        ctx.discovery_mcp_server.call_internal_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_auto_formatting_field_passes_despite_growing_past_the_typed_length(self) -> None:
+        """A phone/card/date input inserts its own separators, so the readback is longer than what
+        was typed with nothing having landed in the wrong field. Rejecting it fails every such form."""
+        ctx = self._ctx_with_value("(555) 123-4567")
+        result = await _verify_scout_type_landed(ctx, selector="#phone", typed_length=len("5551234567"))
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_a_field_holding_more_than_was_typed_passes(self) -> None:
+        """type_text does not hold the value it typed, so a longer readback is not an observation
+        that the text joined a value already in the field."""
+        ctx = self._ctx_with_value("alreadyherenewvalue")
+        result = await _verify_scout_type_landed(ctx, selector="#name", typed_length=len("newvalue"))
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unreadable_field_passes(self) -> None:
+        """An unread field is not an observation that the type was lost, so it must not fail the type."""
+        ctx = self._ctx_with_value(None)
+        result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=12)
+
+        assert result is None
+        assert ctx.discovery_mcp_server.call_internal_tool.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_zero_typed_length_skips_readback(self) -> None:
+        ctx = self._ctx_with_value("")
+        result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=0)
+
+        assert result is None
+        ctx.discovery_mcp_server.call_internal_tool.assert_not_awaited()
+
+
+class TestBrowserInteractionObservationHooks:
+    @pytest.mark.asyncio
+    async def test_click_hook_marks_pending_interaction_observation(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _click_post_hook
+
+        ctx = SimpleNamespace(
+            pending_browser_interaction_observation=None,
+            pending_scout_input_value=None,
+            pending_scout_role_name=None,
+            pending_scout_click_selector=None,
+            pending_scout_ambiguous=None,
+            pending_scout_reanchor=None,
+            pending_scout_dynamic_row=None,
+            pending_scout_download_snapshot=None,
+            pending_scout_download=False,
+            pending_scout_download_detachers=[],
+            pending_scout_popup=None,
+            pending_scout_popup_content_type=None,
+            pending_scout_challenge_frames=[],
+            pending_scout_challenge_detachers=[],
+            pending_scout_challenge_prior_frames=[],
+            last_scout_act_observe_recapture_attempted=False,
+            pending_scout_challenge_armed_at=None,
+            pending_scout_click_pre_frame=None,
+            discovery_mcp_server=None,
+            scouted_interactions=[],
+            scout_trajectory=[],
+            pending_scout_source_url=None,
+            last_run_blocks_workflow_run_id=None,
+            browser_session_id=None,
+            request_policy=None,
+            org_credentials_for_turn=None,
+            organization_id="o_1",
+            codeblock_redaction_parameters={},
+            supports_vision=False,
+        )
+        result = await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+
+        assert result["data"] == {
+            "executed_selector": "#add-to-cart",
+            "effective_target": "#add-to-cart",
+            "url": "https://example.com/",
+            "title": "Results",
+            "visible_effect": "unknown",
+        }
+        assert ctx.pending_browser_interaction_observation is not None
+        assert ctx.pending_browser_interaction_observation.tool_name == "click"
+        assert ctx.pending_browser_interaction_observation.url == "https://example.com/results"
+
+    @pytest.mark.asyncio
+    async def test_failed_click_hook_clears_stale_pending_interaction_observation(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _click_post_hook
+
+        ctx = SimpleNamespace(
+            pending_browser_interaction_observation=PendingBrowserInteractionObservation(
+                tool_name="click",
+                url="https://example.com/results",
+            ),
+            pending_scout_input_value=None,
+            pending_scout_role_name=None,
+            pending_scout_click_selector=None,
+            pending_scout_ambiguous=None,
+            pending_scout_reanchor=None,
+            pending_scout_dynamic_row=None,
+            pending_scout_download_snapshot=None,
+            pending_scout_download=False,
+            pending_scout_download_detachers=[],
+            pending_scout_popup=None,
+            pending_scout_popup_content_type=None,
+            pending_scout_challenge_frames=[],
+            pending_scout_challenge_detachers=[],
+            pending_scout_challenge_prior_frames=[],
+            last_scout_act_observe_recapture_attempted=False,
+            pending_scout_challenge_armed_at=None,
+            pending_scout_click_pre_frame=None,
+            discovery_mcp_server=None,
+            scouted_interactions=[],
+            scout_trajectory=[],
+            pending_scout_source_url=None,
+            last_run_blocks_workflow_run_id=None,
+            browser_session_id=None,
+            codeblock_redaction_parameters={},
+            supports_vision=False,
+        )
+
+        result = await _click_post_hook(
+            {"ok": False, "error": "element not found"},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+
+        assert result == {"ok": False, "error": "element not found", "data": {"visible_effect": "unknown"}}
+        assert ctx.pending_browser_interaction_observation is None
+
+    @pytest.mark.asyncio
+    async def test_type_hook_does_not_mark_pending_interaction_when_readback_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from skyvern.forge.sdk.ember import tools as tools_module
+
+        async def fake_verify(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"ok": False, "error": "field is still empty"}
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", fake_verify)
+        ctx = SimpleNamespace(
+            pending_browser_interaction_observation=None,
+            pending_scout_input_value=None,
+            discovery_mcp_server=None,
+            scouted_interactions=[],
+            scout_trajectory=[],
+            pending_scout_source_url=None,
+            last_run_blocks_workflow_run_id=None,
+            browser_session_id=None,
+            codeblock_redaction_parameters={},
+            supports_vision=False,
+        )
+
+        result = await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#q", "text_length": 12}},
+            {"browser_context": {"url": "https://example.com/search", "title": "Search"}},
+            ctx,
+        )
+
+        assert result == {"ok": False, "error": "field is still empty"}
+        assert ctx.pending_browser_interaction_observation is None
+
+
+_ACTED_SELECTOR = "button[data-action='order']"
+
+
+def _no_redaction_ctx() -> SimpleNamespace:
+    """These cases assert summary shape; the redactor is a no-op without codeblock parameters."""
+    return SimpleNamespace(codeblock_redaction_parameters={})
+
+
+# Post-action browser calls each interaction issues, production-shaped (vision on). Only `click`
+# is in _ACT_OBSERVE_TOOLS, so only it takes the structured packet and its retained fallback frame;
+# The type_text path takes no frame but is the heaviest at four calls: two reads that verify the
+# text landed plus two evaluates. A new probe on any path fails this.
+_INTERACTION_HOOK_PAIRS = (
+    ("_click_pre_hook", {}, "_click_post_hook", {}, {"skyvern_evaluate": 1, "skyvern_screenshot": 1}),
+    (
+        "_type_text_pre_hook",
+        {"text": "socks"},
+        "_type_text_post_hook",
+        {"text_length": 5},
+        {"skyvern_evaluate": 2, "skyvern_get_value": 2},
+    ),
+    ("_select_option_pre_hook", {"value": "price_asc"}, "_select_option_post_hook", {"value": "price_asc"}, {}),
+    ("_press_key_pre_hook", {"key": "Enter"}, "_press_key_post_hook", {"key": "Enter"}, {}),
+)
+
+_INTERACTION_PRE_HOOKS = (
+    ("_click_pre_hook", {}),
+    ("_type_text_pre_hook", {"text": "socks"}),
+    ("_select_option_pre_hook", {"value": "price_asc"}),
+    ("_press_key_pre_hook", {"key": "Enter"}),
+)
+
+
+class TestScoutedInteractionCapture:
+    """A scouted interaction with a concrete selector is captured and surfaced to
+    code-only authoring; intent-only and failed-readback actions are not."""
+
+    def _ctx(self, *, policy: object = None, source_url: str | None = None) -> SimpleNamespace:
+        ns = SimpleNamespace(
+            workflow_permanent_id="wpid_test",
+            codeblock_redaction_parameters={},
+            pending_browser_interaction_observation=None,
+            pending_scout_input_value=None,
+            pending_scout_role_name=None,
+            pending_scout_click_selector=None,
+            pending_scout_ambiguous=None,
+            pending_scout_reanchor=None,
+            pending_scout_dynamic_row=None,
+            pending_scout_download_snapshot=None,
+            pending_scout_download=False,
+            pending_scout_download_detachers=[],
+            pending_scout_popup=None,
+            pending_scout_popup_content_type=None,
+            pending_scout_challenge_frames=[],
+            pending_scout_challenge_detachers=[],
+            pending_scout_challenge_prior_frames=[],
+            last_scout_act_observe_recapture_attempted=False,
+            pending_scout_challenge_armed_at=None,
+            pending_scout_click_pre_frame=None,
+            discovery_mcp_server=None,
+            browser_session_id=None,
+            last_run_blocks_workflow_run_id=None,
+            scouted_interactions=[],
+            scout_trajectory=[],
+            scout_observed_terminal_criterion_ids=set(),
+            completion_criteria_turn_state=None,
+            observed_browser_urls=[],
+            pending_scout_source_url=source_url,
+            prior_carried_trajectory=[],
+            carried_trajectory_rebound_done=False,
+            request_policy=None,
+            org_credentials_for_turn=None,
+            organization_id="o_1",
+            supports_vision=False,
+        )
+        if policy is not None:
+            ns.block_authoring_policy = policy
+        return ns
+
+    def test_browser_selector_candidates_are_preserved_in_response_order(self) -> None:
+        from skyvern.forge.sdk.ember.tools.mcp_hooks import _selector_candidates_from_tool_data
+
+        assert _selector_candidates_from_tool_data(
+            {
+                "selector": "#submit",
+                "resolved_selector": "button.primary",
+                "selector_candidates": [
+                    {"selector": "form#login button[type=submit]", "source": "structural_path", "match_count": 1},
+                    {"selector": "button[aria-label=Continue]", "source": "aria_label", "match_count": 2},
+                    {"selector": "#submit", "source": "id", "match_count": 1},
+                ],
+            }
+        ) == [
+            {"selector": "form#login button[type=submit]", "source": "structural_path", "match_count": 1},
+            {"selector": "button[aria-label=Continue]", "source": "aria_label", "match_count": 2},
+            {"selector": "#submit", "source": "id", "match_count": 1},
+            {"selector": "button.primary", "source": "resolved", "match_count": None},
+        ]
+
+    def test_selector_candidate_parse_drops_malformed_and_duplicate_entries(self) -> None:
+        packet = [
+            {"selector": "#email", "source": "id", "match_count": 1},
+            "#not-a-dict",
+            {"selector": "", "source": "id", "match_count": 1},
+            {"selector": "#email", "source": "name", "match_count": 3},
+            {"selector": 'input[name="email"]', "source": "name", "match_count": True},
+            {"selector": "form#login input:nth-of-type(1)", "source": "structural_path", "match_count": -1},
+        ]
+
+        assert scouting_module._parse_selector_candidates(packet) == [
+            {"selector": "#email", "source": "id", "match_count": 1},
+            {"selector": 'input[name="email"]', "source": "name", "match_count": None},
+            {"selector": "form#login input:nth-of-type(1)", "source": "structural_path", "match_count": None},
+        ]
+
+    def test_record_requires_concrete_selector(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(ctx, tool_name="click", selector="")
+        _record_scouted_interaction(ctx, tool_name="type_text", selector="   ")
+        assert ctx.scouted_interactions == []
+
+    def test_record_press_key_without_selector_is_kept(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(ctx, tool_name="press_key", selector="", key="Enter")
+        assert ctx.scouted_interactions == [{"tool_name": "press_key", "key": "Enter"}]
+
+    def test_record_takes_source_url_param(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(
+            ctx, tool_name="click", selector="#add-to-cart", source_url="https://example.com/product"
+        )
+        recorded = ctx.scouted_interactions[0]
+        assert (recorded["tool_name"], recorded["selector"], recorded["source_url"]) == (
+            "click",
+            "#add-to-cart",
+            "https://example.com/product",
+        )
+        assert "result_url" not in recorded
+
+    def test_record_preserves_browser_target_and_effect_facts_without_ranking(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(
+            ctx,
+            tool_name="click",
+            selector="#submit",
+            selector_candidates=[
+                {"selector": "#submit", "source": "requested", "match_count": 1},
+                {"selector": "xpath=//button[@type='submit']", "source": "resolved", "match_count": None},
+            ],
+            selector_match_count=1,
+            role="button",
+            accessible_name="Submit",
+            role_name_match_count=1,
+            source_url="https://example.com/form",
+            result_url="https://example.com/thanks",
+        )
+
+        assert ctx.scout_trajectory == [
+            {
+                "tool_name": "click",
+                "selector": "#submit",
+                "executed_selector": "#submit",
+                "selector_candidates": [
+                    {"selector": "#submit", "source": "requested", "match_count": 1},
+                    {"selector": "xpath=//button[@type='submit']", "source": "resolved", "match_count": None},
+                ],
+                "selector_match_count": 1,
+                "role": "button",
+                "accessible_name": "Submit",
+                "role_name_match_count": 1,
+                "source_url": "https://example.com/form",
+                "result_url": "https://example.com/thanks",
+                "observed_effects": {"url_changed": True},
+                "trajectory_index": 0,
+            }
+        ]
+
+    def test_record_preserves_selectorless_navigation_fact(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(
+            ctx,
+            tool_name="navigate_browser",
+            source_url="https://example.com/two-factor",
+            result_url="https://example.com/dashboard",
+        )
+
+        assert ctx.scout_trajectory == [
+            {
+                "tool_name": "navigate_browser",
+                "source_url": "https://example.com/two-factor",
+                "result_url": "https://example.com/dashboard",
+                "observed_effects": {"url_changed": True},
+                "trajectory_index": 0,
+            }
+        ]
+
+    def test_record_preserves_selectorless_wait_effect_fact(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(
+            ctx,
+            tool_name="wait_for_either_state",
+            selector_candidates=[
+                {"selector": "#token", "source": "selector_a", "match_count": None},
+                {"selector": "#dashboard", "source": "selector_b", "match_count": None},
+            ],
+            source_url="https://example.com/two-factor",
+            result_url="https://example.com/two-factor",
+            observed_wait_ms=121595,
+        )
+
+        assert ctx.scout_trajectory == [
+            {
+                "tool_name": "wait_for_either_state",
+                "selector_candidates": [
+                    {"selector": "#token", "source": "selector_a", "match_count": None},
+                    {"selector": "#dashboard", "source": "selector_b", "match_count": None},
+                ],
+                "source_url": "https://example.com/two-factor",
+                "result_url": "https://example.com/two-factor",
+                "observed_effects": {"url_changed": False},
+                "observed_wait_ms": 121595,
+                "trajectory_index": 0,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_wait_post_hook_records_the_ordered_effect_fact(self) -> None:
+        from skyvern.forge.sdk.ember.tools.mcp_hooks import _wait_for_either_state_post_hook
+
+        ctx = self._ctx()
+        result = {
+            "ok": False,
+            "data": {
+                "selector_a": "#token",
+                "selector_b": "#dashboard",
+                "source_url": "https://example.com/two-factor",
+                "result_url": "https://example.com/two-factor",
+                "observed_wait_ms": 121595,
+            },
+            "error": "neither state appeared",
+        }
+
+        returned = await _wait_for_either_state_post_hook(result, {}, ctx)
+
+        assert returned is result
+        assert ctx.scout_trajectory[0]["tool_name"] == "wait_for_either_state"
+        assert ctx.scout_trajectory[0]["observed_wait_ms"] == 121595
+
+    @pytest.mark.asyncio
+    async def test_navigate_post_hook_records_the_ordered_effect_fact(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = self._ctx(source_url="https://example.com/two-factor")
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock())
+
+        result = await mcp_hooks._navigate_post_hook(
+            {"ok": True, "data": {"url": "https://example.com/dashboard"}},
+            {},
+            ctx,
+        )
+
+        assert result["url"] == "https://example.com/dashboard"
+        assert ctx.scout_trajectory[0]["tool_name"] == "navigate_browser"
+        assert ctx.scout_trajectory[0]["observed_effects"] == {"url_changed": True}
+
+    @pytest.mark.asyncio
+    async def test_navigate_post_hook_next_step_claims_no_attached_screenshot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = self._ctx(source_url="https://example.com/login")
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=False))
+
+        result = await mcp_hooks._navigate_post_hook(
+            {"ok": True, "data": {"url": "https://example.com/dashboard"}},
+            {},
+            ctx,
+        )
+
+        assert "screenshot" not in result["next_step"]
+        assert "attached" not in result["next_step"]
+
+    @pytest.mark.asyncio
+    async def test_navigate_post_hook_claims_only_the_screenshot_it_staged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = self._ctx(source_url="https://example.com/login")
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=True))
+
+        result = await mcp_hooks._navigate_post_hook(
+            {"ok": True, "data": {"url": "https://example.com/dashboard"}},
+            {},
+            ctx,
+        )
+
+        assert "A screenshot is attached." in result["next_step"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("advertised", "expected"),
+        [
+            ((), "Page loaded."),
+            (
+                (EVALUATE_TOOL_NAME,),
+                "Page loaded." + mcp_hooks._NAVIGATE_READ_GUIDANCE.format(readers=EVALUATE_TOOL_NAME),
+            ),
+        ],
+        ids=["no_reader", "evaluate"],
+    )
+    async def test_navigate_next_step_points_only_at_reads_the_turn_advertises(
+        self, monkeypatch: pytest.MonkeyPatch, advertised: tuple[str, ...], expected: str
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=False))
+        ctx = make_ember_ctx(pending_scout_source_url="https://example.com/login")
+        ctx.eval_mcp_tool_names = advertised
+
+        result = await mcp_hooks._navigate_post_hook(
+            {"ok": True, "data": {"url": "https://example.com/dashboard"}},
+            {},
+            ctx,
+        )
+
+        assert result["next_step"] == expected
+
+    @pytest.mark.asyncio
+    async def test_failed_navigate_stages_a_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        capture = AsyncMock(return_value=True)
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
+
+        ctx = self._ctx(source_url="https://example.com/login")
+        result = await mcp_hooks._navigate_post_hook({"ok": False, "error": "navigation timed out"}, {}, ctx)
+
+        capture.assert_awaited_once()
+        assert "next_step" not in result
+
+    @pytest.mark.asyncio
+    async def _click_with_attached_evidence(
+        self, monkeypatch: pytest.MonkeyPatch, evidence: dict[str, Any]
+    ) -> AsyncMock:
+        capture = AsyncMock(return_value=True)
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
+
+        async def attach_observation(ctx: SimpleNamespace, **kwargs: Any) -> tuple[int | None, dict[str, Any] | None]:
+            ctx.last_scout_act_observe_outcome = "attached"
+            return None, evidence
+
+        monkeypatch.setattr(mcp_hooks, "_register_scout_interaction_observation", attach_observation)
+        monkeypatch.setattr(mcp_hooks, "_attach_scout_page_summary", lambda ctx, result, page_evidence: None)
+
+        ctx = self._ctx(source_url="https://example.com/product")
+        await mcp_hooks._click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+        return capture
+
+    @pytest.mark.asyncio
+    async def test_click_whose_evidence_names_a_modal_stages_no_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        evidence = {
+            "page_title": "Cart",
+            "modal_overlays": [{"selector": "#promo", "dismiss_controls": [{"text": "No thanks"}]}],
+            "challenge_state": {"detected": False},
+        }
+        capture = await self._click_with_attached_evidence(monkeypatch, evidence)
+        capture.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_click_whose_evidence_names_no_obstruction_still_stages_a_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        evidence = {
+            "page_title": "Cart",
+            "modal_overlays": [],
+            "challenge_controls": [],
+            "challenge_state": {"detected": False},
+            "visual_obstruction_candidates": [{"selector": ".sticky", "reason": "fixed_overlay"}],
+        }
+        capture = await self._click_with_attached_evidence(monkeypatch, evidence)
+        capture.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_click_stages_a_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        capture = AsyncMock(return_value=True)
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
+
+        ctx = self._ctx(source_url="https://example.com/product")
+        await mcp_hooks._click_post_hook({"ok": False, "error": "click timed out"}, {}, ctx)
+
+        capture.assert_awaited_once()
+
+    def test_post_action_observation_step_is_attached_to_both_fact_views(self) -> None:
+        from skyvern.forge.sdk.ember.tools.scouting import _attach_scout_observation_step
+
+        ctx = self._ctx()
+        tools_module._record_scouted_interaction(ctx, tool_name="click", selector="#submit")
+
+        _attach_scout_observation_step(
+            ctx,
+            tool_name="click",
+            selector="#submit",
+            observation_step=7,
+        )
+
+        assert ctx.scouted_interactions[-1]["observation_step"] == 7
+        assert ctx.scout_trajectory[-1]["observation_step"] == 7
+
+    def test_demonstrated_step_facts_are_ordered_and_exclude_secret_values(self) -> None:
+        from skyvern.forge.sdk.ember.tools.mcp_hooks import _demonstrated_step_facts
+
+        ctx = self._ctx()
+        ctx.secret_scrub_values = ["actual-password"]
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#password",
+                "selector_candidates": [{"selector": "#password", "source": "requested", "match_count": 1}],
+                "selector_match_count": 1,
+                "role": "textbox",
+                "accessible_name": "Password",
+                "role_name_match_count": 1,
+                "source_url": "https://example.com/login",
+                "result_url": "https://example.com/login",
+                "credential_id": "cred_1",
+                "credential_name": "example-login",
+                "credential_field": "password",
+                "input_id": "input_opaque_1",
+                "input_value": "actual-password",
+                "typed_length": 15,
+                "trajectory_index": 4,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#submit",
+                "source_url": "https://example.com/login",
+                "result_url": "https://example.com/home",
+                "trajectory_index": 5,
+            },
+        ]
+
+        facts = _demonstrated_step_facts(ctx)
+
+        assert [fact["trajectory_index"] for fact in facts] == [4, 5]
+        assert facts[0]["credential_id"] == "cred_1"
+        assert facts[0]["input_id"] == "input_opaque_1"
+        assert "input_value" not in facts[0]
+        assert "actual-password" not in str(facts)
+
+    def test_demonstrated_step_facts_project_urls_to_safe_origins(self) -> None:
+        from skyvern.forge.sdk.ember.tools.mcp_hooks import _demonstrated_step_facts
+
+        ctx = self._ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#submit",
+                "source_url": "https://user:password@example.com/account/5db266e1?token=7cc8f30a#billing",
+                "result_url": "https://example.com/dashboard/9f82016e?session=a857b755#overview",
+            }
+        ]
+
+        assert _demonstrated_step_facts(ctx) == [
+            {
+                "tool_name": "click",
+                "executed_selector": "#submit",
+                "source_url": "https://example.com/",
+                "result_url": "https://example.com/",
+                "selector_candidates": None,
+                "role": None,
+                "accessible_name": None,
+                "role_name_match_count": None,
+                "observed_effects": None,
+                "observation_step": None,
+                "input_id": None,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_code_schema_surfaces_ordered_facts_not_synthesized_source(self) -> None:
+        ctx = self._ctx(policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+        ctx.secret_scrub_values = []
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "executed_selector": "#submit",
+                "selector_candidates": None,
+                "role": None,
+                "accessible_name": None,
+                "role_name_match_count": None,
+                "source_url": "https://example.com/",
+                "result_url": "https://example.com/",
+                "observed_effects": None,
+                "observation_step": None,
+                "input_id": None,
+                "trajectory_index": 0,
+            }
+        ]
+
+        result = await _get_block_schema_post_hook({"data": {"block_type": "code"}}, {}, ctx)
+
+        assert result["data"]["demonstrated_steps"] == [
+            {
+                "tool_name": "click",
+                "executed_selector": "#submit",
+                "selector_candidates": None,
+                "role": None,
+                "accessible_name": None,
+                "role_name_match_count": None,
+                "source_url": "https://example.com/",
+                "result_url": "https://example.com/",
+                "observed_effects": None,
+                "observation_step": None,
+                "input_id": None,
+                "trajectory_index": 0,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_web_search_schema_reports_the_native_block_output(self) -> None:
+        ctx = self._ctx()
+        ctx.secret_scrub_values = []
+        oracle = SearchResponse(
+            query="example",
+            provider="google",
+            results=[
+                SearchResult(
+                    title="A",
+                    link="https://a.example.test/",
+                    snippet="",
+                    display_link="a.example.test",
+                    position=1,
+                )
+            ],
+            prompt_output={"official_url": "https://b.example.test/"},
+        ).output()
+
+        result = await _get_block_schema_post_hook({"data": {"block_type": "web_search"}}, {}, ctx)
+
+        block_output = result["data"]["block_output"]
+        fields = block_output["fields"]
+        assert fields.keys() == oracle.keys()
+        assert fields["results"]["item_keys"] == list(oracle["results"][0])
+        assert "url" not in fields["results"]["item_keys"]
+        assert fields["raw_response"].keys() == oracle["raw_response"].keys()
+        example = block_output["example_with_json_schema"]
+        assert example["provider"] in get_args(SearchProvider)
+        links = {item["link"] for item in example["results"]}
+        assert example["prompt_output"] and not links & set(example["prompt_output"].values())
+
+    @pytest.mark.asyncio
+    async def test_web_search_block_output_stays_off_other_schema_results(self) -> None:
+        ctx = self._ctx(policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+        ctx.secret_scrub_values = []
+
+        code = await _get_block_schema_post_hook({"data": {"block_type": "code"}}, {}, ctx)
+        listed = await _get_block_schema_post_hook({"data": {"block_types": {"navigation": "Navigate"}}}, {}, ctx)
+        others = [
+            await _get_block_schema_post_hook({"data": {"block_type": block_type}}, {}, ctx)
+            for block_type in ("for_loop", "navigation")
+        ]
+
+        assert code["data"]["web_search_helper_contract"] == WEB_SEARCH_HELPER_CONTRACT
+        assert "url" in code["data"]["web_search_helper_contract"]["returns"]["results"]
+        assert all("block_output" not in item["data"] for item in (code, listed, *others))
+
+    def test_consume_scout_source_url_reads_and_clears(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _consume_scout_source_url
+
+        ctx = self._ctx(source_url="https://example.com/product")
+        assert _consume_scout_source_url(ctx) == "https://example.com/product"
+        # cleared so a failed/non-recording action cannot bleed into a later interaction
+        assert ctx.pending_scout_source_url is None
+        assert _consume_scout_source_url(ctx) is None
+
+    def test_record_dedups_identical_interaction(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(ctx, tool_name="click", selector="#x", source_url="https://e.com/a")
+        _record_scouted_interaction(ctx, tool_name="click", selector="#x", source_url="https://e.com/a")
+        _record_scouted_interaction(ctx, tool_name="click", selector="#y", source_url="https://e.com/a")
+        assert ctx.scouted_interactions == [
+            {"tool_name": "click", "selector": "#x", "executed_selector": "#x", "source_url": "https://e.com/a"},
+            {"tool_name": "click", "selector": "#y", "executed_selector": "#y", "source_url": "https://e.com/a"},
+        ]
+
+    def test_record_drops_zero_typed_length(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(ctx, tool_name="type_text", selector="#q", typed_length=0)
+        assert ctx.scouted_interactions == [{"tool_name": "type_text", "selector": "#q", "executed_selector": "#q"}]
+
+    def test_record_omits_empty_extras_and_caps_history(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _MAX_SCOUTED_INTERACTIONS, _record_scouted_interaction
+
+        ctx = self._ctx()
+        for index in range(_MAX_SCOUTED_INTERACTIONS + 5):
+            _record_scouted_interaction(ctx, tool_name="click", selector=f"#item-{index}")
+        assert len(ctx.scouted_interactions) == _MAX_SCOUTED_INTERACTIONS
+        # oldest dropped, newest kept
+        assert ctx.scouted_interactions[-1]["selector"] == f"#item-{_MAX_SCOUTED_INTERACTIONS + 4}"
+        assert "source_url" not in ctx.scouted_interactions[-1]
+
+    def test_recorded_reads_use_monotone_capped_trajectory_indices(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _MAX_SCOUTED_INTERACTIONS
+        from skyvern.forge.sdk.ember.tools.mcp_hooks import _record_scouted_read
+
+        ctx = self._ctx()
+        recorded = None
+        for index in range(_MAX_SCOUTED_INTERACTIONS + 5):
+            recorded = _record_scouted_read(
+                ctx,
+                expression=f"document.querySelector('#value-{index}').textContent",
+                data={"result": str(index)},
+                url="https://example.com/results",
+            )
+
+        assert len(ctx.scout_trajectory) == _MAX_SCOUTED_INTERACTIONS
+        assert ctx.scout_trajectory[0]["trajectory_index"] == 5
+        assert ctx.scout_trajectory[-1]["trajectory_index"] == _MAX_SCOUTED_INTERACTIONS + 4
+        assert recorded is ctx.scout_trajectory[-1]
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_registers_interaction_reached_observation(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _click_post_hook
+
+        ctx = self._ctx(source_url="https://example.com/product")
+        ctx.flow_evidence = []
+        result = await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+        assert len(ctx.flow_evidence) == 1
+        entry = ctx.flow_evidence[0]
+        assert entry["reached_via"] == "interaction"
+        assert entry["evidence"]["source_tool"] == "scout_interaction"
+        assert entry["evidence"]["current_url"] == "https://example.com/cart"
+        assert entry["evidence"]["interaction_selector"] == "#add-to-cart"
+        assert entry["evidence"]["interaction_source_url"] == "https://example.com/product"
+        assert result["observation_step"] == entry["step"]
+        assert result["data"]["observation_step"] == entry["step"]
+
+    @pytest.mark.asyncio
+    async def test_post_hook_skips_observation_without_flow_evidence(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _click_post_hook
+
+        ctx = self._ctx()  # no flow_evidence on this context
+        result = await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+        assert "observation_step" not in result
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_records_source_page_not_destination(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _click_post_hook
+
+        # pre-hook stashed the product page; the click navigates to the cart
+        ctx = self._ctx(source_url="https://example.com/product")
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+        recorded = ctx.scouted_interactions[0]
+        assert (recorded["tool_name"], recorded["selector"], recorded["source_url"]) == (
+            "click",
+            "#add-to-cart",
+            "https://example.com/product",
+        )
+        assert recorded["result_url"] == "https://example.com/cart"
+
+    @pytest.mark.asyncio
+    async def test_navigating_bare_click_records_prenav_role_name(self) -> None:
+        ctx = self._ctx(source_url="https://example.com/billing")
+        ctx.pending_scout_role_name = ("a", "link", "View Printable Statement")
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "a"}},
+            {"browser_context": {"url": "https://example.com/statement.pdf", "title": "Statement"}},
+            ctx,
+        )
+        recorded = ctx.scouted_interactions[0]
+        assert (recorded["tool_name"], recorded["selector"], recorded["source_url"]) == (
+            "click",
+            "a",
+            "https://example.com/billing",
+        )
+        assert (recorded["role"], recorded["accessible_name"]) == ("link", "View Printable Statement")
+        assert ctx.pending_scout_role_name is None
+
+    @pytest.mark.asyncio
+    async def test_prenav_role_name_lets_strict_synthesis_emit_get_by_role(self) -> None:
+        ctx = self._ctx(source_url="https://example.com/billing")
+        ctx.pending_scout_role_name = ("a", "link", "View Printable Statement")
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#statement-row",
+                "source_url": "https://example.com/billing",
+                "trajectory_index": 0,
+            }
+        ]
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "a"}},
+            {"browser_context": {"url": "https://example.com/statement.pdf", "title": "Statement"}},
+            ctx,
+        )
+        result = synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert result is not None
+        assert 'await page.get_by_role("link", name="View Printable Statement", exact=True).click()' in result.code
+        assert result.diagnostics.dropped_interactions == []
+
+    @pytest.mark.asyncio
+    async def test_prenav_role_name_stash_ignored_on_selector_mismatch(self) -> None:
+        ctx = self._ctx(source_url="https://example.com/billing")
+        ctx.pending_scout_role_name = ("a", "link", "View Printable Statement")
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "#concrete-row"}},
+            {"browser_context": {"url": "https://example.com/statement.pdf", "title": "Statement"}},
+            ctx,
+        )
+        recorded = ctx.scouted_interactions[-1]
+        assert "role" not in recorded
+        assert "accessible_name" not in recorded
+        assert ctx.pending_scout_role_name is None
+
+    @pytest.mark.asyncio
+    async def test_click_pre_hook_stashes_role_name_from_role_selector(self) -> None:
+        ctx = self._ctx()
+        ctx.pending_scout_source_url = None
+        await _click_pre_hook({"selector": 'role=link[name="Continue"]'}, ctx)
+        assert ctx.pending_scout_role_name == ('role=link[name="Continue"]', "link", "Continue")
+
+    @pytest.mark.asyncio
+    async def test_click_pre_hook_stashes_role_name_from_bare_css_via_browser_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Bare CSS selector cannot be parsed, so the role/name comes from the page read.
+        ctx = self._ctx_with_scripted_reads(selector_count=1, role_name=("link", "Download"), match_count=1)
+        ctx.pending_scout_source_url = None
+        await _click_pre_hook({"selector": "a"}, ctx)
+        assert ctx.pending_scout_role_name == ("a", "link", "Download")
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_omits_source_url_when_unavailable(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _click_post_hook
+
+        ctx = self._ctx()  # no pre-hook source url
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+        recorded = ctx.scouted_interactions[0]
+        assert recorded["tool_name"] == "click"
+        assert recorded["selector"] == "#add-to-cart"
+        assert "source_url" not in recorded
+
+    @pytest.mark.asyncio
+    async def test_type_post_hook_assigns_opaque_identity_and_keeps_value_private(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.ember import tools as tools_module
+
+        async def passes(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
+        ctx = self._ctx()
+        ctx.pending_scout_input_value = "query123"
+        await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#q", "text_length": 8}},
+            {"browser_context": {"url": "https://example.com/search", "title": "Search"}},
+            ctx,
+        )
+        recorded = ctx.scouted_interactions[0]
+        assert (recorded["tool_name"], recorded["selector"], recorded["typed_length"]) == ("type_text", "#q", 8)
+        assert recorded["input_id"].startswith("input_")
+        assert recorded["input_value"] == "query123"
+        facts = tools_module.mcp_hooks._demonstrated_step_facts(ctx)
+        assert facts[0]["input_id"] == recorded["input_id"]
+        assert "input_value" not in facts[0]
+        assert "query123" not in repr(facts)
+
+    @pytest.mark.asyncio
+    async def test_type_post_hook_records_nothing_when_readback_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.ember import tools as tools_module
+
+        async def fails(*_a: object, **_k: object) -> dict[str, object]:
+            return {"ok": False, "error": "field is still empty"}
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", fails)
+        ctx = self._ctx()
+        await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#q", "text_length": 8}},
+            {"browser_context": {"url": "https://example.com/search", "title": "Search"}},
+            ctx,
+        )
+        assert ctx.scouted_interactions == []
+
+    @pytest.mark.asyncio
+    async def test_select_and_press_key_capture_value_and_key(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _press_key_post_hook, _select_option_post_hook
+
+        ctx = self._ctx()
+        await _select_option_post_hook(
+            {"ok": True, "data": {"selector": "#sort", "value": "price_asc"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+        await _press_key_post_hook(
+            {"ok": True, "data": {"selector": "#q", "key": "Enter"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+        assert [item["tool_name"] for item in ctx.scouted_interactions] == ["select_option", "press_key"]
+        assert (ctx.scouted_interactions[0]["selector"], ctx.scouted_interactions[0]["value"]) == (
+            "#sort",
+            "price_asc",
+        )
+        assert (ctx.scouted_interactions[1]["selector"], ctx.scouted_interactions[1]["key"]) == ("#q", "Enter")
+
+    @pytest.mark.asyncio
+    async def test_selector_press_key_records_complete_source_target_packet_and_clears_pending(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _press_key_post_hook
+        from skyvern.forge.sdk.ember.tools.mcp_hooks import _press_key_pre_hook
+
+        ctx = self._ctx_with_scripted_reads(
+            selector_count=2,
+            role_name=("textbox", "Search"),
+            match_count=2,
+            candidates=[{"selector": "#q", "source": "id"}, {"selector": 'input[name="q"]', "source": "name"}],
+        )
+        ctx.pending_scout_source_url = "https://example.com/form"
+
+        assert await _press_key_pre_hook({"selector": "#q", "key": "Enter"}, ctx) is None
+        await _press_key_post_hook(
+            {"ok": True, "data": {"selector": "#q", "key": "Enter"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+
+        recorded = ctx.scout_trajectory[-1]
+        assert recorded["selector_candidates"] == [
+            {"selector": "#q", "source": "id", "match_count": None},
+            {"selector": 'input[name="q"]', "source": "name", "match_count": None},
+        ]
+        assert recorded["selector_match_count"] == 2
+        assert recorded["role"] == "textbox"
+        assert recorded["accessible_name"] == "Search"
+        assert recorded["role_name_match_count"] == 2
+        assert recorded["ambiguous"] is True
+        assert ctx.pending_scout_selector_candidates is None
+        assert ctx.pending_scout_selector_match_count is None
+        assert ctx.pending_scout_role_name is None
+        assert ctx.pending_scout_role_name_match_count is None
+        assert ctx.pending_scout_ambiguous is None
+        assert ctx.pending_scout_reanchor is None
+
+    @pytest.mark.asyncio
+    async def test_multi_action_sequence_preserves_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.ember import tools as tools_module
+
+        async def passes(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
+        ctx = self._ctx()
+        await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#q", "text_length": 8}},
+            {"browser_context": {"url": "https://example.com/search", "title": "Search"}},
+            ctx,
+        )
+        await tools_module._press_key_post_hook(
+            {"ok": True, "data": {"selector": "#q", "key": "Enter"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+        assert [item["tool_name"] for item in ctx.scouted_interactions] == ["type_text", "press_key"]
+
+    @pytest.mark.asyncio
+    async def test_post_hook_clears_source_url_even_when_action_fails(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _click_post_hook
+
+        # a failed click must not leave its source page to bleed into a later interaction
+        ctx = self._ctx(source_url="https://example.com/product")
+        await _click_post_hook({"ok": False, "error": "not found"}, {}, ctx)
+        assert ctx.pending_scout_source_url is None
+        assert ctx.scouted_interactions == []
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_source_url_reads_live_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.ember import tools as tools_module
+        from skyvern.forge.sdk.ember.tools import scouting as scouting_module
+
+        async def fake_url(_ctx: object) -> str:
+            return "https://example.com/product"
+
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", fake_url)
+        ctx = self._ctx()
+        await tools_module._capture_scout_source_url(ctx)
+        assert ctx.pending_scout_source_url == "https://example.com/product"
+
+    @pytest.mark.asyncio
+    async def test_select_option_post_hook_surfaces_observation_step(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _select_option_post_hook
+
+        ctx = self._ctx()
+        ctx.flow_evidence = []
+        result = await _select_option_post_hook(
+            {"ok": True, "data": {"selector": "#sort", "value": "price_asc"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+        entry = ctx.flow_evidence[0]
+        assert entry["reached_via"] == "interaction"
+        assert entry["evidence"]["interaction_selector"] == "#sort"
+        assert result["data"]["observation_step"] == entry["step"]
+
+    def _ctx_with_count(self, count: int) -> SimpleNamespace:
+        return self._ctx_with_scripted_reads(selector_count=count, role_name=("", ""), match_count=-1)
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_ambiguity_marks_multi_match_selector(self) -> None:
+        ctx = self._ctx_with_count(3)
+        await _capture_scout_pre_action(ctx, "button[data-action='orderDocuments']")
+        assert ctx.pending_scout_ambiguous == ("button[data-action='orderDocuments']", True)
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_ambiguity_does_not_mark_unique_selector(self) -> None:
+        ctx = self._ctx_with_count(1)
+        await _capture_scout_pre_action(ctx, "#unique")
+        assert ctx.pending_scout_ambiguous is None
+
+    def test_live_scout_packet_has_no_dynamic_row_classifier(self) -> None:
+        from skyvern.forge.sdk.ember.tools import mcp_hooks as mcp_hooks_module
+
+        assert "dynamic_row_evidence" not in mcp_hooks_module._MODEL_SCOUT_FACT_KEYS
+        assert not hasattr(mcp_hooks_module, "_capture_scout_dynamic_row")
+
+    @pytest.mark.asyncio
+    async def test_click_cycle_records_scout_ambiguous_multi_match(self) -> None:
+        ctx = self._ctx_with_count(2)
+        await _click_pre_hook({"selector": "button[data-action='orderDocuments']"}, ctx)
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "button[data-action='orderDocuments']"}},
+            {"browser_context": {"url": "https://example.com/portal", "title": "Portal"}},
+            ctx,
+        )
+        assert ctx.scouted_interactions[-1].get("ambiguous") is True
+
+    async def _arm(
+        self, monkeypatch: pytest.MonkeyPatch, page: _ListenerPage, params: dict[str, Any] | None = None
+    ) -> SimpleNamespace:
+        ctx = self._ctx(source_url="https://records.example.test/search")
+        # Agent blocks only, so the challenge listener is the only one this click arms.
+        ctx.authoring_capability = AGENT_BLOCKS_ONLY
+        ctx.browser_session_id = "pbs-debug"
+        ctx.codeblock_redaction_parameters = {}
+        monkeypatch.setattr(
+            scouting_module,
+            "resolve_browser_state_for_context",
+            AsyncMock(return_value=SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))),
+        )
+        await _click_pre_hook(params or {"selector": "#submit-search"}, ctx)
+        return ctx
+
+    async def _post(self, ctx: SimpleNamespace) -> dict[str, Any]:
+        return await _click_post_hook(
+            {"ok": True, "data": {"selector": "#submit-search"}},
+            {"browser_context": {"url": "https://records.example.test/search", "title": "Search"}},
+            ctx,
+        )
+
+    @pytest.mark.asyncio
+    async def test_pre_existing_challenge_frame_that_only_refreshes_is_not_this_clicks_effect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage(child_frame_urls=["https://challenge.vendor.test/turnstile/v0/api.html?token=first"])
+        ctx = await self._arm(monkeypatch, page)
+        page.renavigate_child_frame(0, "https://challenge.vendor.test/turnstile/v0/api.html?token=refreshed")
+
+        result = await self._post(ctx)
+
+        assert "challenge_raised" not in (result["data"].get("observed_effects") or {})
+        assert "challenge_vendor" not in result["data"]
+
+    async def _timed_click(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page: _ListenerPage,
+        *,
+        elapsed: float,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[SimpleNamespace, _ScopedClock, list[float]]:
+        """The click returns at the clock's current time and is reported `elapsed` seconds later, on a clock
+        scoped to the module."""
+        clock = _ScopedClock(now=0.0)
+        monkeypatch.setattr(scouting_module, "time", clock)
+        ctx = await self._arm(monkeypatch, page, params)
+        start_settle = mcp_hooks._start_scout_challenge_settle
+
+        def _start_then_observe(settling_ctx: Any) -> None:
+            start_settle(settling_ctx)
+            clock.now += elapsed
+
+        monkeypatch.setattr(mcp_hooks, "_start_scout_challenge_settle", _start_then_observe)
+        sleeps: list[float] = []
+        return ctx, clock, sleeps
+
+    def _settle_already_over(self, monkeypatch: pytest.MonkeyPatch, ctx: SimpleNamespace) -> None:
+        """Report as though the click returned longer ago than the settle window, so nothing waits."""
+        monkeypatch.setattr(mcp_hooks, "_start_scout_challenge_settle", lambda _ctx: None)
+        ctx.pending_scout_challenge_armed_at = (
+            time.monotonic() - settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 1.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_widget_mounting_inside_what_is_left_of_the_window_is_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+        ctx, _clock, sleeps = await self._timed_click(monkeypatch, page, elapsed=0.1)
+
+        async def _mount_during_settle(seconds: float) -> None:
+            sleeps.append(seconds)
+            page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True)
+
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=_mount_during_settle))
+
+        result = await self._post(ctx)
+
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert result["data"]["challenge_vendor"] == "turnstile"
+
+    @pytest.mark.asyncio
+    async def test_a_click_whose_observation_outlasted_the_window_adds_no_wait(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The listener is live from the moment the click is armed, so time the observation already
+        spent counts toward the window instead of being waited out a second time."""
+        page = _ListenerPage()
+        ctx, _clock, sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0)
+
+        async def _record(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=_record))
+
+        await self._post(ctx)
+
+        assert sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_a_click_that_never_armed_a_listener_neither_waits_nor_records(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no listener there is nothing a wait could catch, so the report must not sleep. The clock
+        sits just past zero so that treating a missing arm as "armed at t=0" would still owe a wait."""
+        monkeypatch.setattr(scouting_module, "time", _ScopedClock(now=0.1))
+        ctx = self._ctx(source_url="https://records.example.test/search")
+        ctx.browser_session_id = "pbs-debug"
+        ctx.codeblock_redaction_parameters = {}
+        sleeps: list[float] = []
+
+        async def _record(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=_record))
+
+        result = await self._post(ctx)
+
+        assert sleeps == []
+        assert "challenge_raised" not in (result["data"].get("observed_effects") or {})
+
+    @pytest.mark.asyncio
+    async def test_a_hidden_helper_frame_does_not_hide_the_visible_challenge_beside_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+        ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0)
+        page.navigate_frame("https://helper.vendor.test/turnstile/v0/api.html", child_frame=True, area=0.0)
+        page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True)
+
+        result = await self._post(ctx)
+
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert result["data"]["challenge_vendor"] == "turnstile"
+
+    @pytest.mark.asyncio
+    async def test_an_intent_click_that_fails_after_mounting_a_challenge_still_reports_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, _ctx = await self._selectorless_click(
+            monkeypatch,
+            {"intent": "the search button"},
+            {"ok": False, "error": "Timeout 30000ms exceeded while waiting for navigation"},
+        )
+
+        assert result["error"] == "Timeout 30000ms exceeded while waiting for navigation"
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert result["data"]["challenge_vendor"] == "turnstile"
+
+    @pytest.mark.parametrize(
+        "params",
+        [{"selector": "#submit-search"}, {"intent": "the search button"}, {"x": 120, "y": 40}],
+        ids=["selector", "intent", "coordinate"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_visible_widget_mounted_while_the_click_is_being_armed_is_not_credited_to_it(
+        self, monkeypatch: pytest.MonkeyPatch, params: dict[str, Any]
+    ) -> None:
+        page = _ListenerPage(child_frame_urls=["https://existing.vendor.test/turnstile/v0/api.html"])
+        existing = page.frames[1]
+        measure = challenge_signature_module.challenge_frame_rendered_area
+
+        async def _mount_while_measuring(frame: Any) -> float | None:
+            if frame is existing and len(page.frames) == 2:
+                page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True)
+            return await measure(frame)
+
+        monkeypatch.setattr(challenge_signature_module, "challenge_frame_rendered_area", _mount_while_measuring)
+        ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0, params=params)
+
+        result = await self._post(ctx)
+
+        assert "challenge_raised" not in (result["data"].get("observed_effects") or {})
+
+    @pytest.mark.asyncio
+    async def test_a_visible_widget_mounted_during_code_only_click_setup_is_not_credited_to_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nor when it refreshes its token after the click, which re-fires the navigation."""
+        page = _ListenerPage()
+
+        async def _mount_during_download_snapshot(_ctx: Any) -> frozenset[str]:
+            page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True)
+            return frozenset()
+
+        monkeypatch.setattr(mcp_hooks, "_ember_authoring_capability", lambda _ctx: CODE_BLOCKS_ONLY)
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", _mount_during_download_snapshot)
+        monkeypatch.setattr(mcp_hooks, "_arm_scout_download_listener", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_arm_scout_popup_listener", AsyncMock())
+        ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0)
+        page.renavigate_child_frame(0, "https://challenge.vendor.test/turnstile/v0/api.html?token=refreshed")
+
+        result = await self._post(ctx)
+
+        assert "challenge_raised" not in (result["data"].get("observed_effects") or {})
+
+    @pytest.mark.asyncio
+    async def test_a_widget_mounted_while_the_dispatch_baseline_is_measured_is_not_credited_to_the_click(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+        measure = challenge_signature_module.challenge_frame_rendered_area
+
+        async def _mount_during_download_snapshot(_ctx: Any) -> frozenset[str]:
+            page.navigate_frame("https://first.vendor.test/turnstile/v0/api.html", child_frame=True)
+            return frozenset()
+
+        async def _mount_while_measuring(frame: Any) -> float | None:
+            if len(page.frames) == 2:
+                page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True)
+            return await measure(frame)
+
+        monkeypatch.setattr(mcp_hooks, "_ember_authoring_capability", lambda _ctx: CODE_BLOCKS_ONLY)
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", _mount_during_download_snapshot)
+        monkeypatch.setattr(mcp_hooks, "_arm_scout_download_listener", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_arm_scout_popup_listener", AsyncMock())
+        monkeypatch.setattr(challenge_signature_module, "challenge_frame_rendered_area", _mount_while_measuring)
+        ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0)
+
+        result = await self._post(ctx)
+
+        assert len(page.frames) == 3
+        assert "challenge_raised" not in (result["data"].get("observed_effects") or {})
+
+    @pytest.mark.parametrize("before_return", [1.0, 5.0], ids=["slow_pre_click_measurement", "slow_target_resolution"])
+    @pytest.mark.asyncio
+    async def test_time_before_the_click_returns_does_not_use_up_the_settle_window(
+        self, monkeypatch: pytest.MonkeyPatch, before_return: float
+    ) -> None:
+        """An intent click can resolve its target for seconds inside the tool before the browser clicks."""
+        page = _ListenerPage(child_frame_urls=["https://existing.vendor.test/turnstile/v0/api.html"])
+        measure = challenge_signature_module.challenge_frame_rendered_area
+        ctx, clock, sleeps = await self._timed_click(monkeypatch, page, elapsed=0.1, params={"intent": "search"})
+
+        async def _record(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(challenge_signature_module, "challenge_frame_rendered_area", measure)
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=_record))
+        clock.now = before_return
+
+        await self._post(ctx)
+
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+
+    @pytest.mark.asyncio
+    async def test_a_widget_mounted_while_the_click_is_being_armed_is_credited_when_revealed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage(child_frame_urls=["https://existing.vendor.test/turnstile/v0/api.html"])
+        existing = page.frames[1]
+        mounted: list[_ListenerFrame] = []
+        measure = challenge_signature_module.challenge_frame_rendered_area
+
+        async def _mount_while_measuring(frame: Any) -> float | None:
+            if frame is existing and not mounted:
+                page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True, area=0.0)
+                mounted.append(page.frames[-1])
+            return await measure(frame)
+
+        monkeypatch.setattr(challenge_signature_module, "challenge_frame_rendered_area", _mount_while_measuring)
+        ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0)
+        existing.area = 0.0
+        mounted[0].area = _ON_SCREEN_AREA
+
+        result = await self._post(ctx)
+
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_click_that_times_out_after_mounting_a_challenge_still_reports_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+        ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0)
+        page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True)
+
+        result = await _click_post_hook(
+            {"ok": False, "error": "Timeout 30000ms exceeded while waiting for navigation"},
+            {"browser_context": {"url": "https://records.example.test/search", "title": "Search"}},
+            ctx,
+        )
+
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert result["data"]["challenge_vendor"] == "turnstile"
+
+    @pytest.mark.asyncio
+    async def test_a_captured_frame_that_navigated_away_does_not_hide_the_challenge_after_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+        ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0)
+        page.navigate_frame("https://first.vendor.test/turnstile/v0/api.html", child_frame=True)
+        page.frames[-1].url = "https://records.example.test/embedded-help"
+        page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True)
+
+        result = await self._post(ctx)
+
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert result["data"]["challenge_vendor"] == "turnstile"
+
+    @pytest.mark.asyncio
+    async def test_a_captured_hidden_helper_does_not_cut_the_wait_for_the_real_widget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only an on-screen frame ends the wait: a hidden helper that navigated first must not let the
+        report skip the window the visible widget arrives in."""
+        page = _ListenerPage()
+        ctx, _clock, sleeps = await self._timed_click(monkeypatch, page, elapsed=0.1)
+        page.navigate_frame("https://helper.vendor.test/turnstile/v0/api.html", child_frame=True, area=0.0)
+
+        async def _mount_during_settle(seconds: float) -> None:
+            sleeps.append(seconds)
+            page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True)
+
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=_mount_during_settle))
+
+        result = await self._post(ctx)
+
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+        assert result["data"]["challenge_vendor"] == "turnstile"
+
+    async def _navigate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page: _ListenerPage,
+        *,
+        before_post: Callable[[], None] | None = None,
+        after_pre_hook: Callable[[SimpleNamespace], None] | None = None,
+    ) -> tuple[dict[str, Any], list[float]]:
+        ctx = self._ctx(source_url="https://records.example.test/start")
+        ctx.browser_session_id = "pbs-debug"
+        page.url = "https://records.example.test/search"
+        monkeypatch.setattr(
+            scouting_module,
+            "resolve_browser_state_for_context",
+            AsyncMock(return_value=SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))),
+        )
+        monkeypatch.setattr(scouting_module, "live_working_page", AsyncMock(return_value=page))
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=True))
+        sleeps: list[float] = []
+
+        async def _record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if before_post is not None:
+                before_post()
+
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=_record_sleep))
+        assert await mcp_hooks._navigate_pre_hook({"url": page.url}, ctx) is None
+        if after_pre_hook is not None:
+            after_pre_hook(ctx)
+        result = await mcp_hooks._navigate_post_hook({"ok": True, "data": {"url": page.url}}, {}, ctx)
+        assert page.listeners.get("framenavigated") == []
+        return result, sleeps
+
+    @pytest.mark.asyncio
+    async def test_a_navigation_that_lands_on_an_on_screen_challenge_names_its_vendor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage(child_frame_urls=["https://challenge.vendor.test/turnstile/v0/api.html"])
+
+        result, sleeps = await self._navigate(monkeypatch, page)
+
+        assert result["page_state"]["challenge_vendor"] == "turnstile"
+        assert sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_a_navigation_to_a_page_without_a_challenge_frame_neither_waits_nor_names_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, sleeps = await self._navigate(monkeypatch, _ListenerPage())
+
+        assert next(iter(result)) == "page_state"
+        assert result["page_state"] == {
+            "read": "ok",
+            "url": "https://records.example.test/search",
+            "title": "Search",
+            "challenge_vendor": None,
+        }
+        assert sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_a_navigation_that_mounts_an_invisible_recaptcha_badge_neither_waits_nor_names_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+
+        result, sleeps = await self._navigate(
+            monkeypatch,
+            page,
+            after_pre_hook=lambda _ctx: page.navigate_frame(
+                "https://www.google.com/recaptcha/api2/anchor?k=6LeTEST&size=invisible", child_frame=True
+            ),
+        )
+
+        assert result["page_state"]["challenge_vendor"] is None
+        assert sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_a_navigation_that_lands_on_a_query_states_the_page_without_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+
+        result, _sleeps = await self._navigate(
+            monkeypatch,
+            page,
+            after_pre_hook=lambda _ctx: setattr(page, "url", "https://records.example.test/search?session=qv-5521"),
+        )
+
+        assert result["page_state"]["url"] == "https://records.example.test/search"
+        assert "qv-5521" not in json.dumps(result["page_state"])
+
+    @pytest.mark.asyncio
+    async def test_a_challenge_frame_the_listener_saw_mount_late_is_named_after_the_settle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+        original_post = mcp_hooks._navigate_post_hook
+
+        async def _post_after_a_frame_came_and_went(
+            result: dict[str, Any], raw: dict[str, Any], ctx: SimpleNamespace
+        ) -> dict[str, Any]:
+            page.navigate_frame("https://loader.vendor.test/turnstile/v0/api.html", child_frame=True, area=0.0)
+            page.frames[-1].url = "about:blank"
+            return await original_post(result, raw, ctx)
+
+        monkeypatch.setattr(mcp_hooks, "_navigate_post_hook", _post_after_a_frame_came_and_went)
+
+        result, sleeps = await self._navigate(
+            monkeypatch,
+            page,
+            before_post=lambda: page.navigate_frame(
+                "https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True
+            ),
+        )
+
+        assert len(sleeps) == 1
+        assert result["page_state"]["challenge_vendor"] == "turnstile"
+
+    async def _selectorless_click(
+        self, monkeypatch: pytest.MonkeyPatch, params: dict[str, Any], tool_result: dict[str, Any]
+    ) -> tuple[dict[str, Any], SimpleNamespace]:
+        """Drive a click with no selector going in, reporting exactly what `skyvern_click` emits for it."""
+        page = _ListenerPage()
+        ctx = self._ctx(source_url="https://records.example.test/search")
+        ctx.browser_session_id = "pbs-debug"
+        ctx.codeblock_redaction_parameters = {}
+        monkeypatch.setattr(
+            scouting_module,
+            "resolve_browser_state_for_context",
+            AsyncMock(return_value=SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))),
+        )
+        await _click_pre_hook(params, ctx)
+        assert ctx.pending_scout_challenge_armed_at is not None
+        self._settle_already_over(monkeypatch, ctx)
+        page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True)
+        result = await _click_post_hook(
+            tool_result,
+            {"browser_context": {"url": "https://records.example.test/search", "title": "Search"}},
+            ctx,
+        )
+        return result, ctx
+
+    @pytest.mark.asyncio
+    async def test_a_coordinate_click_reports_the_challenge_it_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`skyvern_click` with x/y returns `selector: null` and a `resolved_target`, never a
+        `resolved_selector`, so the report cannot depend on a locator to say a challenge appeared."""
+        result, ctx = await self._selectorless_click(
+            monkeypatch,
+            {"x": 120, "y": 40},
+            {
+                "ok": True,
+                "data": {"selector": None, "x": 120, "y": 40, "resolved_target": {"tag": "button", "text": "Search"}},
+            },
+        )
+
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert result["data"]["challenge_vendor"] == "turnstile"
+        assert ctx.scout_trajectory == []
+
+    @pytest.mark.asyncio
+    async def test_an_intent_click_records_the_challenge_against_the_element_it_resolved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An intent click has no selector going in but reports the element it resolved, so the challenge
+        reaches the demonstrated step as well as the tool result."""
+        result, ctx = await self._selectorless_click(
+            monkeypatch,
+            {"intent": "the search button"},
+            {
+                "ok": True,
+                "data": {"selector": None, "intent": "the search button", "resolved_selector": "#submit-search"},
+            },
+        )
+
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert ctx.scout_trajectory[-1]["observed_effects"]["challenge_raised"] is True
+        assert ctx.scout_trajectory[-1]["challenge_vendor"] == "turnstile"
+
+    @pytest.mark.asyncio
+    async def test_every_candidate_challenge_frame_is_measured_at_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Each reading stops itself after the observer timeout, so measuring them one at a time would
+        add that timeout per vendor frame to the click; measured together they cost one."""
+        frames = 4
+        in_flight = 0
+        peak = 0
+        started = asyncio.Event()
+
+        async def _measure(_frame: _ListenerFrame) -> tuple[float, float]:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            if in_flight == frames:
+                started.set()
+            try:
+                await asyncio.wait_for(started.wait(), timeout=0.5)
+            except TimeoutError:
+                pass
+            in_flight -= 1
+            return 1.0, 1.0
+
+        monkeypatch.setattr(challenge_signature_module, "challenge_frame_rendered_size", _measure)
+        page = _ListenerPage(child_frame_urls=["https://challenge.vendor.test/turnstile/v0/api.html"] * frames)
+        ctx = await self._arm(monkeypatch, page)
+        assert peak == frames, "before the click dispatches"
+
+        # The same frames measured as placeholders, so the report re-reads all of them after the click.
+        peak = 0
+        started.clear()
+        self._settle_already_over(monkeypatch, ctx)
+        await self._post(ctx)
+        assert peak == frames, "after the click, when the report scans for one on screen"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outer_style_visible", "credited"),
+        [(False, False), (True, True)],
+        ids=["outer_iframe_hidden_by_style", "outer_iframe_visible"],
+    )
+    async def test_a_nested_vendor_frame_counts_only_when_every_embedding_iframe_is_visible(
+        self, monkeypatch: pytest.MonkeyPatch, outer_style_visible: bool, credited: bool
+    ) -> None:
+        """The observer clips geometry through each ancestor frame, but style is judged per document, so an
+        opacity:0 or visibility:hidden outer iframe would otherwise let a nested helper look on screen."""
+        page = _ListenerPage()
+        ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0)
+        outer = _ListenerFrame("https://embed.example.test/form", page.frames[0], style_visible=outer_style_visible)
+        vendor = _ListenerFrame("https://challenge.vendor.test/turnstile/v0/api.html", outer)
+        page.frames.extend([outer, vendor])
+        page._dispatch(vendor)
+
+        result = await self._post(ctx)
+
+        assert ("challenge_raised" in (result["data"].get("observed_effects") or {})) is credited
+
+    @pytest.mark.asyncio
+    async def test_a_click_mounted_vendor_frame_that_is_not_on_screen_is_not_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A hidden vendor frame is still a solve-ladder marker, so crediting it would send a solve
+        that runs the whole ladder against nothing a person could answer."""
+        page = _ListenerPage()
+        ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0)
+        page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True, area=0.0)
+
+        result = await self._post(ctx)
+
+        assert "challenge_raised" not in (result["data"].get("observed_effects") or {})
+        assert "challenge_vendor" not in result["data"]
+
+    async def _reveal_cycle(
+        self, monkeypatch: pytest.MonkeyPatch, *, before: float | None, after: float | None
+    ) -> dict[str, Any]:
+        """A vendor frame already in the document that never navigates, only changes size."""
+        page = _ListenerPage(child_frame_urls=["https://challenge.vendor.test/turnstile/v0/api.html"])
+        readings = [before]
+        monkeypatch.setattr(
+            challenge_signature_module,
+            "challenge_frame_rendered_size",
+            AsyncMock(side_effect=lambda _frame: (readings.pop(0) if readings else after, 1.0)),
+        )
+        ctx = await self._arm(monkeypatch, page)
+        self._settle_already_over(monkeypatch, ctx)
+        return await self._post(ctx)
+
+    @pytest.mark.asyncio
+    async def test_a_renderer_that_never_answers_does_not_hold_up_the_click(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+        page.frames.append(
+            _ListenerFrame("https://challenge.vendor.test/turnstile/v0/api.html", page.frames[0], unresponsive=True)
+        )
+        monkeypatch.setattr(challenge_signature_module, "_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS", 0.05)
+
+        ctx = await asyncio.wait_for(self._arm(monkeypatch, page), timeout=5)
+
+        assert ctx.pending_scout_challenge_armed_at is not None
+        assert ctx.pending_scout_challenge_prior_frames == [(page.frames[1], None)]
+
+    @pytest.mark.asyncio
+    async def test_preloaded_widget_the_click_reveals_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        result = await self._reveal_cycle(monkeypatch, before=1.0, after=300.0 * 65.0)
+
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert result["data"]["challenge_vendor"] == "turnstile"
+
+    @pytest.mark.asyncio
+    async def test_widget_already_on_screen_before_the_click_is_not_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result = await self._reveal_cycle(monkeypatch, before=300.0 * 65.0, after=300.0 * 65.0)
+
+        assert "challenge_raised" not in (result["data"].get("observed_effects") or {})
+
+    @pytest.mark.asyncio
+    async def test_preloaded_widget_that_stays_a_placeholder_is_not_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result = await self._reveal_cycle(monkeypatch, before=1.0, after=1.0)
+
+        assert "challenge_raised" not in (result["data"].get("observed_effects") or {})
+
+    async def _challenge_on_host(
+        self, monkeypatch: pytest.MonkeyPatch, host: str
+    ) -> tuple[dict[str, Any], SimpleNamespace, list[dict[str, Any]]]:
+        page = _ListenerPage()
+        ctx = await self._arm(monkeypatch, page)
+        self._settle_already_over(monkeypatch, ctx)
+        page.navigate_frame(f"https://{host}/turnstile/", child_frame=True)
+        with capture_logs() as logs:
+            result = await self._post(ctx)
+        return result, ctx, logs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("host", "fragment"),
+        [
+            ("s3cr3t-tenant.challenge.vendor.test", "s3cr3t-tenant"),
+            ("xn--mnchen-3ya.challenge.vendor.test", "xn--mnchen-3ya"),
+        ],
+        ids=["lowercased_slug", "punycode_label"],
+    )
+    async def test_the_challenge_is_named_by_vendor_and_no_part_of_the_host_is_retained(
+        self, monkeypatch: pytest.MonkeyPatch, host: str, fragment: str
+    ) -> None:
+        """A hostname carries whatever the page put in it, in whatever spelling the browser normalised
+        it to, so the only safe host to keep is none: the vendor comes from the signature's literals."""
+        result, ctx, logs = await self._challenge_on_host(monkeypatch, host)
+
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert result["data"]["challenge_vendor"] == "turnstile"
+        signal = next(entry for entry in logs if entry.get("event") == "ember_observed_challenge_signal")
+        for retained in (result["data"], ctx.scout_trajectory[-1], ctx.scouted_interactions[-1], signal):
+            assert fragment not in json.dumps(retained)
+
+    @pytest.mark.asyncio
+    async def test_a_click_whose_locator_the_scrub_removed_still_gets_its_effect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A selector carrying a registered value loses its locator fields when the interaction is
+        scrubbed, so the effect cannot be found again by that selector — and an older click using the
+        same one must not receive it instead."""
+        secret = "s3cr3t-tenant"
+        page = _ListenerPage()
+        ctx = await self._arm(monkeypatch, page)
+        self._settle_already_over(monkeypatch, ctx)
+        earlier_click = {"tool_name": "click", "selector": f"#row-{secret}", "observed_effects": {}}
+        ctx.scout_trajectory = [earlier_click]
+        ctx.scouted_interactions = [earlier_click]
+        ctx.secret_scrub_values = [secret]
+        page.navigate_frame("https://challenge.vendor.test/turnstile/", child_frame=True)
+
+        result = await _click_post_hook(
+            {"ok": True, "data": {"selector": f"#row-{secret}"}},
+            {"browser_context": {"url": "https://records.example.test/search", "title": "Search"}},
+            ctx,
+        )
+
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert earlier_click["observed_effects"] == {}
+        for collection in (ctx.scout_trajectory, ctx.scouted_interactions):
+            assert collection[-1] is not earlier_click
+            assert collection[-1]["observed_effects"]["challenge_raised"] is True
+
+    @pytest.mark.asyncio
+    async def test_challenge_log_carries_the_page_origin_not_the_landed_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+        ctx = await self._arm(monkeypatch, page)
+        self._settle_already_over(monkeypatch, ctx)
+        page.navigate_frame("https://challenge.vendor.test/turnstile/", child_frame=True)
+
+        with capture_logs() as logs:
+            await _click_post_hook(
+                {"ok": True, "data": {"selector": "#submit-search"}},
+                {
+                    "browser_context": {
+                        "url": "https://records.example.test/search?session_token=abc123#magic",
+                        "title": "Search",
+                    }
+                },
+                ctx,
+            )
+
+        signal = next(entry for entry in logs if entry.get("event") == "ember_observed_challenge_signal")
+        assert "session_token" not in json.dumps(signal)
+        assert "abc123" not in json.dumps(signal)
+        assert signal["page_origin"] == "https://records.example.test/"
+
+    @pytest.mark.asyncio
+    async def test_a_click_that_never_arms_does_not_inherit_the_previous_clicks_listener_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A previous click's arm time must not make this click look armed, or already settled."""
+        ctx = self._ctx(source_url="https://records.example.test/search")
+        ctx.browser_session_id = "pbs-debug"
+        ctx.codeblock_redaction_parameters = {}
+        ctx.pending_scout_challenge_armed_at = 123.0
+        ctx.pending_scout_challenge_frames = [object()]
+
+        await _click_pre_hook({"selector": "#submit-search"}, ctx)
+
+        assert ctx.pending_scout_challenge_armed_at is None
+        assert ctx.pending_scout_challenge_frames == []
+        assert ctx.pending_scout_challenge_prior_frames == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outer_style_before", "credited"),
+        [(False, True), (None, False)],
+        ids=["embedding_iframe_hidden_before_the_click", "embedding_iframe_unreadable_before_the_click"],
+    )
+    async def test_a_preload_behind_an_unreadable_embedding_iframe_has_no_baseline_to_reveal_from(
+        self, monkeypatch: pytest.MonkeyPatch, outer_style_before: bool | None, credited: bool
+    ) -> None:
+        page = _ListenerPage()
+        outer = _ListenerFrame("https://embed.example.test/form", page.frames[0], style_visible=outer_style_before)
+        vendor = _ListenerFrame("https://challenge.vendor.test/turnstile/v0/api.html", outer)
+        page.frames.extend([outer, vendor])
+        ctx = await self._arm(monkeypatch, page)
+        outer.style_visible = True
+        self._settle_already_over(monkeypatch, ctx)
+
+        result = await self._post(ctx)
+
+        assert ("challenge_raised" in (result["data"].get("observed_effects") or {})) is credited
+
+    @pytest.mark.asyncio
+    async def test_a_frame_whose_pre_click_state_was_never_measured_is_not_a_reveal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a pre-click reading there is no growth to observe, so an already-challenging
+        widget must not be credited to whatever click followed it."""
+        result = await self._reveal_cycle(monkeypatch, before=None, after=300.0 * 65.0)
+
+        assert "challenge_raised" not in (result["data"].get("observed_effects") or {})
+
+    @pytest.mark.asyncio
+    async def test_placeholder_frame_that_navigates_to_a_vendor_url_is_this_clicks_effect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage(child_frame_urls=["about:blank"])
+        ctx = await self._arm(monkeypatch, page)
+        page.renavigate_child_frame(0, "https://challenge.vendor.test/turnstile/v0/api.html?sitekey=abc")
+
+        result = await self._post(ctx)
+
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert result["data"]["challenge_vendor"] == "turnstile"
+
+    async def _armed_click(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        frame_url: str,
+        child_frame: bool,
+    ) -> tuple[_ListenerPage, SimpleNamespace]:
+        ctx = self._ctx(source_url="https://records.example.test/search")
+        # Agent blocks only, so the challenge listener is the only one this click arms.
+        ctx.authoring_capability = AGENT_BLOCKS_ONLY
+        ctx.browser_session_id = "pbs-debug"
+        ctx.codeblock_redaction_parameters = {}
+        page = _ListenerPage()
+        monkeypatch.setattr(
+            scouting_module,
+            "resolve_browser_state_for_context",
+            AsyncMock(return_value=SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))),
+        )
+        await _click_pre_hook({"selector": "#submit-search"}, ctx)
+        page.navigate_frame(frame_url, child_frame=child_frame)
+        return page, ctx
+
+    async def _click_cycle_with_frame_navigation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        frame_url: str,
+        child_frame: bool,
+        click_ok: bool = True,
+    ) -> tuple[dict[str, Any], _ListenerPage, SimpleNamespace]:
+        page, ctx = await self._armed_click(monkeypatch, frame_url=frame_url, child_frame=child_frame)
+        tool_result: dict[str, Any] = (
+            {"ok": True, "data": {"selector": "#submit-search"}}
+            if click_ok
+            else {"ok": False, "error": "element is not visible"}
+        )
+        result = await _click_post_hook(
+            tool_result,
+            {"browser_context": {"url": "https://records.example.test/search", "title": "Search"}},
+            ctx,
+        )
+        return result, page, ctx
+
+    @pytest.mark.asyncio
+    async def test_click_that_raises_a_vendor_challenge_frame_records_the_effect_and_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, page, ctx = await self._click_cycle_with_frame_navigation(
+            monkeypatch,
+            frame_url="https://challenge.vendor.test/turnstile/v0/api.html?sitekey=abc",
+            child_frame=True,
+        )
+
+        assert result["data"]["observed_effects"]["challenge_raised"] is True
+        assert result["data"]["challenge_vendor"] == "turnstile"
+        for collection in (ctx.scout_trajectory, ctx.scouted_interactions):
+            recorded = collection[-1]
+            assert recorded["observed_effects"]["challenge_raised"] is True
+            assert recorded["challenge_vendor"] == "turnstile"
+        click_fact = next(fact for fact in mcp_hooks._demonstrated_step_facts(ctx) if fact["tool_name"] == "click")
+        assert click_fact["challenge_vendor"] == "turnstile"
+        assert page.removed == ["framenavigated"]
+        assert ctx.pending_scout_challenge_frames == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("frame_url", "child_frame"),
+        [
+            ("https://challenge.vendor.test/turnstile/v0/api.html", False),
+            ("https://cdn.example.test/analytics.html", True),
+        ],
+        ids=["main_frame_navigation", "non_vendor_child_frame"],
+    )
+    async def test_click_without_a_vendor_child_frame_records_no_challenge(
+        self, monkeypatch: pytest.MonkeyPatch, frame_url: str, child_frame: bool
+    ) -> None:
+        result, page, ctx = await self._click_cycle_with_frame_navigation(
+            monkeypatch, frame_url=frame_url, child_frame=child_frame
+        )
+
+        assert "challenge_raised" not in (result["data"].get("observed_effects") or {})
+        assert "challenge_vendor" not in result["data"]
+        for collection in (ctx.scout_trajectory, ctx.scouted_interactions):
+            assert "challenge_vendor" not in collection[-1]
+        assert page.removed == ["framenavigated"]
+
+    @pytest.mark.asyncio
+    async def test_failed_click_releases_the_challenge_listener(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        result, page, ctx = await self._click_cycle_with_frame_navigation(
+            monkeypatch,
+            frame_url="https://challenge.vendor.test/turnstile/v0/api.html",
+            child_frame=True,
+            click_ok=False,
+        )
+
+        assert result["ok"] is False
+        assert page.removed == ["framenavigated"]
+        assert ctx.pending_scout_challenge_detachers == []
+        assert ctx.pending_scout_challenge_frames == []
+
+    @pytest.mark.asyncio
+    async def test_post_hook_exception_releases_the_challenge_listener(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page, ctx = await self._armed_click(
+            monkeypatch,
+            frame_url="https://challenge.vendor.test/turnstile/v0/api.html",
+            child_frame=True,
+        )
+        monkeypatch.setattr(
+            mcp_hooks,
+            "_consume_scout_source_url",
+            MagicMock(side_effect=RuntimeError("browser context lost")),
+        )
+
+        with pytest.raises(RuntimeError):
+            await _click_post_hook(
+                {"ok": True, "data": {"selector": "#submit-search"}},
+                {"browser_context": {"url": "https://records.example.test/search", "title": "Search"}},
+                ctx,
+            )
+
+        assert page.removed == ["framenavigated"]
+        assert ctx.pending_scout_challenge_detachers == []
+        assert ctx.pending_scout_challenge_frames == []
+
+    def _ctx_with_scripted_reads(
+        self,
+        *,
+        selector_count: int,
+        role_name: tuple[str, str],
+        match_count: int,
+        candidates: list[dict[str, str]] | None = None,
+    ) -> SimpleNamespace:
+        role, name = role_name
+
+        async def call(_tool: str, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "data": {
+                    "result": {
+                        "role_name": {"role": role, "accessible_name": name} if (role or name) else None,
+                        "role_name_match_count": match_count,
+                        "selector_match_count": selector_count,
+                        "selector_candidates": candidates or [],
+                    }
+                },
+            }
+
+        server = SimpleNamespace()
+        server.call_internal_tool = AsyncMock(side_effect=call)
+        ctx = self._ctx(source_url="https://example.com/portal")
+        ctx.discovery_mcp_server = server
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_ambiguity_stashes_unique_reanchor(self) -> None:
+        ctx = self._ctx_with_scripted_reads(
+            selector_count=2, role_name=("button", "I AM A BUSINESS CUSTOMER"), match_count=1
+        )
+        await _capture_scout_pre_action(ctx, "button[data-action='businessToggle']")
+        assert ctx.pending_scout_ambiguous == ("button[data-action='businessToggle']", True)
+        assert ctx.pending_scout_reanchor == (
+            "button[data-action='businessToggle']",
+            "button",
+            "I AM A BUSINESS CUSTOMER",
+        )
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_ambiguity_withholds_name_degenerate_reanchor(self) -> None:
+        ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", "Toggle"), match_count=2)
+        await _capture_scout_pre_action(ctx, "button[data-action='businessToggle']")
+        assert ctx.pending_scout_ambiguous == ("button[data-action='businessToggle']", True)
+        assert ctx.pending_scout_reanchor is None
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_ambiguity_withholds_nameless_reanchor(self) -> None:
+        ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", ""), match_count=1)
+        await _capture_scout_pre_action(ctx, "button[data-action='businessToggle']")
+        assert ctx.pending_scout_ambiguous == ("button[data-action='businessToggle']", True)
+        assert ctx.pending_scout_reanchor is None
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_click_records_validated_reanchor_role_name(self) -> None:
+        ctx = self._ctx_with_scripted_reads(
+            selector_count=2, role_name=("button", "I AM A BUSINESS CUSTOMER"), match_count=1
+        )
+        await _click_pre_hook({"selector": "button[data-action='businessToggle']"}, ctx)
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "button[data-action='businessToggle']"}},
+            {"browser_context": {"url": "https://example.com/portal", "title": "Portal"}},
+            ctx,
+        )
+        recorded = ctx.scouted_interactions[-1]
+        assert recorded.get("ambiguous") is True
+        assert recorded.get("role") == "button"
+        assert recorded.get("accessible_name") == "I AM A BUSINESS CUSTOMER"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_click_preserves_observed_nonunique_role_name_and_count(self) -> None:
+        ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", "Toggle"), match_count=2)
+        await _click_pre_hook({"selector": "button[data-action='businessToggle']"}, ctx)
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "button[data-action='businessToggle']"}},
+            {"browser_context": {"url": "https://example.com/portal", "title": "Portal"}},
+            ctx,
+        )
+        recorded = ctx.scouted_interactions[-1]
+        assert recorded.get("ambiguous") is True
+        assert recorded["role"] == "button"
+        assert recorded["accessible_name"] == "Toggle"
+        assert recorded["role_name_match_count"] == 2
+
+    def test_prenav_ambiguity_ignores_mismatched_selector(self) -> None:
+        assert _prenav_ambiguity_for_selector(("button", True), "a") is False
+        assert _prenav_ambiguity_for_selector(("button", True), "button") is True
+        assert _prenav_ambiguity_for_selector(None, "button") is False
+
+    @pytest.mark.asyncio
+    async def test_intent_click_uses_resolved_selector_when_raw_selector_is_none(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _click_post_hook
+
+        ctx = self._ctx(source_url="https://example.com/product")
+        ctx.flow_evidence = []
+        result = await _click_post_hook(
+            {
+                "ok": True,
+                "data": {
+                    "selector": None,
+                    "intent": "click the add button",
+                    "resolved_selector": "xpath=//button[2]",
+                },
+            },
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+
+        assert result["ok"] is True
+        assert result["data"]["executed_selector"] == "xpath=//button[2]"
+        assert result["data"]["effective_target"] == "xpath=//button[2]"
+        recorded = ctx.scouted_interactions[0]
+        assert (recorded["tool_name"], recorded["selector"], recorded["source_url"]) == (
+            "click",
+            "xpath=//button[2]",
+            "https://example.com/product",
+        )
+        assert ctx.flow_evidence[0]["evidence"]["interaction_selector"] == "xpath=//button[2]"
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_preserves_raw_selector_over_resolved_selector(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _click_post_hook
+
+        ctx = self._ctx()
+        result = await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart", "resolved_selector": "xpath=//button[2]"}},
+            {"browser_context": {"url": "https://example.com/product", "title": "Product"}},
+            ctx,
+        )
+
+        assert result["data"]["effective_target"] == "#add-to-cart"
+        recorded = ctx.scouted_interactions[0]
+        assert (recorded["tool_name"], recorded["selector"]) == ("click", "#add-to-cart")
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_records_every_browser_selector_and_source_page_counts(self) -> None:
+        from skyvern.forge.sdk.ember.tools import _click_post_hook
+
+        ctx = self._ctx(source_url="https://example.com/form")
+        ctx.pending_scout_selector_match_count = ("#submit", 1)
+        ctx.pending_scout_role_name = ("#submit", "button", "Submit")
+        ctx.pending_scout_role_name_match_count = ("#submit", "button", "Submit", 1)
+        result = await _click_post_hook(
+            {
+                "ok": True,
+                "data": {"selector": "#submit", "resolved_selector": "xpath=//button[@type='submit']"},
+            },
+            {"browser_context": {"url": "https://example.com/thanks", "title": "Thanks"}},
+            ctx,
+        )
+
+        recorded = ctx.scout_trajectory[-1]
+        assert recorded["selector_candidates"] == [
+            {"selector": "#submit", "source": "requested", "match_count": None},
+            {"selector": "xpath=//button[@type='submit']", "source": "resolved", "match_count": None},
+        ]
+        assert recorded["selector_match_count"] == 1
+        assert recorded["role_name_match_count"] == 1
+        assert recorded["source_url"] == "https://example.com/form"
+        assert recorded["result_url"] == "https://example.com/thanks"
+        assert recorded["observed_effects"] == {"url_changed": True}
+        assert result["data"]["executed_selector"] == "#submit"
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_prefers_accessible_label_for_effective_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.ember import tools as tools_module
+
+        async def resolved_label(*_a: object, **_k: object) -> tuple[str, str]:
+            return "button", "Accept"
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_resolve_scout_role_name", resolved_label)
+        ctx = self._ctx()
+
+        result = await tools_module._click_post_hook(
+            {"ok": True, "data": {"selector": None, "resolved_selector": "xpath=//button[2]"}},
+            {"browser_context": {"url": "https://example.com/product", "title": "Product"}},
+            ctx,
+        )
+
+        assert result["data"]["executed_selector"] == "xpath=//button[2]"
+        assert result["data"]["effective_target"] == "button Accept"
+
+    @pytest.mark.asyncio
+    async def test_scout_helpers_tolerate_selector_none(self) -> None:
+        from skyvern.forge.sdk.ember.tools import (
+            _record_scouted_interaction,
+            _register_scout_interaction_observation,
+            _resolve_scout_role_name,
+        )
+
+        ctx = self._ctx()
+        ctx.flow_evidence = []
+
+        assert await _resolve_scout_role_name(ctx, None) == ("", "")
+        _record_scouted_interaction(ctx, tool_name="click", selector=None)
+        observation_step, page_evidence = await _register_scout_interaction_observation(
+            ctx,
+            tool_name="click",
+            selector=None,
+            source_url="https://example.com/product",
+            url="https://example.com/cart",
+        )
+
+        assert ctx.scouted_interactions == []
+        assert ctx.flow_evidence == []
+        assert observation_step is None
+        assert page_evidence is None
+
+    @pytest.mark.asyncio
+    async def test_selector_none_interaction_hooks_degrade_without_crashing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.ember import tools as tools_module
+
+        async def passes(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
+        ctx = self._ctx()
+
+        type_result = await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": None, "text_length": 8}},
+            {"browser_context": {"url": "https://example.com/form", "title": "Form"}},
+            ctx,
+        )
+        select_result = await tools_module._select_option_post_hook(
+            {"ok": True, "data": {"selector": None, "value": "large"}},
+            {"browser_context": {"url": "https://example.com/form", "title": "Form"}},
+            ctx,
+        )
+        press_result = await tools_module._press_key_post_hook(
+            {"ok": True, "data": {"selector": None, "key": "Enter"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+
+        assert type_result["ok"] is True
+        assert type_result["data"]["executed_selector"] == ""
+        assert select_result["ok"] is True
+        assert select_result["data"]["executed_selector"] == ""
+        assert press_result["ok"] is True
+        assert press_result["data"]["executed_selector"] == ""
+        assert ctx.scouted_interactions[0]["tool_name"] == "press_key"
+        assert ctx.scouted_interactions[0]["key"] == "Enter"
+
+    @pytest.mark.parametrize(("hook_name", "extra_params"), _INTERACTION_PRE_HOOKS)
+    @pytest.mark.parametrize("policy", [None, BlockAuthoringPolicy.CODE_ONLY_BROWSER])
+    @pytest.mark.asyncio
+    async def test_interaction_pre_hook_issues_one_internal_packet(
+        self,
+        hook_name: str,
+        extra_params: dict[str, Any],
+        policy: BlockAuthoringPolicy | None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", "Order"), match_count=1)
+        ctx.block_authoring_policy = policy
+
+        assert await getattr(mcp_hooks, hook_name)({"selector": _ACTED_SELECTOR, **extra_params}, ctx) is None
+
+        assert sum(n for tool, n in self._census(ctx).items() if tool != "skyvern_screenshot") == 1
+
+    def _ctx_with_post_action_capture(
+        self, *, hollow: bool = False, unsettled_challenge: bool = False
+    ) -> SimpleNamespace:
+        """Context whose discovery server answers the fused pre-action read and the
+        post-action structured capture. ``hollow`` returns a packet with no controls,
+        which is the only state that earns the bounded recapture."""
+        page: dict[str, Any] = {"page_title": "Results", "forms": [], "navigation_targets": []}
+        if not hollow:
+            page = {
+                "page_title": "Results",
+                "forms": [
+                    {
+                        "fields": [{"name": "npi", "label": "NPI number", "type": "text", "selector": "#npi"}],
+                        "submit_controls": [{"text": "Search", "type": "submit", "selector": "#go"}],
+                    }
+                ],
+                "navigation_targets": [{"text": "Details", "href": "https://example.com/d", "selector": "a.d"}],
+                "result_containers": [{"tag": "table", "id": "results", "selector": "#results"}],
+            }
+        if unsettled_challenge:
+            # Keyword says challenge, no rendered carrier resolves it — the second recapture trigger.
+            page = {**page, "anti_bot_indicators": ["captcha"], "challenge_controls": []}
+
+        async def call(_tool: str, args: dict[str, Any]) -> dict[str, Any]:
+            if "REQUESTED_TARGETS" in str(args.get("expression", "")):
+                return {"ok": True, "data": {"result": page}}
+            return {
+                "ok": True,
+                "data": {
+                    "result": {
+                        "role_name": {"role": "button", "accessible_name": "Order"},
+                        "role_name_match_count": 1,
+                        "selector_match_count": 1,
+                        "selector_candidates": [],
+                    }
+                },
+            }
+
+        server = SimpleNamespace()
+        server.call_internal_tool = AsyncMock(side_effect=call)
+        ctx = self._ctx(source_url="https://example.com/portal")
+        ctx.discovery_mcp_server = server
+        ctx.pre_run_gated_output_warning_fingerprint = ()
+        ctx.last_code_authoring_repair_context = None
+        ctx.supports_vision = True
+        return ctx
+
+    @staticmethod
+    def _census(ctx: SimpleNamespace) -> dict[str, int]:
+        census: dict[str, int] = {}
+        for await_call in ctx.discovery_mcp_server.call_internal_tool.await_args_list:
+            census[await_call.args[0]] = census.get(await_call.args[0], 0) + 1
+        return census
+
+    @pytest.mark.parametrize(
+        ("pre_hook", "pre_args", "post_hook", "post_data", "expected_census"), _INTERACTION_HOOK_PAIRS
+    )
+    @pytest.mark.asyncio
+    async def test_every_interaction_post_hook_census(
+        self,
+        pre_hook: str,
+        pre_args: dict[str, Any],
+        post_hook: str,
+        post_data: dict[str, Any],
+        expected_census: dict[str, int],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Production-shaped: vision on, so the retained fallback frame is counted."""
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_post_action_capture()
+        assert await getattr(mcp_hooks, pre_hook)({"selector": _ACTED_SELECTOR, **pre_args}, ctx) is None
+        ctx.discovery_mcp_server.call_internal_tool.reset_mock()
+
+        await getattr(mcp_hooks, post_hook)(
+            {"ok": True, "data": {"selector": _ACTED_SELECTOR, **post_data}},
+            {"browser_context": {"url": "https://example.com/next", "title": "Next"}},
+            ctx,
+        )
+
+        assert self._census(ctx) == expected_census
+
+    @pytest.mark.parametrize("policy", [None, BlockAuthoringPolicy.CODE_ONLY_BROWSER])
+    @pytest.mark.parametrize("landing_url", ["https://example.com/portal", "https://example.com/next"])
+    @pytest.mark.asyncio
+    async def test_click_post_hook_issues_one_structured_packet_plus_the_frame(
+        self,
+        policy: BlockAuthoringPolicy | None,
+        landing_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Vision is on, as it is in production, so the fallback frame is counted here."""
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_post_action_capture()
+        ctx.block_authoring_policy = policy
+        assert await mcp_hooks._click_pre_hook({"selector": _ACTED_SELECTOR}, ctx) is None
+        ctx.discovery_mcp_server.call_internal_tool.reset_mock()
+
+        await mcp_hooks._click_post_hook(
+            {"ok": True, "data": {"selector": _ACTED_SELECTOR}},
+            {"browser_context": {"url": landing_url, "title": "Next"}},
+            ctx,
+        )
+
+        assert self._census(ctx) == {"skyvern_evaluate": 1, "skyvern_screenshot": 1}
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_recaptures_once_when_the_first_packet_is_hollow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hollow is one of three recapture triggers; unsettled challenge evidence and an
+        unchanged-after-interaction page are the others."""
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_post_action_capture(hollow=True)
+        assert await mcp_hooks._click_pre_hook({"selector": _ACTED_SELECTOR}, ctx) is None
+        ctx.discovery_mcp_server.call_internal_tool.reset_mock()
+
+        await mcp_hooks._click_post_hook(
+            {"ok": True, "data": {"selector": _ACTED_SELECTOR}},
+            {"browser_context": {"url": "https://example.com/next", "title": "Next"}},
+            ctx,
+        )
+
+        assert self._census(ctx) == {"skyvern_evaluate": 2, "skyvern_screenshot": 1}
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_recaptures_once_when_challenge_evidence_is_unsettled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_post_action_capture(unsettled_challenge=True)
+        assert await mcp_hooks._click_pre_hook({"selector": _ACTED_SELECTOR}, ctx) is None
+        ctx.discovery_mcp_server.call_internal_tool.reset_mock()
+
+        await mcp_hooks._click_post_hook(
+            {"ok": True, "data": {"selector": _ACTED_SELECTOR}},
+            {"browser_context": {"url": "https://example.com/next", "title": "Next"}},
+            ctx,
+        )
+
+        # Two packets, no frame: the settled packet names the challenge, which is the one case the
+        # ticket allows the fallback frame to be dropped.
+        assert self._census(ctx) == {"skyvern_evaluate": 2}
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+
+    def test_page_summary_never_reconstructs_a_singular_selector(self) -> None:
+        long_selector = "div.wrapper > " + " > ".join(f"section.level-{n}" for n in range(12))
+
+        entry = _summary_entry("Close", {"selector": long_selector})
+
+        assert entry == {"text": "Close"}
+        assert _summary_entry(
+            "Close",
+            {"selector_candidates": [{"selector": "#close", "source": "id", "match_count": 1}]},
+        ) == {
+            "text": "Close",
+            "selector_candidates": [{"selector": "#close", "source": "id"}],
+        }
+
+        # The disclosure summary obeys the same no-singular-recommendation invariant.
+        oversized = {"expanded": True, "text": "Show options", "selector": long_selector}
+        assert "selector" not in _summary_disclosure_control(oversized)
+        sized = {
+            "expanded": True,
+            "text": "Show options",
+            "selector_candidates": [{"selector": "#opts", "source": "id", "match_count": 1}],
+        }
+        assert _summary_disclosure_control(sized)["selector_candidates"] == [{"selector": "#opts", "source": "id"}]
+
+    @pytest.mark.parametrize(("hook_name", "extra_params"), _INTERACTION_PRE_HOOKS)
+    @pytest.mark.asyncio
+    async def test_interaction_pre_hooks_reach_the_same_stash(
+        self, hook_name: str, extra_params: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        candidates = [{"selector": "#order-docs", "source": "id", "match_count": None}]
+        ctx = self._ctx_with_scripted_reads(
+            selector_count=2, role_name=("button", "Order"), match_count=1, candidates=candidates
+        )
+
+        assert await getattr(mcp_hooks, hook_name)({"selector": _ACTED_SELECTOR, **extra_params}, ctx) is None
+
+        assert ctx.pending_scout_role_name == (_ACTED_SELECTOR, "button", "Order")
+        assert ctx.pending_scout_role_name_match_count == (_ACTED_SELECTOR, "button", "Order", 1)
+        assert ctx.pending_scout_selector_candidates == candidates
+        assert ctx.pending_scout_selector_match_count == (_ACTED_SELECTOR, 2)
+        assert ctx.pending_scout_ambiguous == (_ACTED_SELECTOR, True)
+        assert ctx.pending_scout_reanchor == (_ACTED_SELECTOR, "button", "Order")
+
+    @pytest.mark.parametrize(("hook_name", "extra_params"), _INTERACTION_PRE_HOOKS)
+    @pytest.mark.asyncio
+    async def test_interaction_pre_hook_without_a_selector_clears_the_prior_stash(
+        self, hook_name: str, extra_params: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", "Order"), match_count=1)
+        ctx.pending_scout_role_name = ("#stale", "button", "Stale")
+        ctx.pending_scout_selector_match_count = ("#stale", 1)
+
+        assert await getattr(mcp_hooks, hook_name)(dict(extra_params), ctx) is None
+
+        assert ctx.pending_scout_role_name is None
+        assert ctx.pending_scout_selector_match_count is None
+        assert set(self._census(ctx)) <= {"skyvern_screenshot"}
+
+    @pytest.mark.asyncio
+    async def test_pre_action_packet_keeps_every_candidate_and_the_ambiguity_flag(self) -> None:
+        candidates = [
+            {"selector": "button[data-action='order']", "source": "requested", "match_count": None},
+            {"selector": "#order-docs", "source": "id", "match_count": None},
+            {"selector": "button.order", "source": "class_list", "match_count": None},
+        ]
+        ctx = self._ctx_with_scripted_reads(
+            selector_count=3, role_name=("button", "Order documents"), match_count=3, candidates=candidates
+        )
+        await _capture_scout_pre_action(ctx, "button[data-action='order']")
+
+        assert ctx.pending_scout_selector_candidates == candidates
+        assert ctx.pending_scout_ambiguous == ("button[data-action='order']", True)
+        assert ctx.pending_scout_selector_match_count == ("button[data-action='order']", 3)
+        assert ctx.pending_scout_reanchor is None
+
+    @pytest.mark.asyncio
+    async def test_pre_action_packet_leaves_unknown_cardinality_unset(self) -> None:
+        ctx = self._ctx_with_scripted_reads(selector_count=-1, role_name=("", ""), match_count=-1)
+        await _capture_scout_pre_action(ctx, "input[[bad")
+
+        assert ctx.pending_scout_selector_match_count is None
+        assert ctx.pending_scout_role_name_match_count is None
+        assert ctx.pending_scout_ambiguous is None
+
+    @pytest.mark.asyncio
+    async def test_pre_action_packet_strips_the_role_and_name(self) -> None:
+        ctx = self._ctx_with_scripted_reads(selector_count=1, role_name=(" button ", " Order "), match_count=1)
+        await _capture_scout_pre_action(ctx, "#order")
+
+        assert ctx.pending_scout_role_name == ("#order", "button", "Order")
+
+
+class TestScoutPageSummary:
+    @staticmethod
+    def _evidence(field_count: int) -> dict[str, Any]:
+        def element(selector: str, **facts: Any) -> dict[str, Any]:
+            return {
+                **facts,
+                "selector_candidates": [
+                    {"selector": selector, "source": "test_fixture", "match_count": 2, "visible_match_count": 1}
+                ],
+            }
+
+        return {
+            "page_title": "Checkout",
+            "forms": [
+                {
+                    "fields": [
+                        element(f"#field-{index}", label=f"Field {index} with a fairly long visible label")
+                        for index in range(field_count)
+                    ],
+                    "submit_controls": [element("#place-order", text="Place order")],
+                }
+            ],
+            "navigation_targets": [
+                element(f"a.nav-{index}", text=f"Section {index} of the site navigation") for index in range(8)
+            ],
+            "modal_overlays": [{"dismiss_controls": [element("#promo-close", text="No thanks")]}],
+            "page_obstructions": [
+                {
+                    "kind": "interaction_blocking_layer",
+                    **element("#checkpoint"),
+                    "intercepts_outside_control": True,
+                    "visible_controls": [element("#continue", text="Continue")],
+                    "visible_controls_omitted": 2,
+                }
+            ],
+            "challenge_state": {"detected": False},
+        }
+
+    def test_summary_carries_unranked_candidates_for_each_control(self) -> None:
+        summary = _build_scout_page_summary(self._evidence(2))
+
+        assert summary["forms"][0]["fields"][0]["selector_candidates"][0]["selector"] == "#field-0"
+        assert summary["forms"][0]["submit_controls"][0]["selector_candidates"][0]["selector"] == "#place-order"
+        assert summary["navigation_targets"][0]["selector_candidates"][0]["selector"] == "a.nav-0"
+        assert summary["modal_dismiss_controls"][0]["selector_candidates"][0]["selector"] == "#promo-close"
+        assert summary["interaction_blocking_layers"] == [
+            {
+                "selector_candidates": [{"selector": "#checkpoint", "source": "test_fixture"}],
+                "intercepts_outside_control": True,
+                "visible_controls": [
+                    {
+                        "text": "Continue",
+                        "selector_candidates": [{"selector": "#continue", "source": "test_fixture"}],
+                    }
+                ],
+                "visible_controls_omitted": 2,
+            }
+        ]
+        assert "match_count" not in summary["forms"][0]["fields"][0]["selector_candidates"][0]
+
+    def test_summary_names_every_section_it_sheds(self) -> None:
+        result: dict[str, Any] = {"ok": True, "data": {"filler": "x" * (scouting_module._SCOUT_RESULT_CHAR_CAP - 800)}}
+        scouting_module._attach_scout_page_summary(_no_redaction_ctx(), result, self._evidence(8))
+
+        page = result["data"]["page"]
+        assert page["shed"][:2] == ["control_selectors", "navigation_targets"]
+        assert page["navigation_targets"] == []
+        assert "page_summary" not in page["shed"]
+
+    def test_selectors_are_shed_before_any_control_the_baseline_carried(self) -> None:
+        evidence = self._evidence(8)
+        result: dict[str, Any] = {"ok": True, "data": {"filler": "x" * 600}}
+        scouting_module._attach_scout_page_summary(_no_redaction_ctx(), result, evidence)
+
+        page = result["data"]["page"]
+        assert page["shed"] == ["control_selectors"]
+        assert page["navigation_targets"] == [target["text"] for target in evidence["navigation_targets"]]
+        assert page["forms"][0]["fields"] == [field["label"] for field in evidence["forms"][0]["fields"]]
+        assert page["interaction_blocking_layers"] == [
+            {
+                "intercepts_outside_control": True,
+                "visible_controls": ["Continue"],
+                "visible_controls_omitted": 2,
+            }
+        ]
+
+    def test_a_summary_too_large_to_shed_still_leaves_its_shed_record(self) -> None:
+        result: dict[str, Any] = {"ok": True, "data": {"filler": "x" * scouting_module._SCOUT_RESULT_CHAR_CAP}}
+        scouting_module._attach_scout_page_summary(_no_redaction_ctx(), result, self._evidence(8))
+
+        page = result["data"]["page"]
+        assert set(page) == {"shed"}
+        assert page["shed"][0] == "control_selectors"
+        assert page["shed"][-1] == "page_summary"
+
+    def test_summary_carries_no_filled_field_value(self) -> None:
+        secret = "hunter2-not-a-real-secret"
+        summary = _build_scout_page_summary(
+            {
+                "page_title": "Sign in",
+                "forms": [
+                    {
+                        "fields": [
+                            {
+                                "label": "Password",
+                                "type": "password",
+                                "value": secret,
+                                "selector_candidates": [{"selector": "#pw", "source": "id", "match_count": 1}],
+                            },
+                            {
+                                "label": "Username",
+                                "value": "operator",
+                                "selector_candidates": [{"selector": "#user", "source": "id", "match_count": 1}],
+                            },
+                        ],
+                        "submit_controls": [
+                            {
+                                "text": "Sign in",
+                                "selector_candidates": [{"selector": "#signin", "source": "id", "match_count": 1}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        assert secret not in json.dumps(summary)
+        assert summary["forms"][0]["fields"][0] == {
+            "text": "Password",
+            "selector_candidates": [{"selector": "#pw", "source": "id"}],
+        }
+
+    def test_obstruction_predicate_ignores_visual_candidates(self) -> None:
+        assert not _page_evidence_names_obstruction(
+            {
+                "modal_overlays": [],
+                "challenge_controls": [],
+                "challenge_state": {"detected": False},
+                "visual_obstruction_candidates": [{"selector": ".sticky"}],
+            }
+        )
+        assert not _page_evidence_names_obstruction({"modal_overlays": [{"selector": "#promo"}]})
+        assert not _page_evidence_names_obstruction(
+            {
+                "page_obstructions": [
+                    {
+                        "kind": "interaction_blocking_layer",
+                        "intercepts_outside_control": True,
+                        "visible_controls": [{"text": "Continue", "selector": "#continue"}],
+                    }
+                ]
+            }
+        )
+        assert _page_evidence_names_obstruction(
+            {"modal_overlays": [{"selector": "#promo", "dismiss_controls": [{"text": "Close", "selector": ".x"}]}]}
+        )
+        assert _page_evidence_names_obstruction({"challenge_state": {"detected": True}})
+
+
+class TestAssembleEnforcementMessages:
+    @staticmethod
+    def _screenshot_msg() -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "screenshot"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        }
+
+    def test_screenshot_and_nudge_ordering(self) -> None:
+        from skyvern.forge.sdk.ember.enforcement import NUDGE_SENTINEL, _assemble_enforcement_messages
+
+        screenshot_msg = self._screenshot_msg()
+        msgs = _assemble_enforcement_messages(screenshot_msg, "please finish the workflow")
+
+        screenshot_indices = [i for i, m in enumerate(msgs) if m is screenshot_msg]
+        assert screenshot_indices == [msgs.index(screenshot_msg)]
+        assert len(screenshot_indices) == 1
+
+        nudge_index = next(
+            i
+            for i, m in enumerate(msgs)
+            if isinstance(m.get("content"), str) and m["content"].startswith(NUDGE_SENTINEL)
+        )
+        assert nudge_index == len(msgs) - 1
+
+    def test_screenshot_without_nudge(self) -> None:
+        from skyvern.forge.sdk.ember.enforcement import NUDGE_SENTINEL, _assemble_enforcement_messages
+
+        screenshot_msg = self._screenshot_msg()
+        msgs = _assemble_enforcement_messages(screenshot_msg, None)
+
+        assert msgs.count(screenshot_msg) == 1
+        assert not any(isinstance(m.get("content"), str) and m["content"].startswith(NUDGE_SENTINEL) for m in msgs)
+
+
+def test_browser_overlays_are_covered_by_session_classification() -> None:
+    """Every browser overlay participates in dead-session failure classification."""
+    from skyvern.forge.sdk.ember.streaming_adapter import _OBSERVATION_TOOLS
+    from skyvern.forge.sdk.ember.tools import _build_skyvern_mcp_overlays
+    from skyvern.forge.sdk.ember.unrecoverable_tool_error import _BROWSER_SESSION_TOOL_NAMES
+
+    browser_overlays = {name for name, o in _build_skyvern_mcp_overlays().items() if o.requires_browser}
+
+    assert browser_overlays <= _BROWSER_SESSION_TOOL_NAMES, browser_overlays - _BROWSER_SESSION_TOOL_NAMES
+
+    # navigate_browser is the call that creates the need for an observation, so it cannot satisfy it.
+    # Every other browser tool touches the page it arrived on, which is what the post-navigate nudge
+    # is asking the model to do — leaving one out re-asks for work it already did.
+    # The tab tools act on tab state, not on the navigated page's content, so none of them satisfies it.
+    tab_tools = {name for name in browser_overlays if name.startswith("skyvern_tab_")}
+    observers = browser_overlays - {"navigate_browser"} - tab_tools
+    assert observers <= _OBSERVATION_TOOLS, observers - _OBSERVATION_TOOLS
+    assert not tab_tools & _OBSERVATION_TOOLS, tab_tools & _OBSERVATION_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_hooks_count_model_calls_and_enforcement_passes() -> None:
+    ctx = make_ember_ctx()
+    hooks = EmberRunHooks(ctx)
+    ctx.open_step_run_ids.append("wr_saved_with_its_step")
+
+    await hooks.on_agent_start(MagicMock(), MagicMock())
+    await hooks.on_llm_start(MagicMock(), MagicMock(), None, [])
+    await hooks.on_llm_start(MagicMock(), MagicMock(), None, [])
+
+    assert ctx.enforcement_pass_count == 1
+    assert ctx.model_calls_this_turn == 2
+    # The SDK saves a step before it starts the next model call, so that step's runs are in the session.
+    assert ctx.open_step_run_ids == []
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_hooks_count_on_a_bare_agent_context() -> None:
+    ctx = AgentContext(
+        organization_id="org-1",
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=MagicMock(is_disconnected=AsyncMock(return_value=False)),
+    )
+    hooks = EmberRunHooks(ctx)
+
+    await hooks.on_agent_start(MagicMock(), MagicMock())
+    await hooks.on_llm_start(MagicMock(), MagicMock(), None, [])
+
+    assert ctx.enforcement_pass_count == 1
+    assert ctx.model_calls_this_turn == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("called_tools", "expected_count"),
+    [
+        pytest.param(["edit_block"], 0, id="no-build-test-call"),
+        pytest.param(["run_blocks_and_collect_debug"], 1, id="one-build-test-call"),
+        pytest.param(["edit_block_and_run", "update_and_run_blocks"], 2, id="two-build-test-calls"),
+        pytest.param(["run_blocks_and_collect_debug", "request_credential"], 1, id="build-test-beside-a-card"),
+    ],
+)
+async def test_on_llm_end_counts_the_responses_build_test_calls_before_any_of_them_runs(
+    called_tools: list[str], expected_count: int
+) -> None:
+    ctx = make_ember_ctx()
+    ctx.build_test_tool_calls_in_model_response = 99
+    response = SimpleNamespace(output=[SimpleNamespace(name=name) for name in called_tools])
+
+    await EmberRunHooks(ctx).on_llm_end(MagicMock(), MagicMock(), response)
+
+    assert ctx.build_test_tool_calls_in_model_response == expected_count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_reason", "dispatched_this_turn", "expected_halt"),
+    [
+        pytest.param(SUPERSEDED_BY_NEWER_TEST_REASON, True, True, id="superseded-this-turn"),
+        pytest.param("The extraction block found no matching element.", True, False, id="ordinary-failure"),
+        pytest.param(SUPERSEDED_BY_NEWER_TEST_REASON, False, False, id="superseded-in-an-earlier-turn"),
+        pytest.param(SUPERSEDED_BY_NEWER_TEST_REASON, False, False, id="inherited-by-a-repair-turn"),
+    ],
+)
+async def test_a_superseded_build_test_run_stops_the_turn_before_it_can_dispatch_another(
+    failure_reason: str, dispatched_this_turn: bool, expected_halt: bool
+) -> None:
+    ctx = make_ember_ctx()
+    if dispatched_this_turn:
+        ctx.dispatched_run_ids_this_turn.add("wr_this_turn")
+    else:
+        # What a repair turn inherits: seeded as the turn's last run, but never dispatched here.
+        ctx.last_run_blocks_workflow_run_id = "wr_this_turn"
+    await _halt_turn_if_superseded(
+        ctx,
+        SimpleNamespace(failure_reason=failure_reason),
+        workflow_run_id="wr_this_turn",
+    )
+    output = _mcp_text_output({"ok": False, "data": {"workflow_run_id": "wr_this_turn"}})
+    tool = fake_tool("run_blocks_and_collect_debug")
+
+    if not expected_halt:
+        await EmberRunHooks(ctx).on_tool_end(_UNUSED, _UNUSED, tool, output)
+        assert ctx.turn_halt is None
+        return
+
+    with pytest.raises(EmberTurnHalt) as raised:
+        await EmberRunHooks(ctx).on_tool_end(_UNUSED, _UNUSED, tool, output)
+    assert raised.value.halt.kind is TurnHaltKind.BUILD_TEST_SUPERSEDED
+    assert raised.value.halt.run_refs == {"workflow_run_id": "wr_this_turn"}
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_run_still_drains_after_its_reason_is_overwritten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The superseded run's own finalizer can overwrite the reason on the run row, so the drain
+    falls back to copilot's record of what it ended."""
+    import skyvern.forge.sdk.ember.tools.run_execution as run_execution_module
+
+    was_superseded = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        run_execution_module,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(workflow_params=SimpleNamespace(build_test_run_was_superseded=was_superseded))
+        ),
+    )
+    ctx = make_ember_ctx(workflow_copilot_chat_id="wcc_1")
+    ctx.dispatched_run_ids_this_turn.add("wr_this_turn")
+
+    await _halt_turn_if_superseded(
+        ctx,
+        SimpleNamespace(failure_reason="code_block block failed. failure reason: Target page closed"),
+        workflow_run_id="wr_this_turn",
+    )
+
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind is TurnHaltKind.BUILD_TEST_SUPERSEDED
+    was_superseded.assert_awaited_once()
+
+
+CONTINUATION_RUN_OTP = "424242"
+CONTINUATION_RUN_PASSWORD = "Sp1r!t-Level-2026"
+
+
+def _terminal_credential_run_ctx() -> AgentContext:
+    ctx = make_ember_ctx(browser_session_id="pbs_run")
+    clear_session_scrub_values("pbs_run")
+    ctx.last_run_blocks_browser_session_id = "pbs_run"
+    ctx.last_run_blocks_workflow_run_id = "wr_credential"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_credential",
+        parameters={"password": CONTINUATION_RUN_PASSWORD, "totp": CONTINUATION_RUN_OTP},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    register_secret_scrub_values_from_structure(ctx, ctx.origin_run_redaction_registry.parameters)
+    return ctx
+
+
+class TestSensitiveOriginActionContinuation:
+    @pytest.mark.asyncio
+    async def test_click_continues_on_the_page_a_terminal_credential_run_left(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = _terminal_credential_run_ctx()
+        landed_page = {
+            "page_title": f"Web analytics {CONTINUATION_RUN_PASSWORD}",
+            "forms": [
+                {
+                    "fields": [{"name": "range", "label": "Date range", "type": "select", "selector": "#range"}],
+                    "submit_controls": [{"text": "Apply", "type": "submit", "selector": "#apply"}],
+                }
+            ],
+            "navigation_targets": [],
+            "result_containers": [{"tag": "table", "id": "trends", "selector": "#trends"}],
+        }
+        ctx.discovery_mcp_server = SimpleNamespace(
+            call_internal_tool=AsyncMock(return_value={"ok": True, "data": {"result": landed_page}})
+        )
+        ctx.supports_vision = False
+
+        assert await mcp_hooks._click_pre_hook({"selector": "a.nav--analytics"}, ctx) is None
+        result = await mcp_hooks._click_post_hook(
+            {
+                "ok": True,
+                "data": {"selector": "a.nav--analytics", "text_content": f"Web analytics {CONTINUATION_RUN_OTP}"},
+            },
+            {"browser_context": {"url": f"http://pathfold.test/app?code={CONTINUATION_RUN_OTP}", "title": "Pathfold"}},
+            ctx,
+        )
+
+        assert result["ok"] is True
+        assert ctx.scouted_interactions, "the continuation click was not recorded"
+        # The page the click reached is observed and retained, not just the click itself: a
+        # click-reached block can be authored against it without a separate inspection.
+        assert ctx.last_scout_act_observe_packet is not None
+        assert result["observation_step"] is not None
+        assert result["data"]["observation_step"] == result["observation_step"]
+        # Every retained store, the interaction-reached URLs included, is free of both run secrets.
+        retained = json.dumps(
+            {
+                "scouted_interactions": ctx.scouted_interactions,
+                "scout_trajectory": ctx.scout_trajectory,
+                "flow_evidence": ctx.flow_evidence,
+                "composition_page_evidence": ctx.composition_page_evidence,
+                "act_observe_packet": ctx.last_scout_act_observe_packet,
+            },
+            default=str,
+        )
+        assert CONTINUATION_RUN_PASSWORD not in retained
+        assert CONTINUATION_RUN_OTP not in retained
+        assert ctx.pending_screenshots == []
+
+    @pytest.mark.asyncio
+    async def test_a_retained_selector_a_secret_rewrote_is_dropped_not_kept_dead(self) -> None:
+        """A six-digit code can occur inside an id by chance; a placeholder there is a dead locator
+        that would fail a later run silently, so the whole locator identity is dropped: the synthesizer
+        must not fall back from the dropped selector to a role/name pair that carries the placeholder."""
+        ctx = _terminal_credential_run_ctx()
+        register_secret_scrub_value(ctx, CONTINUATION_RUN_OTP)
+
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="click",
+            selector=f"#row-{CONTINUATION_RUN_OTP} button",
+            source_url=f"http://pathfold.test/app?code={CONTINUATION_RUN_OTP}",
+            accessible_name=f"Verify {CONTINUATION_RUN_OTP}",
+            role="button",
+        )
+
+        recorded = ctx.scouted_interactions[-1]
+        assert not set(recorded) & set(scouting_module._RETAINED_LOCATOR_IDENTITY_FIELDS)
+        assert recorded["source_url"] == f"http://pathfold.test/app?code={REDACTED_SECRET_PLACEHOLDER}"
+        assert CONTINUATION_RUN_OTP not in json.dumps(ctx.scout_trajectory)
+
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="drag",
+            selector="#card",
+            destination={"selector": f"#lane-{CONTINUATION_RUN_OTP}", "role": "list"},
+        )
+
+        dragged = ctx.scouted_interactions[-1]
+        assert not set(dragged) & set(scouting_module._RETAINED_LOCATOR_IDENTITY_FIELDS)
+        assert CONTINUATION_RUN_OTP not in json.dumps(ctx.scout_trajectory)
+
+
+@pytest.mark.asyncio
+async def test_schedule_pre_hook_only_blocks_chat_history_visible_proposals(monkeypatch: pytest.MonkeyPatch) -> None:
+    canonical = SimpleNamespace(model_dump=lambda **_: {"title": "Saved workflow"})
+    current_fingerprint = proposal_workflow_fingerprint(canonical)
+    monkeypatch.setattr(mcp_hooks, "_schedule_parameters_credential_pre_hook", AsyncMock(return_value=None))
+    ctx = make_ember_ctx(workflow_copilot_chat_id="chat-test")
+
+    for fingerprint, disposition, expected_pending in (
+        ("", "accepting", False),
+        ("stale", "review_untested", False),
+        (None, None, True),
+        (current_fingerprint, "accepting", True),
+    ):
+        proposal: dict[str, Any] = {"_copilot_yaml": "title: Draft\n"}
+        if fingerprint is not None:
+            proposal["_copilot_proposal"] = {
+                "owner_turn_id": "turn-test",
+                "revision": 1,
+                "canonical_fingerprint": fingerprint,
+                "disposition": disposition,
+            }
+        chat = SimpleNamespace(proposed_workflow=proposal, workflow_permanent_id="wfp-test")
+        monkeypatch.setattr(
+            app.DATABASE.workflow_params,
+            "get_ember_chat_by_id",
+            AsyncMock(return_value=chat),
+        )
+        monkeypatch.setattr(
+            app.DATABASE.workflows,
+            "get_workflow_by_permanent_id",
+            AsyncMock(return_value=canonical),
+        )
+
+        result = await mcp_hooks._create_workflow_schedule_pre_hook({}, ctx)
+
+        assert (result is not None) is expected_pending

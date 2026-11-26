@@ -73,6 +73,7 @@ import {
   buildWorkflowSaveRequest,
   buildEmberContext,
   restoreEmberSettings,
+  withheldEmberSettingsDigest,
 } from "./workflowYamlDocument";
 import {
   normalizeRetryPolicy,
@@ -386,6 +387,19 @@ describe("buildWorkflowYamlDocument", () => {
 });
 
 describe("settings patch validation and merge", () => {
+  test("a header-only edit changes the withheld-settings digest, not the Ember document", () => {
+    const edited = input();
+    edited.settings.extraHttpHeaders = JSON.stringify({ "X-Edited": "1" });
+    const before = buildEmberContext(input());
+    const after = buildEmberContext(edited);
+    expect(after.document).toEqual(before.document);
+    const unchanged = withheldEmberSettingsDigest(
+      buildEmberContext(input()).snapshot,
+    );
+    expect(withheldEmberSettingsDigest(before.snapshot)).toBe(unchanged);
+    expect(withheldEmberSettingsDigest(after.snapshot)).not.toBe(unchanged);
+  });
+
   test("round-trips a null proxy through YAML, canvas, save, and Ember context", () => {
     const data = input();
     data.settings.proxyLocation = null;
@@ -2052,11 +2066,11 @@ describe("metadata lifecycle", () => {
       titleHasBeenGenerated: false,
       description: "Reopened workflow",
     });
-    store.setTitleFromEmberIfDefault("Copilot title");
+    store.setTitleFromEmberIfDefault("Ember title");
     store.initializeTitle("New Agent", "wpid_next");
     store.syncTitleFromWorkflow("New Workflow");
     expect(useWorkflowTitleStore.getState()).toMatchObject({
-      title: "Copilot title",
+      title: "Ember title",
       titleHasBeenGenerated: true,
     });
     store.setTitleFromGeneration("Generated title");
@@ -2942,7 +2956,7 @@ describe("regular save transactions", () => {
   test.each([
     ["yaml", "A YAML commit is in progress"],
     ["save", "A save is in progress"],
-    ["copilot", "Wait for the Copilot change to finish"],
+    ["copilot", "Wait for the Ember change to finish"],
   ])("refuses a save during %s", async (lock, message) => {
     const { owner, view, client } = mountSave();
     if (lock === "yaml") beginYamlCommit(owner);

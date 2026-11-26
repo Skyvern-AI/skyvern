@@ -20,7 +20,7 @@ keywords:
   - password
 ---
 
-Everything in Skyvern (agents, runs, credentials, API keys, credits) belongs to an **organization**. Open **Settings** from the menu under your organization name at the top of the sidebar: **Organization settings** opens the organization pages, **Account settings** opens your personal ones.
+Everything in Skyvern (agents, runs, credentials, API keys, credits) belongs to an **organization**. Click **Settings**, the last row of the sidebar's main navigation, to open the organization pages. The menu under your organization name at the top of the sidebar opens them too: **Organization settings** opens the organization pages, **Account settings** opens your personal ones.
 
 | Group | Page | What it holds |
 |---|---|---|
@@ -39,6 +39,8 @@ Everything in Skyvern (agents, runs, credentials, API keys, credits) belongs to 
 ## API keys
 
 Your API key authenticates every API, SDK, CLI and MCP request for your organization. Every Admin and Member can open this page, unless your organization enables [role-based access control](#roles) and withholds **API keys: View** from their role.
+
+Skyvern creates the key when your [trial](#your-14-day-trial) starts or when you start a plan. Until your organization adds a card it holds no key, and the app opens **Start your 14-day trial** in place of any other page, **Settings → API keys** and **Settings → Billing** included. Add your card there to start the trial. Rotating, creating or reissuing a key, signing in with the CLI, and signing in from an MCP client are refused with `402` and `Add a card to start your 14-day Skyvern trial at https://app.skyvern.com`. An organization whose trial has ended or whose trial credits are used up is refused the same way, and its message points at Billing to [choose a plan](#plans).
 
 <Steps>
   <Step title="Open API keys">
@@ -108,11 +110,11 @@ curl https://api.skyvern.com/.well-known/oauth-protected-resource
 
 | Property | Value |
 | --- | --- |
-| Issuer | `https://clerk.skyvern.com` |
+| Issuer | `https://api.skyvern.com` |
 | Authorization endpoint | `https://api.skyvern.com/oauth/authorize` |
 | Token endpoint | `https://api.skyvern.com/oauth/token` |
 | Revocation endpoint | `https://clerk.skyvern.com/oauth/token/revoke` |
-| Dynamic client registration | `https://clerk.skyvern.com/oauth/register` |
+| Dynamic client registration | `https://api.skyvern.com/oauth/register` |
 | Grant types | `authorization_code`, `refresh_token` |
 | PKCE | `S256` required |
 | Protected resource | `https://api.skyvern.com/mcp` |
@@ -146,7 +148,7 @@ Each person in an organization is an **Admin**, a **Member** or a **Billing Admi
 
 **Role-based access control is opt-in and needs the Enterprise plan.** Until an Admin turns it on, a Member can access most organization actions. Managing member roles and SFTP and Concord fax adapter configuration remain Admin-only either way, including configuration reads and writes. A Member can't grant themselves more access or switch role-based access control on.
 
-Once an Admin enables it, each person's role decides what they can do and requests outside their role are refused with `403`. That covers event triggers, additional organization API keys, the 1Password connection, the [audit log](#audit-log) export and the rest of the organization's actions. On [Integrations](/cloud/integrations), a role without the grant sees **Admin required** or **Organization admin access is required** in place of the connect and configure buttons. Elsewhere the control stays visible but disabled, and hovering it shows **Organization admin access is required for this action.** That covers the trash icon and the bulk **Delete** button on Credentials, both cards on **Settings → Models**, and the fields and **Save** button on **Settings → Limits**. A Copilot card that would delete credentials reads **Ask an Admin to delete this credential.** for one credential or **Ask an Admin to delete these credentials.** for several, and offers only **Cancel**. While Skyvern is still checking your role, the control is disabled and the tooltip reads **Checking permissions…**.
+Once an Admin enables it, each person's role decides what they can do and requests outside their role are refused with `403`. That covers event triggers, additional organization API keys, the 1Password connection, the [audit log](#audit-log) export and the rest of the organization's actions. On [Integrations](/cloud/integrations), a role without the grant sees **Admin required** or **Organization admin access is required** in place of the connect and configure buttons. Elsewhere the control stays visible but disabled, and hovering it shows **Organization admin access is required for this action.** That covers the trash icon and the bulk **Delete** button on Credentials, both cards on **Settings → Models**, and the fields and **Save** button on **Settings → Limits**. A Copilot card that would delete credentials reads **Ask an Admin to delete this credential.** for one credential or **Ask an Admin to delete these credentials.** for several, and offers only **Cancel**. A role that may delete only the agents it created keeps the delete item in an agent's row menu, the **...** menu on the agent's page and the bulk **Actions** menu, but on someone else's agent the item is disabled and shows **You can only delete agents you created.** beneath it; select your own agents together with a teammate's and the bulk item adds **Deselect the others to delete the rest.** A role with no agent-delete grant reads **Your role cannot delete agents.** instead. While Skyvern is still checking your role, the control is disabled and the tooltip reads **Checking permissions…**.
 
 These limits also apply whether or not you enable role-based access control:
 
@@ -261,7 +263,7 @@ Open **Settings → Billing**. On the Trial and Hobby plans, the **Upgrade plan*
 
 ### How credits are used
 
-One credit is $0.001. Credits are charged for what the browser does:
+One credit is $0.001. Credits are charged for what the browser and the AI do:
 
 | Usage | Credits |
 |---|---|
@@ -270,8 +272,9 @@ One credit is $0.001. Credits are charged for what the browser does:
 | Browser uptime | 200 per hour ($0.20) |
 | One-time code read from an email or text message | 10 ($0.01) |
 | Agent block tool call, including reads of the run's data (not counting `finish`) | 30 ($0.03) |
+| Text Prompt or PDF Fill block | 30 ($0.03) per block |
 
-A short login takes a few actions; a long multi-page run takes many more. Two job recipes have their own prices: applying to a job costs 200 credits per application (400 when it signs in with a saved login), and extracting a job posting costs 50 credits per attempt. Other recipes are billed like any other run. The blocks an Agent block runs are billed as usual.
+A short login takes a few actions; a long multi-page run takes many more. Two job recipes have their own prices: applying to a job costs 200 credits per application (400 when it signs in, with a username and password or with a saved `credential_id`), and extracting a job posting costs 50 credits per attempt. The price is charged when the run starts, so a run that stops early keeps it, for example when a saved login may not sign in on the job's sign-in page. Other recipes are billed like any other run. The blocks an Agent block runs are billed as usual.
 
 A Code block that performs no browser actions is charged one cached action (15 credits) the first time it runs successfully in a workflow run. Later executions of the same block in that workflow run, such as loop iterations, that perform no browser actions are free. A retried run can be charged this minimum again.
 
@@ -298,11 +301,11 @@ Trial credits don't reset and end with the trial. Click **Subscribe** on the Hob
 
 ### Extra credits and payment
 
-On a paid plan, **Buy Extra Credits** lets you top up with a one-time purchase (\$10, \$25, \$50, \$100 or a custom amount). Some plans also offer monthly add-on credit packs under **Add more credits**. Click **Manage Payment Methods** to update your card, see invoices and change billing details.
+On a paid plan, **Buy Extra Credits** lets you top up with a one-time purchase (\$10, \$25, \$50, \$100 or a custom amount). Some plans also offer monthly add-on credit packs under **Add more credits**. Click **Manage Payment Methods** to update your card, see invoices and change billing details. During a trial, **Payment Method** shows your saved card and the same **Manage Payment Methods** button. Once you cancel the trial, or after it ends, open the **...** menu next to the card and choose **Remove card** to delete it. While the trial will still charge on day 14, cancel it first. Resuming a trial needs a card on file.
 
 ### Runs refused for credits
 
-Skyvern checks credits before it starts a run and returns `402` if they don't cover it. Scheduled runs and retries are checked as they start, so an out-of-credit run fails before a browser opens. Code blocks and cached actions are checked when the run reaches them: a refused block fails and the run stops, even when **On block failure** would otherwise continue.
+Skyvern checks credits before it starts a run and returns `402` if they don't cover it. Scheduled runs and retries are checked as they start, so an out-of-credit run fails before a browser opens. Code, Text Prompt and PDF Fill blocks and cached actions are checked when the run reaches them: a refused block fails and the run stops, even when **On block failure** would otherwise continue.
 
 | Message | Why | Fix |
 |---|---|---|

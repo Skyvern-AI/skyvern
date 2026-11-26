@@ -30,7 +30,6 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     deregister_custom_llm_config,
     register_custom_llm_config,
 )
-from skyvern.forge.sdk.copilot.challenge_evidence import is_carrier_backed_category_entry
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -43,6 +42,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunBlockModel,
     WorkflowRunModel,
 )
+from skyvern.forge.sdk.ember.challenge_evidence import is_carrier_backed_category_entry
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.forge.sdk.schemas.har_evidence import (
@@ -943,7 +943,13 @@ async def test_a_task_v2_roots_matched_code_is_stored_and_served_with_its_run_se
         await session.execute(
             TaskV2Model.__table__.update()
             .where(TaskV2Model.observer_cruise_id == task_v2_id)
-            .values(status="running", failure_category=None, error_code_mapping=ROOT_MAPPING, prompt="goal")
+            .values(
+                status="running",
+                failure_category=None,
+                error_code_mapping=ROOT_MAPPING,
+                prompt="goal",
+                otp_request_id="otpr_response",
+            )
         )
         await session.commit()
     run_context = WorkflowRunContext("ffd", f"w_{run_id}", f"wpid_{run_id}", run_id, aws_client=MagicMock())
@@ -985,6 +991,7 @@ async def test_a_task_v2_roots_matched_code_is_stored_and_served_with_its_run_se
     assert len(calls) == 1 and run.failure_category == stored.failure_category
     assert stored.failure_category[0] == PRIMARY and stored.status.value == "failed"
     assert [(e["error_code"], e["error_type"]) for e in api.errors or []] == [("BOT_WALL", "USER_DEFINED_ERROR")]
+    assert api.run_request is not None and api.run_request.otp_request_id == "otpr_response"
     payload = deliver.await_args.kwargs["payload"]
     for served in (
         json.dumps(stored.failure_category),

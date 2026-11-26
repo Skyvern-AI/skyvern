@@ -169,7 +169,7 @@ class PersistentSessionsManager(Protocol):
         ...
 
     async def get_observer_browser_state(
-        self, session_id: str, organization_id: str | None = None
+        self, session_id: str, organization_id: str | None = None, *, for_profile_capture: bool = False
     ) -> BrowserState | None:
         """Get the browser state for a session to watch it, never to drive it.
 
@@ -241,12 +241,25 @@ class PersistentSessionsManager(Protocol):
         created_for_workflow_run_id: str | None = None,
         created_for_workflow_permanent_id: str | None = None,
         bot_protection: BotProtection | None = None,
+        workflow_permanent_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session.
 
         A create cancelled before it returns can still start a browser that the manager may not clean up, so a
         cancellable caller shields the create and closes the session it returns.
         """
+        ...
+
+    async def resolve_session_proxy_location(
+        self,
+        browser_session: PersistentBrowserSession,
+        proxy_location: ProxyLocationInput,
+        *,
+        workflow_permanent_id: str | None = None,
+    ) -> ProxyLocationInput: ...
+
+    async def session_records_managed_egress(self, browser_session: PersistentBrowserSession) -> bool:
+        """Whether the session records the egress its location names in this deployment; False when unverifiable."""
         ...
 
     async def create_fresh_exit_session(

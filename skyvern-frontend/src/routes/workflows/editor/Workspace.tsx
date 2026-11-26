@@ -182,9 +182,11 @@ import {
   createNode,
   defaultEdge,
   generateNodeLabel,
+  getUniqueLabelForExistingNode,
   layout,
   startNode,
   getWorkflowBlocks,
+  keepUneditedBlockFields,
   getWorkflowErrors,
   upgradeWorkflowDefinitionToVersionTwo,
   withGoalUndoRecordsFrom,
@@ -390,7 +392,7 @@ export function useWorkspaceEmberUpdate({
         applyWorkflowUpdate(workflowData, { ...options, userDriven: true }) ===
         false
       )
-        throw new Error("The editor refused the Copilot update");
+        throw new Error("The editor refused the Ember update");
       const { fire, nextState } = shouldAutoOpenEditor(
         editorAutoOpenStateRef.current,
         {
@@ -1582,7 +1584,7 @@ function Workspace({
           variant: "destructive",
           title: "SOP not received",
           description:
-            "The SOP file did not reach the editor. Use Upload an SOP in the Copilot panel to try again.",
+            "The SOP file did not reach the editor. Use Upload an SOP in the Ember panel to try again.",
         });
       // After staging: opening the Ember pane navigates with the current URL, which would
       // put the marker back if it ran after this rewrite.
@@ -1609,6 +1611,11 @@ function Workspace({
       setTimeout(() => {
         // Get the latest nodes and edges (including visibility changes)
         const currentNodes = getNodes() as Array<AppNode>;
+        // Read-only comparison canvases also fire this event while the main canvas is
+        // unmounted; writing back the empty store would remount it with no nodes.
+        if (currentNodes.length === 0) {
+          return;
+        }
         const currentEdges = getEdges();
 
         const layoutedElements = layout(currentNodes, currentEdges, blockLabel);
@@ -1656,15 +1663,12 @@ function Workspace({
     const id = nanoid();
     // Use global label tracking instead of just current nodes
     const existingLabels = Array.from(usedLabelsRef.current);
-    const newLabel =
-      label && !existingLabels.includes(label)
-        ? label
-        : generateNodeLabel(
-            existingLabels,
-            useWorkflowParametersStore
-              .getState()
-              .parameters.map((parameter) => parameter.key),
-          );
+    const parameterKeys = useWorkflowParametersStore
+      .getState()
+      .parameters.map((parameter) => parameter.key);
+    const newLabel = label
+      ? getUniqueLabelForExistingNode(label, existingLabels, parameterKeys)
+      : generateNodeLabel(existingLabels, parameterKeys);
     const computedParentId = parent ?? branch?.conditionalNodeId;
     const node = createNode(
       { id, parentId: computedParentId },
@@ -1821,6 +1825,12 @@ function Workspace({
       workflow_permanent_id: workflow.workflow_permanent_id,
       block_type: blockTypeFromNode(node) ?? nodeType,
       position: previousNodeIndex + 1,
+      ...(integrationAction && node.type === "integrationAction"
+        ? {
+            integration_id: integrationAction.integrationId,
+            integration_action: integrationAction.actionId,
+          }
+        : {}),
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
     if (select) useWorkflowPanelStore.getState().setSelectedBlockId(id);
@@ -2189,7 +2199,13 @@ function Workspace({
         true,
         workflowEffectiveDefaultEngine(saveData.workflow, queryClient),
       );
-      const repairedBlocks = getWorkflowBlocks(repairedNodes, repairedEdges);
+      const repairedBlocks = keepUneditedBlockFields(
+        getWorkflowBlocks(repairedNodes, repairedEdges),
+        {
+          ...saveData.workflow,
+          workflow_definition: response.data.workflow_definition,
+        },
+      );
       settings.finallyBlockLabel = resolveFinallyBlockLabel(
         settings.finallyBlockLabel,
         settingsPatch,
@@ -2326,7 +2342,7 @@ function Workspace({
     // A restore would replace the canvas a pending Ember proposal is staged on.
     if (useEmberProposalStore.getState().proposal) {
       toast({
-        title: "Resolve the Copilot proposal before restoring a version.",
+        title: "Resolve the Ember proposal before restoring a version.",
         variant: "destructive",
       });
       return;
@@ -2352,12 +2368,34 @@ function Workspace({
       workflowEffectiveDefaultEngine(selectedVersion, queryClient),
     );
 
+    // Studio Save ignores a clean editor, so mark the restore as an edit; the
+    // Save dialog diffs it against the existing baseline (or the pre-restore
+    // draft if none). contentDirty too, or the Doc clears it as "back to saved"
+    // before the remount recomputes it. Reselecting the loaded version on a
+    // clean editor changes nothing, so it stays clean.
+    if (
+      selectedVersion.version !== workflow.version ||
+      useWorkflowHasChangesStore.getState().hasChanges
+    ) {
+      useWorkflowSnapshotStore.getState().markUserEdit();
+      useWorkflowSnapshotStore.setState({ contentDirty: true });
+      workflowChangesStore.setHasChanges(true);
+    }
+
     const collapsedSet = useNodeCollapseStore.getState().collapsed;
     const wpid = workflowPermanentId ?? "__global__";
     setNodes(
       replayPersistedCollapseVisibility(elements.nodes, wpid, collapsedSet),
     );
     setEdges(elements.edges);
+    setParameterBaselines((current) => ({
+      ...current,
+      [selectedVersion.workflow_permanent_id]:
+        selectedVersion.workflow_definition.parameters,
+    }));
+    useWorkflowParametersStore
+      .getState()
+      .setParameters(getInitialParameters(selectedVersion));
     const titleStore = useWorkflowTitleStore.getState();
     titleStore.clearEmberMetadata(selectedVersion.workflow_permanent_id);
     titleStore.trackEmberMetadata(
@@ -2956,6 +2994,7 @@ function Workspace({
                           // to type into and a session resting on about:blank has
                           // no way out (SKY-13705).
                           enableUrlInput={true}
+                          showConsole={true}
                           onReadyChange={handleLiveBrowserReadyChange}
                         />
                       ) : (

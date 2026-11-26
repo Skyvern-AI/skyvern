@@ -711,18 +711,13 @@ def test_parse_click_double_click_true() -> None:
     assert action.repeat == 2
 
 
-def test_parse_click_double_click_false() -> None:
+@pytest.mark.parametrize("double_click", [False, None])
+def test_parse_click_single_click_by_default(double_click: bool | None) -> None:
+    payload = {"action_type": "CLICK", "id": "1", "reasoning": "test"}
+    if double_click is not None:
+        payload["double_click"] = double_click
     action = parse_action(
-        action={"action_type": "CLICK", "id": "1", "reasoning": "test", "double_click": False},
-        scraped_page=_mock_scraped_page(),
-    )
-    assert isinstance(action, ClickAction)
-    assert action.repeat == 1
-
-
-def test_parse_click_no_double_click_field() -> None:
-    action = parse_action(
-        action={"action_type": "CLICK", "id": "1", "reasoning": "test"},
+        action=payload,
         scraped_page=_mock_scraped_page(),
     )
     assert isinstance(action, ClickAction)

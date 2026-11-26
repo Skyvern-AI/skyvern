@@ -68,8 +68,30 @@ function GoogleSheetsWriteEditorBody({
   blockId: string;
   data: GoogleSheetsWriteNodeData;
 }) {
-  const { editable } = data;
+  const update = useUpdate<GoogleSheetsWriteNodeData>({
+    id: blockId,
+    editable: data.editable,
+  });
+  return (
+    <GoogleSheetsWriteFields blockId={blockId} data={data} update={update} />
+  );
+}
 
+type GoogleSheetsWriteFieldsProps = {
+  blockId: string;
+  data: GoogleSheetsWriteNodeData;
+  update: (updates: Partial<GoogleSheetsWriteNodeData>) => unknown;
+  showAccount?: boolean;
+  showParameters?: boolean;
+};
+
+function GoogleSheetsWriteFields({
+  blockId,
+  data,
+  update,
+  showAccount = true,
+  showParameters = true,
+}: GoogleSheetsWriteFieldsProps) {
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const availableOutputParameterKeys = getAvailableOutputParameterKeys(
@@ -77,11 +99,6 @@ function GoogleSheetsWriteEditorBody({
     edges,
     blockId,
   );
-
-  const update = useUpdate<GoogleSheetsWriteNodeData>({
-    id: blockId,
-    editable,
-  });
 
   const [spreadsheetDisplayName, setSpreadsheetDisplayName] = useState<
     string | null
@@ -156,39 +173,43 @@ function GoogleSheetsWriteEditorBody({
   return (
     <div data-testid="google-sheets-write-block-form" className="space-y-4">
       <div className="space-y-3">
-        <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-          Connection
-        </div>
+        {showAccount ? (
+          <>
+            <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              Connection
+            </div>
 
-        <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-tertiary-foreground">
-              Google Account
-            </Label>
-            <HelpTooltip
-              content={
-                helpTooltips["google_sheets_write"]?.["credentialId"] ??
-                "The Google account used to authenticate with the spreadsheet"
-              }
-            />
-          </div>
-          <GoogleOAuthCredentialSelector
-            nodeId={blockId}
-            value={data.credentialId}
-            onChange={(next) => update({ credentialId: next })}
-            requiredScopes={GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES}
-          />
-          {needsReconnect ? (
-            <a
-              href="/integrations"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[0.7rem] text-amber-700 hover:bg-amber-100 dark:border-amber-600/50 dark:bg-amber-900/30 dark:text-amber-200 dark:hover:bg-amber-900/50"
-            >
-              Reconnect this Google account
-            </a>
-          ) : null}
-        </div>
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Label className="text-xs text-tertiary-foreground">
+                  Google Account
+                </Label>
+                <HelpTooltip
+                  content={
+                    helpTooltips["google_sheets_write"]?.["credentialId"] ??
+                    "The Google account used to authenticate with the spreadsheet"
+                  }
+                />
+              </div>
+              <GoogleOAuthCredentialSelector
+                nodeId={blockId}
+                value={data.credentialId}
+                onChange={(next) => update({ credentialId: next })}
+                requiredScopes={GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES}
+              />
+              {needsReconnect ? (
+                <a
+                  href="/integrations"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[0.7rem] text-amber-700 hover:bg-amber-100 dark:border-amber-600/50 dark:bg-amber-900/30 dark:text-amber-200 dark:hover:bg-amber-900/50"
+                >
+                  Reconnect this Google account
+                </a>
+              ) : null}
+            </div>
+          </>
+        ) : null}
 
         <div className="space-y-2">
           <div className="flex items-center justify-between gap-2">
@@ -519,13 +540,15 @@ function GoogleSheetsWriteEditorBody({
                 </Label>
                 <HelpTooltip content="Auto-create the target sheet tab before writing. Required when looping with a dynamic sheet name like sheet_{{ current_index }}." />
               </div>
-              <ParametersMultiSelect
-                availableOutputParameters={availableOutputParameterKeys}
-                parameters={data.parameterKeys}
-                onParametersChange={(parameterKeys) => {
-                  update({ parameterKeys });
-                }}
-              />
+              {showParameters ? (
+                <ParametersMultiSelect
+                  availableOutputParameters={availableOutputParameterKeys}
+                  parameters={data.parameterKeys}
+                  onParametersChange={(parameterKeys) => {
+                    update({ parameterKeys });
+                  }}
+                />
+              ) : null}
             </div>
           </AccordionContent>
         </AccordionItem>
@@ -534,4 +557,4 @@ function GoogleSheetsWriteEditorBody({
   );
 }
 
-export { GoogleSheetsWriteEditor };
+export { GoogleSheetsWriteEditor, GoogleSheetsWriteFields };

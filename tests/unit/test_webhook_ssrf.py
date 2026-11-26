@@ -8,8 +8,11 @@ was validated, or a rebinding host answers again with a private address at conne
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import socket
 import time
+import zlib
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,9 +20,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, FailedToGetTOTPVerificationCode, SkyvernHTTPException
+from skyvern.forge import agent_functions as agent_functions_module
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.models import WorkflowRunAttemptModel
 from skyvern.forge.sdk.routes import webhooks as webhook_routes
@@ -39,6 +44,59 @@ METADATA_IP = "169.254.169.254"
 
 
 pytestmark = pytest.mark.usefixtures("no_env_proxy")
+
+
+class _OverflowThenPoison(httpx.AsyncByteStream):
+    def __init__(self, limit: int, wire_encoding: str | None = None) -> None:
+        self.limit = limit
+        self.wire_encoding = wire_encoding
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        if self.wire_encoding == "empty-gzip":
+            return
+        if self.wire_encoding == "gzip-members":
+            member_size = 64 * 1024 + 1
+            wire_body = gzip.compress(b"a" * member_size) + gzip.compress(b"b" * member_size)
+            for offset in range(0, len(wire_body), 100):
+                yield wire_body[offset : offset + 100]
+            return
+        if self.wire_encoding == "gzip":
+            yield gzip.compress(b"a" * self.limit + b"b")
+            raise AssertionError("response reader continued after detecting overflow")
+        if self.wire_encoding == "truncated-gzip":
+            yield gzip.compress(b"a")[:-8]
+            return
+        if self.wire_encoding == "raw-deflate":
+            compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+            yield compressor.compress(b"a" * self.limit + b"b") + compressor.flush()
+            raise AssertionError("response reader continued after detecting overflow")
+        yield b"a" * self.limit
+        yield b"b"
+        raise AssertionError("response reader continued after detecting overflow")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _StaticAsyncBody(httpx.AsyncByteStream):
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self.body
+
+
+def _async_response(status_code: int, *, body: bytes = b"", headers: dict[str, str] | None = None) -> httpx.Response:
+    return httpx.Response(status_code, headers=headers, stream=_StaticAsyncBody(body))
+
+
+def _async_json_response(status_code: int, value: object) -> httpx.Response:
+    return _async_response(
+        status_code,
+        body=json.dumps(value).encode(),
+        headers={"Content-Type": "application/json"},
+    )
 
 
 @pytest.mark.asyncio
@@ -195,7 +253,9 @@ def capture_connect_target(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]
         captured["connect_host"] = request.url.host
         captured["sni_hostname"] = request.extensions.get("sni_hostname")
         captured["host_header"] = request.headers.get("host")
-        return httpx.Response(200, text="ok")
+        if isinstance(response := captured.get("response"), httpx.Response):
+            return response
+        return _async_response(200, body=b"ok")
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _capture)
     return captured
@@ -226,10 +286,37 @@ async def test_pinned_client_keeps_sni_and_host_on_the_original_hostname(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wire_encoding", "status_code", "expect_error"),
+    [
+        (None, 200, False),
+        ("gzip", 200, False),
+        ("gzip-members", 200, False),
+        ("raw-deflate", 200, False),
+        ("empty-gzip", 200, False),
+        ("empty-gzip", 204, False),
+        ("empty-gzip", 304, False),
+        ("truncated-gzip", 200, True),
+    ],
+)
 async def test_test_webhook_connects_to_validated_ip_after_dns_rebind(
     rebinding_dns: None,
     capture_connect_target: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    wire_encoding: str | None,
+    status_code: int,
+    expect_error: bool,
 ) -> None:
+    member_size = 64 * 1024 + 1
+    limit = 2 * member_size if wire_encoding == "gzip-members" else 8
+    stream = _OverflowThenPoison(limit, wire_encoding)
+    content_encoding = "deflate" if wire_encoding == "raw-deflate" else "gzip" if wire_encoding else None
+    response_headers = {"Content-Encoding": content_encoding} if content_encoding else None
+    if response_headers is not None and wire_encoding == "empty-gzip":
+        response_headers["Content-Length"] = "0"
+    capture_connect_target["response"] = httpx.Response(status_code, headers=response_headers, stream=stream)
+    monkeypatch.setattr(webhook_routes, "WEBHOOK_TEST_RESPONSE_LIMIT_BYTES", limit, raising=False)
+
     with patch("skyvern.forge.sdk.routes.webhooks.app.DATABASE.organizations.get_valid_org_auth_token") as get_token:
         get_token.return_value = None
         response = await webhook_routes.test_webhook(
@@ -237,7 +324,18 @@ async def test_test_webhook_connects_to_validated_ip_after_dns_rebind(
             current_org=MagicMock(organization_id="o_1"),
         )
 
-    assert response.status_code == 200
+    assert response.status_code == status_code
+    if wire_encoding == "gzip-members":
+        assert response.response_body == "a" * member_size + "b" * member_size
+    else:
+        assert response.response_body == (
+            "" if wire_encoding in {"empty-gzip", "truncated-gzip"} else f"{'a' * limit}\n... (truncated)"
+        )
+    if expect_error:
+        assert response.error == "Unexpected error: Incomplete compressed response"
+    else:
+        assert response.error is None
+    assert stream.closed
     assert capture_connect_target["connect_host"] == PUBLIC_IP
 
     # The host has since rebound to the metadata address, so an unpinned connect would land there.
@@ -272,13 +370,21 @@ async def test_replay_reports_a_refused_target_without_an_unexpected_error() -> 
     async def _deliver(**kwargs: object) -> httpx.Response:
         raise BlockedHost("rebinding.example.test")
 
-    with patch("skyvern.services.webhook_service.app.AGENT_FUNCTION.deliver_webhook", _deliver):
+    target_url = f"{REBINDING_HOST_URL}/fake-path-token?fake_key=fake-query-value"
+    with (
+        patch("skyvern.services.webhook_service.app.AGENT_FUNCTION.deliver_webhook", _deliver),
+        capture_logs() as logs,
+    ):
         status_code, _latency, _body, error = await webhook_service._deliver_webhook(
-            url=REBINDING_HOST_URL, payload="{}", headers={}
+            url=target_url, payload="{}", headers={}
         )
 
     assert status_code is None
     assert error == "The target host was refused by SSRF protection."
+    refused = next(entry for entry in logs if entry["event"] == "Webhook replay target refused")
+    assert refused["url"] == "https://rebinding.example.test/…?…"
+    assert "fake-path-token" not in repr(logs)
+    assert "fake-query-value" not in repr(logs)
 
 
 @pytest.fixture
@@ -314,22 +420,48 @@ async def _post_totp(url: str) -> object:
 
 @pytest.mark.asyncio
 async def test_run_webhook_delivery_connects_to_validated_ip_after_dns_rebind(
-    rebinding_dns: None, oss_outbound_seams: None, capture_connect_target: dict[str, object]
+    rebinding_dns: None,
+    oss_outbound_seams: None,
+    capture_connect_target: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    limit = 8
+    stream = _OverflowThenPoison(limit)
+    capture_connect_target["response"] = httpx.Response(200, stream=stream)
+    monkeypatch.setattr(agent_functions_module, "OUTBOUND_RESPONSE_LIMIT_BYTES", limit, raising=False)
+
     response = await _deliver_run_webhook(REBINDING_HOST_URL)
 
     assert response.status_code == 200
+    assert response.content == b"a" * limit
+    assert stream.closed
     assert capture_connect_target["connect_host"] == PUBLIC_IP
     assert capture_connect_target["sni_hostname"] == "rebinding.example.test"
 
 
 @pytest.mark.asyncio
 async def test_totp_verification_post_connects_to_validated_ip_after_dns_rebind(
-    rebinding_dns: None, oss_outbound_seams: None, capture_connect_target: dict[str, object]
+    rebinding_dns: None,
+    oss_outbound_seams: None,
+    capture_connect_target: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    status_code, *_ = await _post_totp(REBINDING_HOST_URL)
+    limit = 8
+    stream = _OverflowThenPoison(limit)
+    capture_connect_target["response"] = httpx.Response(200, stream=stream)
+    monkeypatch.setattr(agent_functions_module, "OUTBOUND_RESPONSE_LIMIT_BYTES", limit, raising=False)
 
-    assert status_code == 200
+    response = await AgentFunction().post_totp_verification_request(
+        url=REBINDING_HOST_URL,
+        payload="{}",
+        headers={},
+        organization_id="o_1",
+        resolved_ips=(PUBLIC_IP,),
+    )
+
+    assert response.status_code == 200
+    assert response.body == "a" * limit
+    assert stream.closed
     assert capture_connect_target["connect_host"] == PUBLIC_IP
     assert capture_connect_target["host_header"] == "rebinding.example.test"
 
@@ -498,14 +630,19 @@ def redirecting_endpoints(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, ht
     async def _answer(self: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
         host_header = request.headers["host"]
         requests.append((request.method, request.url.host, host_header, await request.aread()))
-        return responses[host_header]
+        response = responses[host_header]
+        if isinstance(response.stream, _StaticAsyncBody):
+            return _async_response(response.status_code, body=response.stream.body, headers=dict(response.headers))
+        if isinstance(response.stream, httpx.AsyncByteStream):
+            return response
+        return _async_response(response.status_code, body=response.content, headers=dict(response.headers))
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _answer)
     return responses, requests
 
 
 def _redirect(status_code: int, location: str) -> httpx.Response:
-    return httpx.Response(status_code, headers={"Location": location})
+    return _async_response(status_code, headers={"Location": location})
 
 
 @pytest.mark.asyncio
@@ -520,7 +657,7 @@ async def test_totp_redirect_to_a_public_host_is_followed_and_pinned(
 ) -> None:
     responses, requests = redirecting_endpoints
     responses[TOTP_HOST] = _redirect(status_code, "https://next.example.test/code")
-    responses["next.example.test"] = httpx.Response(200, json={"verification_code": "123456"})
+    responses["next.example.test"] = _async_json_response(200, {"verification_code": "123456"})
 
     status, _headers, body, _is_json = await _post_totp(f"https://{TOTP_HOST}/totp")
 
@@ -598,7 +735,7 @@ async def test_totp_redirect_drops_the_signature_when_the_origin_changes(
         custom_header_seen.append("x-api-key" in request.headers)
         if len(seen) == 1:
             return _redirect(status_code, location)
-        return httpx.Response(200, json={"verification_code": "123456"})
+        return _async_json_response(200, {"verification_code": "123456"})
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _answer)
 

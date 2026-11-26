@@ -1,6 +1,10 @@
 """Tests that update_credential() accepts user_context and save_browser_session_intent
 on CredentialRepository."""
 
+import asyncio
+import errno
+import os
+from contextlib import AsyncExitStack
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,17 +13,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import BackgroundTasks, HTTPException
 from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.config import settings
 from skyvern.forge import app as forge_app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_app import ForgeApp
+from skyvern.forge.sdk.artifact.storage.base import BrowserProfileSnapshot
 from skyvern.forge.sdk.credential_site_policy import MAX_EXTRA_SITE_URLS, MAX_SITE_URL_LENGTH
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
+from skyvern.forge.sdk.executor import background_task_executor
+from skyvern.forge.sdk.executor.async_executor import CredentialProfileCreation
 from skyvern.forge.sdk.routes import credentials as credentials_routes
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
@@ -47,7 +55,10 @@ from skyvern.schemas.proxy_pinning import (
     is_proxy_session_id,
 )
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.webeye.browser_artifacts import BrowserArtifacts, CredentialProfileFinalizer
 from tests.unit.conftest import MockAsyncSessionCtx, make_mock_session
+from tests.unit.credential_profile_save import make_credential_profile_run
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _make_credential_repo(mock_credential: MagicMock) -> CredentialRepository:
@@ -721,70 +732,20 @@ async def test_repo_create_browser_profile_clears_incompatible_proxy_pin() -> No
 
 
 @pytest.mark.asyncio
-async def test_browser_profile_resave_updates_proxy_pin_after_storage_write(monkeypatch: pytest.MonkeyPatch) -> None:
-    events: list[str] = []
-
-    async def store_browser_profile(**_kwargs: object) -> None:
-        events.append("store")
-
-    async def update_browser_profile(**_kwargs: object) -> SimpleNamespace:
-        events.append("update_profile")
-        return SimpleNamespace()
-
-    async def mark_verified_login(**_kwargs: object) -> None:
-        events.append("mark_verified")
-
-    async def update_credential(**_kwargs: object) -> SimpleNamespace:
-        events.append("update_credential")
-        return SimpleNamespace()
-
-    monkeypatch.setattr(
-        forge_app.DATABASE.workflow_runs,
-        "get_workflow_run",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status=WorkflowRunStatus.completed, browser_profile_id=None, browser_sink_profile_id=None
-            )
+@pytest.mark.parametrize(
+    ("credential_pin", "profile_pin", "expected_events"),
+    [
+        pytest.param(
+            "abc1234567", None, ["store", "update_profile", "mark_verified", "update_credential"], id="new-profile-pin"
         ),
-    )
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/session"))
-    monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
-    monkeypatch.setattr(
-        forge_app.DATABASE.credentials,
-        "get_credential",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-                proxy_session_id="abc1234567",
-            )
+        pytest.param(None, None, ["store", "mark_verified", "update_credential"], id="unpinned-credential"),
+        pytest.param(
+            "credential-pin", "profile-pin", ["store", "mark_verified", "update_credential"], id="preserve-existing-pin"
         ),
-    )
-    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
-    monkeypatch.setattr(
-        forge_app.DATABASE.browser_sessions,
-        "get_browser_profile",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_existing")),
-    )
-    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "update_browser_profile", update_browser_profile)
-    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "mark_verified_login", mark_verified_login)
-
-    await credentials_routes._create_browser_profile_after_workflow(
-        credential_id="cred_123",
-        workflow_run_id="wr_123",
-        workflow_id="wf_123",
-        workflow_permanent_id="wp_123",
-        organization_id="org_123",
-        credential_name="test",
-        test_url="https://example.com/login",
-        existing_browser_profile_id="bp_existing",
-    )
-
-    assert events == ["store", "update_profile", "mark_verified", "update_credential"]
-
-
-@pytest.mark.asyncio
-async def test_browser_profile_resave_leaves_existing_profile_pin_when_credential_unpinned(
-    monkeypatch: pytest.MonkeyPatch,
+    ],
+)
+async def test_browser_profile_resave_proxy_pin(
+    credential_pin: str | None, profile_pin: str | None, expected_events: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     events: list[str] = []
 
@@ -811,19 +772,27 @@ async def test_browser_profile_resave_leaves_existing_profile_pin_when_credentia
             )
         ),
     )
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/session"))
+    monkeypatch.setattr(
+        forge_app.STORAGE,
+        "retrieve_browser_session_snapshot",
+        AsyncMock(return_value=BrowserProfileSnapshot("/tmp/session")),
+    )
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
     monkeypatch.setattr(
         forge_app.DATABASE.credentials,
         "get_credential",
-        AsyncMock(return_value=SimpleNamespace(proxy_location=None, proxy_session_id=None)),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                proxy_location=ProxyLocation.RESIDENTIAL_ISP if credential_pin else None,
+                proxy_session_id=credential_pin,
+            )
+        ),
     )
     monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
-    monkeypatch.setattr(
-        forge_app.DATABASE.browser_sessions,
-        "get_browser_profile",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_existing")),
-    )
+    profile = SimpleNamespace(browser_profile_id="bp_existing")
+    if profile_pin is not None:
+        profile.proxy_session_id = profile_pin
+    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "get_browser_profile", AsyncMock(return_value=profile))
     monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "update_browser_profile", update_browser_profile)
     monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "mark_verified_login", mark_verified_login)
 
@@ -838,81 +807,18 @@ async def test_browser_profile_resave_leaves_existing_profile_pin_when_credentia
         existing_browser_profile_id="bp_existing",
     )
 
-    assert events == ["store", "mark_verified", "update_credential"]
+    assert events == expected_events
 
 
 @pytest.mark.asyncio
-async def test_browser_profile_resave_preserves_different_existing_profile_pin(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-
-    async def store_browser_profile(**_kwargs: object) -> None:
-        events.append("store")
-
-    async def update_browser_profile(**_kwargs: object) -> SimpleNamespace:
-        events.append("update_profile")
-        return SimpleNamespace()
-
-    async def mark_verified_login(**_kwargs: object) -> None:
-        events.append("mark_verified")
-
-    async def update_credential(**_kwargs: object) -> SimpleNamespace:
-        events.append("update_credential")
-        return SimpleNamespace()
-
-    monkeypatch.setattr(
-        forge_app.DATABASE.workflow_runs,
-        "get_workflow_run",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status=WorkflowRunStatus.completed, browser_profile_id=None, browser_sink_profile_id=None
-            )
-        ),
-    )
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/session"))
-    monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
-    monkeypatch.setattr(
-        forge_app.DATABASE.credentials,
-        "get_credential",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-                proxy_session_id="credential-pin",
-            )
-        ),
-    )
-    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
-    monkeypatch.setattr(
-        forge_app.DATABASE.browser_sessions,
-        "get_browser_profile",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_existing", proxy_session_id="profile-pin")),
-    )
-    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "update_browser_profile", update_browser_profile)
-    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "mark_verified_login", mark_verified_login)
-
-    await credentials_routes._create_browser_profile_after_workflow(
-        credential_id="cred_123",
-        workflow_run_id="wr_123",
-        workflow_id="wf_123",
-        workflow_permanent_id="wp_123",
-        organization_id="org_123",
-        credential_name="test",
-        test_url="https://example.com/login",
-        existing_browser_profile_id="bp_existing",
-    )
-
-    assert events == ["store", "mark_verified", "update_credential"]
-
-
-@pytest.mark.asyncio
+@pytest.mark.parametrize("encrypted", [False, True])
 async def test_credential_browser_profile_save_reads_managed_profile_blob(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, encrypted: bool
 ) -> None:
     create_browser_profile = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_created"))
     update_credential = AsyncMock(return_value=SimpleNamespace())
     store_browser_profile = AsyncMock()
-    retrieve_profile = AsyncMock(return_value="/tmp/managed_profile")
+    retrieve_profile = AsyncMock(return_value=BrowserProfileSnapshot("/tmp/managed_profile", encrypted))
     retrieve_session = AsyncMock()
 
     monkeypatch.setattr(
@@ -937,8 +843,8 @@ async def test_credential_browser_profile_save_reads_managed_profile_blob(
         "get_browser_profile",
         AsyncMock(return_value=SimpleNamespace(is_managed=True, workflow_permanent_id="wpid_123")),
     )
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_profile", retrieve_profile)
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", retrieve_session)
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_profile_snapshot", retrieve_profile)
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session_snapshot", retrieve_session)
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
     monkeypatch.setattr(
         forge_app.DATABASE.credentials,
@@ -964,6 +870,7 @@ async def test_credential_browser_profile_save_reads_managed_profile_blob(
         organization_id="org_123",
         profile_id="bp_created",
         directory="/tmp/managed_profile",
+        require_encryption=encrypted,
     )
     update_credential.assert_awaited_once()
 
@@ -976,7 +883,7 @@ async def test_credential_browser_profile_save_falls_back_to_legacy_archive_for_
     update_credential = AsyncMock(return_value=SimpleNamespace())
     store_browser_profile = AsyncMock()
     retrieve_profile = AsyncMock(return_value=None)
-    retrieve_session = AsyncMock(return_value="/tmp/legacy_session")
+    retrieve_session = AsyncMock(return_value=BrowserProfileSnapshot("/tmp/legacy_session"))
     get_storage_key = AsyncMock(return_value="wpid_123")
 
     monkeypatch.setattr(
@@ -1002,8 +909,8 @@ async def test_credential_browser_profile_save_falls_back_to_legacy_archive_for_
         AsyncMock(return_value=SimpleNamespace(is_managed=True, workflow_permanent_id="wpid_123")),
     )
     monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_browser_session_storage_key", get_storage_key)
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_profile", retrieve_profile)
-    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", retrieve_session)
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_profile_snapshot", retrieve_profile)
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session_snapshot", retrieve_session)
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
     monkeypatch.setattr(
         forge_app.DATABASE.credentials,
@@ -1029,6 +936,7 @@ async def test_credential_browser_profile_save_falls_back_to_legacy_archive_for_
         organization_id="org_123",
         profile_id="bp_created",
         directory="/tmp/legacy_session",
+        require_encryption=False,
     )
 
 
@@ -1073,16 +981,18 @@ async def test_validate_browser_profile_id_rejects_managed(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_validate_browser_profile_id_rejects_other_workflow_owned(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A plain-looking profile still owned by a workflow (workflow_permanent_id set) is rejected.
+async def test_validate_browser_profile_id_accepts_source_bound_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A saved profile tied to its source workflow links; folder access is checked when a run uses it.
     monkeypatch.setattr(
         forge_app.DATABASE.browser_sessions,
         "get_browser_profile",
         AsyncMock(return_value=SimpleNamespace(is_managed=False, workflow_permanent_id="wpid_other")),
     )
-    with pytest.raises(HTTPException) as exc:
-        await credentials_routes._validate_credential_browser_profile_id("bp_x", "org_123")
-    assert exc.value.status_code == 400
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials, "get_browser_profile_credential_links", AsyncMock(return_value={})
+    )
+
+    assert await credentials_routes._validate_credential_browser_profile_id("bp_x", "org_123") is None
 
 
 @pytest.mark.asyncio
@@ -1639,7 +1549,6 @@ async def test_repo_update_credential_disables_pin_without_reminting() -> None:
 async def test_update_credential_conflict_translates_to_400(monkeypatch: pytest.MonkeyPatch) -> None:
     # G: the atomic partial-unique backstop. A concurrent link that slips past the read-check hits the
     # DB unique constraint; the route translates it into the same 400 as the friendly read-check.
-    from sqlalchemy.exc import IntegrityError
 
     orig = Exception('duplicate key value violates unique constraint "uq_credentials_browser_profile_id"')
     monkeypatch.setattr(
@@ -1657,8 +1566,6 @@ async def test_update_credential_conflict_translates_to_400(monkeypatch: pytest.
 
 @pytest.mark.asyncio
 async def test_update_credential_conflict_reraises_unrelated_integrity_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    from sqlalchemy.exc import IntegrityError
-
     orig = Exception('null value in column "name" violates not-null constraint')
     monkeypatch.setattr(
         forge_app.DATABASE.credentials,
@@ -2014,3 +1921,217 @@ async def test_create_credential_records_the_caller_as_creator(
     )
 
     assert listed.created_by == "user_creator"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "captured-writer",
+        "upload-error-false",
+        "upload-error-null",
+        "upload-error-temporary",
+        "upload-error-linked",
+        "competing-link",
+        "competing-unlink",
+        "dangling-link",
+        "unlink-before-capture",
+        "link-aba",
+        "incomplete-capture",
+        "writeback-fallback",
+        "capture-put-fails-fallback",
+        "publish-name-conflict",
+        "publish-lock-failure",
+        "publish-cancel-precommit",
+        "publish-commit-lost-reply",
+        "publish-commit-ambiguous",
+        "publish-cancel-at-commit",
+        "publish-cancel-lost-reply",
+        "dispatch_failure_unlinked",
+        "dispatch_failure_linked",
+    ],
+)
+async def test_background_credential_first_save(
+    scenario: str, monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    owner = await make_credential_profile_run(sqlite_engine, monkeypatch, tmp_path)
+    if scenario.startswith("dispatch_failure_"):
+        credential_id = owner.credential.credential_id
+        linked_id = None
+        if scenario == "dispatch_failure_linked":
+            linked = await owner.db.browser_sessions.create_browser_profile(owner.org_id, "User-selected profile")
+            linked_id = linked.browser_profile_id
+
+        async def reject_dispatch(**_options: object) -> None:
+            if linked_id is not None:
+                await owner.db.credentials.update_credential(credential_id, owner.org_id, browser_profile_id=linked_id)
+            raise RuntimeError("synthetic dispatch failure")
+
+        monkeypatch.setattr(
+            credentials_routes.AsyncExecutorFactory,
+            "get_executor",
+            lambda: SimpleNamespace(execute_workflow=reject_dispatch),
+        )
+        vault = SimpleNamespace(create_credential=AsyncMock(return_value=owner.credential))
+        monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault))
+        poll_delay = credentials_routes.asyncio.sleep
+        polls = 0
+
+        async def count_poll_delay(seconds: float) -> None:
+            nonlocal polls
+            polls += 1
+            await poll_delay(seconds)
+
+        monkeypatch.setattr(credentials_routes, "asyncio", ScopedAsyncio(sleep=count_poll_delay))
+        try:
+            with pytest.raises(RuntimeError, match="synthetic dispatch failure"):
+                await credentials_routes.test_login(
+                    background_tasks=BackgroundTasks(),
+                    data=LoginTestRequest(url=owner.test_url, username="synthetic@example.invalid", password=""),
+                    current_org=owner.org,
+                    current_user_id=None,
+                )
+            before_timeout = await owner.credential_row()
+            assert before_timeout.is_test_login_temporary is True
+            assert before_timeout.deleted_at is None
+            assert before_timeout.browser_profile_id == linked_id
+        finally:
+            owner.settled.set()
+            await asyncio.gather(*tuple(owner.pending))
+
+        assert polls == 120
+        run = await owner.db.workflow_runs.get_workflow_run(owner.run.workflow_run_id, owner.org_id)
+        assert run is not None and run.status == owner.run.status and not run.status.is_final()
+        credential = await owner.credential_row()
+        assert credential.browser_profile_id == linked_id
+        if linked_id is None:
+            assert credential.deleted_at is not None
+            assert credential.item_id not in owner.vault_items
+        else:
+            assert credential.deleted_at is None
+            assert credential.item_id in owner.vault_items
+        return
+    if scenario.startswith("publish-"):
+        directory = owner.cookies_directory("direct-capture", b"confirmed cookies")
+        lost_reply = scenario in {"publish-commit-lost-reply", "publish-cancel-lost-reply"}
+        fault = None
+        if scenario == "publish-name-conflict":
+            competing = await owner.db.browser_sessions.create_browser_profile(
+                owner.org_id, f"Profile - {owner.credential.name} ({owner.credential.credential_id})"
+            )
+            await owner.storage.store_browser_profile(owner.org_id, competing.browser_profile_id, str(directory))
+            previous_objects = owner.transport.objects.copy()
+            expected_error = IntegrityError
+        elif scenario == "publish-lock-failure":
+            expected_error = OperationalError
+        else:
+            create_profile = owner.db.browser_sessions.create_browser_profile
+            fault = (
+                asyncio.CancelledError(scenario)
+                if scenario.startswith("publish-cancel-")
+                else RuntimeError("synthetic commit acknowledgement lost")
+            )
+            expected_error = type(fault)
+
+            async def create_with_commit_fault(**kwargs):
+                profile = await create_profile(**kwargs)
+                if scenario == "publish-cancel-precommit":
+                    raise fault
+                session = kwargs["session"]
+                commit = session.commit
+
+                async def commit_with_fault() -> None:
+                    if lost_reply:
+                        await commit()
+                    raise fault
+
+                monkeypatch.setattr(session, "commit", commit_with_fault)
+                return profile
+
+            monkeypatch.setattr(owner.db.browser_sessions, "create_browser_profile", create_with_commit_fault)
+        async with AsyncExitStack() as stack:
+            if scenario == "publish-lock-failure":
+                lock = await stack.enter_async_context(sqlite_engine.connect())
+                await lock.exec_driver_sql("BEGIN IMMEDIATE")
+            with pytest.raises(expected_error) as error:
+                await credential_creation_service.save_new_credential_capture(
+                    storage=owner.storage,
+                    creation=CredentialProfileCreation(owner.credential.credential_id, None),
+                    organization_id=owner.org_id,
+                    directory=str(directory),
+                    writer="msedge",
+                    test_url=owner.test_url,
+                )
+        if fault is not None:
+            assert error.value is fault
+        credential = await owner.credential_row()
+        profiles = await owner.profile_rows()
+        if scenario == "publish-name-conflict":
+            assert "browser_profiles.organization_id, browser_profiles.name" in str(error.value)
+            assert [profile.browser_profile_id for profile in profiles] == [competing.browser_profile_id]
+            assert credential.browser_profile_id is None and credential.tested_url is None
+            assert owner.transport.objects == previous_objects
+        elif scenario in {"publish-lock-failure", "publish-cancel-precommit"}:
+            if scenario == "publish-lock-failure":
+                assert "database is locked" in str(error.value)
+            assert len(owner.transport.profile_uploads) == 1
+            assert not profiles and credential.browser_profile_id is None and credential.tested_url is None
+            assert not owner.transport.objects
+        else:
+            assert len(owner.transport.objects) == 1
+            profile_id = Path(owner.transport.profile_uploads[0][1]).stem
+            assert owner.transport.saved_cookies(profile_id) == b"confirmed cookies"
+            if lost_reply:
+                (profile,) = profiles
+                assert profile.browser_profile_id == credential.browser_profile_id == profile_id
+                assert profile.source_browser_type == "msedge" and credential.tested_url == owner.test_url
+            else:
+                assert not profiles and credential.browser_profile_id is None and credential.tested_url is None
+        return
+    competing_id = await owner.configure_upload(scenario)
+    executor = background_task_executor.BackgroundTaskExecutor()
+    monkeypatch.setattr(background_task_executor, "acquire_run_lease", AsyncMock(return_value=True))
+    monkeypatch.setattr(background_task_executor, "queue_initial_attempt", AsyncMock(return_value=True))
+    monkeypatch.setattr(background_task_executor, "initialize_skyvern_state_file", AsyncMock())
+    monkeypatch.setattr(background_task_executor, "prepare_org_llm_runtime", AsyncMock())
+
+    async def run_browser_body(*, credential_profile_finalizer: CredentialProfileFinalizer, **_options: object) -> None:
+        if scenario == "unlink-before-capture":
+            await owner.db.credentials.update_credential(
+                owner.credential.credential_id, owner.org_id, browser_profile_id=None
+            )
+        if scenario in {"incomplete-capture", "writeback-fallback", "capture-put-fails-fallback"}:
+            directory = owner.cookies_directory("closed-browser", b"session archive cookies")
+            (directory / "Local State").write_text("synthetic readable state")
+            capture = BrowserArtifacts(browser_session_dir=str(directory))
+            denied = []
+            if scenario == "incomplete-capture":
+                capture._credential_profile_writer = "msedge"
+                scandir = os.scandir
+
+                def deny_network(path):
+                    if not isinstance(path, int) and Path(path) == directory / "Default" / "Network":
+                        denied.append(path)
+                        raise PermissionError(errno.EACCES, "synthetic unreadable cookie directory", path)
+                    return scandir(path)
+
+                monkeypatch.setattr(os, "scandir", deny_network)
+            elif scenario == "capture-put-fails-fallback":
+                capture._credential_profile_writer = "msedge"
+
+                async def fail_capture_put() -> None:
+                    if len(owner.transport.profile_uploads) == 1:
+                        raise OSError("synthetic first capture PUT failed")
+
+                owner.transport.before_profile_upload = fail_capture_put
+            await owner.finish_capture(credential_profile_finalizer, capture, write_back=True)
+            if scenario == "incomplete-capture":
+                assert len(denied) == 2
+        else:
+            await owner.finish_capture(credential_profile_finalizer, write_back=scenario == "link-aba")
+
+    monkeypatch.setattr(owner.service, "execute_workflow_with_retries", run_browser_body)
+    await owner.invoke(executor)
+    await owner.assert_save_attempt(
+        scenario, competing_id, from_saved_session=scenario in {"writeback-fallback", "capture-put-fails-fallback"}
+    )

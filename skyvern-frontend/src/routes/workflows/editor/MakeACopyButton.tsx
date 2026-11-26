@@ -19,7 +19,10 @@ function MakeACopyButton() {
     if (!workflow) {
       return;
     }
-    createWorkflowMutation.mutate(convert(workflow, { asNewWorkflow: true }));
+    createWorkflowMutation.mutate({
+      ...convert(workflow, { asNewWorkflow: true }),
+      mask_secrets: true,
+    });
   };
 
   return (

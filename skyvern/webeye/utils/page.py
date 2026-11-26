@@ -54,6 +54,7 @@ from skyvern.webeye.browser_runtime_events import (
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 from skyvern.webeye.navigation import redact_url_secrets
+from skyvern.webeye.utils._html_content import read_html
 from skyvern.webeye.utils.flutter_semantics import FLUTTER_STATE_JS, FlutterSemanticsState
 
 if TYPE_CHECKING:
@@ -285,10 +286,28 @@ async def apply_secret_visual_mask_to_active_element(page: Page) -> None:
 _SECRET_VISUAL_MASK_TIMEOUT_MS = 2000
 
 
-async def apply_secret_visual_mask_to_locator(locator: Locator, *, timeout: float) -> None:
+# The step engine's Mask Secrets rule leaves a password box alone, since it already hides its value. Follows a label to
+# its control first, as the mask itself does.
+_IS_PASSWORD_INPUT_SCRIPT = """(el) => {
+  if (!el.isContentEditable && !["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName)) {
+    const label = el.closest ? el.closest("label") : null;
+    if (label && label.control) el = label.control;
+  }
+  return el.tagName === "INPUT" && String(el.getAttribute("type")).toLowerCase() === "password";
+}"""
+
+
+async def apply_secret_visual_mask_to_locator(
+    locator: Locator, *, timeout: float, skip_password_input: bool = False
+) -> None:
     # Waits for the field as long as the write that follows would, so a late render cannot outlast the mask and
     # take the value unmasked; a field that never comes raises here, as the write would have.
     await locator.wait_for(state="attached", timeout=timeout)
+    if skip_password_input:
+        # A probe that fails masks the field: masking a password box is harmless, leaving a secret legible is not.
+        with contextlib.suppress(Exception):
+            if await locator.evaluate(_IS_PASSWORD_INPUT_SCRIPT, timeout=_SECRET_VISUAL_MASK_TIMEOUT_MS):
+                return
     # A field that detaches or re-renders mid-evaluation fails the first attempt; the retry re-resolves the
     # locator to the element the write will also reach. Each attempt is capped, since the field has attached.
     for attempt in range(2):
@@ -532,6 +551,12 @@ def _is_readiness_timeout(exc: BaseException, engine_selection: BrowserEngineSel
     return isinstance(exc, (asyncio.TimeoutError, SkyvernPageAnalysisTimeout)) or is_engine_timeout(
         exc, engine_selection
     )
+
+
+class HttpUrlResponse(NamedTuple):
+    body: bytes
+    content_type: str
+    content_disposition: str
 
 
 class BlobTooLargeError(Exception):
@@ -1905,6 +1930,7 @@ async (args) => {
             return { ok: false, status: response.status };
         }
         const contentType = response.headers.get('content-type') || '';
+        const contentDisposition = response.headers.get('content-disposition') || '';
         if (!response.body) return { ok: false, error: 'no_readable_stream' };
         const reader = response.body.getReader();
         const chunks = [];
@@ -1931,7 +1957,7 @@ async (args) => {
                     resolve({ ok: false, error: 'no_data_url_payload' });
                     return;
                 }
-                resolve({ ok: true, base64: result.substring(comma + 1), contentType });
+                resolve({ ok: true, base64: result.substring(comma + 1), contentType, contentDisposition });
             };
             reader.onerror = () => resolve({ ok: false, error: 'file_reader_error' });
             reader.readAsDataURL(blob);
@@ -2722,6 +2748,29 @@ class SkyvernFrame:
         redirect: Literal["follow", "error"] = "follow",
         check_active: Callable[[], None] | None = None,
     ) -> bytes | None:
+        response = await SkyvernFrame.read_http_url_response(
+            page,
+            url,
+            workflow_run_id=workflow_run_id,
+            max_size_bytes=max_size_bytes,
+            timeout_ms=timeout_ms,
+            headers=headers,
+            redirect=redirect,
+            check_active=check_active,
+        )
+        return response.body if response is not None else None
+
+    @staticmethod
+    async def read_http_url_response(
+        page: Page,
+        url: str,
+        workflow_run_id: str | None = None,
+        max_size_bytes: int | None = None,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        headers: dict[str, str] | None = None,
+        redirect: Literal["follow", "error"] = "follow",
+        check_active: Callable[[], None] | None = None,
+    ) -> HttpUrlResponse | None:
         """Fetch an http(s) URL's bytes via an in-page fetch() inside a same-origin frame.
 
         Recovers a resource whose inline iframe render was refused by a frame-embedding policy
@@ -2787,9 +2836,12 @@ class SkyvernFrame:
             if not isinstance(b64_payload, str):
                 continue
             try:
-                return base64.b64decode(b64_payload, validate=True)
+                body = base64.b64decode(b64_payload, validate=True)
             except Exception:
                 continue
+            return HttpUrlResponse(
+                body, str(result.get("contentType") or ""), str(result.get("contentDisposition") or "")
+            )
         return None
 
     # -- cursor overlay helpers ------------------------------------------------
@@ -3057,7 +3109,7 @@ class SkyvernFrame:
     @traced(name="skyvern.browser.get_content")
     async def get_content(self, timeout: float = PAGE_CONTENT_TIMEOUT) -> str:
         async with asyncio.timeout(timeout):
-            return mask_otp_values_in_html(await self.frame.content())
+            return mask_otp_values_in_html(await read_html(self.frame, self.engine_selection))
 
     async def get_scroll_x_y(self) -> tuple[int, int]:
         js_script = with_dom_utils("() => getScrollXY()", ("getScrollXY",))

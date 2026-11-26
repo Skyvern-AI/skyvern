@@ -11,10 +11,12 @@ import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import type { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { deepEqualStringArrays } from "@/util/equality";
 
 import { helpTooltips } from "../../helpContent";
 import { useUpdate } from "../../useUpdate";
+import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { workflowBlockTitle } from "../types";
 import {
   AGENT_STEP_MAX_TURNS_LIMIT,
@@ -73,6 +75,19 @@ function AgentStepEditorBody({
     editable: data.editable,
   });
   const { data: tools } = useAgentStepToolsQuery();
+  const { parameters } = useWorkflowParametersStore();
+  const readOnlyScope = useWorkflowScopeReadOnly();
+  const needsCredential =
+    !readOnlyScope &&
+    data.tools.includes("login") &&
+    !data.parameterKeys.some((key) =>
+      parameters.some(
+        (parameter) =>
+          parameter.key === key &&
+          (parameter.parameterType === "credential" ||
+            parameter.parameterType === "onepassword"),
+      ),
+    );
   const toolOptions = tools
     ? tools
         .map((tool) => ({
@@ -167,6 +182,11 @@ function AgentStepEditorBody({
           placeholder="Choose the tools this step may call"
           value={data.tools}
         />
+        {needsCredential && (
+          <p className="text-xs text-tertiary-foreground">
+            Login needs a saved login: add one under Inputs.
+          </p>
+        )}
       </div>
     </div>
   );

@@ -185,7 +185,7 @@ beforeEach(() => {
 describe("StudioPaneToggles structure", () => {
   test("renders the four peer tabs with icon + label", () => {
     renderAt();
-    for (const label of ["Copilot", "Editor", "Browser", "Past Runs"]) {
+    for (const label of ["Ember", "Editor", "Browser", "Past Runs"]) {
       expect(tab(new RegExp(`^${label}`))).toBeTruthy();
     }
   });
@@ -194,13 +194,13 @@ describe("StudioPaneToggles structure", () => {
     renderAt();
     expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
     expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("false");
-    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
+    expect(tab(/^Ember/).getAttribute("aria-expanded")).toBe("true");
   });
 
   test("reflects an explicit ?panes= list", () => {
     renderAt("/workflows/wpid_abc/studio?panes=editor");
     expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
-    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
+    expect(tab(/^Ember/).getAttribute("aria-expanded")).toBe("false");
     expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("false");
   });
 
@@ -215,7 +215,7 @@ describe("StudioPaneToggles structure", () => {
   test("explicit ?panes= wins over a run deep link", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
     renderAt("/workflows/wpid_abc/studio?wr=run_1&panes=ember");
-    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
+    expect(tab(/^Ember/).getAttribute("aria-expanded")).toBe("true");
     // The inspected-run control reports whether its pane is open.
     expect(runsTab().getAttribute("aria-pressed")).toBe("false");
   });
@@ -225,24 +225,24 @@ describe("StudioPaneToggles structure", () => {
     expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("false");
     expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("true");
     expect(runsTab().getAttribute("aria-pressed")).toBe("true");
-    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
+    expect(tab(/^Ember/).getAttribute("aria-expanded")).toBe("false");
   });
 });
 
 describe("StudioPaneToggles pane toggling", () => {
   test("opening Ember updates runtime state without creating a panes param", () => {
     renderAt("/workflows/wpid_abc/studio?wr=wr_1");
-    fireEvent.click(tab(/^Copilot/));
+    fireEvent.click(tab(/^Ember/));
     expect(urlPanes()).toBeNull();
-    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
+    expect(tab(/^Ember/).getAttribute("aria-expanded")).toBe("true");
   });
 
   test("closing Ember keeps the committed panes URL unchanged", () => {
     renderAt("/workflows/wpid_abc/studio?panes=editor,ember,browser");
-    fireEvent.click(tab(/^Copilot/));
+    fireEvent.click(tab(/^Ember/));
     expect(urlPanes()).toBe("editor,ember,browser");
     expect(currentPanes()).toBe("editor,browser");
-    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
+    expect(tab(/^Ember/).getAttribute("aria-expanded")).toBe("false");
   });
 
   test("closing the last pane leaves an empty runtime list and preserves the shared URL", () => {
@@ -255,13 +255,13 @@ describe("StudioPaneToggles pane toggling", () => {
   test("Ember toggling preserves unrelated params without adding panes", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
     renderAt("/workflows/wpid_abc/studio?wr=run_1&bl=block_1");
-    fireEvent.click(tab(/^Copilot/));
+    fireEvent.click(tab(/^Ember/));
     const search = screen.getByTestId("search").textContent ?? "";
     const params = new URLSearchParams(search);
     expect(params.get("wr")).toBe("run_1");
     expect(params.get("bl")).toBe("block_1");
     expect(params.get("panes")).toBeNull();
-    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
+    expect(tab(/^Ember/).getAttribute("aria-expanded")).toBe("true");
   });
 });
 
@@ -691,7 +691,7 @@ describe("StudioPaneToggles Ember question", () => {
       renderAt(`/workflows/wpid_abc/studio?panes=${panes}`);
       expect(
         screen.getByRole("button", {
-          name: "Copilot, waiting for your answer",
+          name: "Ember, waiting for your answer",
         }),
       ).toBeTruthy();
     },
@@ -701,7 +701,7 @@ describe("StudioPaneToggles Ember question", () => {
     useEmberHeaderStore.getState().setAttention("credential");
     renderAt("/workflows/wpid_abc/studio?panes=browser");
     expect(
-      screen.getByRole("button", { name: "Copilot, needs to sign in" }),
+      screen.getByRole("button", { name: "Ember, needs to sign in" }),
     ).toBeTruthy();
   });
 
@@ -711,7 +711,7 @@ describe("StudioPaneToggles Ember question", () => {
     act(() => useEmberHeaderStore.getState().setAttention(null));
     expect(
       screen.queryByRole("button", {
-        name: "Copilot, waiting for your answer",
+        name: "Ember, waiting for your answer",
       }),
     ).toBeNull();
   });
@@ -721,7 +721,7 @@ describe("StudioPaneToggles keyboard navigation", () => {
   test("the rail is a single tab stop (roving tabindex)", () => {
     renderAt();
     expect(
-      ["Copilot", "Editor", "Browser"].map(
+      ["Ember", "Editor", "Browser"].map(
         (l) => tab(new RegExp(`^${l}`)).tabIndex,
       ),
     ).toEqual([0, -1, -1]);
@@ -750,15 +750,15 @@ describe("StudioPaneToggles keyboard navigation", () => {
 
   test("ArrowRight moves across all four tabs and wraps", () => {
     renderAt();
-    tab(/^Copilot/).focus();
-    fireEvent.keyDown(tab(/^Copilot/), { key: "ArrowRight" });
+    tab(/^Ember/).focus();
+    fireEvent.keyDown(tab(/^Ember/), { key: "ArrowRight" });
     expect(document.activeElement).toBe(tab(/^Editor/));
     fireEvent.keyDown(tab(/^Editor/), { key: "ArrowRight" });
     expect(document.activeElement).toBe(tab(/^Browser/));
     fireEvent.keyDown(tab(/^Browser/), { key: "ArrowRight" });
     expect(document.activeElement).toBe(runsTab());
     fireEvent.keyDown(runsTab(), { key: "ArrowRight" });
-    expect(document.activeElement).toBe(tab(/^Copilot/));
+    expect(document.activeElement).toBe(tab(/^Ember/));
   });
 
   test("ArrowRight includes the separate Past runs control while inspecting a run", () => {
@@ -772,21 +772,21 @@ describe("StudioPaneToggles keyboard navigation", () => {
     fireEvent.keyDown(tab("Past Runs"), { key: "ArrowRight" });
     expect(document.activeElement).toBe(tab("Copy run link"));
     fireEvent.keyDown(tab("Copy run link"), { key: "ArrowRight" });
-    expect(document.activeElement).toBe(tab(/^Copilot/));
+    expect(document.activeElement).toBe(tab(/^Ember/));
   });
 
   test("ArrowLeft wraps to the last tab and Home returns to the first", () => {
     renderAt();
-    tab(/^Copilot/).focus();
-    fireEvent.keyDown(tab(/^Copilot/), { key: "ArrowLeft" });
+    tab(/^Ember/).focus();
+    fireEvent.keyDown(tab(/^Ember/), { key: "ArrowLeft" });
     expect(document.activeElement).toBe(runsTab());
     fireEvent.keyDown(runsTab(), { key: "Home" });
-    expect(document.activeElement).toBe(tab(/^Copilot/));
+    expect(document.activeElement).toBe(tab(/^Ember/));
   });
 
   test("arrow keys move focus without toggling panes", () => {
     renderAt();
-    fireEvent.keyDown(tab(/^Copilot/), { key: "ArrowRight" });
+    fireEvent.keyDown(tab(/^Ember/), { key: "ArrowRight" });
     expect(urlPanes()).toBeNull();
     expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
   });

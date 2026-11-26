@@ -291,7 +291,7 @@ describe("PromptBox", () => {
   test.each([
     ["legacy", false, false, "RESIDENTIAL"],
     ["redesigned", false, true, "RESIDENTIAL"],
-    ["Copilot handoff", true, true, null],
+    ["Ember handoff", true, true, null],
   ])(
     "prewarms once on first input in the %s Home prompt",
     async (_label, enableEmberHandoff, minimal, expectedProxyLocation) => {

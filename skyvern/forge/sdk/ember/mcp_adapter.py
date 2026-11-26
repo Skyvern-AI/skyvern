@@ -1,0 +1,3179 @@
+"""SDK-native MCP server with schema overlays for the Skyvern copilot."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import logging
+import posixpath
+import re
+import time
+import unicodedata
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, Protocol, TypedDict, cast
+from urllib.parse import urlsplit, urlunsplit
+
+import structlog
+from agents import default_tool_error_function
+from agents.agent import AgentBase
+from agents.mcp import MCPToolMetaContext
+from agents.mcp.server import MCPServer
+from agents.run_context import RunContextWrapper
+from agents.tool_context import ToolContext
+from fastmcp import Client
+from fastmcp.client.client import CallToolResult as FastMCPCallToolResult
+from mcp import Tool as MCPTool
+from mcp.types import (
+    CallToolResult,
+    GetPromptResult,
+    ListPromptsResult,
+    TextContent,
+)
+from PIL import Image
+from playwright.async_api import Browser, BrowserContext, Page
+from pydantic import ValidationError
+
+from skyvern.cli.core.client import reset_api_key_override, set_api_key_override
+from skyvern.cli.core.result import ErrorCode
+from skyvern.cli.core.session_manager import (
+    RequestFailure,
+    RequestFailureLog,
+    newest_per_failure_text_first,
+    request_session_scope,
+)
+from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS
+from skyvern.forge import app
+from skyvern.forge.sdk.core.pending_operation import pending_operation
+from skyvern.forge.sdk.ember.blocker_signal import (
+    BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
+    EmberToolBlockerSignal,
+    stash_blocker_signal,
+)
+from skyvern.forge.sdk.ember.build_test_connect_failure import BuildTestConnectFailure
+from skyvern.forge.sdk.ember.context import USER_FACING_REASON_PARAM
+from skyvern.forge.sdk.ember.enforcement import requested_output_paths_for_derivation
+from skyvern.forge.sdk.ember.hooks import _ember_log_fields
+from skyvern.forge.sdk.ember.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.ember.output_utils import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    mark_mcp_result_untrusted_for_llm,
+    sanitize_tool_result_for_llm,
+    screened_recorded_url,
+)
+from skyvern.forge.sdk.ember.page_identity import safe_page_origin
+from skyvern.forge.sdk.ember.runtime import (
+    _BROWSER_BOOT_WAIT_SECONDS,
+    AgentContext,
+    EmberBrowserGenerationRetired,
+    EmberBrowserSessionUnavailable,
+    RunSecretsNotRegistered,
+    bound_call_browser_session,
+    browser_evidence_commit_lock,
+    browser_session_acquisition_failure_sentence,
+    browser_session_recovery,
+    browser_session_turn,
+    carries_browser_session_acquisition_failure,
+    close_browser_session_quietly,
+    current_call_browser_session_override,
+    current_demonstrated_action,
+    effective_browser_session_id,
+    ensure_browser_session,
+    mcp_browser_context,
+    mcp_to_ember,
+    retire_browser_session_id,
+)
+from skyvern.forge.sdk.ember.screenshot_utils import (
+    ScreenshotActionRelation,
+    ScreenshotProvenance,
+    capturing_tool_call,
+    enqueue_screenshot_from_result,
+    screenshot_viewport_css_px,
+)
+from skyvern.forge.sdk.ember.secret_scrub import (
+    is_registered_scrub_value,
+    matching_origin_run_redaction_parameters,
+    registered_scrub_values,
+    scrub_secrets_from_structure,
+    scrub_secrets_from_text,
+)
+from skyvern.forge.sdk.ember.turn_origin import TurnOrigin
+from skyvern.forge.sdk.ember.unrecoverable_tool_error import PAGE_CRASHES_KEY, PAGE_REQUEST_FAILURES_KEY
+from skyvern.forge.sdk.workflow.models.block import parameter_strings
+from skyvern.utils.contained_effects import contained_effect
+from skyvern.utils.secret_scrub import encoded_secret_variants
+from skyvern.webeye.browser_retirement import BrowserRetirementReason
+from skyvern.webeye.browser_state import BrowserState, PageCrashRecord
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.ember.context import EmberContext
+    from skyvern.forge.sdk.ember.tools.scouting import PageState
+
+from skyvern.forge.sdk.ember.browser_target import (
+    BROWSER_TARGET_PARAM,
+    BROWSER_TARGET_PARAM_NAME,
+    BrowserSessionBinding,
+    last_run_facts,
+    resolve_browser_session_binding,
+)
+
+__all__ = [
+    "BROWSER_TARGET_PARAM",
+    "BROWSER_TARGET_PARAM_NAME",
+    "BrowserSessionBinding",
+    "resolve_browser_session_binding",
+]
+
+PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
+PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
+
+
+class PageStateReader(Protocol):
+    async def __call__(
+        self,
+        ctx: AgentContext,
+        *,
+        tool_name: str,
+        result: dict[str, Any],
+        binding: BrowserSessionBinding,
+        probe: bool,
+    ) -> tuple[PageState, Page | None]: ...
+
+
+_SHARED_BROWSER_OUTCOME_TOOLS = frozenset({"skyvern_evaluate", "skyvern_screenshot"})
+_REPORTED_REQUEST_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"})
+_MAX_REPORTED_REQUEST_FAILURES = 5
+_MAX_REPORTED_FAILURE_TEXT_CHARS = 200
+_MAX_REPORTED_URL_CHARS = 300
+_BrowserCallErrorKind = Literal["tool", "protocol"]
+_BrowserSessionLossDisposition = Literal["reestablished", "generation_retired", "failed"]
+
+
+@dataclass(frozen=True)
+class _BrowserCallOutcome:
+    """Immutable browser facts captured before either Copilot adapter shapes them.
+
+    The payload is copied structurally at the protocol boundary and for each
+    projection. Immutable leaves (including screenshot base64 strings) are shared,
+    so adapter isolation does not duplicate the largest response body.
+    """
+
+    raw_tool_name: str
+    source_browser_session_id: str | None
+    source_browser_session_generation: int
+    dispatched: bool
+    ok: bool
+    error_kind: _BrowserCallErrorKind | None
+    error_code: str | None
+    screenshot_present: bool
+    screenshot_reference: str | None
+    response_truncated: bool
+    payload_omitted: bool
+    session_loss_disposition: _BrowserSessionLossDisposition | None = None
+    # Carried beside the disposition because the projection is the only thing the primary browser
+    # tools return, and it has no context to read the cause from.
+    session_loss_deadline_expired: bool = False
+    session_loss_acquisition_failure: BuildTestConnectFailure | None = None
+    replacement_browser_session_id: str | None = None
+    completion_browser_session_id: str | None = None
+    completion_browser_session_generation: int | None = None
+    cancelled: bool = False
+    protocol_error_detail: str | None = None
+    last_run_facts: dict[str, str] = field(default_factory=dict)
+    _raw_result_payload: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def raw_result(self) -> dict[str, Any]:
+        return deepcopy(self._raw_result_payload)
+
+    def with_raw_result(self, raw_result: dict[str, Any]) -> _BrowserCallOutcome:
+        outcome = replace(self, _raw_result_payload=_copy_browser_result(raw_result))
+        return outcome.as_redaction_withheld() if is_redaction_withheld(raw_result) else outcome
+
+    def as_redaction_withheld(self) -> _BrowserCallOutcome:
+        return replace(self, ok=False, payload_omitted=True, error_kind=self.error_kind or "tool")
+
+
+@dataclass(frozen=True)
+class _InternalBrowserCallResult:
+    result: dict[str, Any]
+    outcome: _BrowserCallOutcome
+
+
+@dataclass(frozen=True)
+class _InternalToolCallResult:
+    result: dict[str, Any]
+    browser_outcome: _BrowserCallOutcome | None = None
+
+
+def _copy_browser_result(raw_result: dict[str, Any]) -> dict[str, Any]:
+    # deepcopy copies mutable containers but returns immutable strings unchanged.
+    # Inline screenshot bytes therefore have one string allocation in custody.
+    return deepcopy(raw_result)
+
+
+def _browser_error_code(raw_result: dict[str, Any]) -> str | None:
+    error = raw_result.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    return code if isinstance(code, str) and code else None
+
+
+class ReportedRequestFailure(TypedDict):
+    method: str
+    resource_type: str
+    failure_text: str
+    url: NotRequired[str]
+    page_url: NotRequired[str]
+
+
+def _reported_url(url: str) -> str | None:
+    # The query goes first because _redact_url's masks would make the screen withhold the whole URL.
+    try:
+        path_only = urlunsplit(urlsplit(url)._replace(query="", fragment=""))
+    except ValueError:
+        return None
+    screened = screened_recorded_url(path_only)[0]
+    return screened if screened is not None and len(screened) <= _MAX_REPORTED_URL_CHARS else None
+
+
+def _reported_request_url(url: str, page_url: str) -> str | None:
+    # A cross-origin path can carry a token the model has no use for, so only its origin is shown.
+    if (screened := _reported_url(url)) is None or (origin := safe_page_origin(screened)) is None:
+        return None
+    return (urlsplit(screened).path or "/") if origin == safe_page_origin(page_url) else origin.rstrip("/")
+
+
+def _screened_request_failure(entry: RequestFailure) -> ReportedRequestFailure:
+    # The method and failure text are page-influenced strings, so both are bounded before the model sees them.
+    method = entry["method"].upper()
+    reported = ReportedRequestFailure(
+        method=method if method in _REPORTED_REQUEST_METHODS else "OTHER",
+        resource_type=entry["resource_type"],
+        failure_text=entry["failure_text"][:_MAX_REPORTED_FAILURE_TEXT_CHARS],
+    )
+    if (url := _reported_request_url(entry["url"], entry["page_url"])) is not None:
+        reported["url"] = url
+    if (page_url := _reported_url(entry["page_url"])) is not None:
+        reported["page_url"] = page_url
+    return reported
+
+
+def reported_request_failures(entries: list[RequestFailure]) -> list[ReportedRequestFailure]:
+    return [
+        _screened_request_failure(entry)
+        for entry in newest_per_failure_text_first(entries, _MAX_REPORTED_REQUEST_FAILURES)
+    ]
+
+
+# Chromium serializes URLs and net error names as ASCII with quotes percent-encoded, so JSON escaping adds nothing.
+_LARGEST_REPORTED_REQUEST_FAILURE_CHARS = len(
+    json.dumps(
+        ReportedRequestFailure(
+            method="OPTIONS",
+            resource_type="document",
+            failure_text="f" * _MAX_REPORTED_FAILURE_TEXT_CHARS,
+            url="u" * _MAX_REPORTED_URL_CHARS,
+            page_url="u" * _MAX_REPORTED_URL_CHARS,
+        )
+    )
+)
+
+
+def _refit_scrubbed_failure(entry: dict[str, str]) -> dict[str, str] | None:
+    # Scrubbing can lengthen a field after its bound was checked, so a URL that no longer fits is left out.
+    fitted = {
+        key: value
+        for key, value in entry.items()
+        if key not in ("url", "page_url") or len(value) <= _MAX_REPORTED_URL_CHARS
+    }
+    return fitted if len(json.dumps(fitted)) <= _LARGEST_REPORTED_REQUEST_FAILURE_CHARS else None
+
+
+def _secret_url_markers(ctx: AgentContext) -> set[str]:
+    """Lowercased forms a registered value can take in a URL Chromium recorded: the value, every form of the part
+    before its first ``?`` or ``#``, its compatibility mapping in a host, and what dot-segment removal leaves of it."""
+    values = registered_scrub_values(ctx)
+    heads = {head for value in values if (head := value.partition("?")[0].partition("#")[0]) and head != value}
+    markers = {value.lower() for value in values} | {
+        form.lower() for head in heads for form in encoded_secret_variants(head)
+    }
+    for text in (*values, *heads):
+        if not text.isascii():
+            markers.add(unicodedata.normalize("NFKC", text).casefold())
+        if "/" in text and "." in text:
+            markers.add(posixpath.normpath(f"/{text}").lstrip("/").lower())
+    markers.discard("")
+    return markers
+
+
+def _with_decoded_host(url: str) -> str:
+    # Chromium punycode-encodes a whole non-ASCII host label, so a secret inside one is matched only once decoded.
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return url
+    if not host or "xn--" not in host:
+        return url
+    labels = []
+    for label in host.split("."):
+        if label.startswith("xn--"):
+            try:
+                label = label[4:].encode("ascii").decode("punycode")
+            except UnicodeError:
+                pass
+        labels.append(label)
+    return url.replace(host, ".".join(labels), 1)
+
+
+def _scrubbed_url(ctx: AgentContext, url: str, secret_markers: set[str]) -> str:
+    # Scrubbed whole, before the report drops the query and fragment: a secret can span the path and the query.
+    scrubbed = scrub_secrets_from_text(ctx, url)
+    # What the exact scrub cannot match: a host Chromium lowercased or punycode-encoded, or a secret cut at
+    # its ? or # (a masked query value, or a fragment the browser never sends).
+    lowered = _with_decoded_host(scrubbed).lower()
+    return "" if any(marker in lowered for marker in secret_markers) else scrubbed
+
+
+def _with_scrubbed_urls(ctx: AgentContext, entry: RequestFailure, secret_markers: set[str]) -> RequestFailure:
+    scrubbed = entry.copy()
+    scrubbed["url"] = _scrubbed_url(ctx, entry["url"], secret_markers)
+    scrubbed["page_url"] = _scrubbed_url(ctx, entry["page_url"], secret_markers)
+    return scrubbed
+
+
+class ReportedPageCrash(TypedDict):
+    crashed_at: str
+    cause: Literal["page_crash", "page_lost"]
+    reopened: bool
+    url: NotRequired[str]
+
+
+def _reported_page_crash(ctx: AgentContext, record: PageCrashRecord, secret_markers: set[str]) -> ReportedPageCrash:
+    reported = ReportedPageCrash(
+        crashed_at=record.crashed_at.isoformat(timespec="seconds"), cause=record.cause, reopened=record.reopened
+    )
+    if (url := _reported_url(_scrubbed_url(ctx, record.crashed_url, secret_markers))) is not None:
+        reported["url"] = url
+    return reported
+
+
+def _refit_scrubbed_crash(entry: ReportedPageCrash) -> ReportedPageCrash:
+    # Scrubbing can lengthen the URL after its bound was checked, so a URL that no longer fits is left out.
+    if len(entry.get("url", "")) <= _MAX_REPORTED_URL_CHARS:
+        return entry
+    fitted = entry.copy()
+    del fitted["url"]
+    return fitted
+
+
+# The reopened values each live crash record was reported with, across turns: a record whose reopened flips is
+# reported again, and an entry goes when the browser state drops its record.
+_REPORTED_PAGE_CRASHES: weakref.WeakKeyDictionary[PageCrashRecord, set[bool]] = weakref.WeakKeyDictionary()
+
+
+@dataclass
+class HeldPageFacts:
+    taken_request_failures: list[tuple[RequestFailureLog, Page, list[RequestFailure]]] = field(default_factory=list)
+    taken_page_crashes: list[tuple[PageCrashRecord, bool]] = field(default_factory=list)
+
+    def take(self, ctx: AgentContext, page: Page | None) -> list[ReportedRequestFailure]:
+        session_id = effective_browser_session_id(ctx)
+        log = ctx.request_failure_logs_by_browser_session.get(session_id) if session_id else None
+        if log is None or page is None:
+            return []
+        taken = log.take_tab(str(id(page)))
+        if not taken:
+            return []
+        self.taken_request_failures.append((log, page, taken))
+        secret_markers = _secret_url_markers(ctx)
+        return reported_request_failures([_with_scrubbed_urls(ctx, entry, secret_markers) for entry in taken])
+
+    def take_page_crashes(self, ctx: AgentContext) -> list[ReportedPageCrash]:
+        # Drained per browser, not per tab: the crashed tab is gone and its replacement has a new id.
+        session_id = effective_browser_session_id(ctx)
+        records = ctx.page_crash_records_by_browser_session.get(session_id, ()) if session_id else ()
+        taken = [record for record in records if record.reopened not in _REPORTED_PAGE_CRASHES.get(record, ())]
+        if not taken:
+            return []
+        for record in taken:
+            _REPORTED_PAGE_CRASHES.setdefault(record, set()).add(record.reopened)
+            self.taken_page_crashes.append((record, record.reopened))
+        secret_markers = _secret_url_markers(ctx)
+        return [_reported_page_crash(ctx, record, secret_markers) for record in taken]
+
+    def restore_request_failures(self) -> None:
+        for log, page, taken in reversed(self.taken_request_failures):
+            # A closed tab's id() can be reused by a later page, which would inherit these entries.
+            if not page.is_closed():
+                log.restore(taken)
+        self.taken_request_failures.clear()
+
+    def restore_page_crashes(self) -> None:
+        for record, reopened in self.taken_page_crashes:
+            _REPORTED_PAGE_CRASHES.get(record, set()).discard(reopened)
+        self.taken_page_crashes.clear()
+
+    def restore(self) -> None:
+        self.restore_request_failures()
+        self.restore_page_crashes()
+
+    def release(self) -> None:
+        self.taken_request_failures.clear()
+        self.taken_page_crashes.clear()
+
+
+# Set while a model-facing post-hook runs, so a hook that stamps its own page_state drains into the call's hold.
+POST_HOOK_HELD_PAGE_FACTS: ContextVar[HeldPageFacts | None] = ContextVar("post_hook_held_page_facts", default=None)
+
+
+def _json_chars(value: dict[str, Any]) -> int:
+    return len(json.dumps(value, default=str))
+
+
+def stamp_page_facts(
+    ctx: AgentContext,
+    held: HeldPageFacts | None,
+    result: dict[str, Any],
+    page_state: PageState,
+    page: Page | None,
+) -> dict[str, Any]:
+    """``result`` led by ``page_state``, the failed requests of the tab it was read from, and the browser's
+    unreported crashes, taken into ``held``. A call with no ``held`` drains nothing; a page_state read from no tab
+    drains only the crashes."""
+    stamped: dict[str, Any] = {"page_state": page_state, **result}
+    if held is None:
+        return stamped
+    facts: dict[str, list[dict[str, str]] | list[ReportedPageCrash]] = {}
+    if failures := held.take(ctx, page):
+        reported = scrub_model_facing_tool_result(ctx, {PAGE_REQUEST_FAILURES_KEY: failures}).get(
+            PAGE_REQUEST_FAILURES_KEY
+        )
+        fitted = (
+            [f for entry in reported if (f := _refit_scrubbed_failure(entry))] if isinstance(reported, list) else []
+        )
+        if fitted:
+            facts[PAGE_REQUEST_FAILURES_KEY] = fitted
+        else:
+            held.restore_request_failures()
+    # A read that failed still reports the crashes: the crash is often why it failed.
+    if crashes := held.take_page_crashes(ctx):
+        reported = scrub_model_facing_tool_result(ctx, {PAGE_CRASHES_KEY: crashes}).get(PAGE_CRASHES_KEY)
+        if isinstance(reported, list) and reported:
+            facts[PAGE_CRASHES_KEY] = [_refit_scrubbed_crash(entry) for entry in reported]
+        else:
+            held.restore_page_crashes()
+    if not facts:
+        return stamped
+    with_facts = {"page_state": page_state, **facts, **result}
+    # Page facts never push a result past the recent-output cap, where its tail would be cut off. A crash that
+    # fits without the request failures is kept.
+    if _json_chars(with_facts) <= _RECENT_TOOL_OUTPUT_CHAR_CAP or _json_chars(stamped) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+        return with_facts
+    held.restore_request_failures()
+    if kept_crashes := facts.get(PAGE_CRASHES_KEY):
+        with_crashes = {"page_state": page_state, PAGE_CRASHES_KEY: kept_crashes, **result}
+        if _json_chars(with_crashes) <= _RECENT_TOOL_OUTPUT_CHAR_CAP:
+            return with_crashes
+    held.restore_page_crashes()
+    return stamped
+
+
+def _scrub_stamped_tool_result(
+    ctx: AgentContext, held: HeldPageFacts, result: Any, *, tool_name: str
+) -> dict[str, Any]:
+    # Page facts must not be what withholds a result that passes without them, so they go back instead. Request
+    # failures go first, so a crash that fits without them is kept.
+    if isinstance(result, dict):
+        for key in (PAGE_REQUEST_FAILURES_KEY, PAGE_CRASHES_KEY):
+            if (
+                key in result
+                and _scrub_model_facing_tool_result(ctx, result, tool_name=tool_name, carry_inline=False)
+                == "redaction_budget"
+            ):
+                del result[key]
+    scrubbed = scrub_model_facing_tool_result(ctx, result, tool_name=tool_name, carry_inline=False)
+    if PAGE_REQUEST_FAILURES_KEY not in scrubbed:
+        held.restore_request_failures()
+    if PAGE_CRASHES_KEY not in scrubbed:
+        held.restore_page_crashes()
+    return scrubbed
+
+
+def _screenshot_reference(raw_tool_name: str, raw_result: dict[str, Any]) -> tuple[bool, str | None]:
+    if raw_tool_name != _SCREENSHOT_TOOL_NAME:
+        return False, None
+    data = raw_result.get("data")
+    reference = data.get("path") if isinstance(data, dict) else None
+    inline_present = isinstance(data, dict) and any(
+        isinstance(data.get(key), str) and bool(data[key]) for key in ("data", "screenshot_base64", "image_base64")
+    )
+    artifacts = raw_result.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or artifact.get("kind") != "screenshot":
+                continue
+            artifact_path = artifact.get("path")
+            if isinstance(artifact_path, str) and artifact_path:
+                reference = artifact_path
+                break
+    safe_reference = reference if isinstance(reference, str) and reference else None
+    return inline_present or safe_reference is not None, safe_reference
+
+
+def _browser_call_outcome_from_mapping(
+    *,
+    raw_tool_name: str,
+    source_browser_session_id: str | None,
+    source_browser_session_generation: int = 0,
+    dispatched: bool = True,
+    raw_result: dict[str, Any],
+    error_kind: _BrowserCallErrorKind | None = None,
+    protocol_error_detail: str | None = None,
+) -> _BrowserCallOutcome:
+    ok = raw_result.get("ok", raw_result.get("error") is None) is True and error_kind is None
+    normalized_error_kind = error_kind or ("tool" if not ok else None)
+    screenshot_present, screenshot_reference = _screenshot_reference(raw_tool_name, raw_result)
+    response_truncated = raw_result.get("_truncated") is True
+    return _BrowserCallOutcome(
+        raw_tool_name=raw_tool_name,
+        source_browser_session_id=source_browser_session_id,
+        source_browser_session_generation=source_browser_session_generation,
+        dispatched=dispatched,
+        ok=ok,
+        error_kind=normalized_error_kind,
+        error_code=_browser_error_code(raw_result),
+        screenshot_present=screenshot_present,
+        screenshot_reference=screenshot_reference,
+        response_truncated=response_truncated,
+        payload_omitted=response_truncated,
+        protocol_error_detail=protocol_error_detail,
+        _raw_result_payload=_copy_browser_result(raw_result),
+    )
+
+
+def _normalize_browser_call_outcome(
+    *,
+    raw_tool_name: str,
+    source_browser_session_id: str | None,
+    source_browser_session_generation: int = 0,
+    raw_result: FastMCPCallToolResult,
+) -> _BrowserCallOutcome:
+    raw_mcp = dict(raw_result.structured_content or {})
+    if raw_result.is_error:
+        raw_mcp["ok"] = False
+        if not raw_result.structured_content and raw_result.content:
+            text_parts = [content.text for content in raw_result.content if isinstance(content, TextContent)]
+            raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
+        else:
+            raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+    return _browser_call_outcome_from_mapping(
+        raw_tool_name=raw_tool_name,
+        source_browser_session_id=source_browser_session_id,
+        source_browser_session_generation=source_browser_session_generation,
+        raw_result=raw_mcp,
+        error_kind="tool" if raw_result.is_error else None,
+    )
+
+
+def _browser_protocol_exception_outcome(
+    *,
+    raw_tool_name: str,
+    source_browser_session_id: str | None,
+    source_browser_session_generation: int = 0,
+    dispatched: bool = True,
+    exception: BaseException,
+) -> _BrowserCallOutcome:
+    try:
+        detail = str(exception)
+    except BaseException:  # noqa: BLE001 - exception text is an untrusted protocol boundary
+        detail = ""
+    return _browser_call_outcome_from_mapping(
+        raw_tool_name=raw_tool_name,
+        source_browser_session_id=source_browser_session_id,
+        source_browser_session_generation=source_browser_session_generation,
+        dispatched=dispatched,
+        raw_result={},
+        error_kind="protocol",
+        protocol_error_detail=detail,
+    )
+
+
+def _not_dispatched_browser_call_outcome(
+    *,
+    raw_tool_name: str,
+    source_browser_session_id: str | None,
+    source_browser_session_generation: int,
+    raw_result: dict[str, Any],
+    ctx: AgentContext,
+    session_loss_disposition: _BrowserSessionLossDisposition | None = None,
+) -> _BrowserCallOutcome:
+    return replace(
+        _browser_call_outcome_from_mapping(
+            raw_tool_name=raw_tool_name,
+            source_browser_session_id=source_browser_session_id,
+            source_browser_session_generation=source_browser_session_generation,
+            dispatched=False,
+            raw_result=raw_result,
+            error_kind="protocol",
+        ),
+        session_loss_disposition=session_loss_disposition,
+        session_loss_deadline_expired=ctx.browser_session_continuity_deadline_expired,
+        session_loss_acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
+        replacement_browser_session_id=(
+            ctx.browser_session_id if session_loss_disposition == "reestablished" else None
+        ),
+        completion_browser_session_id=ctx.browser_session_id,
+        completion_browser_session_generation=ctx.browser_session_continuity_generation,
+    )
+
+
+def _cancelled_browser_call_outcome(
+    *,
+    raw_tool_name: str,
+    source_browser_session_id: str | None,
+    source_browser_session_generation: int,
+    dispatch_started: bool,
+    ctx: AgentContext,
+) -> _BrowserCallOutcome:
+    return replace(
+        _browser_call_outcome_from_mapping(
+            raw_tool_name=raw_tool_name,
+            source_browser_session_id=source_browser_session_id,
+            source_browser_session_generation=source_browser_session_generation,
+            dispatched=dispatch_started,
+            raw_result={},
+            error_kind="protocol",
+        ),
+        cancelled=True,
+        completion_browser_session_id=ctx.browser_session_id,
+        completion_browser_session_generation=ctx.browser_session_continuity_generation,
+    )
+
+
+def _record_browser_call_outcome(
+    ctx: AgentContext,
+    outcome: _BrowserCallOutcome,
+    *,
+    call_path: Literal["model", "internal"],
+) -> None:
+    with contained_effect("record browser call outcome", tool_name=outcome.raw_tool_name):
+        LOG.info(
+            "ember_browser_call_outcome",
+            tool_name=outcome.raw_tool_name,
+            call_path=call_path,
+            dispatched=outcome.dispatched,
+            ok=outcome.ok,
+            error_kind=outcome.error_kind,
+            error_code=outcome.error_code,
+            cancelled=outcome.cancelled,
+            source_browser_session_id=outcome.source_browser_session_id,
+            source_browser_session_generation=outcome.source_browser_session_generation,
+            replacement_browser_session_id=outcome.replacement_browser_session_id,
+            completion_browser_session_id=outcome.completion_browser_session_id,
+            completion_browser_session_generation=outcome.completion_browser_session_generation,
+            response_truncated=outcome.response_truncated,
+            payload_omitted=outcome.payload_omitted,
+            **_ember_log_fields(cast("EmberContext", ctx)),
+        )
+
+
+def _scrub_browser_call_outcome(ctx: AgentContext, outcome: _BrowserCallOutcome) -> _BrowserCallOutcome:
+    scrubbed = outcome.with_raw_result(
+        scrub_model_facing_tool_result(ctx, outcome.raw_result(), tool_name=outcome.raw_tool_name)
+    )
+    if outcome.error_kind == "protocol":
+        scrubbed = replace(scrubbed, last_run_facts=last_run_facts(ctx, outcome.source_browser_session_id))
+    if outcome.protocol_error_detail is None:
+        return scrubbed
+    detail_result = scrub_model_facing_tool_result(ctx, {"ok": False, "error": outcome.protocol_error_detail})
+    detail = detail_result.get("error")
+    return replace(scrubbed, protocol_error_detail=detail if isinstance(detail, str) else "")
+
+
+def _project_browser_call_outcome(
+    outcome: _BrowserCallOutcome,
+    *,
+    display_tool_name: str,
+) -> dict[str, Any]:
+    if outcome.protocol_error_detail is not None:
+        detail = outcome.protocol_error_detail
+        failure = f"{display_tool_name} failed: {detail}" if detail else f"{display_tool_name} failed"
+        if outcome.dispatched:
+            guidance = (
+                "No result was returned, so whether the call ran is unknown. Observe the page again "
+                "before relying on state that may have changed."
+            )
+            effect = "unknown"
+        else:
+            guidance = "The call was never sent to the browser, so it had no effect."
+            effect = "none"
+        result: dict[str, Any] = {
+            "ok": False,
+            "error": f"{failure}. {guidance}",
+            "data": {
+                "browser_call_continuity": {
+                    "source": "direct_mcp",
+                    "failed_tool": display_tool_name,
+                    "browser_session_id": outcome.source_browser_session_id,
+                    "browser_session_generation": outcome.source_browser_session_generation,
+                    "browser_session_id_after": outcome.completion_browser_session_id,
+                    "browser_session_generation_after": outcome.completion_browser_session_generation,
+                    "dispatched": outcome.dispatched,
+                    "result_delivered": False,
+                    "prior_action_effect": effect,
+                }
+            },
+        }
+    else:
+        raw_result = outcome.raw_result()
+        result = mcp_to_ember(raw_result) if raw_result else {}
+    if outcome.session_loss_disposition is not None:
+        result = _browser_session_loss_result(
+            result,
+            disposition=outcome.session_loss_disposition,
+            deadline_expired=outcome.session_loss_deadline_expired,
+            acquisition_failure=outcome.session_loss_acquisition_failure,
+        )
+    # A cancelled or timed-out call projects no continuity block of its own, and that is the shape
+    # the other browser matters most on, so the carrier is made rather than skipped.
+    if outcome.last_run_facts and result.get("ok") is not True:
+        data = result.setdefault("data", {})
+        if isinstance(data, dict):
+            continuity = data.get("browser_call_continuity") or data.get("browser_session_continuity")
+            if not isinstance(continuity, dict):
+                continuity = {"source": "direct_mcp", "failed_tool": display_tool_name}
+                data["browser_call_continuity"] = continuity
+            continuity.update(outcome.last_run_facts)
+    return result
+
+
+_POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
+    "flow_evidence",
+    "composition_page_evidence",
+    "workflow_verification_evidence",
+    "pending_browser_interaction_observation",
+    "scouted_interactions",
+    "scout_trajectory",
+    "signed_out_page_observations",
+    "signed_out_page_observation_attempts",
+    "pending_scout_source_url",
+    "pending_scout_selector_candidates",
+    "pending_scout_input_value",
+    "pending_scout_role_name",
+    "pending_scout_role_name_match_count",
+    "pending_scout_ambiguous",
+    "pending_scout_selector_match_count",
+    "pending_scout_reanchor",
+    "post_run_page_observation_tool",
+    "post_run_page_observation_url",
+    "post_run_page_observation_workflow_run_id",
+    "post_run_page_observation_after_failed_test",
+    "post_run_page_observation_generation",
+    "post_run_current_page_inspection_workflow_run_id",
+    "observed_browser_urls",
+    "latest_recorded_build_test_outcome",
+    "recorded_build_test_outcome_history",
+    "recorded_persisted_block_run_workflow_run_id",
+    "code_only_target_page_evidence_seen",
+    "last_scout_observation_trajectory_index",
+    "last_scout_observation_has_password_control",
+    "last_scout_act_observe_outcome",
+    "last_scout_act_observe_packet",
+    "scouted_output_covered_paths",
+    "scout_observed_terminal_criterion_ids",
+    "scout_observation_contract",
+    "pending_scout_read_expression",
+    "pending_scout_read_output_path",
+)
+
+
+@dataclass(frozen=True)
+class _PostHookContextSnapshot:
+    values: dict[str, Any]
+
+
+def _snapshot_post_hook_context(ctx: AgentContext) -> _PostHookContextSnapshot:
+    ctx_vars = vars(ctx)
+    return _PostHookContextSnapshot(
+        {field: deepcopy(ctx_vars[field]) for field in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS if field in ctx_vars}
+    )
+
+
+def _restore_post_hook_context(ctx: AgentContext, snapshot: _PostHookContextSnapshot) -> None:
+    for field_name, value in snapshot.values.items():
+        setattr(ctx, field_name, deepcopy(value))
+
+
+@dataclass
+class SchemaOverlay:
+    """Schema overlay for MCP tools — hides params, renames args, injects forced values."""
+
+    description: str | None = None
+    # Appended to the tool's own description instead of replacing it, for a fact the copilot
+    # owns (a policy-dependent restriction) on a tool whose documentation it does not own.
+    description_suffix: str | None = None
+    hide_params: frozenset[str] = frozenset()
+    required_overrides: list[str] | None = None
+    arg_transforms: dict[str, str] = field(default_factory=dict)
+    forced_args: dict[str, Any] = field(default_factory=dict)
+    # Params the copilot offers on top of the MCP tool's own schema. A hook consumes them; they are
+    # stripped before the call, so the underlying tool never sees an argument it cannot accept.
+    ember_params: dict[str, Any] = field(default_factory=dict)
+    # Merged over an MCP param's own schema (an enum, a description) while the argument still reaches the tool.
+    param_patches: dict[str, dict[str, Any]] = field(default_factory=dict)
+    requires_browser: bool = False
+    # Dispatch overwrites binds_chat_workflow_param with the chat's own workflow, so the model cannot
+    # aim the call at any other workflow. Pair it with hiding that param from the schema.
+    binds_chat_workflow: bool = False
+    binds_chat_workflow_param: str = "workflow_permanent_id"
+    # Creates or changes future runs, so a turn without browser authority, which may not start a
+    # run either, does not see it.
+    requires_run_authority: bool = False
+    # Set when the post-hook is what keeps stored values from the model: a crash then withholds the
+    # result instead of falling back to the unfiltered one.
+    post_hook_fails_closed: bool = False
+    timeout: int | None = None
+    pre_hook: PreHook | None = None
+    post_hook: PostHook | None = None
+
+
+LOG = structlog.get_logger()
+_INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
+_SESSION_EXPIRED_ERROR_CODE = "SESSION_EXPIRED"
+_EFFECT_UNKNOWN_GUIDANCE = "The call timed out before its result was confirmed; read the page before retrying."
+_BROWSER_GENERATION_RETIRED_ERROR_CODE = "BROWSER_GENERATION_RETIRED"
+BROWSER_SESSION_LOSS_ERROR_CODES = frozenset({_SESSION_EXPIRED_ERROR_CODE, _BROWSER_GENERATION_RETIRED_ERROR_CODE})
+_CONTINUITY_COORDINATION_TTL = timedelta(minutes=45)
+_SESSION_LOST_FACT = "The browser session was lost, and I couldn't re-establish it."
+_SESSION_DEADLINE_EXPIRED_FACT = (
+    "The browser session reached the time limit fixed for it and was ended, and I couldn't re-establish it."
+)
+_SESSION_LOST_USER_FACING_REASON = f"{_SESSION_LOST_FACT} Please retry this turn."
+_SESSION_DEADLINE_EXPIRED_USER_FACING_REASON = f"{_SESSION_DEADLINE_EXPIRED_FACT} Please retry this turn."
+_FALLBACK_LOGGER = logging.getLogger(__name__)
+
+
+def _reestablish_lock_seconds() -> int:
+    """The re-create is bounded by the manager's own startup timeout plus the boot poll; the
+    coordination lock only has to outlive that."""
+    startup = app.PERSISTENT_SESSIONS_MANAGER.get_browser_session_startup_timeout_seconds()
+    return int(startup + _BROWSER_BOOT_WAIT_SECONDS)
+
+
+@dataclass(frozen=True)
+class _BrowserSessionContinuityOutcome:
+    lost_session_id: str
+    root_session_id: str
+    disposition: Literal["reestablished", "failed"]
+    replacement_session_id: str | None
+    # The session reached the deadline its infrastructure fixes rather than failing unexplained.
+    deadline_expired: bool = False
+    acquisition_failure: BuildTestConnectFailure | None = None
+
+
+def _validated_acquisition_failure(payload: object) -> BuildTestConnectFailure | None:
+    # The shared cache can hold an outcome an older deploy wrote.
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return BuildTestConnectFailure.model_validate(payload)
+    except ValidationError:
+        return None
+
+
+def _session_loss_reason(*, deadline_expired: bool, acquisition_failure: BuildTestConnectFailure | None) -> str:
+    if acquisition_failure is None:
+        return _SESSION_DEADLINE_EXPIRED_USER_FACING_REASON if deadline_expired else _SESSION_LOST_USER_FACING_REASON
+    loss_fact = _SESSION_DEADLINE_EXPIRED_FACT if deadline_expired else _SESSION_LOST_FACT
+    return f"{loss_fact} {browser_session_acquisition_failure_sentence(acquisition_failure)}"
+
+
+@dataclass
+class _LocalContinuityLock:
+    lock: asyncio.Lock
+    users: int = 0
+
+
+_LOCAL_CONTINUITY_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], _LocalContinuityLock] = {}
+_LOCAL_CONTINUITY_OUTCOMES: dict[tuple[str, str], _BrowserSessionContinuityOutcome] = {}
+_LOCAL_CONTINUITY_ROOTS: dict[tuple[str, str], str] = {}
+
+
+EMBER_BROWSER_CONTINUITY_KEY_PREFIX = "copilot_browser_continuity"
+
+
+def _continuity_outcome_key(organization_id: str, lost_session_id: str) -> str:
+    return f"{EMBER_BROWSER_CONTINUITY_KEY_PREFIX}:outcome:{organization_id}:{lost_session_id}"
+
+
+def _continuity_lineage_key(organization_id: str, session_id: str) -> str:
+    return f"{EMBER_BROWSER_CONTINUITY_KEY_PREFIX}:lineage:{organization_id}:{session_id}"
+
+
+def _continuity_lock_key(organization_id: str, lost_session_id: str) -> str:
+    return f"{EMBER_BROWSER_CONTINUITY_KEY_PREFIX}:lock:{organization_id}:{lost_session_id}"
+
+
+def _cache_supports_continuity_state() -> bool:
+    # Every real BaseCache advertises this as a bool. Some focused tests replace
+    # app.CACHE with a loose mock; keep those isolated from accidental mock state.
+    return isinstance(getattr(app.CACHE, "is_shared", None), bool)
+
+
+@asynccontextmanager
+async def _browser_session_continuity_lock(organization_id: str, lost_session_id: str) -> AsyncIterator[None]:
+    lock_key = _continuity_lock_key(organization_id, lost_session_id)
+    local_key = (asyncio.get_running_loop(), lock_key)
+    entry = _LOCAL_CONTINUITY_LOCKS.setdefault(local_key, _LocalContinuityLock(lock=asyncio.Lock()))
+    entry.users += 1
+    try:
+        async with entry.lock:
+            if getattr(app.CACHE, "is_shared", False) is not True:
+                yield
+            else:
+                async with app.CACHE.get_lock(
+                    lock_key,
+                    blocking_timeout=_reestablish_lock_seconds() + 5,
+                    timeout=_reestablish_lock_seconds() + 10,
+                ):
+                    yield
+    finally:
+        entry.users -= 1
+        if entry.users == 0 and _LOCAL_CONTINUITY_LOCKS.get(local_key) is entry:
+            _LOCAL_CONTINUITY_LOCKS.pop(local_key, None)
+
+
+def _decode_continuity_outcome(raw: object) -> _BrowserSessionContinuityOutcome | None:
+    if isinstance(raw, bytes):
+        raw = raw.decode(errors="replace")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    disposition = data.get("disposition")
+    replacement = data.get("replacement_session_id")
+    if (
+        not isinstance(data.get("lost_session_id"), str)
+        or not isinstance(data.get("root_session_id"), str)
+        or disposition not in {"reestablished", "failed"}
+        or (replacement is not None and not isinstance(replacement, str))
+    ):
+        return None
+    return _BrowserSessionContinuityOutcome(
+        lost_session_id=data["lost_session_id"],
+        root_session_id=data["root_session_id"],
+        disposition=disposition,
+        replacement_session_id=replacement,
+        deadline_expired=data.get("deadline_expired") is True,
+        acquisition_failure=_validated_acquisition_failure(data.get("acquisition_failure")),
+    )
+
+
+async def _get_continuity_outcome(
+    organization_id: str, lost_session_id: str
+) -> _BrowserSessionContinuityOutcome | None:
+    if not _cache_supports_continuity_state():
+        return _LOCAL_CONTINUITY_OUTCOMES.get((organization_id, lost_session_id))
+    return _decode_continuity_outcome(await app.CACHE.get(_continuity_outcome_key(organization_id, lost_session_id)))
+
+
+async def _get_continuity_root(organization_id: str, session_id: str) -> str | None:
+    if not _cache_supports_continuity_state():
+        return _LOCAL_CONTINUITY_ROOTS.get((organization_id, session_id))
+    raw = await app.CACHE.get(_continuity_lineage_key(organization_id, session_id))
+    if isinstance(raw, bytes):
+        raw = raw.decode(errors="replace")
+    return raw if isinstance(raw, str) and raw else None
+
+
+async def _store_continuity_outcome(organization_id: str, outcome: _BrowserSessionContinuityOutcome) -> None:
+    if not _cache_supports_continuity_state():
+        _LOCAL_CONTINUITY_OUTCOMES[(organization_id, outcome.lost_session_id)] = outcome
+        if outcome.replacement_session_id is not None:
+            _LOCAL_CONTINUITY_ROOTS[(organization_id, outcome.replacement_session_id)] = outcome.root_session_id
+        return
+    await app.CACHE.set(
+        _continuity_outcome_key(organization_id, outcome.lost_session_id),
+        json.dumps(
+            {
+                "lost_session_id": outcome.lost_session_id,
+                "root_session_id": outcome.root_session_id,
+                "disposition": outcome.disposition,
+                "replacement_session_id": outcome.replacement_session_id,
+                "deadline_expired": outcome.deadline_expired,
+                "acquisition_failure": (
+                    None
+                    if outcome.acquisition_failure is None
+                    else outcome.acquisition_failure.model_dump(mode="json", exclude_none=True)
+                ),
+            }
+        ),
+        ex=_CONTINUITY_COORDINATION_TTL,
+    )
+    if outcome.replacement_session_id is not None:
+        await app.CACHE.set(
+            _continuity_lineage_key(organization_id, outcome.replacement_session_id),
+            outcome.root_session_id,
+            ex=_CONTINUITY_COORDINATION_TTL,
+        )
+
+
+def _mapping_keys_preserved(source: Any, scrubbed: Any) -> bool:
+    if isinstance(source, dict):
+        return (
+            isinstance(scrubbed, dict)
+            and source.keys() == scrubbed.keys()
+            and all(_mapping_keys_preserved(value, scrubbed[key]) for key, value in source.items())
+        )
+    if isinstance(source, (list, tuple)):
+        return (
+            type(source) is type(scrubbed)
+            and len(source) == len(scrubbed)
+            and all(_mapping_keys_preserved(left, right) for left, right in zip(source, scrubbed, strict=True))
+        )
+    return True
+
+
+# A driver navigation token names a Chromium error, but a registered value occurring inside it (a
+# parameter "net") would corrupt it: the model would read a mangled code, and a proxy outage would
+# reach attribution as an authoring defect. A token that is itself a registered value is left scrubbed.
+_DRIVER_NAV_ERROR_CODE = re.compile(r"net::ERR_[A-Z0-9_]+")
+
+
+# Only the navigation tool reports a driver code, and only its own reader writes one. Preserving the
+# field for any tool would let one that echoes an argument into it disclose a registered value.
+_NAVIGATION_TOOL_NAME = "skyvern_navigate"
+
+
+def _active_parameter_sets(ctx: AgentContext) -> list[dict[str, Any]]:
+    """The redaction parameter sets this scrub applies, in the order it applies them."""
+    parameter_sets: list[dict[str, Any]] = []
+    parameters = getattr(ctx, "codeblock_redaction_parameters", None)
+    if isinstance(parameters, dict) and parameters:
+        parameter_sets.append(parameters)
+    origin_parameters = matching_origin_run_redaction_parameters(ctx)
+    if origin_parameters:
+        parameter_sets.append(origin_parameters)
+    return parameter_sets
+
+
+def _preserved_nav_code(ctx: AgentContext, tool_name: str | None, value: object) -> str | None:
+    if tool_name != _NAVIGATION_TOOL_NAME:
+        return None
+    if not isinstance(value, str) or not _DRIVER_NAV_ERROR_CODE.fullmatch(value):
+        return None
+    if is_registered_scrub_value(ctx, value):
+        return None
+    # The scrub redacts registered values AND the run's redaction parameters, so a guard that reads
+    # only the first restores whatever the second was hiding. A walk that does not finish cannot say
+    # the code is absent, so it refuses too.
+    for parameter_set in _active_parameter_sets(ctx):
+        carried_strings = parameter_strings(parameter_set)
+        if carried_strings is None or value in carried_strings:
+            return None
+    return value
+
+
+# Where a navigation code sits: the flattened Copilot result, and the raw MCP error's details.
+_NAV_ERROR_CODE_PARENTS: tuple[tuple[str, ...], ...] = ((), ("error", "details"))
+
+
+def _mapping_at(value: Any, path: tuple[str, ...]) -> dict[str, Any] | None:
+    for key in path:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+_REDACTION_WITHHELD_KEY = "redaction_withheld"
+_RedactionWithheldReason = Literal["redaction_budget", "redaction_unavailable"]
+
+
+def is_redaction_withheld(result: object) -> bool:
+    data = result.get("data") if isinstance(result, dict) else None
+    return isinstance(data, dict) and isinstance(data.get(_REDACTION_WITHHELD_KEY), dict)
+
+
+def _original_chars(result: Any) -> int | None:
+    if is_redaction_withheld(result):
+        inherited = result["data"][_REDACTION_WITHHELD_KEY].get("original_chars")
+        return inherited if type(inherited) is int else None
+    try:
+        return len(json.dumps(result, default=str, ensure_ascii=False))
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
+def _redaction_withheld_result(
+    ctx: AgentContext, result: Any, *, tool_name: str | None, failure: _RedactionWithheldReason
+) -> dict[str, Any]:
+    original_chars = _original_chars(result)
+    rewithheld = is_redaction_withheld(result)
+    if rewithheld:
+        inherited_budget = result["data"][_REDACTION_WITHHELD_KEY].get("reason") == "redaction_budget"
+        failure = "redaction_budget" if inherited_budget else "redaction_unavailable"
+    # An inherited size can be missing because it was dropped as a registered value, not because it was small.
+    over_budget = original_chars > MCP_MAX_RESPONSE_CHARS if original_chars is not None else rewithheld
+    reason: _RedactionWithheldReason = (
+        "redaction_budget" if failure == "redaction_budget" and over_budget else "redaction_unavailable"
+    )
+    # A size equal to a registered value would disclose it, so the size is only reported when it scrubs to itself.
+    if original_chars is not None:
+        probe = {"original_chars": original_chars, "text": str(original_chars)}
+        if _scrub_model_facing_tool_result(ctx, probe) != probe:
+            original_chars = None
+    if not rewithheld:
+        LOG.warning(
+            "ember_model_facing_result_withheld",
+            tool_name=tool_name,
+            reason=reason,
+            original_chars=original_chars,
+            active_parameter_sets=len(_active_parameter_sets(ctx)),
+        )
+    withheld: dict[str, Any] = {"reason": reason}
+    if original_chars is not None:
+        withheld["original_chars"] = original_chars
+    if reason == "redaction_budget":
+        size = f" ({original_chars} characters)" if original_chars is not None else ""
+        error = f"Result withheld, too large to redact{size}."
+    else:
+        error = "Result withheld: it could not be redacted safely."
+    return {"ok": False, "error": error, "data": {_REDACTION_WITHHELD_KEY: withheld}}
+
+
+_SCREENSHOT_TOOL_NAME = "skyvern_screenshot"
+_SCREENSHOT_IMAGE_MAX_CHARS = 8_000_000
+_SCREENSHOT_IMAGE_MAX_PIXELS = 40_000_000
+_PNG_IEND_CHUNK = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+_SCREENSHOT_IMAGE_OMITTED_NOTE = "The screenshot image could not be prepared and was left out."
+
+
+_ScreenshotImageCheck = Literal["valid", "over_cap", "invalid"]
+
+
+def _check_png_image(value: str) -> _ScreenshotImageCheck:
+    # verify() checks the PNG header and chunk CRCs but stops at the first IEND, so bytes after it are checked here.
+    if len(value) > _SCREENSHOT_IMAGE_MAX_CHARS:
+        return "over_cap"
+    try:
+        decoded = base64.b64decode(value, validate=True)
+        with Image.open(io.BytesIO(decoded), formats=("PNG",)) as image:
+            image.verify()
+            pixels = image.width * image.height
+    except Image.DecompressionBombError:
+        return "over_cap"
+    except Exception:  # noqa: BLE001
+        return "invalid"
+    if decoded.find(_PNG_IEND_CHUNK) != len(decoded) - len(_PNG_IEND_CHUNK):
+        return "invalid"
+    return "over_cap" if pixels > _SCREENSHOT_IMAGE_MAX_PIXELS else "valid"
+
+
+def _set_aside_screenshot_image(
+    result: Any, tool_name: str | None, *, carry_inline: bool, log_drops: bool = True
+) -> tuple[Any, dict[str, str]]:
+    data = result.get("data") if isinstance(result, dict) else None
+    if tool_name != _SCREENSHOT_TOOL_NAME or not isinstance(data, dict):
+        return result, {}
+    text_data = dict(data)
+    carried: dict[str, str] = {}
+
+    def drop(field: str, reason: str, value: str) -> None:
+        if log_drops:
+            LOG.warning(
+                "ember_screenshot_image_dropped", tool_name=tool_name, field=field, reason=reason, length=len(value)
+            )
+
+    inline_image = data.get("data")
+    if isinstance(inline_image, str) and inline_image:
+        inline_png = data.get("inline") is True and data.get("mime") == "image/png"
+        # A successful post-hook moves the image to screenshot_base64, so one still inline after it is never carried.
+        if not carry_inline:
+            drop("data", "inline_after_post_hook", inline_image)
+            text_data["data"] = _SCREENSHOT_IMAGE_OMITTED_NOTE
+        elif not inline_png or (inline_check := _check_png_image(inline_image)) == "invalid":
+            # Blanked rather than noted: internal callers read a non-empty data.data as image bytes.
+            drop("data", "invalid_image" if inline_png else "not_inline_png", inline_image)
+            text_data["data"] = ""
+        elif inline_check == "valid":
+            text_data["data"] = ""
+            carried["data"] = inline_image
+    screenshot = data.get("screenshot_base64")
+    if isinstance(screenshot, str):
+        check = _check_png_image(screenshot) if screenshot else "invalid"
+        if check == "valid":
+            text_data["screenshot_base64"] = ""
+            carried["screenshot_base64"] = screenshot
+        elif check == "invalid":
+            # The sanitizer reports any screenshot_base64, even an empty one, as a successful screenshot.
+            if screenshot:
+                drop("screenshot_base64", "invalid_image", screenshot)
+            del text_data["screenshot_base64"]
+            text_data["data"] = _SCREENSHOT_IMAGE_OMITTED_NOTE
+    if text_data == data:
+        return result, {}
+    return {**result, "data": text_data}, carried
+
+
+def scrub_model_facing_tool_result(
+    ctx: AgentContext, result: Any, *, tool_name: str | None = None, carry_inline: bool = True
+) -> dict[str, Any]:
+    driver_codes = {
+        path: code
+        for path in _NAV_ERROR_CODE_PARENTS
+        if (code := _preserved_nav_code(ctx, tool_name, (_mapping_at(result, path) or {}).get("nav_error_code")))
+        is not None
+    }
+    text_only, carried = _set_aside_screenshot_image(result, tool_name, carry_inline=carry_inline)
+    scrubbed = _scrub_set_aside_result(ctx, text_only, carried)
+    if not isinstance(scrubbed, dict):
+        return _redaction_withheld_result(ctx, text_only, tool_name=tool_name, failure=scrubbed)
+    for path, code in driver_codes.items():
+        parent = _mapping_at(scrubbed, path)
+        if parent is not None:
+            parent["nav_error_code"] = code
+    return scrubbed
+
+
+def _scrub_model_facing_tool_result(
+    ctx: AgentContext, result: Any, *, tool_name: str | None = None, carry_inline: bool = True
+) -> dict[str, Any] | _RedactionWithheldReason:
+    text_only, carried = _set_aside_screenshot_image(result, tool_name, carry_inline=carry_inline, log_drops=False)
+    return _scrub_set_aside_result(ctx, text_only, carried)
+
+
+def _scrub_set_aside_result(
+    ctx: AgentContext, text_only: Any, carried: dict[str, str]
+) -> dict[str, Any] | _RedactionWithheldReason:
+    scrubbed = _scrub_model_facing_text(ctx, text_only)
+    if carried and isinstance(scrubbed, dict):
+        scrubbed["data"].update(carried)
+    return scrubbed
+
+
+def _scrub_model_facing_text(ctx: AgentContext, result: Any) -> dict[str, Any] | _RedactionWithheldReason:
+    scrubbed_secrets = scrub_secrets_from_structure(ctx, result)
+    if not isinstance(scrubbed_secrets, dict) or not _mapping_keys_preserved(result, scrubbed_secrets):
+        return "redaction_unavailable"
+    scrubbed = scrubbed_secrets
+    for parameter_set in _active_parameter_sets(ctx):
+        candidate = app.AGENT_FUNCTION.redact_codeblock_parameter_values(
+            scrubbed,
+            parameter_set,
+            max_disclosure_chars=MCP_MAX_RESPONSE_CHARS,
+            max_disclosure_nodes=MCP_MAX_RESPONSE_CHARS,
+        )
+        if not isinstance(candidate, dict):
+            # The redactor returns the same non-dict for a blown budget and for a parameter set it refuses,
+            # so ask it about an empty input to tell the two apart.
+            refuses_parameters = not isinstance(
+                app.AGENT_FUNCTION.redact_codeblock_parameter_values({}, parameter_set), dict
+            )
+            return "redaction_unavailable" if refuses_parameters else "redaction_budget"
+        if not _mapping_keys_preserved(scrubbed, candidate):
+            return "redaction_unavailable"
+        if type(scrubbed.get("ok")) is bool:
+            candidate["ok"] = scrubbed["ok"]
+        scrubbed = candidate
+    return scrubbed
+
+
+def _scrub_tool_exception(ctx: AgentContext, tool_name: str, exception: BaseException) -> Any:
+    try:
+        detail = str(exception)
+    except BaseException:
+        detail = ""
+    error = f"{tool_name} failed: {detail}" if detail else f"{tool_name} failed"
+    del exception, detail
+    return scrub_model_facing_tool_result(ctx, {"ok": False, "error": error})
+
+
+_MCPCallPhase = Literal["session_prepare", "context_enter", "dispatch", "context_exit"]
+_MCP_CALL_SEGMENTS: tuple[_MCPCallPhase, ...] = ("session_prepare", "context_enter", "dispatch", "context_exit")
+
+
+class _PhaseClock:
+    """Segments one MCP call's wall clock. Per-segment flooring keeps the residual non-negative."""
+
+    def __init__(self) -> None:
+        self._started = time.monotonic()
+        self._mark = self._started
+        self._bucket: _MCPCallPhase | None = None
+        self._wall: int | None = None
+        self._paused_at: float | None = None
+        self._excluded_seconds = 0.0
+        self.current: _MCPCallPhase | None = None
+        self.elapsed: dict[_MCPCallPhase, int] = {}
+
+    def _charge(self, now: float) -> None:
+        if self._bucket is not None:
+            self.elapsed[self._bucket] = self.elapsed.get(self._bucket, 0) + int((now - self._mark) * 1000)
+        self._mark = now
+
+    def enter(self, phase: _MCPCallPhase) -> None:
+        now = time.monotonic()
+        if self._paused_at is not None:
+            self._excluded_seconds += now - self._paused_at
+            self._paused_at = None
+            self._mark = now
+        else:
+            self._charge(now)
+        self._bucket = phase
+        self.current = phase
+
+    def unwind(self) -> None:
+        """Charge the teardown to ``context_exit`` while ``current`` keeps naming the segment that failed."""
+        self._charge(time.monotonic())
+        self._bucket = "context_exit"
+
+    def pause(self) -> None:
+        """Exclude result projection and evidence enrichment from server-call timing."""
+        now = time.monotonic()
+        self._charge(now)
+        self._bucket = None
+        self._paused_at = now
+
+    def close(self) -> int:
+        if self._wall is None:
+            now = time.monotonic()
+            if self._paused_at is not None:
+                self._excluded_seconds += now - self._paused_at
+                self._paused_at = None
+                self._mark = now
+            else:
+                self._charge(now)
+            self._bucket = None
+            self._wall = int((now - self._started - self._excluded_seconds) * 1000)
+        return self._wall
+
+    def settle(self) -> None:
+        """The call answered, so no segment holds a failure and ``timing_phase`` would misname a returned error."""
+        self.current = None
+
+
+def _server_mark(raw_mcp: dict[str, Any], name: str) -> int | None:
+    timing = raw_mcp.get("timing_ms")
+    value = timing.get(name) if isinstance(timing, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _log_mcp_timing(
+    ctx: EmberContext,
+    tool_name: str,
+    mcp_tool_name: str,
+    phases: _PhaseClock,
+    raw_mcp: dict[str, Any],
+    call_path: Literal["model", "internal"],
+    call_status: Literal["ok", "timeout", "error", "session_error", "cancelled", "not_connected"] = "ok",
+    *,
+    dispatch_started: bool | None = None,
+) -> None:
+    with contained_effect("emit MCP tool timing", tool_name=tool_name, call_status=call_status):
+        reported = _server_mark(raw_mcp, "total")
+        attach_ms = _server_mark(raw_mcp, "attach")
+        # The tool's total excludes the browser attach it did before opening its timer, so the span the
+        # server actually held the call is the two together.
+        server_span_ms = None if reported is None else reported + (attach_ms or 0)
+        wall_clock_ms = phases.close()
+        spent = {phase: phases.elapsed.get(phase, 0) for phase in _MCP_CALL_SEGMENTS}
+        dispatch_ms = spent["dispatch"]
+        # The server measures on its own clock, so a span outside the dispatch segment cannot be
+        # subtracted from it without inventing a component.
+        server_fits = server_span_ms is not None and 0 <= server_span_ms <= dispatch_ms
+        untimed_ms = dispatch_ms - server_span_ms if server_fits and server_span_ms is not None else None
+        LOG.info(
+            "MCP tool timing",
+            tool_name=tool_name,
+            mcp_tool_name=mcp_tool_name,
+            wall_clock_ms=wall_clock_ms,
+            server_timing_ms=server_span_ms,
+            server_attach_ms=attach_ms,
+            call_path=call_path,
+            call_status=call_status,
+            dispatch_started=dispatch_started,
+            phase_session_prepare_ms=spent["session_prepare"],
+            phase_context_enter_ms=spent["context_enter"],
+            phase_dispatch_ms=dispatch_ms,
+            phase_context_exit_ms=spent["context_exit"],
+            phase_residual_ms=wall_clock_ms - sum(spent.values()),
+            timing_phase=phases.current if call_status != "ok" else None,
+            phase_dispatch_untimed_ms=untimed_ms,
+            timing_server_overrun=None if server_span_ms is None else not server_fits,
+            **_ember_log_fields(ctx),
+        )
+
+
+def _browser_session_loss_result(
+    result: dict[str, Any],
+    *,
+    disposition: _BrowserSessionLossDisposition,
+    deadline_expired: bool = False,
+    acquisition_failure: BuildTestConnectFailure | None = None,
+) -> dict[str, Any]:
+    data = result.get("data")
+    continuity = {
+        "source": "direct_mcp",
+        "disposition": disposition,
+        "cause": (
+            "fixed_deadline_expiry"
+            if deadline_expired
+            else "connection_generation_retired"
+            if disposition == "generation_retired"
+            else "unknown"
+        ),
+        "fresh_state_required": disposition in {"reestablished", "generation_retired"},
+        "prior_action_effect": "unknown",
+    }
+    result_data = dict(data) if isinstance(data, dict) else {}
+    result_data["browser_session_continuity"] = continuity
+    if disposition == "reestablished":
+        error = (
+            "The browser session reached the time limit fixed for it and was ended during this "
+            "operation. A fresh browser session is ready, on the same kind of time limit; inspect "
+            "the page before continuing because the prior operation's effect is unknown."
+            if deadline_expired
+            else "The browser session was lost during this operation. A fresh browser session is ready; "
+            "inspect the page before continuing because the prior operation's effect is unknown."
+        )
+    elif disposition == "generation_retired":
+        error = (
+            "The browser connection used by this operation was replaced during shared-session recovery. "
+            "Inspect the current page before retrying because the prior operation's effect is unknown."
+        )
+    elif current_call_browser_session_override() is not None:
+        # The chat's browser is fine; the one this call was aimed at is gone. Retrying the turn,
+        # which is what the chat-flavoured wording asks for, would not bring it back.
+        error = (
+            "The browser this call targeted is no longer available, so its page cannot be observed. "
+            "Continue from the evidence the run already returned, or run the blocks again."
+        )
+    else:
+        error = _session_loss_reason(deadline_expired=deadline_expired, acquisition_failure=acquisition_failure)
+        if acquisition_failure is not None:
+            result_data["browser_session_acquisition_failure"] = acquisition_failure.model_dump(
+                mode="json", exclude_none=True
+            )
+    return {
+        **result,
+        "ok": False,
+        "error_code": (
+            _BROWSER_GENERATION_RETIRED_ERROR_CODE
+            if disposition == "generation_retired"
+            else _SESSION_EXPIRED_ERROR_CODE
+        ),
+        "error": error,
+        "data": result_data,
+    }
+
+
+def _browser_session_loss_blocker_signal(
+    *,
+    tool_name: str,
+    call_path: Literal["model", "internal"],
+    lost_session_id: str,
+    deadline_expired: bool = False,
+    acquisition_failure: BuildTestConnectFailure | None = None,
+) -> EmberToolBlockerSignal:
+    extra: dict[str, Any] = {
+        "call_path": call_path,
+        "continuity_source": "direct_mcp",
+        "continuity_disposition": "failed",
+        "lost_browser_session_id": lost_session_id,
+    }
+    if acquisition_failure is not None:
+        extra["browser_session_acquisition_failure"] = acquisition_failure.model_dump(mode="json", exclude_none=True)
+    return EmberToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=(
+            "The browser session reached the time limit fixed for it and one replacement attempt "
+            "failed. End the turn from the recorded session-loss evidence."
+            if deadline_expired
+            else "The browser session was confirmed lost and one replacement attempt failed. "
+            "End the turn from the recorded session-loss evidence."
+        ),
+        user_facing_reason=_session_loss_reason(
+            deadline_expired=deadline_expired, acquisition_failure=acquisition_failure
+        ),
+        recovery_hint="report_blocker_to_user",
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code=BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
+        blocked_tool=tool_name,
+        extra=extra,
+    )
+
+
+async def _session_reached_its_fixed_deadline(organization_id: str, session_id: str) -> bool:
+    """Whether the lost session was ended by its own time limit rather than failing unexplained.
+
+    A session on infrastructure that pins the deadline at provisioning is killed on the clock while
+    it is still healthy, so the loss the turn sees is expected and periodic rather than a browser
+    fault (SKY-15044). Asked as "has that deadline passed?" rather than read off the row's status:
+    the worker writes the terminal status only after tearing the provider's browser down, so an
+    attach failing inside that window still finds a row marked running. The deadline is fixed when
+    the browser is handed over and never moves, so it answers correctly throughout.
+    """
+    reached = False
+    # Contained, comparison included: this only names a cause, and nothing about resolving it --
+    # including a manager that answers with something uncomparable -- may stop the replacement.
+    with contained_effect("resolve ember browser session end reason", session_id=session_id):
+        remaining_seconds = await app.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline(
+            session_id, organization_id
+        )
+        reached = remaining_seconds is not None and remaining_seconds <= 0
+    return reached
+
+
+async def _handle_browser_session_loss(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    call_path: Literal["model", "internal"],
+    lost_session_id: str,
+) -> Literal["reestablished", "failed"]:
+    targeted_session_id = current_call_browser_session_override()
+    if targeted_session_id is not None and lost_session_id == targeted_session_id != ctx.browser_session_id:
+        # Continuity recovery closes the lost browser and rebinds the chat to a replacement, which
+        # is only ever right for the chat's own session. A call targeted at another browser reports
+        # that browser as gone; it must not tear it down, and must not swap the chat's out from
+        # under the turn because a browser it does not own died.
+        LOG.info(
+            "Browser session loss on a targeted session; leaving chat continuity untouched",
+            tool=tool_name,
+            call_path=call_path,
+        )
+        return "failed"
+
+    # Promotion of retained browser-code source holds this same context lock through persistence.
+    # Recovery must not retire the browser or advance its generation while that promotion is in flight.
+    async with browser_session_recovery(ctx):
+        return await _handle_browser_session_loss_under_context_lock(
+            ctx,
+            tool_name=tool_name,
+            call_path=call_path,
+            lost_session_id=lost_session_id,
+        )
+
+
+async def _handle_browser_session_loss_under_context_lock(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    call_path: Literal["model", "internal"],
+    lost_session_id: str,
+) -> Literal["reestablished", "failed"]:
+    local_replacements = getattr(ctx, "browser_session_replacements", {})
+    if lost_session_id in local_replacements:
+        return "reestablished" if local_replacements[lost_session_id] is not None else "failed"
+
+    async with _browser_session_continuity_lock(ctx.organization_id, lost_session_id):
+        recorded = await _get_continuity_outcome(ctx.organization_id, lost_session_id)
+        if recorded is not None:
+            await _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
+            return recorded.disposition
+
+        root_session_id = await _get_continuity_root(ctx.organization_id, lost_session_id)
+        # Read before the close: the finalized row carries the reason, and closing it writes one.
+        deadline_expired = await _session_reached_its_fixed_deadline(ctx.organization_id, lost_session_id)
+        _emit_continuity_event(
+            ctx,
+            tool_name=tool_name,
+            call_path=call_path,
+            lost_session_id=lost_session_id,
+            replacement_session_id=None,
+            disposition="detected",
+            deadline_expired=deadline_expired,
+        )
+        await close_browser_session_quietly(ctx.organization_id, lost_session_id)
+        await retire_browser_session_id(ctx, lost_session_id)
+
+        if root_session_id is not None:
+            outcome = _BrowserSessionContinuityOutcome(
+                lost_session_id=lost_session_id,
+                root_session_id=root_session_id,
+                disposition="failed",
+                replacement_session_id=None,
+                deadline_expired=deadline_expired,
+            )
+        else:
+            try:
+                recovery_error = await ensure_browser_session(ctx)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                recovery_error = {"ok": False, "error": "Failed to create browser session"}
+            replacement_session_id = ctx.browser_session_id if recovery_error is None else None
+            acquisition_failure: BuildTestConnectFailure | None = None
+            if recovery_error is not None and carries_browser_session_acquisition_failure(recovery_error):
+                acquisition_failure = _validated_acquisition_failure(
+                    recovery_error["data"]["browser_session_acquisition_failure"]
+                )
+            if recovery_error is not None and ctx.browser_session_id is not None:
+                await close_browser_session_quietly(ctx.organization_id, ctx.browser_session_id)
+                await retire_browser_session_id(ctx, ctx.browser_session_id)
+            outcome = _BrowserSessionContinuityOutcome(
+                lost_session_id=lost_session_id,
+                root_session_id=lost_session_id,
+                disposition="reestablished" if replacement_session_id is not None else "failed",
+                replacement_session_id=replacement_session_id,
+                deadline_expired=deadline_expired,
+                acquisition_failure=acquisition_failure,
+            )
+
+        await _store_continuity_outcome(ctx.organization_id, outcome)
+        await _apply_continuity_outcome(ctx, outcome, tool_name=tool_name, call_path=call_path)
+        _emit_continuity_event(
+            ctx,
+            tool_name=tool_name,
+            call_path=call_path,
+            lost_session_id=lost_session_id,
+            replacement_session_id=outcome.replacement_session_id,
+            disposition=outcome.disposition,
+            deadline_expired=outcome.deadline_expired,
+        )
+        return outcome.disposition
+
+
+async def _browser_session_error_disposition(
+    ctx: AgentContext,
+    error: EmberBrowserGenerationRetired | EmberBrowserSessionUnavailable,
+    *,
+    tool_name: str,
+    call_path: Literal["model", "internal"],
+) -> _BrowserSessionLossDisposition:
+    if (
+        isinstance(error, EmberBrowserGenerationRetired)
+        and error.retirement_reason is BrowserRetirementReason.replacement
+    ):
+        return "generation_retired"
+    return await _handle_browser_session_loss(
+        ctx,
+        tool_name=tool_name,
+        call_path=call_path,
+        lost_session_id=error.session_id,
+    )
+
+
+def _emit_continuity_event(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    call_path: Literal["model", "internal"],
+    lost_session_id: str,
+    replacement_session_id: str | None,
+    disposition: Literal["detected", "reestablished", "failed"],
+    deadline_expired: bool,
+) -> None:
+    # The payload is built inside the guard too: this emit sits ahead of the recovery
+    # call, so a failure anywhere in it -- not just in the sink -- would leave
+    # ensure_browser_session uncalled and the disposition unrecorded.
+    with contained_effect("emit ember session continuity event", session_id=lost_session_id):
+        workflow_run_id = (
+            ctx.sdk_action_workflow_run_ids_by_browser_session.get((ctx.organization_id, lost_session_id))
+            or ctx.last_run_blocks_workflow_run_id
+        )
+        fields: dict[str, Any] = {
+            "error_code": _SESSION_EXPIRED_ERROR_CODE,
+            "session_id": lost_session_id,
+            "replacement_session_id": replacement_session_id,
+            "workflow_run_id": workflow_run_id,
+            "tool_name": tool_name,
+            "call_path": call_path,
+            "continuity_source": "direct_mcp",
+            "continuity_disposition": disposition,
+            "deadline_expired": deadline_expired,
+            **_ember_log_fields(cast("EmberContext", ctx)),
+        }
+        log = LOG.info if disposition == "reestablished" else LOG.warning
+        try:
+            log("ember_browser_session_continuity_loss", **fields)
+        except Exception:
+            _FALLBACK_LOGGER.warning(
+                "ember_browser_session_continuity_loss session_id=%s disposition=%s",
+                lost_session_id,
+                disposition,
+            )
+
+
+async def _apply_continuity_outcome(
+    ctx: AgentContext,
+    outcome: _BrowserSessionContinuityOutcome,
+    *,
+    tool_name: str,
+    call_path: Literal["model", "internal"],
+) -> None:
+    async with browser_session_recovery(ctx):
+        ctx.browser_session_id = outcome.replacement_session_id
+        replacements = getattr(ctx, "browser_session_replacements", None)
+        if not isinstance(replacements, dict):
+            replacements = {}
+            ctx.browser_session_replacements = replacements
+        replacements[outcome.lost_session_id] = outcome.replacement_session_id
+        ctx.browser_session_continuity_generation = getattr(ctx, "browser_session_continuity_generation", 0) + 1
+        ctx.browser_session_continuity_disposition = outcome.disposition
+        ctx.browser_session_continuity_deadline_expired = outcome.deadline_expired
+        ctx.browser_session_continuity_acquisition_failure = outcome.acquisition_failure
+        if outcome.disposition == "failed":
+            stash_blocker_signal(
+                ctx,
+                _browser_session_loss_blocker_signal(
+                    tool_name=tool_name,
+                    call_path=call_path,
+                    lost_session_id=outcome.lost_session_id,
+                    deadline_expired=outcome.deadline_expired,
+                    acquisition_failure=outcome.acquisition_failure,
+                ),
+            )
+
+
+async def _prepare_browser_session_for_dispatch(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    call_path: Literal["model", "internal"],
+    observed_generation: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, _BrowserSessionLossDisposition | None]:
+    """Verify the current session and return any error, continuity result, and fresh disposition."""
+    targeted_session_id = current_call_browser_session_override()
+    if targeted_session_id is not None and targeted_session_id != ctx.browser_session_id:
+        # This call acts in a browser the chat does not own, so the chat's continuity is not its
+        # precondition. The dispatch is the oracle for the targeted session; a dead one lands in
+        # _handle_browser_session_loss, which refuses the call without disturbing the chat.
+        return None, None, None
+    async with browser_session_recovery(ctx):
+        if getattr(ctx, "browser_session_continuity_generation", 0) != observed_generation:
+            disposition: Literal["reestablished", "failed"] = (
+                "reestablished"
+                if getattr(ctx, "browser_session_continuity_disposition", None) == "reestablished"
+                else "failed"
+            )
+            return (
+                None,
+                _browser_session_loss_result(
+                    {},
+                    disposition=disposition,
+                    deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                    acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
+                ),
+                disposition,
+            )
+
+        prior_session_id = ctx.browser_session_id
+        if not prior_session_id:
+            return await ensure_browser_session(ctx), None, None
+
+        async with _browser_session_continuity_lock(ctx.organization_id, prior_session_id):
+            recorded = await _get_continuity_outcome(ctx.organization_id, prior_session_id)
+            if recorded is not None:
+                await _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
+                return (
+                    None,
+                    _browser_session_loss_result(
+                        {},
+                        disposition=recorded.disposition,
+                        deadline_expired=recorded.deadline_expired,
+                        acquisition_failure=recorded.acquisition_failure,
+                    ),
+                    recorded.disposition,
+                )
+        # The attach in mcp_browser_context is the oracle; a lost session is handled where it is discovered.
+        return None, None, None
+
+
+def _requested_output_path_choices(schema: dict[str, Any], paths: list[str]) -> dict[str, Any]:
+    """Present the outputs this turn owes as the choices for the path a read claims.
+
+    A free-form string left the model naming its own purpose, so the read that observed the requested
+    quantity was filed as exploration and the value it saw never witnessed the path the binder owes
+    (SKY-13226). The field stays optional: a read that is genuinely exploration omits it, and every
+    requested path stays available so a later read can refine one already claimed.
+    """
+    properties = schema.get("properties")
+    if not paths or not isinstance(properties, dict):
+        return schema
+    output_path = properties.get("output_path")
+    if not isinstance(output_path, dict):
+        return schema
+    listed = ", ".join(paths)
+    return {
+        **schema,
+        "properties": {
+            **properties,
+            "output_path": {
+                **output_path,
+                "enum": paths,
+                "description": (
+                    f"{output_path.get('description', '')} This turn owes: {listed}. Set it to the one "
+                    "this read fills; omit it when the read is exploration."
+                ).strip(),
+            },
+        },
+    }
+
+
+def _apply_schema_overlay(
+    input_schema: dict[str, Any],
+    overlay: SchemaOverlay,
+) -> dict[str, Any]:
+    props = dict(input_schema.get("properties", {}))
+    required = list(input_schema.get("required", []))
+
+    for p in overlay.hide_params | frozenset(overlay.forced_args):
+        props.pop(p, None)
+        if p in required:
+            required.remove(p)
+
+    for ember_param, mcp_param in overlay.arg_transforms.items():
+        if mcp_param in props:
+            props[ember_param] = props.pop(mcp_param)
+        if mcp_param in required:
+            required.remove(mcp_param)
+            required.append(ember_param)
+
+    for param, patch in overlay.param_patches.items():
+        if param in props:
+            props[param] = {**props[param], **patch}
+
+    props.update(overlay.ember_params)
+
+    if overlay.required_overrides is not None:
+        required = list(overlay.required_overrides)
+    if USER_FACING_REASON_PARAM in props and USER_FACING_REASON_PARAM not in required:
+        required.append(USER_FACING_REASON_PARAM)
+
+    return {
+        **input_schema,
+        "type": input_schema.get("type", "object"),
+        "properties": props,
+        "required": required,
+    }
+
+
+def _transform_args(
+    arguments: dict[str, Any],
+    overlay: SchemaOverlay,
+) -> dict[str, Any]:
+    dropped = overlay.hide_params | _INTERNAL_TOOL_ARG_KEYS | frozenset(overlay.ember_params)
+    mcp_args = {k: v for k, v in arguments.items() if k not in dropped}
+
+    for ember_param, mcp_param in overlay.arg_transforms.items():
+        if ember_param in mcp_args:
+            mcp_args[mcp_param] = mcp_args.pop(ember_param)
+
+    mcp_args.update(overlay.forced_args)
+    return mcp_args
+
+
+def _ember_to_call_tool_result(
+    ember_result: dict[str, Any],
+    tool_name: str = "",
+) -> CallToolResult:
+    if not ember_result:
+        return CallToolResult(content=[], isError=True)
+    sanitized = sanitize_tool_result_for_llm(tool_name, ember_result)
+    marked = mark_mcp_result_untrusted_for_llm(sanitized)
+    content: list[TextContent] = [TextContent(type="text", text=json.dumps(marked))]
+    is_error = ember_result.get("ok", True) is not True
+    return CallToolResult(content=content, isError=is_error)
+
+
+@asynccontextmanager
+async def service_worker_blocked_context(
+    browser_state: BrowserState,
+    *,
+    organization_id: str,
+) -> AsyncIterator[BrowserContext]:
+    original_context = browser_state.browser_context
+    if original_context is None:
+        raise RuntimeError("This browser does not support an isolated context")
+    original_page = await browser_state.get_working_page()
+    browser = original_context.browser
+    fallback_browser: Browser | None = None
+    if browser is None:
+        fallback_browser = await browser_state.pw.chromium.launch()
+        browser = fallback_browser
+    candidate_context: BrowserContext | None = None
+    try:
+        candidate_context = await browser.new_context(service_workers="block")
+        await app.AGENT_FUNCTION.setup_browser_context_extensions(
+            candidate_context,
+            organization_id=organization_id,
+            ember_candidate_network_guard=True,
+        )
+        candidate_page = await candidate_context.new_page()
+        browser_state.browser_context = candidate_context
+        await browser_state.set_active_page(candidate_page)
+        yield candidate_context
+    finally:
+        try:
+            if candidate_context is not None:
+                browser_state.browser_context = original_context
+                if original_page is None:
+                    await browser_state.set_working_page(None)
+                else:
+                    await browser_state.set_active_page(original_page)
+                await candidate_context.close()
+        finally:
+            if fallback_browser is not None:
+                await fallback_browser.close()
+
+
+_TOOL_CALL_ID_META_KEY = "tool_call_id"
+
+
+def _owning_tool_call_meta(context: MCPToolMetaContext) -> dict[str, Any] | None:
+    run_context = context.run_context
+    return {_TOOL_CALL_ID_META_KEY: run_context.tool_call_id} if isinstance(run_context, ToolContext) else None
+
+
+def _mcp_tool_failure(ctx: RunContextWrapper[Any], error: Exception) -> str:
+    # The SDK drops the JSONDecodeError behind "Invalid JSON input for tool X" unless tool-data logging is on, and
+    # its formatter reports the parse position only when that error is the cause.
+    if isinstance(ctx, ToolContext) and error.__cause__ is None:
+        try:
+            json.loads(ctx.tool_arguments or "{}")
+        except json.JSONDecodeError as exc:
+            error.__cause__ = exc
+    return default_tool_error_function(ctx, error)
+
+
+@contextmanager
+def _reporting_lifecycle_failure(phase: Literal["connect", "cleanup"]) -> Iterator[None]:
+    # MCPServerManager logs these failures without their cause unless tool-data logging is on.
+    started = time.monotonic()
+    try:
+        yield
+    except asyncio.CancelledError:
+        # The manager's lifecycle timeout reaches the server as a cancellation.
+        LOG.warning(
+            "ember_mcp_server_lifecycle_cancelled",
+            phase=phase,
+            elapsed_seconds=round(time.monotonic() - started, 1),
+        )
+        raise
+    except Exception:
+        LOG.exception("ember_mcp_server_lifecycle_failed", phase=phase)
+        raise
+
+
+class SkyvernOverlayMCPServer(MCPServer):
+    """MCP server that wraps a FastMCP transport with schema overlays and
+    copilot-specific dispatch logic (loop detection, browser injection, hooks).
+    """
+
+    def __init__(
+        self,
+        transport: Any,
+        overlays: dict[str, SchemaOverlay],
+        alias_map: dict[str, str],
+        allowlist: frozenset[str],
+        context_provider: Callable[[], Any],
+        *,
+        ordered_allowlist: tuple[str, ...] | None = None,
+        enforce_dispatch_allowlist: bool = False,
+        page_state_reader: PageStateReader | None = None,
+        recorded_alias_map: dict[str, str] | None = None,
+        recorded_overlays: dict[str, SchemaOverlay] | None = None,
+    ) -> None:
+        super().__init__(
+            use_structured_content=False,
+            failure_error_function=_mcp_tool_failure,
+            tool_meta_resolver=_owning_tool_call_meta,
+        )
+        self._transport = transport
+        self._overlays = overlays
+        self._page_state_reader = page_state_reader
+        self._alias_map = alias_map  # copilot_name -> mcp_name
+        self._reverse_alias: dict[str, str] = {v: k for k, v in alias_map.items()}
+        self._ordered_allowlist = ordered_allowlist
+        self._enforce_allowlist_on_dispatch = enforce_dispatch_allowlist
+        self._allowlist = allowlist
+        # A narrowed surface withdraws the action tools the model may not call, but a replayed demonstration
+        # step still needs their hooks to record the user's action.
+        self._recorded_alias_map = alias_map if recorded_alias_map is None else recorded_alias_map
+        self._recorded_overlays = overlays if recorded_overlays is None else recorded_overlays
+        self._context_provider = context_provider
+        self._client: Client | None = None
+        self._exit_stack: AsyncExitStack | None = None
+        self._cached_raw_tools: list[MCPTool] | None = None
+
+    @property
+    def name(self) -> str:
+        return "skyvern"
+
+    def requires_browser(self, tool_name: str) -> bool:
+        return self._overlays.get(tool_name, SchemaOverlay()).requires_browser
+
+    async def connect(self) -> None:
+        with _reporting_lifecycle_failure("connect"):
+            ctx = self._context_provider()
+            if not ctx.api_key:
+                raise RuntimeError("Copilot agent context missing api_key")
+            stack = AsyncExitStack()
+            await stack.__aenter__()
+            client = Client(self._transport)
+            # The in-process transport's server task copies context vars once, at client entry, so a
+            # per-call override never reaches tool bodies; without this they authenticate as the server key.
+            override_token = set_api_key_override(ctx.api_key)
+            try:
+                with request_session_scope(ctx.organization_id):
+                    await stack.enter_async_context(client)
+            finally:
+                reset_api_key_override(override_token)
+            self._client = client
+            self._exit_stack = stack
+
+    async def cleanup(self) -> None:
+        if self._exit_stack:
+            with _reporting_lifecycle_failure("cleanup"):
+                await self._exit_stack.__aexit__(None, None, None)
+        self._client = None
+        self._exit_stack = None
+        self._cached_raw_tools = None
+
+    async def list_tools(
+        self,
+        run_context: RunContextWrapper[Any] | None = None,
+        agent: AgentBase | None = None,
+    ) -> list[MCPTool]:
+        if not self._client:
+            raise RuntimeError("Not connected — call connect() first")
+
+        if self._cached_raw_tools is None:
+            self._cached_raw_tools = await self._client.list_tools()
+        raw_tools = self._cached_raw_tools
+        result: list[MCPTool] = []
+        try:
+            requested_output_path_choices = sorted(requested_output_paths_for_derivation(self._context_provider()))
+        except Exception:
+            requested_output_path_choices = []
+
+        selected_tools = raw_tools
+        if self._ordered_allowlist is not None:
+            raw_by_name = {tool.name: tool for tool in raw_tools}
+            if len(raw_by_name) != len(raw_tools):
+                raise RuntimeError("MCP transport returned duplicate tool names")
+            missing = [name for name in self._ordered_allowlist if name not in raw_by_name]
+            if missing:
+                raise RuntimeError(f"MCP transport omitted allowed tools: {', '.join(missing)}")
+            selected_tools = [raw_by_name[name] for name in self._ordered_allowlist]
+
+        for tool in selected_tools:
+            if tool.name not in self._allowlist:
+                continue
+
+            ember_name = self._reverse_alias.get(tool.name, tool.name)
+
+            overlay = self._overlays.get(ember_name, SchemaOverlay())
+
+            schema = _apply_schema_overlay(tool.inputSchema, overlay)
+            schema = _requested_output_path_choices(schema, requested_output_path_choices)
+            description = overlay.description or tool.description or ""
+            if overlay.description_suffix:
+                description = f"{description} {overlay.description_suffix}".strip()
+
+            result.append(
+                MCPTool(
+                    name=ember_name,
+                    description=description,
+                    inputSchema=schema,
+                )
+            )
+        return result
+
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        meta: dict[str, Any] | None = None,
+    ) -> CallToolResult:
+        if arguments is not None:
+            arguments = {name: value for name, value in arguments.items() if name != USER_FACING_REASON_PARAM}
+        propagated_error: BaseException
+        ember_ctx = self._context_provider()
+        overlay = self._overlays.get(tool_name, SchemaOverlay())
+        demonstrated_action = current_demonstrated_action()
+        # Bound out here so one call's browser reaches everything it touches: pre-hooks, session
+        # preparation, dispatch and post-hooks. Binding only the dispatch would collect evidence
+        # from one browser, act in another, then record the result from the first.
+        # Resolved once. A sibling call in the same turn can record or clear the run session, so
+        # resolving again for dispatch could bind the hooks to one browser and the dispatch to another.
+        call_binding = (
+            (resolve_browser_session_binding(ember_ctx, arguments or {}) if overlay.requires_browser else None)
+            if demonstrated_action is None
+            else None
+        )
+        owning_call_id = (meta or {}).get(_TOOL_CALL_ID_META_KEY)
+        try:
+            if overlay.requires_browser and demonstrated_action is None:
+                async with browser_session_turn(
+                    ember_ctx, session_id=call_binding.session_id_for(ember_ctx) if call_binding else None
+                ):
+                    with (
+                        pending_operation(f"mcp.call_tool:{tool_name}"),
+                        bound_call_browser_session(call_binding.session_id_override if call_binding else None),
+                        capturing_tool_call(owning_call_id),
+                    ):
+                        return await self._call_tool(tool_name, arguments, meta, binding=call_binding)
+            else:
+                with (
+                    pending_operation(f"mcp.call_tool:{tool_name}"),
+                    bound_call_browser_session(call_binding.session_id_override if call_binding else None),
+                    capturing_tool_call(owning_call_id),
+                ):
+                    return await self._call_tool(tool_name, arguments, meta, binding=call_binding)
+        except RunSecretsNotRegistered as exc:
+            return _ember_to_call_tool_result({"ok": False, "error": str(exc)}, tool_name)
+        except BaseException as exc:
+            if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
+                LOG.warning("MCP tool dispatch failed", tool=tool_name)
+                return CallToolResult(content=[], isError=True)
+            propagated_error = exc.with_traceback(None)
+            # Cancellation tracebacks retain this frame. Drop every local that can
+            # transitively reference parameter-bearing context before propagating it.
+            del self, tool_name, arguments, meta, ember_ctx, overlay, call_binding, exc
+        raise propagated_error from None
+
+    async def _call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        meta: dict[str, Any] | None = None,
+        *,
+        binding: BrowserSessionBinding | None = None,
+    ) -> CallToolResult:
+        if not self._client:
+            raise RuntimeError("Not connected — call connect() first")
+
+        arguments = arguments or {}
+        arguments = {k: v for k, v in arguments.items() if k not in _INTERNAL_TOOL_ARG_KEYS}
+        ember_ctx = self._context_provider()
+        held_facts = HeldPageFacts()
+        demonstrated_action = current_demonstrated_action()
+        # A replayed step never touches the browser, so the dispatch allowlist below (which stops the model acting
+        # directly) does not apply to it.
+        if demonstrated_action is not None:
+            if tool_name not in self._recorded_alias_map:
+                raise ValueError(f"Not a recordable demonstration tool: {tool_name}")
+            overlay = self._recorded_overlays.get(tool_name, SchemaOverlay())
+            mcp_name = self._recorded_alias_map.get(tool_name, tool_name)
+            existing_interactions = {id(item) for item in ember_ctx.scouted_interactions}
+            existing_trajectory = {id(item) for item in ember_ctx.scout_trajectory}
+
+            def stamp_user_actor() -> None:
+                for item in ember_ctx.scouted_interactions:
+                    if id(item) not in existing_interactions:
+                        item["actor"] = "user"
+                for item in ember_ctx.scout_trajectory:
+                    if id(item) not in existing_trajectory:
+                        item["actor"] = "user"
+
+            if overlay.pre_hook is not None:
+                refusal = await overlay.pre_hook(arguments, ember_ctx)
+                if refusal is not None:
+                    LOG.info("ember_demonstration_replay_refused", tool=tool_name)
+                    stamp_user_actor()
+                    projected_refusal = scrub_model_facing_tool_result(ember_ctx, refusal, tool_name=mcp_name)
+                    projected_refusal = _scrub_stamped_tool_result(
+                        ember_ctx, held_facts, projected_refusal, tool_name=mcp_name
+                    )
+                    record_tool_step_result_for_ctx(ember_ctx, tool_name, arguments, projected_refusal)
+                    return _ember_to_call_tool_result(projected_refusal, tool_name)
+
+            raw_mcp = scrub_model_facing_tool_result(
+                ember_ctx,
+                deepcopy(demonstrated_action.synthesized_result),
+                tool_name=mcp_name,
+            )
+            ember_result = mcp_to_ember(raw_mcp) if raw_mcp else {}
+            if overlay.post_hook is not None:
+                async with browser_evidence_commit_lock(ember_ctx):
+                    base_ember_result = deepcopy(ember_result)
+                    ctx_snapshot = _snapshot_post_hook_context(ember_ctx)
+                    held_token = POST_HOOK_HELD_PAGE_FACTS.set(held_facts)
+                    try:
+                        ember_result = await overlay.post_hook(ember_result, raw_mcp, ember_ctx)
+                    except asyncio.CancelledError:
+                        _restore_post_hook_context(ember_ctx, ctx_snapshot)
+                        raise
+                    except Exception:  # noqa: BLE001
+                        _restore_post_hook_context(ember_ctx, ctx_snapshot)
+                        LOG.warning(
+                            "MCP post-hook failed",
+                            tool=tool_name,
+                            fails_closed=overlay.post_hook_fails_closed,
+                        )
+                        ember_result = (
+                            {
+                                "ok": False,
+                                "error": f"{tool_name} result could not be prepared for display and is withheld.",
+                            }
+                            if overlay.post_hook_fails_closed
+                            else base_ember_result
+                        )
+                    finally:
+                        POST_HOOK_HELD_PAGE_FACTS.reset(held_token)
+            stamp_user_actor()
+            ember_result = _scrub_stamped_tool_result(ember_ctx, held_facts, ember_result, tool_name=mcp_name)
+            record_tool_step_result_for_ctx(ember_ctx, tool_name, arguments, ember_result)
+            held_facts.release()
+            return _ember_to_call_tool_result(ember_result, tool_name)
+
+        if self._enforce_allowlist_on_dispatch and tool_name not in self._alias_map:
+            raise ValueError(f"MCP tool is not available on this Copilot surface: {tool_name}")
+        overlay = self._overlays.get(tool_name, SchemaOverlay())
+        mcp_name = self._alias_map.get(tool_name, tool_name)
+        if self._enforce_allowlist_on_dispatch and mcp_name not in self._allowlist:
+            raise ValueError(f"MCP tool is not available on this Copilot surface: {tool_name}")
+        observed_continuity_generation = ember_ctx.browser_session_continuity_generation
+        attempt_browser_session_id = current_call_browser_session_override() or getattr(
+            ember_ctx, "browser_session_id", None
+        )
+        uses_shared_browser_outcome = mcp_name in _SHARED_BROWSER_OUTCOME_TOOLS
+        dispatch_started = False
+        phases = _PhaseClock()
+
+        if binding is None:
+            binding = resolve_browser_session_binding(ember_ctx, arguments or {})
+
+        async def _stamp_page_state(result: dict[str, Any], *, probe: bool = True) -> None:
+            reader = self._page_state_reader
+            if reader is None or not result or not overlay.requires_browser or "page_state" in result:
+                return
+            # Failures an abandoned result took go back, so this one reports the tab it reads.
+            held_facts.restore()
+            # First, so a head-truncated copy of a long result still carries it.
+            page_state, page = await reader(ember_ctx, tool_name=tool_name, result=result, binding=binding, probe=probe)
+            # A call aimed at a browser it could not bind reports nothing of the chat's browser it fell back to.
+            held = None if binding.unavailable_reason else held_facts
+            stamped = stamp_page_facts(ember_ctx, held, result, page_state, page)
+            result.clear()
+            result.update(stamped)
+
+        if overlay.requires_browser and binding.unavailable_reason:
+            # Refused before dispatch: a call aimed at the run's browser must not quietly act in
+            # the chat's, where a click or a fill would be a real side effect in the wrong place.
+            result = {"ok": False, "error": binding.unavailable_reason, **binding.provenance()}
+            await _stamp_page_state(result)
+            record_tool_step_result_for_ctx(ember_ctx, tool_name, arguments, result)
+            return _ember_to_call_tool_result(result, tool_name)
+
+        async def _run_pre_hook() -> CallToolResult | None:
+            if overlay.pre_hook is None:
+                return None
+            try:
+                hook_result = await overlay.pre_hook(arguments, ember_ctx)
+            except asyncio.CancelledError:
+                if uses_shared_browser_outcome:
+                    outcome = _cancelled_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        dispatch_started=False,
+                        ctx=ember_ctx,
+                    )
+                    _record_browser_call_outcome(ember_ctx, outcome, call_path="model")
+                raise
+            if hook_result is not None:
+                if uses_shared_browser_outcome:
+                    outcome = _not_dispatched_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        raw_result=hook_result,
+                        ctx=ember_ctx,
+                    )
+                    outcome = _scrub_browser_call_outcome(ember_ctx, outcome)
+                    _record_browser_call_outcome(ember_ctx, outcome, call_path="model")
+                    hook_result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
+                else:
+                    hook_result = scrub_model_facing_tool_result(ember_ctx, hook_result, tool_name=mcp_name)
+                await _stamp_page_state(hook_result)
+                record_tool_step_result_for_ctx(ember_ctx, tool_name, arguments, hook_result)
+                return _ember_to_call_tool_result(hook_result, tool_name)
+            return None
+
+        if not overlay.requires_browser:
+            pre_hook_result = await _run_pre_hook()
+            if pre_hook_result is not None:
+                return pre_hook_result
+
+        mcp_args = _transform_args(arguments, overlay)
+        if overlay.binds_chat_workflow:
+            mcp_args[overlay.binds_chat_workflow_param] = ember_ctx.workflow_permanent_id
+
+        if overlay.requires_browser:
+            phases.enter("session_prepare")
+            try:
+                err, continuity_result, continuity_disposition = await _prepare_browser_session_for_dispatch(
+                    ember_ctx,
+                    tool_name=tool_name,
+                    call_path="model",
+                    observed_generation=observed_continuity_generation,
+                )
+            except asyncio.CancelledError:
+                _log_mcp_timing(ember_ctx, tool_name, mcp_name, phases, {}, "model", "cancelled")
+                if uses_shared_browser_outcome:
+                    outcome = _cancelled_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        dispatch_started=False,
+                        ctx=ember_ctx,
+                    )
+                    _record_browser_call_outcome(ember_ctx, outcome, call_path="model")
+                raise
+            except Exception as exc:
+                _log_mcp_timing(ember_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
+                if uses_shared_browser_outcome:
+                    outcome = _browser_protocol_exception_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        dispatched=False,
+                        exception=exc,
+                    )
+                    _record_browser_call_outcome(ember_ctx, outcome, call_path="model")
+                raise
+            if err:
+                _log_mcp_timing(
+                    ember_ctx,
+                    tool_name,
+                    mcp_name,
+                    phases,
+                    {},
+                    "model",
+                    "session_error",
+                )
+                if uses_shared_browser_outcome:
+                    outcome = _not_dispatched_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        raw_result=err,
+                        ctx=ember_ctx,
+                    )
+                    outcome = _scrub_browser_call_outcome(ember_ctx, outcome)
+                    _record_browser_call_outcome(ember_ctx, outcome, call_path="model")
+                    err = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
+                else:
+                    err = scrub_model_facing_tool_result(ember_ctx, err)
+                await _stamp_page_state(err, probe=False)
+                record_tool_step_result_for_ctx(ember_ctx, tool_name, arguments, err)
+                return _ember_to_call_tool_result(err, tool_name)
+            if continuity_result is not None:
+                _log_mcp_timing(ember_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
+                if uses_shared_browser_outcome:
+                    outcome = _not_dispatched_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        raw_result=continuity_result,
+                        ctx=ember_ctx,
+                        session_loss_disposition=continuity_disposition,
+                    )
+                    outcome = _scrub_browser_call_outcome(ember_ctx, outcome)
+                    _record_browser_call_outcome(ember_ctx, outcome, call_path="model")
+                    continuity_result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
+                else:
+                    continuity_result = scrub_model_facing_tool_result(ember_ctx, continuity_result)
+                await _stamp_page_state(continuity_result, probe=False)
+                record_tool_step_result_for_ctx(ember_ctx, tool_name, arguments, continuity_result)
+                return _ember_to_call_tool_result(continuity_result, tool_name)
+            mcp_args["session_id"] = binding.session_id_for(ember_ctx)
+        call_browser_session_id = binding.session_id_for(ember_ctx) if overlay.requires_browser else None
+        call_browser_session_generation = ember_ctx.browser_session_continuity_generation
+
+        async def _project_result(
+            raw_result: FastMCPCallToolResult,
+            *,
+            defer_evidence: bool = False,
+            evidence_lock_held: bool = False,
+        ) -> tuple[CallToolResult, dict[str, Any], bool, Callable[[], None]]:
+            browser_outcome: _BrowserCallOutcome | None = None
+            if uses_shared_browser_outcome:
+                browser_outcome = _normalize_browser_call_outcome(
+                    raw_tool_name=mcp_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    raw_result=raw_result,
+                )
+                raw_mcp = browser_outcome.raw_result()
+                failed = not browser_outcome.ok
+            else:
+                # Copy fastmcp's structured_content so mutations below stay local to
+                # this call — the client may reuse or cache the response object.
+                raw_mcp = dict(raw_result.structured_content or {})
+                if raw_result.is_error:
+                    raw_mcp["ok"] = False
+                    if not raw_result.structured_content and raw_result.content:
+                        text_parts = [c.text for c in raw_result.content if hasattr(c, "text")]
+                        raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
+                    else:
+                        raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+                failed = raw_result.is_error or raw_mcp.get("ok", True) is not True
+            phases.settle()
+            phases.pause()
+            # Scrub before the post hook so evidence the hooks record from raw_mcp
+            # (flow evidence, scout observations) is scrubbed too.
+            raw_mcp = scrub_model_facing_tool_result(ember_ctx, raw_mcp, tool_name=mcp_name)
+            session_lost = False
+            error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(raw_mcp)
+            if (
+                overlay.requires_browser
+                and ember_ctx.turn_origin != TurnOrigin.code_block_ai_fallback
+                and isinstance(call_browser_session_id, str)
+                and call_browser_session_id
+                and error_code == _SESSION_EXPIRED_ERROR_CODE
+            ):
+                session_lost = True
+                try:
+                    disposition = await _handle_browser_session_loss(
+                        ember_ctx,
+                        tool_name=tool_name,
+                        call_path="model",
+                        lost_session_id=call_browser_session_id,
+                    )
+                except asyncio.CancelledError:
+                    if browser_outcome is not None:
+                        cancelled_outcome = replace(
+                            browser_outcome,
+                            cancelled=True,
+                            ok=False,
+                            error_kind="protocol",
+                            completion_browser_session_id=ember_ctx.browser_session_id,
+                            completion_browser_session_generation=ember_ctx.browser_session_continuity_generation,
+                        )
+                        _record_browser_call_outcome(ember_ctx, cancelled_outcome, call_path="model")
+                    raise
+                if browser_outcome is not None:
+                    browser_outcome = replace(
+                        browser_outcome.with_raw_result(raw_mcp),
+                        session_loss_disposition=disposition,
+                        session_loss_deadline_expired=ember_ctx.browser_session_continuity_deadline_expired,
+                        session_loss_acquisition_failure=ember_ctx.browser_session_continuity_acquisition_failure,
+                        replacement_browser_session_id=(
+                            ember_ctx.browser_session_id if disposition == "reestablished" else None
+                        ),
+                    )
+                else:
+                    ember_result = _browser_session_loss_result(
+                        mcp_to_ember(raw_mcp),
+                        disposition=disposition,
+                        deadline_expired=ember_ctx.browser_session_continuity_deadline_expired,
+                        acquisition_failure=ember_ctx.browser_session_continuity_acquisition_failure,
+                    )
+
+            if browser_outcome is not None:
+                if browser_outcome.session_loss_disposition is None:
+                    browser_outcome = browser_outcome.with_raw_result(raw_mcp)
+                browser_outcome = replace(
+                    browser_outcome,
+                    completion_browser_session_id=ember_ctx.browser_session_id,
+                    completion_browser_session_generation=ember_ctx.browser_session_continuity_generation,
+                )
+                ember_result = _project_browser_call_outcome(browser_outcome, display_tool_name=tool_name)
+            elif not session_lost:
+                ember_result = mcp_to_ember(raw_mcp) if raw_mcp else {}
+
+            if overlay.requires_browser and isinstance(ember_result, dict):
+                # Stamped before the post-hook, which is allowed to fail back to this base result: a
+                # browser answer whose provenance dropped is a silent cross-browser read.
+                ember_result.update(binding.provenance())
+                error = ember_result.get("error")
+                if ember_result.get("error_code") == ErrorCode.TIMEOUT and isinstance(error, str):
+                    separator = " " if error.endswith((".", "?", "!")) else ". "
+                    ember_result["error"] = f"{error}{separator}{_EFFECT_UNKNOWN_GUIDANCE}"
+
+            if overlay.post_hook and not session_lost:
+                async with AsyncExitStack() as evidence_stack:
+                    if not evidence_lock_held:
+                        await evidence_stack.enter_async_context(browser_evidence_commit_lock(ember_ctx))
+                    base_ember_result = deepcopy(ember_result)
+                    ctx_snapshot = _snapshot_post_hook_context(ember_ctx)
+                    held_token = POST_HOOK_HELD_PAGE_FACTS.set(held_facts)
+                    try:
+                        ember_result = await overlay.post_hook(ember_result, raw_mcp, ember_ctx)
+                    except asyncio.CancelledError:
+                        _restore_post_hook_context(ember_ctx, ctx_snapshot)
+                        raise
+                    except Exception:
+                        # An enrichment hook's crash must not fail the action or keep partial credit.
+                        _restore_post_hook_context(ember_ctx, ctx_snapshot)
+                        LOG.warning(
+                            "MCP post-hook failed",
+                            tool=tool_name,
+                            fails_closed=overlay.post_hook_fails_closed,
+                        )
+                        if overlay.post_hook_fails_closed:
+                            server_outcome = ", which reported an error" if failed else ", which reported success"
+                            ember_result = {
+                                "ok": False,
+                                "error": (
+                                    f"{tool_name} reached the server{server_outcome}, but its result could not "
+                                    "be prepared for display and is withheld."
+                                ),
+                            }
+                        else:
+                            ember_result = base_ember_result
+                    finally:
+                        POST_HOOK_HELD_PAGE_FACTS.reset(held_token)
+
+            if isinstance(ember_result, dict):
+                await _stamp_page_state(ember_result)
+            ember_result = _scrub_stamped_tool_result(ember_ctx, held_facts, ember_result, tool_name=mcp_name)
+            if browser_outcome is not None and is_redaction_withheld(ember_result):
+                browser_outcome = browser_outcome.as_redaction_withheld()
+
+            def _commit_evidence() -> None:
+                if browser_outcome is not None:
+                    _record_browser_call_outcome(ember_ctx, browser_outcome, call_path="model")
+                record_tool_step_result_for_ctx(ember_ctx, tool_name, arguments, ember_result)
+                screenshot_data = ember_result.get("data")
+                screenshot_data = screenshot_data if isinstance(screenshot_data, dict) else {}
+                captured_url = screenshot_data.get("url") or screenshot_data.get("current_url")
+                observation_step = ember_result.get("observation_step")
+                if observation_step is None:
+                    observation_step = screenshot_data.get("observation_step")
+                workflow_run_id = ember_result.get("workflow_run_id") or screenshot_data.get("workflow_run_id")
+                enqueue_screenshot_from_result(
+                    ember_ctx,
+                    ember_result,
+                    provenance=ScreenshotProvenance(
+                        source_tool=tool_name,
+                        captured_url=captured_url if isinstance(captured_url, str) and captured_url else None,
+                        observation_step=observation_step
+                        if isinstance(observation_step, int) and not isinstance(observation_step, bool)
+                        else None,
+                        browser_session_id=call_browser_session_id,
+                        workflow_run_id=workflow_run_id
+                        if isinstance(workflow_run_id, str) and workflow_run_id
+                        else None,
+                        action_relation=ScreenshotActionRelation.TOOL_RESULT,
+                        viewport_css_px=screenshot_viewport_css_px(ember_result),
+                    ),
+                )
+
+            if not defer_evidence:
+                _commit_evidence()
+            return _ember_to_call_tool_result(ember_result, tool_name), raw_mcp, failed, _commit_evidence
+
+        try:
+            # wait_for(timeout=None) is a plain await, so only overlays that declare an action
+            # ceiling get one. Browser-state resolution has its own shared typed ceiling before
+            # dispatch, where expiry can still truthfully report that no browser action started.
+            if overlay.requires_browser:
+                phases.enter("context_enter")
+                # The snapshot and its possible rollback are one transaction against the shared
+                # AgentContext. Holding this across the generation scope prevents a retired call
+                # from restoring over evidence committed by a concurrent sibling call.
+                async with browser_evidence_commit_lock(ember_ctx):
+                    lease_context_snapshot = _snapshot_post_hook_context(ember_ctx)
+                    # Only a call the model pointed elsewhere carries an override; the ordinary debug
+                    # path resolves from the context, so a session re-established mid-dispatch applies.
+                    browser_scope = (
+                        mcp_browser_context(ember_ctx, session_id_override=binding.session_id_override)
+                        if binding.session_id_override
+                        else mcp_browser_context(ember_ctx)
+                    )
+                    try:
+                        async with browser_scope:
+                            pre_hook_result = await _run_pre_hook()
+                            # A refusal is returned only after the scope exits, which can still fail and
+                            # abandon it; its failures stay held until then.
+                            if pre_hook_result is None:
+                                phases.enter("dispatch")
+                                dispatch_started = True
+                                try:
+                                    raw_result = await asyncio.wait_for(
+                                        self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
+                                        timeout=overlay.timeout,
+                                    )
+                                except BaseException:
+                                    phases.unwind()
+                                    raise
+                                projected_result, timing_raw_mcp, failed, commit_evidence = await _project_result(
+                                    raw_result,
+                                    defer_evidence=True,
+                                    evidence_lock_held=True,
+                                )
+                                phases.enter("context_exit")
+                    except (asyncio.CancelledError, EmberBrowserGenerationRetired):
+                        _restore_post_hook_context(ember_ctx, lease_context_snapshot)
+                        raise
+                    finally:
+                        # The click post hook is skipped on session loss, timeout, and errors, and
+                        # the viewport bytes the pre hook held for it must not outlive this call.
+                        ember_ctx.pending_scout_click_pre_frame = None
+                    if pre_hook_result is not None:
+                        held_facts.release()
+                        return pre_hook_result
+                    commit_evidence()
+                phases.settle()
+                _log_mcp_timing(
+                    ember_ctx,
+                    tool_name,
+                    mcp_name,
+                    phases,
+                    timing_raw_mcp,
+                    "model",
+                    "error" if failed else "ok",
+                )
+                held_facts.release()
+                return projected_result
+            else:
+                phases.enter("dispatch")
+                dispatch_started = True
+                raw_result = await asyncio.wait_for(
+                    self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
+                    timeout=overlay.timeout,
+                )
+                projected_result, timing_raw_mcp, failed, _ = await _project_result(raw_result)
+                _log_mcp_timing(
+                    ember_ctx,
+                    tool_name,
+                    mcp_name,
+                    phases,
+                    timing_raw_mcp,
+                    "model",
+                    "error" if failed else "ok",
+                )
+                return projected_result
+        except TimeoutError:
+            LOG.warning("MCP tool call timed out", tool=tool_name, ceiling_seconds=overlay.timeout)
+            _log_mcp_timing(ember_ctx, tool_name, mcp_name, phases, {}, "model", "timeout")
+            # The call is cancelled where it stands, so a tool that changes the page may already have
+            # changed it. Reporting a plain failure invites a retry that acts on the page twice.
+            within = f" within {overlay.timeout}s" if overlay.timeout is not None else ""
+            err = {
+                "ok": False,
+                "error": f"{tool_name} did not answer{within} and was cancelled. {_EFFECT_UNKNOWN_GUIDANCE}",
+            }
+            if uses_shared_browser_outcome:
+                outcome = _browser_call_outcome_from_mapping(
+                    raw_tool_name=mcp_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatched=dispatch_started,
+                    raw_result=err,
+                    error_kind="protocol",
+                )
+                outcome = replace(
+                    outcome,
+                    completion_browser_session_id=ember_ctx.browser_session_id,
+                    completion_browser_session_generation=ember_ctx.browser_session_continuity_generation,
+                )
+                _record_browser_call_outcome(ember_ctx, outcome, call_path="model")
+                err = _project_browser_call_outcome(
+                    _scrub_browser_call_outcome(ember_ctx, outcome),
+                    display_tool_name=tool_name,
+                )
+            else:
+                err = scrub_model_facing_tool_result(ember_ctx, err)
+            await _stamp_page_state(err, probe=False)
+            record_tool_step_result_for_ctx(ember_ctx, tool_name, arguments, err)
+            held_facts.release()
+            return _ember_to_call_tool_result(err, tool_name)
+        except (EmberBrowserGenerationRetired, EmberBrowserSessionUnavailable) as exc:
+            _log_mcp_timing(ember_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
+            try:
+                disposition = await _browser_session_error_disposition(
+                    ember_ctx,
+                    exc,
+                    tool_name=tool_name,
+                    call_path="model",
+                )
+            except asyncio.CancelledError:
+                if uses_shared_browser_outcome:
+                    outcome = _cancelled_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=call_browser_session_id,
+                        source_browser_session_generation=call_browser_session_generation,
+                        dispatch_started=dispatch_started,
+                        ctx=ember_ctx,
+                    )
+                    _record_browser_call_outcome(ember_ctx, outcome, call_path="model")
+                raise
+            if uses_shared_browser_outcome:
+                outcome = _browser_call_outcome_from_mapping(
+                    raw_tool_name=mcp_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatched=dispatch_started,
+                    raw_result={},
+                    error_kind="protocol",
+                )
+                outcome = replace(
+                    outcome,
+                    session_loss_disposition=disposition,
+                    session_loss_deadline_expired=ember_ctx.browser_session_continuity_deadline_expired,
+                    session_loss_acquisition_failure=ember_ctx.browser_session_continuity_acquisition_failure,
+                    replacement_browser_session_id=(
+                        ember_ctx.browser_session_id if disposition == "reestablished" else None
+                    ),
+                    completion_browser_session_id=ember_ctx.browser_session_id,
+                    completion_browser_session_generation=ember_ctx.browser_session_continuity_generation,
+                )
+                _record_browser_call_outcome(ember_ctx, outcome, call_path="model")
+                err = _project_browser_call_outcome(
+                    _scrub_browser_call_outcome(ember_ctx, outcome),
+                    display_tool_name=tool_name,
+                )
+            else:
+                err = scrub_model_facing_tool_result(
+                    ember_ctx,
+                    _browser_session_loss_result(
+                        {},
+                        disposition=disposition,
+                        deadline_expired=ember_ctx.browser_session_continuity_deadline_expired,
+                        acquisition_failure=ember_ctx.browser_session_continuity_acquisition_failure,
+                    ),
+                )
+            await _stamp_page_state(err, probe=False)
+            record_tool_step_result_for_ctx(ember_ctx, tool_name, arguments, err)
+            held_facts.release()
+            return _ember_to_call_tool_result(err, tool_name)
+        except asyncio.CancelledError:
+            _log_mcp_timing(ember_ctx, tool_name, mcp_name, phases, {}, "model", "cancelled")
+            if uses_shared_browser_outcome:
+                outcome = _cancelled_browser_call_outcome(
+                    raw_tool_name=mcp_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatch_started=dispatch_started,
+                    ctx=ember_ctx,
+                )
+                _record_browser_call_outcome(ember_ctx, outcome, call_path="model")
+            raise
+        except Exception as exc:
+            LOG.warning("MCP tool call failed", tool=tool_name)
+            _log_mcp_timing(ember_ctx, tool_name, mcp_name, phases, {}, "model", "error")
+            if uses_shared_browser_outcome:
+                outcome = _browser_protocol_exception_outcome(
+                    raw_tool_name=mcp_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatched=dispatch_started,
+                    exception=exc,
+                )
+                # The call was bound to one browser; a run-targeted call must not report the
+                # chat's browser as where it ended up. The generation counter belongs to the chat's
+                # browser only, so a fixed target has none to report.
+                outcome = replace(
+                    outcome,
+                    completion_browser_session_id=binding.session_id_for(ember_ctx),
+                    completion_browser_session_generation=(
+                        None if binding.session_id_override else ember_ctx.browser_session_continuity_generation
+                    ),
+                )
+                _record_browser_call_outcome(ember_ctx, outcome, call_path="model")
+                err = _project_browser_call_outcome(
+                    _scrub_browser_call_outcome(ember_ctx, outcome),
+                    display_tool_name=tool_name,
+                )
+            else:
+                err = _scrub_tool_exception(ember_ctx, tool_name, exc)
+            await _stamp_page_state(err)
+            record_tool_step_result_for_ctx(ember_ctx, tool_name, arguments, err)
+            held_facts.release()
+            return _ember_to_call_tool_result(err, tool_name)
+        finally:
+            held_facts.restore()
+
+    async def call_internal_tool(
+        self,
+        mcp_tool_name: str,
+        mcp_args: dict[str, Any],
+    ) -> dict[str, Any]:
+        propagated_error: BaseException
+        try:
+            return (await self._call_internal_tool(mcp_tool_name, mcp_args)).result
+        except BaseException as exc:
+            if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
+                LOG.warning("Internal MCP tool dispatch failed")
+                return {}
+            propagated_error = exc.with_traceback(None)
+            del self, mcp_tool_name, mcp_args, exc
+        raise propagated_error from None
+
+    async def call_internal_browser_tool(
+        self,
+        mcp_tool_name: Literal["skyvern_evaluate", "skyvern_screenshot"],
+        mcp_args: dict[str, Any],
+    ) -> _InternalBrowserCallResult:
+        """Typed sibling for native consumers that need browser-call provenance."""
+        propagated_error: BaseException
+        try:
+            call = await self._call_internal_tool(mcp_tool_name, mcp_args)
+            if call.browser_outcome is None:
+                raise RuntimeError(f"Missing browser-call outcome for {mcp_tool_name}")
+            return _InternalBrowserCallResult(result=call.result, outcome=call.browser_outcome)
+        except BaseException as exc:
+            if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
+                LOG.warning("Internal MCP browser tool dispatch failed")
+                raise
+            propagated_error = exc.with_traceback(None)
+            del self, mcp_tool_name, mcp_args, exc
+        raise propagated_error from None
+
+    async def _call_internal_tool(
+        self,
+        mcp_tool_name: str,
+        mcp_args: dict[str, Any],
+    ) -> _InternalToolCallResult:
+        """Raw FastMCP call for internal copilot subsystems (discovery walker).
+
+        Bypasses overlay hooks, loop detection, and screenshot recording —
+        those are model-facing concerns. Still routes through
+        ``ensure_browser_session`` and ``mcp_browser_context`` for session/auth
+        scoping. Mirrors the error-handling block from ``call_tool`` so MCP-
+        side validation or tool errors surface as ``ok=False`` with an
+        extracted error string rather than silently defaulting to
+        ``ok=True``.
+        """
+        phases = _PhaseClock()
+        ember_name = self._reverse_alias.get(mcp_tool_name, mcp_tool_name)
+        ctx = self._context_provider()
+        requested_session_id = mcp_args.get("session_id")
+        if not isinstance(requested_session_id, str) or not requested_session_id:
+            requested_session_id = None
+        observed_continuity_generation = ctx.browser_session_continuity_generation
+        call_session_override = current_call_browser_session_override()
+        attempt_browser_session_id = requested_session_id or call_session_override or ctx.browser_session_id
+        uses_shared_browser_outcome = mcp_tool_name in _SHARED_BROWSER_OUTCOME_TOOLS
+        if current_demonstrated_action() is not None:
+            result = {"ok": False, "error": "Browser access is unavailable while replaying a demonstration."}
+            if uses_shared_browser_outcome:
+                outcome = _not_dispatched_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    raw_result=result,
+                    ctx=ctx,
+                )
+                outcome = _scrub_browser_call_outcome(ctx, outcome)
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=ember_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, result, tool_name=mcp_tool_name))
+        dispatch_started = False
+        if not self._client:
+            _log_mcp_timing(ctx, ember_name, mcp_tool_name, phases, {}, "internal", "not_connected")
+            result = {"ok": False, "error": "MCP client not connected"}
+            if uses_shared_browser_outcome:
+                outcome = _not_dispatched_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    raw_result=result,
+                    ctx=ctx,
+                )
+                outcome = _scrub_browser_call_outcome(ctx, outcome)
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, result, tool_name=mcp_tool_name))
+        phases.enter("session_prepare")
+        try:
+            err, continuity_result, continuity_disposition = await _prepare_browser_session_for_dispatch(
+                ctx,
+                tool_name=ember_name,
+                call_path="internal",
+                observed_generation=observed_continuity_generation,
+            )
+        except asyncio.CancelledError:
+            _log_mcp_timing(ctx, ember_name, mcp_tool_name, phases, {}, "internal", "cancelled")
+            if uses_shared_browser_outcome:
+                outcome = _cancelled_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    dispatch_started=False,
+                    ctx=ctx,
+                )
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+            raise
+        except Exception as exc:
+            _log_mcp_timing(ctx, ember_name, mcp_tool_name, phases, {}, "internal", "session_error")
+            if uses_shared_browser_outcome:
+                outcome = _browser_protocol_exception_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    dispatched=False,
+                    exception=exc,
+                )
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+            raise
+        if err:
+            _log_mcp_timing(
+                ctx,
+                ember_name,
+                mcp_tool_name,
+                phases,
+                {},
+                "internal",
+                "session_error",
+            )
+            if uses_shared_browser_outcome:
+                outcome = _not_dispatched_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    raw_result=err,
+                    ctx=ctx,
+                )
+                outcome = _scrub_browser_call_outcome(ctx, outcome)
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, err))
+        if continuity_result is not None:
+            _log_mcp_timing(ctx, ember_name, mcp_tool_name, phases, {}, "internal", "session_error")
+            if uses_shared_browser_outcome:
+                outcome = _not_dispatched_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    raw_result=continuity_result,
+                    ctx=ctx,
+                    session_loss_disposition=continuity_disposition,
+                )
+                outcome = _scrub_browser_call_outcome(ctx, outcome)
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, continuity_result))
+        # An explicit session is a dispatch lease chosen before session preparation awaits. Do not
+        # relabel that call with mutable ambient context if another concurrent tool replaces it.
+        call_browser_session_id = requested_session_id or call_session_override or ctx.browser_session_id
+        merged_args = {**mcp_args, "session_id": call_browser_session_id}
+        call_browser_session_generation = ctx.browser_session_continuity_generation
+        browser_outcome: _BrowserCallOutcome | None = None
+        try:
+            phases.enter("context_enter")
+            # Only pass the override when there is one, as the model-facing path does: an
+            # unconditional keyword reaches callers that resolve the session themselves.
+            browser_scope = (
+                mcp_browser_context(ctx, session_id_override=call_session_override)
+                if call_session_override
+                else mcp_browser_context(ctx)
+            )
+            async with browser_scope:
+                phases.enter("dispatch")
+                dispatch_started = True
+                try:
+                    raw = await self._client.call_tool(mcp_tool_name, merged_args, raise_on_error=False)
+                    if uses_shared_browser_outcome:
+                        browser_outcome = _normalize_browser_call_outcome(
+                            raw_tool_name=mcp_tool_name,
+                            source_browser_session_id=call_browser_session_id,
+                            source_browser_session_generation=call_browser_session_generation,
+                            raw_result=raw,
+                        )
+                except BaseException:
+                    phases.unwind()
+                    raise
+                phases.enter("context_exit")
+            phases.close()
+        except asyncio.CancelledError:
+            _log_mcp_timing(ctx, ember_name, mcp_tool_name, phases, {}, "internal", "cancelled")
+            if uses_shared_browser_outcome and browser_outcome is None:
+                outcome = _cancelled_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatch_started=dispatch_started,
+                    ctx=ctx,
+                )
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+            raise
+        except (EmberBrowserGenerationRetired, EmberBrowserSessionUnavailable) as exc:
+            _log_mcp_timing(ctx, ember_name, mcp_tool_name, phases, {}, "internal", "session_error")
+            try:
+                disposition = await _browser_session_error_disposition(
+                    ctx,
+                    exc,
+                    tool_name=ember_name,
+                    call_path="internal",
+                )
+            except asyncio.CancelledError:
+                if uses_shared_browser_outcome:
+                    outcome = _cancelled_browser_call_outcome(
+                        raw_tool_name=mcp_tool_name,
+                        source_browser_session_id=call_browser_session_id,
+                        source_browser_session_generation=call_browser_session_generation,
+                        dispatch_started=dispatch_started,
+                        ctx=ctx,
+                    )
+                    _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                raise
+            if uses_shared_browser_outcome:
+                outcome = _browser_call_outcome_from_mapping(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatched=dispatch_started,
+                    raw_result={},
+                    error_kind="protocol",
+                )
+                outcome = replace(
+                    outcome,
+                    session_loss_disposition=disposition,
+                    session_loss_deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                    session_loss_acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
+                    replacement_browser_session_id=ctx.browser_session_id if disposition == "reestablished" else None,
+                    completion_browser_session_id=ctx.browser_session_id,
+                    completion_browser_session_generation=ctx.browser_session_continuity_generation,
+                )
+                outcome = _scrub_browser_call_outcome(ctx, outcome)
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(
+                result=scrub_model_facing_tool_result(
+                    ctx,
+                    _browser_session_loss_result(
+                        {},
+                        disposition=disposition,
+                        deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                        acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
+                    ),
+                )
+            )
+        except Exception as exc:
+            LOG.warning("Internal MCP tool call failed", tool=mcp_tool_name)
+            _log_mcp_timing(ctx, ember_name, mcp_tool_name, phases, {}, "internal", "error")
+            if uses_shared_browser_outcome:
+                outcome = _browser_protocol_exception_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatched=dispatch_started,
+                    exception=exc,
+                )
+                outcome = replace(
+                    _scrub_browser_call_outcome(ctx, outcome),
+                    completion_browser_session_id=call_browser_session_id,
+                    completion_browser_session_generation=(
+                        None
+                        if (requested_session_id or call_session_override)
+                        else ctx.browser_session_continuity_generation
+                    ),
+                )
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(result=_scrub_tool_exception(ctx, mcp_tool_name, exc))
+        if browser_outcome is not None:
+            raw_mcp = browser_outcome.raw_result()
+            failed = not browser_outcome.ok
+        else:
+            raw_mcp = dict(raw.structured_content or {})
+            if raw.is_error:
+                raw_mcp["ok"] = False
+                if not raw.structured_content and raw.content:
+                    text_parts = [c.text for c in raw.content if hasattr(c, "text")]
+                    raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
+                else:
+                    raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+            failed = raw.is_error or raw_mcp.get("ok", True) is not True
+        phases.settle()
+        call_status: Literal["ok", "error"] = "error" if failed else "ok"
+        _log_mcp_timing(ctx, ember_name, mcp_tool_name, phases, raw_mcp, "internal", call_status)
+        scrubbed = scrub_model_facing_tool_result(ctx, raw_mcp, tool_name=mcp_tool_name)
+        error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(scrubbed)
+        if (
+            ctx.turn_origin != TurnOrigin.code_block_ai_fallback
+            and call_browser_session_id is not None
+            and error_code == _SESSION_EXPIRED_ERROR_CODE
+        ):
+            try:
+                disposition = await _handle_browser_session_loss(
+                    ctx,
+                    tool_name=ember_name,
+                    call_path="internal",
+                    lost_session_id=call_browser_session_id,
+                )
+            except asyncio.CancelledError:
+                if browser_outcome is not None:
+                    cancelled_outcome = replace(
+                        browser_outcome,
+                        cancelled=True,
+                        ok=False,
+                        error_kind="protocol",
+                        completion_browser_session_id=ctx.browser_session_id,
+                        completion_browser_session_generation=ctx.browser_session_continuity_generation,
+                    )
+                    _record_browser_call_outcome(ctx, cancelled_outcome, call_path="internal")
+                raise
+            if browser_outcome is not None:
+                browser_outcome = replace(
+                    browser_outcome.with_raw_result(scrubbed),
+                    session_loss_disposition=disposition,
+                    session_loss_deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                    session_loss_acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
+                    replacement_browser_session_id=ctx.browser_session_id if disposition == "reestablished" else None,
+                )
+                browser_outcome = replace(
+                    browser_outcome,
+                    completion_browser_session_id=ctx.browser_session_id,
+                    completion_browser_session_generation=ctx.browser_session_continuity_generation,
+                )
+                _record_browser_call_outcome(ctx, browser_outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(browser_outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=browser_outcome,
+                )
+            return _InternalToolCallResult(
+                result=_browser_session_loss_result(
+                    mcp_to_ember(scrubbed),
+                    disposition=disposition,
+                    deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                    acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
+                )
+            )
+        if browser_outcome is not None:
+            browser_outcome = replace(
+                browser_outcome.with_raw_result(scrubbed),
+                completion_browser_session_id=ctx.browser_session_id,
+                completion_browser_session_generation=ctx.browser_session_continuity_generation,
+            )
+            _record_browser_call_outcome(ctx, browser_outcome, call_path="internal")
+            return _InternalToolCallResult(
+                result=_project_browser_call_outcome(browser_outcome, display_tool_name=mcp_tool_name),
+                browser_outcome=browser_outcome,
+            )
+        return _InternalToolCallResult(result=mcp_to_ember(scrubbed) if scrubbed else {})
+
+    async def list_prompts(self) -> ListPromptsResult:
+        return ListPromptsResult(prompts=[])
+
+    async def get_prompt(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> GetPromptResult:
+        raise ValueError(f"Prompts not supported: {name}")

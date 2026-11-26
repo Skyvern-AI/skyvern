@@ -252,6 +252,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     redacted_exception_origin,
     settle_browser_downloads_for_context,
 )
+from skyvern.webeye.computer_surface import ComputerSurface
 from skyvern.webeye.dom_inspection import (
     is_static_listbox_option_snapshot,
     read_static_listbox_option_snapshot,
@@ -850,10 +851,14 @@ def _truncate_select_shadow_field(text: str | None) -> str | None:
     return text[:SELECT_SHADOW_MATCH_FIELD_MAX_CHARS] + "…"
 
 
-def _normalized_select_shadow_field(text: str | None) -> str | None:
-    if text is None:
+def _select_shadow_length(text: str | None) -> int | None:
+    return None if text is None else len(text)
+
+
+def _select_shadow_equal(left: str | None, right: str | None) -> bool | None:
+    if left is None or right is None:
         return None
-    return _truncate_select_shadow_field(_normalize_select_shadow_text(text))
+    return _normalize_select_shadow_text(left) == _normalize_select_shadow_text(right)
 
 
 def _collapse_select_shadow_field(text: str | None) -> str | None:
@@ -950,18 +955,18 @@ async def _verify_autocomplete_option_identity(
             LOG.info(
                 "Autocomplete option index differed from deterministic candidate; accepting label match",
                 expected_index=matched_index,
-                expected_label=matched_label,
+                expected_label_length=len(str(matched_label or "")),
                 actual_index=actual_index,
-                actual_label=actual_label,
+                actual_label_length=len(str(actual_label or "")),
             )
         return True
 
     LOG.info(
         "Autocomplete option identity did not match deterministic candidate",
         expected_index=matched_index,
-        expected_label=matched_label,
+        expected_label_length=len(str(matched_label or "")),
         actual_index=actual_index,
-        actual_label=actual_label,
+        actual_label_length=len(str(actual_label or "")),
     )
     return False
 
@@ -982,8 +987,8 @@ async def _verify_autocomplete_input_readback(
     LOG.info(
         "Autocomplete read-back did not match deterministic option",
         expected_index=matched_index,
-        expected_label=matched_label,
-        actual_value=actual_value,
+        expected_label_length=len(str(matched_label or "")),
+        actual_value_length=len(str(actual_value or "")),
     )
     return False
 
@@ -1269,18 +1274,20 @@ def _log_select_shadow_match(
         if matched_index is not None and result.agrees is not True:
             matched_candidate = candidates[matched_index] if matched_index < len(candidates) else {}
             disagreement_fields = {
-                "target_value": _truncate_select_shadow_field(target_value),
+                "target_value_length": len(str(target_value or "")),
                 "matched_index": matched_index,
-                "matched_label": _truncate_select_shadow_field(matched_candidate.get("label")),
-                "matched_value": _truncate_select_shadow_field(matched_candidate.get("value")),
+                "matched_label_length": _select_shadow_length(matched_candidate.get("label")),
+                "matched_value_length": _select_shadow_length(matched_candidate.get("value")),
                 "matched_element_id": matched_candidate.get("element_id"),
                 "llm_index": result.llm_index,
-                "llm_value": _truncate_select_shadow_field(result.llm_value),
+                "llm_value_length": _select_shadow_length(result.llm_value),
                 "llm_element_id": result.llm_element_id,
-                "normalized_target_value": _normalized_select_shadow_field(target_value),
-                "normalized_matched_label": _normalized_select_shadow_field(matched_candidate.get("label")),
-                "normalized_matched_value": _normalized_select_shadow_field(matched_candidate.get("value")),
-                "normalized_llm_value": _normalized_select_shadow_field(result.llm_value),
+                "llm_value_equals_matched_label_normalized": _select_shadow_equal(
+                    result.llm_value, matched_candidate.get("label")
+                ),
+                "llm_value_equals_matched_value_normalized": _select_shadow_equal(
+                    result.llm_value, matched_candidate.get("value")
+                ),
             }
             disagreement_fields = {key: value for key, value in disagreement_fields.items() if value is not None}
         LOG.info(
@@ -2908,7 +2915,7 @@ def _phone_digits(value: str | None) -> str:
 def _input_target_log_fields(*, is_tel: bool, text: str) -> dict[str, str | int]:
     if is_tel:
         return {"target_digit_count": len(_phone_digits(text))}
-    return {"target_value": text}
+    return {"target_value_length": len(text)}
 
 
 def _browser_error_log_fields(exc: Exception, *, is_tel: bool) -> dict[str, str]:
@@ -4580,8 +4587,8 @@ async def _normal_select_readback_contradicts(
         LOG.info(
             "Failed to read normal select option after deterministic selection; keeping select_option success",
             expected_index=matched_index,
-            expected_label=matched_label,
-            expected_value=matched_value,
+            expected_label_length=len(str(matched_label or "")),
+            expected_value_length=len(str(matched_value or "")),
             exc_info=True,
         )
         return False
@@ -4590,8 +4597,8 @@ async def _normal_select_readback_contradicts(
         LOG.info(
             "Normal select read-back returned unexpected payload; keeping select_option success",
             expected_index=matched_index,
-            expected_label=matched_label,
-            expected_value=matched_value,
+            expected_label_length=len(str(matched_label or "")),
+            expected_value_length=len(str(matched_value or "")),
             actual_selection=selection,
         )
         return False
@@ -4615,11 +4622,13 @@ async def _normal_select_readback_contradicts(
     LOG.info(
         "Normal select read-back did not match deterministic option",
         expected_index=matched_index,
-        expected_label=expected_label,
-        expected_value=expected_value,
+        expected_label_length=len(str(expected_label or "")),
+        expected_value_length=len(str(expected_value or "")),
         actual_index=actual_index,
-        actual_label=actual_label,
-        actual_value=actual_value,
+        actual_label_length=len(str(actual_label or "")),
+        actual_value_length=len(str(actual_value or "")),
+        labels_equal_normalized=" ".join(str(actual_label or "").split()).casefold()
+        == str(expected_label or "").casefold(),
     )
     return True
 
@@ -5143,6 +5152,7 @@ class ActionHandler:
         *,
         file_download_false_click_eligible: bool = False,
         allow_stale_refresh: bool = False,
+        computer_surface: ComputerSurface | None = None,
     ) -> list[ActionResult]:
         context = skyvern_context.current()
         prior_reservations: tuple[tuple[Page, ...], tuple[Page, ...]] = ((), ())
@@ -5165,6 +5175,7 @@ class ActionHandler:
                 action,
                 file_download_false_click_eligible=file_download_false_click_eligible,
                 allow_stale_refresh=allow_stale_refresh,
+                computer_surface=computer_surface,
             )
             if _browser_dispatch_committed.get():
                 app.AGENT_FUNCTION.note_page_action(page, action)
@@ -5202,6 +5213,7 @@ class ActionHandler:
         *,
         file_download_false_click_eligible: bool = False,
         allow_stale_refresh: bool = False,
+        computer_surface: ComputerSurface | None = None,
     ) -> list[ActionResult]:
         # task_id, step_id auto-attached by @traced from SkyvernContext
         _action_span = otel_trace.get_current_span()
@@ -5288,6 +5300,7 @@ class ActionHandler:
                             page=page,
                             action=action,
                             allow_stale_refresh=allow_stale_refresh,
+                            computer_surface=computer_surface,
                         )
                 finally:
                     if false_click_eligible_token is not None:
@@ -5494,6 +5507,7 @@ class ActionHandler:
                                     page=page,
                                     action=action,
                                     allow_stale_refresh=allow_stale_refresh,
+                                    computer_surface=computer_surface,
                                 )
                             except asyncio.CancelledError:
                                 raise
@@ -5815,6 +5829,7 @@ class ActionHandler:
                     page=page,
                     action=action,
                     allow_stale_refresh=allow_stale_refresh,
+                    computer_surface=computer_surface,
                 )
             # The execution window ends when the inner action completes: the download wait
             # below (up to BROWSER_DOWNLOAD_TIMEOUT) is settle observation, excluded to match
@@ -6454,6 +6469,7 @@ class ActionHandler:
         page: Page,
         action: Action,
         allow_stale_refresh: bool = False,
+        computer_surface: ComputerSurface | None = None,
     ) -> list[ActionResult]:
         action.tel_input_outcome = None
         await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
@@ -6540,7 +6556,21 @@ class ActionHandler:
                     # do the handler
                     handler = ActionHandler._handled_action_types[action.action_type]
                     action_phase.mark_action_phase(ActionPhase.HANDLER)
-                    results = await handler(action, page, scraped_page, task, step)
+                    if computer_surface is not None and action.action_type in (
+                        ActionType.CLICK,
+                        ActionType.INPUT_TEXT,
+                        ActionType.WAIT,
+                        ActionType.SCROLL,
+                        ActionType.KEYPRESS,
+                        ActionType.MOVE,
+                        ActionType.DRAG,
+                        ActionType.LEFT_MOUSE,
+                    ):
+                        results = await cast(Callable[..., Awaitable[list[ActionResult]]], handler)(
+                            action, page, scraped_page, task, step, computer_surface=computer_surface
+                        )
+                    else:
+                        results = await handler(action, page, scraped_page, task, step)
                     actions_result.extend(results)
                     await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
                     # do the teardown
@@ -7828,6 +7858,8 @@ async def handle_click_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     # Get wait config once for this handler
     wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
@@ -7835,6 +7867,9 @@ async def handle_click_action(
     dom = DomUtil(scraped_page=scraped_page, page=page)
     original_url = page.url
     if action.x is not None and action.y is not None:
+        if computer_surface is not None:
+            await computer_surface.click(action.x, action.y, action.button, action.repeat)
+            return [ActionSuccess()]
         # Find the element at the clicked location using JavaScript evaluation
         element_id: str | None = await page.evaluate(
             """data => {
@@ -9535,6 +9570,8 @@ async def handle_input_text_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     action.tel_input_outcome = None
     return await _handle_input_text_action(
@@ -9543,6 +9580,7 @@ async def handle_input_text_action(
         scraped_page=scraped_page,
         task=task,
         step=step,
+        computer_surface=computer_surface,
     )
 
 
@@ -9568,6 +9606,8 @@ async def _handle_input_text_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     initial_action_target_id = action.element_id
     context = skyvern_context.current()
@@ -9657,7 +9697,10 @@ async def _handle_input_text_action(
             task.workflow_run_id,
             is_card_secret=_is_card_secret_parameter(task, action.text, resolved_to_a_secret=cua_text != action.text),
         )
-        await EventStrategyFactory.type_text(page, None, cua_text)
+        if computer_surface is not None:
+            await computer_surface.type_text(cua_text)
+        else:
+            await EventStrategyFactory.type_text(page, None, cua_text)
         return [ActionSuccess()]
 
     totp_secret: str | None = None
@@ -10463,7 +10506,7 @@ async def _handle_input_text_action(
             except Exception:
                 LOG.warning(
                     "Failed to check the date format, using the original text to fill in the date input",
-                    text=text,
+                    text_length=len(str(text)),
                     action=action,
                     exc_info=True,
                 )
@@ -11540,7 +11583,7 @@ async def handle_select_option_action(
         ):
             LOG.info(
                 "Optional custom-select found no matching option; recording an optional miss and skipping the step",
-                target_value=action.option.label or action.option.value,
+                target_value_length=len(str(action.option.label or action.option.value or "")),
             )
             results.append(ActionAbort())
             return results
@@ -11577,7 +11620,7 @@ async def handle_select_option_action(
     LOG.info(
         "Try to select by value in custom select",
         element_id=skyvern_element.get_id(),
-        value=suggested_value,
+        value_length=len(str(suggested_value)) if suggested_value is not None else None,
     )
     try:
         await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
@@ -11667,8 +11710,13 @@ async def handle_wait_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
-    await asyncio.sleep(action.seconds)
+    if computer_surface is not None:
+        await computer_surface.wait(action.seconds)
+    else:
+        await asyncio.sleep(action.seconds)
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
 
 
@@ -11887,6 +11935,8 @@ async def handle_scroll_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     if action.scroll_x is None or action.scroll_y is None:
         return [ActionFailure(Exception("ScrollAction is missing scroll_x/scroll_y coordinates"))]
@@ -12059,10 +12109,16 @@ async def handle_scroll_action(
             await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     elif action.x and action.y:
         # Coordinate-based scrolling from CUA/UI-TARS agents
-        await EventStrategyFactory.move_cursor(page, action.x, action.y)
-        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
+        if computer_surface is not None:
+            await computer_surface.scroll(action.x, action.y, action.scroll_x, action.scroll_y)
+        else:
+            await EventStrategyFactory.move_cursor(page, action.x, action.y)
+            await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     else:
-        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
+        if computer_surface is not None:
+            await computer_surface.scroll(None, None, action.scroll_x, action.scroll_y)
+        else:
+            await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     return [ActionSuccess()]
 
 
@@ -12073,9 +12129,16 @@ async def handle_keypress_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     otp_dispatch_effect.set("unknown")
-    await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
+    if computer_surface is not None:
+        await computer_surface.key(action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
+    else:
+        await handler_utils.keypress(
+            page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat
+        )
     otp_dispatch_effect.set("dispatched")
     return [ActionSuccess()]
 
@@ -12263,10 +12326,15 @@ async def handle_move_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     if action.x is None or action.y is None:
         return [ActionFailure(Exception("MoveAction is missing x/y coordinates"))]
-    await EventStrategyFactory.move_cursor(page, action.x, action.y)
+    if computer_surface is not None:
+        await computer_surface.move(action.x, action.y)
+    else:
+        await EventStrategyFactory.move_cursor(page, action.x, action.y)
     return [ActionSuccess()]
 
 
@@ -12277,8 +12345,13 @@ async def handle_drag_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
-    await handler_utils.drag(page, action.start_x, action.start_y, action.path)
+    if computer_surface is not None:
+        await computer_surface.drag(action.start_x, action.start_y, action.path)
+    else:
+        await handler_utils.drag(page, action.start_x, action.start_y, action.path)
     return [ActionSuccess()]
 
 
@@ -12306,8 +12379,13 @@ async def handle_left_mouse_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
-    await handler_utils.left_mouse(page, action.x, action.y, action.direction)
+    if computer_surface is not None:
+        await computer_surface.left_mouse(action.x, action.y, action.direction)
+    else:
+        await handler_utils.left_mouse(page, action.x, action.y, action.direction)
     return [ActionSuccess()]
 
 
@@ -13293,7 +13371,7 @@ async def choose_auto_completion_dropdown(
                                 "Autocomplete deterministic option identity failed, resetting input before LLM fallback",
                                 element_id=matched_element_id,
                                 matched_index=matched_index,
-                                matched_label=matched_label,
+                                matched_label_length=len(str(matched_label or "")),
                             )
                             (
                                 incremental_scraped,
@@ -13319,9 +13397,9 @@ async def choose_auto_completion_dropdown(
                             LOG.info(
                                 "Autocomplete deterministic fast path: exact/stem option found, skipping LLM",
                                 element_id=matched_element_id,
-                                input_value=text,
+                                input_value_length=len(str(text)),
                                 matched_index=matched_index,
-                                matched_label=matched_label,
+                                matched_label_length=len(str(matched_label or "")),
                             )
                             try:
                                 await matched_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
@@ -13338,14 +13416,14 @@ async def choose_auto_completion_dropdown(
                                     "Autocomplete deterministic read-back failed, resetting input before LLM fallback",
                                     element_id=matched_element_id,
                                     matched_index=matched_index,
-                                    matched_label=matched_label,
+                                    matched_label_length=len(str(matched_label or "")),
                                 )
                             except Exception:
                                 LOG.info(
                                     "Autocomplete deterministic fast-path click/read-back failed, falling through to LLM",
                                     element_id=matched_element_id,
                                     matched_index=matched_index,
-                                    matched_label=matched_label,
+                                    matched_label_length=len(str(matched_label or "")),
                                     exc_info=True,
                                 )
                             (
@@ -13376,7 +13454,7 @@ async def choose_auto_completion_dropdown(
                             "Autocomplete deterministic option detached before click, resetting input before LLM fallback",
                             element_id=matched_element_id,
                             matched_index=matched_index,
-                            matched_label=matched_label,
+                            matched_label_length=len(str(matched_label or "")),
                         )
                         (
                             incremental_scraped,
@@ -13414,7 +13492,7 @@ async def choose_auto_completion_dropdown(
                         LOG.info(
                             "Location auto-completion fast path: single option found, skipping LLM",
                             element_id=fast_path_element_id,
-                            input_value=text,
+                            input_value_length=len(str(text)),
                         )
                         try:
                             await fast_path_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
@@ -13492,7 +13570,7 @@ async def choose_auto_completion_dropdown(
         if json_response.get("direct_searching", False):
             LOG.info(
                 "Decided to directly search with the current value",
-                value=text,
+                value_length=len(str(text)),
             )
             await skyvern_element.press_key("Enter")
             clear_input = False
@@ -13562,7 +13640,7 @@ async def choose_auto_completion_dropdown(
             "Failed to choose the auto completion dropdown",
             sampling=True,
             exc_info=True,
-            input_value=text,
+            input_value_length=len(str(text)),
         )
         result.action_result = ActionFailure(exception=e)
         return result
@@ -13655,7 +13733,7 @@ async def input_or_auto_complete_input(
         LOG.info(
             "Try the potential value for auto completion",
             sampling=True,
-            input_value=current_value,
+            input_value_length=len(str(current_value)),
         )
         is_location = input_or_select_context.is_location_input or False
         attempt_started_at = monotonic()
@@ -13707,7 +13785,7 @@ async def input_or_auto_complete_input(
                 element_id=skyvern_element.get_id(),
                 elapsed_seconds=round(_elapsed_seconds(), 1),
                 budget_seconds=retry_budget_seconds,
-                attempts=attempt_timings,
+                attempt_seconds=[attempt["seconds"] for attempt in attempt_timings],
             )
         else:
             prompt = prompt_engine.load_prompt(
@@ -13722,7 +13800,7 @@ async def input_or_auto_complete_input(
 
             LOG.info(
                 "Ask LLM to give potential values based on the current value",
-                current_value=current_value,
+                current_value_length=len(str(current_value)),
                 potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
             )
             if collapse_autocomplete_fanout_enabled and action is not None:
@@ -13737,7 +13815,7 @@ async def input_or_auto_complete_input(
             if not value:
                 LOG.info(
                     "Empty potential value, skip this attempt",
-                    value=each_value,
+                    value_index=value_index,
                 )
                 continue
             if _retry_budget_exhausted():
@@ -13746,14 +13824,14 @@ async def input_or_auto_complete_input(
                     element_id=skyvern_element.get_id(),
                     elapsed_seconds=round(_elapsed_seconds(), 1),
                     budget_seconds=retry_budget_seconds,
-                    attempts=attempt_timings,
+                    attempt_seconds=[attempt["seconds"] for attempt in attempt_timings],
                     skipped_value_count=len(values) - value_index,
                 )
                 break
             LOG.info(
                 "Try the potential value for auto completion",
                 sampling=True,
-                input_value=value,
+                input_value_length=len(str(value)),
             )
             attempt_started_at = monotonic()
             result = await choose_auto_completion_dropdown(
@@ -13783,7 +13861,7 @@ async def input_or_auto_complete_input(
         if current_attemp < MAX_AUTO_COMPLETE_ATTEMP:
             LOG.info(
                 "Ask LLM to tweak the current value based on tried input values",
-                current_value=current_value,
+                current_value_length=len(str(current_value)),
                 current_attemp=current_attemp,
             )
             cleaned_new_elements = remove_duplicated_HTML_element(whole_new_elements)
@@ -13807,8 +13885,8 @@ async def input_or_auto_complete_input(
             LOG.info(
                 "Ask LLM tweaked the current value with a new value",
                 field_information=input_or_select_context.field,
-                current_value=current_value,
-                new_value=new_current_value,
+                current_value_length=len(str(current_value)),
+                new_value_length=len(str(new_current_value)),
             )
             current_value = new_current_value
 
@@ -13817,7 +13895,7 @@ async def input_or_auto_complete_input(
             LOG.info(
                 "Auto completion attempts exhausted, trying discover-all-options fallback",
                 element_id=skyvern_element.get_id(),
-                original_text=text,
+                original_text_length=len(str(text or "")),
             )
             fallback_result = await discover_and_select_from_full_dropdown(
                 context=input_or_select_context,
@@ -13836,7 +13914,7 @@ async def input_or_auto_complete_input(
             "Auto completion didn't finish, this might leave the input value to be empty.",
             sampling=True,
             **llm_response_log_metadata(input_or_select_context.model_dump()),
-            attempts=attempt_timings,
+            attempt_seconds=[attempt["seconds"] for attempt in attempt_timings],
             total_seconds=round(_elapsed_seconds(), 1),
         )
         return None
@@ -13968,7 +14046,7 @@ async def discover_and_select_from_full_dropdown(
         LOG.info(
             "Discover fallback: asking LLM to pick from actual options",
             element_id=skyvern_element.get_id(),
-            original_text=original_text,
+            original_text_length=len(str(original_text)),
         )
         json_response = await get_org_aware_secondary_llm_api_handler(default=app.AUTO_COMPLETION_LLM_API_HANDLER)(
             prompt=prompt, step=step, prompt_name="auto-completion-choose-option"
@@ -13991,7 +14069,7 @@ async def discover_and_select_from_full_dropdown(
             "Discover fallback: found suitable option, typing discovered value to trigger auto-completion",
             element_id=element_id,
             relevance_float=relevance_float,
-            discovered_value=discovered_value,
+            discovered_value_length=len(str(discovered_value)),
         )
 
         if not discovered_value:
@@ -14014,14 +14092,14 @@ async def discover_and_select_from_full_dropdown(
             await skyvern_element.press_key("Enter")
             LOG.info(
                 "Discover fallback: selected option via keyboard",
-                discovered_value=discovered_value,
+                discovered_value_length=len(str(discovered_value)),
             )
             return ActionSuccess()
         except Exception:
             LOG.info(
                 "Discover fallback: keyboard selection failed",
                 exc_info=True,
-                discovered_value=discovered_value,
+                discovered_value_length=len(str(discovered_value)),
             )
             return None
 
@@ -14029,7 +14107,7 @@ async def discover_and_select_from_full_dropdown(
         LOG.warning(
             "Discover fallback failed",
             exc_info=True,
-            original_text=original_text,
+            original_text_length=len(str(original_text)),
         )
         return None
     finally:
@@ -14815,7 +14893,7 @@ async def _custom_select_scope_confirms_committed(
         LOG.info(
             "Failed to read custom-select committed label",
             matched_element_id=matched_element_id,
-            matched_label=matched_label,
+            matched_label_length=len(str(matched_label or "")),
             exc_info=True,
         )
         return False, "none"
@@ -14963,9 +15041,9 @@ async def _resolve_custom_select_readback_scope_element(
     except Exception:
         LOG.info(
             "Failed to resolve custom-select read-back scope element; continuing with matched-element read-back",
-            target_value=target_value,
+            target_value_length=len(str(target_value or "")),
             matched_element_id=matched_element_id,
-            matched_label=matched_label,
+            matched_label_length=len(str(matched_label or "")),
             exc_info=True,
         )
         return None
@@ -15228,7 +15306,7 @@ async def _select_deterministic_custom_option(
             if pre_click_anchor_value is None:
                 LOG.info(
                     "Anchor value unreadable before deterministic click; falling back to LLM path",
-                    target_value=target_value,
+                    target_value_length=len(target_value) if target_value is not None else None,
                     matched_element_id=element_id,
                 )
                 emit(CustomSelectFamilyOutcome.llm_fallback_pre_click_error)
@@ -15253,18 +15331,18 @@ async def _select_deterministic_custom_option(
         if not click_attempted or isinstance(exc, InteractWithDisabledElement):
             LOG.info(
                 "Deterministic custom-select failed; falling back to LLM path",
-                target_value=target_value,
+                target_value_length=len(target_value) if target_value is not None else None,
                 matched_element_id=element_id,
-                matched_label=matched_label,
+                matched_label_length=len(str(matched_label or "")),
                 exc_info=True,
             )
             emit(CustomSelectFamilyOutcome.llm_fallback_pre_click_error)
             return None
         LOG.info(
             "Deterministic custom-select failed after click; returning failure to avoid replaying over mutated widget",
-            target_value=target_value,
+            target_value_length=len(target_value) if target_value is not None else None,
             matched_element_id=element_id,
-            matched_label=matched_label,
+            matched_label_length=len(str(matched_label or "")),
             exc_info=True,
         )
         emit(CustomSelectFamilyOutcome.terminal_post_click_exception)
@@ -15286,16 +15364,16 @@ async def _select_deterministic_custom_option(
                 emit(CustomSelectFamilyOutcome.llm_fallback_reset_verified)
             LOG.info(
                 "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
-                target_value=target_value,
+                target_value_length=len(target_value) if target_value is not None else None,
                 matched_element_id=element_id,
-                matched_label=matched_label,
+                matched_label_length=len(str(matched_label or "")),
             )
             return None
         LOG.info(
             "Deterministic custom-select combobox reset failed; returning failure to avoid replaying over mutated widget",
-            target_value=target_value,
+            target_value_length=len(target_value) if target_value is not None else None,
             matched_element_id=element_id,
-            matched_label=matched_label,
+            matched_label_length=len(str(matched_label or "")),
         )
         emit(CustomSelectFamilyOutcome.terminal_unverified_reset)
         return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
@@ -15303,18 +15381,18 @@ async def _select_deterministic_custom_option(
     if not matched_option_is_choice_input:
         LOG.info(
             "Deterministic custom-select read-back inconclusive on non-choice-input option; returning terminal failure",
-            target_value=target_value,
+            target_value_length=len(target_value) if target_value is not None else None,
             matched_element_id=element_id,
-            matched_label=matched_label,
+            matched_label_length=len(str(matched_label or "")),
         )
         emit(CustomSelectFamilyOutcome.terminal_unverified_click)
         return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
 
     LOG.info(
         "Deterministic custom-select read-back failed after click; returning failure to avoid replaying over mutated widget",
-        target_value=target_value,
+        target_value_length=len(target_value) if target_value is not None else None,
         matched_element_id=element_id,
-        matched_label=matched_label,
+        matched_label_length=len(str(matched_label or "")),
     )
     emit(CustomSelectFamilyOutcome.terminal_unverified_toggle)
     return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
@@ -16220,7 +16298,7 @@ async def select_from_dropdown(
         # but only one option is clickable on the page
         LOG.debug(
             "Searching option with the same value in incremental elements",
-            value=value,
+            value_length=len(str(value)),
             elements=incremental_scraped.element_tree,
         )
         locator = await incremental_scraped.select_one_element_by_value(value=value)
@@ -16233,7 +16311,7 @@ async def select_from_dropdown(
         try:
             LOG.info(
                 "Find an alternative option with the same value. Try to select the option.",
-                value=value,
+                value_length=len(str(value)),
             )
             await EventStrategyFactory.move_to_element(page, locator)
             await locator.click(timeout=timeout)
@@ -16721,9 +16799,9 @@ async def normal_select(
             LOG.info(
                 "Deterministic normal-select failed; falling back to LLM path",
                 action=action,
-                target_value=target_value,
+                target_value_length=len(str(target_value or "")),
                 matched_index=resolution.matched_index,
-                matched_label=resolution.matched_label,
+                matched_label_length=len(str(resolution.matched_label or "")),
             )
 
     if collapse_select_fanout_enabled:

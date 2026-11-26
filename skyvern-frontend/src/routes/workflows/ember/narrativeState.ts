@@ -335,6 +335,8 @@ export interface BlockState {
   outcome?: BlockOutcome;
   outcomeReason?: string;
   outcomeRole?: RunOutcomeRole;
+  // On a failed block, the backend's code for a refusal of access (see ACCESS_REFUSED_FAILURE_CODES).
+  failureCode?: string;
   // Requested blocks the run did not execute, shown before this, the run's first card.
   skippedBefore?: SkippedPrefixBlock[];
   lastSeenIteration: number;
@@ -544,6 +546,9 @@ export interface ConnectionCard {
   scopeProfile: string | null;
   requiredScopes: string[];
   reconnectConnectionId: string | null;
+  credentialBackends?: ("native" | "nango")[];
+  // The step runs only on a Connected Gmail account, so a Google sign-in account is neither offered nor connected.
+  connectedGmailOnly?: boolean;
 }
 
 export function connectionCardKey(card: ConnectionCard): string {
@@ -881,6 +886,15 @@ export function parseConnectionCards(value: unknown): ConnectionCard[] {
         row.reconnectConnectionId.length > 0
           ? row.reconnectConnectionId
           : null,
+      ...(Array.isArray(row.credentialBackends)
+        ? {
+            credentialBackends: row.credentialBackends.filter(
+              (backend): backend is "native" | "nango" =>
+                backend === "native" || backend === "nango",
+            ),
+          }
+        : {}),
+      ...(row.connectedGmailOnly === true ? { connectedGmailOnly: true } : {}),
     };
     const key = connectionCardKey(card);
     if (seen.has(key)) continue;
@@ -930,6 +944,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   select_option: "Selecting option",
   press_key: "Interacting with page",
   drag: "Interacting with page",
+  hover: "Interacting with page",
   navigate_browser: "Opening page",
   wait_for_either_state: "Waiting for the page",
   skyvern_frame_list: "Finding embedded pages",
@@ -957,12 +972,15 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   list_credentials: "Checking saved credentials",
   get_organization_usage_quota: "Checking account usage",
   create_webhook_trigger: "Creating a webhook trigger",
+  create_google_sheet: "Creating a Google Sheet",
   test_trigger_mapping: "Testing the trigger mapping",
   list_workflow_triggers: "Checking this workflow's triggers",
   extend_browser_session: "Extending the browser session",
   read_chat_history: "Reading earlier messages in this chat",
   load_skill: "Loading a skill",
   read_skill_resource: "Reading a skill file",
+  save_org_skill: "Saving a skill",
+  delete_org_skill: "Deleting a skill",
   run_browser_code: "Working in the browser",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
@@ -976,6 +994,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   [SINGLE_RUN_TOOL]: "Reviewing the run with you",
   [INPUT_GROUP_TOOL]: "Reviewing the runs with you",
   get_account_group_status: "Checking the group runs",
+  get_run_group_results: "Reading the group results",
   cancel_account_group: "Reviewing a cancel with you",
   delete_saved_credentials: "Reviewing a credential deletion with you",
 };
@@ -1014,10 +1033,13 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   request_connection: "other",
   offer_demonstration: "other",
   read_google_sheet: "other",
+  create_google_sheet: "other",
   read_attached_pdf: "other",
   read_chat_history: "other",
   load_skill: "other",
   read_skill_resource: "other",
+  save_org_skill: "other",
+  delete_org_skill: "other",
   get_organization_usage_quota: "other",
   create_webhook_trigger: "other",
   test_trigger_mapping: "other",
@@ -1039,6 +1061,7 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   [SINGLE_RUN_TOOL]: "run",
   [INPUT_GROUP_TOOL]: "run",
   get_account_group_status: "other",
+  get_run_group_results: "other",
   cancel_account_group: "other",
   delete_saved_credentials: "other",
 };
@@ -1637,6 +1660,7 @@ export function applyNarrativeEvent(
         outcome: previousBlock?.outcome,
         outcomeReason: previousBlock?.outcomeReason,
         outcomeRole: previousBlock?.outcomeRole,
+        failureCode: event.failure_code ?? undefined,
         skippedBefore: previousBlock?.skippedBefore ?? pendingSkipped,
         recordedActions: previousBlock?.recordedActions,
         recordedActionsAt: previousBlock?.recordedActionsAt,
@@ -2234,6 +2258,8 @@ export function hydrateNarrativeFromPayload(
         outcomeRole,
         outcomeReason:
           typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
+        failureCode:
+          typeof obj.failureCode === "string" ? obj.failureCode : undefined,
         skippedBefore: parseSkippedPrefix(obj.skippedBefore),
         state: ((): BlockState["state"] => {
           const s = obj.state;

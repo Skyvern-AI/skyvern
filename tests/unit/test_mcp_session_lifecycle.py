@@ -17,9 +17,10 @@ from playwright.async_api import Page
 from structlog.testing import capture_logs
 
 from skyvern.cli.core import client as client_mod
-from skyvern.cli.core import copilot_sessions, hosted_driver
+from skyvern.cli.core import ember_sessions, hosted_driver
 from skyvern.cli.core import result as result_mod
 from skyvern.cli.core import session_manager, session_ops
+from skyvern.cli.core.browser_ops import do_network_route
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_ops import SessionCloseResult, coerce_proxy_location
 from skyvern.cli.mcp_tools import mcp
@@ -35,6 +36,7 @@ from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
 from skyvern.services import hosted_driver_sweep
+from tests.unit._mcp_browser_fakes import make_cdp_page
 
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
 
@@ -55,7 +57,7 @@ def _clear_singletons() -> None:
     session_manager._current_organization_id.set(None)
     session_manager._global_session = None
     session_manager._organization_sessions.clear()
-    copilot_sessions._copilot_sessions.clear()
+    ember_sessions._ember_sessions.clear()
     session_manager._session_ref_maps.clear()
     session_manager._session_ref_generations.clear()
     session_manager.set_stateless_http_mode(False)
@@ -551,7 +553,7 @@ async def test_resolve_browser_keeps_cdp_urls_on_direct_attach_path(
     ("organization_id", "api_key"),
     [(None, "sk_copilot_org"), ("org_copilot", "sk_other_org")],
 )
-async def test_resolve_browser_requires_matching_organization_and_credential_for_registered_copilot_session(
+async def test_resolve_browser_requires_matching_organization_and_credential_for_registered_ember_session(
     monkeypatch: pytest.MonkeyPatch,
     organization_id: str | None,
     api_key: str,
@@ -561,7 +563,7 @@ async def test_resolve_browser_requires_matching_organization_and_credential_for
         context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
         api_key_hash=session_manager._api_key_hash("sk_copilot_org"),
     )
-    copilot_sessions.register_copilot_session("pbs_copilot", registered_state, organization_id="org_copilot")
+    ember_sessions.register_ember_session("pbs_copilot", registered_state, organization_id="org_copilot")
 
     fallback_browser = MagicMock()
     fake_skyvern = MagicMock()
@@ -583,28 +585,28 @@ async def test_resolve_browser_requires_matching_organization_and_credential_for
     fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_copilot")
 
 
-def test_copilot_session_registry_preserves_each_parallel_registration() -> None:
+def test_ember_session_registry_preserves_each_parallel_registration() -> None:
     first = session_manager.SessionState()
     second = session_manager.SessionState()
 
-    copilot_sessions.register_copilot_session("pbs_shared", first, organization_id="org_shared")
-    copilot_sessions.register_copilot_session("pbs_shared", second, organization_id="org_shared")
+    ember_sessions.register_ember_session("pbs_shared", first, organization_id="org_shared")
+    ember_sessions.register_ember_session("pbs_shared", second, organization_id="org_shared")
 
-    assert copilot_sessions.registered_copilot_session("pbs_shared", organization_id="org_shared") is second
+    assert ember_sessions.registered_ember_session("pbs_shared", organization_id="org_shared") is second
 
-    copilot_sessions.unregister_copilot_session(
+    ember_sessions.unregister_ember_session(
         "pbs_shared",
         organization_id="org_shared",
         expected_state=second,
     )
-    assert copilot_sessions.registered_copilot_session("pbs_shared", organization_id="org_shared") is first
+    assert ember_sessions.registered_ember_session("pbs_shared", organization_id="org_shared") is first
 
-    copilot_sessions.unregister_copilot_session(
+    ember_sessions.unregister_ember_session(
         "pbs_shared",
         organization_id="org_shared",
         expected_state=first,
     )
-    assert copilot_sessions.registered_copilot_session("pbs_shared", organization_id="org_shared") is None
+    assert ember_sessions.registered_ember_session("pbs_shared", organization_id="org_shared") is None
 
 
 @pytest.mark.asyncio
@@ -683,11 +685,11 @@ async def test_tool_calls_disconnect_only_the_stateless_cdp_connections_they_ope
     fake_skyvern = MagicMock()
     fake_skyvern.connect_to_cloud_browser_session = AsyncMock(side_effect=connect)
     monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
-    copilot_browser = _FakeCloudBrowser()
-    copilot_sessions.register_copilot_session(
+    ember_browser = _FakeCloudBrowser()
+    ember_sessions.register_ember_session(
         "pbs_copilot",
         session_manager.SessionState(
-            browser=copilot_browser,
+            browser=ember_browser,
             context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
         ),
         organization_id="org_1",
@@ -708,8 +710,8 @@ async def test_tool_calls_disconnect_only_the_stateless_cdp_connections_they_ope
         # Stateful transports keep the organization's connection for the next call.
         assert len(opened) == 1
         assert opened[0].browser.connected
-    assert copilot_browser.browser.connected
-    assert not any(browser.session_closed for browser in [*opened, copilot_browser])
+    assert ember_browser.browser.connected
+    assert not any(browser.session_closed for browser in [*opened, ember_browser])
 
 
 class _FakeDriverProcess:
@@ -1410,14 +1412,14 @@ async def test_stateful_transport_keeps_one_driver_for_its_session(
 
 
 @pytest.mark.asyncio
-async def test_a_registered_copilot_browser_is_borrowed_not_owned(
+async def test_a_registered_ember_browser_is_borrowed_not_owned(
     fake_playwright: _FakePlaywright, hosted_mcp: None
 ) -> None:
-    copilot_browser = _FakeCloudBrowser()
-    copilot_sessions.register_copilot_session(
+    ember_browser = _FakeCloudBrowser()
+    ember_sessions.register_ember_session(
         "pbs_copilot",
         session_manager.SessionState(
-            browser=cast(SkyvernBrowser, copilot_browser),
+            browser=cast(SkyvernBrowser, ember_browser),
             context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
             api_key_hash=session_manager._api_key_hash("sk_key_a"),
         ),
@@ -1426,10 +1428,10 @@ async def test_a_registered_copilot_browser_is_borrowed_not_owned(
 
     browser = await _hosted_call("sk_key_a", "pbs_copilot")
 
-    assert browser is cast(SkyvernBrowser, copilot_browser)
+    assert browser is cast(SkyvernBrowser, ember_browser)
     assert fake_playwright.drivers == []
-    assert copilot_browser.browser.connected
-    assert not copilot_browser.session_closed
+    assert ember_browser.browser.connected
+    assert not ember_browser.session_closed
     assert await _sweep_after_idle() == 0
 
 
@@ -2314,8 +2316,95 @@ async def test_close_current_session_skips_api_close_for_local_session(monkeypat
     assert session_manager.get_current_session().browser is None
 
 
+async def _case_close_current_session_finishes_after_interceptor_failure(
+    monkeypatch: pytest.MonkeyPatch, cancel: bool, browser_fails: bool, second_fails: bool
+) -> None:
+    calls: list[str] = []
+    entered, release = asyncio.Event(), asyncio.Event()
+    owner_error = RuntimeError("auxiliary detach failed")
+    browser_error = RuntimeError("browser shutdown failed")
+    replacements: list[session_manager.SessionState] = []
+    browser = MagicMock()
+    state = session_manager.SessionState(browser=browser, context=BrowserContext(mode="local"))
+    session_manager.set_current_session(state)
+    session_manager.replace_session_ref_map({"e1": {"tag": "button"}})
+    for page in (make_cdp_page(), make_cdp_page()):
+        await do_network_route(page, state, url_pattern="**/api", action="mock", mock_body="held")
+    first, second = tuple(state._http_interceptors)
+    first_binding = next(iter(first._pages.values()))
+    second_binding = next(iter(second._pages.values()))
+    second_detach = second_binding.session.detach
+
+    async def fail_first() -> None:
+        calls.append("first")
+        entered.set()
+        await release.wait()
+        raise owner_error
+
+    async def close_second() -> None:
+        calls.append("second")
+        if second_fails:
+            raise owner_error
+        await second_detach()
+
+    async def close_browser() -> None:
+        calls.append("browser")
+        assert not state.active_routes and not state._http_interceptors
+        if browser_fails:
+            raise browser_error
+
+    async def close_current() -> None:
+        try:
+            await session_manager.close_current_session()
+        finally:
+            replacements.append(session_manager.get_current_session())
+
+    monkeypatch.setattr(first_binding.session, "detach", fail_first)
+    monkeypatch.setattr(second_binding.session, "detach", close_second)
+    browser.close = AsyncMock(side_effect=close_browser)
+    closing = asyncio.create_task(close_current())
+    try:
+        with capture_logs() as logs:
+            await asyncio.wait_for(entered.wait(), 1)
+            if cancel:
+                closing.cancel()
+                await asyncio.sleep(0)
+                closing.cancel()
+                await asyncio.sleep(0)
+                assert not closing.done() and not replacements
+            release.set()
+            (outcome,) = await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), 1)
+        assert calls == ["first", "second", "browser"]
+        assert not state._http_interceptors and not state.active_routes and not state._observed_refs
+        assert len(replacements) == 1 and replacements[0] is not state and replacements[0].browser is None
+        warnings = [entry for entry in logs if entry["event"] == "Best-effort HTTP interception close failed"]
+        assert len(warnings) == 1 + second_fails and all(entry["exc_info"] for entry in warnings)
+        if cancel:
+            assert isinstance(outcome, asyncio.CancelledError)
+        elif browser_fails:
+            assert outcome is browser_error
+        else:
+            assert outcome is None
+        assert not any(
+            task.get_name() in {"http-interception-close", "browser-session-close"} for task in asyncio.all_tasks()
+        )
+    finally:
+        release.set()
+        if not closing.done():
+            closing.cancel()
+        await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), 1)
+
+
 @pytest.mark.asyncio
-async def test_close_current_session_still_closes_browser_when_api_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "auxiliary",
+    [None]
+    + [(False, False, False), (False, False, True), (False, True, False), (True, False, False), (True, True, True)],
+)
+async def test_close_current_session_still_closes_browser_when_api_fails(monkeypatch, auxiliary) -> None:
+    if auxiliary is not None:
+        await _case_close_current_session_finishes_after_interceptor_failure(monkeypatch, *auxiliary)
+        return
     """When do_session_close raises, browser.close() should still run and state should be cleared."""
     browser = MagicMock()
     browser.close = AsyncMock()

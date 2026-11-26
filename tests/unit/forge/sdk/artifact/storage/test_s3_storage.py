@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import io
+import json
 import os
+import random
 import shutil
 import subprocess
+import threading
+import time
 import zipfile
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,29 +22,50 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import zstandard as zstd
+from aiobotocore.credentials import AioCredentialResolver
+from aiobotocore.response import StreamingBody
+from aiohttp import web
+from anyio import CancelScope, to_thread
+from botocore import UNSIGNED
+from botocore.exceptions import ClientError, ConnectTimeoutError, EndpointConnectionError
 from freezegun import freeze_time
+from google.api_core.exceptions import Forbidden, RetryError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ReadTimeout, SSLError
 from structlog.testing import capture_logs
+from urllib3.exceptions import ConnectTimeoutError as Urllib3ConnectTimeoutError
 
 import skyvern.forge.sdk.artifact.storage.base as base_module
 import skyvern.forge.sdk.artifact.storage.s3 as s3_module
 from skyvern.config import settings
 from skyvern.exceptions import DownloadSaveIncompleteError
-from skyvern.forge.sdk.api.aws import _STREAM_UPLOAD_IO_QUEUE_DEPTH, S3StorageClass, S3Uri
+from skyvern.forge.sdk.api.aws import _STREAM_UPLOAD_IO_QUEUE_DEPTH, AsyncAWSClient, S3StorageClass, S3Uri
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
+from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
+    WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+    ProfilePublicationConflict,
+)
+from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.db.id import generate_artifact_id
+from skyvern.forge.sdk.encrypt.files import FILE_MAGIC, ArtifactDecryptionError, encrypt_file
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
 from tests.unit.forge.sdk.artifact.storage.test_helpers import (
+    ProfileTransport,
+    artifact_root,
     create_fake_for_ai_suggestion,
     create_fake_step,
     create_fake_task_v2,
     create_fake_thought,
     create_fake_workflow_run_block,
+    install_s3_profile_transport,
 )
+from tests.unit.test_aws_client_ttl import _local_s3
 
 if TYPE_CHECKING:
     from types_boto3_s3.client import S3Client
@@ -73,6 +101,35 @@ def aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     """Mocked AWS Credentials for moto."""
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+
+
+@pytest.fixture(name="storage_bodies")
+def audit_storage_bodies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    observations = SimpleNamespace(reads=[], closes=0, by_content_range={})
+    real_read = StreamingBody.read
+
+    async def read(self: StreamingBody, amt: int | None = None) -> bytes:
+        chunk = await real_read(self, amt)
+        observations.reads.append((amt, len(chunk)))
+        content_range = self.__wrapped__.headers.get("Content-Range")
+        observations.by_content_range.setdefault(content_range, []).append(len(chunk))
+        return chunk
+
+    def close(self: StreamingBody) -> None:
+        observations.closes += 1
+        self.__wrapped__.close()
+
+    monkeypatch.setattr(StreamingBody, "read", read)
+    monkeypatch.setattr(StreamingBody, "close", close, raising=False)
+    return observations
+
+
+@pytest.fixture
+def no_s3_credential_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_lookup(self: AioCredentialResolver) -> None:
+        raise AssertionError("loopback storage must use its explicit fixture credentials")
+
+    monkeypatch.setattr(AioCredentialResolver, "load_credentials", fail_lookup)
 
 
 @freeze_time("2025-06-09T12:00:00")
@@ -1014,124 +1071,73 @@ class TestS3StorageZIPArchiveRetrieve:
             modified_at=datetime.utcnow(),
         )
 
-    async def test_retrieve_text_entry_from_step_archive(
-        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    @pytest.mark.parametrize(
+        ("archive_type", "bundle_key", "expected", "siblings", "zstd_wrapper"),
+        [
+            (
+                ArtifactType.STEP_ARCHIVE,
+                "scrape.html",
+                b"<html>hello world</html>",
+                {"element_tree.json": b"[]"},
+                False,
+            ),
+            (ArtifactType.STEP_ARCHIVE, "screenshot_llm_0.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 50, {}, False),
+            (
+                ArtifactType.TASK_ARCHIVE,
+                "browser_console.log",
+                b"[info] page loaded\n[error] fetch failed",
+                {"har.har": b'{"log":{}}'},
+                False,
+            ),
+            (ArtifactType.TASK_ARCHIVE, "legacy.html", b"<p>legacy</p>", {}, True),
+        ],
+        ids=["step-text", "step-png", "task-console", "legacy-zstd-wrapped-zip"],
+    )
+    async def test_retrieve_member_from_archive(
+        self,
+        s3_storage: S3Storage,
+        boto3_test_client: S3Client,
+        archive_type: ArtifactType,
+        bundle_key: str,
+        expected: bytes,
+        siblings: dict[str, bytes],
+        zstd_wrapper: bool,
     ) -> None:
-        """Retrieve a text artifact stored inside a STEP_ARCHIVE ZIP."""
         step = create_fake_step(TEST_STEP_ID)
-        bundle_key = "scrape.html"
-        expected = b"<html>hello world</html>"
-        zip_bytes = _build_zip({bundle_key: expected, "element_tree.json": b"[]"})
+        artifact = self._make_archive_artifact(s3_storage, step, archive_type, bundle_key)
+        encoded = _build_zip({bundle_key: expected, **siblings})
+        if zstd_wrapper:
+            artifact = artifact.model_copy(update={"uri": f"{artifact.uri}.zst"})
+        parent = artifact.model_copy(
+            update={"artifact_id": generate_artifact_id(), "artifact_type": archive_type, "bundle_key": None}
+        )
+        await s3_storage.store_artifact(parent, encoded)
 
+        assert await s3_storage.retrieve_artifact(artifact) == expected
+
+    @pytest.mark.parametrize(
+        ("bundle_key", "data"),
+        [
+            ("nonexistent.txt", _build_zip({"scrape.html": b"content"})),
+            ("scrape.html", b"this is not a zip file at all"),
+        ],
+        ids=["missing-member", "bad-zip"],
+    )
+    async def test_missing_or_corrupt_archive_member_returns_none(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, bundle_key: str, data: bytes
+    ) -> None:
+        step = create_fake_step(TEST_STEP_ID)
         artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, bundle_key)
-
-        # Upload the archive directly (simulating what _flush_step_archive does)
-        archive_artifact = Artifact(
-            artifact_id=generate_artifact_id(),
-            artifact_type=ArtifactType.STEP_ARCHIVE,
-            uri=artifact.uri,
-            organization_id=TEST_ORGANIZATION_ID,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            created_at=datetime.utcnow(),
-            modified_at=datetime.utcnow(),
+        parent = artifact.model_copy(
+            update={
+                "artifact_id": generate_artifact_id(),
+                "artifact_type": ArtifactType.STEP_ARCHIVE,
+                "bundle_key": None,
+            }
         )
-        await s3_storage.store_artifact(archive_artifact, zip_bytes)
+        await s3_storage.store_artifact(parent, data)
 
-        retrieved = await s3_storage.retrieve_artifact(artifact)
-        assert retrieved == expected
-
-    async def test_retrieve_screenshot_from_step_archive(
-        self, s3_storage: S3Storage, boto3_test_client: S3Client
-    ) -> None:
-        """Retrieve a PNG screenshot from a STEP_ARCHIVE ZIP."""
-        step = create_fake_step(TEST_STEP_ID)
-        bundle_key = "screenshot_llm_0.png"
-        fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
-        zip_bytes = _build_zip({bundle_key: fake_png})
-
-        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, bundle_key)
-        archive_artifact = Artifact(
-            artifact_id=generate_artifact_id(),
-            artifact_type=ArtifactType.STEP_ARCHIVE,
-            uri=artifact.uri,
-            organization_id=TEST_ORGANIZATION_ID,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            created_at=datetime.utcnow(),
-            modified_at=datetime.utcnow(),
-        )
-        await s3_storage.store_artifact(archive_artifact, zip_bytes)
-
-        retrieved = await s3_storage.retrieve_artifact(artifact)
-        assert retrieved == fake_png
-
-    async def test_retrieve_from_task_archive(self, s3_storage: S3Storage, boto3_test_client: S3Client) -> None:
-        """Retrieve a browser console log from a TASK_ARCHIVE ZIP."""
-        step = create_fake_step(TEST_STEP_ID)
-        bundle_key = "browser_console.log"
-        log_content = b"[info] page loaded\n[error] fetch failed"
-        zip_bytes = _build_zip({bundle_key: log_content, "har.har": b'{"log":{}}'})
-
-        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.TASK_ARCHIVE, bundle_key)
-        archive_artifact = Artifact(
-            artifact_id=generate_artifact_id(),
-            artifact_type=ArtifactType.TASK_ARCHIVE,
-            uri=artifact.uri,
-            organization_id=TEST_ORGANIZATION_ID,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            created_at=datetime.utcnow(),
-            modified_at=datetime.utcnow(),
-        )
-        await s3_storage.store_artifact(archive_artifact, zip_bytes)
-
-        retrieved = await s3_storage.retrieve_artifact(artifact)
-        assert retrieved == log_content
-
-    async def test_retrieve_missing_bundle_key_returns_none(
-        self, s3_storage: S3Storage, boto3_test_client: S3Client
-    ) -> None:
-        """bundle_key that doesn't exist inside the ZIP should return None."""
-        step = create_fake_step(TEST_STEP_ID)
-        zip_bytes = _build_zip({"scrape.html": b"content"})
-
-        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, "nonexistent.txt")
-        archive_artifact = Artifact(
-            artifact_id=generate_artifact_id(),
-            artifact_type=ArtifactType.STEP_ARCHIVE,
-            uri=artifact.uri,
-            organization_id=TEST_ORGANIZATION_ID,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            created_at=datetime.utcnow(),
-            modified_at=datetime.utcnow(),
-        )
-        await s3_storage.store_artifact(archive_artifact, zip_bytes)
-
-        result = await s3_storage.retrieve_artifact(artifact)
-        assert result is None
-
-    async def test_retrieve_corrupt_zip_returns_none(self, s3_storage: S3Storage, boto3_test_client: S3Client) -> None:
-        """A corrupt (non-ZIP) payload with a bundle_key should return None gracefully."""
-        step = create_fake_step(TEST_STEP_ID)
-        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, "scrape.html")
-
-        # Upload garbage bytes as the archive
-        archive_artifact = Artifact(
-            artifact_id=generate_artifact_id(),
-            artifact_type=ArtifactType.STEP_ARCHIVE,
-            uri=artifact.uri,
-            organization_id=TEST_ORGANIZATION_ID,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            created_at=datetime.utcnow(),
-            modified_at=datetime.utcnow(),
-        )
-        await s3_storage.store_artifact(archive_artifact, b"this is not a zip file at all")
-
-        result = await s3_storage.retrieve_artifact(artifact)
-        assert result is None
+        assert await s3_storage.retrieve_artifact(artifact) is None
 
     async def test_retrieve_without_bundle_key_returns_raw_bytes(
         self, s3_storage: S3Storage, boto3_test_client: S3Client
@@ -1184,6 +1190,528 @@ class TestS3StorageZIPArchiveRetrieve:
         )
         assert uri.endswith(".zip")
         assert not uri.endswith(".zst")
+
+
+_PNG_KEY = "stp_example_screenshot.png"
+_TEXT_KEY = "stp_example_scrape.txt"
+_SIBLING_KEYS = ("before.webm", "after.zip")
+_MIB = 1024 * 1024
+_PAUSED_PREFIX_BYTES = 64 * 1024
+
+
+@dataclass
+class _ArchiveFixture:
+    encoded: bytes
+    payloads: dict[str, tuple[int, int]]
+
+
+def _archive_fixture(sibling_size: int, *, variant: str = "ordinary") -> _ArchiveFixture:
+    if variant == "empty-object":
+        return _ArchiveFixture(b"", {})
+    png_size = {"stored-growth": 5 * _MIB + 37, "small": 20 * 1024 - 8, "tiny": 1024 - 8}.get(variant, 128 * 1024)
+    text = b"".join(f"tree node {i} at {i * 13}\n".encode() for i in range(12_000))
+    if variant == "deflated-growth":
+        rng = random.Random(21434)
+        text = b"".join(rng.randbytes(_MIB // 4) + b"\0" * (3 * _MIB // 4) for _ in range(16))
+    if variant in {"small", "tiny"}:
+        text = b"sample text"
+    entries = {
+        _SIBLING_KEYS[0]: b"x" * sibling_size,
+        _PNG_KEY: b"\x89PNG\r\n\x1a\n" + bytes(png_size),
+        _TEXT_KEY: text,
+        _SIBLING_KEYS[1]: b"y" * sibling_size,
+    }
+    if variant == "empty":
+        entries[_PNG_KEY] = b""
+    if variant == "replacement":
+        entries[_PNG_KEY] = entries[_PNG_KEY][:-1] + b"z"
+    raw = io.BytesIO()
+    payloads = {}
+    with zipfile.ZipFile(raw, "w") as archive:
+        if variant == "max-comment":
+            archive.comment = b"c" * 65535
+        for key, body in entries.items():
+            file = zipfile.ZipInfo(key)
+            file.file_size = len(body)
+            file.compress_type = zipfile.ZIP_DEFLATED if key == _TEXT_KEY else zipfile.ZIP_STORED
+            padded = variant == "padded" and key == _PNG_KEY
+            if padded:
+                file.extra = b"\xfe\xca" + (60_000).to_bytes(2, "little") + bytes(60_000)
+            with archive.open(file, "w", force_zip64=variant == "zip64" and key == _PNG_KEY) as writer:
+                start = raw.tell()
+                writer.write(body)
+            payloads[key] = start, start + file.compress_size
+            if padded:
+                file.extra = b""  # Only the local record retains the extra field.
+                raw.write(bytes(2 * _MIB))
+                archive.start_dir = raw.tell()
+        if variant == "duplicate":
+            with pytest.warns(UserWarning, match="Duplicate name"):
+                archive.writestr(_PNG_KEY, b"last directory entry")
+            payloads[_PNG_KEY] = raw.tell() - archive.getinfo(_PNG_KEY).compress_size, raw.tell()
+    return _ArchiveFixture(raw.getvalue(), payloads)
+
+
+@dataclass
+class _GetReceipt:
+    range_header: str | None
+    if_match: str | None
+    status: int
+    written: int
+
+
+class _ArchiveEndpoint:
+    etag = '"original"'
+
+    def __init__(
+        self, archive: _ArchiveFixture, mode: str = "normal", replacement: _ArchiveFixture | None = None
+    ) -> None:
+        self.archive = archive
+        self.mode = mode
+        self.replacement = replacement
+        self.head_count = 0
+        self.gets: list[_GetReceipt] = []
+        self.paused = asyncio.Event()
+        self.continue_prefix = asyncio.Event()
+        self.paused_range: str | None = None
+        self.finished = asyncio.Event()
+        self.release = asyncio.Event()
+        self.peer_closed = False
+
+    async def respond(self, request: web.Request) -> web.StreamResponse:
+        data = self.archive.encoded
+        assert "Authorization" not in request.headers
+        if request.method == "HEAD":
+            self.head_count += 1
+            return web.Response(headers={"Content-Length": str(len(data)), "ETag": self.etag})
+        assert request.method == "GET"
+
+        range_header = request.headers.get("Range")
+        if_match = request.headers.get("If-Match")
+        etag = self.etag
+        if self.replacement is not None and self.gets:
+            data = self.replacement.encoded
+            etag = '"replacement"'
+        if if_match is not None and if_match != etag:
+            return self._error(range_header, if_match, 412, "PreconditionFailed")
+        if self.mode == "not-found":
+            return self._error(range_header, if_match, 404, "NoSuchKey")
+        if self.mode == "unsatisfiable":
+            return self._error(range_header, if_match, 416, "InvalidRange")
+        if range_header is None:
+            self.gets.append(_GetReceipt(None, if_match, 200, len(data)))
+            return web.Response(body=data, headers={"ETag": etag})
+
+        start, end = map(int, range_header.removeprefix("bytes=").split("-"))
+        block = data[start : end + 1]
+        headers = {"Content-Range": f"bytes {start}-{end}/{len(data)}", "ETag": etag}
+        if self.mode == "wrong-range":
+            headers["Content-Range"] = f"bytes {start}-{end}/{len(data) + 1}"
+        if self.mode == "wrong-etag":
+            headers["ETag"] = '"wrong-etag"'
+        if self.mode == "wrong-length":
+            block = block[:-1]
+        pause = False
+        if self.mode == "pause":
+            payload_start, payload_end = self.archive.payloads[_PNG_KEY]
+            pause = max(start, payload_start) < min(end + 1, payload_end)
+        interrupted = self.mode in {"ignored-range", "truncated"} or pause
+        if not interrupted:
+            self.gets.append(_GetReceipt(range_header, if_match, 206, len(block)))
+            return web.Response(body=block, status=206, headers=headers)
+
+        status = 200 if self.mode == "ignored-range" else 206
+        if status == 200:
+            headers = {"ETag": etag}
+            block = data
+        response = web.StreamResponse(status=status, headers={**headers, "Content-Length": str(len(block))})
+        receipt = _GetReceipt(range_header, if_match, status, 0)
+        self.gets.append(receipt)
+        transport = request.transport
+        assert transport is not None
+        await response.prepare(request)
+        try:
+            initial = block[: (_PAUSED_PREFIX_BYTES // 2 if pause else min(4096, len(block) // 2))]
+            await response.write(initial)
+            receipt.written = len(initial)
+            if self.mode == "truncated":
+                transport.close()
+            else:
+                if pause:
+                    assert len(block) > _PAUSED_PREFIX_BYTES
+                    self.paused_range = headers["Content-Range"]
+                self.paused.set()
+                if pause:
+                    await self.continue_prefix.wait()
+                    await response.write(block[len(initial) : _PAUSED_PREFIX_BYTES])
+                    receipt.written = _PAUSED_PREFIX_BYTES
+                while not transport.is_closing() and not self.release.is_set():
+                    await asyncio.sleep(0.002)
+                self.peer_closed = transport.is_closing()
+                if not self.peer_closed:
+                    await response.write(block[receipt.written :])
+                    receipt.written = len(block)
+        except ConnectionResetError:
+            self.peer_closed = True
+        finally:
+            self.finished.set()
+        return response
+
+    def _error(self, range_header: str | None, if_match: str | None, status: int, code: str) -> web.Response:
+        body = f"<Error><Code>{code}</Code></Error>".encode()
+        self.gets.append(_GetReceipt(range_header, if_match, status, len(body)))
+        return web.Response(status=status, body=body, content_type="application/xml")
+
+
+def _unsigned_archive_storage(endpoint: str) -> S3Storage:
+    storage = S3Storage(bucket=TEST_BUCKET, endpoint_url=endpoint)
+    storage.async_client = AsyncAWSClient(
+        aws_access_key_id="fixture",
+        aws_secret_access_key="fixture",
+        region_name="us-east-1",
+        endpoint_url=endpoint,
+    )
+    storage.async_client.session.events.register_first("choose-signer.s3", lambda **_: UNSIGNED)
+    return storage
+
+
+def _bundle_artifact(key: str, *, filename: str = "archive.zip") -> Artifact:
+    now = datetime.now(UTC)
+    return Artifact(
+        artifact_id="a_bundle",
+        artifact_type=ArtifactType.HTML_SCRAPE,
+        uri=f"s3://{TEST_BUCKET}/{filename}",
+        organization_id=TEST_ORGANIZATION_ID,
+        created_at=now,
+        modified_at=now,
+        bundle_key=key,
+    )
+
+
+def _assert_released(storage: S3Storage, observed_bodies: int, expected_bodies: int) -> None:
+    assert observed_bodies == expected_bodies
+    clients = storage.async_client._shared_s3_clients
+    assert clients and all(client.leases == 0 for client in clients.values())
+
+
+def _archive_wire_receipt(
+    endpoint: _ArchiveEndpoint,
+    storage_bodies: SimpleNamespace,
+    **result: object,
+) -> str:
+    return json.dumps(
+        {
+            "archive_bytes": len(endpoint.archive.encoded),
+            "head_count": endpoint.head_count,
+            "gets": [asdict(get) for get in endpoint.gets],
+            "get_count": len(endpoint.gets),
+            "server_body_bytes": sum(get.written for get in endpoint.gets),
+            "client_body_bytes": sum(size for _, size in storage_bodies.reads),
+            "bodies_closed": storage_bodies.closes,
+            **result,
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "variant"),
+    [
+        pytest.param(_PNG_KEY, "small", id="ordinary-small"),
+        pytest.param(_PNG_KEY, "tiny", id="tiny-archive"),
+        pytest.param(_PNG_KEY, "stored-growth", id="stored-growth"),
+        pytest.param(_TEXT_KEY, "deflated-growth", id="deflated-growth"),
+        pytest.param(_PNG_KEY, "padded", id="padded-local-extra"),
+        pytest.param(_PNG_KEY, "zip64", id="zip64-member"),
+        pytest.param(_PNG_KEY, "zip64-directory", id="zip64-directory"),
+        pytest.param(_PNG_KEY, "max-comment", id="max-comment"),
+        pytest.param(_PNG_KEY, "duplicate", id="last-duplicate"),
+        pytest.param(_PNG_KEY, "empty", id="empty-member"),
+        pytest.param(_PNG_KEY, "empty-object", id="empty-object"),
+    ],
+)
+async def test_bundled_member_reads_use_bounded_s3_ranges(
+    key: str,
+    variant: str,
+    monkeypatch: pytest.MonkeyPatch,
+    storage_bodies: SimpleNamespace,
+    no_s3_credential_chain: None,
+    record_property: Callable[[str, object], None],
+) -> None:
+    sizes = (
+        (8 * _MIB, 16 * _MIB)
+        if variant.endswith("-growth")
+        else ({"small": 80 * 1024, "tiny": 2048, "empty-object": 0}.get(variant, 128 * 1024),)
+    )
+    consumption = []
+    for size in sizes:
+        with monkeypatch.context() as fixture_writer:
+            if variant == "zip64-directory":
+                fixture_writer.setattr(zipfile, "ZIP64_LIMIT", 65536)
+            archive = _archive_fixture(size, variant=variant)
+        if variant == "zip64-directory":
+            assert b"PK\x06\x06" in archive.encoded[-128:]
+        endpoint = _ArchiveEndpoint(archive)
+        expected, info = b"", None
+        request_budget = {"empty-object": 1, "tiny": 2, "max-comment": 6}.get(variant, 3)
+        if archive.encoded:
+            with zipfile.ZipFile(io.BytesIO(archive.encoded)) as local:
+                expected, info = local.read(key), local.getinfo(key)
+            if variant.endswith("-growth"):
+                physical_bytes = archive.payloads[key][1] - info.header_offset
+                request_budget = 2 + (physical_bytes + _MIB - 1) // _MIB  # HEAD, tail and compressed blocks.
+            if variant == "deflated-growth":
+                assert info.compress_size > _MIB and info.file_size > 3 * info.compress_size
+        before_reads = len(storage_bodies.reads)
+        before_closed = storage_bodies.closes
+        async with _local_s3(respond=endpoint.respond) as (url, seen):
+            storage = _unsigned_archive_storage(url)
+            received = await storage.retrieve_artifact(_bundle_artifact(key))
+            _assert_released(storage, storage_bodies.closes - before_closed, len(endpoint.gets))
+            assert all(not authorization for _, authorization, _ in seen)
+
+        expected_sha = hashlib.sha256(expected).hexdigest()
+        assert received is not None and hashlib.sha256(received).hexdigest() == expected_sha
+        assert endpoint.head_count <= 1 and endpoint.head_count + len(endpoint.gets) <= request_budget
+        wire_bytes = sum(get.written for get in endpoint.gets)
+        assert wire_bytes == sum(count for _, count in storage_bodies.reads[before_reads:])
+        if variant == "tiny":
+            assert 0 < wire_bytes == len(archive.encoded) <= 8192
+        elif variant == "empty-object":
+            assert not endpoint.gets
+        else:
+            assert 0 < wire_bytes < len(archive.encoded)
+        spans = []
+        for get in endpoint.gets:
+            assert get.range_header and get.if_match == endpoint.etag and get.status == 206
+            lo, hi = map(int, get.range_header.removeprefix("bytes=").split("-"))
+            assert 0 <= lo <= hi < len(archive.encoded)
+            assert get.written == hi - lo + 1 <= _MIB
+            spans.append((lo, hi + 1))
+        sibling_overlap = 0
+        for name, (start, end) in archive.payloads.items():
+            if name != key:
+                for lo, hi in spans:
+                    overlap_start, overlap_end = max(lo, start), min(hi, end)
+                    if overlap_start < overlap_end:
+                        assert overlap_start >= len(archive.encoded) - 8192
+                        sibling_overlap += overlap_end - overlap_start
+        if variant == "padded":
+            assert info is not None and not info.extra
+            start, end = archive.payloads[key]
+            assert start - info.header_offset > 60_000
+            ceiling = info.header_offset + info.compress_size + 131_100
+            assert all(hi <= ceiling or lo >= end + 2 * _MIB for lo, hi in spans)
+        consumption.append((wire_bytes, len(endpoint.gets), expected_sha, sibling_overlap))
+        record_property(
+            f"wire_{size}",
+            _archive_wire_receipt(
+                endpoint,
+                SimpleNamespace(
+                    reads=storage_bodies.reads[before_reads:], closes=storage_bodies.closes - before_closed
+                ),
+                member=key,
+                member_bytes=len(expected),
+                member_sha256=expected_sha,
+                compression=info.compress_type if info is not None else None,
+                compressed_bytes=info.compress_size if info is not None else 0,
+                sibling_payload_bytes=size,
+                sibling_overlap_bytes=sibling_overlap,
+                request_budget=request_budget,
+            ),
+        )
+    assert len(set(consumption)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "wire_status"),
+    [
+        ("ignored-range", 200),
+        ("wrong-range", 206),
+        ("wrong-etag", 206),
+        ("wrong-length", 206),
+        ("truncated", 206),
+        ("not-found", 404),
+        ("unsatisfiable", 416),
+        ("replace", 412),
+        ("missing-member", 206),
+        ("bad-crc", 206),
+    ],
+)
+async def test_bundled_member_errors_preserve_unavailable_result(
+    case: str,
+    wire_status: int,
+    storage_bodies: SimpleNamespace,
+    no_s3_credential_chain: None,
+    record_property: Callable[[str, object], None],
+) -> None:
+    archive = _archive_fixture(128 * 1024)
+    if case == "bad-crc":
+        altered = bytearray(archive.encoded)
+        altered[archive.payloads[_PNG_KEY][0] + 17] ^= 1
+        archive.encoded = bytes(altered)
+    replacement = _archive_fixture(128 * 1024, variant="replacement") if case == "replace" else None
+    if replacement is not None:
+        assert len(replacement.encoded) == len(archive.encoded) and replacement.encoded != archive.encoded
+    endpoint = _ArchiveEndpoint(archive, case, replacement=replacement)
+    artifact = _bundle_artifact("missing.txt" if case == "missing-member" else _PNG_KEY)
+    async with _local_s3(respond=endpoint.respond) as (url, _):
+        storage = _unsigned_archive_storage(url)
+        try:
+            async with asyncio.timeout(5):
+                assert await storage.retrieve_artifact(artifact) is None
+                if case == "ignored-range":
+                    await endpoint.finished.wait()
+                    assert endpoint.peer_closed
+        finally:
+            endpoint.release.set()
+        _assert_released(storage, storage_bodies.closes, sum(get.status in {200, 206} for get in endpoint.gets))
+
+    assert endpoint.head_count <= 1 and endpoint.head_count + len(endpoint.gets) <= 3
+    assert endpoint.gets[-1].status == wire_status
+    assert all(get.range_header and get.if_match == endpoint.etag for get in endpoint.gets)
+    if case in {"ignored-range", "wrong-range", "wrong-length", "wrong-etag"}:
+        assert not storage_bodies.reads
+    if case == "replace":
+        assert [get.status for get in endpoint.gets] == [206, 412]
+    record_property("wire", _archive_wire_receipt(endpoint, storage_bodies, case=case))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_kind", ["asyncio", "anyio-level", "queued", "isolation"])
+async def test_bundled_member_cancel_drains_reader_and_releases_body(
+    cancel_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+    storage_bodies: SimpleNamespace,
+    no_s3_credential_chain: None,
+    record_property: Callable[[str, object], None],
+) -> None:
+    archive = _archive_fixture(128 * 1024)
+    endpoint = _ArchiveEndpoint(archive, "pause")
+    extraction_closed = threading.Event()
+    host_thread = threading.get_ident()
+
+    class ObservedZipFile(zipfile.ZipFile):
+        def close(self) -> None:
+            was_open = self.fp is not None
+            super().close()
+            if was_open:
+                assert threading.get_ident() != host_thread
+                extraction_closed.set()
+
+    monkeypatch.setattr(s3_module.zipfile, "ZipFile", ObservedZipFile)
+    limiter = s3_module._archive_thread_limiter()
+    assert limiter.total_tokens == 40
+    monkeypatch.setattr(limiter, "total_tokens", 1)
+    if cancel_kind == "isolation":
+        monkeypatch.setattr(to_thread.current_default_thread_limiter(), "total_tokens", 1)
+    async with _local_s3(respond=endpoint.respond) as (url, _):
+        storage = _unsigned_archive_storage(url)
+        artifact = _bundle_artifact(_PNG_KEY)
+        if cancel_kind == "queued":
+            queued = asyncio.create_task(storage.retrieve_artifact(artifact))
+            try:
+                async with limiter:
+                    async with asyncio.timeout(5):
+                        while limiter.statistics().tasks_waiting == 0 and not queued.done():
+                            await asyncio.sleep(0.001)
+                    assert not queued.done()
+                    queued.cancel()
+                    done, _ = await asyncio.wait({queued}, timeout=1)
+                    assert queued in done, "queued cancellation did not finish with the archive limiter held"
+                    with pytest.raises(asyncio.CancelledError):
+                        await queued
+            finally:
+                endpoint.continue_prefix.set()
+                endpoint.release.set()
+                if not queued.done():
+                    queued.cancel()
+                await asyncio.gather(queued, return_exceptions=True)
+            assert not endpoint.gets and endpoint.head_count <= 1
+            assert not extraction_closed.is_set()
+            assert limiter.borrowed_tokens == limiter.statistics().tasks_waiting == 0
+            _assert_released(storage, storage_bodies.closes, 0)
+            record_property("wire", _archive_wire_receipt(endpoint, storage_bodies, cancelled_while_queued=True))
+            return
+
+        scope = CancelScope()
+
+        async def scoped_read() -> None:
+            with scope:
+                await storage.retrieve_artifact(artifact)
+            assert scope.cancelled_caught
+
+        task = asyncio.create_task(
+            scoped_read() if cancel_kind == "anyio-level" else storage.retrieve_artifact(artifact)
+        )
+        unrelated = None
+        try:
+            async with asyncio.timeout(5):
+                await endpoint.paused.wait()
+                content_range = endpoint.paused_range
+                assert content_range is not None
+                for prefix in (_PAUSED_PREFIX_BYTES // 2, _PAUSED_PREFIX_BYTES):
+                    while sum(storage_bodies.by_content_range.get(content_range, ())) < prefix:
+                        await asyncio.sleep(0.001)
+                    endpoint.continue_prefix.set()
+            chunks = storage_bodies.by_content_range[content_range]
+            assert sum(chunks) == _PAUSED_PREFIX_BYTES and len(chunks) >= 2
+            if cancel_kind == "isolation":
+                unrelated = asyncio.create_task(to_thread.run_sync(threading.get_ident))
+                done, _ = await asyncio.wait({unrelated}, timeout=1)
+                assert unrelated in done, "unrelated sync work blocked behind the paused archive read"
+                assert await unrelated != host_thread
+            assert limiter.borrowed_tokens == 1
+            ticker = []
+            for _ in range(5):
+                await asyncio.sleep(0.002)
+                assert not task.done()
+                ticker.append(time.monotonic())
+            cancelled = time.monotonic()
+            if cancel_kind == "anyio-level":
+                scope.cancel()
+            else:
+                task.cancel()
+                await asyncio.sleep(0)
+                task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=1)
+            assert task in done, "active cancellation did not finish while the payload was paused"
+            if cancel_kind == "anyio-level":
+                await task
+            else:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            cancel_to_join_ms = (time.monotonic() - cancelled) * 1000
+            assert extraction_closed.is_set() and limiter.borrowed_tokens == 0
+            _assert_released(storage, storage_bodies.closes, len(endpoint.gets))
+            async with asyncio.timeout(2):
+                await endpoint.finished.wait()
+        finally:
+            endpoint.continue_prefix.set()
+            endpoint.release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            if unrelated is not None:
+                await asyncio.gather(unrelated, return_exceptions=True)
+
+    assert endpoint.peer_closed
+    assert endpoint.gets[-1].written == _PAUSED_PREFIX_BYTES
+    record_property(
+        "wire",
+        _archive_wire_receipt(
+            endpoint,
+            storage_bodies,
+            ticker_count=len(ticker),
+            ticker_observed_ms=(ticker[-1] - ticker[0]) * 1000,
+            cancel_to_join_ms=cancel_to_join_ms,
+            paused_body_chunk_sizes=chunks,
+            peer_closed=endpoint.peer_closed,
+            parser_closed=extraction_closed.is_set(),
+            unrelated_sync_completed=unrelated is not None,
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -1307,7 +1835,6 @@ async def test_browser_profile_exists_propagates_non_not_found_errors() -> None:
     # Regression: a confirmed not-found returns False, but transient/authz errors must PROPAGATE (not
     # swallow to False) so _managed_browser_profile_has_content's fail-safe treats a flaky read as
     # existing content instead of reseeding a run to fresh and overwriting its saved archive.
-    from botocore.exceptions import ClientError
 
     storage = S3Storage()
     storage.async_client = MagicMock()
@@ -1324,62 +1851,312 @@ async def test_browser_profile_exists_propagates_non_not_found_errors() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "named",
+        "strict",
+        "403",
+        "404",
+        "5xx-probe",
+        "timeout",
+        "decrypt",
+        "extract",
+        "valid",
+        "recheck",
+        "legacy-missing",
+        "legacy-500",
+        "legacy-invalid",
+        "cancel",
+    ],
+)
 async def test_retrieve_browser_profile_extracts_sub_buffer_size_archive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
     # Regression: the archive used to be closed only AFTER unzipping, so anything smaller than the io
     # buffer (~8KB) — a cookie-only first bank — was still unflushed and ZipFile hit an empty file.
     zip_bytes = _build_zip({".skyvern_banked_cookies.json": b'[{"name":"session"}]'})
     assert len(zip_bytes) < 1024
 
-    storage = S3Storage()
-    storage.async_client = MagicMock()
-    storage.async_client.download_file = AsyncMock(return_value=zip_bytes)
+    storage, transport = S3Storage(), ProfileTransport()
+    legacy, sealed = storage._profile_uris("o", "bp") if case == "named" else storage._workflow_session_uris("o", "wp")
+    install_s3_profile_transport(storage, transport, monkeypatch)
+    temp = tmp_path / "runtime"
+    monkeypatch.setattr(settings, "TEMP_PATH", str(temp))
+    if case != "legacy-missing":
+        transport.objects[legacy] = b"not a zip" if case == "legacy-invalid" else zip_bytes
+    if case in {"timeout", "decrypt"}:
+        transport.objects[sealed] = b"invalid sealed bytes"
+    if case in {"extract", "valid", "recheck"}:
+        monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", (artifact_root(),))
+        plaintext, ciphertext = tmp_path / "fixture.zip", tmp_path / "fixture.enc"
+        plaintext.write_bytes(
+            b"invalid ZIP" if case == "extract" else _build_zip({".skyvern_banked_cookies.json": b"seal"})
+        )
+        encrypt_file(
+            plaintext, ciphertext, organization_id="o", purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE, object_id="wp"
+        )
+        if case != "recheck":
+            transport.objects[sealed] = ciphertext.read_bytes()
 
-    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
-    profile_dir = await storage.retrieve_browser_profile("o", "bp")
+    async def download(uri: str, **kwargs: object) -> bytes | None:
+        if uri == legacy:
+            if case == "legacy-500":
+                raise ClientError({"Error": {"Code": "InternalError"}}, "GetObject")
+            if case == "recheck":
+                transport.objects[sealed] = ciphertext.read_bytes()
+        else:
+            if case in {"403", "strict", "legacy-missing", "legacy-500", "legacy-invalid"} or (
+                case == "recheck" and sealed not in transport.objects
+            ):
+                raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+            if case == "404":
+                raise ClientError({"Error": {"Code": "404"}}, "GetObject")
+            if case == "5xx-probe":
+                raise ClientError(
+                    {"Error": {"Code": "InternalError"}, "ResponseMetadata": {"HTTPStatusCode": 503}}, "GetObject"
+                )
+            if case == "timeout":
+                raise TimeoutError()
+            if case == "cancel":
+                raise asyncio.CancelledError()
+        return await read(uri, **kwargs)
+
+    async def fail_probe(_: str) -> None:
+        raise OSError("metadata unavailable")
+
+    read = transport.download_file
+    monkeypatch.setattr(transport, "download_file", download)
+    if case == "5xx-probe":
+        monkeypatch.setattr(transport, "get_object_info", fail_probe)
+    if case == "strict":
+        with pytest.raises(ClientError, match="AccessDenied"):
+            await storage.retrieve_browser_session_snapshot("o", "wp")
+        assert not temp.exists()
+        return
+    if case in {"cancel", "legacy-invalid"}:
+        with pytest.raises(asyncio.CancelledError if case == "cancel" else zipfile.BadZipFile):
+            await storage.retrieve_browser_session_snapshot("o", "wp", allow_sealed_fallback=True)
+        if case == "cancel":
+            assert not temp.exists()
+        return
+
+    protected = case in {"valid", "recheck"}
+    if case == "named":
+        profile_dir = await storage.retrieve_browser_profile("o", "bp")
+    else:
+        snapshot = await storage.retrieve_browser_session_snapshot("o", "wp", allow_sealed_fallback=True)
+        if case in {"legacy-missing", "legacy-500"}:
+            assert snapshot is None
+            return
+        assert snapshot is not None and snapshot.encrypted is protected
+        assert snapshot.version == str(ProfileTransport._version(transport.objects[sealed if protected else legacy]))
+        profile_dir = snapshot.directory
 
     assert profile_dir is not None
-    assert (Path(profile_dir) / ".skyvern_banked_cookies.json").read_bytes() == b'[{"name":"session"}]'
+    assert (Path(profile_dir) / ".skyvern_banked_cookies.json").read_bytes() == (
+        b"seal" if protected else b'[{"name":"session"}]'
+    )
     # The extraction directory must be the ONLY thing left in TEMP_PATH — the downloaded archive is
     # written there under a suffixless temp name, so a leak would show up as a second entry.
-    assert [entry.name for entry in tmp_path.iterdir()] == [Path(profile_dir).name]
+    assert [entry.name for entry in temp.iterdir()] == [Path(profile_dir).name]
 
 
 _EXTENSION_ID = "a" * 32
 _RULESET_BYTES = 4096
+_COOKIES_MEMBER = "Default/Network/Cookies"
+
+
+def _profile_archive_cases() -> list:
+    capture_cases = [
+        pytest.param(_COOKIES_MEMBER, False, None, None, id="readable"),
+        pytest.param(_COOKIES_MEMBER, False, "listing", errno.EACCES, id="listing"),
+        pytest.param(_COOKIES_MEMBER, False, errno.EACCES, errno.EACCES, id="stat-permission"),
+        pytest.param(_COOKIES_MEMBER, False, errno.EIO, errno.EIO, id="stat-io"),
+        pytest.param(_COOKIES_MEMBER, False, errno.ENOENT, errno.ENOENT, id="missing-cookies"),
+        pytest.param("SingletonLock", True, None, None, id="root-lock"),
+        pytest.param("SingletonCookie", True, None, None, id="root-cookie"),
+        pytest.param("SingletonSocket", True, None, None, id="root-socket"),
+        pytest.param("RunningChromeVersion", True, None, None, id="root-running-version"),
+        pytest.param("Default/Network/SingletonLock", True, None, None, id="nested-lock"),
+        pytest.param("UnrecognizedLink", True, None, None, id="unrecognized-link"),
+        pytest.param("SingletonLock", False, None, None, id="regular-lock"),
+        pytest.param("SingletonLock", False, errno.ENOENT, errno.ENOENT, id="regular-lock-enoent"),
+        pytest.param("SingletonLock", True, errno.EACCES, errno.EACCES, id="root-link-permission"),
+        pytest.param("SingletonLock", True, errno.EIO, errno.EIO, id="root-link-io"),
+    ]
+    cases = [
+        pytest.param(confirm, *case.values, backend, None, id=f"{case.id}-{confirm}-{backend}")
+        for backend in ("s3", "azure", "gcs")
+        for case in capture_cases
+        for confirm in (False, True)
+        if backend == "s3" or case.id == "listing"
+    ]
+    common = (
+        "legacy",
+        "legacy-read-migrates",
+        "encrypted",
+        "workflow-session",
+        "failed-upload",
+        "cancelled-upload",
+        "sealed-get-confirm-both",
+        "post-stat-unknown",
+    )
+    shared_faults = (
+        "sealed-get-absent",
+        "sealed-get-present",
+        "sealed-get-unknown",
+        "sealed-get-forbidden",
+        "sealed-get-recheck-forbidden",
+        "sealed-get-recheck-unknown",
+        "post-stat-absent",
+        "post-stat-competing",
+    )
+    transport_faults = {
+        "s3": {
+            "endpoint": ("sealed-get-absent", "sealed-get-stat-forbidden", "post-stat-forbidden"),
+            "connect-timeout": ("sealed-get-present", "post-stat-absent"),
+        },
+        "gcs": {
+            "connection": ("sealed-get-absent", "post-stat-absent"),
+            "read-timeout": ("sealed-get-present", "post-stat-unknown"),
+            "retry-connect": ("sealed-get-absent", "post-stat-absent"),
+            "certificate": ("sealed-get-unclassified", "post-stat-unclassified"),
+            "retry-denied": ("sealed-get-unclassified", "post-stat-unclassified"),
+            "retry-unknown": ("sealed-get-unclassified", "post-stat-unclassified"),
+        },
+    }
+    for backend in ("s3", "azure", "gcs"):
+        scenarios = [(scenario, "") for scenario in (common + (shared_faults if backend == "s3" else ()))]
+        scenarios.extend(
+            (scenario, f":{transport}")
+            for transport, faults in transport_faults.get(backend, {}).items()
+            for scenario in faults
+        )
+        cases.extend(
+            pytest.param(
+                False,
+                _COOKIES_MEMBER,
+                False,
+                None,
+                None,
+                backend,
+                f"{scenario}{transport}",
+                id=f"{scenario}-{backend}{transport.replace(':', '-')}",
+            )
+            for scenario, transport in scenarios
+        )
+    return cases
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("confirm_creation", "member", "dangling", "fault", "strict_error", "backend", "scenario"),
+    _profile_archive_cases(),
+)
 async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_the_archive(
-    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    s3_storage: S3Storage,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    confirm_creation: bool,
+    member: str,
+    dangling: bool,
+    fault: str | int | None,
+    strict_error: int | None,
+    backend: str,
+    scenario: str | None,
 ) -> None:
     # Each run loads its extensions from a new path, so Chrome indexes a fresh DNR ruleset under a new extension
     # id and never prunes the old ones; archiving them grew one profile to 2.7 GiB extracted.
     profile = tmp_path / "profile"
-    (profile / "Default" / "Network").mkdir(parents=True)
-    (profile / "Default" / "Network" / "Cookies").write_bytes(b"cookies")
+    network = profile / "Default" / "Network"
+    network.mkdir(parents=True)
+    cookies = network / "Cookies"
+    cookies.write_bytes(b"cookies")
+    entry = profile / member
+    if dangling:
+        entry.symlink_to("nonexistent-runtime-target")
+    elif entry != cookies:
+        entry.write_bytes(b"regular file")
+    (profile / "Local State").write_bytes(b"state")
     settings_dir = profile / "Default" / "Local Extension Settings" / _EXTENSION_ID
     settings_dir.mkdir(parents=True)
     (settings_dir / "000003.log").write_bytes(b"settings")
     rules_dir = profile / "Default" / "DNR Extension Rules" / _EXTENSION_ID
     rules_dir.mkdir(parents=True)
     (rules_dir / "ruleset.bin").write_bytes(b"r" * _RULESET_BYTES)
-    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
+    if fault == "listing":
+        scandir = os.scandir
 
-    archived: list[str] = []
+        def scan_directory(path: str) -> os.ScandirIterator[str]:
+            if path == str(network):
+                raise PermissionError(errno.EACCES, "synthetic unreadable profile directory", path)
+            return scandir(path)
+
+        monkeypatch.setattr(os, "scandir", scan_directory)
+    elif isinstance(fault, int):
+        real_stat = os.stat
+
+        def stat_entry(path: str, *, dir_fd: int | None = None, follow_symlinks: bool = True) -> os.stat_result:
+            if path == str(entry):
+                if fault == errno.ENOENT and entry == cookies:
+                    cookies.unlink(missing_ok=True)
+                else:
+                    raise OSError(fault, "synthetic profile stat fault", path)
+            return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(os, "stat", stat_entry)
+
+    temp = tmp_path / "temp"
+    monkeypatch.setattr(settings, "TEMP_PATH", str(temp))
+    monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", (artifact_root(),))
+    monkeypatch.setattr(settings, "AWS_S3_BUCKET_BROWSER_SESSIONS", TEST_BUCKET)
+    monkeypatch.setattr(settings, "AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS", "test-container")
+    monkeypatch.setattr(settings, "GCS_BUCKET_BROWSER_SESSIONS", TEST_BUCKET)
+    monkeypatch.setattr(settings, "ENABLE_ENCRYPTION", True)
+    assert type(settings).model_fields["SKYVERN_ENCRYPT_BROWSER_PROFILES"].default is False
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
+    storage = {
+        "s3": lambda: s3_storage,
+        "azure": lambda: AzureStorage(account_name="teststorage", account_key="synthetic-test-key"),
+        "gcs": GcsStorage,
+    }[backend]()
+    fake = ProfileTransport()
+    if isinstance(storage, S3Storage):
+        install_s3_profile_transport(storage, fake, monkeypatch)
+    else:
+        monkeypatch.setattr(storage, "async_client", fake)
+
+    upload = storage.async_client.upload_file_from_path
+    uploads: list[str] = []
+    archived: dict[str, bytes] = {}
 
     async def capture_upload(uri: str, path: str, **kwargs: object) -> None:
+        uploads.append(uri)
+        if confirm_creation and backend == "s3" and not kwargs.get("raise_exception"):
+            return
         with zipfile.ZipFile(path) as archive:
-            archived.extend(archive.namelist())
+            archived.update({name: archive.read(name) for name in archive.namelist()})
+        await upload(uri, path, **kwargs)
 
-    s3_storage.async_client = MagicMock()
-    s3_storage.async_client.upload_file_from_path = AsyncMock(side_effect=capture_upload)
+    monkeypatch.setattr(storage.async_client, "upload_file_from_path", capture_upload)
+
+    if confirm_creation and strict_error is not None:
+        with pytest.raises(OSError) as error:
+            await storage.store_browser_profile("o", "bp", str(profile), confirm_creation=True)
+        assert error.value.errno == strict_error
+        assert not uploads
+        assert not list((tmp_path / "temp").glob("*.zip"))
+        return
 
     with capture_logs() as events:
-        await s3_storage.store_browser_profile("o", "bp", str(profile))
+        await storage.store_browser_profile(
+            "o", "bp", str(profile), **({"confirm_creation": True} if confirm_creation else {})
+        )
 
-    assert "Default/Network/Cookies" in archived
+    assert "Local State" in archived
+    assert (member in archived) is (not dangling and fault is None)
+    assert archived.get(_COOKIES_MEMBER) == (None if member == _COOKIES_MEMBER and fault is not None else b"cookies")
     assert f"Default/Local Extension Settings/{_EXTENSION_ID}/000003.log" in archived
     assert not [name for name in archived if "DNR Extension Rules" in name]
     # The run's live profile directory is left alone: Chrome may still be using it mid-run.
@@ -1387,7 +2164,248 @@ async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_t
     archived_event = next(event for event in events if event["event"] == "Archived browser profile")
     assert archived_event["excluded_bytes"] == _RULESET_BYTES
     assert archived_event["zip_bytes"] > 0
-    assert not list((tmp_path / "temp").glob("*.zip"))
+    assert not list(temp.glob("*.zip"))
+    if scenario is None:
+        return
+
+    monkeypatch.setattr(storage.async_client, "upload_file_from_path", upload)
+    legacy_uri, legacy = next(iter(fake.objects.items()))
+    assert legacy_uri.endswith("/o/profiles/bp.zip")
+    assert await storage.browser_profile_exists("o", "bp")
+    original_stat = fake.get_object_info
+
+    async def no_metadata(uri: str) -> dict | None:
+        raise AssertionError("Legacy Azure/GCS freshness must not call metadata")
+
+    if backend != "s3":
+        monkeypatch.setattr(fake, "get_object_info", no_metadata)
+    legacy_etag = await storage.get_browser_profile_etag("o", "bp")
+    if backend != "s3":
+        assert legacy_etag is None
+        monkeypatch.setattr(fake, "get_object_info", original_stat)
+    reopened = await storage.retrieve_browser_profile_snapshot("o", "bp", copy=True)
+    assert reopened is not None and not reopened.encrypted
+    assert (Path(reopened.directory) / cookies.relative_to(profile)).read_bytes() == b"cookies"
+    if backend == "s3":
+        assert fake.upload_policies[-1]["StorageClass"] == str(S3StorageClass.ONEZONE_IA)
+    if scenario == "legacy":
+        assert reopened.version is not None
+        assert await storage.get_browser_profile_etag("o", "bp", encrypted=reopened.encrypted) == reopened.version
+        cookies.write_bytes(b"updated legacy profile")
+        await storage.store_browser_profile("o", "bp", str(profile))
+        current = await storage.get_browser_profile_etag("o", "bp", encrypted=reopened.encrypted)
+        assert current is not None and current != reopened.version
+        return
+
+    if scenario == "workflow-session":
+        await storage.store_browser_session("o", "wpid_test", str(profile))
+        archive = next(uri for uri in fake.objects if uri.endswith("/o/wpid_test.zip"))
+        snapshot = await storage.retrieve_browser_session_snapshot("o", "wpid_test")
+        assert snapshot and not snapshot.encrypted
+        await storage.store_browser_session("o", "wpid_test", snapshot.directory, require_encryption=True)
+        assert archive not in fake.objects and fake.objects[archive + ".enc"].startswith(FILE_MAGIC)
+        snapshot = await storage.retrieve_browser_session_snapshot("o", "wpid_test")
+        assert snapshot and snapshot.encrypted
+        assert (Path(snapshot.directory) / _COOKIES_MEMBER).read_bytes() == b"cookies"
+        await storage.delete_browser_session("o", "wpid_test")
+        assert fake.objects.keys() == {legacy_uri}
+        assert await storage.retrieve_browser_session_snapshot("o", "wpid_test") is None
+        return
+
+    sealed_uri = f"{legacy_uri}.enc"
+    if scenario == "legacy-read-migrates":
+        legacy_downloaded = asyncio.Event()
+        resume_download = asyncio.Event()
+        download = fake.download_file
+
+        async def migrating_download(uri: str, **kwargs: object) -> bytes | None:
+            data = await download(uri, **kwargs)
+            if uri == legacy_uri:
+                assert data == legacy
+                legacy_downloaded.set()
+                await resume_download.wait()
+            return data
+
+        monkeypatch.setattr(fake, "download_file", migrating_download)
+        reader = asyncio.create_task(storage.retrieve_browser_profile_snapshot("o", "bp"))
+        try:
+            await asyncio.wait_for(legacy_downloaded.wait(), 5)
+            cookies.write_bytes(b"newer sealed cookies")
+            await storage.store_browser_profile("o", "bp", str(profile), require_encryption=True)
+            assert set(fake.objects) == {sealed_uri}
+            assert fake.objects[sealed_uri].startswith(FILE_MAGIC)
+        finally:
+            resume_download.set()
+            snapshot = await reader
+        assert snapshot and snapshot.encrypted
+        assert snapshot.version == await storage.get_browser_profile_etag("o", "bp", encrypted=True)
+        assert (Path(snapshot.directory) / _COOKIES_MEMBER).read_bytes() == b"newer sealed cookies"
+        return
+
+    scenario, _, sdk_error = scenario.partition(":")
+    endpoint = "https://storage.example.invalid"
+    failures = {
+        "endpoint": EndpointConnectionError(endpoint_url=endpoint),
+        "connect-timeout": ConnectTimeoutError(endpoint_url=endpoint),
+        "connection": RequestsConnectionError("connection lost"),
+        "read-timeout": ReadTimeout("body timed out"),
+        "retry-connect": RetryError("retry exhausted", Urllib3ConnectTimeoutError("connect timed out")),
+        "certificate": SSLError("invalid certificate"),
+        "retry-denied": RetryError("retry exhausted", Forbidden("denied")),
+        "retry-unknown": RetryError("retry exhausted", ValueError("unknown")),
+    }
+
+    def transport_error(message: str) -> Exception:
+        return failures.get(sdk_error, TimeoutError(message))
+
+    if scenario.startswith("sealed-get-"):
+        download = fake.download_file
+        legacy_read = False
+        confirmations = 0
+
+        async def flaky_download(uri: str, **kwargs: object) -> bytes | None:
+            nonlocal legacy_read
+            if uri != sealed_uri:
+                legacy_read = True
+                return await download(uri, **kwargs)
+            if (scenario == "sealed-get-absent" and legacy_read) or (
+                scenario.startswith("sealed-get-recheck-") and not legacy_read
+            ):
+                return await download(uri, **kwargs)
+            if scenario in {"sealed-get-forbidden", "sealed-get-recheck-forbidden"}:
+                raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+            raise transport_error("sealed GET failed")
+
+        async def status(uri: str) -> dict | None:
+            nonlocal confirmations
+            confirmations += 1
+            assert uri == sealed_uri and scenario != "sealed-get-unclassified"
+            if scenario in {"sealed-get-unknown", "sealed-get-recheck-unknown"}:
+                raise TimeoutError("sealed status unavailable")
+            if scenario == "sealed-get-stat-forbidden":
+                raise ClientError({"Error": {"Code": "AccessDenied"}}, "HeadObject")
+            return {"ETag": "exists"} if scenario == "sealed-get-present" else None
+
+        monkeypatch.setattr(fake, "download_file", flaky_download)
+        monkeypatch.setattr(fake, "get_object_info", status)
+        if scenario in {"sealed-get-absent", "sealed-get-confirm-both"}:
+            recovered = await storage.retrieve_browser_profile_snapshot("o", "bp")
+            assert recovered and not recovered.encrypted
+            assert (Path(recovered.directory) / _COOKIES_MEMBER).read_bytes() == b"cookies"
+        else:
+            expected_error = {
+                "sealed-get-forbidden": ClientError,
+                "sealed-get-recheck-forbidden": ClientError,
+                "sealed-get-stat-forbidden": ClientError,
+                "sealed-get-present": type(transport_error("GET")),
+                "sealed-get-unclassified": type(transport_error("GET")),
+                "sealed-get-unknown": TimeoutError,
+                "sealed-get-recheck-unknown": TimeoutError,
+            }[scenario]
+            with pytest.raises(expected_error):
+                await storage.retrieve_browser_profile_snapshot("o", "bp")
+        if scenario == "sealed-get-confirm-both":
+            assert confirmations == 2
+        elif scenario.endswith(("get-forbidden", "recheck-forbidden", "unclassified")):
+            assert confirmations == 0
+        else:
+            assert confirmations == 1
+        assert fake.objects == {legacy_uri: legacy}
+        return
+
+    if scenario.startswith("post-stat-"):
+        stat_attempts = 0
+        uploads_before = len(fake.paths)
+
+        async def status(uri: str) -> dict | None:
+            nonlocal stat_attempts
+            assert uri == sealed_uri  # Plaintext stores may not fetch the legacy header.
+            stat_attempts += 1
+            if stat_attempts == 1:
+                return None
+            assert len(fake.paths) == uploads_before + 1
+            if stat_attempts == 2 or scenario == "post-stat-unknown":
+                raise transport_error("sealed metadata unavailable")
+            if scenario in {"post-stat-competing", "post-stat-forbidden"}:
+                fake.objects[sealed_uri] = b"concurrent seal"
+                if scenario == "post-stat-forbidden":
+                    raise ClientError({"Error": {"Code": "AccessDenied"}}, "HeadObject")
+                return {"ETag": "concurrent"}
+            return None
+
+        async def unexpected_download(uri: str, **kwargs: object) -> None:
+            raise AssertionError("Profile publication must not download the legacy header")
+
+        monkeypatch.setattr(fake, "download_file", unexpected_download)
+        monkeypatch.setattr(fake, "get_object_info", status)
+        if scenario == "post-stat-absent":
+            await storage.store_browser_profile("o", "bp", str(profile))
+            assert fake.objects.keys() == {legacy_uri}
+        else:
+            with pytest.raises(ProfilePublicationConflict):
+                await storage.store_browser_profile("o", "bp", str(profile))
+            if scenario == "post-stat-competing":
+                assert fake.objects == {sealed_uri: b"concurrent seal"}
+            else:
+                with zipfile.ZipFile(io.BytesIO(fake.objects[legacy_uri])) as saved:
+                    assert saved.read(_COOKIES_MEMBER) == b"cookies"
+                assert set(fake.objects) == (
+                    {legacy_uri, sealed_uri} if scenario == "post-stat-forbidden" else {legacy_uri}
+                )
+        assert stat_attempts == (2 if scenario == "post-stat-unclassified" else 3)
+        assert not fake.paths[-1].exists()
+        return
+
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", True)
+    await storage.store_browser_profile("o", "bp", str(profile))
+    seal = fake.objects[sealed_uri]
+    assert seal.startswith(FILE_MAGIC) and not zipfile.is_zipfile(io.BytesIO(seal))
+    assert set(fake.objects) == {sealed_uri}
+    assert await storage.get_browser_profile_etag("o", "bp") != legacy_etag
+
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
+    reopened = await storage.retrieve_browser_profile_snapshot("o", "bp")
+    assert reopened is not None and reopened.encrypted
+    assert await storage.get_browser_profile_etag("o", "bp", encrypted=True) is not None
+    assert (Path(reopened.directory) / cookies.relative_to(profile)).read_bytes() == b"cookies"
+    cookies.write_bytes(b"rotated-cookie-state")
+
+    if scenario == "failed-upload":
+        fake.error = OSError("upload failed")
+        with pytest.raises(OSError, match="upload failed"):
+            await storage.store_browser_profile("o", "bp", str(profile))
+        assert fake.objects == {sealed_uri: seal}
+    elif scenario == "cancelled-upload":
+        fake.pause_upload = True
+        fake.upload_started.clear()
+        task = asyncio.create_task(storage.store_browser_profile("o", "bp", str(profile)))
+        try:
+            await asyncio.wait_for(fake.upload_started.wait(), 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert fake.paths[-1].is_file()
+            assert not task.done()
+        finally:
+            fake.upload_released.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        updated = await storage.retrieve_browser_profile("o", "bp")
+        assert updated is not None
+        assert (Path(updated) / cookies.relative_to(profile)).read_bytes() == b"rotated-cookie-state"
+    else:
+        await storage.store_browser_profile("o", "bp", str(profile))
+        assert set(fake.objects) == {sealed_uri}
+        assert fake.objects[sealed_uri].startswith(FILE_MAGIC)
+        assert fake.objects[sealed_uri] != seal
+        fake.objects[sealed_uri] = fake.objects[sealed_uri][:-1]
+        fake.objects[legacy_uri] = legacy
+        with pytest.raises(ArtifactDecryptionError):
+            await storage.retrieve_browser_profile("o", "bp")
+        await storage.delete_browser_profile("o", "bp", hard_delete=True)
+        assert not fake.objects
+
+    assert all(not path.exists() for path in fake.paths)
+    assert not list(temp.glob("skyvern_profile_archive_*"))
 
 
 @pytest.mark.asyncio
@@ -1405,7 +2423,9 @@ async def test_retrieve_browser_profile_skips_regenerated_extension_rules_alread
     )
     storage = S3Storage()
     storage.async_client = MagicMock()
-    storage.async_client.download_file = AsyncMock(return_value=zip_bytes)
+    storage.async_client.download_file = AsyncMock(
+        side_effect=lambda uri, **_: None if uri.endswith(".enc") else zip_bytes
+    )
     monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
 
     with capture_logs() as events:
@@ -1430,11 +2450,9 @@ async def test_delete_browser_profile_hard_raises_soft_swallows() -> None:
     storage.async_client.delete_file = AsyncMock(side_effect=RuntimeError("s3 down"))
     with pytest.raises(RuntimeError):
         await storage.delete_browser_profile("o", "bp", hard_delete=True)
-    assert storage.async_client.delete_file.await_args.kwargs["raise_on_error"] is True
 
-    storage.async_client.delete_file = AsyncMock()
+    storage.async_client.delete_file = AsyncMock(side_effect=RuntimeError("s3 down"))
     await storage.delete_browser_profile("o", "bp", hard_delete=False)
-    assert storage.async_client.delete_file.await_args.kwargs["raise_on_error"] is False
 
 
 def _share_artifact(artifact_type: ArtifactType, uri: str) -> Artifact:

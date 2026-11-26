@@ -23,15 +23,15 @@ export type EmberAttention =
 export const EMBER_ATTENTION_LABEL: Record<EmberAttention, string> = {
   question: "waiting for your answer",
   credential: "needs to sign in",
-  account: "needs a Google account",
+  account: "needs an account",
   demonstration: "waiting for your demonstration",
 };
 
 export const EMBER_ATTENTION_DOT: Record<EmberAttention, string> = {
-  question: "Copilot needs your answer",
-  credential: "Copilot needs to sign in",
-  account: "Copilot needs a Google account",
-  demonstration: "Copilot is watching your demonstration",
+  question: "Ember needs your answer",
+  credential: "Ember needs to sign in",
+  account: "Ember needs an account",
+  demonstration: "Ember is watching your demonstration",
 };
 
 /**

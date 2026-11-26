@@ -15,6 +15,7 @@ from skyvern.exceptions import (
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
+from skyvern.forge.sdk.core import aiohttp_helper
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
@@ -37,6 +38,7 @@ from skyvern.services.webhook_service import (
 from skyvern.utils.url_validators import pinned_ip_client, validate_fetch_url_with_resolved_ips
 
 LOG = structlog.get_logger()
+WEBHOOK_TEST_RESPONSE_LIMIT_BYTES = 2 * 1024
 
 
 @legacy_base_router.post(
@@ -137,20 +139,23 @@ async def test_webhook(
 
     try:
         async with pinned_ip_client(resolved_ips) as client:
-            response = await client.post(
+            request_headers = {
+                name: value for name, value in signed_data.headers.items() if name.lower() != "accept-encoding"
+            }
+            request_headers["Accept-Encoding"] = "gzip, deflate"
+            async with client.stream(
+                "POST",
                 validated_url,
                 content=signed_data.signed_payload,
-                headers=signed_data.headers,
+                headers=request_headers,
                 timeout=httpx.Timeout(60.0),
-            )
-            status_code = response.status_code
-
-            # Capture first 2KB of response body
-            response_text = response.text
-            if len(response_text) > 2048:
-                response_body = response_text[:2048] + "\n... (truncated)"
-            else:
-                response_body = response_text
+            ) as response:
+                status_code = response.status_code
+                body, truncated = await aiohttp_helper.read_httpx_response_body_limited(
+                    response, WEBHOOK_TEST_RESPONSE_LIMIT_BYTES
+                )
+                response_text = aiohttp_helper.buffered_httpx_response(response, body).text
+                response_body = response_text + ("\n... (truncated)" if truncated else "")
 
     except httpx.TimeoutException:
         error = "Request timed out after 60 seconds."

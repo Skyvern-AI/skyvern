@@ -23,6 +23,7 @@ export interface FileUploadBlock {
     azure_blob_container_name?: string;
     google_credential_id?: string;
     google_drive_folder_id?: string;
+    google_drive_save_as_sheet?: boolean;
     sftp_host?: string;
     sftp_port?: number;
     sftp_username?: string;

@@ -20,7 +20,7 @@ from skyvern.utils.secret_redaction import collect_secret_values_at_any_length
 LOG = structlog.get_logger()
 
 _CACHE_TTL_SECONDS = 600
-_CACHE_PREFIX = "copilot:origin-run-runtime-secrets:v1"
+EMBER_RUNTIME_SECRET_CACHE_PREFIX = "copilot:origin-run-runtime-secrets:v1"
 _ENCRYPTED_PREFIX = "aes:"
 _LOCAL_PREFIX = "local:"
 _CLEAR_SENTINEL = "cleared"
@@ -38,7 +38,7 @@ _LOCAL_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], _LocalLockEntry] = {}
 
 
 def _cache_key(organization_id: str, workflow_run_id: str) -> str:
-    return f"{_CACHE_PREFIX}:{organization_id}:{workflow_run_id}"
+    return f"{EMBER_RUNTIME_SECRET_CACHE_PREFIX}:{organization_id}:{workflow_run_id}"
 
 
 @asynccontextmanager
@@ -56,7 +56,7 @@ async def _consume_lock(key: str) -> AsyncIterator[None]:
             _LOCAL_LOCKS.pop(local_key, None)
 
 
-async def publish_copilot_runtime_secret_values(
+async def publish_ember_runtime_secret_values(
     *,
     organization_id: str,
     workflow_run_id: str,
@@ -89,7 +89,7 @@ async def publish_copilot_runtime_secret_values(
         await app.CACHE.set(_cache_key(organization_id, workflow_run_id), stored, ex=_CACHE_TTL_SECONDS)
     except Exception:
         LOG.warning(
-            "Copilot origin-run runtime secrets could not be handed off",
+            "Ember origin-run runtime secrets could not be handed off",
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
             exc_info=True,
@@ -98,7 +98,7 @@ async def publish_copilot_runtime_secret_values(
     return True
 
 
-async def consume_copilot_runtime_secret_values(
+async def consume_ember_runtime_secret_values(
     *,
     organization_id: str,
     workflow_run_id: str,
@@ -135,7 +135,7 @@ async def consume_copilot_runtime_secret_values(
             return set(decoded["values"])
     except Exception:
         LOG.warning(
-            "Copilot origin-run runtime secret handoff could not be consumed",
+            "Ember origin-run runtime secret handoff could not be consumed",
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
             exc_info=True,

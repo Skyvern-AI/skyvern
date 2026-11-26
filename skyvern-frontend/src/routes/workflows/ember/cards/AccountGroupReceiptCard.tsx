@@ -1,9 +1,5 @@
 import { QuestionMarkCircledIcon } from "@radix-ui/react-icons";
-import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
-import { isAxiosError } from "axios";
-import { getClient } from "@/api/AxiosClient";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
 import type {
   AccountGroupCancelReview,
@@ -16,42 +12,14 @@ import { runIsLogicallyFinal } from "../../workflowRun/runRetryState";
 import { RunCostFactList } from "./AccountGroupReviewCard";
 import { AttentionMarker } from "./AttentionTray";
 import { TONE_CLASSES, type Tone } from "./receiptTone";
-
-const POLL_MS = 5000;
-
-type GroupStatus = "active" | "cancel_requested" | "finished";
-
-interface GroupItem {
-  key: string;
-  workflow_run_id: string;
-  run_status: string | null;
-  outcome: AccountGroupOutcome;
-}
-
-interface Group {
-  status: GroupStatus;
-  items: GroupItem[];
-}
-
-const OUTCOME_LABEL: Record<AccountGroupOutcome, string> = {
-  pending: "Waiting",
-  in_progress: "Running",
-  completed: "Completed",
-  failed: "Failed before acting",
-  unknown: "Unknown, may have acted",
-  canceled: "Canceled",
-};
-
-const OUTCOME_CLASS: Partial<Record<AccountGroupOutcome, string>> = {
-  failed: "text-rose-700 dark:text-rose-300",
-  unknown: "text-amber-700 dark:text-yellow-400",
-};
-
-const STATUS_LABEL: Record<GroupStatus, string> = {
-  active: "running",
-  cancel_requested: "stopping",
-  finished: "finished",
-};
+import {
+  OUTCOME_CLASS,
+  OUTCOME_LABEL,
+  STATUS_LABEL,
+  plural,
+  useGroup,
+  type Group,
+} from "./runGroup";
 
 const COUNTED_OUTCOMES: [AccountGroupOutcome, string][] = [
   ["completed", "completed"],
@@ -60,42 +28,12 @@ const COUNTED_OUTCOMES: [AccountGroupOutcome, string][] = [
   ["canceled", "canceled"],
 ];
 
-function plural(count: number, noun: string): string {
-  return count === 1 ? `1 ${noun}` : `${count} ${noun}s`;
-}
-
 function groupMeta(group: Group): string {
   const counts = COUNTED_OUTCOMES.map(([outcome, label]) => {
     const count = group.items.filter((item) => item.outcome === outcome).length;
     return count > 0 ? `${count} ${label}` : null;
   }).filter((part) => part !== null);
   return [STATUS_LABEL[group.status], ...counts].join(" · ");
-}
-
-function isClientError(error: unknown): boolean {
-  const status = isAxiosError(error) ? error.response?.status : undefined;
-  return status !== undefined && status >= 400 && status < 500;
-}
-
-function useGroup(groupId: string | null) {
-  const credentialGetter = useCredentialGetter();
-  return useQuery<Group>({
-    queryKey: ["workflowRunGroup", groupId],
-    enabled: groupId !== null,
-    queryFn: async () => {
-      const client = await getClient(credentialGetter);
-      const response = await client.get<Group>(
-        `/workflow_run_groups/${groupId}`,
-      );
-      return response.data;
-    },
-    retry: (failureCount, error) => !isClientError(error) && failureCount < 3,
-    refetchInterval: (query) =>
-      query.state.data?.status === "finished" ||
-      isClientError(query.state.error)
-        ? false
-        : POLL_MS,
-  });
 }
 
 export function Heading({
@@ -154,8 +92,8 @@ export function AccountGroupReceiptCard({
           }
           title={
             singleRun
-              ? "Copilot asked you to review a run"
-              : `Copilot asked you to review ${plural(review.rows.length, rowGroup ? "run" : "account")}`
+              ? "Ember asked you to review a run"
+              : `Ember asked you to review ${plural(review.rows.length, rowGroup ? "run" : "account")}`
           }
         />
       </div>
@@ -312,10 +250,21 @@ export function AccountGroupReceiptCard({
           ))}
         </ul>
       ) : null}
+      {review.workflow_run_group_id ? (
+        <a
+          className="self-start pl-4 underline underline-offset-2"
+          href={`/run-groups/${review.workflow_run_group_id}`}
+          target="_blank"
+          rel="noreferrer"
+        >
+          Open results
+          <span className="sr-only"> (opens in new tab)</span>
+        </a>
+      ) : null}
       {group && group.status !== "finished" ? (
         <p className="pl-4 text-muted-foreground">
           The chat's Stop button does not stop these runs. To stop them, ask
-          Copilot to cancel the group.
+          Ember to cancel the group.
         </p>
       ) : null}
       {query.isError ? (
@@ -327,7 +276,7 @@ export function AccountGroupReceiptCard({
         <p className="pl-4 text-muted-foreground">Starting the runs…</p>
       ) : (
         <p className="pl-4 text-muted-foreground">
-          No run group is linked to this approval. Copilot's reply says whether
+          No run group is linked to this approval. Ember's reply says whether
           the runs started.
         </p>
       )}
@@ -379,7 +328,7 @@ export function AccountGroupCancelReceipt({
               className="size-3.5 shrink-0"
             />
           }
-          title={`Copilot asked whether to stop ${plural(count, "run")}`}
+          title={`Ember asked whether to stop ${plural(count, "run")}`}
         />
       </div>
     );

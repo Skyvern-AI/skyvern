@@ -2,7 +2,12 @@ import asyncio
 import hashlib
 import os
 import shutil
+import stat
+import tempfile
 import threading
+from collections.abc import Mapping
+from contextlib import ExitStack, suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePath
 from typing import BinaryIO
@@ -17,20 +22,32 @@ from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
+    downloads_to_save,
     get_download_dir,
     get_skyvern_temp_dir,
     make_run_temp_directory,
     parse_uri_to_path,
     register_local_download_root,
-    wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
+    BrowserProfileSnapshot,
     download_checksums_by_uri,
-    is_file_from_retry_attempt,
     resolve_download_attempt_fail_open,
+)
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
+    PROFILE_ENCRYPTION_PURPOSE,
+    SEALED_PROFILE_SUFFIX,
+    TRANSIENT_PROFILE_FILES,
+    WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+    ProfilePublicationConflict,
+    profile_archive_staging_dir,
+    restore_profile_archive,
+    run_profile_io,
+    should_encrypt_profile,
+    stage_profile_archive,
 )
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import settle
 from skyvern.forge.sdk.models import Step
@@ -44,11 +61,6 @@ from skyvern.webeye.session_cookies import SESSION_COOKIES_FILENAME
 
 LOG = structlog.get_logger()
 WINDOWS = os.name == "nt"
-
-# Live Chromium profiles carry runtime files that exist but can't be copied as regular files
-# (Singleton sockets/locks). These are skipped during a store; a copy failure on any other file
-# means an incomplete profile and is re-raised.
-_TRANSIENT_PROFILE_FILES = {"RunningChromeVersion", "SingletonLock", "SingletonSocket", "SingletonCookie"}
 
 
 def _safe_timestamp() -> str:
@@ -264,27 +276,36 @@ class LocalStorage(BaseStorage):
             return
         (stored_folder_path / SESSION_COOKIES_FILENAME).unlink(missing_ok=True)
 
-    def _copy_directory_best_effort(self, source_directory: Path, stored_folder_path: Path) -> None:
+    def _copy_directory_best_effort(
+        self, source_directory: Path, stored_folder_path: Path, *, private_copy: bool = False
+    ) -> None:
         # Source may be a live browser profile. Skip only transient runtime files: ones that vanish
         # mid-walk (FileNotFoundError) or Chrome's Singleton sockets/locks that can't be copied as
         # regular files. Re-raise anything else (e.g. ENOSPC/permission on Cookies or localStorage) so
         # a partial profile isn't silently stored and later reused as if it were valid.
-        for root, _, files in os.walk(source_directory):
+        def raise_walk_error(error: OSError) -> None:
+            raise error
+
+        for root, _, files in os.walk(source_directory, onerror=raise_walk_error if private_copy else None):
             for file in files:
                 source_file_path = Path(root) / file
+                if private_copy and source_file_path.is_symlink():
+                    continue
                 target_file_path = stored_folder_path / source_file_path.relative_to(source_directory)
                 try:
                     self._create_directories_if_not_exists(target_file_path)
                     shutil.copy2(source_file_path, target_file_path)
                 except OSError as e:
-                    if isinstance(e, FileNotFoundError) or file in _TRANSIENT_PROFILE_FILES:
+                    if isinstance(e, FileNotFoundError) or file in TRANSIENT_PROFILE_FILES:
                         LOG.debug(
                             "Skipped transient profile file while storing browser dir", path=str(source_file_path)
                         )
                     else:
                         raise
 
-    async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
+    async def store_browser_session(
+        self, organization_id: str, workflow_permanent_id: str, directory: str, *, require_encryption: bool = False
+    ) -> None:
         stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
         if stored_folder_path is None:
             LOG.warning(
@@ -295,6 +316,17 @@ class LocalStorage(BaseStorage):
             )
             return
         source_directory = Path(directory).resolve()
+        sealed = stored_folder_path.with_name(stored_folder_path.name + SEALED_PROFILE_SUFFIX)
+        if should_encrypt_profile(protected_input=require_encryption) or self._profile_stat(sealed) is not None:
+            await self._seal_local_archive(
+                source_directory,
+                stored_folder_path,
+                sealed,
+                organization_id,
+                workflow_permanent_id,
+                purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+            )
+            return
         if source_directory == stored_folder_path:
             return
         self._create_directories_if_not_exists(stored_folder_path)
@@ -306,22 +338,27 @@ class LocalStorage(BaseStorage):
             browser_session_path=str(stored_folder_path),
         )
 
-        self._drop_stale_session_sidecar(source_directory, stored_folder_path)
-        self._copy_directory_best_effort(source_directory, stored_folder_path)
+        self._copy_legacy_archive(source_directory, stored_folder_path, sealed)
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
-        stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
-        if stored_folder_path is None:
-            LOG.warning(
-                "Refused to retrieve browser session outside storage base path",
-                organization_id=organization_id,
-                workflow_permanent_id=workflow_permanent_id,
-                base_path=settings.BROWSER_SESSION_BASE_PATH,
-            )
+        snapshot = await self.retrieve_browser_session_snapshot(organization_id, workflow_permanent_id)
+        return snapshot.directory if snapshot is not None else None
+
+    async def retrieve_browser_session_snapshot(
+        self, organization_id: str, workflow_permanent_id: str
+    ) -> BrowserProfileSnapshot | None:
+        stored = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
+        if stored is None:
             return None
-        if not stored_folder_path.exists():
-            return None
-        return str(stored_folder_path)
+        sealed = stored.with_name(stored.name + SEALED_PROFILE_SUFFIX)
+        return await self._retrieve_local_archive(
+            stored,
+            sealed,
+            organization_id,
+            workflow_permanent_id,
+            copy=False,
+            purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+        )
 
     async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
         stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
@@ -333,10 +370,10 @@ class LocalStorage(BaseStorage):
                 base_path=settings.BROWSER_SESSION_BASE_PATH,
             )
             return
-        if not stored_folder_path.exists():
-            return
         try:
-            shutil.rmtree(stored_folder_path)
+            if self._profile_stat(stored_folder_path) is not None:
+                shutil.rmtree(stored_folder_path)
+            stored_folder_path.with_name(stored_folder_path.name + SEALED_PROFILE_SUFFIX).unlink(missing_ok=True)
         except Exception:
             LOG.exception(
                 "Failed to delete local browser session",
@@ -346,18 +383,52 @@ class LocalStorage(BaseStorage):
             )
             raise
 
-    async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
-        """Store browser profile locally."""
-        stored_folder_path = self._resolve_browser_storage_path(organization_id, "profiles", profile_id)
-        if stored_folder_path is None:
-            LOG.warning(
-                "Refused to store browser profile outside storage base path",
-                organization_id=organization_id,
-                profile_id=profile_id,
-                base_path=settings.BROWSER_SESSION_BASE_PATH,
+    def _profile_paths(self, organization_id: str, profile_id: str) -> tuple[Path, Path]:
+        root = self._resolve_browser_storage_path(organization_id, "profiles")
+        name = Path(profile_id)
+        if root is None or profile_id in {"", ".", ".."} or name.name != profile_id or name.drive:
+            raise ValueError("Invalid local browser profile storage path")
+        return root / profile_id, root / f"{profile_id}{SEALED_PROFILE_SUFFIX}"
+
+    @staticmethod
+    def _profile_stat(path: Path) -> os.stat_result | None:
+        try:
+            return path.lstat()
+        except FileNotFoundError:
+            return None
+
+    def is_browser_profile_working_copy(self, organization_id: str, profile_id: str, directory: str) -> bool:
+        stored, _ = self._profile_paths(organization_id, profile_id)
+        return Path(directory).resolve() != stored
+
+    async def store_browser_profile(
+        self,
+        organization_id: str,
+        profile_id: str,
+        directory: str,
+        *,
+        require_encryption: bool = False,
+        write_back: bool = False,
+        seed_etag: str | None = None,
+    ) -> None:
+        stored_folder_path, sealed = self._profile_paths(organization_id, profile_id)
+        source_directory = Path(directory).resolve()
+        if not source_directory.is_dir():
+            raise NotADirectoryError(source_directory)
+        sealed_seed = seed_etag is not None if write_back else self._profile_stat(sealed) is not None
+        if should_encrypt_profile(protected_input=require_encryption, protected_destination=sealed_seed):
+            await self._seal_local_archive(
+                source_directory,
+                stored_folder_path,
+                sealed,
+                organization_id,
+                profile_id,
+                write_back=write_back,
+                seed_etag=seed_etag,
             )
             return
-        source_directory = Path(directory).resolve()
+        if write_back and not self._profile_seed_matches(stored_folder_path, sealed, seed_etag):
+            return
         if source_directory == stored_folder_path:
             return
         # True overwrite: drop any prior contents so a re-save can't leave stale cookies or
@@ -374,60 +445,169 @@ class LocalStorage(BaseStorage):
             browser_profile_path=str(stored_folder_path),
         )
 
-        self._drop_stale_session_sidecar(source_directory, stored_folder_path)
-        self._copy_directory_best_effort(source_directory, stored_folder_path)
+        self._copy_legacy_archive(source_directory, stored_folder_path, sealed)
+
+    async def _seal_local_archive(
+        self,
+        source_directory: Path,
+        stored_folder_path: Path,
+        sealed: Path,
+        organization_id: str,
+        profile_id: str,
+        *,
+        purpose: str = PROFILE_ENCRYPTION_PURPOSE,
+        write_back: bool = False,
+        seed_etag: str | None = None,
+    ) -> None:
+        if not source_directory.is_dir():
+            raise NotADirectoryError(source_directory)
+        sealed.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            tempfile.TemporaryDirectory(dir=sealed.parent, prefix=".profile-sealed-") as staging_dir,
+            profile_archive_staging_dir() as zip_dir,
+        ):
+            staged = await run_profile_io(
+                stage_profile_archive,
+                str(source_directory),
+                zip_dir,
+                organization_id,
+                profile_id,
+                encrypted=True,
+                sealed_dir=Path(staging_dir),
+                purpose=purpose,
+            )
+            if write_back and not self._profile_seed_matches(stored_folder_path, sealed, seed_etag):
+                return
+            os.replace(staged, sealed)
+            if self._profile_stat(stored_folder_path) is not None:
+                shutil.rmtree(stored_folder_path)
+
+    def _copy_legacy_archive(self, source_directory: Path, stored_folder_path: Path, sealed: Path) -> None:
+        try:
+            self._drop_stale_session_sidecar(source_directory, stored_folder_path)
+            self._copy_directory_best_effort(source_directory, stored_folder_path)
+        except BaseException as exc:
+            competing_seal = False
+            with suppress(OSError):
+                competing_seal = self._remove_legacy_if_sealed(stored_folder_path, sealed)
+            if competing_seal:
+                raise exc from ProfilePublicationConflict("Profile was encrypted by another writer during save")
+            raise
+        if self._remove_legacy_if_sealed(stored_folder_path, sealed):
+            raise ProfilePublicationConflict("Profile was encrypted by another writer during save")
+
+    def _remove_legacy_if_sealed(self, stored: Path, sealed: Path) -> bool:
+        if self._profile_stat(sealed) is None:
+            return False
+        try:
+            shutil.rmtree(stored)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            LOG.warning(
+                "Could not remove legacy browser profile after a competing seal", profile_id=stored.name, exc_info=True
+            )
+        return True
+
+    async def write_back_browser_profile(
+        self, organization_id: str, profile_id: str, directory: str, *, seed_etag: str | None
+    ) -> None:
+        await self.store_browser_profile(organization_id, profile_id, directory, write_back=True, seed_etag=seed_etag)
+
+    def _profile_seed_matches(self, stored: Path, sealed: Path, seed_etag: str | None) -> bool:
+        if self._sealed_profile_etag(sealed) == seed_etag and (
+            seed_etag is not None or self._profile_stat(stored) is not None
+        ):
+            return True
+        LOG.warning("Skipping local profile write-back because the stored profile changed", profile_id=stored.name)
+        return False
+
+    async def retrieve_browser_profile_snapshot(
+        self, organization_id: str, profile_id: str, *, copy: bool = False
+    ) -> BrowserProfileSnapshot | None:
+        stored, sealed = self._profile_paths(organization_id, profile_id)
+        return await self._retrieve_local_archive(
+            stored, sealed, organization_id, profile_id, copy=copy, purpose=PROFILE_ENCRYPTION_PURPOSE
+        )
+
+    async def _retrieve_local_archive(
+        self, stored: Path, sealed: Path, organization_id: str, profile_id: str, *, copy: bool, purpose: str
+    ) -> BrowserProfileSnapshot | None:
+        if (sealed_stat := self._profile_stat(sealed)) is None:
+            legacy_stat = self._profile_stat(stored)
+            if (sealed_stat := self._profile_stat(sealed)) is None and legacy_stat is not None:
+                if not stat.S_ISDIR(legacy_stat.st_mode):
+                    raise NotADirectoryError(stored)
+                if not copy and not settings.SKYVERN_ENCRYPT_BROWSER_PROFILES:
+                    return BrowserProfileSnapshot(str(stored))
+                with ExitStack() as abandoned:
+                    working_copy = make_run_temp_directory(prefix="skyvern_browser_profile_")
+                    abandoned.callback(shutil.rmtree, working_copy, ignore_errors=True)
+                    try:
+                        await run_profile_io(
+                            self._copy_directory_best_effort, stored, Path(working_copy), private_copy=True
+                        )
+                    except FileNotFoundError:
+                        if (sealed_stat := self._profile_stat(sealed)) is None:
+                            raise
+                    else:
+                        if (sealed_stat := self._profile_stat(sealed)) is None:
+                            abandoned.pop_all()
+                            return BrowserProfileSnapshot(working_copy, legacy_local_copy=True)
+        if sealed_stat is None:
+            return None
+        if not stat.S_ISREG(sealed_stat.st_mode):
+            raise OSError("Invalid encrypted browser profile file")
+        version = self._sealed_stat_etag(sealed_stat)
+        snapshot = await restore_profile_archive(sealed, organization_id, profile_id, encrypted=True, purpose=purpose)
+        try:
+            return replace(snapshot, version=version) if self._sealed_profile_etag(sealed) == version else snapshot
+        except BaseException:
+            shutil.rmtree(snapshot.directory, ignore_errors=True)
+            raise
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
-        """Retrieve browser profile from local storage."""
-        stored_folder_path = self._resolve_browser_storage_path(organization_id, "profiles", profile_id)
-        if stored_folder_path is None:
-            LOG.warning(
-                "Refused to retrieve browser profile outside storage base path",
-                organization_id=organization_id,
-                profile_id=profile_id,
-                base_path=settings.BROWSER_SESSION_BASE_PATH,
-            )
-            return None
-        if not stored_folder_path.exists():
-            return None
-        return str(stored_folder_path)
+        snapshot = await self.retrieve_browser_profile_snapshot(organization_id, profile_id)
+        return snapshot.directory if snapshot is not None else None
 
     async def retrieve_browser_profile_copy(self, organization_id: str, profile_id: str) -> str | None:
-        stored_folder_path = await self.retrieve_browser_profile(organization_id, profile_id)
-        if stored_folder_path is None:
-            return None
-        working_copy = make_run_temp_directory(prefix="skyvern_browser_profile_")
-        self._copy_directory_best_effort(Path(stored_folder_path), Path(working_copy))
-        return working_copy
+        snapshot = await self.retrieve_browser_profile_snapshot(organization_id, profile_id, copy=True)
+        return snapshot.directory if snapshot is not None else None
 
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
-        """Non-destructive existence check — stat the stored directory, never retrieve/delete it."""
-        stored_folder_path = self._resolve_browser_storage_path(organization_id, "profiles", profile_id)
-        return stored_folder_path is not None and stored_folder_path.exists()
+        stored, sealed = self._profile_paths(organization_id, profile_id)
+        return (
+            self._profile_stat(sealed) is not None
+            or self._profile_stat(stored) is not None
+            or self._profile_stat(sealed) is not None
+        )
+
+    async def get_browser_profile_etag(
+        self, organization_id: str, profile_id: str, *, encrypted: bool | None = None
+    ) -> str | None:
+        _, sealed = self._profile_paths(organization_id, profile_id)
+        return self._sealed_profile_etag(sealed)
+
+    def _sealed_profile_etag(self, sealed: Path) -> str | None:
+        current = self._profile_stat(sealed)
+        if current is None:
+            return None
+        return self._sealed_stat_etag(current)
+
+    @staticmethod
+    def _sealed_stat_etag(info: os.stat_result) -> str:
+        return f"{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}"
 
     async def delete_browser_profile(self, organization_id: str, profile_id: str, hard_delete: bool = False) -> None:
-        """Delete a browser profile from local storage. Best-effort: a missing profile is a no-op.
-        Local storage keeps no old versions, so a terminal dir delete is full erasure; under hard_delete
-        a delete failure is RAISED (not swallowed) so the caller reports reap_failed, not a false erasure."""
-        stored_folder_path = self._resolve_browser_storage_path(organization_id, "profiles", profile_id)
-        if stored_folder_path is None:
-            LOG.warning(
-                "Refused to delete browser profile outside storage base path",
-                organization_id=organization_id,
-                profile_id=profile_id,
-                base_path=settings.BROWSER_SESSION_BASE_PATH,
-            )
-            return
-        if not stored_folder_path.exists():
-            return
         try:
-            shutil.rmtree(stored_folder_path)
+            stored, sealed = self._profile_paths(organization_id, profile_id)
+            # Erase legacy first so a failed deletion cannot expose stale plaintext as the current profile.
+            if self._profile_stat(stored) is not None:
+                shutil.rmtree(stored)
+            sealed.unlink(missing_ok=True)
         except Exception:
             LOG.exception(
-                "Failed to delete local browser profile",
-                organization_id=organization_id,
-                profile_id=profile_id,
-                path=str(stored_folder_path),
+                "Failed to delete local browser profile", organization_id=organization_id, profile_id=profile_id
             )
             if hard_delete:
                 raise
@@ -438,12 +618,12 @@ class LocalStorage(BaseStorage):
         run_id: str | None,
         *,
         attempt_number: int | None = None,
+        files: Mapping[str, str] | None = None,
     ) -> None:
         if run_id is None:
             return
         download_dir = get_download_dir(run_id=run_id)
-        files = os.listdir(download_dir)
-        if not files:
+        if files is None and not os.listdir(download_dir):
             return
         owner_id, number, started_at = await resolve_download_attempt_fail_open(organization_id, run_id, attempt_number)
         destination = Path(self.artifact_path) / DOWNLOAD_FILE_PREFIX / settings.ENV / organization_id / run_id
@@ -454,17 +634,10 @@ class LocalStorage(BaseStorage):
         )
         saved = download_checksums_by_uri(artifacts)
         skipped: list[str] = []
-        for filename in files:
-            if filename.endswith(BROWSER_DOWNLOADING_SUFFIX):
-                continue
-            source = Path(download_dir) / filename
-            if not source.is_file():
-                continue
-            filename = await wait_for_pending_extension_rename(download_dir, filename)
-            source = Path(download_dir) / filename
-            if not source.is_file() or (number > 1 and not is_file_from_retry_attempt(str(source), started_at)):
-                continue
-            target = destination / filename
+        for key, path in await downloads_to_save(download_dir, files, started_at if number > 1 else None):
+            filename = os.path.basename(key)
+            source = Path(path)
+            target = destination / key
             uri = managed_file_uri(target.resolve())
             try:
                 checksum = calculate_sha256_for_file(str(source))

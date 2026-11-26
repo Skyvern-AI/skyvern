@@ -177,7 +177,7 @@ describe("CredentialCard content", () => {
       />,
     );
     expect(
-      screen.getByText(`Copilot needs to sign in to ${origin}`),
+      screen.getByText(`Ember needs to sign in to ${origin}`),
     ).toBeTruthy();
   });
 
@@ -191,9 +191,7 @@ describe("CredentialCard content", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(
-      screen.getByText("Copilot needs to sign in to the site"),
-    ).toBeTruthy();
+    expect(screen.getByText("Ember needs to sign in to the site")).toBeTruthy();
   });
 
   it("falls back to the raw string when login_page_urls[0] isn't a parseable URL", () => {
@@ -209,7 +207,7 @@ describe("CredentialCard content", () => {
       />,
     );
     expect(
-      screen.getByText("Copilot needs to sign in to not a valid url"),
+      screen.getByText("Ember needs to sign in to not a valid url"),
     ).toBeTruthy();
   });
 
@@ -240,7 +238,7 @@ describe("CredentialCard content", () => {
     expect(container.querySelector("p.text-sm")).toBeNull();
     expect(
       screen.getByText(
-        "Copilot needs to sign in to https://news.ycombinator.com",
+        "Ember needs to sign in to https://news.ycombinator.com",
       ),
     ).toBeTruthy();
   });
@@ -255,9 +253,7 @@ describe("CredentialCard content", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(
-      screen.getByText("Copilot needs to sign in to the site"),
-    ).toBeTruthy();
+    expect(screen.getByText("Ember needs to sign in to the site")).toBeTruthy();
     expect(
       screen.getByText(
         CREDENTIAL_WHY_LINE_BY_REASON.workflow_credential_inputs_unbound,
@@ -1192,7 +1188,7 @@ describe("CredentialCard terminal org-credential picker", () => {
     expect(screen.getAllByText("cred_named").length).toBeGreaterThan(0);
     expect(
       screen.getByText(
-        /You named this login \(cred_named\)\. Copilot wants to use it on https:\/\/example\.com\./,
+        /You named this login \(cred_named\)\. Ember wants to use it on https:\/\/example\.com\./,
       ),
     ).toBeTruthy();
     fireEvent.click(use);
@@ -2041,7 +2037,7 @@ describe("CredentialCard missing-authenticator ask", () => {
 
     expect(
       screen.getByText(
-        "Copilot chose this saved login because its saved URL matches this page. Updating it changes it everywhere it is used.",
+        "Ember chose this saved login because its saved URL matches this page. Updating it changes it everywhere it is used.",
       ),
     ).toBeTruthy();
     const update = screen.getByRole("button", { name: "Update credential" });

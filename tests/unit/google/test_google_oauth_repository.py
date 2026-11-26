@@ -3,9 +3,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 import pytest_asyncio
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -23,13 +24,16 @@ from skyvern.forge.sdk.db.repositories.google_oauth import (
 )
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.integrations.google import tokens as google_tokens
+from skyvern.forge.sdk.routes import google_drive as google_drive_routes
 from skyvern.forge.sdk.routes import google_oauth as google_oauth_routes
 from skyvern.forge.sdk.schemas.google_oauth import (
     CreateGoogleOAuthAuthorizeRequest,
     CreateGoogleOAuthCallbackRequest,
     GoogleOAuthCredentialBase,
 )
-from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.services import google_oauth_service, org_auth_service
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from tests.unit.conftest import SqliteEngineFactory
 
 
@@ -728,7 +732,7 @@ async def test_mark_active_mismatched_client_as_error_flips_only_mismatched_boun
             ).all()
         )
 
-    assert changed == 1
+    assert changed == ["gcred_flip"]
     assert states == {
         "gcred_flip": STATE_ERROR,
         "gcred_match": STATE_ACTIVE,
@@ -787,7 +791,7 @@ async def test_mark_active_mismatched_client_as_error_with_no_new_client_flips_a
             ).all()
         )
 
-    assert changed == 2
+    assert sorted(changed) == ["gcred_bound_1", "gcred_bound_2"]
     assert states == {
         "gcred_bound_1": STATE_ERROR,
         "gcred_bound_2": STATE_ERROR,
@@ -1231,21 +1235,209 @@ async def _finish_consent(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("scope_profile", "asked", "granted"),
+    ("principal", "scenario", "expected_status", "expected_code"),
     [
-        ("gmail_send", [GMAIL_SEND_SCOPE, "openid", "email"], SEND_GRANT),
-        ("gmail_read_send", [GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE, "openid", "email"], READ_SEND_GRANT),
+        pytest.param(
+            RequestPrincipal("o_test", AuthKind.api_key),
+            "ready",
+            403,
+            "picker_owner_only",
+            id="organization-api-key",
+        ),
+        pytest.param(
+            RequestPrincipal("o_test", AuthKind.member_api_key, "user_1"),
+            "ready",
+            403,
+            "picker_owner_only",
+            id="member-api-key",
+        ),
+        pytest.param(
+            RequestPrincipal("o_test", AuthKind.bearer, "user_1", impersonator_user_id="user_support"),
+            "ready",
+            403,
+            "picker_owner_only",
+            id="impersonated-bearer",
+        ),
+        pytest.param(RequestPrincipal("o_test", AuthKind.bearer, "user_1"), "ready", 200, None, id="owner-bearer"),
+        pytest.param(
+            RequestPrincipal("o_test", AuthKind.bearer, "user_1"),
+            "error-state",
+            409,
+            "reconnect_required",
+            id="owner-error-state",
+        ),
+        pytest.param(
+            RequestPrincipal("o_test", AuthKind.bearer, "user_1"),
+            "revoked-state",
+            403,
+            "picker_owner_only",
+            id="owner-revoked-state",
+        ),
+        pytest.param(
+            RequestPrincipal("o_test", AuthKind.bearer, "user_1"),
+            "missing-secrets",
+            409,
+            "reconnect_required",
+            id="owner-missing-secrets",
+        ),
+        pytest.param(
+            RequestPrincipal("o_test", AuthKind.bearer, "user_1"),
+            "expired-refresh",
+            409,
+            "reconnect_required",
+            id="owner-expired-refresh",
+        ),
+        pytest.param(
+            RequestPrincipal("o_test", AuthKind.bearer, "user_1"),
+            "version-race",
+            409,
+            "picker_retry_required",
+            id="owner-version-race",
+        ),
+        pytest.param(
+            RequestPrincipal("o_test", AuthKind.bearer, "user_1"),
+            "owner-change",
+            403,
+            "picker_owner_only",
+            id="owner-changes-during-refresh",
+        ),
+        pytest.param(
+            RequestPrincipal("o_test", AuthKind.bearer, "user_1"),
+            "audit-failure",
+            503,
+            None,
+            id="strict-audit-failure",
+        ),
     ],
 )
-async def test_gmail_send_new_connection_asks_for_its_profile_and_records_the_verified_account(
-    gmail_send_oauth: SimpleNamespace, engine: AsyncEngine, scope_profile: str, asked: list[str], granted: list[str]
+async def test_drive_picker_token_route_enforces_security_boundaries(
+    gmail_send_oauth: SimpleNamespace,
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    principal: RequestPrincipal,
+    scenario: str,
+    expected_status: int,
+    expected_code: str | None,
+) -> None:
+    """Non-owners and staff impersonation never receive a cached Drive picker token."""
+    scopes = [*google_oauth_service.GOOGLE_DRIVE_SCOPES, google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE]
+    await _seed_active_credential(repo, "goac_picker", "nonce-picker", scopes=scopes)
+    values: dict[str, object] = {"initiating_user_id": "user_1"}
+    if scenario == "error-state":
+        values["state"] = STATE_ERROR
+    elif scenario == "revoked-state":
+        values["state"] = STATE_REVOKED
+    elif scenario == "missing-secrets":
+        values["encrypted_refresh_token"] = None
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(GoogleOAuthCredentialModel).where(GoogleOAuthCredentialModel.id == "goac_picker").values(**values)
+        )
+    gmail_send_oauth.requested_scopes = []
+
+    async def refresh(
+        *,
+        organization_id: str,
+        credential_id: str,
+        credential_secrets: google_oauth_service.GoogleCredentialSecrets,
+        requested_scopes: tuple[str, ...] | None = None,
+    ) -> google_oauth_service.GoogleRefreshResult:
+        assert (organization_id, credential_id) == ("o_test", "goac_picker")
+        gmail_send_oauth.requested_scopes.append(tuple(requested_scopes or ()))
+        if scenario == "expired-refresh":
+            raise google_oauth_service.ExpiredRefreshTokenError("expired")
+        if scenario in {"version-race", "owner-change"}:
+            assert credential_secrets.credential_version is not None
+            updated_values: dict[str, object]
+            if scenario == "version-race":
+                updated_values = {"modified_at": credential_secrets.credential_version + datetime.timedelta(seconds=1)}
+            else:
+                updated_values = {"initiating_user_id": "user_2"}
+            async with engine.begin() as conn:
+                await conn.execute(
+                    update(GoogleOAuthCredentialModel)
+                    .where(GoogleOAuthCredentialModel.id == "goac_picker")
+                    .values(**updated_values)
+                )
+        return google_oauth_service.GoogleRefreshResult(
+            "picker-token",
+            credential_secrets.credential_version,
+            granted_scopes=(google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,),
+        )
+
+    monkeypatch.setattr(google_oauth_service, "refresh_and_rotate", refresh)
+    audit_events: list[tuple[str, str, str, str | None]] = []
+
+    async def record_audit_event(
+        organization_id: str,
+        action: str,
+        resource_type: str,
+        resource_id: str | None,
+    ) -> None:
+        if scenario == "audit-failure":
+            raise RuntimeError("audit unavailable")
+        audit_events.append((organization_id, action, resource_type, resource_id))
+
+    monkeypatch.setattr(google_drive_routes, "get_request_principal", lambda: principal)
+    monkeypatch.setattr(google_drive_routes, "record_request_audit_event_strict", record_audit_event)
+    api = FastAPI()
+    api.include_router(google_drive_routes.google_drive_router, prefix="/v1/integrations/google/drive")
+    api.dependency_overrides[org_auth_service.get_current_org_for_credential_routes] = lambda: SimpleNamespace(
+        organization_id="o_test"
+    )
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api), base_url="http://skyvern.test") as client:
+        response = await client.post(
+            "/v1/integrations/google/drive/picker-token",
+            json={"credential_id": "goac_picker"},
+        )
+
+    assert response.status_code == expected_status
+    assert response.headers["Cache-Control"] == "no-store"
+    if expected_code is not None:
+        assert response.json()["detail"]["code"] == expected_code
+    if expected_status == 200:
+        assert response.json()["access_token"] == "picker-token"
+        assert gmail_send_oauth.requested_scopes == [(google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,)]
+        assert audit_events == [("o_test", "google_oauth.picker_token", "google_oauth_credential", "goac_picker")]
+    elif scenario == "audit-failure":
+        assert "access_token" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope_profile", "asked", "granted", "gmail_send_ready"),
+    [
+        ("gmail_send", [GMAIL_SEND_SCOPE, "openid", "email"], SEND_GRANT, True),
+        ("gmail_read_send", [GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE, "openid", "email"], READ_SEND_GRANT, True),
+        (
+            "google_drive",
+            [
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
+                "openid",
+                "email",
+            ],
+            [*google_oauth_service.GOOGLE_DRIVE_SCOPES, *IDENTITY_GRANT],
+            False,
+        ),
+    ],
+)
+async def test_new_connection_asks_for_its_profile_and_records_the_verified_account(
+    gmail_send_oauth: SimpleNamespace,
+    engine: AsyncEngine,
+    scope_profile: str,
+    asked: list[str],
+    granted: list[str],
+    gmail_send_ready: bool,
 ) -> None:
     state, requested = await _start_consent(scope_profile=scope_profile)
     credential = await _finish_consent(gmail_send_oauth, state, granted)
 
     stored = await _stored_connection(engine, credential.id)
     assert requested == asked
-    assert credential.gmail_send_ready is True
+    assert credential.gmail_send_ready is gmail_send_ready
     assert (GMAIL_READONLY_SCOPE in credential.scopes_granted) == (scope_profile == "gmail_read_send")
     assert (stored.email_address, stored.google_subject) == ("sender@example.test", "subject-1")
     gmail_send_oauth.fetch_profile_email.assert_not_awaited()
@@ -1428,54 +1620,242 @@ async def test_gmail_send_upgrade_is_refused_for_a_connection_with_no_stored_ide
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing_grants", "scope_profile", "expected_requested", "actual_grants"),
+    [
+        pytest.param(
+            list(google_oauth_service.GOOGLE_SHEETS_SCOPES),
+            "google_drive",
+            [
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
+                *google_oauth_service.GOOGLE_SHEETS_SCOPES,
+                "openid",
+                "email",
+            ],
+            [
+                *google_oauth_service.GOOGLE_SHEETS_SCOPES,
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
+                *IDENTITY_GRANT,
+            ],
+            id="profile-unions-existing-sheets",
+        ),
+        pytest.param(
+            list(google_oauth_service.GOOGLE_SHEETS_SCOPES),
+            "google_drive",
+            [
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
+                *google_oauth_service.GOOGLE_SHEETS_SCOPES,
+                "openid",
+                "email",
+            ],
+            [
+                *google_oauth_service.GOOGLE_SHEETS_SCOPES,
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                *IDENTITY_GRANT,
+            ],
+            id="profile-upgrade-declines-picker",
+        ),
+        pytest.param(
+            [*google_oauth_service.GOOGLE_SHEETS_SCOPES, *google_oauth_service.GOOGLE_DRIVE_SCOPES],
+            None,
+            [
+                *google_oauth_service.GOOGLE_SHEETS_SCOPES,
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
+                "openid",
+                "email",
+            ],
+            [
+                *google_oauth_service.GOOGLE_SHEETS_SCOPES,
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
+                *IDENTITY_GRANT,
+            ],
+            id="plain-legacy-drive-adds-picker",
+        ),
+        pytest.param(
+            [*google_oauth_service.GOOGLE_SHEETS_SCOPES, *google_oauth_service.GOOGLE_DRIVE_SCOPES],
+            None,
+            [
+                *google_oauth_service.GOOGLE_SHEETS_SCOPES,
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
+                "openid",
+                "email",
+            ],
+            [
+                *google_oauth_service.GOOGLE_SHEETS_SCOPES,
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                *IDENTITY_GRANT,
+            ],
+            id="plain-legacy-drive-declines-picker",
+        ),
+        pytest.param(
+            [*google_oauth_service.GOOGLE_SHEETS_SCOPES, *google_oauth_service.GOOGLE_DRIVE_SCOPES],
+            "google_drive",
+            [
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
+                *google_oauth_service.GOOGLE_SHEETS_SCOPES,
+                "openid",
+                "email",
+            ],
+            [
+                *google_oauth_service.GOOGLE_SHEETS_SCOPES,
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                *IDENTITY_GRANT,
+            ],
+            id="profile-legacy-drive-declines-picker",
+        ),
+    ],
+)
 async def test_google_drive_reconnect_keeps_id_and_unions_existing_sheets_grants(
     gmail_send_oauth: SimpleNamespace,
     repo: GoogleOAuthRepository,
     engine: AsyncEngine,
+    existing_grants: list[str],
+    scope_profile: str | None,
+    expected_requested: list[str],
+    actual_grants: list[str],
 ) -> None:
-    sheets_scopes = list(google_oauth_service.GOOGLE_SHEETS_SCOPES)
-    drive_scope = google_oauth_service.GOOGLE_DRIVE_SCOPES[0]
-    await _seed_gmail_connection(repo, engine, sheets_scopes, subject="subject-1")
+    await _seed_gmail_connection(repo, engine, existing_grants, subject="subject-1")
 
-    state, requested = await _start_consent(credential_id="goac_gmail", scope_profile="google_drive")
-    actual_grants = [*sheets_scopes, drive_scope, *IDENTITY_GRANT]
+    state, requested = await _start_consent(credential_id="goac_gmail", scope_profile=scope_profile)
     credential = await _finish_consent(gmail_send_oauth, state, actual_grants)
 
     stored = await _stored_connection(engine)
-    assert requested == [drive_scope, *sheets_scopes, "openid", "email"]
+    assert requested == expected_requested
     assert (credential.id, credential.state) == ("goac_gmail", STATE_ACTIVE)
     assert stored.scopes_granted == actual_grants
     assert (stored.email_address, stored.google_subject) == ("sender@example.test", "subject-1")
 
+    wrong_owner = await google_tokens.resolve_drive_picker_token("o_test", "goac_gmail", "user_2")
+    assert wrong_owner.status == google_tokens.DrivePickerTokenStatus.OWNER_ONLY
+
+    if google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE not in actual_grants:
+        picker = await google_tokens.resolve_drive_picker_token("o_test", "goac_gmail", "user_1")
+        assert picker.status == google_tokens.DrivePickerTokenStatus.PICKER_RECONNECT_REQUIRED
+        return
+
+    gmail_send_oauth.refresh.return_value = google_oauth_service.GoogleRefreshResult(
+        "picker-token",
+        stored.modified_at,
+        granted_scopes=(google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,),
+    )
+    picker = await google_tokens.resolve_drive_picker_token("o_test", "goac_gmail", "user_1")
+    assert (picker.status, picker.access_token) == (google_tokens.DrivePickerTokenStatus.READY, "picker-token")
+
+    for granted_scopes in (
+        None,
+        (google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE, google_oauth_service.GOOGLE_DRIVE_SCOPES[0]),
+    ):
+        gmail_send_oauth.refresh.return_value = google_oauth_service.GoogleRefreshResult(
+            "discarded-token",
+            stored.modified_at,
+            granted_scopes=granted_scopes,
+        )
+        picker = await google_tokens.resolve_drive_picker_token("o_test", "goac_gmail", "user_1")
+        assert (picker.status, picker.access_token) == (google_tokens.DrivePickerTokenStatus.TOKEN_TOO_BROAD, None)
+
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["wrong-account", "wrong-account-with-set-account", "partial-grant"])
-async def test_google_drive_reconnect_rejection_leaves_existing_connection_unchanged(
+@pytest.mark.parametrize(
+    ("failure", "existing_grants", "scope_profile", "missing_scope"),
+    [
+        pytest.param(
+            "new-connection-partial-grant",
+            None,
+            "google_drive",
+            google_oauth_service.GOOGLE_DRIVE_SCOPES[0],
+            id="new-drive-partial-grant",
+        ),
+        pytest.param(
+            "wrong-account",
+            list(google_oauth_service.GOOGLE_SHEETS_SCOPES),
+            "google_drive",
+            None,
+            id="wrong-account",
+        ),
+        pytest.param(
+            "wrong-account-with-set-account",
+            list(google_oauth_service.GOOGLE_SHEETS_SCOPES),
+            "google_drive",
+            None,
+            id="wrong-account-with-set-account",
+        ),
+        pytest.param(
+            "partial-grant",
+            list(google_oauth_service.GOOGLE_SHEETS_SCOPES),
+            "google_drive",
+            google_oauth_service.GOOGLE_DRIVE_SCOPES[0],
+            id="profile-upgrade-partial-grant",
+        ),
+        pytest.param(
+            "partial-grant",
+            [*google_oauth_service.GOOGLE_SHEETS_SCOPES, *google_oauth_service.GOOGLE_DRIVE_SCOPES],
+            None,
+            google_oauth_service.GOOGLE_DRIVE_SCOPES[0],
+            id="plain-reconnect-missing-existing-drive-grant",
+        ),
+        pytest.param(
+            "send-declined",
+            [
+                *google_oauth_service.GOOGLE_SHEETS_SCOPES,
+                *google_oauth_service.GOOGLE_DRIVE_SCOPES,
+                google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
+            ],
+            "gmail_send",
+            GMAIL_SEND_SCOPE,
+            id="send-upgrade-on-drive-connection-declines-only-send",
+        ),
+    ],
+)
+async def test_google_drive_consent_rejection_leaves_connection_unchanged_or_uncreated(
     gmail_send_oauth: SimpleNamespace,
     repo: GoogleOAuthRepository,
     engine: AsyncEngine,
     failure: str,
+    existing_grants: list[str] | None,
+    scope_profile: str | None,
+    missing_scope: str | None,
 ) -> None:
     sheets_scopes = list(google_oauth_service.GOOGLE_SHEETS_SCOPES)
     drive_scope = google_oauth_service.GOOGLE_DRIVE_SCOPES[0]
-    await _seed_gmail_connection(repo, engine, sheets_scopes, subject="subject-1")
-    before = await _stored_connection(engine)
+    drive_file_scope = google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE
+    before = None
+    if existing_grants is not None:
+        await _seed_gmail_connection(repo, engine, existing_grants, subject="subject-1")
+        before = await _stored_connection(engine)
     state, _ = await _start_consent(
-        credential_id="goac_gmail",
-        scope_profile="google_drive",
+        credential_id="goac_gmail" if before is not None else None,
+        scope_profile=scope_profile,
         set_account=failure == "wrong-account-with-set-account",
     )
-    grants = [*sheets_scopes, drive_scope, *IDENTITY_GRANT]
+    grants = [*sheets_scopes, drive_scope, drive_file_scope, *SEND_GRANT]
     if failure.startswith("wrong-account"):
         gmail_send_oauth.claims["sub"] = "subject-2"
     else:
-        grants.remove(drive_scope)
+        assert missing_scope is not None
+        grants.remove(missing_scope)
 
     with pytest.raises(HTTPException) as rejected:
         await _finish_consent(gmail_send_oauth, state, grants)
 
-    after = await _stored_connection(engine)
     assert rejected.value.status_code == 409
+    if before is None:
+        assert "Google Drive access" in rejected.value.detail
+        assert "sending" not in rejected.value.detail
+        assert "previous connection" not in rejected.value.detail
+        assert await repo.list_visible_for_org("o_test") == []
+        return
+    if failure == "send-declined":
+        assert "sending was not enabled" in rejected.value.detail
+        assert "Google Drive" not in rejected.value.detail
+
+    after = await _stored_connection(engine)
     assert (
         after.encrypted_refresh_token,
         after.state,

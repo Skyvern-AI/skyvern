@@ -24,10 +24,14 @@ SESSION_COOKIES_FILENAME = ".skyvern_session_cookies.json"
 _SESSION_COOKIE_EXPIRES = (-1, 0)
 
 
-async def persist_session_cookies(browser_context: BrowserContext | None, user_data_dir: str | None) -> None:
+async def persist_session_cookies(
+    browser_context: BrowserContext | None, user_data_dir: str | None, *, strict: bool = False
+) -> None:
     """Snapshot the live context's session cookies into a sidecar inside ``user_data_dir``."""
     try:
         if browser_context is None or not user_data_dir or not os.path.isdir(user_data_dir):
+            if strict:
+                raise RuntimeError("Browser profile is unavailable for cookie capture")
             return
         path = os.path.join(user_data_dir, SESSION_COOKIES_FILENAME)
         # A cookie with no "expires" key defaults to -1 here: unknown expiry, treat as a session cookie.
@@ -53,6 +57,8 @@ async def persist_session_cookies(browser_context: BrowserContext | None, user_d
                 os.remove(tmp)
         LOG.info("Persisted session cookies for browser profile", cookie_count=len(cookies))
     except Exception:
+        if strict:
+            raise
         LOG.warning("Failed to persist session cookies", exc_info=True)
 
 
@@ -100,7 +106,9 @@ async def _add_cookies_with_fallback(browser_context: BrowserContext, cookies: l
         return restored
 
 
-async def restore_session_cookies(browser_context: BrowserContext | None, user_data_dir: str | None) -> None:
+async def restore_session_cookies(
+    browser_context: BrowserContext | None, user_data_dir: str | None, *, strict: bool = False
+) -> None:
     """Re-inject session cookies captured by ``persist_session_cookies`` if a sidecar exists."""
     try:
         if browser_context is None or not user_data_dir or not os.path.isdir(user_data_dir):
@@ -119,13 +127,17 @@ async def restore_session_cookies(browser_context: BrowserContext | None, user_d
         ]
         if not sanitized:
             return
-        await _add_cookies_with_fallback(browser_context, sanitized, "session")
+        restored = await _add_cookies_with_fallback(browser_context, sanitized, "session")
+        if strict and restored != len(sanitized):
+            raise RuntimeError("Could not restore all profile session cookies")
     except Exception:
+        if strict:
+            raise
         LOG.warning("Failed to restore session cookies", exc_info=True)
 
 
 async def _restore_cookie_sidecar(
-    browser_context: BrowserContext | None, user_data_dir: str | None, filename: str, kind: str
+    browser_context: BrowserContext | None, user_data_dir: str | None, filename: str, kind: str, *, strict: bool = False
 ) -> int:
     try:
         if browser_context is None or not user_data_dir or not os.path.isdir(user_data_dir):
@@ -145,26 +157,38 @@ async def _restore_cookie_sidecar(
         ]
         if not sanitized:
             return 0
-        return await _add_cookies_with_fallback(browser_context, sanitized, kind)
+        restored = await _add_cookies_with_fallback(browser_context, sanitized, kind)
+        if strict and restored != len(sanitized):
+            raise RuntimeError("Could not restore all profile cookies")
+        return restored
     except Exception:
+        if strict:
+            raise
         LOG.warning("Failed to restore cookies", kind=kind, exc_info=True)
         return 0
 
 
-async def restore_banked_cookies(browser_context: BrowserContext | None, user_data_dir: str | None) -> None:
+async def restore_banked_cookies(
+    browser_context: BrowserContext | None, user_data_dir: str | None, *, strict: bool = False
+) -> None:
     """Re-inject cookies unioned by ``profile_cookie_merge.union_cookies_into_profile_dir``.
 
     Called AFTER ``restore_session_cookies`` so a verified-login heal wins over the profile's own
     older session sidecar on a (domain, name, path) clash. Persistent expiries are preserved;
     session expiries (-1/0) are pinned to -1 for the same patchright reason as restore_session_cookies.
     """
-    await _restore_cookie_sidecar(browser_context, user_data_dir, BANKED_COOKIES_FILENAME, "banked")
+    await _restore_cookie_sidecar(browser_context, user_data_dir, BANKED_COOKIES_FILENAME, "banked", strict=strict)
 
 
-async def restore_signin_cookies(browser_context: BrowserContext | None, user_data_dir: str | None) -> None:
+async def restore_signin_cookies(
+    browser_context: BrowserContext | None, user_data_dir: str | None, *, strict: bool = False
+) -> None:
     """Re-inject a profile's sign-in seed, then delete it so a later write-back archives the live jar
     instead of carrying the seed forward to replay over fresher cookies."""
-    if await _restore_cookie_sidecar(browser_context, user_data_dir, SIGNIN_COOKIES_FILENAME, "signin"):
+    if await _restore_cookie_sidecar(browser_context, user_data_dir, SIGNIN_COOKIES_FILENAME, "signin", strict=strict):
+        if strict:
+            os.remove(os.path.join(user_data_dir or "", SIGNIN_COOKIES_FILENAME))
+            return
         with contextlib.suppress(OSError):
             os.remove(os.path.join(user_data_dir or "", SIGNIN_COOKIES_FILENAME))
 

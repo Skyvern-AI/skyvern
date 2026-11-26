@@ -4,7 +4,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NamedTuple, TypedDict
 
 from sqlalchemy import (
     JSON,
@@ -23,6 +23,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Load, with_expression
+from sqlalchemy.sql.selectable import Join
 
 from skyvern.forge.failure_classifier import derive_failure_attribution
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -108,6 +109,39 @@ def _stale_dispatch_claim_conditions(stale_before: datetime) -> ColumnElement[bo
     )
 
 
+class WorkflowRunAttemptSummary(NamedTuple):
+    workflow_run_id: str
+    attempt_number: int
+    retry_decision: str | None
+    next_attempt_prepared_at: datetime | None
+    next_attempt_at: datetime | None
+
+
+def _latest_attempts_join(workflow_run_ids: Sequence[str]) -> Join:
+    ranked_attempts = (
+        select(
+            WorkflowRunAttemptModel.workflow_run_id,
+            WorkflowRunAttemptModel.attempt_number,
+            func.row_number()
+            .over(
+                partition_by=WorkflowRunAttemptModel.workflow_run_id,
+                order_by=WorkflowRunAttemptModel.attempt_number.desc(),
+            )
+            .label("attempt_rank"),
+        )
+        .where(WorkflowRunAttemptModel.workflow_run_id.in_(workflow_run_ids))
+        .subquery()
+    )
+    return WorkflowRunAttemptModel.__table__.join(
+        ranked_attempts,
+        and_(
+            WorkflowRunAttemptModel.workflow_run_id == ranked_attempts.c.workflow_run_id,
+            WorkflowRunAttemptModel.attempt_number == ranked_attempts.c.attempt_number,
+            ranked_attempts.c.attempt_rank == 1,
+        ),
+    )
+
+
 class WorkflowRunAttemptsRepository(BaseRepository):
     @db_operation("create_attempt")
     async def create_attempt(
@@ -174,32 +208,29 @@ class WorkflowRunAttemptsRepository(BaseRepository):
         if not workflow_run_ids:
             return {}
 
-        ranked_attempts = (
-            select(
-                WorkflowRunAttemptModel.workflow_run_id,
-                WorkflowRunAttemptModel.attempt_number,
-                func.row_number()
-                .over(
-                    partition_by=WorkflowRunAttemptModel.workflow_run_id,
-                    order_by=WorkflowRunAttemptModel.attempt_number.desc(),
-                )
-                .label("attempt_rank"),
-            )
-            .where(WorkflowRunAttemptModel.workflow_run_id.in_(workflow_run_ids))
-            .subquery()
-        )
-        query = select(WorkflowRunAttemptModel).join(
-            ranked_attempts,
-            and_(
-                WorkflowRunAttemptModel.workflow_run_id == ranked_attempts.c.workflow_run_id,
-                WorkflowRunAttemptModel.attempt_number == ranked_attempts.c.attempt_number,
-                ranked_attempts.c.attempt_rank == 1,
-            ),
-        )
+        query = select(WorkflowRunAttemptModel).select_from(_latest_attempts_join(workflow_run_ids))
 
         async with self.Session() as session:
             attempts = (await session.scalars(query.options(attempt_metadata_options(session.bind.dialect.name)))).all()
             return {attempt.workflow_run_id: attempt for attempt in attempts}
+
+    @db_operation("get_latest_attempt_summaries_for_runs")
+    async def get_latest_attempt_summaries_for_runs(
+        self, workflow_run_ids: Sequence[str]
+    ) -> dict[str, WorkflowRunAttemptSummary]:
+        if not workflow_run_ids:
+            return {}
+
+        query = select(
+            WorkflowRunAttemptModel.workflow_run_id,
+            WorkflowRunAttemptModel.attempt_number,
+            WorkflowRunAttemptModel.retry_decision,
+            WorkflowRunAttemptModel.next_attempt_prepared_at,
+            WorkflowRunAttemptModel.next_attempt_at,
+        ).select_from(_latest_attempts_join(workflow_run_ids))
+        async with self.Session() as session:
+            rows = (await session.execute(query)).all()
+            return {row.workflow_run_id: WorkflowRunAttemptSummary(*row) for row in rows}
 
     @db_operation("list_stale_pending_retries")
     async def list_stale_pending_retries(self, cutoff: datetime) -> list[WorkflowRunAttemptModel]:

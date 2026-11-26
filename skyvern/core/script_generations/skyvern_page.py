@@ -163,6 +163,10 @@ class SkyvernPage(Page):
         """Public read-only view of the working iframe (None means the main frame)."""
         return object.__getattribute__(self, "_working_frame")
 
+    @property
+    def page_ai(self) -> SkyvernPageAi:
+        return object.__getattribute__(self, "_ai")
+
     async def _decorate_call(
         self,
         fn: Callable,
@@ -233,7 +237,10 @@ class SkyvernPage(Page):
     def _is_card_secret_reference(self, value: str) -> bool:
         return False
 
-    async def _mask_card_secret_field(self, locator: Locator, original_value: str, value: str, timeout: float) -> None:
+    def _mask_secrets_enabled(self) -> bool:
+        return False
+
+    async def _mask_secret_field(self, locator: Locator, original_value: str, value: str, timeout: float) -> None:
         # A vault card number or CVV is masked whatever the run's Mask Secrets setting: the mask is CSS-only.
         if (
             settings.ENABLE_SECRET_VISUAL_MASKING
@@ -241,6 +248,14 @@ class SkyvernPage(Page):
             and self._is_card_secret_reference(original_value)
         ):
             await apply_secret_visual_mask_to_locator(locator, timeout=timeout)
+        # The step engine's Mask Secrets rule: a field that receives a value the resolver produced (a secret, a TOTP
+        # code, a polled one-time code) or a code digit is masked.
+        elif (
+            settings.ENABLE_SECRET_VISUAL_MASKING
+            and (value != original_value or isinstance(original_value, ResolvedSensitiveValue))
+            and self._mask_secrets_enabled()
+        ):
+            await apply_secret_visual_mask_to_locator(locator, timeout=timeout, skip_password_input=True)
 
     async def _resolve_totp_placeholder_or_raise(
         self,
@@ -743,6 +758,7 @@ class SkyvernPage(Page):
                 raise ValueError("mode='direct' requires a selector.")
             if value is None:
                 raise ValueError("mode='direct' requires a value.")
+            direct_original_value = value
             value = await self._resolve_totp_placeholder_or_raise(
                 value,
                 totp_identifier=totp_identifier,
@@ -750,6 +766,7 @@ class SkyvernPage(Page):
             )
             timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
             locator = self._locator_scope.locator(selector).first
+            await self._mask_secret_field(locator, direct_original_value, value, timeout)
             element = None
             if _direct_fill_release_guard is not None:
                 element = await locator.element_handle(timeout=timeout)
@@ -1013,7 +1030,7 @@ class SkyvernPage(Page):
             raise NoTOTPSecretFound()
 
         try:
-            await self._mask_card_secret_field(
+            await self._mask_secret_field(
                 self._locator_scope.locator(selector).first, original_value, actual_value, timeout
             )
             result = await self._do_autocomplete(
@@ -1263,7 +1280,7 @@ class SkyvernPage(Page):
                             totp_identifier=totp_identifier,
                             totp_url=totp_url,
                         )
-                    await self._mask_card_secret_field(locator, original_value, value, timeout)
+                    await self._mask_secret_field(locator, original_value, value, timeout)
                     # Use locator.fill() (programmatic, single-shot) instead of typing
                     # character-by-character.  Sequential typing triggers autocomplete
                     # dropdowns on search bars and typeaheads which destabilise the DOM
@@ -1329,6 +1346,7 @@ class SkyvernPage(Page):
                 totp_identifier=totp_identifier,
                 totp_url=totp_url,
             )
+        await self._mask_secret_field(locator, original_value, value, timeout)
         await locator.fill(value, timeout=timeout)
         return value
 
@@ -1966,7 +1984,7 @@ class SkyvernPage(Page):
                         field_label=label[:50],
                         field_type=field_type,
                         field_index=idx,
-                        value=str(value)[:50],
+                        value_length=len(str(value)),
                         options_count=len(field.get("options", [])),
                         option_labels=[(o.get("label") or "?")[:30] for o in field.get("options", [])],
                     )
@@ -2069,7 +2087,7 @@ class SkyvernPage(Page):
                         "fill_from_mapping: custom widget detected",
                         field_label=label,
                         widget_type=field_type,
-                        value=str(value)[:50],
+                        value_length=len(str(value)),
                     )
                     if _budget_available():
                         filled = await app.AGENT_FUNCTION.fill_custom_widget(

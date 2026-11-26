@@ -5,12 +5,16 @@ CDP input channel for interactive browser control via Chrome DevTools Protocol.
 import asyncio
 import base64
 import binascii
+import collections
+import contextlib
 import dataclasses
+import hashlib
 import json
 import time
 import typing as t
 import uuid
 from pathlib import PurePath
+from urllib.parse import urlsplit
 
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
@@ -38,8 +42,9 @@ from skyvern.forge.sdk.streaming.registries import (
 )
 from skyvern.forge.sdk.streaming.user_control import mark_user_control, release_user_control
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
-from skyvern.webeye.browser_errors import is_target_closed_message
+from skyvern.webeye.browser_errors import is_context_lost_message, is_target_closed_message
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.navigation import revalidate_redirect_chain, validate_navigation_destination
 
@@ -89,6 +94,13 @@ _TARGET_CLOSED_ERROR_TYPES = frozenset({"TargetClosedError", "CdpTargetClosedErr
 _PIPELINED_INPUT_KINDS = frozenset({"mouseEvent", "wheelEvent", "keyEvent"})
 _MAX_IN_FLIGHT_INPUT_DISPATCHES = 32
 _MAX_FILE_UPLOAD_BYTES = 30 * 1024 * 1024
+_MAX_CONSOLE_EXPRESSION_CHARS = 100_000
+_MAX_CONSOLE_REQUEST_ID_CHARS = 64
+_MAX_CONSOLE_RESULT_CHARS = 64_000
+_CONSOLE_EVALUATE_TIMEOUT_MS = 30_000
+_CONSOLE_OBJECT_GROUP = "skyvern-console"
+_CONSOLE_RATE_LIMIT_WINDOW_SECONDS = 10.0
+_CONSOLE_RATE_LIMIT_MAX_REQUESTS = 20
 
 
 def _input_kind_label(kind: object) -> str:
@@ -101,6 +113,11 @@ class CdpInputChannel:
     organization_id: str
     websocket: WebSocket
     interactor: t.Literal["agent", "user"] = "agent"
+    console_enabled: bool = False
+    console_authorization: t.Callable[[], t.Awaitable[bool]] | None = None
+    principal: RequestPrincipal | None = None
+    console_busy: bool = False
+    console_request_timestamps: collections.deque[float] = dataclasses.field(default_factory=collections.deque)
 
     def __post_init__(self) -> None:
         add_cdp_input_channel(self)
@@ -341,7 +358,9 @@ async def _reauthorize_stream_periodically(
         attempt_started_at = time.monotonic()
         timeout = grace if failure_started_at is None else max(0.001, grace - (attempt_started_at - failure_started_at))
         try:
-            authorized = await asyncio.wait_for(reauthorize(), timeout=timeout)
+            # Not wait_for: on Python 3.11 it drops a cancel that lands as the check ends, so the loop never stops.
+            async with asyncio.timeout(timeout):
+                authorized = await reauthorize()
         except asyncio.CancelledError:
             raise
         except PermissionError:
@@ -564,6 +583,169 @@ async def _dispatch_file_upload_event(page: object, msg: dict, websocket: WebSoc
     await websocket.send_json({"kind": "file-upload-complete"})
 
 
+def _truncate_console_text(text: str) -> str:
+    if len(text) <= _MAX_CONSOLE_RESULT_CHARS:
+        return text
+    return f"{text[:_MAX_CONSOLE_RESULT_CHARS]}… (truncated from {len(text):,} characters)"
+
+
+def _format_preview_value(prop: dict) -> str:
+    if prop.get("type") == "string":
+        return json.dumps(prop.get("value", ""), ensure_ascii=False)
+    value = prop.get("value")
+    if isinstance(value, str) and value:
+        return value
+    return str(prop.get("subtype") or prop.get("type") or "?")
+
+
+def _format_object_preview(preview: dict, description: str) -> str:
+    properties = [prop for prop in preview.get("properties") or [] if isinstance(prop, dict)]
+    is_array = preview.get("subtype") in {"array", "typedarray"}
+    if is_array:
+        body = ", ".join(_format_preview_value(prop) for prop in properties)
+    else:
+        body = ", ".join(f"{prop.get('name', '')}: {_format_preview_value(prop)}" for prop in properties)
+    if preview.get("overflow"):
+        body = f"{body}, …" if body else "…"
+    opening, closing = ("[", "]") if is_array else ("{", "}")
+    prefix = "" if description == "Object" else f"{description} "
+    return f"{prefix}{opening}{body}{closing}"
+
+
+def _format_console_value(remote_object: dict) -> str:
+    kind = remote_object.get("type")
+    subtype = remote_object.get("subtype")
+    description = remote_object.get("description")
+    if "unserializableValue" in remote_object:
+        return str(remote_object["unserializableValue"])
+    if kind == "undefined":
+        return "undefined"
+    if kind == "string":
+        return json.dumps(remote_object.get("value", ""), ensure_ascii=False)
+    if kind in {"number", "boolean"}:
+        return json.dumps(remote_object.get("value"))
+    if kind == "object" and subtype == "null":
+        return "null"
+    preview = remote_object.get("preview")
+    if kind == "object" and subtype not in {"node", "error"} and isinstance(preview, dict):
+        return _format_object_preview(preview, str(description or "Object"))
+    return str(description or kind or "unknown")
+
+
+def _url_origin(url: str) -> str | None:
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.hostname:
+        return parts.scheme or None
+    return f"{parts.scheme}://{parts.hostname}" + (f":{port}" if port else "")
+
+
+async def _evaluate_console_expression(cdp_session: CDPSession, expression: str) -> tuple[str, str]:
+    # Raw Runtime.evaluate runs in the page's main world, so page globals such as jQuery stay in scope;
+    # the driver's page.evaluate defaults to an isolated world where they are undefined.
+    started = time.monotonic()
+    try:
+        response = await asyncio.wait_for(
+            cdp_session.send(
+                "Runtime.evaluate",
+                {
+                    "expression": expression,
+                    "objectGroup": _CONSOLE_OBJECT_GROUP,
+                    "includeCommandLineAPI": True,
+                    "returnByValue": False,
+                    "generatePreview": True,
+                    "userGesture": True,
+                    "awaitPromise": True,
+                    "replMode": True,
+                    "timeout": _CONSOLE_EVALUATE_TIMEOUT_MS,
+                },
+            ),
+            timeout=_CONSOLE_EVALUATE_TIMEOUT_MS / 1000 + 5,
+        )
+    except TimeoutError:
+        return "timeout", f"No result after {_CONSOLE_EVALUATE_TIMEOUT_MS // 1000} seconds."
+    except Exception as error:
+        if _is_navigation_target_loss(error) or is_context_lost_message(str(error)):
+            return "navigated", "The page navigated before the code finished."
+        # Chrome reports a script it stopped at `timeout` as a bare protocol "Internal error".
+        if time.monotonic() - started >= _CONSOLE_EVALUATE_TIMEOUT_MS / 1000:
+            return "timeout", f"Stopped after {_CONSOLE_EVALUATE_TIMEOUT_MS // 1000} seconds."
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                cdp_session.send("Runtime.releaseObjectGroup", {"objectGroup": _CONSOLE_OBJECT_GROUP}),
+                timeout=2,
+            )
+
+    if not isinstance(response, dict):
+        return "error", "The browser returned no result."
+    details = response.get("exceptionDetails")
+    if isinstance(details, dict):
+        exception = details.get("exception")
+        if isinstance(exception, dict) and exception.get("description"):
+            message = str(exception["description"])
+        elif isinstance(exception, dict):
+            message = _format_console_value(exception)
+        else:
+            message = str(details.get("text") or "Uncaught error")
+        return "error", _truncate_console_text(message)
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return "error", "The browser returned no result."
+    return "ok", _truncate_console_text(_format_console_value(result))
+
+
+async def _run_console_request(
+    channel: CdpInputChannel,
+    cdp_session: CDPSession,
+    page_url: str,
+    request_id: str,
+    expression: str,
+    log_id_key: str,
+    log_id_value: str,
+) -> None:
+    started = time.monotonic()
+    status = "cancelled"
+    text = ""
+    cancelled = False
+    try:
+        status, text = await _evaluate_console_expression(cdp_session, expression)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    except Exception as error:
+        LOG.warning("Browser console evaluation failed", **{log_id_key: log_id_value}, error_type=type(error).__name__)
+        status, text = "error", "Couldn't run the code in the page."
+    finally:
+        channel.console_busy = False
+        principal = channel.principal
+        # The expression and its result are page and user data: log their size and digest, never their text.
+        with contained_effect("browser console evaluation audit log", **{log_id_key: log_id_value}):
+            LOG.info(
+                "Browser console evaluation",
+                **{log_id_key: log_id_value},
+                organization_id=channel.organization_id,
+                user_id=principal.user_id if principal else None,
+                impersonator_user_id=principal.impersonator_user_id if principal else None,
+                api_key_token_id=principal.api_key_token_id if principal else None,
+                auth_kind=str(principal.auth_kind) if principal else None,
+                page_origin=_url_origin(page_url),
+                expression_chars=len(expression),
+                expression_sha256=hashlib.sha256(expression.encode()).hexdigest(),
+                status=status,
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+        if not cancelled:
+            with contextlib.suppress(Exception):
+                await channel.websocket.send_json(
+                    {"kind": "evaluateResult", "id": request_id, "status": status, "text": text, "url": page_url}
+                )
+
+
 async def _dispatch_event(
     cdp_session: CDPSession,
     page: object,
@@ -644,6 +826,65 @@ async def _run_input_loop(
         finally:
             dispatch_semaphore.release()
 
+    async def start_console_request(msg: dict) -> None:
+        request_id = msg.get("id")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > _MAX_CONSOLE_REQUEST_ID_CHARS:
+            return
+
+        async def reject(status: str, text: str) -> None:
+            await websocket.send_json({"kind": "evaluateResult", "id": request_id, "status": status, "text": text})
+
+        expression = msg.get("expression")
+        if not channel.console_enabled:
+            await reject("unavailable", "The console isn't available for this session.")
+            return
+        if channel.interactor != "user":
+            await reject("rejected", "Take control of the browser to run code.")
+            return
+        if not isinstance(expression, str) or not expression.strip() or len(expression) > _MAX_CONSOLE_EXPRESSION_CHARS:
+            await reject("rejected", f"Enter code of up to {_MAX_CONSOLE_EXPRESSION_CHARS:,} characters.")
+            return
+        if channel.console_busy:
+            await reject("rejected", "Wait for the previous code to finish.")
+            return
+        now = time.monotonic()
+        cutoff = now - _CONSOLE_RATE_LIMIT_WINDOW_SECONDS
+        while channel.console_request_timestamps and channel.console_request_timestamps[0] < cutoff:
+            channel.console_request_timestamps.popleft()
+        if len(channel.console_request_timestamps) >= _CONSOLE_RATE_LIMIT_MAX_REQUESTS:
+            await reject("rejected", "Too many requests. Wait a moment and try again.")
+            return
+        channel.console_request_timestamps.append(now)
+        # Availability was decided at connect, but a role change or flag flip must take effect on an
+        # open socket, so every evaluation asks again.
+        try:
+            still_allowed = channel.console_authorization is not None and await channel.console_authorization()
+        except Exception:
+            LOG.warning("Browser console: authorization re-check failed", **{log_id_key: log_id_value}, exc_info=True)
+            await reject("error", "Couldn't confirm access to the console. Try again.")
+            return
+        if not still_allowed:
+            channel.console_enabled = False
+            await reject("unavailable", "The console isn't available for this session.")
+            await websocket.send_json({"kind": "console", "available": False})
+            return
+        try:
+            cdp_session = await input_session.get_session(force_refresh=True)
+        except Exception:
+            LOG.warning("Browser console: failed to resolve active page", **{log_id_key: log_id_value}, exc_info=True)
+            cdp_session = None
+        if cdp_session is None:
+            await reject("error", "There's no page to run the code in.")
+            return
+
+        channel.console_busy = True
+        page_url = getattr(input_session.page, "url", "") or ""
+        task = asyncio.create_task(
+            _run_console_request(channel, cdp_session, page_url, request_id, expression, log_id_key, log_id_value)
+        )
+        dispatch_tasks.add(task)
+        task.add_done_callback(dispatch_tasks.discard)
+
     try:
         while True:
             try:
@@ -671,6 +912,9 @@ async def _run_input_loop(
                 LOG.info("CDP input: cede-control received", **{log_id_key: log_id_value}, client_id=channel.client_id)
                 if controlled_browser_session_id is not None:
                     await release_user_control(channel.organization_id, controlled_browser_session_id, control_holder)
+                continue
+            if kind == "evaluate":
+                await start_console_request(msg)
                 continue
 
             if channel.interactor != "user":
@@ -749,6 +993,27 @@ async def _run_input_loop(
             await release_user_control(channel.organization_id, controlled_browser_session_id, control_holder)
 
 
+async def _configure_console_channel(
+    channel: CdpInputChannel,
+    websocket: WebSocket,
+    principal: RequestPrincipal | None,
+    organization_id: str,
+    resolve_browser_session_id: t.Callable[[], str | None],
+    **log_context: str,
+) -> None:
+    async def console_authorized() -> bool:
+        return await app.AGENT_FUNCTION.browser_session_console_enabled(
+            principal, organization_id, resolve_browser_session_id()
+        )
+
+    channel.console_authorization = console_authorized
+    try:
+        channel.console_enabled = await console_authorized()
+    except Exception:
+        LOG.warning("Browser console availability check failed", **log_context, exc_info=True)
+    await websocket.send_json({"kind": "console", "available": channel.console_enabled})
+
+
 @legacy_base_router.websocket("/stream/cdp_input/workflow_run/{workflow_run_id}")
 async def cdp_input_stream(
     websocket: WebSocket,
@@ -769,10 +1034,12 @@ async def cdp_input_stream(
         return
     assert client_id is not None
 
+    principal = get_request_principal()
     channel = CdpInputChannel(
         client_id=client_id,
         organization_id=organization_id,
         websocket=websocket,
+        principal=principal,
     )
 
     cdp_session: CDPSession | None = None
@@ -817,7 +1084,6 @@ async def cdp_input_stream(
             await websocket.close(code=4408, reason="browser_state_timeout")
             return
 
-        principal = get_request_principal()
         last_browser_session_id: str | None = None
 
         async def resolve_browser_session_id() -> str | None:
@@ -901,6 +1167,15 @@ async def cdp_input_stream(
         LOG.info("CDP input channel ready", workflow_run_id=workflow_run_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
 
+        await _configure_console_channel(
+            channel,
+            websocket,
+            principal,
+            organization_id,
+            lambda: last_browser_session_id,
+            workflow_run_id=workflow_run_id,
+        )
+
         await _run_input_loop(
             websocket,
             channel,
@@ -983,6 +1258,7 @@ async def cdp_input_browser_session_stream(
         client_id=client_id,
         organization_id=organization_id,
         websocket=websocket,
+        principal=principal,
     )
 
     input_session: ActivePageCdpInputSession | None = None
@@ -1043,6 +1319,15 @@ async def cdp_input_browser_session_stream(
 
         LOG.info("CDP input channel ready", browser_session_id=browser_session_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
+
+        await _configure_console_channel(
+            channel,
+            websocket,
+            principal,
+            organization_id,
+            lambda: browser_session_id,
+            browser_session_id=browser_session_id,
+        )
 
         await _run_input_loop(
             websocket,

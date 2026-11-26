@@ -30,6 +30,7 @@ import skyvern.forge.sdk.artifact.storage.base as storage_base_module
 import skyvern.forge.sdk.artifact.storage.local as local_storage_module
 import skyvern.forge.sdk.workflow.service as workflow_service_module
 import skyvern.library.embedded_server_factory as embedded_server_module
+import skyvern.webeye.utils.page as page_utils
 from skyvern.config import settings
 from skyvern.constants import NAVIGATION_MAX_RETRY_TIME
 from skyvern.core.script_generations import skyvern_page as skyvern_page_module
@@ -47,6 +48,7 @@ from skyvern.exceptions import (
     SkyvernHTTPException,
     StaleFrameSelectionError,
 )
+from skyvern.forge import app
 from skyvern.forge.sdk.api import files as files_module
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact
@@ -66,6 +68,7 @@ from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess
 from skyvern.webeye.skycdp.facade.page import Frame as CdpFrame
 from skyvern.webeye.utils.page import SkyvernFrame
+from tests.unit._script_page_fakes import AiStub, ScrapedPageStub, build_navigation_page
 from tests.unit._task_block_fakes import run_bound_browser_state
 from tests.unit.conftest import CARD_SECRET_RUN_ID
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -89,10 +92,6 @@ def create_mock_page() -> _PageStub:
     return _PageStub()
 
 
-class _AiStub:
-    pass
-
-
 def _make_script_page(scraped_page, ai) -> ScriptSkyvernPage:
     with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
         return ScriptSkyvernPage(scraped_page=scraped_page, page=create_mock_page(), ai=ai)
@@ -112,11 +111,6 @@ def _selected_engine():
     return selection
 
 
-class _ScrapedPageStub:
-    def __init__(self) -> None:
-        self._browser_state = SimpleNamespace(begin_navigation=MagicMock(), record_navigation_result=AsyncMock())
-
-
 @pytest.fixture(autouse=True)
 def no_cached_action_delay(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "CACHED_ACTION_DELAY_SECONDS", 0)
@@ -124,21 +118,12 @@ def no_cached_action_delay(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def mock_scraped_page():
-    return _ScrapedPageStub()
+    return ScrapedPageStub()
 
 
 @pytest.fixture
 def mock_ai():
-    return _AiStub()
-
-
-def _build_navigation_page(page_type, mock_scraped_page, mock_ai):
-    raw_page = MagicMock(spec=["goto"])
-    raw_page.goto = AsyncMock()
-    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
-        if page_type is ScriptSkyvernPage:
-            return page_type(scraped_page=mock_scraped_page, page=raw_page, ai=mock_ai), raw_page
-        return page_type(page=raw_page, ai=mock_ai), raw_page
+    return AiStub()
 
 
 @pytest.mark.asyncio
@@ -151,7 +136,7 @@ def _build_navigation_page(page_type, mock_scraped_page, mock_ai):
     ],
 )
 async def test_page_navigation_rejects_internal_destination(page_type, url, mock_scraped_page, mock_ai):
-    page, raw_page = _build_navigation_page(page_type, mock_scraped_page, mock_ai)
+    page, raw_page = build_navigation_page(page_type, mock_scraped_page, mock_ai)
 
     with pytest.raises(SkyvernHTTPException):
         await page.goto(url)
@@ -162,7 +147,7 @@ async def test_page_navigation_rejects_internal_destination(page_type, url, mock
 @pytest.mark.asyncio
 @pytest.mark.parametrize("page_type", [SkyvernPage, ScriptSkyvernPage])
 async def test_page_navigation_accepts_public_destination(page_type, mock_scraped_page, mock_ai):
-    page, raw_page = _build_navigation_page(page_type, mock_scraped_page, mock_ai)
+    page, raw_page = build_navigation_page(page_type, mock_scraped_page, mock_ai)
 
     await page.goto("https://93.184.216.34/path")
 
@@ -176,7 +161,7 @@ async def test_page_navigation_accepts_public_destination(page_type, mock_scrape
 
 @pytest.mark.asyncio
 async def test_script_page_reports_deferred_navigation_failure(mock_scraped_page, mock_ai):
-    page, raw_page = _build_navigation_page(ScriptSkyvernPage, mock_scraped_page, mock_ai)
+    page, raw_page = build_navigation_page(ScriptSkyvernPage, mock_scraped_page, mock_ai)
     error = RuntimeError("net::ERR_INVALID_AUTH_CREDENTIALS")
     raw_page.goto = AsyncMock(side_effect=error)
 
@@ -205,7 +190,7 @@ async def test_script_page_stops_retrying_navigation_after_native_browser_loss(
     browser_state, context = run_bound_browser_state("wr_script")
     context._skyvern_cdp_download_interceptor = None
     scraped_page = SimpleNamespace(_browser_state=browser_state)
-    page, raw_page = _build_navigation_page(ScriptSkyvernPage, scraped_page, mock_ai)
+    page, raw_page = build_navigation_page(ScriptSkyvernPage, scraped_page, mock_ai)
 
     async def goto(url: str, **_: object) -> None:
         if seam == "native_close_during_goto":
@@ -1036,9 +1021,17 @@ class _FillablePageStub(_PageStub):
     def __init__(self) -> None:
         super().__init__()
         self.events: list[str] = []
+        self.input_type = "text"
         self.field = MagicMock()
         self.field.wait_for = AsyncMock()
-        self.field.evaluate = AsyncMock(side_effect=lambda *_args, **_kwargs: self.events.append("mask"))
+
+        async def evaluate(script: str, *_args: Any, **_kwargs: Any) -> bool | None:
+            if script == page_utils._IS_PASSWORD_INPUT_SCRIPT:
+                return self.input_type == "password"
+            self.events.append("mask")
+            return None
+
+        self.field.evaluate = evaluate
         self.field.fill = AsyncMock(side_effect=lambda *_args, **_kwargs: self.events.append("fill"))
 
     def locator(self, _selector: str) -> SimpleNamespace:
@@ -1086,18 +1079,59 @@ async def test_cached_card_fill_masks_a_field_that_renders_late(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("field", "events"), [("card_number", ["mask", "fill"]), ("card_holder_name", ["fill"])])
-async def test_cached_fill_masks_a_vault_card_field_before_writing_it(
-    card_secret_run: dict[str, str], mock_scraped_page, mock_ai, field: str, events: list[str]
+@pytest.mark.parametrize(
+    ("field", "mask_secrets", "input_type", "events"),
+    [
+        pytest.param("card_number", False, "text", ["mask", "fill"], id="card-data-without-mask-secrets"),
+        pytest.param("card_holder_name", False, "text", ["fill"], id="credential-without-mask-secrets"),
+        pytest.param("card_holder_name", True, "text", ["mask", "fill"], id="credential-with-mask-secrets"),
+        pytest.param("card_holder_name", True, "password", ["fill"], id="credential-in-a-password-box"),
+        pytest.param("secret_parameter", False, "text", ["fill"], id="secret-parameter-without-mask-secrets"),
+        pytest.param("secret_parameter", True, "text", ["mask", "fill"], id="secret-parameter-with-mask-secrets"),
+        pytest.param("code_digit", False, "text", ["fill"], id="code-digit-without-mask-secrets"),
+        pytest.param("code_digit", True, "text", ["mask", "fill"], id="code-digit-with-mask-secrets"),
+        pytest.param("plain", True, "text", ["fill"], id="plain-text-with-mask-secrets"),
+        pytest.param("code_without_ai", True, "text", ["mask", "fill"], id="code-without-ai-with-mask-secrets"),
+        pytest.param("code_direct", True, "text", ["mask", "fill"], id="code-direct-with-mask-secrets"),
+        pytest.param("code_direct", False, "text", ["fill"], id="code-direct-without-mask-secrets"),
+    ],
+)
+async def test_cached_fill_masks_typed_secrets_before_writing_them(
+    card_secret_run: dict[str, str],
+    mock_scraped_page,
+    mock_ai,
+    field: str,
+    mask_secrets: bool,
+    input_type: str,
+    events: list[str],
 ) -> None:
     """A cached script fills by selector without the action handler and stores a screenshot right after, so
-    the fill itself has to mask card data when the workflow has not opted into Mask Secrets (SKY-19351)."""
+    the fill itself masks card data always, and under Mask Secrets what the step engine masks, minus password boxes."""
+    run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[CARD_SECRET_RUN_ID]
+    run_context.mask_secrets = mask_secrets
+    values = {
+        **card_secret_run,
+        "secret_parameter": run_context.register_secret_value("sk-test-parameter-value"),
+        "code_digit": ResolvedSensitiveValue("7"),
+        "plain": "Springfield",
+    }
     page = _FillablePageStub()
+    page.input_type = input_type
     with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
         script_page = ScriptSkyvernPage(scraped_page=mock_scraped_page, page=page, ai=mock_ai)
 
+    code_placeholder = "placeholder_AbCd_totp"
+    script_page._resolve_totp_placeholder_or_raise = AsyncMock(
+        side_effect=lambda value, **_kwargs: "654321" if value == code_placeholder else value
+    )
+
     with skyvern_context.scoped(SkyvernContext(workflow_run_id=CARD_SECRET_RUN_ID)):
-        await script_page._input_text("#field", card_secret_run[field], _skip_element_prep=True)
+        if field == "code_without_ai":
+            await script_page._input_text("#field", code_placeholder, ai=None, _skip_element_prep=True)
+        elif field == "code_direct":
+            await script_page.fill("#field", code_placeholder, mode="direct")
+        else:
+            await script_page._input_text("#field", values[field], _skip_element_prep=True)
 
     assert page.events == events
 
@@ -3264,7 +3298,7 @@ def _run_bound_script_page(ai: object, locators: dict[str, object]) -> tuple[Scr
 async def test_cached_click_dispatches_nothing_after_native_browser_loss(
     monkeypatch: pytest.MonkeyPatch, seam: str, expected: list[int]
 ) -> None:
-    ai = _AiStub()
+    ai = AiStub()
     ai.ai_click = AsyncMock(return_value="xpath=//button")
     locator = MagicMock()
     locator.first = locator
@@ -3341,7 +3375,7 @@ async def test_cached_click_dispatches_nothing_after_native_browser_loss(
 async def test_fill_from_mapping_stops_at_the_field_after_native_browser_loss(
     browser_lost: bool, mapping: dict[int, str]
 ) -> None:
-    ai = _AiStub()
+    ai = AiStub()
     ai.ai_input_text = AsyncMock(return_value="Noor")
     name, color = MagicMock(), MagicMock(select_option=AsyncMock())
     name.first = name
@@ -3373,7 +3407,7 @@ async def test_fill_from_mapping_stops_at_the_field_after_native_browser_loss(
 async def test_fill_multipage_form_reports_no_pages_after_native_browser_loss(
     monkeypatch: pytest.MonkeyPatch, seam: str
 ) -> None:
-    page, browser_state, browser_context = _run_bound_script_page(_AiStub(), {})
+    page, browser_state, browser_context = _run_bound_script_page(AiStub(), {})
     pages = [[{"selector": f"#{name}", "type": "text", "tag": "input", "label": name}] for name in ("name", "email")]
     extract_form_fields = AsyncMock(side_effect=[pages[0], pages[0], pages[1], pages[1]])
 
@@ -3600,6 +3634,7 @@ class TestScriptSkyvernPageMagicLink:
                 organization_id="org_1",
                 workflow_run_id="wr_1",
                 task_id="task_1",
+                otp_request_id="otpr_script_magic_link",
             )
         )
         return skyvern_context
@@ -3619,6 +3654,7 @@ class TestScriptSkyvernPageMagicLink:
             ctx.reset()
 
         assert state["polled_with"]["expected_otp_type"] is OTPType.MAGIC_LINK
+        assert state["polled_with"]["otp_request_id"] == "otpr_script_magic_link"
         assert state["polled_with"]["task_url"] == "https://portal.example.com/login"
         assert script_page.page.url == "https://customer.auth0.com/callback"
         assert state["navigations"] == [link]
@@ -4622,14 +4658,28 @@ async def test_polled_script_code_is_registered_so_its_saved_row_is_marked(monke
     monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager, raising=False)
     monkeypatch.setattr(module, "get_actual_value_of_parameter_if_secret", lambda _workflow_run_id, value: value)
     monkeypatch.setattr(module, "render_template", lambda value: value)
-    monkeypatch.setattr(module, "poll_otp_value", AsyncMock(return_value=OTPValue(value="482913", type=OTPType.TOTP)))
+    polled_with: dict[str, object] = {}
+
+    async def poll(**kwargs: object) -> OTPValue:
+        polled_with.update(kwargs)
+        return OTPValue(value="482913", type=OTPType.TOTP)
+
+    monkeypatch.setattr(module, "poll_otp_value", poll)
     script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
     script_page.page = SimpleNamespace()
 
-    with skyvern_context.scoped(SkyvernContext(organization_id="org_1", workflow_run_id="wr_1", task_id="tsk_1")):
+    with skyvern_context.scoped(
+        SkyvernContext(
+            organization_id="org_1",
+            workflow_run_id="wr_1",
+            task_id="tsk_1",
+            otp_request_id="otpr_script_value",
+        )
+    ):
         value = await script_page.get_actual_value("", totp_identifier="inbox@example.com")
         codes = manager.get_one_time_codes_for_run("wr_1")
 
     typed = InputTextAction(element_id="otp", text=value, workflow_run_id="wr_1")
     assert value == "482913"
+    assert polled_with["otp_request_id"] == "otpr_script_value"
     assert skyvern_context.action_for_multi_field_totp_persistence(typed, codes).totp_code_required

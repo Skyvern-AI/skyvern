@@ -28,6 +28,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
     is_sensitive_workflow_parameter,
 )
+from skyvern.forge.sdk.workflow.response_value_caps import is_non_completed_envelope
 from skyvern.schemas.run_enums import TERMINAL_STATUSES
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import BlockType
@@ -261,8 +262,9 @@ def _scan_output_value(value: Any, stats: dict[str, Any], depth: int = 0) -> Non
         return
 
     if isinstance(value, dict):
+        payload_counts = not is_non_completed_envelope(value)
         for key, nested_value in value.items():
-            if key == "extracted_information" and nested_value is not None:
+            if key == "extracted_information" and nested_value is not None and payload_counts:
                 stats["has_extracted_information"] = True
             if key in _SCREENSHOT_LIST_KEYS and isinstance(nested_value, list):
                 stats["nested_screenshot_count"] += len(nested_value)
@@ -1870,6 +1872,8 @@ async def skyvern_workflow_create(
 
     Skill instructions can be stored in `workflow_definition.workflow_system_prompt`; see
     skyvern_workflow_get for the read/preserve flow and format caveats.
+
+    If the user asks Ember or Copilot to build the workflow, use skyvern_ember_send instead.
     """
     if format not in ("json", "yaml", "auto"):
         return make_result(

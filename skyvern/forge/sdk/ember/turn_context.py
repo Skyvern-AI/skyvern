@@ -1,0 +1,409 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+import structlog
+import yaml
+from pydantic import BaseModel, ConfigDict, Field
+
+from skyvern.forge.sdk.ember.request_policy import (
+    RequestPolicy,
+    build_transcript_context,
+    redact_raw_secrets_for_prompt,
+)
+from skyvern.forge.sdk.ember.workflow_change_summary import WorkflowChangeKind, summarize_user_workflow_change
+from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.ember import (
+    MAX_ATTACHED_FILES_PER_MESSAGE,
+    EmberAttachedFile,
+    EmberChatHistoryMessage,
+    EmberChatSender,
+)
+from skyvern.forge.sdk.workflow.code_block_steps import (
+    code_block_labels_awaiting_goal_rebuild,
+    code_block_labels_with_user_owned_goal,
+)
+from skyvern.utils.raw_secret_redaction import redact_secretlike_filename
+from skyvern.utils.yaml_loader import safe_load_no_dates
+
+LOG = structlog.get_logger()
+
+TurnContextSection = Literal[
+    "current_workflow",
+    "latest_assistant_proposal",
+    "latest_run_result",
+    "credential_metadata",
+    "attached_files",
+]
+
+
+class TurnContextOmission(BaseModel):
+    context_key: TurnContextSection
+    reason: Literal["unavailable", "truncated_to_budget"]
+    detail: str = ""
+
+
+class WorkflowContext(BaseModel):
+    yaml: str
+    original_chars: int
+    truncated: bool = False
+
+
+class ProposalContext(BaseModel):
+    latest_assistant_proposal: str
+    original_chars: int
+    truncated: bool = False
+
+
+class WorkflowChangeContext(BaseModel):
+    kind: str
+    rendered_summary: str
+    structural_diff_unavailable: bool = False
+
+
+class RunnableDraftContext(BaseModel):
+    rendered_summary: str
+    block_labels: list[str] = Field(default_factory=list)
+
+
+class UserGoalContext(BaseModel):
+    rendered_summary: str
+    block_labels: list[str] = Field(default_factory=list)
+
+
+class TranscriptContext(BaseModel):
+    earliest_user_turn: str
+    latest_prior_user_turn: str
+    latest_assistant_turn: str
+    retained_history: str
+    omitted_any: bool
+
+
+EMBER_TESTS_ENDED_AFTER_THEIR_TURN_KEY = "copilot_tests_ended_after_their_turn"
+
+
+class RunContext(BaseModel):
+    """The prior run, typed. A rendered sentence cannot say which error code fired or which line
+    raised, and those are the facts a repair acts on."""
+
+    packet: dict[str, Any] | None = None
+
+
+class CredentialMetadata(BaseModel):
+    credential_id: str
+    name: str
+    credential_type: str
+    vault_type: str | None = None
+    tested_url: str | None = None
+    browser_profile_id: str | None = None
+
+
+class CredentialContext(BaseModel):
+    requested_refs: list[str] = Field(default_factory=list)
+    invalid_credential_ids: list[str] = Field(default_factory=list)
+    credentials: list[CredentialMetadata] = Field(default_factory=list)
+    omitted_credential_count: int = 0
+
+
+class AttachedFileContext(BaseModel):
+    files: list[EmberAttachedFile] = Field(default_factory=list)
+    omitted_file_count: int = 0
+
+    def render_prompt_block(self) -> str:
+        lines: list[str] = []
+        for attached in self.files:
+            name = redact_secretlike_filename(attached.filename) or "(name unavailable)"
+            if attached.available:
+                lines.append(f"- {name} (file_id: {attached.file_id})")
+            else:
+                lines.append(f"- {name} (file_id: {attached.file_id}) — NO LONGER AVAILABLE")
+        if self.omitted_file_count:
+            lines.append(f"- ...and {self.omitted_file_count} older attachment(s) not listed")
+        return "\n".join(lines)
+
+
+class TurnContextPacket(BaseModel):
+    workflow_context: WorkflowContext | None = None
+    proposal_context: ProposalContext | None = None
+    workflow_change_context: WorkflowChangeContext | None = None
+    runnable_draft_context: RunnableDraftContext | None = None
+    user_goal_context: UserGoalContext | None = None
+    transcript_context: TranscriptContext
+    run_context: RunContext | None = None
+    copilot_tests_ended_after_their_turn: list[RunContext] | None = None
+    credential_context: CredentialContext | None = None
+    attached_file_context: AttachedFileContext | None = None
+    omissions: list[TurnContextOmission] = Field(default_factory=list)
+
+    def to_trace_data(self) -> dict[str, Any]:
+        section_fields = (
+            "workflow_context",
+            "proposal_context",
+            "workflow_change_context",
+            "runnable_draft_context",
+            "user_goal_context",
+            "run_context",
+            "copilot_tests_ended_after_their_turn",
+            "credential_context",
+            "attached_file_context",
+        )
+        return {
+            "sections": [field for field in section_fields if getattr(self, field) is not None],
+            "omissions": [omission.context_key for omission in self.omissions],
+            "omission_reasons": [omission.reason for omission in self.omissions],
+            "workflow_truncated": bool(self.workflow_context and self.workflow_context.truncated),
+            "proposal_truncated": bool(self.proposal_context and self.proposal_context.truncated),
+            "workflow_change_kind": self.workflow_change_context.kind if self.workflow_change_context else None,
+        }
+
+
+class TurnContextInputs(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    request_policy: RequestPolicy
+    user_message: str = ""
+    workflow_yaml: str = ""
+    prior_workflow_yaml: str = ""
+    chat_history: list[EmberChatHistoryMessage] = Field(default_factory=list)
+    prior_run_packet: dict[str, Any] | None = None
+    copilot_test_packets: list[dict[str, Any]] = Field(default_factory=list)
+    attached_files: list[EmberAttachedFile] = Field(default_factory=list)
+
+
+def _dedupe_nonempty(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _bounded_text(value: str, char_budget: int) -> tuple[str, int, bool]:
+    redacted = redact_raw_secrets_for_prompt(value or "")
+    original_chars = len(redacted)
+    if original_chars <= char_budget:
+        return redacted, original_chars, False
+    suffix = "...<truncated>"
+    if char_budget <= len(suffix):
+        return redacted[:char_budget], original_chars, True
+    return redacted[: char_budget - len(suffix)].rstrip() + suffix, original_chars, True
+
+
+def _top_level_block_labels(workflow_yaml: str) -> list[str]:
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    definition = parsed.get("workflow_definition")
+    if not isinstance(definition, dict):
+        return []
+    blocks = definition.get("blocks")
+    if not isinstance(blocks, list):
+        return []
+    labels: list[str] = []
+    for block in blocks:
+        if isinstance(block, dict):
+            label = block.get("label")
+            if isinstance(label, str) and label:
+                labels.append(label)
+    return labels
+
+
+def _latest_assistant_turn(chat_history: list[EmberChatHistoryMessage]) -> str:
+    for message in reversed(chat_history):
+        if message.sender == EmberChatSender.AI and (message.content or "").strip():
+            return message.content
+    return ""
+
+
+def _safe_credential_metadata(credential: Credential) -> CredentialMetadata:
+    return CredentialMetadata(
+        credential_id=credential.credential_id,
+        name=credential.name,
+        credential_type=str(credential.credential_type),
+        vault_type=str(credential.vault_type) if credential.vault_type else None,
+        tested_url=credential.tested_url,
+        browser_profile_id=credential.browser_profile_id,
+    )
+
+
+class TurnContextAssembler:
+    def __init__(
+        self,
+        *,
+        workflow_char_budget: int = 12_000,
+        proposal_char_budget: int = 2_000,
+        credential_count_budget: int = 20,
+        attached_file_count_budget: int = MAX_ATTACHED_FILES_PER_MESSAGE,
+    ) -> None:
+        self.workflow_char_budget = workflow_char_budget
+        self.proposal_char_budget = proposal_char_budget
+        self.credential_count_budget = credential_count_budget
+        self.attached_file_count_budget = attached_file_count_budget
+
+    def assemble(self, inputs: TurnContextInputs) -> TurnContextPacket:
+        omissions: list[TurnContextOmission] = []
+        transcript = build_transcript_context(inputs.chat_history, inputs.user_message)
+        transcript_context = TranscriptContext(
+            earliest_user_turn=transcript.earliest_user_turn,
+            latest_prior_user_turn=transcript.latest_prior_user_turn,
+            latest_assistant_turn=transcript.latest_assistant_turn,
+            retained_history=transcript.retained_history,
+            omitted_any=transcript.omitted_any,
+        )
+
+        workflow_context: WorkflowContext | None = None
+        proposal_context: ProposalContext | None = None
+        workflow_change_context: WorkflowChangeContext | None = None
+        run_context: RunContext | None = None
+
+        if inputs.workflow_yaml.strip():
+            yaml_text, original_chars, truncated = _bounded_text(inputs.workflow_yaml, self.workflow_char_budget)
+            workflow_context = WorkflowContext(
+                yaml=yaml_text,
+                original_chars=original_chars,
+                truncated=truncated,
+            )
+            if truncated:
+                omissions.append(
+                    TurnContextOmission(
+                        context_key="current_workflow",
+                        reason="truncated_to_budget",
+                        detail=f"workflow_yaml exceeded {self.workflow_char_budget} chars",
+                    )
+                )
+        else:
+            omissions.append(TurnContextOmission(context_key="current_workflow", reason="unavailable"))
+
+        latest_proposal = _latest_assistant_turn(inputs.chat_history)
+        if latest_proposal:
+            proposal, original_chars, truncated = _bounded_text(latest_proposal, self.proposal_char_budget)
+            proposal_context = ProposalContext(
+                latest_assistant_proposal=proposal,
+                original_chars=original_chars,
+                truncated=truncated,
+            )
+            if truncated:
+                omissions.append(
+                    TurnContextOmission(
+                        context_key="latest_assistant_proposal",
+                        reason="truncated_to_budget",
+                        detail=f"latest assistant proposal exceeded {self.proposal_char_budget} chars",
+                    )
+                )
+
+        if inputs.prior_workflow_yaml.strip():
+            change_summary = summarize_user_workflow_change(
+                prior_yaml=inputs.prior_workflow_yaml,
+                current_yaml=inputs.workflow_yaml,
+            )
+            # Only surface the section when the user actually edited the workflow.
+            # An unchanged or first-turn baseline carries no signal the agent acts on.
+            if change_summary.kind is WorkflowChangeKind.USER_MODIFIED_SINCE_LAST_TURN:
+                workflow_change_context = WorkflowChangeContext(
+                    kind=change_summary.kind.value,
+                    rendered_summary=change_summary.render_prompt_block(),
+                    structural_diff_unavailable=change_summary.structural_diff_unavailable,
+                )
+
+        runnable_draft_context = self._runnable_draft_context(inputs)
+        user_goal_context = self._user_goal_context(inputs)
+
+        if inputs.prior_run_packet:
+            run_context = RunContext(packet=inputs.prior_run_packet)
+        else:
+            omissions.append(TurnContextOmission(context_key="latest_run_result", reason="unavailable"))
+
+        credential_context, credential_omissions = self._credential_context(inputs.request_policy)
+        omissions.extend(credential_omissions)
+
+        attached_file_context, attached_file_omissions = self._attached_file_context(inputs.attached_files)
+        omissions.extend(attached_file_omissions)
+
+        packet = TurnContextPacket(
+            workflow_context=workflow_context,
+            proposal_context=proposal_context,
+            workflow_change_context=workflow_change_context,
+            runnable_draft_context=runnable_draft_context,
+            user_goal_context=user_goal_context,
+            transcript_context=transcript_context,
+            run_context=run_context,
+            copilot_tests_ended_after_their_turn=(
+                [RunContext(packet=packet) for packet in inputs.copilot_test_packets] or None
+            ),
+            credential_context=credential_context,
+            attached_file_context=attached_file_context,
+            omissions=omissions,
+        )
+
+        LOG.info(
+            "assembled ember turn context packet",
+            **{f"turn_context_{key}": value for key, value in packet.to_trace_data().items()},
+        )
+        return packet
+
+    def _user_goal_context(self, inputs: TurnContextInputs) -> UserGoalContext | None:
+        labels = code_block_labels_awaiting_goal_rebuild(inputs.workflow_yaml)
+        if not labels:
+            return None
+        owned_labels = code_block_labels_with_user_owned_goal(inputs.workflow_yaml)
+        summary = (
+            "The user changed the Goal on these code blocks and has not applied it yet: "
+            f"{', '.join(labels)}. Their Goal text is what the block is for; the saved code still does what the "
+            "previous Goal said. The user applies a new Goal from the block, which sends its own request. "
+            f"A Goal you submit for any user-owned block ({', '.join(owned_labels)}) is discarded; the Goal "
+            "field on the block is where the user edits it."
+        )
+        return UserGoalContext(rendered_summary=summary, block_labels=labels)
+
+    def _runnable_draft_context(self, inputs: TurnContextInputs) -> RunnableDraftContext | None:
+        if not inputs.request_policy.allow_run_blocks:
+            return None
+        if _top_level_block_labels(inputs.workflow_yaml):
+            return None
+        labels = _top_level_block_labels(inputs.prior_workflow_yaml)
+        if not labels:
+            return None
+        labels_csv = ", ".join(labels)
+        summary = (
+            "A prior turn produced an uncommitted workflow draft. It is not the current canvas workflow. "
+            f"The draft remains runnable by its top-level block labels: {labels_csv}."
+        )
+        return RunnableDraftContext(rendered_summary=summary, block_labels=labels)
+
+    def _credential_context(self, request_policy: RequestPolicy) -> tuple[CredentialContext, list[TurnContextOmission]]:
+        omissions: list[TurnContextOmission] = []
+        credentials = request_policy.resolved_credentials[: self.credential_count_budget]
+        omitted_count = max(len(request_policy.resolved_credentials) - len(credentials), 0)
+        if omitted_count:
+            omissions.append(
+                TurnContextOmission(
+                    context_key="credential_metadata",
+                    reason="truncated_to_budget",
+                    detail=f"{omitted_count} credential metadata entries omitted",
+                )
+            )
+        if not request_policy.resolved_credentials and not request_policy.credential_refs:
+            omissions.append(TurnContextOmission(context_key="credential_metadata", reason="unavailable"))
+        return CredentialContext(
+            requested_refs=_dedupe_nonempty(request_policy.credential_refs),
+            invalid_credential_ids=_dedupe_nonempty(request_policy.invalid_credential_ids),
+            credentials=[_safe_credential_metadata(credential) for credential in credentials],
+            omitted_credential_count=omitted_count,
+        ), omissions
+
+    def _attached_file_context(
+        self, attached_files: list[EmberAttachedFile]
+    ) -> tuple[AttachedFileContext | None, list[TurnContextOmission]]:
+        if not attached_files:
+            return None, []
+        kept = attached_files[: self.attached_file_count_budget]
+        omitted_count = len(attached_files) - len(kept)
+        omissions = []
+        if omitted_count:
+            omissions.append(
+                TurnContextOmission(
+                    context_key="attached_files",
+                    reason="truncated_to_budget",
+                    detail=f"{omitted_count} attached file entries omitted",
+                )
+            )
+        return AttachedFileContext(files=kept, omitted_file_count=omitted_count), omissions

@@ -36,6 +36,24 @@ def resolve_schema_type(schema_type: str | list[Any] | None, path: str) -> str |
     return str(schema_type).lower() if schema_type is not None else None
 
 
+def json_type_name(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return type(value).__name__
+
+
 def get_default_value_for_type(schema_type: str | list[Any] | None, path: str = "root") -> Any:
     """Get a default value based on JSON schema type."""
     normalized_type = resolve_schema_type(schema_type, path)
@@ -246,6 +264,13 @@ def _filter_invalid_array_items(data: list[Any], schema: dict[str, Any]) -> list
         LOG.info(f"Removed {removed_count} invalid array items")
 
     return filtered
+
+
+def expected_extraction_root(schema: dict[str, Any] | list | str | None) -> str | None:
+    if not isinstance(schema, dict):
+        return "text"
+    root_type = resolve_schema_type(schema.get("type"), "root")
+    return "object" if root_type == "object" or "properties" in schema else root_type
 
 
 def extraction_shape_matches(value: Any, schema: dict[str, Any] | list | str | None) -> bool:

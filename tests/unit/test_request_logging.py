@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sys
 import threading
 import typing
@@ -36,6 +37,7 @@ from skyvern.forge.request_logging import (
     RequestLoggingMiddleware,
     _client_ip_from_headers,
     _is_loggable_content_type,
+    _is_run_payload_endpoint,
     _sanitize_body,
     _sanitize_headers,
     _sanitize_response_body,
@@ -46,7 +48,7 @@ from skyvern.forge.request_logging import (
     set_request_organization,
 )
 from skyvern.forge.sdk.core.run_submission_gate import RunSubmissionGate
-from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_routes
+from skyvern.forge.sdk.routes import ember as ember_routes
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services.org_auth_service import apply_request_org_context
 
@@ -74,13 +76,160 @@ def test_onboarding_bodies_are_opaque_even_when_malformed(method: str, path: str
 
 
 @pytest.mark.parametrize(
-    "body", ['{"type":"session.removed","data":{"user":{"email_addresses":[{"email_address":"user@example.com"}]}}}']
+    ("path", "body"),
+    [
+        (
+            "/api/v1/clerk-webhook",
+            '{"type":"session.removed","data":{"user":{"email_addresses":[{"email_address":"user@example.com"}]}}}',
+        ),
+        ("/v1/powerbi/dax-assist/suggest", '{"request":"sales for Jane Doe","query":"EVALUATE Sales"}'),
+        ("/api/v1/powerbi/dax-assist/suggest", '{"request":"sales for Jane Doe","query":"EVALUATE Sales"}'),
+        ("/v1/powerbi/dax-assist/preview", '{"query":"EVALUATE Sales","rows":[{"Name":"Jane Doe"}]}'),
+        ("/api/v1/powerbi/dax-assist/preview/", '{"query":"EVALUATE Sales","rows":[{"Name":"Jane Doe"}]}'),
+    ],
+    ids=["identity_provider_webhook", "dax_suggest", "api_dax_suggest", "dax_preview", "api_dax_preview"],
 )
-def test_identity_provider_webhook_bodies_are_opaque(body: str) -> None:
-    request = Request(
-        {"type": "http", "method": "POST", "path": "/api/v1/clerk-webhook", "headers": [], "query_string": b""}
-    )
+def test_sensitive_post_bodies_are_opaque(path: str, body: str) -> None:
+    request = Request({"type": "http", "method": "POST", "path": path, "headers": [], "query_string": b""})
     assert _sanitize_body(request, body.encode(), "application/json") == REDACTED
+    assert _sanitize_response_body(request, body, "application/json") == REDACTED
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body", "expected"),
+    [
+        (
+            "POST",
+            "/v1/run/workflows",
+            '{"workflow_id":"wpid_1","parameters":{"name":"Jane Doe"}}',
+            {"workflow_id": "wpid_1", "parameters": REDACTED},
+        ),
+        (
+            "POST",
+            "/v1/run/workflows/",
+            '{"run_id":"wr_1","status":"queued","run_request":{"parameters":{"dob":"1990-01-01"},"prompt":"p"}}',
+            {"run_id": "wr_1", "status": "queued", "run_request": {"parameters": REDACTED, "prompt": REDACTED}},
+        ),
+        (
+            "POST",
+            "/api/v1/workflow_run_groups",
+            '{"items":[{"parameters":{"ssn":"123-45-6789"}}],"workflow_id":"wpid_1"}',
+            {"items": [{"parameters": REDACTED}], "workflow_id": "wpid_1"},
+        ),
+        (
+            "POST",
+            "/api/v1/tasks",
+            '{"url":"https://h.invalid","navigation_payload":{"zip":"94105"},"navigation_goal":"apply as Jane"}',
+            {"url": "https://h.invalid", "navigation_payload": REDACTED, "navigation_goal": REDACTED},
+        ),
+        (
+            "PUT",
+            "/v1/workflows/wpid_1/schedules/ws_1",
+            '{"detail":"Missing schedule parameters for workflow wpid_1","parameters":{"a":"b"}}',
+            {"detail": "Missing schedule parameters for workflow wpid_1", "parameters": REDACTED},
+        ),
+        (
+            "POST",
+            "/v1/run/tasks",
+            '{"url":"https://h.invalid/p?email=jane%40x.invalid#f","intention":"type 94105","run_metadata":{"k":"v"}}',
+            {"url": "https://h.invalid/p?[query:email]", "intention": REDACTED, "run_metadata": REDACTED},
+        ),
+        ("POST", "/v1/run/tasks", "prompt=apply as Jane Doe", REDACTED),
+        ("POST", "/v1/run/tasks", '{"items":' * 5000 + "1" + "}" * 5000, REDACTED),
+        ("POST", "/v1/run/tasks", '{"n":' + "1" * 5000 + "}", REDACTED),
+        (
+            "POST",
+            "/v1/run/workflows/blocks",
+            '{"workflow_id":"wpid_1","block_labels":["b1"],"block_outputs":{"upstream":"sample"}}',
+            {"workflow_id": "wpid_1", "block_labels": ["b1"], "block_outputs": REDACTED},
+        ),
+        (
+            "POST",
+            "/api/v1/tasks",
+            '{"title":"sample","data_extraction_goal":"sample","workflow_system_prompt":"sample",'
+            '"complete_criterion":"sample","max_steps":5,"browser_session_id":"sample","msg":"sample"}',
+            {
+                "title": REDACTED,
+                "data_extraction_goal": REDACTED,
+                "workflow_system_prompt": REDACTED,
+                "complete_criterion": REDACTED,
+                "max_steps": 5,
+                "browser_session_id": REDACTED,
+                "msg": REDACTED,
+            },
+        ),
+        (
+            "POST",
+            "/v1/run/tasks",
+            '{"detail":[{"type":"dict_type","loc":["body","parameters"],"msg":"Input should be a valid dictionary",'
+            '"input":"apply as sample","ctx":{"error":"sample"}}]}',
+            {
+                "detail": [
+                    {
+                        "type": "dict_type",
+                        "loc": ["body", "parameters"],
+                        "msg": "Input should be a valid dictionary",
+                        "input": REDACTED,
+                        "ctx": REDACTED,
+                    }
+                ]
+            },
+        ),
+        (
+            "POST",
+            "/v1/run/workflows",
+            '{"run_id":"wr_1","screenshot_urls":["https://h.invalid/s.png?X-Amz-Signature=sample"]}',
+            {"run_id": "wr_1", "screenshot_urls": ["https://h.invalid/s.png?[query:X-Amz-Signature]"]},
+        ),
+        ("POST", "/v1/run/workflows", '{"parameters":{"ssn":"sample"},"parameters":null}', {"parameters": None}),
+        ("POST", "/v1/webhook/trigger/wpid_1", '["sample",{"items":["sample"]}]', [REDACTED, {"items": [REDACTED]}]),
+        *(
+            (
+                "POST",
+                path,
+                '{"run_id":"wr_1","payload":"{\\"ssn\\":\\"sample\\"}"}',
+                {"run_id": "wr_1", "payload": REDACTED},
+            )
+            for path in (
+                "/v1/webhook/trigger/wpid_1",
+                "/v1/sdk/run_action",
+                "/v1/workflows/wpid_1/run",
+                "/v1/workflows/runs/wr_1/retry",
+                "/api/v1/workflows/runs/wr_1/continue",
+                "/v1/scripts/s_1/run",
+                "/v1/runs/wr_1/retry_webhook",
+                "/v1/internal/runs/wr_1/test-webhook",
+                "/api/v1/prompts/summarize-output",
+                "/v1/otp-bound/run/tasks",
+                "/v1/otp-bound/run/agents/",
+                "/api/v1/otp-bound/tasks",
+                "/api/v2/otp-bound/tasks/",
+                "/api/v1/otp-bound/workflows/wpid_1/run",
+                "/v1/otp-bound/workflows/runs/wr_1/retry",
+            )
+        ),
+        (
+            "POST",
+            "/v1/otp-bound/run/tasks",
+            '{"url":"https://h.invalid/p?email=jane%40x.invalid","otp_request_id":"sample","prompt":"sample"}',
+            {"url": "https://h.invalid/p?[query:email]", "otp_request_id": REDACTED, "prompt": REDACTED},
+        ),
+        (
+            "POST",
+            "/v1/workflows",
+            '{"title":"t","parameters":{"name":"Jane Doe"}}',
+            {"title": "t", "parameters": {"name": "Jane Doe"}},
+        ),
+    ],
+)
+def test_run_route_bodies_blank_run_values(method: str, path: str, body: str, expected: object) -> None:
+    request = Request({"type": "http", "method": method, "path": path, "headers": [], "query_string": b""})
+    for sanitized in (
+        _sanitize_body(request, body.encode(), "application/json"),
+        _sanitize_response_body(request, body, "application/json"),
+    ):
+        assert (sanitized if expected == REDACTED else json.loads(sanitized)) == expected
+        assert "sample" not in sanitized
 
 
 class TestClientIpFromHeaders:
@@ -92,11 +241,9 @@ class TestClientIpFromHeaders:
         headers = {"x-forwarded-for": "198.51.100.2"}
         assert _client_ip_from_headers(headers) == "198.51.100.2"
 
-    def test_missing_header_returns_none(self) -> None:
-        assert _client_ip_from_headers({}) is None
-
-    def test_empty_header_returns_none(self) -> None:
-        assert _client_ip_from_headers({"x-forwarded-for": ""}) is None
+    @pytest.mark.parametrize("headers", [{}, {"x-forwarded-for": ""}])
+    def test_missing_or_empty_header_returns_none(self, headers: dict[str, str]) -> None:
+        assert _client_ip_from_headers(headers) is None
 
 
 @pytest.mark.parametrize(
@@ -461,10 +608,13 @@ def _make_request(method: str = "GET", path: str = "/api/v1/test") -> Request:
     return Request({"type": "http", "method": method, "path": path, "headers": [], "query_string": b""})
 
 
-def test_sanitize_headers_removes_posthog_attribution_but_keeps_ordinary_header() -> None:
+def test_sanitize_headers_removes_attribution_and_signature_headers_but_keeps_ordinary_header() -> None:
     assert _sanitize_headers(
         {
             "X-PostHog-Attribution": "encoded-attribution",
+            "Svix-Id": "msg_fake",
+            "Svix-Timestamp": "1700000000",
+            "Svix-Signature": "v1,fake-signature",
             "X-Request-ID": "request-id",
         }
     ) == {"X-Request-ID": "request-id"}
@@ -494,9 +644,17 @@ class TestSanitizeResponseBody:
             assert _sanitize_response_body(request, body, "application/json") == REDACTED
         parse.assert_not_called()
 
-    def test_sensitive_endpoint_fully_redacted(self) -> None:
-        request = _make_request("POST", "/api/v1/credentials")
-        result = _sanitize_response_body(request, '{"token": "abc"}', "application/json")
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/v1/credentials",
+            "/v1/integrations/google/drive/picker-token",
+            "/api/v1/integrations/google/drive/picker-token",
+        ],
+    )
+    def test_sensitive_endpoint_fully_redacted(self, path: str) -> None:
+        request = _make_request("POST", path)
+        result = _sanitize_response_body(request, '{"public_canary": "must-not-be-logged"}', "application/json")
         assert result == REDACTED
 
     def test_empty_body(self) -> None:
@@ -568,6 +726,8 @@ class TestSanitizeResponseBody:
         [
             ("POST", "/v1/credentials/totp"),
             ("POST", "/v1/credentials/totp/"),
+            ("POST", "/v1/otp-bound/credentials/totp"),
+            ("POST", "/v1/otp-bound/credentials/totp/"),
             ("POST", "/api/v1/totp"),
             ("POST", "/api/v1/totp/"),
             ("GET", "/v1/credentials/totp"),
@@ -612,9 +772,13 @@ class TestSanitizeBody:
         assert _sanitize_body(request, body.encode(), "application/json") == body
         assert _sanitize_response_body(request, body, "application/json") == body
 
-    def test_sensitive_endpoint_request_fully_redacted(self) -> None:
-        request = _make_request("POST", "/v1/credentials")
-        result = _sanitize_body(request, b'{"password": "hunter2"}', "application/json")
+    @pytest.mark.parametrize("path", ["/v1/credentials", "/api/v1/internal/gmail/organize"])
+    def test_sensitive_endpoint_request_fully_redacted(self, path: str) -> None:
+        request = _make_request("POST", path)
+        body = (
+            b'{"password": "synthetic", "folder": "synthetic", "message_ids": ["synthetic"], "grants": ["synthetic"]}'
+        )
+        result = _sanitize_body(request, body, "application/json")
         assert result == REDACTED
 
     @pytest.mark.parametrize(
@@ -634,8 +798,8 @@ class TestSanitizeBody:
     def test_every_ember_post_body_is_opaque_and_each_old_route_has_a_twin(self) -> None:
         routes = [
             route
-            for route in workflow_copilot_routes.base_router.routes
-            if isinstance(route, APIRoute) and route.endpoint.__module__ == workflow_copilot_routes.__name__
+            for route in ember_routes.base_router.routes
+            if isinstance(route, APIRoute) and route.endpoint.__module__ == ember_routes.__name__
         ]
         neutral = {"/workflow/suggest-goal", "/workflow/convert-yaml-to-blocks"}
         old = {
@@ -660,28 +824,16 @@ class TestSanitizeBody:
                 assert result == REDACTED, route.path
 
     @pytest.mark.parametrize(
-        "path",
+        ("method", "path", "body"),
         [
-            "/api/v1/google/oauth/config",
-            "/v1/google/oauth/config",
+            ("PUT", "/api/v1/google/oauth/config", b'{"client_id": "cid", "client_secret": "secret"}'),
+            ("PUT", "/v1/google/oauth/config", b'{"client_id": "cid", "client_secret": "secret"}'),
+            ("POST", "/api/v1/google/oauth/callback", b'{"code": "4/0Adeu...", "state": "nonce"}'),
+            ("POST", "/v1/google/oauth/callback", b'{"code": "4/0Adeu...", "state": "nonce"}'),
         ],
     )
-    def test_google_oauth_config_request_redacted(self, path: str) -> None:
-        request = _make_request("PUT", path)
-        result = _sanitize_body(request, b'{"client_id": "cid", "client_secret": "secret"}', "application/json")
-        assert result == REDACTED
-
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "/api/v1/google/oauth/callback",
-            "/v1/google/oauth/callback",
-        ],
-    )
-    def test_google_oauth_callback_request_redacted(self, path: str) -> None:
-        request = _make_request("POST", path)
-        result = _sanitize_body(request, b'{"code": "4/0Adeu...", "state": "nonce"}', "application/json")
-        assert result == REDACTED
+    def test_google_oauth_request_redacted(self, method: str, path: str, body: bytes) -> None:
+        assert _sanitize_body(_make_request(method, path), body, "application/json") == REDACTED
 
     @pytest.mark.parametrize("path", ["/api/v1/skyplane/authority/session", "/api/v1/skyplane/authority/feedback"])
     def test_skyplane_authority_request_and_response_are_fully_redacted(self, path: str) -> None:
@@ -723,6 +875,8 @@ class TestSanitizeBody:
         [
             ("POST", "/v1/credentials/totp"),
             ("POST", "/v1/credentials/totp/"),
+            ("POST", "/v1/otp-bound/credentials/totp"),
+            ("POST", "/v1/otp-bound/credentials/totp/"),
             ("POST", "/api/v1/totp"),
             ("POST", "/api/v1/totp/"),
             ("GET", "/v1/credentials/totp"),
@@ -888,6 +1042,28 @@ def real_api_app() -> FastAPI:
     app = api_app.create_api_app()
     sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
     return app
+
+
+def test_every_route_serving_a_run_handler_is_a_run_route(real_api_app: FastAPI) -> None:
+    def concrete(route: APIRoute, method: str) -> Request:
+        return _make_request(method, re.sub(r"\{[^}]+\}", "x_1", route.path))
+
+    routes = [
+        (route, method)
+        for route in real_api_app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods & {"POST", "PUT"}
+    ]
+    run_handlers = {route.endpoint for route, method in routes if _is_run_payload_endpoint(concrete(route, method))}
+    uncovered = sorted(
+        f"{method} {route.path}"
+        for route, method in routes
+        if route.endpoint in run_handlers and not _is_run_payload_endpoint(concrete(route, method))
+    )
+    assert uncovered == []
+    assert {"POST /v1/agents/runs/{workflow_run_id}/retry", "POST /v1/agents/{workflow_permanent_id}/schedules"} <= {
+        f"{method} {route.path}" for route, method in routes if route.endpoint in run_handlers
+    }
 
 
 @pytest.fixture
@@ -1077,7 +1253,7 @@ class TestMiddlewareLogVolume:
             now = datetime.now(UTC)
             apply_request_org_context(
                 Organization(
-                    organization_id="o_385835488455492960",
+                    organization_id="o_000000000000000000",
                     organization_name="Acme Corp",
                     created_at=now,
                     modified_at=now,
@@ -1089,7 +1265,7 @@ class TestMiddlewareLogVolume:
 
         assert response.status_code == 200
         logged = log_mock.info.call_args.kwargs
-        assert logged["organization_id"] == "o_385835488455492960"
+        assert logged["organization_id"] == "o_000000000000000000"
         assert logged["organization_name"] == "Acme Corp"
         assert type(logged["org_age"]) is int and logged["org_age"] == 0
 
@@ -1101,13 +1277,13 @@ class TestMiddlewareLogVolume:
 
         @app.post("/_test_request_logging_authed_boom")
         async def boom() -> None:
-            set_request_organization("o_385835488455492960", "Acme Corp")
+            set_request_organization("o_000000000000000000", "Acme Corp")
             raise ValueError("kaboom")
 
         response = TestClient(app, raise_server_exceptions=False).post("/_test_request_logging_authed_boom")
 
         assert response.status_code == 500
-        assert log_mock.error.call_args.kwargs["organization_id"] == "o_385835488455492960"
+        assert log_mock.error.call_args.kwargs["organization_id"] == "o_000000000000000000"
 
     @pytest.mark.parametrize("allow_bodies", [False, True])
     @pytest.mark.parametrize("error", [False, True])
@@ -1208,7 +1384,7 @@ class TestMiddlewareLogVolume:
 
         @app.post("/_test_request_logging_authed_then_anonymous")
         async def authed() -> dict:
-            set_request_organization("o_385835488455492960", "Acme Corp")
+            set_request_organization("o_000000000000000000", "Acme Corp")
             return {"ok": True}
 
         @app.post("/_test_request_logging_anonymous")
@@ -1415,7 +1591,7 @@ class TestMiddlewareLogVolume:
 _LOG_DRIVER_LINE_LIMIT_BYTES = 16 * 1024
 # Deep enough that the traceback alone passes the limit, as production pool-timeout errors do.
 _ROUTE_CALL_DEPTH = 25
-_TEST_ORGANIZATION_ID = "o_385835488455492960"
+_TEST_ORGANIZATION_ID = "o_000000000000000000"
 
 
 def _raise_from_depth(depth: int) -> None:
@@ -1569,7 +1745,7 @@ class TestRawRequestLogLevel:
 @pytest.mark.parametrize(
     "recovery_header", ["X-Ember-Credential-Recovery-Token", "X-Copilot-Credential-Recovery-Token"]
 )
-def test_copilot_recovery_capabilities_never_enter_request_logs(
+def test_ember_recovery_capabilities_never_enter_request_logs(
     log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, status_code: int, recovery_header: str
 ) -> None:
     monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS_SUCCESSFUL_READS", True)

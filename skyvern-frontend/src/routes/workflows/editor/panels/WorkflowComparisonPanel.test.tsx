@@ -44,7 +44,7 @@ describe("WorkflowComparisonPanel diff summary", () => {
     render(
       <WorkflowComparisonPanel
         version1={version("Current")}
-        version2={version("Copilot Suggestion", [block])}
+        version2={version("Ember Suggestion", [block])}
         mode="ember"
         onEmberReviewClose={vi.fn()}
       />,
@@ -70,7 +70,7 @@ describe("WorkflowComparisonPanel Ember review actions", () => {
     render(
       <WorkflowComparisonPanel
         version1={version("Current")}
-        version2={version("Copilot Suggestion")}
+        version2={version("Ember Suggestion")}
         mode="ember"
         onEmberReviewClose={onEmberReviewClose}
       />,

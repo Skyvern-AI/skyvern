@@ -93,6 +93,8 @@ async def _execute_block_for_test(
             output_parameter_value=kwargs.get("output_parameter_value"),
             status=kwargs.get("status", BlockStatus.failed),
             workflow_run_block_id=kwargs.get("workflow_run_block_id"),
+            error_codes=kwargs.get("error_codes") or [],
+            can_continue_after_failure=kwargs.get("can_continue_after_failure") is not False,
         )
 
     with (
@@ -163,6 +165,28 @@ async def test_a_connected_gmail_id_in_credential_id_names_the_field_that_can_us
     assert "credential_source to nango" in (misplaced.failure_reason or "")
     assert "connection_id" in (misplaced.failure_reason or "")
     assert "Reconnect the Gmail account" in (unknown.failure_reason or "")
+
+    # A native account must be refused before reading or changing any mail.
+    accessed: list[str] = []
+
+    async def read(*args: Any, **kwargs: Any) -> None:
+        accessed.append("read")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_google_workspace_credentials", read)
+    result = await _execute_block_for_test(_make_block(organize_action="archive"))
+    assert not result.success
+    assert "Connected Gmail account" in (result.failure_reason or "")
+    assert "Nothing was changed" in (result.failure_reason or "")
+    assert accessed == []
+
+    monkeypatch.setattr(_FakeContextForTest, "get_gmail_hop_refusal", lambda *_: "run_not_supported")
+    result = await _execute_block_for_test(
+        _make_block(credential_source="nango", connection_id="ngc_test", organize_action="archive")
+    )
+    assert not result.success
+    assert "This run cannot use Connected Gmail" in (result.failure_reason or "")
+    assert "Nothing was changed" in (result.failure_reason or "")
+    assert accessed == []
 
 
 @pytest.mark.asyncio
@@ -401,7 +425,7 @@ async def test_downloads_matched_attachments_without_email_body_and_registers_fi
         "file_path": str(download_dir / "_invoice_1-0003-0002.pdf"),
         "url": file_info.url,
     }
-    save_downloaded_files.assert_awaited_once_with(organization_id="org_1", run_id="wr_test")
+    save_downloaded_files.assert_awaited_once_with(organization_id="org_1", run_id="wr_test", files=None)
 
 
 @pytest.mark.asyncio

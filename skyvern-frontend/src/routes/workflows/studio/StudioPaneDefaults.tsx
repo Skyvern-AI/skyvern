@@ -44,6 +44,7 @@ const REOPEN_EDITOR_PANE_RANK: Record<StudioPaneId, number> = {
   ember: 1,
   overview: 2,
   browser: 3,
+  triggers: 4,
 };
 
 // Create markers nothing reads after mount; discover, template and record are

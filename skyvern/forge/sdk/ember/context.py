@@ -1,0 +1,1749 @@
+"""Structured context for copilot cross-turn memory."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import re
+import uuid
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Literal, get_args
+
+import structlog
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
+from typing_extensions import NotRequired, TypedDict
+
+from skyvern.constants import EMBER_TEST_RUN_UNSUPPORTED_CODE
+from skyvern.forge.sdk.agents.skills import EMBER_SKILLS_AGENT, SkillSession
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.ember.agent_context import AgentContext
+from skyvern.forge.sdk.ember.browser_ablation import (
+    BrowserAblationMetadata,
+    EmberToolSurfaceIdentity,
+)
+from skyvern.forge.sdk.ember.budget_expiry import BudgetExpiryState
+from skyvern.forge.sdk.ember.code_write_diff import TURN_PATCH_CHAR_BUDGET, CodeWriteDiff
+from skyvern.forge.sdk.ember.config import BlockAuthoringPolicy, EmberConfig
+from skyvern.forge.sdk.ember.connected_accounts import ConnectionCardPayload
+from skyvern.forge.sdk.ember.credential_resolution import loggable_origin, safe_admitted_url
+from skyvern.forge.sdk.ember.human_input_wait import HumanInputWait
+from skyvern.forge.sdk.ember.page_identity import page_location_fingerprint, safe_page_origin
+from skyvern.forge.sdk.ember.review_gate import NarrativeReviewProjection
+from skyvern.forge.sdk.ember.run_outcome import RunOutcomeRole
+from skyvern.forge.sdk.ember.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.workflow.block_notes import block_field_texts
+from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
+from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.schemas.proxy_location import ProxyLocationInput
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_structured_prompt
+from skyvern.utils.strings import join_phrases
+
+LOG = structlog.get_logger()
+
+ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
+EMBER_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
+ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
+
+AskSubject = Literal["output_schema", "credentials", "target_url", "disambiguation", "deliverable_permission", "other"]
+EMBER_ASK_SUBJECTS: tuple[AskSubject, ...] = get_args(AskSubject)
+
+
+def coerce_ask_subject(value: object) -> AskSubject | None:
+    for subject in EMBER_ASK_SUBJECTS:
+        if value == subject:
+            return subject
+    return None
+
+
+def parsed_ask_refs(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [ref for ref in value if isinstance(ref, str) and ref]
+
+
+class NarrativeDraft(TypedDict):
+    blockCount: int
+    blockLabels: list[str]
+    summary: str | None
+
+
+REPLY_TOOL_NAME = "reply"
+EDIT_BLOCK_TOOL_NAME = "edit_block"
+EDIT_BLOCK_AND_RUN_TOOL_NAME = "edit_block_and_run"
+UPDATE_AND_RUN_BLOCKS_TOOL_NAME = "update_and_run_blocks"
+UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
+RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
+BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
+CREATE_WEBHOOK_TRIGGER_TOOL_NAME = "create_webhook_trigger"
+CREATE_GOOGLE_SHEET_TOOL_NAME = "create_google_sheet"
+FRESH_BROWSER_TOOL_NAME = "start_fresh_browser"
+BLOCK_RUNNING_TOOLS = frozenset(
+    {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
+)
+WORKFLOW_MUTATION_TOOLS = frozenset(
+    {
+        UPDATE_WORKFLOW_TOOL_NAME,
+        UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
+        EDIT_BLOCK_TOOL_NAME,
+        EDIT_BLOCK_AND_RUN_TOOL_NAME,
+        "add_block",
+        "delete_block",
+    }
+)
+USER_FACING_REASON_PARAM = "user_facing_reason"
+USER_FACING_REASON_SCHEMA = {
+    "type": ["string", "null"],
+    "description": (
+        "One short sentence displayed above this action while it runs, saying what it is for. Null is accepted."
+    ),
+}
+
+
+def normalize_action_reason(value: Any) -> str | None:
+    """Untrusted JSON metadata never changes ordinary action validation."""
+    return value.strip() or None if isinstance(value, str) else None
+
+
+class DesignActivityBucket(TypedDict):
+    kind: Literal["design"]
+
+
+class BlockActivityBucket(TypedDict):
+    kind: Literal["block"]
+    workflow_run_block_id: str
+
+
+ActivityBucket = DesignActivityBucket | BlockActivityBucket
+
+
+EmberTestInputSource = Literal["copilot", "page", "earlier_run", "default", "placeholder"]
+
+
+class EmberTestInput(TypedDict):
+    key: str
+    source: EmberTestInputSource
+    sourceRunId: NotRequired[str]
+
+
+# Shape must match the FE ``ActivityEntry`` in narrativeState.ts; toolName is
+# present only for tool_call/tool_result and success only for tool_result.
+class NarrativeActivityEntry(TypedDict):
+    kind: str
+    text: str
+    iteration: int
+    toolName: NotRequired[str]
+    displayLabel: NotRequired[str]
+    success: NotRequired[bool]
+    reason: NotRequired[str]
+    activityStartedAt: NotRequired[str]
+    activityBucket: NotRequired[ActivityBucket]
+    activeLabel: NotRequired[str]
+    outcomeLabel: NotRequired[str]
+    codeDiffs: NotRequired[list[CodeWriteDiff]]
+    browserSteps: NotRequired[list[str]]
+    workflowRunId: NotRequired[str]
+    testInputs: NotRequired[list[EmberTestInput]]
+    id: str
+    # Server clock read for the event this entry describes, shared with the SSE
+    # update so a rehydrated row renders the same elapsed the live row did.
+    timestamp: NotRequired[str]
+
+
+class SkippedPrefixBlock(TypedDict):
+    label: str
+    kind: Literal["reused", "not_run"]
+    sourceWorkflowRunId: NotRequired[str]
+
+
+class NarrativeBlock(TypedDict):
+    label: str
+    workflowRunBlockId: NotRequired[str]
+    workflowRunId: NotRequired[str]
+    parentWorkflowRunBlockId: NotRequired[str]
+    blockType: str
+    state: str
+    lastSeenIteration: int
+    activity: list[NarrativeActivityEntry]
+    startedAt: str | None
+    endedAt: str | None
+    outcome: NotRequired[str]
+    outcomeReason: NotRequired[str]
+    outcomeRole: NotRequired[RunOutcomeRole]
+    skippedBefore: NotRequired[list[SkippedPrefixBlock]]
+    failureCode: NotRequired[str]
+
+
+# A loop body mints fresh run-block ids every iteration, so the identity-keyed archive
+# is unbounded without this. Mirror MAX_BLOCK_ATTEMPTS in narrativeState.ts.
+MAX_NARRATIVE_BLOCK_ATTEMPTS = 200
+
+
+class NarrativeBlockAttempt(TypedDict):
+    workflowRunBlockId: str
+    workflowRunId: str | None
+    parentWorkflowRunBlockId: NotRequired[str]
+    label: str
+    blockType: str
+    rawStatus: str
+    lastSeenIteration: int
+    startedAt: str | None
+    endedAt: str | None
+    outcome: NotRequired[str]
+    outcomeReason: NotRequired[str]
+    outcomeRole: NotRequired[RunOutcomeRole]
+    failureCode: NotRequired[str]
+
+
+# A failed block carrying one of these was refused access to an account, so the review card says it could not test.
+ACCESS_REFUSAL_ERROR_CODES = frozenset({EMBER_TEST_RUN_UNSUPPORTED_CODE})
+
+
+# Only the platform's connected-account blocks write the refusal code (saved app actions run as integration_action);
+# an author can declare any code on other blocks.
+_ACCESS_REFUSAL_BLOCK_TYPES = frozenset({"send_email", "email_inbox", "integration_action"})
+
+
+def block_failure_code(status: str | None, error_codes: Iterable[str], block_type: str) -> str | None:
+    if status != "failed" or block_type not in _ACCESS_REFUSAL_BLOCK_TYPES:
+        return None
+    return next((code for code in error_codes if code in ACCESS_REFUSAL_ERROR_CODES), None)
+
+
+def skipped_prefix_anchor(archive: dict[str, NarrativeBlockAttempt], workflow_run_id: str) -> str | None:
+    """The run's earliest surviving attempt, which the run's skipped-prefix rows render before."""
+    return next(
+        (attempt_id for attempt_id, attempt in archive.items() if attempt["workflowRunId"] == workflow_run_id),
+        None,
+    )
+
+
+def upsert_narrative_block_attempt(
+    archive: dict[str, NarrativeBlockAttempt],
+    *,
+    workflow_run_block_id: str,
+    workflow_run_id: str | None,
+    label: str,
+    block_type: str,
+    status: str,
+    iteration: int,
+    started_at: str | None,
+    ended_at: str | None,
+    parent_workflow_run_block_id: str | None = None,
+    failure_code: str | None = None,
+) -> NarrativeBlockAttempt:
+    attempt = archive.get(workflow_run_block_id)
+    if attempt is None:
+        attempt = {
+            "workflowRunBlockId": workflow_run_block_id,
+            "workflowRunId": workflow_run_id,
+            "label": label,
+            "blockType": block_type,
+            "rawStatus": status,
+            "lastSeenIteration": iteration,
+            "startedAt": started_at,
+            "endedAt": ended_at,
+        }
+        if parent_workflow_run_block_id:
+            attempt["parentWorkflowRunBlockId"] = parent_workflow_run_block_id
+        if failure_code:
+            attempt["failureCode"] = failure_code
+        archive[workflow_run_block_id] = attempt
+        while len(archive) > MAX_NARRATIVE_BLOCK_ATTEMPTS:
+            del archive[next(iter(archive))]
+        return attempt
+
+    attempt["workflowRunId"] = workflow_run_id or attempt["workflowRunId"]
+    if parent_workflow_run_block_id:
+        attempt["parentWorkflowRunBlockId"] = parent_workflow_run_block_id
+    attempt["label"] = label or attempt["label"]
+    attempt["blockType"] = block_type or attempt["blockType"]
+    attempt["rawStatus"] = status
+    if failure_code:
+        attempt["failureCode"] = failure_code
+    else:
+        attempt.pop("failureCode", None)
+    attempt["lastSeenIteration"] = iteration
+    if attempt["startedAt"] is None and started_at is not None:
+        attempt["startedAt"] = started_at
+    attempt["endedAt"] = None if status == "running" else ended_at or attempt["endedAt"]
+    return attempt
+
+
+class NarrativeConnectedAccountChoice(TypedDict):
+    connection_id: str
+    name: str
+    state: str
+    email_address: str | None
+
+
+class NarrativeOutputFile(TypedDict):
+    artifact_id: str
+    filename: str
+
+
+class NarrativeTurnFacts(TypedDict):
+    factsAvailable: bool
+    evaluationState: str | None
+    runId: str | None
+    runCompleted: bool | None
+    terminalCause: str | None
+    blocksRunThisTurn: int | None
+    # The failed run's own recorded reason, secret-scrubbed at source. Carried as evidence so a
+    # terminal that ships no model reply still shows why the run failed, in the run's words.
+    # NotRequired: rows persisted before it was published carry no such key.
+    recordedFailure: NotRequired[str | None]
+    authoredBlockCount: NotRequired[int]
+    matchingSourceBlockCount: NotRequired[int]
+    # The tested claim is decided once, in _turn_fact_bundle, so no surface re-derives it.
+    ranCleanOnCurrentSource: bool
+    editedBlockLabels: NotRequired[list[str]]
+
+
+class HistoricalNarrativeTurnFacts(TypedDict, total=False):
+    factsAvailable: bool
+    evaluationState: str | None
+    runId: str | None
+    runCompleted: bool | None
+    terminalCause: str | None
+    blocksRunThisTurn: int | None
+    authoredBlockCount: int
+    matchingSourceBlockCount: int
+    ranCleanOnCurrentSource: bool
+
+
+class HistoricalTurnFactsProjection(TypedDict):
+    scope: Literal["originating_turn"]
+    turnId: NotRequired[str]
+    turnIndex: NotRequired[int]
+    facts: HistoricalNarrativeTurnFacts
+
+
+class NarrativeBudgetExpiry(TypedDict):
+    budgetExpired: Literal[True]
+    source: Literal["deadline", "max_turns"]
+    reportProduced: bool | None
+    stagedDraftId: str | None
+    drainFingerprint: str | None
+    leftRunIds: NotRequired[list[str]]
+
+
+# Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
+class NarrativeWorkPlan(TypedDict):
+    toolCallId: str
+    items: list[str]
+
+
+class NarrativeScreenshot(TypedDict):
+    artifactId: str
+    capturedAt: str
+    toolCallId: str | None
+
+
+class NarrativeTriggerFilter(TypedDict):
+    label: str
+    value: str
+
+
+class NarrativeCreatedTrigger(TypedDict):
+    eventTriggerId: str
+    sourceKind: str
+    filters: list[NarrativeTriggerFilter]
+    firesOnItsOwn: bool
+    # The account the source reads through, if any, so the card can name it without storing it here.
+    connectionId: str | None
+
+
+class CanonicalWorkflowUnavailableFacts(TypedDict):
+    workflow_permanent_id: str
+    candidate_published: NotRequired[Literal[False]]
+    test_started: Literal[False]
+    detail: NotRequired[str]
+
+
+class TurnNarrativePayload(TypedDict):
+    turnId: str | None
+    turnIndex: int
+    responseType: NotRequired[ResponseType]
+    cancelled: NotRequired[bool]
+    proposalDisposition: NotRequired[ProposalDisposition]
+    # TurnOutcome.response_kind value: "answer" | "build" | "clarify" | "diagnose" | "refuse" | "recover".
+    responseKind: NotRequired[str]
+    questionInteractions: NotRequired[list[dict[str, Any]]]
+    steerMessages: NotRequired[list[dict[str, Any]]]
+    # {"reason": <token>}, set when this turn surfaces a typed credential need.
+    credentialPrompt: NotRequired[dict[str, str]]
+    # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ..., "anchorToolCallId": ...}, set
+    # when a mid-build credential pause (credential_pause.py) resolved during this turn. The anchor is
+    # the tool call whose row was newest when the card was raised.
+    credentialPause: NotRequired[dict[str, str | list[str]]]
+    # Every pick card's credentialPause, oldest first; set only when more than one card settled this turn.
+    credentialPauses: NotRequired[list[dict[str, str | list[str]]]]
+    # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
+    # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
+    credentialAutoBound: NotRequired[dict[str, str]]
+    connectedAccountChoices: NotRequired[list[NarrativeConnectedAccountChoice]]
+    outputFiles: NotRequired[list[NarrativeOutputFile]]
+    connectionCards: NotRequired[list[ConnectionCardPayload]]
+    demonstrationOffer: NotRequired[bool]
+    createdTriggers: NotRequired[list[NarrativeCreatedTrigger]]
+    canonicalWorkflowUnavailable: NotRequired[CanonicalWorkflowUnavailableFacts]
+    designStarted: bool
+    designEnded: bool
+    draft: NarrativeDraft | None
+    blocks: list[NarrativeBlock]
+    terminal: str
+    terminalMessage: str | None
+    narrativeSummary: str | None
+    priorBlockCount: int | None
+    designActivity: list[NarrativeActivityEntry]
+    # The last plan a successful set_work_plan stored this turn. Kept off designActivity, whose cap
+    # can trim the call's row in a long turn.
+    workPlan: NotRequired[NarrativeWorkPlan]
+    screenshots: NotRequired[list[NarrativeScreenshot]]
+    startedAt: str | None
+    endedAt: str | None
+    review: NotRequired[NarrativeReviewProjection]
+    testedBlockFingerprints: NotRequired[dict[str, list[str]]]
+    budgetExpiry: NotRequired[NarrativeBudgetExpiry]
+    turnFacts: NotRequired[NarrativeTurnFacts]
+    demonstrationItems: NotRequired[list[str]]
+
+
+class LiveTurnNarrative(TurnNarrativePayload):
+    browserSessionId: str | None
+    pausedFor: Literal["question", "credential"] | None
+
+
+if TYPE_CHECKING:
+    from agents.items import ModelResponse
+
+    from skyvern.forge.sdk.ember.blocker_signal import EmberToolBlockerSignal
+    from skyvern.forge.sdk.ember.build_test_outcome import (
+        RecordedBuildTestOutcome,
+    )
+    from skyvern.forge.sdk.ember.completion_criteria_store import CompletionCriteriaTurnState
+    from skyvern.forge.sdk.ember.credential_pause import SiteAnswer
+    from skyvern.forge.sdk.ember.diagnosis_repair_contract import DiagnosisRepairContract
+    from skyvern.forge.sdk.ember.interruption import StoppedTurnFacts
+    from skyvern.forge.sdk.ember.mcp_adapter import SkyvernOverlayMCPServer
+    from skyvern.forge.sdk.ember.narration import NarratorState
+    from skyvern.forge.sdk.ember.request_policy import RequestPolicy
+    from skyvern.forge.sdk.ember.run_outcome import RecordedRunOutcome
+    from skyvern.forge.sdk.ember.turn_context import TurnContextPacket
+    from skyvern.forge.sdk.ember.turn_halt import TurnHalt
+    from skyvern.forge.sdk.schemas.ember import EmberChatSender
+    from skyvern.forge.sdk.schemas.ember_turn_outcome import (
+        ConnectedAccountChoice,
+        DeliveredOutputFile,
+        TurnOutcome,
+    )
+
+
+class UrlVisit(BaseModel):
+    url: str
+    summary: str = ""
+
+
+class FieldFilled(BaseModel):
+    selector: str = ""
+    label: str = ""
+    value: str = ""
+
+
+class CredentialCheck(BaseModel):
+    credential_name: str = ""
+    credential_id: str | None = None
+    found: bool = False
+
+
+class ApprovedCredential(BaseModel):
+    credential_id: str
+    # Set for a credential-card selection or an answered carried proposal. The approval stays
+    # bound to that origin. Empty for a credential the user named without an origin.
+    admitted_url: str = ""
+    # A connected account Test end to end derived from the pending proposal: it admits fields that read, never one
+    # that acts.
+    reads_only: bool = False
+
+
+ProposedCredentialOrigin = Literal["live_page_admitted", "executed_credential_fill"]
+
+
+class ProposedCredential(BaseModel):
+    credential_id: str
+    admitted_url: str = ""
+    origin_arm: ProposedCredentialOrigin | None = None
+    # How many later asks this proposal has already survived. The renewal cannot tell an ask about
+    # this credential from an ask about anything else, so the count is what bounds it.
+    carries: int = 0
+
+
+class ObservedPage(BaseModel):
+    """Compact cross-turn record of a page the agent scouted (SKY-10562).
+
+    Carries only what the composition gate needs to credit a prior observation:
+    a model-safe origin, a keyed location fingerprint, whether bounded page schema
+    was captured, and how the state was reached. Full page schemas and raw location
+    state stay within-turn.
+    """
+
+    url: str = ""
+    location_fingerprint: str = ""
+    had_bounded_schema: bool = False
+    reached_via: str = ""
+
+
+# The fields ScoutedInteraction declares turn-ephemeral. Everything else on an
+# interaction crosses the turn boundary as captured: the turn boundary is not a
+# disclosure boundary, so there is no field roster here to keep in step with the record.
+# ``input_value`` is the private same-turn literal; the model sees ``input_id``, which does
+# cross. ``typed_value`` is absent because the record no longer has one — it was retired
+# with the literal, and is discarded when a legacy payload is migrated below.
+_TURN_EPHEMERAL_INTERACTION_FIELDS = frozenset({"input_value", "read_result_value", "selector_match_count"})
+# Held by chats persisted before the record exposed secret-safe input identities.
+_RETIRED_INTERACTION_FIELDS = frozenset({"typed_value"})
+
+
+class PageObstructionSelectorCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    selector: str
+    source: str
+
+
+class PageObstructionIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tag: str
+    role: str
+    label_context: str
+
+
+class PageObstructionControl(BaseModel):
+    """A producer-bounded control plus scalar capture extensions not known to this consumer."""
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    __pydantic_extra__: dict[str, str | bool | int | float] = Field(init=False)
+    tag: str | None = None
+    text: str | None = None
+    aria_label: str | None = None
+    title: str | None = None
+    selector: str | None = None
+    type: str | None = None
+    selector_candidates: list[PageObstructionSelectorCandidate] = Field(default_factory=list)
+    identity: PageObstructionIdentity | None = None
+
+
+class PageObstruction(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: str | None = None
+    source: str | None = None
+    selector: str | None = None
+    selector_candidates: list[PageObstructionSelectorCandidate] = Field(default_factory=list)
+    identity: PageObstructionIdentity | None = None
+    text: str | None = None
+    visual_location: str | None = None
+    underlying_page_blocked: bool | None = None
+    intercepts_outside_control: bool | None = None
+    visible_controls: list[PageObstructionControl] = Field(default_factory=list)
+    visible_controls_omitted: int | None = None
+
+
+SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP = 2500
+
+
+class SignedOutPageObservation(BaseModel):
+    """One URL as a browser carrying no cookies or storage renders it."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    requested_url: str
+    reached_url: str
+    page_summary: dict[str, Any]
+
+
+class CodeAuthoringRepairContext(BaseModel):
+    block_label: str
+    reason_code: str
+    unresolved_names: list[str] = Field(default_factory=list)
+    parameter_keys: list[str] = Field(default_factory=list)
+    available_parameter_keys: list[str] = Field(default_factory=list)
+    binding_candidates: list[str] = Field(default_factory=list)
+    selector: str | None = None
+    refiner_selector: str | None = None
+    runtime_failure_reason: str | None = None
+    runtime_failure_class: str | None = None
+    output_dependency_failure_class: str | None = None
+    missing_output_key: str | None = None
+    available_output_keys: list[str] = Field(default_factory=list)
+    current_block_parameter_keys: list[str] = Field(default_factory=list)
+    required_goal_value_paths: list[str] = Field(default_factory=list)
+    required_extraction_schema_paths: list[str] = Field(default_factory=list)
+    required_code_return_paths: list[str] = Field(default_factory=list)
+    metadata_contract_source: str = ""
+    metadata_contract_reason_code: str = ""
+    failed_block_status: str | None = None
+    workflow_run_id: str | None = None
+    current_origin: str | None = None
+    current_url: str | None = None
+    current_title: str | None = None
+    page_evidence_source: str | None = None
+    observed_after_workflow_run: bool = False
+    rendered_value_excerpt: str | None = None
+    page_form_summaries: list[str] = Field(default_factory=list)
+    page_value_bindings: list[str] = Field(default_factory=list)
+    page_result_summaries: list[str] = Field(default_factory=list)
+    page_action_summaries: list[str] = Field(default_factory=list)
+    page_challenge_summaries: list[str] = Field(default_factory=list)
+    page_obstruction_summaries: list[str] = Field(default_factory=list)
+    page_obstructions: list[PageObstruction] = Field(default_factory=list)
+    page_obstruction_omission_notices: list[str] = Field(default_factory=list)
+    repair_instruction: str = ""
+
+
+class StructuredContext(BaseModel):
+    # Without populate_by_name, the alias on carried_trajectory below would make the field
+    # unconstructable by its own name.
+    model_config = ConfigDict(populate_by_name=True)
+
+    user_goal: str = ""
+    urls_visited: list[UrlVisit] = Field(default_factory=list)
+    fields_filled: list[FieldFilled] = Field(default_factory=list)
+    credentials_checked: list[CredentialCheck] = Field(default_factory=list)
+    approved_credentials: list[ApprovedCredential] = Field(default_factory=list)
+    # Google connections the user picked from the account card. Separate from approved_credentials
+    # because connections never enter resolved_credentials, which is ADR 0002's password-fill plane.
+    approved_connections: list[ApprovedCredential] = Field(default_factory=list)
+    # The credential the server itself resolved on a turn that ended by asking the user about it,
+    # rewritten unconditionally at every turn end so it never outlives the turn after the ask.
+    proposed_credential: ProposedCredential | None = None
+    decisions_made: list[str] = Field(default_factory=list)
+    workflow_state: str = ""
+    page_inspection_calls_made: int = 0
+    observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
+    # Chats persisted before this record was generalized still store it under ``fill_carry``.
+    carried_trajectory: list[dict[str, Any]] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("carried_trajectory", "fill_carry"),
+    )
+
+    @field_validator("carried_trajectory", mode="before")
+    @classmethod
+    def _drop_retired_fields(cls, value: object) -> object:
+        """A chat persisted under the old key still holds ``typed_value``, the literal the
+        record retired in favour of a secret-safe input identity. Migration drops it here
+        rather than in the ongoing filter, which admits every field the record still has.
+
+        The turn-ephemeral pair goes with it. Nothing legitimate carries them — the outbound
+        filter excludes both — so an inbound entry holding ``input_value`` is a stale payload
+        re-introducing the private literal the identity replaced.
+        """
+        if not isinstance(value, list):
+            return value
+        dropped = _RETIRED_INTERACTION_FIELDS | _TURN_EPHEMERAL_INTERACTION_FIELDS
+        return [
+            {
+                **({"executed_selector": entry["selector"]} if isinstance(entry.get("selector"), str) else {}),
+                **{key: item for key, item in entry.items() if key not in dropped and key != "selector"},
+            }
+            if isinstance(entry, dict)
+            else entry
+            for entry in value
+        ]
+
+    entrypoint_url: str | None = None
+
+    def to_json_str(self) -> str:
+        payload = self.model_dump(mode="json")
+        payload["carried_trajectory"] = [dict(entry) for entry in self.carried_trajectory]
+        return json.dumps(payload, indent=2, default=str)
+
+    @classmethod
+    def from_json_str(cls, raw: str | None) -> StructuredContext:
+        if not raw:
+            return cls()
+        raw = raw.strip()
+        if raw.startswith("{"):
+            try:
+                return cls.model_validate_json(raw)
+            except Exception:
+                # The fallback erases every typed field, including credential approvals,
+                # so a silent hit here is invisible authority loss (SKY-13986).
+                LOG.warning(
+                    "structured_context_parse_failed",
+                    raw_length=len(raw),
+                    raw_sha256=hashlib.sha256(raw.encode()).hexdigest()[:16],
+                )
+                return cls(user_goal=raw)
+        return cls(user_goal=raw)
+
+    def merge_turn_summary(self, tool_activity: list[dict]) -> None:
+        for entry in tool_activity:
+            tool = entry.get("tool", "")
+            summary = entry.get("summary", "")
+
+            if tool == "navigate_browser":
+                url = summary.removeprefix("Navigated to ").strip()
+                if url and not any(v.url == url for v in self.urls_visited):
+                    self.urls_visited.append(UrlVisit(url=url, summary=""))
+
+            elif tool == "list_credentials":
+                resolved = entry.get("credentials")
+                if isinstance(resolved, list) and resolved:
+                    for credential in resolved:
+                        if not isinstance(credential, dict):
+                            continue
+                        credential_id = credential.get("credential_id")
+                        if not isinstance(credential_id, str):
+                            continue
+                        name = credential.get("name")
+                        self.credentials_checked.append(
+                            CredentialCheck(
+                                credential_name=name if isinstance(name, str) else "",
+                                credential_id=credential_id,
+                                found=True,
+                            )
+                        )
+                else:
+                    match = re.search(r"Found (\d+)", summary)
+                    found = int(match.group(1)) > 0 if match else False
+                    self.credentials_checked.append(CredentialCheck(credential_name=summary, found=found))
+
+            elif tool == "type_text":
+                parts = summary.split("into ")
+                selector = parts[-1].strip("'\"") if len(parts) > 1 else ""
+                # Intentionally omit value: typed text may contain PII / credentials.
+                self.fields_filled.append(FieldFilled(selector=selector, label=selector))
+
+            elif tool == "update_workflow":
+                self.workflow_state = summary
+
+            elif tool == "run_browser_code":
+                self.decisions_made.append(f"{tool}: {summary}")
+                if summary.startswith("Ran browser code") and " at " in summary:
+                    url = summary.rsplit(" at ", 1)[1].strip()
+                    if url and not any(v.url == url for v in self.urls_visited):
+                        self.urls_visited.append(UrlVisit(url=url, summary="browser code"))
+
+            elif tool in (
+                "click",
+                "evaluate",
+                "run_blocks_and_collect_debug",
+                "update_and_run_blocks",
+                "edit_block_and_run",
+                "test_workflow_from_blank_browser",
+                "get_run_results",
+            ):
+                self.decisions_made.append(f"{tool}: {summary}")
+
+            elif tool == "get_browser_screenshot":
+                if "(" in summary and ")" in summary:
+                    url = summary.split("(", 1)[1].rsplit(")", 1)[0]
+                    if url and not any(v.url == url for v in self.urls_visited):
+                        self.urls_visited.append(UrlVisit(url=url, summary="screenshot"))
+
+            output = entry.get("output_preview")
+            if output and tool in (
+                "run_blocks_and_collect_debug",
+                "update_and_run_blocks",
+                "edit_block_and_run",
+                "test_workflow_from_blank_browser",
+                "get_run_results",
+            ):
+                preview = output[:300] if len(output) > 300 else output
+                self.decisions_made.append(f"  output: {preview}")
+
+        if len(self.decisions_made) > 20:
+            self.decisions_made = self.decisions_made[-15:]
+        if len(self.urls_visited) > 50:
+            self.urls_visited = self.urls_visited[-40:]
+        if len(self.fields_filled) > 50:
+            self.fields_filled = self.fields_filled[-40:]
+        if len(self.credentials_checked) > 50:
+            self.credentials_checked = self.credentials_checked[-40:]
+
+
+def sanitize_global_llm_context_for_prompt(global_llm_context: str | None) -> str:
+    raw = global_llm_context or ""
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    return json.dumps(payload, indent=2)
+
+
+def build_model_safe_global_llm_context(global_llm_context: str | None) -> str:
+    """The model-facing view of the serialized context: values redacted structurally,
+    document kept valid. Policy code consumes the raw serialized context, never this view."""
+    return sanitize_global_llm_context_for_prompt(redact_raw_secrets_for_structured_prompt(global_llm_context or ""))
+
+
+_MAX_OBSERVED_ACTED_PAGES = 20
+_MAX_CARRIED_INTERACTIONS = 60
+
+
+def _carried_trajectory_from_scout_trajectory(
+    trajectory: Sequence[Mapping[str, Any]],
+    credential_field_inventory: Mapping[str, frozenset[str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Carry each interaction forward as captured, minus the turn-ephemeral fields.
+
+    No tool filter and no field roster: a field added to ``ScoutedInteraction`` crosses
+    without an entry anywhere. Credential inventory is attached here because it is
+    resolve-time metadata the interaction itself never carried.
+    """
+    carried: list[dict[str, Any]] = []
+    for interaction in trajectory:
+        if not str(interaction.get("tool_name") or "").strip():
+            continue
+        entry = {
+            key: value
+            for key, value in interaction.items()
+            if key not in _TURN_EPHEMERAL_INTERACTION_FIELDS and key != "selector"
+        }
+        selector = interaction.get("selector")
+        if isinstance(selector, str) and selector:
+            entry.setdefault("executed_selector", selector)
+        credential_id = entry.get("credential_id")
+        inventory = (credential_field_inventory or {}).get(credential_id) if isinstance(credential_id, str) else None
+        if inventory:
+            entry["available_fields"] = sorted(inventory)
+        carried.append(entry)
+    return carried[-_MAX_CARRIED_INTERACTIONS:]
+
+
+def _merge_carried_trajectory(
+    prior: Sequence[Mapping[str, Any]], current: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """Retained entries first, then this turn's, dropping entries already represented.
+
+    A turn whose rebind was declined never re-derives the prior entries from its own
+    trajectory, so replacing rather than merging would discard the record a turn at a
+    time — the loss compounding on itself.
+    """
+    merged = [dict(entry) for entry in prior]
+    # Hydration seeds this turn's trajectory with the retained record, marking each entry
+    # carried, so when there is a prior record those entries are already represented and
+    # re-appending would double them. Matching on content instead would collapse a genuine
+    # repeat — a banner dismissed twice, the same value read twice — and silently shorten
+    # the record. Tested against ``prior``, never the list being built, which grows.
+    skip_carried = bool(merged)
+    for entry in current:
+        if skip_carried and entry.get("carried") is True:
+            continue
+        merged.append(dict(entry))
+    return merged[-_MAX_CARRIED_INTERACTIONS:]
+
+
+def _merge_observed_acted_pages(prior: list[ObservedPage], flow_evidence: list[dict[str, Any]]) -> list[ObservedPage]:
+    """Fold this turn's flow-evidence trajectory into the persisted summary.
+
+    Keyed by safe origin plus location fingerprint; a later observation of the same page replaces the earlier one,
+    and a bounded-schema or interaction observation never regresses to a weaker
+    one for the same page.
+    """
+    by_location: dict[tuple[str, str], ObservedPage] = {}
+    for page in prior:
+        safe_url = safe_page_origin(page.url)
+        fingerprint = page.location_fingerprint or page_location_fingerprint(page.url)
+        if not safe_url or not fingerprint:
+            continue
+        by_location[(safe_url, fingerprint)] = ObservedPage(
+            url=safe_url,
+            location_fingerprint=fingerprint,
+            had_bounded_schema=page.had_bounded_schema,
+            reached_via=page.reached_via,
+        )
+    for entry in flow_evidence:
+        evidence = entry.get("evidence")
+        url = entry.get("url")
+        if (not isinstance(url, str) or not url.strip()) and isinstance(evidence, dict):
+            url = evidence.get("current_url") or evidence.get("inspected_url")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        safe_url = safe_page_origin(url)
+        if not safe_url:
+            continue
+        fingerprint = (
+            str(evidence.get("current_url_location_fingerprint") or "") if isinstance(evidence, dict) else ""
+        ) or page_location_fingerprint(url)
+        if not fingerprint:
+            continue
+        location_key = (safe_url, fingerprint)
+        existing = by_location.get(location_key)
+        had_schema = bool(entry.get("had_bounded_schema")) or (existing.had_bounded_schema if existing else False)
+        reached_via = str(entry.get("reached_via") or (existing.reached_via if existing else ""))
+        if existing and existing.reached_via == "interaction":
+            reached_via = "interaction"
+        by_location[location_key] = ObservedPage(
+            url=safe_url,
+            location_fingerprint=fingerprint,
+            had_bounded_schema=had_schema,
+            reached_via=reached_via,
+        )
+    return list(by_location.values())[-_MAX_OBSERVED_ACTED_PAGES:]
+
+
+def finalize_observation_context(ctx: Any, raw_context: str | None) -> str | None:
+    """Fold durable observation evidence into the outgoing global LLM context.
+
+    Called from agent.py's `_make_agent_result` factory so every AgentResult
+    exit path — timeout, cancel, max-turns, output-policy block, request-
+    policy clarification, infeasibility clarification, non-retriable nav error,
+    normal translate-result, missing-SDK fallback, unexpected-error fallback —
+    carries the updated count.
+
+    Returns None when there is nothing to record and no prior context, so the
+    pre-existing 'no global_llm_context' behaviour is preserved.
+    """
+    prior_inspections = int(getattr(ctx, "prior_page_inspection_calls_made", 0) or 0)
+    inspections_this_turn = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
+    flow_evidence = getattr(ctx, "flow_evidence", None) or []
+    raw_scout_trajectory = getattr(ctx, "scout_trajectory", None)
+    scout_trajectory = raw_scout_trajectory if isinstance(raw_scout_trajectory, Sequence) else ()
+    raw_inventory = getattr(ctx, "scouted_credential_field_inventory_by_credential_id", None)
+    raw_entrypoint_url = getattr(ctx, "resolved_discovery_entrypoint_url", None)
+    resolved_entrypoint_url = raw_entrypoint_url if isinstance(raw_entrypoint_url, str) else None
+    carried_this_turn = _carried_trajectory_from_scout_trajectory(
+        [interaction for interaction in scout_trajectory if isinstance(interaction, Mapping)],
+        credential_field_inventory=raw_inventory if isinstance(raw_inventory, Mapping) else None,
+    )
+    if (
+        not raw_context
+        and inspections_this_turn == 0
+        and not flow_evidence
+        and not carried_this_turn
+        and not resolved_entrypoint_url
+    ):
+        return None
+    sc = StructuredContext.from_json_str(raw_context)
+    if resolved_entrypoint_url:
+        sc.entrypoint_url = resolved_entrypoint_url
+    sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
+    sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)
+    sc.carried_trajectory = _merge_carried_trajectory(sc.carried_trajectory, carried_this_turn)
+    if sc.carried_trajectory:
+        LOG.info(
+            "ember_carried_trajectory_persisted",
+            source_url=sc.carried_trajectory[0].get("source_url"),
+            interaction_count=len(sc.carried_trajectory),
+            this_turn_count=len(carried_this_turn),
+        )
+    return sc.to_json_str()
+
+
+_MAX_APPROVED_CREDENTIALS = 20
+# Copilot re-asks about the same credential a handful of times before the user answers — the
+# production chat this carry was built for asked four. Past that the conversation has moved on,
+# whatever the turns are shaped like.
+_MAX_PROPOSAL_CARRIES = 5
+
+
+def record_approved_credentials_in_global_llm_context(ctx: EmberContext, raw_context: str | None) -> str | None:
+    """Persist resolved credentials as durable cross-turn approval. Records only from
+    resolved_credentials, never discovered_credentials, so ADR-0002's run/draft split
+    holds by construction. A credential a live login page vouched for is left out: its
+    evidence is that page, which a later turn has not seen, so it must be re-earned there.
+
+    Google connections are recorded on the same terms but from the account the user picked,
+    since connections never enter resolved_credentials. Without this the pick authorizes only
+    the turn it arrived on, and a workflow that has not yet persisted re-asks every turn.
+    """
+    policy = ctx.request_policy
+    if policy is None or not (policy.resolved_credentials or policy.selected_connected_account_id):
+        return raw_context
+    sc = StructuredContext.from_json_str(raw_context)
+    selected = policy.selected_connected_account_id
+    if selected is not None:
+        reads_only = policy.selected_connected_account_from_pending_proposal
+        prior = next((record for record in sc.approved_connections if record.credential_id == selected), None)
+        if prior is None:
+            sc.approved_connections.append(ApprovedCredential(credential_id=selected, reads_only=reads_only))
+            if len(sc.approved_connections) > _MAX_APPROVED_CREDENTIALS:
+                sc.approved_connections = sc.approved_connections[-_MAX_APPROVED_CREDENTIALS:]
+        elif not reads_only:
+            prior.reads_only = False
+    existing_records = {record.credential_id: record for record in sc.approved_credentials}
+    for credential in policy.resolved_credentials:
+        # A credential the user picked from the card is durable approval even though the resume
+        # stamped an origin for it; only page-vouched ids have to be re-earned.
+        # A stamp the carry restored is not page evidence the user has to re-earn: without this a
+        # user who answers by naming the credential gets no durable approval, which is the re-ask
+        # loop this amendment exists to end. A stamp a live page wrote this turn still counts.
+        settled_ids = policy.current_turn_named_credential_ids | policy.origin_recovery_kept_named_credential_ids
+        # Read at turn end, when what the user settled is final: a card pick or a typed name landing
+        # after the citation is still them answering this ask by choosing a different credential.
+        carry_stamp_the_user_answered = (
+            credential.credential_id in policy.seeded_proposal_credential_ids
+            and credential.credential_id in policy.carry_cited_credential_ids
+            and not (settled_ids and credential.credential_id not in settled_ids)
+        )
+        card_selected = credential.credential_id in policy.credential_pause_connected_credential_ids
+        stamped_by_page = (
+            credential.credential_id in policy.live_page_admitted_urls
+            and not card_selected
+            and not carry_stamp_the_user_answered
+        )
+        if (
+            credential.credential_id in policy.persisted_workflow_credential_ids
+            and credential.credential_id not in settled_ids
+            and not card_selected
+            and not carry_stamp_the_user_answered
+        ):
+            # A saved binding grants authority through that workflow, not an independent chat
+            # approval that would outlive removal of the binding.
+            continue
+        source_url = policy.live_page_admitted_urls.get(credential.credential_id, "")
+        if source_url and (card_selected or carry_stamp_the_user_answered) and canonicalize_origin(source_url) is None:
+            continue
+        admitted_url = safe_admitted_url(source_url) if card_selected or carry_stamp_the_user_answered else ""
+        existing_record = existing_records.get(credential.credential_id)
+        if existing_record is not None:
+            # A new explicit card answer can bind a prior name-only approval, or select a new
+            # login origin. Page observations alone never rewrite durable user approval.
+            if card_selected and admitted_url:
+                existing_record.admitted_url = admitted_url
+            continue
+        if stamped_by_page:
+            continue
+        # An approval minted from a carry keeps the origin that vouched for the credential. Without
+        # it the id is resolved on every later turn with nothing pinning it, and the fill seam's
+        # user-provided-site route then reaches any site named anywhere in the conversation.
+        sc.approved_credentials.append(
+            ApprovedCredential(
+                credential_id=credential.credential_id,
+                admitted_url=admitted_url,
+            )
+        )
+        existing_records[credential.credential_id] = sc.approved_credentials[-1]
+    if len(sc.approved_credentials) > _MAX_APPROVED_CREDENTIALS:
+        sc.approved_credentials = sc.approved_credentials[-_MAX_APPROVED_CREDENTIALS:]
+    return sc.to_json_str()
+
+
+def _live_page_admitted_proposal(policy: RequestPolicy) -> ProposedCredential | None:
+    """The credential a login page admitted on this turn, when it admitted exactly one.
+
+    An id the carry itself seeded is not evidence: hydration restores the same two fields a fresh
+    admission writes, so counting it here would re-mint the carry from its own state every turn.
+    """
+    # Count only what a page admitted this turn. Hydration appends the carry to the same list, so
+    # counting it would bail whenever a page freshly admits a second credential — dropping the new
+    # one and renewing the stale carry, on the turn copilot found a different login.
+    admitted_this_turn = [
+        credential
+        for credential in policy.auto_bound_credentials
+        if credential.credential_id not in policy.seeded_proposal_credential_ids
+    ]
+    if len(admitted_this_turn) != 1:
+        return None
+    credential_id = admitted_this_turn[0].credential_id
+    admitted_url = policy.live_page_admitted_urls.get(credential_id) or ""
+    if not admitted_url:
+        return None
+    return ProposedCredential(
+        credential_id=credential_id,
+        admitted_url=safe_admitted_url(admitted_url),
+        origin_arm="live_page_admitted",
+    )
+
+
+def _carried_proposal_still_unanswered(policy: RequestPolicy, sc: StructuredContext) -> ProposedCredential | None:
+    """The carry from an earlier turn, kept while the ask it was recorded for is still outstanding.
+
+    Copilot asks about the same credential across several turns before the user answers, so a carry
+    that died on the first re-ask would restore the loop this exists to end. The carry retires the
+    moment the answer lands: an answered proposal is durable approval, and a turn that settles a
+    different credential is the user declining this one. A turn that does not end by asking clears
+    it, since the recorder only reaches here on an ask.
+    """
+    seed = sc.proposed_credential
+    if seed is None or seed.credential_id not in policy.seeded_proposal_credential_ids:
+        return None
+    return seed
+
+
+def _executed_credential_fill_proposal(ctx: EmberContext) -> ProposedCredential | None:
+    """The credential the server itself filled this turn, when the turn ran exactly one such fill.
+
+    Read from this turn's own trajectory, never the persisted record: ``_merge_carried_trajectory``
+    keeps earlier turns' entries verbatim and unmarked, so a filter over the merged list would match
+    every historical fill and re-derive the carry forever. ``credentials_checked`` is not a source
+    either — a vault lookup by name has no page behind it, so it leaves no origin to restore.
+    """
+    raw_trajectory = getattr(ctx, "scout_trajectory", None)
+    trajectory = raw_trajectory if isinstance(raw_trajectory, Sequence) else ()
+    fills = [
+        entry
+        for entry in trajectory
+        if isinstance(entry, Mapping)
+        and entry.get("carried") is not True
+        and entry.get("tool_name") == CREDENTIAL_FILL_TOOL_NAME
+        and isinstance(entry.get("credential_id"), str)
+        and entry.get("credential_id")
+        and isinstance(entry.get("executed_selector"), str)
+        and entry.get("executed_selector")
+        and isinstance(entry.get("source_url"), str)
+        and entry.get("source_url")
+    ]
+    if len({str(entry["credential_id"]) for entry in fills}) != 1:
+        return None
+    return ProposedCredential(
+        credential_id=str(fills[-1]["credential_id"]),
+        admitted_url=safe_admitted_url(str(fills[-1]["source_url"])),
+        origin_arm="executed_credential_fill",
+    )
+
+
+def _proposal_that_survives_this_turn(
+    proposed: ProposedCredential, policy: RequestPolicy, sc: StructuredContext
+) -> ProposedCredential | None:
+    """Apply the retirement rules to whichever arm produced the proposal.
+
+    Held here rather than in the arms because each arm otherwise enforces its own subset: a turn that
+    ran a fill would mint a fresh record every time, resetting the count and outliving both the
+    answer and a different credential the user settled — the login-retry loop the fill arm exists for
+    is exactly where that ran forever.
+    """
+    if proposed.credential_id in policy.carry_cited_credential_ids:
+        return None
+    settled_ids = policy.current_turn_named_credential_ids
+    if settled_ids and proposed.credential_id not in settled_ids:
+        return None
+    prior = sc.proposed_credential
+    # Fresh evidence for a credential the user still has not answered for is the same unanswered ask,
+    # so the count follows the credential rather than the arm that produced this turn's record.
+    carries = prior.carries + 1 if prior is not None and prior.credential_id == proposed.credential_id else 0
+    if carries >= _MAX_PROPOSAL_CARRIES:
+        return None
+    return proposed.model_copy(update={"carries": carries})
+
+
+def record_proposed_credential_in_global_llm_context(
+    ctx: EmberContext, raw_context: str | None, response_type: str
+) -> str | None:
+    """Carry the credential the server itself bound or filled, when the turn ends by asking the user,
+    so the next turn can verify a model citation against it. The write is unconditional in both
+    directions, so any turn reaching here expires an older record.
+    """
+    policy = ctx.request_policy
+    sc = StructuredContext.from_json_str(raw_context)
+    proposed: ProposedCredential | None = None
+    if policy is not None and response_type == "ASK_QUESTION":
+        proposed = (
+            _live_page_admitted_proposal(policy)
+            or _executed_credential_fill_proposal(ctx)
+            or _carried_proposal_still_unanswered(policy, sc)
+        )
+        if proposed is not None:
+            proposed = _proposal_that_survives_this_turn(proposed, policy, sc)
+        # The card settles its own id within the turn, so a card answer never needs the carry — and
+        # a card answer naming a different credential retires the proposal it replaced.
+        if proposed is not None and ctx.credential_pause_connected_credential_id is not None:
+            proposed = None
+    if proposed is None:
+        return clear_proposed_credential(raw_context)
+    LOG.info(
+        "ember_credential_proposal_recorded",
+        credential_id=proposed.credential_id,
+        origin_arm=proposed.origin_arm,
+        admitted_url=loggable_origin(proposed.admitted_url),
+    )
+    if sc.proposed_credential == proposed:
+        return raw_context
+    sc.proposed_credential = proposed
+    return sc.to_json_str()
+
+
+def clear_proposed_credential(raw_context: str | None) -> str | None:
+    """Drop the one-turn credential proposal from a context a turn is about to persist. Every path
+    that persists without running the recorder above must call this, or the proposal outlives its
+    turn and re-grants fill authority later.
+    """
+    if raw_context is None:
+        return raw_context
+    sc = StructuredContext.from_json_str(raw_context)
+    if sc.proposed_credential is None:
+        return raw_context
+    sc.proposed_credential = None
+    return sc.to_json_str()
+
+
+# Turn-end writers: adopt_model_authored_context restores the first group, merge_turn_summary adds to the third.
+# finalize_observation_context recomputes only page_inspection_calls_made and builds the rest on what it was given.
+TRUSTED_CONTEXT_FIELDS = ("approved_credentials", "approved_connections", "proposed_credential", "carried_trajectory")
+OBSERVED_CONTEXT_FIELDS = ("entrypoint_url", "page_inspection_calls_made", "observed_acted_pages", "carried_trajectory")
+TOOL_ACTIVITY_CONTEXT_FIELDS = (
+    "urls_visited",
+    "fields_filled",
+    "credentials_checked",
+    "decisions_made",
+    "workflow_state",
+)
+_CONTEXT_FIELD_NOTES = {
+    "urls_visited": "append, don't repeat",
+    "decisions_made": "concise",
+    "workflow_state": "what blocks exist now",
+}
+
+
+def _context_field_phrases(names: Iterable[str]) -> list[str]:
+    return [f"{name} ({_CONTEXT_FIELD_NOTES[name]})" if name in _CONTEXT_FIELD_NOTES else name for name in names]
+
+
+def model_written_context_fields() -> str:
+    server_written = {*TRUSTED_CONTEXT_FIELDS, *OBSERVED_CONTEXT_FIELDS, *TOOL_ACTIVITY_CONTEXT_FIELDS}
+    return join_phrases(
+        _context_field_phrases(name for name in StructuredContext.model_fields if name not in server_written), "and"
+    )
+
+
+def tool_recorded_context_fields() -> str:
+    return join_phrases(_context_field_phrases(TOOL_ACTIVITY_CONTEXT_FIELDS), "and", serial_comma=False)
+
+
+def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> StructuredContext:
+    """Take the model's context but keep the server-owned fields server-owned.
+
+    Approval is recorded only from server-resolved credentials; an entry the model
+    supplied would be promoted into `resolved_credentials` on the next turn and clear
+    the unapproved-credential gate for a credential the user never named. Membership
+    of the org is not evidence the user named it. `approved_connections` is server-owned
+    for the same reason: a model-authored entry would grant its own draft a run.
+
+    `carried_trajectory` is the record of what the browser was observed doing, so an
+    entry the model wrote would enter the factual record as an observation nothing made.
+    It also displaces the real one: the turn-end merge treats whatever arrives here as the
+    prior record and drops this turn's re-hydrated entries against it, so a model-authored
+    list survives and the observed one does not.
+    """
+    trusted = StructuredContext.from_json_str(trusted_raw)
+    structured = trusted
+    if isinstance(model_raw, dict):
+        try:
+            structured = StructuredContext.model_validate(model_raw)
+        except Exception as exc:
+            # The whole update is dropped, user_goal included, so a silent hit here hides lost model context.
+            LOG.warning(
+                "structured_context_model_update_rejected",
+                error_type=type(exc).__name__,
+                rejected_fields=sorted({str(error["loc"][0]) for error in exc.errors() if error["loc"]})
+                if isinstance(exc, ValidationError)
+                else [],
+            )
+            structured = trusted
+    elif isinstance(model_raw, str):
+        structured = StructuredContext.from_json_str(model_raw)
+    for field_name in TRUSTED_CONTEXT_FIELDS:
+        setattr(structured, field_name, deepcopy(getattr(trusted, field_name)))
+    return structured
+
+
+@dataclass
+class AgentResult:
+    user_response: str
+    updated_workflow: Workflow | None
+    global_llm_context: str | None
+    response_type: ResponseType = "REPLY"
+    workflow_yaml: str | None = None
+    private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
+    workflow_was_persisted: bool = False
+    # Route nulls any persisted proposed_workflow when this is set.
+    clear_proposed_workflow: bool = False
+    # Set when request policy barred this turn from authoring; the route's own
+    # proposal-clearing branches must not retire a draft such a turn never saw.
+    authoring_barred: bool = False
+    # Actual API token usage accumulated across the agent run. None when no
+    # provider reported usage on the stream — distinguishes "no data" from
+    # "0 tokens" so eval cost grading can flag missing telemetry instead of
+    # silently passing as cheap.
+    total_tokens: int | None = None
+    # Model name for the terminal attempt (primary or fallback), including an interrupted attempt.
+    # None when the turn never reached an attempt; telemetry only.
+    resolved_model: str | None = None
+    # Set when the agent absorbed an asyncio cancellation initiated by an
+    # explicit user Stop. Lets the route route to a cancel-specific
+    # persistence path (rollback + stop-report chat row) without
+    # losing ``workflow_was_persisted`` the way a re-raise would.
+    cancelled: bool = False
+    # Facts the route needs to persist an interruption record; the route sees the
+    # AgentResult, never the context that recorded them. None when unknown.
+    cancellation_iteration: int | None = None
+    cancellation_last_recorded_phase: str | None = None
+    cancellation_workflow_run_id: str | None = None
+    cancellation_stopped_facts: StoppedTurnFacts | None = None
+    # Controls whether the route may auto-apply the proposal or must force explicit review.
+    proposal_disposition: ProposalDisposition = "auto_applicable"
+    output_policy_diagnostics: dict[str, Any] | None = None
+    turn_outcome: TurnOutcome | None = None
+    turn_id: str | None = None
+    narrative_summary: str | None = None
+    # Persisted on the assistant chat message so the bubble survives a reload.
+    narrative_payload: TurnNarrativePayload | None = None
+    staged_workflow_yaml: str | None = None
+    staged_workflow: Workflow | None = None
+    has_staged_proposal: bool = False
+    proposal_owner_turn_id: str | None = None
+    proposal_revision: int | None = None
+    # The turn took over another turn's stored candidate and authored nothing since, so it has no turn-end write.
+    proposal_adopted: bool = False
+    proposal_workflow_run_id: str | None = None
+    # The version a run card saved this turn: the turn's rollback target, and it rules out an auto-accept commit.
+    run_card_saved_workflow: Workflow | None = None
+    code_artifact_metadata: dict[str, dict[str, Any]] | None = None
+    executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
+    # Legacy marker for turns that wrote canonical before snapshot isolation.
+    # Terminal handlers retain rollback support for those persisted turns.
+    canonical_was_persisted_due_to_param_change: bool = False
+    # Exact model-owned contract deletion must survive to the auto-accept write; ordinary saves
+    # still preserve a stored contract when their rebuilt definition omits this Copilot field.
+    clear_persisted_completion_contract: bool = False
+    # Criteria lifecycle decision + adjudication counters the route persists
+    # after the turn; None when persisted criteria are disabled.
+    completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
+    # Internal eval-only metadata. The normal response schema never serializes this field.
+    browser_ablation_metadata: BrowserAblationMetadata | None = None
+    # None when the turn never reached the agent loop, so a terminal frame built without a
+    # context leaves the client's rendered plan untouched instead of clearing it.
+    work_plan: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class ChatHistoryRow:
+    message_id: str
+    sender: EmberChatSender
+    created_at: str
+    text: str
+
+
+@dataclass(frozen=True)
+class InFlightStreamToolCall:
+    call_id: str
+    tool_name: str
+    iteration: int
+    display_label: str | None = None
+    reason: str | None = None
+    started_at: datetime | None = None
+    activity_bucket: ActivityBucket | None = None
+
+
+@dataclass
+class EmberContext(AgentContext):
+    """Unified context for the copilot agent run.
+
+    Extends AgentContext with enforcement state, tool tracking, and
+    workflow state needed by the SDK-based agent loop.
+
+    Field-shadowing note: the enforcement / workflow / frontier state fields
+    declared below are intentionally redeclared on this subclass. The parent
+    ``AgentContext`` (in ``runtime.py``) still carries the same names with the
+    same defaults for legacy paths that instantiate ``AgentContext`` directly.
+    Python's MRO resolves to the child's declaration when a ``CopilotContext``
+    instance is used — that's the desired behavior here. Stripping the
+    duplicates from the parent is tracked in SKY-8974; until that lands, if
+    you add a new field here, keep the defaults in sync with the parent to
+    avoid drift.
+    """
+
+    workflow_copilot_chat_id: str | None = None
+    ember_cancel_token: str | None = None
+    handled_steer_ids: set[str] = field(default_factory=set)
+    # A message or question answer from someone other than the starter reached the model, so the turn's input is not
+    # only the starter's.
+    steered_by_another: bool = False
+    ember_question_pause_seconds: float = 0.0
+    human_input_wait: HumanInputWait = field(default_factory=HumanInputWait)
+    eval_capture_case_id: str | None = None
+    eval_prompt_sha256: str | None = None
+    tool_surface_identity: EmberToolSurfaceIdentity | None = None
+    eval_tool_surface_sha256: str | None = None
+    eval_native_tool_names: tuple[str, ...] = ()
+    eval_mcp_tool_names: tuple[str, ...] = ()
+    eval_tool_activity: list[dict[str, Any]] = field(default_factory=list)
+    eval_screenshot_frames: list[dict[str, Any]] = field(default_factory=list)
+
+    # Enforcement state
+    navigate_called: bool = False
+    observation_after_navigate: bool = False
+    update_workflow_called: bool = False
+    test_after_update_done: bool = False
+    ember_total_timeout_exceeded: bool = False
+    ember_turn_cancelled_iteration: int | None = None
+    ember_max_turns_exceeded: bool = False
+    empty_completion: bool = False
+    budget_expiry_state: BudgetExpiryState = field(default_factory=BudgetExpiryState)
+    check_model_work_deadline: Callable[[], None] | None = field(default=None, repr=False)
+    model_calls_this_turn: int = 0
+    # The latest model response this turn, or None while a model call is in flight.
+    last_model_response: ModelResponse | None = field(default=None, repr=False)
+    tool_calls_this_turn: int = 0
+    enforcement_pass_count: int = 0
+    pre_run_gated_output_warning_fingerprint: tuple[tuple[str, str, bool, str], ...] = ()
+    user_message: str = ""
+    block_goal_main_goal: str = ""
+    request_policy: RequestPolicy | None = None
+    ember_config: EmberConfig | None = None
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
+    target_block_label: str | None = None
+    selected_block_label: str | None = None
+    doc_editor_enabled: bool = False
+    turn_context_packet: TurnContextPacket | None = None
+    # Renders this chat's rows older than the chat_history window, oldest first, only when first called.
+    earlier_chat_history_rows: Callable[[], tuple[ChatHistoryRow, ...]] = tuple
+    chat_history_oldest_shown_id: str | None = None
+    earlier_chat_history_unavailable: bool = False
+    skill_session: SkillSession = field(default_factory=lambda: SkillSession([], agent=EMBER_SKILLS_AGENT))
+    prior_turn_outcome: TurnOutcome | None = None
+    # Server-verified display data for recovering from a model-staged connected
+    # account that has no run authority. This never grants authority itself.
+    connected_account_recovery_choices: list[ConnectedAccountChoice] = field(default_factory=list)
+    latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
+    blocked_reply_signatures: list[str] = field(default_factory=list)
+
+    # Mid-build credential pause (credential_pause.py). client_supports_credential_pause is set from the
+    # chat request at construction; the rest are owned by maybe_credential_pause.
+    client_supports_credential_pause: bool = False
+    client_supports_credential_pause_recovery: bool = False
+    client_supports_credential_generation: bool = False
+    credential_recovery_token_digest: str | None = field(default=None, repr=False)
+    credential_recovery_armed: bool = False
+    # One update card (add an authenticator, or replace values a site refused) may follow an answered
+    # card per turn: it asks to fix the credential the user already chose, not to choose again.
+    credential_totp_update_asked: bool = False
+    ember_credential_pause_seconds: float = 0.0
+    credential_pause_outcome: str | None = None
+    credential_registration_outcome: Literal["rejected", "unknown"] | None = None
+    # Generate and save created, or may have created, a credential; a second generate card could mint a duplicate.
+    credential_generation_spent: bool = False
+    credential_pause_connected_credential_id: str | None = None
+    credential_pause_anchor_tool_call_id: str | None = None
+    credential_pause_receipts: list[dict[str, str | list[str]]] = field(default_factory=list)
+    credential_pause_site_answer: SiteAnswer | None = None
+    demonstration_requested: bool = False
+    demonstration_ran: bool = False
+    demonstration_id: str | None = None
+    demonstration_insertion: dict[str, str | None] | None = None
+    demonstration_items: list[str] = field(default_factory=list)
+    demonstration_offered: bool = False
+    # Each trigger created this turn gets a card that opens it, switched off, in the Studio Triggers panel.
+    created_triggers: list[NarrativeCreatedTrigger] = field(default_factory=list)
+    # Set while a ``request_credential`` ask is open, so tool calls issued alongside it in the same
+    # model response wait for the user's answer instead of racing it.
+    credential_pause_settled: asyncio.Event | None = None
+    # Preserve the immutable turn-open document because ``workflow_yaml`` is
+    # reassigned after every accepted update in the same agent turn.
+    turn_start_workflow_yaml: str | None = field(init=False, default=None)
+    # Set once background naming renames the placeholder, so a title the model mints afterwards on
+    # this turn is recognised as a mint rather than a rename.
+    agent_named_title: str | None = field(init=False, default=None)
+    # The saved row's title as the turn opened. Independent of the saved YAML, which a workflow with
+    # no blocks does not have, and of the submitted canvas, which can carry an unsaved rename.
+    opening_workflow_title: str | None = None
+    connection_cards: list[ConnectionCardPayload] = field(default_factory=list)
+    canonical_workflow_unavailable: CanonicalWorkflowUnavailableFacts | None = None
+
+    # Tool tracking
+    tool_activity: list[dict[str, Any]] = field(default_factory=list)
+    # A goal-satisfied stop raised from on_tool_end ends the SDK stream before
+    # the satisfying tool's tool_output event flushes; these carry what the
+    # exit path needs to emit the missing TOOL_RESULT frame.
+    in_flight_stream_tool_call: InFlightStreamToolCall | None = None
+    stream_tool_calls: dict[str, InFlightStreamToolCall] = field(default_factory=dict)
+    pending_stream_tool_call_ids: set[str] = field(default_factory=set)
+    goal_satisfied_tool_call_id: str | None = None
+    goal_satisfied_tool_name: str | None = None
+    goal_satisfied_tool_output: dict[str, Any] | None = None
+    # Stashed by the write seam under the id of the tool call that produced it, and drained by
+    # that same call's result: parallel tool calls are the provider default, so an arrival-ordered
+    # stash would show a write's patch on a sibling's row. The budget is a dataclass default, so a
+    # new turn's context starts with the full allowance.
+    pending_code_write_diffs: dict[str, list[CodeWriteDiff]] = field(default_factory=dict)
+    code_write_patch_budget: int = TURN_PATCH_CHAR_BUDGET
+    latest_tool_blocker_signal: EmberToolBlockerSignal | None = None
+    tool_blocker_signals: list[EmberToolBlockerSignal] = field(default_factory=list)
+    turn_halt: TurnHalt | None = None
+
+    # ``None`` until usage is observed; ``0`` only when a provider explicitly
+    # reported zero. Distinct values let cost grading flag missing telemetry.
+    total_tokens_used: int | None = None
+    input_tokens_used: int | None = None
+    output_tokens_used: int | None = None
+    resolved_model: str | None = None
+
+    # Workflow state
+    authored_private_workflow_settings: dict[str, Any] | None = field(default=None, repr=False)
+    persisted_workflow_yaml: str | None = None
+    # The saved row; persisted_workflow_yaml is None when it has no blocks, so its canvas comes from here.
+    saved_workflow: Workflow | None = field(default=None, repr=False)
+    private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
+    last_workflow: Workflow | None = field(default=None, repr=False)
+    last_workflow_yaml: str | None = None
+    # Copies of the saved workflow a full test loaded this turn; matched by identity, never offered as a proposal.
+    saved_workflows_under_test: list[Workflow] = field(default_factory=list)
+    # Always False under staging; ``has_staged_proposal`` carries the signal.
+    workflow_persisted: bool = False
+    last_update_block_count: int | None = None
+    last_test_ok: bool | None = None
+    last_test_failure_reason: str | None = None
+    last_artifact_health_blocker_reason: str | None = None
+    last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
+    last_artifact_health_failure_classes: list[str] = field(default_factory=list)
+    code_only_target_page_evidence_seen: bool = False
+    last_failed_workflow_yaml: str | None = None
+    code_native_pending_capability: str | None = None
+    # Set when a block-running tool timed out and the run's true outcome
+    # could not be reconciled (post-drain row was ``canceled``, non-final, or
+    # unreadable). Blocks further block-running tool calls until the LLM
+    # calls ``get_run_results(workflow_run_id=<same>)`` AND that read returns
+    # a status in ``_TRUSTED_POST_DRAIN_STATUSES``. Turn-scoped by
+    # construction — ``CopilotContext`` is re-created per agent turn — so
+    # this guards auto-retry WITHIN a turn but not cross-turn "user says
+    # retry" requests.
+    # Block-running tools make their own run context available for same-turn
+    # reporting. This is deliberately not persisted across turns. The
+    # successful variant is kept for "default to the last clean result"; the
+    # generic variant allows the agent to re-read the same failed/canceled run
+    # after a watchdog reconciliation read has cleared the retry guard.
+    last_run_blocks_workflow_run_id: str | None = None
+    last_successful_run_blocks_workflow_run_id: str | None = None
+    # Runs this turn actually dispatched. ``last_run_blocks_workflow_run_id`` cannot answer that:
+    # a repair turn is seeded with the run it was opened about, which this turn never dispatched.
+    dispatched_run_ids_this_turn: set[str] = field(default_factory=set)
+    # Keyed by run id and drained by that run's own tool result, so a parallel sibling never shows these.
+    pending_test_inputs: dict[str, list[EmberTestInput]] = field(default_factory=dict)
+    # Redacted, display-clamped labels of blocks this turn's writes changed, in first-write order.
+    edited_block_labels_this_turn: list[str] = field(default_factory=list)
+    # Counts every recorded block edit, repeats included, so a run can tell whether an edit followed it.
+    block_edits_recorded_this_turn: int = 0
+    block_edits_recorded_at_dispatch: dict[str, int] = field(default_factory=dict)
+    # Whether the latest recorded run-tool result created a run row; None until one is recorded.
+    last_test_run_started: bool | None = None
+    # The files the last recorded worker run published, keyed by that run's id.
+    delivered_output_files: tuple[str, list[DeliveredOutputFile]] | None = None
+    # Producers a dispatched run was seeded with and never ran; their values belong to another run.
+    seeded_only_labels_by_run_id: dict[str, frozenset[str]] = field(default_factory=dict)
+    skipped_prefix_by_run_id: dict[str, list[SkippedPrefixBlock]] = field(default_factory=dict)
+    # The browser session the last run actually executed in. On the fresh-session replay path this
+    # is not ctx.browser_session_id, which stays pointed at the debug/scout browser.
+    last_run_blocks_browser_session_id: str | None = None
+    # Why the chat's last recorded run could not be bound, when it could not. Distinct from having
+    # no run at all, which the target resolver states itself.
+    last_run_binding_unavailable_reason: str | None = None
+    # In-turn run-outcome trace derived from assignments to ``last_run_outcome``
+    # (the same source that powers run_outcome SSE frames). Append-only across
+    # per-run pointer resets (``last_run_outcome = None``) and workflow edits.
+    run_outcome_trace: list[RecordedRunOutcome] = field(default_factory=list)
+    effective_workflow_proxy_location: ProxyLocationInput = None
+
+    # Per-request frontier state. `verified_block_outputs` and
+    # `verified_prefix_labels` are populated ONLY from fully-successful runs —
+    # a single failed block in the executed suffix leaves the prior verified
+    # state untouched, because the browser session is now in post-failure
+    # state and the prefix labels can no longer be trusted as an anchor.
+    verified_block_outputs: dict[str, Any] = field(default_factory=dict)
+    verified_prefix_labels: list[str] = field(default_factory=list)
+    verified_prefix_current_url: str | None = None
+    last_requested_block_labels: list[str] = field(default_factory=list)
+    last_executed_block_labels: list[str] = field(default_factory=list)
+    executed_block_labels: set[str] = field(default_factory=set)
+    executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
+    last_full_workflow_test_ok: bool = False
+    last_unverified_block_labels: list[str] = field(default_factory=list)
+    workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
+    last_frontier_start_label: str | None = None
+    pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
+    last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
+    signed_out_page_observations: list[SignedOutPageObservation] = field(default_factory=list)
+    signed_out_page_observation_attempts: list[str] = field(default_factory=list)
+    latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
+    recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
+    recorded_persisted_block_run_workflow_run_id: str | None = None
+    # Set by _record_run_blocks_result when the last failed run blames the target (DNS / cert / SSL / invalid URL),
+    # never Skyvern's own proxy hop; cleared at the top of every call so stale state can't leak across runs.
+    last_test_non_retriable_nav_error: str | None = None
+    # Secure-runner codes from the latest run that were faults of the sandbox itself, joined.
+    # Cleared per run in _record_run_blocks_result, so a later clean run releases the guard.
+    last_infrastructure_tool_error: str | None = None
+    # Normalized signature of the non-retriable nav error last nudged on.
+    # Lets the stop nudge re-fire if the user retries with a different bad URL
+    # (different signature) in the same session. Cleared on meaningful success.
+    last_failure_category_top: str | None = None
+
+    ember_run_start_monotonic: float | None = None
+
+    last_good_workflow: Workflow | None = None
+    last_good_workflow_yaml: str | None = None
+    last_good_private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    # Populated lazily by ``stream_to_sse`` and reused across enforcement
+    # iterations so cadence/last-emitted-at survive ``run_with_enforcement``
+    # retries. Declared here (rather than attached dynamically) so future
+    # refactors can't strip it silently.
+    narrator_state: NarratorState | None = None
+
+    prior_page_inspection_calls_made: int = 0
+    page_inspection_calls_this_turn: int = 0
+    discovery_step_count: int = 0
+    discovery_evidence_trail: list[dict[str, Any]] = field(default_factory=list)
+    resolved_discovery_entrypoint_url: str | None = None
+    resolved_discovery_failure_reason: str | None = None
+    resolved_discovery_entrypoint_inspection_baseline: int = 0
+    # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
+    discovery_mcp_server: SkyvernOverlayMCPServer | None = None
+
+    # default_factory is the safety net — Python dataclass inheritance
+    # disallows non-default fields after default ones, and the parent
+    # ``AgentContext`` has many defaulted fields. The route generates the
+    # canonical turn_id and passes it as an explicit kwarg at every
+    # construction site, overriding this default.
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    turn_index: int = 0
+    narrative_summary: str | None = None
+
+    staged_workflow_yaml: str | None = None
+    staged_workflow: Workflow | None = None
+    has_staged_proposal: bool = False
+    # Fields by label that a write this turn kept from the saved workflow because the submitted YAML omitted them.
+    # Label -> field -> the text Copilot left out and the save kept, from the previous draft or the saved row.
+    kept_note_labels: dict[str, dict[str, str]] = field(default_factory=dict)
+    # The pending proposal when only a canvas edit kept it from being restored this turn.
+    canvas_rejected_proposal_yaml: str | None = None
+    # Blocks whose notes in that proposal differ from the saved notes this turn reads.
+    unrestored_proposal_note_labels: list[str] = field(default_factory=list)
+    # A single in-process writer at a time; the row-level CAS below this lock is the
+    # cross-process fence. The token is replaced only after a durable publication.
+    proposal_mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # Held from reading the stored draft through publishing the edit, so tool calls sent in one model
+    # response compose in order. Separate from proposal_mutation_lock, which the publish takes inside it.
+    block_edit_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    proposal_owner_turn_id: str | None = None
+    proposal_revision: int | None = None
+    # A token this turn adopted but did not author never authorizes a turn-end write.
+    proposal_adopted: bool = False
+    proposal_adoptions: int = 0
+    # Adoptions the latest model response had seen; its tool calls were written before any later one.
+    proposal_adoptions_seen_by_model: int = 0
+    proposal_canonical_fingerprint: str | None = None
+    proposal_workflow_run_id: str | None = None
+    # When set, a run binds only while the stored run id still equals proposal_workflow_run_id, so two turns
+    # resuming one account pick cannot both bind a run.
+    proposal_bind_checks_run_id: bool = False
+    run_card_saved_workflow: Workflow | None = None
+    # A restored candidate whose request private settings differ from its own; its stored bytes cannot vouch
+    # for what a test under this token would run, so binding a run to it is refused.
+    settings_diverged_proposal_token: tuple[str, int] | None = None
+    # The chat row's setting, not the turn's commit decision: the route can still refuse to apply a
+    # staged draft at turn end. None on entrypoints that load no chat row.
+    auto_accept: bool | None = None
+    # Prior turn's uncommitted draft; carries blocks even when the request body and canonical row are empty.
+    prior_ember_workflow_yaml: str | None = None
+    # Legacy marker for turns that wrote canonical before snapshot isolation.
+    # Terminal handlers retain rollback support for those persisted turns.
+    canonical_was_persisted_due_to_param_change: bool = False
+    clear_persisted_completion_contract: bool = False
+    completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
+    prior_block_count: int | None = None
+    narrative_block_attempts: dict[str, NarrativeBlockAttempt] = field(default_factory=dict)
+    turn_started_at: str | None = None
+    turn_ended_at: str | None = None
+    # Browser predicted for the latest browser tool call, as on its tool_call frame; kept when a call predicts none.
+    tool_browser_session_id: str | None = None
+    live_narrative_task: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        parent_post_init = getattr(super(), "__post_init__", None)
+        if callable(parent_post_init):
+            parent_post_init()
+        from skyvern.forge.sdk.ember.run_outcome import RecordedRunOutcome
+
+        self.turn_start_workflow_yaml = self.workflow_yaml
+
+        if isinstance(self.last_run_outcome, RecordedRunOutcome):
+            super().__setattr__("run_outcome_trace", [self.last_run_outcome])
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name != "last_run_outcome":
+            return
+        from skyvern.forge.sdk.ember.run_outcome import RecordedRunOutcome
+
+        if not isinstance(value, RecordedRunOutcome):
+            # ``last_run_outcome = None`` is a per-run pointer reset, not an
+            # archive reset. The trace retains the full in-order run record;
+            # terminal projection deliberately anchors to its latest run.
+            return
+        outcomes = getattr(self, "run_outcome_trace", None)
+        if isinstance(outcomes, list):
+            outcomes.append(value)
+        else:
+            super().__setattr__("run_outcome_trace", [value])
+
+    def has_genuine_workflow_attempt(self) -> bool:
+        """This turn persisted a workflow proposal or executed a real build-test run; excludes
+        ``test_after_update_done``, which is stamped for any ``run_blocks_and_collect_debug`` scout
+        probe (including early-return probes that record no run) and so is not a genuine-attempt signal."""
+        if self.update_workflow_called:
+            return True
+        if self.last_update_block_count is not None:
+            return True
+        if self.last_test_ok is not None:
+            return True
+        # Runs this turn dispatched, not ``last_run_blocks_workflow_run_id``: that one can hold a
+        # run inherited from an earlier turn, which is not an attempt by this one.
+        return bool(self.dispatched_run_ids_this_turn)
+
+    def record_edited_block_label(self, label: str) -> None:
+        if not label:
+            return
+        self.block_edits_recorded_this_turn += 1
+        if label not in self.edited_block_labels_this_turn:
+            self.edited_block_labels_this_turn.append(label)
+
+    def record_dispatched_run(self, workflow_run_id: str) -> None:
+        self.dispatched_run_ids_this_turn.add(workflow_run_id)
+        self.block_edits_recorded_at_dispatch.setdefault(workflow_run_id, self.block_edits_recorded_this_turn)
+
+    def edited_after_dispatch(self, workflow_run_id: str) -> bool:
+        # A run whose dispatch was never recorded is treated as preceding every edit, so it never vouches for one.
+        return self.block_edits_recorded_this_turn > self.block_edits_recorded_at_dispatch.get(workflow_run_id, 0)
+
+    def genuine_attempt_parity_fields(self) -> dict[str, bool | int | str | None]:
+        return {
+            "has_genuine_workflow_attempt": self.has_genuine_workflow_attempt(),
+            "update_workflow_called": self.update_workflow_called,
+            "test_after_update_done": self.test_after_update_done,
+            "last_update_block_count": self.last_update_block_count,
+            "last_test_ok": self.last_test_ok,
+            "last_run_blocks_workflow_run_id": self.last_run_blocks_workflow_run_id,
+            "last_successful_run_blocks_workflow_run_id": self.last_successful_run_blocks_workflow_run_id,
+            "dispatched_run_count_this_turn": len(self.dispatched_run_ids_this_turn),
+            "ctx_last_workflow_present": self.last_workflow is not None,
+        }
+
+
+def advertises(ctx: EmberContext | None, tool_name: str) -> bool:
+    # A context that never resolved a tool surface advertises nothing.
+    return ctx is not None and (tool_name in ctx.eval_native_tool_names or tool_name in ctx.eval_mcp_tool_names)
+
+
+def ember_sees_notes(ctx: AgentContext | None) -> bool:
+    """Notes and step descriptions reach the Copilot model only with the Doc editor on; they stay saved either way."""
+    return isinstance(ctx, EmberContext) and ctx.doc_editor_enabled
+
+
+def record_kept_note_texts(ctx: EmberContext, kept_fields: Mapping[str, Sequence[str]], stored_yaml: str) -> None:
+    texts = block_field_texts(stored_yaml)
+    for label, fields in kept_fields.items():
+        for key in fields:
+            if text := texts.get(label, {}).get(key):
+                ctx.kept_note_labels.setdefault(label, {})[key] = text

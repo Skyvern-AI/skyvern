@@ -715,6 +715,81 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     });
   });
 
+  test.each([
+    {
+      organize: {
+        organize_action: "label" as const,
+        organize_label: "Processed",
+      },
+    },
+    { organize: { organize_action: null, organize_label: null } },
+    { organize: {} },
+  ])(
+    "email inbox preserves organize settings through conversion: $organize",
+    ({ organize }) => {
+      const block: EmailInboxBlock = {
+        ...makeEmailInboxBlock("Read Inbox", []),
+        email_client: "gmail",
+        credential_id: null,
+        credential_source: "nango",
+        connection_id: "nc_synthetic_gmail",
+        ...organize,
+      };
+      const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+      const saved = getWorkflowBlocks(nodes, edges)[0];
+      const fromDefinition = convert({
+        workflow_definition: { version: 2, parameters: [], blocks: [block] },
+      } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+
+      for (const converted of [saved, fromDefinition]) {
+        const yamlBlock = parse(stringify(converted));
+        expect(yamlBlock.organize_action).toBe(organize.organize_action);
+        expect(yamlBlock.organize_label).toBe(organize.organize_label);
+        expect("organize_action" in yamlBlock).toBe(
+          "organize_action" in organize,
+        );
+        expect("organize_label" in yamlBlock).toBe(
+          "organize_label" in organize,
+        );
+      }
+
+      const reloaded = getElements(
+        [{ ...block, ...parse(stringify(saved)) } as EmailInboxBlock],
+        DEFAULT_SETTINGS,
+        true,
+      );
+      expect(getWorkflowBlocks(reloaded.nodes, reloaded.edges)[0]).toEqual(
+        saved,
+      );
+    },
+  );
+
+  test.each([
+    { emailClient: "outlook" as const, credentialSource: "nango" as const },
+    { emailClient: "gmail" as const, credentialSource: "native" as const },
+  ])(
+    "email inbox omits organize settings for an unsupported mailbox: $emailClient",
+    (mailbox) => {
+      const block: EmailInboxBlock = {
+        ...makeEmailInboxBlock("Read Inbox", []),
+        email_client: "gmail",
+        credential_id: null,
+        credential_source: "nango",
+        connection_id: "nc_synthetic_gmail",
+        organize_action: "label",
+        organize_label: "Processed",
+      };
+      const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+      const node = nodes.find((candidate) => candidate.type === "emailInbox");
+      if (!node || node.type !== "emailInbox")
+        throw new Error("Expected email inbox node");
+      Object.assign(node.data, mailbox);
+      const saved = parse(stringify(getWorkflowBlocks(nodes, edges)[0]));
+      expect(saved).not.toHaveProperty("organize_action");
+      expect(saved).not.toHaveProperty("organize_label");
+    },
+  );
+
   test("Nango Gmail source and connection survive API, editor, YAML, and reload", () => {
     const block: EmailInboxBlock = {
       ...makeEmailInboxBlock("Read Gmail", []),

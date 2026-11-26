@@ -99,7 +99,7 @@ interface WorkflowSaveOpts {
   status?: string;
 }
 
-const PROPOSAL_SAVE_MESSAGE = "Resolve the Copilot proposal before saving.";
+const PROPOSAL_SAVE_MESSAGE = "Resolve the Ember proposal before saving.";
 
 function assertWorkflowSaveAllowed(
   yamlCommit?: YamlCommitContext,
@@ -492,6 +492,12 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
               queryKey: ["workflow", base.workflow.workflow_permanent_id],
             });
             void queryClient.invalidateQueries({ queryKey: ["workflows"] });
+            void queryClient.invalidateQueries({
+              queryKey: [
+                "workflowVersions",
+                base.workflow.workflow_permanent_id,
+              ],
+            });
             void queryClient.invalidateQueries({
               queryKey: ["block-scripts", base.workflow.workflow_permanent_id],
             });

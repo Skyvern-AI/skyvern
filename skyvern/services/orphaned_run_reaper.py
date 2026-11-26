@@ -5,7 +5,7 @@ from functools import partial
 import structlog
 
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import WORKER_CONTAINER_RESTARTED_REASON_CODE, classify_from_failure_reason
+from skyvern.forge.failure_classifier import WORKER_CONTAINER_RESTARTED_REASON_CODE, failure_category_for_exception_name
 from skyvern.forge.final_failure_diagnostic import log_diagnostic_unavailable
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.repositories.run_execution_leases import REAPER_OWNER_SUFFIX, RunExecutionLease
@@ -326,11 +326,7 @@ async def reap_orphaned_runs_once() -> None:
         "This run stopped because the Skyvern server process that ran it exited or stopped responding "
         f"(no heartbeat for {timeout} minutes). Retry the run if needed."
     )
-    category = classify_from_failure_reason(
-        reason,
-        exception_name=WORKER_CONTAINER_RESTARTED_REASON_CODE,
-        fallback_to_unknown=True,
-    )
+    category = failure_category_for_exception_name(WORKER_CONTAINER_RESTARTED_REASON_CODE)
     global _scan_after, _scan_cutoff
     repository = app.DATABASE.run_execution_leases
     if _scan_cutoff is None:

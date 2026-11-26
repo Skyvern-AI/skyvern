@@ -4,6 +4,7 @@ import type {
   RestoreResult,
 } from "../editor/editorStateSnapshot";
 import { ATTACHMENT_SIZE_LIMIT_BYTES } from "./attachmentLimits";
+import { bidiIsolate } from "@/util/bidiText";
 import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
 import { hashKey } from "@tanstack/react-query";
 import {
@@ -96,6 +97,7 @@ import {
   buildEmberContext,
   buildWorkflowYamlDocument,
   restoreEmberSettings,
+  withheldEmberSettingsDigest,
 } from "@/routes/workflows/editor/workflowYamlDocument";
 import { apiWorkflowToSettings } from "@/routes/workflows/editor/apiWorkflowToSettings";
 import { convert } from "@/routes/workflows/editor/workflowEditorUtils";
@@ -115,6 +117,7 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
+  ConnectedAccountChoice,
   EmberAttachedFile,
   EmberCancelRequest,
   EmberProposalMetadata,
@@ -230,6 +233,10 @@ import {
 } from "./cards/CredentialDeleteCard";
 import { QuestionReceipt } from "./cards/QuestionReceipt";
 import {
+  SkillWriteReceipt,
+  SkillWriteReviewCard,
+} from "./cards/SkillWriteCard";
+import {
   QUESTION_DETAIL_ID,
   QUESTION_PROMPT_ID,
   QuestionTray,
@@ -250,6 +257,7 @@ import {
   ReviewGateCard,
   getPendingReviewGateVerdict,
   getReviewGateVerdict,
+  proposalUsesConnectedGmail,
 } from "./cards/ReviewGateCard";
 import { TURN_ROW_INSET } from "./cards/cardLayout";
 import { CardFooter, CardHeader, EmberCard } from "./cards/cardChrome";
@@ -258,7 +266,7 @@ import { TestRunOutputCard } from "./cards/TestRunOutputCard";
 import { ConnectionCard } from "./cards/ConnectionCard";
 import { TriggerCreatedCard } from "./cards/TriggerCreatedCard";
 import { usePageSlots } from "@/store/PageSlots";
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useTriggerFocusStore } from "@/store/TriggerFocusStore";
 import {
   CredentialAskMarker,
   CredentialCard,
@@ -434,7 +442,7 @@ async function requestWithin<T>(
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
           controller.abort();
-          reject(new Error("Copilot request timed out"));
+          reject(new Error("Ember request timed out"));
         }, ACCEPT_SETTLE_CEILING_MS);
       }),
     ]);
@@ -504,7 +512,7 @@ const RECOVERY_POLL_SUPERSEDE_READS = 4;
 // Says only what is true: the composer stays enabled while this is showing, so
 // it must not claim a retry is being held back.
 const RECOVERY_IN_PROGRESS_MESSAGE =
-  "The connection dropped, so Copilot is checking whether this turn finished.";
+  "The connection dropped, so Ember is checking whether this turn finished.";
 const TEST_END_TO_END_PROMPT = "Test this workflow end to end.";
 const DEMONSTRATION_START_MESSAGE = "Showing you in the browser now.";
 const DEMONSTRATION_DONE_MESSAGE =
@@ -692,6 +700,7 @@ function collectTimelineBlockActions(
 // window is sized to it — long enough to swallow the stray click, short enough that the
 // visible Stop is not dead while a turn hangs. The first frame arms sooner and clears it.
 const STOP_ARM_DOUBLE_TAP_MS = 500;
+const DEFERRED_DEMONSTRATION_POLL_MS = 500;
 
 const DELETION_STOP_BLOCKED_REASON =
   "Stop unavailable until the credential deletion finishes";
@@ -937,9 +946,12 @@ function AttachmentChip({
   );
 }
 
+const CONNECTION_ID_PATTERN = /^(goac|moac|ngc)_[A-Za-z0-9]+$/;
+
 function connectedAccountSelectionReceipt(
   messages: ChatMessage[],
   index: number,
+  cardAccounts: Readonly<Record<string, ConnectedAccountChoice>>,
 ): string | null {
   const message = messages[index];
   const prior = previousAskingMessage(messages, index);
@@ -955,14 +967,18 @@ function connectedAccountSelectionReceipt(
     (choice) => choice.connection_id === message.content,
   );
   if (selected) {
-    return `Selected ${selected.name} — ${connectedAccountChoiceLabel(selected, choices)}`;
+    return `Selected ${bidiIsolate(selected.name)} (${connectedAccountChoiceLabel(selected, choices)})`;
   }
-  // A connection card lists accounts made after its turn ended, which no stored choice set holds.
+  // A connection card lists accounts made after its turn ended, which no stored choice set holds; the card names
+  // the one it shows as picked.
   if (
     prior.narrative.connectionCards.length > 0 &&
-    /^(goac|moac|ngc)_[A-Za-z0-9]+$/.test(message.content)
+    CONNECTION_ID_PATTERN.test(message.content)
   ) {
-    return `Selected connection …${message.content.slice(-8)}`;
+    const shown = cardAccounts[message.content];
+    return shown
+      ? `Selected ${bidiIsolate(shown.name)}${shown.email_address ? ` (${shown.email_address})` : ""}`
+      : `Selected connection …${message.content.slice(-8)}`;
   }
   return null;
 }
@@ -977,24 +993,24 @@ const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
   return null;
 };
 
-const ACCEPT_IN_FLIGHT_SAVE_REASON = "Copilot is saving your accepted changes.";
+const ACCEPT_IN_FLIGHT_SAVE_REASON = "Ember is saving your accepted changes.";
 
 const DETACHED_GATE_RECEIPT = "detached";
 
 const ACCEPT_SAVED_NOT_SHOWN_SAVE_REASON =
-  "Copilot saved this change but the editor couldn't load it, so saving now would write an older workflow over it.";
+  "Ember saved this change but the editor couldn't load it, so saving now would write an older workflow over it.";
 
 const ACCEPT_UNCONFIRMED_SAVE_REASON =
-  "Copilot couldn't confirm whether an Accept already saved. Use Try again on the review gate first.";
+  "Ember couldn't confirm whether an Accept already saved. Use Try again on the review gate first.";
 
 const WORKFLOW_CLAIMED_SAVE_REASON =
   "Another change to this workflow is being saved right now. Reload the page before saving, so you don't overwrite it \u2014 reloading discards unsaved canvas edits.";
 
 const PROPOSAL_CHANGED_SAVE_REASON =
-  "This workflow changed after Copilot staged its proposal, so this canvas may be out of date. Reload the page before saving, so you don't overwrite that change \u2014 reloading discards unsaved canvas edits.";
+  "This workflow changed after Ember staged its proposal, so this canvas may be out of date. Reload the page before saving, so you don't overwrite that change \u2014 reloading discards unsaved canvas edits.";
 
 const ACCEPT_STALE_CANVAS_SAVE_REASON =
-  "Copilot couldn't confirm an earlier Accept, so this canvas may be out of date. Saving it could overwrite newer changes \u2014 reload the page first, which discards unsaved canvas edits.";
+  "Ember couldn't confirm an earlier Accept, so this canvas may be out of date. Saving it could overwrite newer changes \u2014 reload the page first, which discards unsaved canvas edits.";
 const getLatestDiffCardTurnIdFromHistory = (
   messages: EmberChatHistoryMessage[],
 ): string | null => {
@@ -1651,7 +1667,7 @@ function DemonstrationOfferCard({
           />
         }
         wrapTitle
-        title="Show Copilot how in the browser"
+        title="Show Ember how in the browser"
       />
       <CardFooter className="flex items-center">
         <TooltipProvider>
@@ -1718,17 +1734,14 @@ export function EmberChat({
     triggerCreatedCard: LiveTriggerCreatedCard = TriggerCreatedCard,
   } = usePageSlots();
   const hasTriggersPanel = Boolean(workflowTriggersPanel);
-  const setWorkflowPanelState = useWorkflowPanelStore(
-    (state) => state.setWorkflowPanelState,
-  );
   const openTriggerInPanel = (eventTriggerId: string) => {
-    // The panel's trigger list may be cached from before Ember created this one.
+    // The pane's trigger list may be cached from before Ember created this one.
     void queryClient.invalidateQueries({ queryKey: ["eventTriggers"] });
-    setWorkflowPanelState({
-      active: true,
-      content: "triggers",
-      data: { focusTriggerId: eventTriggerId, focusRequest: Date.now() },
+    useTriggerFocusStore.setState({
+      triggerId: eventTriggerId,
+      request: Date.now(),
     });
+    openPane("triggers");
   };
   const docEditorEnabled = useWorkflowDocEditorFlag();
   const logging = useLogging();
@@ -1782,6 +1795,10 @@ export function EmberChat({
   const [workPlan, setWorkPlan] = useState<string[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
+  const proposalUsesGmail = useMemo(
+    () => proposalUsesConnectedGmail(proposedWorkflow),
+    [proposedWorkflow],
+  );
   const [pendingProposalMetadata, setPendingProposalMetadataState] =
     useState<EmberProposalMetadata | null>(null);
   // Written with the state, not after a commit: an Accept resuming from its await reads it to
@@ -1823,7 +1840,7 @@ export function EmberChat({
     row: EmberChatHistoryResponse;
   } | null>(null);
   const acceptHoldReason = startupPending
-    ? "Checking saved Copilot changes. Retry if the check fails."
+    ? "Checking saved Ember changes. Retry if the check fails."
     : isAccepting
       ? ACCEPT_IN_FLIGHT_SAVE_REASON
       : outstandingAccept
@@ -2085,6 +2102,20 @@ export function EmberChat({
     connectedAccountChoicePendingTurnId,
     setConnectedAccountChoicePendingTurnId,
   ] = useState<string | null>(null);
+  const [cardAccounts, setCardAccounts] = useState<
+    Readonly<Record<string, ConnectedAccountChoice>>
+  >({});
+  const rememberCardAccount = useCallback(
+    (choice: ConnectedAccountChoice) =>
+      setCardAccounts((known) => {
+        const prior = known[choice.connection_id];
+        return prior?.name === choice.name &&
+          prior.email_address === choice.email_address
+          ? known
+          : { ...known, [choice.connection_id]: choice };
+      }),
+    [],
+  );
   // Synchronous mirror of queuedPrompt (like inFlightRef) so a same-tick double
   // submit can't queue twice and orphan the first message. Set via updateQueuedPrompt.
   const queuedPromptRef = useRef<QueuedPrompt | null>(null);
@@ -3956,7 +3987,7 @@ export function EmberChat({
         finish();
         logEmberRequestFailure(
           "recovery_poll_gave_up",
-          new Error("Copilot recovery polling gave up"),
+          new Error("Ember recovery polling gave up"),
           chatId,
         );
         setMessages((prev) =>
@@ -4066,7 +4097,7 @@ export function EmberChat({
               (requestId !== turnId ? requestId : undefined);
             if (!cancelToken) {
               toast({
-                title: "Could not cancel the Copilot turn",
+                title: "Could not cancel the Ember turn",
                 description:
                   "The saved turn has no cancellation token. Retry to check its status.",
                 variant: "destructive",
@@ -4099,8 +4130,8 @@ export function EmberChat({
                 });
                 logEmberRequestFailure("cancel", error, chatId);
                 toast({
-                  title: "Could not cancel the Copilot turn",
-                  description: "Copilot will keep checking for saved changes.",
+                  title: "Could not cancel the Ember turn",
+                  description: "Ember will keep checking for saved changes.",
                   variant: "destructive",
                 });
               } finally {
@@ -4890,7 +4921,7 @@ export function EmberChat({
         if (unanswered?.turn_id && !data.proposed_workflow) {
           pending = { turn_id: unanswered.turn_id };
           toast({
-            title: "Could not recover the Copilot turn controls",
+            title: "Could not recover the Ember turn controls",
             description:
               "The saved turn has no cancellation token. Retry to check its status.",
             variant: "destructive",
@@ -5745,7 +5776,7 @@ export function EmberChat({
             toast({
               title: "The draft could not be restored",
               description:
-                "The Copilot change was saved on the server. The saved workflow was loaded.",
+                "The Ember change was saved on the server. The saved workflow was loaded.",
               variant: "destructive",
             });
         }
@@ -5776,7 +5807,7 @@ export function EmberChat({
           pendingCanonicalRecovery.current === pending
         ) {
           toast({
-            title: "Could not check the saved Copilot change",
+            title: "Could not check the saved Ember change",
             description:
               "Your draft is retained. Reload to check the saved workflow before saving.",
             variant: "destructive",
@@ -5943,7 +5974,7 @@ export function EmberChat({
         toast({
           title: "Accept failed",
           description:
-            "Copilot could not verify the current proposal. Please try again.",
+            "Ember could not verify the current proposal. Please try again.",
           variant: "destructive",
         });
         return;
@@ -6747,10 +6778,10 @@ export function EmberChat({
       console.error("Failed to clear proposed workflow:", error);
       logEmberRequestFailure("proposal_sync", error, chatId);
       toast({
-        title: "Copilot update failed",
+        title: "Ember update failed",
         description: autoAcceptValue
           ? "Agent was applied, but auto-accept did not update."
-          : "Failed to clear copilot proposal. Please try again.",
+          : "Failed to clear the Ember proposal. Please try again.",
         variant: "destructive",
       });
       return false;
@@ -6816,7 +6847,7 @@ export function EmberChat({
         toast({
           title: "Review dismissed",
           description:
-            "Copilot is still working on this proposal. Its status is shown in the chat.",
+            "Ember is still working on this proposal. Its status is shown in the chat.",
         });
         return true;
       }
@@ -7263,7 +7294,7 @@ export function EmberChat({
         toast({
           variant: "destructive",
           title: "Couldn't send now",
-          description: "Your message is queued for when Copilot finishes.",
+          description: "Your message is queued for when Ember finishes.",
         });
       }
     }
@@ -7678,7 +7709,8 @@ export function EmberChat({
   const composerQuestion =
     trayQuestion?.account_group_review ||
     trayQuestion?.account_group_cancel ||
-    trayQuestion?.credential_delete_review
+    trayQuestion?.credential_delete_review ||
+    trayQuestion?.skill_write_review
       ? undefined
       : trayQuestion;
   const isDeleting = (item: QuestionInteraction | undefined) =>
@@ -7953,11 +7985,11 @@ export function EmberChat({
   if (trayCredentialKey) {
     attentionQueue.push({
       kind: "credential",
-      upNext: "Copilot needs to sign in",
+      upNext: "Ember needs to sign in",
     });
   }
   if (trayAccountChoice) {
-    attentionQueue.push({ kind: "account", upNext: "Choose a Google account" });
+    attentionQueue.push({ kind: "account", upNext: "Choose an account" });
   }
   if (demonstrationCredentialFrame) {
     attentionQueue.push({
@@ -7974,7 +8006,7 @@ export function EmberChat({
   if (isDemonstrating) {
     attentionQueue.push({
       kind: "demonstration",
-      upNext: "Show Copilot the task",
+      upNext: "Show Ember the task",
     });
   }
   const activeAttention = attentionQueue[0]?.kind ?? null;
@@ -8205,7 +8237,8 @@ export function EmberChat({
           item.status === "pending" &&
           !item.account_group_review &&
           !item.account_group_cancel &&
-          !item.credential_delete_review,
+          !item.credential_delete_review &&
+          !item.skill_write_review,
       );
       // The composer is the text field for the question on screen, so Enter steps through the
       // tray and the last step sends every part's answer together.
@@ -8277,7 +8310,7 @@ export function EmberChat({
         ) {
           toast({
             title: "Add a message",
-            description: "Tell Copilot what to do with the attached file.",
+            description: "Tell Ember what to do with the attached file.",
           });
         }
         return false;
@@ -8723,6 +8756,7 @@ export function EmberChat({
         canonicalAtSubmit = saveData?.workflow;
         const workflowId = saveData?.workflow.workflow_id;
         let workflowYaml = "";
+        let editorSettingsDigest: string | null = null;
         let audioArtifactId: string | null = null;
 
         if (!workflowId) {
@@ -8739,11 +8773,12 @@ export function EmberChat({
         }
 
         if (saveData) {
-          const { document } = buildEmberContext({
+          const { document, snapshot } = buildEmberContext({
             ...saveData,
             definitionVersion: saveData.workflowDefinitionVersion,
           });
           workflowYaml = convertToYAML(document);
+          editorSettingsDigest = withheldEmberSettingsDigest(snapshot);
           submittedSettings = structuredClone(saveData.settings);
           pendingSubmitSettings.current = submittedSettings;
 
@@ -9159,10 +9194,20 @@ export function EmberChat({
             workflow_yaml: workflowYaml,
             mode: "build",
             doc_editor_enabled: docEditorEnabled,
+            editor_settings_digest: editorSettingsDigest,
             cancel_token: cancelToken,
             idempotency_key: options.idempotencyKey ?? null,
             target_block_label: targetBlockLabel,
             product_action: productAction?.action ?? null,
+            // Names the proposal the review card showed; the server approves the Test only for that one.
+            test_proposal_owner_turn_id:
+              productAction?.action === "test_end_to_end"
+                ? (stagedProposalMetadata.current?.owner_turn_id ?? null)
+                : null,
+            test_proposal_revision:
+              productAction?.action === "test_end_to_end"
+                ? (stagedProposalMetadata.current?.revision ?? null)
+                : null,
             demonstration_id:
               productAction?.action === "demonstrate"
                 ? productAction.demonstrationId
@@ -9180,6 +9225,7 @@ export function EmberChat({
             supports_single_run_card: true,
             supports_input_group_card: true,
             supports_credential_delete_card: true,
+            supports_skill_write_card: true,
             supports_connection_card: true,
             supports_demonstration_offer:
               Boolean(onRecordTask) &&
@@ -9654,29 +9700,56 @@ export function EmberChat({
   // would re-register the launcher on every navigation.
   const panesRef = useRef({ openPane, setOpenPanes, resolveLivePanes });
   panesRef.current = { openPane, setOpenPanes, resolveLivePanes };
+  const deferredDemonstrationTimer = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
+  const latestStartDemonstration = useRef<
+    (options?: StartDemonstrationOptions) => void
+  >(() => {});
+  // A start deferred for one agent or browser never fires against the next.
+  useEffect(
+    () => () => {
+      if (deferredDemonstrationTimer.current !== null)
+        clearTimeout(deferredDemonstrationTimer.current);
+      deferredDemonstrationTimer.current = null;
+    },
+    [liveBrowserSessionId, workflowPermanentId],
+  );
   const handleStartDemonstration = useCallback(
-    ({ insertion, keepEditor = false }: StartDemonstrationOptions = {}) => {
+    (options: StartDemonstrationOptions = {}) => {
+      if (deferredDemonstrationTimer.current !== null) {
+        clearTimeout(deferredDemonstrationTimer.current);
+        deferredDemonstrationTimer.current = null;
+      }
       if (!liveBrowserSessionId) return;
-      if (historyLoadedForRef.current !== workflowPermanentId) {
-        toast({ title: "Wait for Copilot to finish loading" });
+      if (isDemonstrating || demonstrationUnavailable || runOwnsBrowser) {
         noteDemonstrationStartFailed();
         return;
       }
       if (hasPendingQuestion) {
-        toast({ title: "Answer Copilot's question first" });
+        toast({ title: "Answer Ember's question first" });
         noteDemonstrationStartFailed();
         return;
       }
+      // These refs flip before the launcher's render-state gate catches up, so a start can land
+      // mid-turn; it polls (refs don't re-render) and starts once Copilot is idle.
       if (
+        historyLoadedForRef.current !== workflowPermanentId ||
         inFlightRef.current ||
         queuedPromptRef.current ||
-        recoveredTurnOwnerRef.current ||
-        isDemonstrating
+        recoveredTurnOwnerRef.current
       ) {
-        toast({ title: "Wait for Copilot to finish" });
-        noteDemonstrationStartFailed();
+        // A new or switched chat abandons the start instead of carrying it into another conversation.
+        const navEpoch = chatNavEpochRef.current;
+        deferredDemonstrationTimer.current = setTimeout(() => {
+          deferredDemonstrationTimer.current = null;
+          if (chatNavEpochRef.current === navEpoch)
+            latestStartDemonstration.current(options);
+          else noteDemonstrationStartFailed();
+        }, DEFERRED_DEMONSTRATION_POLL_MS);
         return;
       }
+      const { insertion, keepEditor = false } = options;
       void stopSpeech();
       // The Edit layout leaves the Browser pane closed, so a demonstration would
       // otherwise record into a browser the user cannot see or drive. Editor
@@ -9705,14 +9778,17 @@ export function EmberChat({
       startRecording({ insertion });
     },
     [
+      demonstrationUnavailable,
       hasPendingQuestion,
       isDemonstrating,
       liveBrowserSessionId,
+      runOwnsBrowser,
       startRecording,
       stopSpeech,
       workflowPermanentId,
     ],
   );
+  latestStartDemonstration.current = handleStartDemonstration;
   const setStartDemonstration = useRecordingLauncherStore(
     (state) => state.setStartDemonstration,
   );
@@ -10099,13 +10175,13 @@ export function EmberChat({
       toast({
         title: "Could not auto-send message",
         description: initialAction
-          ? "The copilot was not ready in time — click Fix with Copilot again."
-          : "The copilot was not ready in time — please retype your prompt.",
+          ? "Ember was not ready in time — click Fix with Ember again."
+          : "Ember was not ready in time — please retype your prompt.",
         variant: "destructive",
       });
       logEmberRequestFailure(
         "auto_send",
-        new Error("Copilot auto-send timed out"),
+        new Error("Ember auto-send timed out"),
       );
     }, AUTO_SEND_TIMEOUT_MS);
     return () => {
@@ -10536,14 +10612,14 @@ export function EmberChat({
         {recoveryControls.conflict
           ? "The saved workflow changed while you had local edits. Choose which changes to keep."
           : recoveryControls.cancelling
-            ? "Cancelling the Copilot turn. Checking for saved changes before restoring your draft."
+            ? "Cancelling the Ember turn. Checking for saved changes before restoring your draft."
             : recoveryControls.reload
-              ? "Could not confirm whether Copilot saved changes. Save is blocked. Retry or reload the saved workflow to check again."
+              ? "Could not confirm whether Ember saved changes. Save is blocked. Retry or reload the saved workflow to check again."
               : recoveryControls.followingDraft
                 ? recoveryControls.draftApplied
-                  ? "The canvas shows Copilot's latest draft and is read-only while the turn runs. Reject cancels the turn and restores your workflow."
-                  : "Copilot is still working on this turn. The canvas is read-only and updates when Copilot saves a draft. Reject cancels the turn and restores your workflow."
-                : "Copilot is checking for saved changes. Your draft is retained. Reject requests cancellation; changes already saved will be kept."}
+                  ? "The canvas shows Ember's latest draft and is read-only while the turn runs. Reject cancels the turn and restores your workflow."
+                  : "Ember is still working on this turn. The canvas is read-only and updates when Ember saves a draft. Reject cancels the turn and restores your workflow."
+                : "Ember is checking for saved changes. Your draft is retained. Reject requests cancellation; changes already saved will be kept."}
       </p>
       <div className="flex gap-2">
         {recoveryControls.conflict ? (
@@ -10590,7 +10666,7 @@ export function EmberChat({
                   content={
                     deletingCredentials
                       ? DELETION_STOP_BLOCKED_REASON
-                      : "Cancel the Copilot turn"
+                      : "Cancel the Ember turn"
                   }
                   blocked={deletingCredentials}
                 >
@@ -10898,6 +10974,12 @@ export function EmberChat({
         interaction={interaction}
         review={interaction.credential_delete_review}
       />
+    ) : interaction.skill_write_review ? (
+      <SkillWriteReceipt
+        key={interaction.interaction_id}
+        interaction={interaction}
+        review={interaction.skill_write_review}
+      />
     ) : (
       <QuestionReceipt
         key={interaction.interaction_id}
@@ -10984,9 +11066,9 @@ export function EmberChat({
     : isDemonstrating
       ? "A demonstration is already open"
       : hasPendingQuestion
-        ? "Answer Copilot's question first"
+        ? "Answer Ember's question first"
         : isLoading
-          ? "Wait for Copilot to finish"
+          ? "Wait for Ember to finish"
           : null;
   const content = (
     <div
@@ -11023,7 +11105,7 @@ export function EmberChat({
           {chromeless ? null : (
             <div className="flex items-center gap-2">
               <h3 className="text-sm font-semibold text-foreground">
-                {docked ? "Copilot" : "Agent Copilot (Beta)"}
+                {docked ? "Ember" : "Ember (Beta)"}
               </h3>
               {docked ? (
                 <span className="rounded bg-slate-elevation3 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -11412,7 +11494,7 @@ export function EmberChat({
                             This agent is no longer available
                           </div>
                           <div className="mt-1 text-xs text-muted-foreground">
-                            Copilot can&apos;t save or test changes to it. Open
+                            Ember can&apos;t save or test changes to it. Open
                             another agent or create a new one to continue.
                           </div>
                           <Button
@@ -11429,11 +11511,14 @@ export function EmberChat({
                         <ConnectionCard
                           key={connectionCardKey(card)}
                           card={card}
+                          turnId={turnId}
+                          postedAt={message.timestamp}
                           selectedConnectionId={
                             adjacentMessage?.sender === "user"
                               ? adjacentMessage.content
                               : null
                           }
+                          onSelectionShown={rememberCardAccount}
                           disabled={
                             !isLastMessage ||
                             isLoading ||
@@ -11491,6 +11576,7 @@ export function EmberChat({
                           ) : null}
                           <ReviewGateCard
                             docEditorEnabled={docEditorEnabled}
+                            usesConnectedGmail={proposalUsesGmail}
                             turn={message.narrative}
                             pending={index === gateIndex && gateHasSubject}
                             verdict={
@@ -11567,6 +11653,7 @@ export function EmberChat({
                 const selectionReceipt = connectedAccountSelectionReceipt(
                   messages,
                   index,
+                  cardAccounts,
                 );
                 const messageDemonstrationItems =
                   message.demonstrationItems ??
@@ -11609,6 +11696,7 @@ export function EmberChat({
                           {isGateOwnerOrLast || acceptedReceiptHere ? (
                             <ReviewGateCard
                               docEditorEnabled={docEditorEnabled}
+                              usesConnectedGmail={proposalUsesGmail}
                               pending={isGateOwnerOrLast}
                               verdict={
                                 isGateOwnerOrLast
@@ -11693,8 +11781,8 @@ export function EmberChat({
                 className="space-y-2 rounded-md border p-3 text-sm"
               >
                 <p>
-                  Could not check saved Copilot changes. Save and chat actions
-                  are paused.
+                  Could not check saved Ember changes. Save and chat actions are
+                  paused.
                 </p>
                 <Button
                   variant="outline"
@@ -11717,6 +11805,7 @@ export function EmberChat({
                 ) : null}
                 <ReviewGateCard
                   docEditorEnabled={docEditorEnabled}
+                  usesConnectedGmail={proposalUsesGmail}
                   pending={!detachedReceiptShown}
                   verdict={
                     detachedReceiptShown
@@ -12058,6 +12147,21 @@ export function EmberChat({
             }
             upNext={attentionUpNext}
           />
+        ) : trayQuestion?.skill_write_review ? (
+          <SkillWriteReviewCard
+            key={trayQuestion.interaction_id}
+            review={trayQuestion.skill_write_review}
+            disabled={isSubmittingQuestion || acceptUnresolved}
+            lockReason={acceptUnresolved ? acceptHoldReason : null}
+            collapsed={questionTrayCollapsed}
+            onCollapsedChange={setQuestionTrayCollapsed}
+            onDecide={(approved) =>
+              void handleQuestionAnswer(trayQuestion, {
+                account_group_decision: { approved, credential_ids: [] },
+              })
+            }
+            upNext={attentionUpNext}
+          />
         ) : trayQuestion?.account_group_cancel ? (
           <AccountGroupCancelCard
             key={trayQuestion.interaction_id}
@@ -12156,7 +12260,7 @@ export function EmberChat({
         ) : null}
         <div
           role="group"
-          aria-label="Copilot message composer"
+          aria-label="Ember message composer"
           onDragEnter={handleComposerDragEnter}
           onDragOver={handleComposerDragOver}
           onDragLeave={handleComposerDragLeave}
@@ -12396,7 +12500,7 @@ export function EmberChat({
                       <span className="block">Attach a file</span>
                       <span className="block text-xs text-muted-foreground">
                         {attachDisabledReason ??
-                          "A document, spreadsheet, or SOP for Copilot"}
+                          "A document, spreadsheet, or SOP for Ember"}
                       </span>
                     </span>
                   </DropdownMenuItem>
@@ -12412,7 +12516,7 @@ export function EmberChat({
                       <span className="block">Demonstrate task</span>
                       <span className="block text-xs text-muted-foreground">
                         {composerDemonstrateDisabledReason ??
-                          "Show Copilot how in the browser"}
+                          "Show Ember how in the browser"}
                       </span>
                     </span>
                   </DropdownMenuItem>

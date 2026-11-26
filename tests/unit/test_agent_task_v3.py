@@ -11,16 +11,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import itertools
 import json
+import random
 import re
+import string
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import quote, quote_plus, unquote_plus
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
@@ -39,10 +44,12 @@ from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
+from skyvern.forge.sdk.core.escaped_secrets import decoding_stages
+from skyvern.forge.sdk.core.skyvern_context import MODEL_HIDDEN_PLACEHOLDER, EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -53,6 +60,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK
 from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -64,6 +72,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     NavigationBlock,
     TaskBlock,
     ValidationBlock,
+    task_block_failure_category,
 )
 from skyvern.forge.sdk.workflow.models.credential_release import CodeBlockCredentialReleaseError
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -92,6 +101,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_LOOP_GUARD,
     DOWNLOAD_NO_FILE_FACT,
+    LLM_CALL_FAILED_GUARD,
     NAV_DEAD_END_GUARD,
     LoopOutcome,
     RoundAction,
@@ -2065,7 +2075,8 @@ def test_every_tool_that_pays_for_a_name_has_something_to_say_about_it() -> None
     from skyvern.forge.taskv3.target_label import TARGET_VERBS
     from skyvern.forge.taskv3.tools import _TARGET_LABEL_TOOL_NAMES
 
-    assert set(TARGET_VERBS) == set(_TARGET_LABEL_TOOL_NAMES)
+    # download runs click's own wrapped handler, so its result already carries click's captured name.
+    assert set(TARGET_VERBS) == set(_TARGET_LABEL_TOOL_NAMES) | {"download"}
 
 
 @pytest.mark.asyncio
@@ -2466,6 +2477,32 @@ def _make_credential_parameter(key: str) -> CredentialParameter:
     )
 
 
+def _escaped_forms(char: str) -> list[str]:
+    """Ways that HTML, a URL, or a JSON or JavaScript string can write ``char``."""
+    point = ord(char)
+    utf8 = char.encode("utf-8")
+    forms = [
+        char,
+        f"&#{point};",
+        f"&#x{point:x};",
+        f"&#X{point:04X};",
+        "".join(f"%{byte:02x}" for byte in utf8),
+        "".join(f"%{byte:02X}" for byte in utf8),
+        f"\\u{point:04x}",
+    ]
+    if point < 256:
+        forms.append(f"\\x{point:02X}")
+    if not char.isalnum():
+        forms.append("\\" + char)
+    named = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;", "\u00a0": "&nbsp;"}
+    if char in named:
+        forms.append(named[char])
+    if char == " ":
+        forms.append("+")
+        forms += _escaped_forms("\u00a0")
+    return forms
+
+
 def _make_workflow_credential_parameter(key: str) -> WorkflowParameter:
     now = datetime.now(UTC)
     return WorkflowParameter(
@@ -2568,6 +2605,7 @@ async def _run_execute_step_gate(
     recovery_code_progress: CodeProgressRecord | None = None,
     observer: Any = None,
     artifact_manager: ArtifactManager | None = None,
+    confine_credentials: bool = False,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Drive ForgeAgent.execute_step through the v3 dispatch gate and return (mocked _execute_task_v3,
@@ -2610,6 +2648,9 @@ async def _run_execute_step_gate(
             else:
                 mock_app.DATABASE.observer.set_workflow_run_block_engine_by_task_id = AsyncMock()
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+            mock_app.AGENT_FUNCTION.confine_task_credentials_to_saved_sites = MagicMock(
+                return_value=confine_credentials
+            )
             if experimentation_provider is not None:
                 mock_app.EXPERIMENTATION_PROVIDER = experimentation_provider
                 mock_wbe_app.EXPERIMENTATION_PROVIDER = experimentation_provider
@@ -2638,6 +2679,7 @@ async def _run_execute_step_gate(
     finally:
         skyvern_context.reset()
     v3_mock.task = task
+    v3_mock.context = context
     v3_mock.fail_task_mock = fail_task_mock
     return v3_mock, step_engine_mock
 
@@ -2728,6 +2770,7 @@ async def test_execute_step_v1_engine_block_unaffected() -> None:
 async def test_execute_step_bare_task_dispatch_unchanged() -> None:
     v3_mock, step_engine_mock = await _run_execute_step_gate(engine=agent_module.RunEngine.skyvern_v3, task_block=None)
     v3_mock.assert_awaited_once()
+    assert v3_mock.context.engine == agent_module.RunEngine.skyvern_v3
     assert v3_mock.await_args.kwargs["task_block"] is None
     step_engine_mock.assert_not_awaited()
 
@@ -2781,6 +2824,13 @@ async def test_disabled_v3_dispatch_is_not_credited_as_pure() -> None:
     v3_mock.assert_not_awaited()
     step_engine_mock.assert_awaited_once()
 
+    bare_v3_mock, _ = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=None,
+        experimentation_provider=provider,
+    )
+    assert bare_v3_mock.context.engine == agent_module.RunEngine.skyvern_v1
+
 
 @pytest.mark.asyncio
 async def test_an_unevaluable_kill_switch_runs_an_explicit_v3_block_on_the_step_engine() -> None:
@@ -2808,6 +2858,13 @@ async def test_an_unevaluable_kill_switch_runs_an_explicit_v3_block_on_the_step_
         log.get("route_reason") == "flag_error" and log.get("workflow_run_id") == "wr_task_v3_kill_down" for log in logs
     )
 
+    bare_v3_mock, _ = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=None,
+        experimentation_provider=provider,
+    )
+    assert bare_v3_mock.context.engine == agent_module.RunEngine.skyvern_v1
+
 
 @pytest.mark.asyncio
 async def test_execute_step_hands_the_recovery_code_outline_to_the_v3_run() -> None:
@@ -2826,15 +2883,21 @@ async def test_execute_step_hands_the_recovery_code_outline_to_the_v3_run() -> N
 
 
 @pytest.mark.asyncio
-async def test_a_kill_switched_recovery_fails_instead_of_running_on_the_step_engine() -> None:
+@pytest.mark.parametrize("confined_block", [False, True], ids=["recovery", "confined-block"])
+async def test_a_kill_switched_recovery_or_confined_block_fails_instead_of_running_on_the_step_engine(
+    confined_block: bool,
+) -> None:
     provider = MagicMock(spec=BaseExperimentationProvider)
     provider.resolve_feature_flag_strict = AsyncMock(return_value=True)
 
     v3_mock, step_engine_mock = await _run_execute_step_gate(
         engine=agent_module.RunEngine.skyvern_v3,
-        task_block=None,
+        task_block=_make_block(TaskBlock, label="confined_task", engine=agent_module.RunEngine.skyvern_v3)
+        if confined_block
+        else None,
         experimentation_provider=provider,
-        workflow_owned_recovery=True,
+        workflow_owned_recovery=not confined_block,
+        confine_credentials=confined_block,
         workflow_run_id="wr_recovery_kill_switch",
     )
 
@@ -4213,14 +4276,19 @@ async def test_execute_task_v3_zero_credential_params_leaves_active_key_untouche
     assert loop_mock.context.active_credential_parameter_key == "pre_existing_key"
 
 
-def _capture_allowed_credential_keys(monkeypatch: pytest.MonkeyPatch, sink: list[Sequence[str] | None]) -> None:
+def _capture_allowed_credential_keys(
+    monkeypatch: pytest.MonkeyPatch, sink: list[Sequence[str] | None], bound_sink: list[bool] | None = None
+) -> None:
     def capturing_build(
         task: Task,
         page_provider: PageProvider | None = None,
         state: VerificationState | None = None,
         allowed_credential_parameter_keys: Sequence[str] | None = None,
+        bind_credential_codes: bool = False,
     ) -> tuple[list[ToolSpec], str]:
         sink.append(allowed_credential_parameter_keys)
+        if bound_sink is not None:
+            bound_sink.append(bind_credential_codes)
         return [], ""
 
     monkeypatch.setattr("skyvern.forge.taskv3.auth_tools.build_auth_tools", capturing_build)
@@ -4355,22 +4423,35 @@ async def test_recovery_guard_holds_a_vault_login_to_its_items_sites(
 
 
 @pytest.mark.asyncio
-async def test_recovery_guard_is_absent_when_the_credential_has_no_saved_site(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("refuse_siteless", [False, True], ids=["recovery-keeps-working", "confined-refuses"])
+async def test_recovery_guard_for_a_credential_with_no_saved_site(
+    monkeypatch: pytest.MonkeyPatch, refuse_siteless: bool
 ) -> None:
-    # No tested_url means no scope to compare against; the run keeps working and says so in the log
-    # rather than refusing every fill.
+    # No tested_url means no scope to compare against. A recovery keeps working and says so in the log rather
+    # than refusing every fill; a run that confines its credentials refuses the value on every page instead.
     _stub_recovery_run_context(monkeypatch, tested_url=None)
     task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
 
-    assert agent_module.recovery_credential_release_guard(task, ["portal_credential"], enforce_vault_sites=True) is None
+    guard = agent_module.recovery_credential_release_guard(
+        task, ["portal_credential"], enforce_vault_sites=True, refuse_siteless=refuse_siteless
+    )
+
+    if not refuse_siteless:
+        assert guard is None
+        return
+    assert guard is not None
+    armed = guard.matches("s3cret-value")
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(armed[0], "https://portal-example.com/login", operation="taskv3.type")
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_arms_the_release_guard_only_for_a_workflow_owned_recovery(
+async def test_execute_task_v3_arms_the_release_guard_for_a_recovery_or_a_confined_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_recovery_run_context(monkeypatch, tested_url="https://portal-example.com/login")
+    context = _stub_recovery_run_context(monkeypatch, tested_url="https://portal-example.com/login")
+    codes_bound: list[bool] = []
+    _capture_allowed_credential_keys(monkeypatch, [], bound_sink=codes_bound)
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
     _step, _task, recovery_loop, _post = await _run_execute_task_v3(
         monkeypatch,
@@ -4382,7 +4463,9 @@ async def test_execute_task_v3_arms_the_release_guard_only_for_a_workflow_owned_
         extracted_information_schema=None,
         workflow_run_id="wr_test",
     )
-    assert recovery_loop.call_args.kwargs["credential_release_guard"] is not None
+    recovery_guard = recovery_loop.call_args.kwargs["credential_release_guard"]
+    assert recovery_guard is not None
+    assert recovery_guard.literal_matches("s3cret-value") == []
 
     block = _make_block(ActionBlock, parameters=[_make_credential_parameter("portal_credential")])
     _step, _task, block_loop, _post = await _run_execute_task_v3(
@@ -4394,6 +4477,148 @@ async def test_execute_task_v3_arms_the_release_guard_only_for_a_workflow_owned_
         workflow_run_id="wr_test",
     )
     assert block_loop.call_args.kwargs["credential_release_guard"] is None
+
+    # A run that confines its credentials arms the guard for a block too, also in script mode, where a block
+    # lists no parameters: the saved site and a site added to the login take the password, an unrelated one not.
+    # A login saved for no website is refused everywhere, and a vault login is held to its vault item's sites.
+    context.parameters["portal_credential"] = _make_workflow_credential_parameter("portal_credential")
+    context.credential_extra_site_urls["portal_credential"] = ["https://idp-example.org/login"]
+    context.values["portal_credential"]["totp"] = "placeholder_t"
+    context.secrets["placeholder_t"] = "BW_TOTP"
+    context.secrets[context.totp_secret_value_key("placeholder_t")] = "JBSWY3DPEHPK3PXP"
+    markup_password = "pa&ss\"9<w>o'rd"
+    passwords = {"short_credential": "pin7", "markup_credential": markup_password}
+    for key in ("siteless_credential", "vault_credential", "short_credential", "markup_credential"):
+        context.parameters[key] = _make_workflow_credential_parameter(key)
+        context.values[key] = {"password": f"placeholder_{key}"}
+        context.secrets[f"placeholder_{key}"] = passwords.get(key, f"{key}-secret")
+    context.credential_tested_urls["short_credential"] = "https://portal-example.com/login"
+    context.credential_tested_urls["markup_credential"] = "https://portal-example.com/login"
+    # The password as a page shows it: mirrored into a field's value attribute (newer and older Chromium escaping),
+    # printed as text, and echoed in a URL.
+    markup_pages = [
+        '<input type="password" value="pa&amp;ss&quot;9&lt;w&gt;o\'rd">',
+        '<input type="password" value="pa&amp;ss&quot;9<w>o\'rd">',
+        "<p>pa&amp;ss\"9&lt;w&gt;o'rd</p>",
+        "url=https://jobs.portal-example.com/next?p=pa%26ss%229%3Cw%3Eo%27rd",
+    ]
+    context.credential_tested_urls["vault_credential"] = "https://portal-example.com/login"
+    context.bitwarden_login_sites["vault_credential"] = [LoginSite("https://vault-item-example.com", whole_site=True)]
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.confine_task_credentials_to_saved_sites", lambda _task: True
+    )
+    released_to: list[Any] = []
+    hidden_from_model: list[set[str]] = []
+    shown_to_model: list[list[str]] = []
+    run_contexts: list[Any] = []
+
+    def capture(loop_kwargs: dict[str, Any]) -> None:
+        released_to.append(loop_kwargs["credential_release_guard"])
+        current = skyvern_context.current()
+        hidden_from_model.append(set(current.model_hidden_values) if current is not None else set())
+        shown_to_model.append([current.hide_from_model(page) for page in markup_pages] if current is not None else [])
+        run_contexts.append(current)
+
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(ActionBlock, parameters=[]),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        workflow_run_id="wr_test",
+        context_overrides={"script_mode": True},
+        on_loop=capture,
+    )
+    guard = released_to[0]
+    assert guard is not None
+    armed = guard.matches("s3cret-value")
+    for page_url in ("https://accounts.portal-example.com/signin", "https://accounts.idp-example.org/signin"):
+        guard.check_release(armed[0], page_url, operation="taskv3.type", alternatives=armed[1:])
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(armed[0], "https://phisher-signin.net/login", operation="taskv3.type")
+    siteless = guard.matches("siteless_credential-secret")
+    assert siteless
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(siteless[0], "https://accounts.portal-example.com/signin", operation="taskv3.type")
+    vault = guard.matches("vault_credential-secret")
+    guard.check_release(vault[0], "https://login.vault-item-example.com/", operation="taskv3.type")
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(vault[0], "https://accounts.portal-example.com/signin", operation="taskv3.type")
+    # Only the confined block hands out a code made from a credential's seed as that credential's placeholder,
+    # and its passwords, not its usernames, stay out of the model's view.
+    assert codes_bound == [False, False, True]
+    assert "s3cret-value" in hidden_from_model[0] and "demo_business_user" not in hidden_from_model[0]
+    assert len(shown_to_model[0]) == len(markup_pages)
+    for shown in shown_to_model[0]:
+        assert markup_password not in html.unescape(shown) and markup_password not in unquote_plus(shown), shown
+        assert MODEL_HIDDEN_PLACEHOLDER in shown, shown
+    # The class, not a list of forms: each character as itself or with one escape, in any mix, under up to two more
+    # escape layers, never brings a saved password to the model. A password with a backslash or an escape of its own
+    # gets the layers only when written plainly. Text that holds none of them passes unchanged.
+    run_context = run_contexts[0]
+    plain = '<a href="/jobs?q=a%20b&amp;page=2">x &lt; y</a> \\n'
+    assert run_context.hide_from_model(plain) == plain
+    rng = random.Random(20912)
+    alphabet = string.ascii_letters + string.digits + "&\"'<>%+\\/#;=?@! ~\u00e9\u20ac"
+    layers = [html.escape, lambda text: quote(text, safe=""), quote_plus, lambda text: json.dumps(text)[1:-1]]
+    cases = [
+        # Its own '%1C' decodes along with the two JSON layers.
+        ("?Ly%1COvO2/\u00e9", json.dumps(json.dumps("?Ly%1COvO2/\u00e9")[1:-1])[1:-1]),
+        # An outer escape that hides only a reference's ';', or one byte of a character's percent escapes.
+        ("Pass-w0rd!", "&#80\\u003bass-w0rd!"),
+        ("caf\u00e9-w0rd", "caf%C3\\u0025A9-w0rd"),
+    ]
+    for _ in range(300):
+        password = "".join(rng.choice(alphabet) for _ in range(rng.randint(5, 14)))
+        mixed = "".join(rng.choice(_escaped_forms(char)) for char in password)
+        own_escape = "\\" in password or next(decoding_stages(password), None) is not None
+        cases.append((password, mixed))
+        for written in (password, password if own_escape else mixed):
+            for layer in rng.choices(layers, k=rng.randint(0, 2)):
+                written = layer(written)
+            cases.append((password, written))
+    for password, written in cases:
+        run_context.hide_from_model_in_any_escape(password)
+        shown = run_context.hide_from_model(f"<p>before {written} after</p>")
+        assert written not in shown and password not in shown, (password, written, shown)
+    # A space written as a no-break space or its percent escape, and an emoji as an ASCII-escaped JSON surrogate pair,
+    # are masked where they stand, so the model keeps the rest of the text.
+    for password, written in (
+        ("pa ss9word", "pa\u00a0ss9word"),
+        ("pa ss9word", "pa%C2%A0ss9word"),
+        ("p\U0001f600ss-w0rd", json.dumps("p\U0001f600ss-w0rd")[1:-1]),
+    ):
+        run_context.hide_from_model_in_any_escape(password)
+        shown = run_context.hide_from_model(f"<p>before {written} after</p>")
+        assert written not in shown and MODEL_HIDDEN_PLACEHOLDER in shown, (password, written, shown)
+    # Only the confined block's guard also judges a password the model types back as plain text, a short one included,
+    # which stays visible to the model because hiding it as a substring would damage page text.
+    assert guard.literal_matches("s3cret-value") and not guard.literal_matches("demo_business_user")
+    assert guard.literal_matches("pin7") and "pin7" not in hidden_from_model[0]
+
+    # The next block of the run builds its own guard. A code that the sign-in block entered, read off its page and
+    # entered again as plain text, is still refused off the credential's sites and still goes in on them.
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(ActionBlock, parameters=[]),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        workflow_run_id="wr_test",
+        context_overrides={"script_mode": True},
+        on_loop=capture,
+    )
+    assert len(released_to) == 2 and released_to[1] is not None
+    code = generate_totp_code("JBSWY3DPEHPK3PXP")
+    held = released_to[1].literal_matches(f"code {code}")
+    assert held
+    released_to[1].check_release(
+        held[0], "https://accounts.portal-example.com/signin", operation="taskv3.type", alternatives=held[1:]
+    )
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        released_to[1].check_release(
+            held[0], "https://phisher-signin.net/login", operation="taskv3.type", alternatives=held[1:]
+        )
 
 
 @pytest.mark.asyncio
@@ -6452,7 +6677,11 @@ async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeyp
     seen_states: list[Any] = []
 
     def capturing_build(
-        task: Any, page_provider: Any = None, state: Any = None, allowed_credential_parameter_keys: Any = None
+        task: Any,
+        page_provider: Any = None,
+        state: Any = None,
+        allowed_credential_parameter_keys: Any = None,
+        bind_credential_codes: bool = False,
     ) -> tuple[list[Any], str]:
         seen_states.append(state)
         return [], ""
@@ -6481,7 +6710,11 @@ async def test_execute_task_v3_pins_credential_before_building_auth_tools(
     seen_providers: list[Any] = []
 
     def capturing_build(
-        task: Any, page_provider: Any = None, state: Any = None, allowed_credential_parameter_keys: Any = None
+        task: Any,
+        page_provider: Any = None,
+        state: Any = None,
+        allowed_credential_parameter_keys: Any = None,
+        bind_credential_codes: bool = False,
     ) -> tuple[list[Any], str]:
         ctx = skyvern_context.current()
         seen_keys.append(ctx.active_credential_parameter_key if ctx else None)
@@ -6512,7 +6745,11 @@ async def test_execute_task_v3_withholds_the_page_provider_from_auth_tools_when_
     seen_providers: list[Any] = []
 
     def capturing_build(
-        task: Any, page_provider: Any = None, state: Any = None, allowed_credential_parameter_keys: Any = None
+        task: Any,
+        page_provider: Any = None,
+        state: Any = None,
+        allowed_credential_parameter_keys: Any = None,
+        bind_credential_codes: bool = False,
     ) -> tuple[list[Any], str]:
         seen_providers.append(page_provider)
         return [], ""
@@ -6672,18 +6909,113 @@ async def test_execute_task_v3_refused_round_persists_a_failed_row_without_a_bud
     ]
 
 
+def _stop_entry(name: str, category: str, **extra: Any) -> list[dict[str, Any]]:
+    return [{"category": category, "confidence_float": 1.0, "reasoning": name, "reason_code": name, **extra}]
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "run_kwargs", "status", "category"),
+    [
+        pytest.param(
+            LoopOutcome(status="terminated", reason="The records list is suspended."),
+            {},
+            TaskStatus.terminated,
+            _stop_entry("model_verdict", "UNKNOWN"),
+            id="model_verdict",
+        ),
+        pytest.param(
+            LoopOutcome(status="failed", reason="The records list is suspended.", error_code="RECORDS_SUSPENDED"),
+            {},
+            TaskStatus.failed,
+            _stop_entry("model_verdict", "UNKNOWN", error_code="RECORDS_SUSPENDED"),
+            id="model_verdict_error_code",
+        ),
+        pytest.param(
+            LoopOutcome(status="terminated", reason="None of the codes fit.", error_code_declined=True),
+            {},
+            TaskStatus.terminated,
+            _stop_entry("model_verdict", "UNKNOWN", error_code_declined=True),
+            id="model_verdict_declined",
+        ),
+        *(
+            pytest.param(
+                LoopOutcome(status=status, reason="A check stopped the run.", guard=guard),
+                {},
+                TaskStatus.terminated if status == "terminated" else TaskStatus.failed,
+                _stop_entry(guard, category),
+                id=guard,
+            )
+            for guard, status, category in [
+                ("perception_stall", "terminated", "UNKNOWN"),
+                ("action_loop", "terminated", "UNKNOWN"),
+                ("page_refresh_exhausted", "terminated", "UNKNOWN"),
+                ("answer_basis_hold_bound", "terminated", "UNKNOWN"),
+                ("navigation_dead_end", "terminated", "NAVIGATION_FAILURE"),
+                ("browser_lost", "failed", "BROWSER_ERROR"),
+                ("llm_call_failed", "loop_error", "LLM_ERROR"),
+                ("no_outcome", "loop_error", "UNKNOWN"),
+                ("completion_gate", "terminated", "UNKNOWN"),
+            ]
+        ),
+        pytest.param(
+            LoopOutcome(status="completed", reason="done", billable_actions=["click"]),
+            {"completion_gate_vetoes": True},
+            TaskStatus.failed,
+            _stop_entry("completion_gate", "UNKNOWN"),
+            id="completion_gate_after_loop",
+        ),
+        pytest.param(
+            LoopOutcome(status="completed", reason="done", billable_actions=["click"]),
+            {"browser_connection_lost": True},
+            TaskStatus.failed,
+            _stop_entry("browser_connection_lost", "BROWSER_ERROR"),
+            id="browser_connection_lost",
+        ),
+        pytest.param(
+            LoopOutcome(status="completed", reason="search submitted", billable_actions=["click"]),
+            {
+                "task_block": _make_block(NavigationBlock, navigation_goal="Search"),
+                "page_url_after_loop": "about:blank",
+            },
+            TaskStatus.failed,
+            _stop_entry("blank_page", "WRONG_PAGE_STATE"),
+            id="blank_page",
+        ),
+        pytest.param(
+            LoopOutcome(status="completed", reason="done", billable_actions=[]),
+            {"data_extraction_goal": "Extract the records"},
+            TaskStatus.failed,
+            _stop_entry("extraction_missing", "DATA_EXTRACTION_FAILURE"),
+            id="extraction_missing",
+        ),
+        pytest.param(
+            LoopOutcome(status="budget_exhausted", reason="cap", cap_trip="max_turns (40) reached"),
+            {},
+            TaskStatus.failed,
+            [{"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": "max_turns (40) reached"}],
+            id="budget",
+        ),
+        pytest.param(
+            LoopOutcome(status="canceled", reason="run canceled"), {}, TaskStatus.canceled, None, id="canceled"
+        ),
+        pytest.param(LoopOutcome(status="completed", reason="done"), {}, TaskStatus.completed, None, id="completed"),
+    ],
+)
 async def test_execute_task_v3_failed_run_carries_failure_category(
     monkeypatch: pytest.MonkeyPatch,
+    outcome: LoopOutcome,
+    run_kwargs: dict[str, Any],
+    status: TaskStatus,
+    category: list[dict[str, Any]] | None,
 ) -> None:
-    # fail_task records a code-level failure classification; v3's direct finalization must too.
-    outcome = LoopOutcome(status="budget_exhausted", reason="Reached the maximum steps (2)", billable_actions=[])
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
-    )
-    assert task.status == TaskStatus.failed
-    update_kwargs = loop_mock.update_task_kwargs
-    assert update_kwargs.get("failure_category")
+    monkeypatch.setattr(agent_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    run_kwargs = {"data_extraction_goal": None, "extracted_information_schema": None, **run_kwargs}
+    if run_kwargs.pop("browser_connection_lost", False):
+        monkeypatch.setattr(agent_module, "get_browser_connection_loss", lambda _state: object())
+    _step, task, loop_mock, _post = await _run_execute_task_v3(monkeypatch, replace(outcome), **run_kwargs)
+    assert task.status == status
+    assert loop_mock.update_task_kwargs.get("failure_category") == category
 
 
 @pytest.mark.asyncio
@@ -6774,9 +7106,8 @@ async def test_execute_task_v3_cap_tripped_finish_keeps_output_and_decision_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A finish delivered on the granted final turn: the model's verdict and reason stand, the
-    # extracted_output persists despite the non-completed status, the category classifies from the
-    # model's reason (a captcha block is anti-bot, not budget — the cap merely coincided), and the
-    # terminal decision row is written like any other finish.
+    # extracted_output persists despite the non-completed status, the category names the model's
+    # verdict and the cap that coincided, and the terminal decision row is written like any other finish.
     from skyvern.forge import agent as agent_mod
 
     outcome = LoopOutcome(
@@ -6790,8 +7121,9 @@ async def test_execute_task_v3_cap_tripped_finish_keeps_output_and_decision_row(
     assert task.status == TaskStatus.failed
     update_kwargs = loop_mock.update_task_kwargs
     assert update_kwargs.get("failure_reason") == "blocked by a captcha"
-    category = update_kwargs.get("failure_category")
-    assert category and category[0]["category"] == "ANTI_BOT_DETECTION", category
+    assert update_kwargs.get("failure_category") == _stop_entry(
+        "model_verdict", "UNKNOWN", cap_trip="Reached the maximum steps (25)"
+    )
     assert update_kwargs.get("extracted_information") == {"rows": [1]}
     persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
     assert persisted.action_type == ActionType.TERMINATE
@@ -6799,22 +7131,29 @@ async def test_execute_task_v3_cap_tripped_finish_keeps_output_and_decision_row(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_cap_tripped_finish_with_unclassifiable_reason_falls_back_to_budget(
+async def test_execute_task_v3_model_verdict_category_does_not_read_the_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A granted-turn failed verdict whose reason carries no classifiable signal is usually the
-    # model narrating the truncation: the typed cap fact beats an UNKNOWN keyword fallback.
-    outcome = LoopOutcome(
-        status="failed",
-        reason="could not finish filling in the remaining sections",
-        cap_trip="max_turns (40) reached",
-        billable_actions=["click"],
-        extracted_output={"partial": True},
-    )
-    _step, task, loop_mock, _post = await _run_execute_task_v3(monkeypatch, outcome, action_rounds=None)
-    assert task.status == TaskStatus.failed
-    category = loop_mock.update_task_kwargs.get("failure_category")
-    assert category == [
+    # One exit, two reasons: one a keyword pass labels and one it does not. Both record the same entry.
+    labelled, unlabelled = "Login failed: invalid username or password", "could not finish the remaining sections"
+    assert (classify_from_failure_reason(labelled) or [{}])[0].get("category") == "AUTH_FAILURE"
+    assert classify_from_failure_reason(unlabelled) is None
+    categories, block_categories = [], []
+    for reason in (labelled, unlabelled):
+        outcome = LoopOutcome(
+            status="failed", reason=reason, cap_trip="max_turns (40) reached", billable_actions=["click"]
+        )
+        _step, task, loop_mock, _post = await _run_execute_task_v3(monkeypatch, outcome, action_rounds=None)
+        assert task.status == TaskStatus.failed
+        stored = loop_mock.update_task_kwargs.get("failure_category")
+        categories.append(json.dumps(stored))
+        block_categories.append(task_block_failure_category(stored, TaskStatus.failed, reason))
+    assert categories[0] == categories[1]
+    assert json.loads(categories[0]) == _stop_entry("model_verdict", "UNKNOWN", cap_trip="max_turns (40) reached")
+    # The block output, which the workflow run, credential fallback and templates read, keeps the reason's
+    # classification, and BUDGET_EXHAUSTED when no rule matches under a tripped cap.
+    assert block_categories[0] == classify_from_failure_reason(labelled)
+    assert block_categories[1] == [
         {"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": "max_turns (40) reached"}
     ]
 
@@ -6824,8 +7163,7 @@ async def test_execute_task_v3_cap_tripped_guard_termination_is_not_budget_categ
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A repeat-guard termination on the granted turn terminated for the guard's reason (which rides
-    # `guard`, beside the customer-facing sentence in failure_reason); stamping BUDGET_EXHAUSTED over
-    # it would mix the label axes.
+    # `guard`, beside the customer-facing sentence in failure_reason), not the budget's.
     outcome = LoopOutcome(
         status="terminated",
         reason='The run repeated the same action on the "Continue" button and the page did not change.',
@@ -6838,7 +7176,9 @@ async def test_execute_task_v3_cap_tripped_guard_termination_is_not_budget_categ
         monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
     )
     assert task.status == TaskStatus.terminated
-    assert loop_mock.update_task_kwargs.get("failure_category") is None
+    stored = loop_mock.update_task_kwargs.get("failure_category")
+    assert stored == _stop_entry("action_loop", "UNKNOWN", cap_trip="max_turns (40) reached")
+    assert task_block_failure_category(stored, TaskStatus.terminated, outcome.reason) is None
 
 
 @pytest.mark.asyncio
@@ -6858,9 +7198,9 @@ async def test_execute_task_v3_cap_tripped_missing_extraction_keeps_its_own_cate
         monkeypatch, outcome, data_extraction_goal="Extract the rows", extracted_information_schema=None
     )
     assert task.status == TaskStatus.failed
-    category = loop_mock.update_task_kwargs.get("failure_category")
-    assert category, category
-    assert category[0]["category"] != "BUDGET_EXHAUSTED", category
+    assert loop_mock.update_task_kwargs.get("failure_category") == _stop_entry(
+        "extraction_missing", "DATA_EXTRACTION_FAILURE"
+    )
 
 
 @pytest.mark.asyncio
@@ -6873,6 +7213,7 @@ async def test_execute_task_v3_cap_tripped_loop_error_keeps_provider_category_an
     outcome = LoopOutcome(
         status="loop_error",
         reason="llm_call_failed: RuntimeError: provider unavailable",
+        guard=LLM_CALL_FAILED_GUARD,
         cap_trip="max_tool_calls (100) reached",
         billable_actions=[],
         extracted_output={"rows": [8]},
@@ -6881,63 +7222,88 @@ async def test_execute_task_v3_cap_tripped_loop_error_keeps_provider_category_an
         monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
     )
     assert task.status == TaskStatus.failed
-    category = loop_mock.update_task_kwargs.get("failure_category")
-    assert category, category
-    assert category[0]["category"] != "BUDGET_EXHAUSTED", category
+    assert loop_mock.update_task_kwargs.get("failure_category") == _stop_entry("llm_call_failed", "LLM_ERROR")
     assert loop_mock.update_task_kwargs.get("extracted_information") == {"rows": [8]}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "reason"),
+    ("status", "reason", "cap_trip", "extracted_output"),
     [
-        ("budget_exhausted", "The run reached its turn budget before the model finished."),
-        ("loop_error", "llm_call_failed: RuntimeError: provider unavailable"),
+        (
+            "budget_exhausted",
+            "The run reached its turn budget before the model finished.",
+            "max_turns (40) reached",
+            {"rows": [3]},
+        ),
+        ("loop_error", "llm_call_failed: RuntimeError: provider unavailable", None, None),
     ],
 )
 async def test_execute_task_v3_verdictless_death_persists_a_failed_decision_row(
-    monkeypatch: pytest.MonkeyPatch, status: str, reason: str
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    reason: str,
+    cap_trip: str | None,
+    extracted_output: dict[str, Any] | None,
 ) -> None:
-    # A death with no agent verdict is exactly the run a click-free block has no step details for:
-    # the terminal decision row is synthesized as a FAILED terminate carrying the outcome reason.
-    from skyvern.forge import agent as agent_mod
-
-    outcome = LoopOutcome(status=status, reason=reason, billable_actions=["click"])
-    _step, task, _loop, _post = await _run_execute_task_v3(
+    # A death with no agent verdict is exactly the run a click-free block has no step details for: the terminal
+    # decision row is synthesized as a FAILED terminate carrying the outcome reason, even when data survived.
+    outcome = LoopOutcome(
+        status=status, reason=reason, cap_trip=cap_trip, billable_actions=["click"], extracted_output=extracted_output
+    )
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
     )
     assert task.status == TaskStatus.failed
-    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert loop_mock.update_task_kwargs.get("extracted_information") == extracted_output
+    persisted = agent_module.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
     assert persisted.action_type == ActionType.TERMINATE
     assert persisted.status == ActionStatus.failed
     assert persisted.reasoning == reason
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_verdictless_death_with_salvaged_output_still_fails_the_decision_row(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("status", "gate_vetoes", "expected_status"),
+    [
+        ("terminated", False, TaskStatus.terminated),
+        ("failed", False, TaskStatus.failed),
+        ("completed", True, TaskStatus.failed),
+    ],
+    ids=["terminated", "failed", "gate_vetoed_completion"],
+)
+async def test_execute_task_v3_keeps_the_raw_redacted_payload_on_every_verdict(
+    monkeypatch: pytest.MonkeyPatch, status: str, gate_vetoes: bool, expected_status: TaskStatus
 ) -> None:
-    # The decision row records whether the agent gave a verdict, not whether data survived: a
-    # cap-tripped death still persists FAILED even though AC-2 carries the staged extraction
-    # through. Coupling the row's status to the salvage would hide these runs from the
-    # failed-decision-row taxonomy the docs point at.
-    from skyvern.forge import agent as agent_mod
-
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run", lambda *_a, **_k: {"482913"}
+    )
     outcome = LoopOutcome(
-        status="budget_exhausted",
-        reason="The run reached its turn budget before the model finished.",
-        cap_trip="max_turns (40) reached",
+        status=status,
+        reason="stopped on the second page",
         billable_actions=["click"],
-        extracted_output={"rows": [3]},
+        extracted_output={"rows": [1, 2, 3], "note": "code 482913"},
     )
+    schema = {
+        "type": "object",
+        "properties": {"rows": {"type": "array"}, "total": {"type": "integer"}},
+        "required": ["total"],
+    }
     _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+        monkeypatch,
+        outcome,
+        completion_gate_vetoes=gate_vetoes,
+        data_extraction_goal="Extract the rows",
+        extracted_information_schema=schema,
     )
-    assert task.status == TaskStatus.failed
-    assert loop_mock.update_task_kwargs.get("extracted_information") == {"rows": [3]}
-    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
-    assert persisted.action_type == ActionType.TERMINATE
-    assert persisted.status == ActionStatus.failed
+    assert task.status == expected_status
+    assert loop_mock.update_task_kwargs.get("extracted_information") == {
+        "rows": [1, 2, 3],
+        "note": f"code {REDACTED_SECRET_PLACEHOLDER}",
+    }
 
 
 @pytest.mark.asyncio

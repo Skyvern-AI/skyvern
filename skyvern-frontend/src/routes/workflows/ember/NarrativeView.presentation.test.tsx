@@ -392,9 +392,7 @@ describe("NarrativeView drafting row (codegen_progress)", () => {
     );
 
     expect(draftingRow()).toBeNull();
-    expect(
-      screen.getByText("Copilot is working on your request…"),
-    ).toBeTruthy();
+    expect(screen.getByText("Ember is working on your request…")).toBeTruthy();
   });
 
   it("does not outlive the live frames", () => {
@@ -607,7 +605,7 @@ describe("NarrativeView failed test attempts", () => {
 
     const card = cardFor("Attempt 1 failed");
     expect(card.dataset.tone).toBe("failed");
-    expect(card.textContent).toContain("Copilot is fixing it");
+    expect(card.textContent).toContain("Ember is fixing it");
     expect(occurrences("Outcome not confirmed")).toBe(0);
     expect(occurrences(firstReason)).toBe(1);
 
@@ -624,7 +622,7 @@ describe("NarrativeView failed test attempts", () => {
     expect(occurrences(`Attempt 1 failed — ${firstReason}`)).toBe(1);
 
     rerender(<NarrativeView turn={ended(live)} />);
-    expect(occurrences("Copilot is fixing it")).toBe(0);
+    expect(occurrences("Ember is fixing it")).toBe(0);
   });
 
   it("never shows an earlier attempt's reason on a newer attempt before its outcome lands", () => {
@@ -780,7 +778,7 @@ describe("NarrativeView failed test attempts", () => {
     ]);
     expect(
       testCards().map((card) =>
-        card.textContent?.includes("Copilot is fixing it"),
+        card.textContent?.includes("Ember is fixing it"),
       ),
     ).toEqual([false, false, true]);
   });

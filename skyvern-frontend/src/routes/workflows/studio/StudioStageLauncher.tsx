@@ -12,12 +12,8 @@ import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { ControlTooltip } from "./ControlTooltip";
 import { PastRunsList } from "./PastRunsList";
 import { STUDIO_PANE_META, railLabel } from "./paneMeta";
-import {
-  STUDIO_PANE_IDS,
-  WORKFLOW_AUTHORING_PANES,
-  type StudioPaneId,
-} from "./panes";
-import { useStudioPanes } from "./useStudioPanes";
+import { WORKFLOW_AUTHORING_PANES, type StudioPaneId } from "./panes";
+import { useStudioPaneIds, useStudioPanes } from "./useStudioPanes";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 
 /**
@@ -28,6 +24,7 @@ import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
  */
 export function StudioStageLauncher() {
   const { openPane } = useStudioPanes();
+  const paneIds = useStudioPaneIds();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
   const clearBrowserActivity = useStudioBrowserStore((s) => s.clearActivity);
   const [runsSelectorOpen, setRunsSelectorOpen] = useState(false);
@@ -51,7 +48,7 @@ export function StudioStageLauncher() {
           All panes are closed. Open one to keep working:
         </p>
         <div className="flex flex-wrap items-center justify-center gap-2">
-          {STUDIO_PANE_IDS.map((id) => {
+          {paneIds.map((id) => {
             const { icon: Icon } = STUDIO_PANE_META[id];
             const label = railLabel(id);
             const blockedByDeletion =

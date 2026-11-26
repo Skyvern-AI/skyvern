@@ -1,0 +1,35 @@
+"""Regression coverage for non-budget terminal copy retained after budget drain."""
+
+from __future__ import annotations
+
+from skyvern.forge.sdk.ember.agent import (
+    _build_cancel_exit_result,
+    _build_max_turns_exit_result,
+    _build_timeout_exit_result,
+)
+from tests.unit.ember_test_helpers import make_ember_ctx
+
+
+def test_budget_exit_builders_persist_typed_no_report() -> None:
+    for builder, source, terminal_reason in (
+        (_build_timeout_exit_result, "deadline", "timeout"),
+        (_build_max_turns_exit_result, "max_turns", "max_turns"),
+    ):
+        ctx = make_ember_ctx()
+        result = builder(ctx, global_llm_context=None)
+
+        assert result.user_response == ""
+        assert result.turn_outcome is not None
+        assert result.turn_outcome.budget_expired is True
+        assert result.turn_outcome.budget_expiry_source == source
+        assert result.turn_outcome.budget_expiry_report_produced is False
+        assert result.turn_outcome.terminal_reason == terminal_reason
+
+
+def test_cancel_exit_writes_no_copy_of_its_own() -> None:
+    ctx = make_ember_ctx()
+    result = _build_cancel_exit_result(ctx, global_llm_context=None)
+
+    assert result.user_response == ""
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.terminal_reason == "cancel"

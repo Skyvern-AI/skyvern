@@ -1,4 +1,6 @@
 import asyncio
+import copy
+import json
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -7,8 +9,9 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from skyvern.forge.agent import ForgeAgent, SpeculativePlan, StepPromptResult
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.schemas.runs import RunEngine
@@ -16,7 +19,8 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.utils import stall_watch
 from skyvern.webeye.actions.actions import ClickAction, CompleteAction, ExtractAction
 from skyvern.webeye.actions.responses import ActionSuccess
-from skyvern.webeye.scraper.scraped_page import ScrapedPage
+from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
+from skyvern.webeye.scraper.scraper import hash_element, trim_element_tree
 from tests.unit.helpers import (
     make_browser_state,
     make_organization,
@@ -867,73 +871,441 @@ async def test_agent_step_persists_artifacts_when_using_speculative_plan(
     agent._persist_scrape_artifacts.assert_awaited_once()
 
 
-def _make_scrape_test_fixtures(now, monkeypatch):
-    """Shared setup for _persist_scrape_artifacts tests."""
+def _marker(typed: str) -> str:
+    return f"[REDACTED_INPUT len={len(typed)}]"
+
+
+def _form_rows() -> list[tuple[dict, dict]]:
+    """Each row is (live element, element as stored)."""
+    link = "https://docs.example/share?k=SECRETTOKEN42"
+    message = "Please include an '@'. 'BADMAILjane' is missing an '@'."
+    forwarded = "Please include an '@'. 'janedoe' is missing an '@'."
+    rows: list[tuple[dict, dict]] = [
+        (
+            {
+                "tagName": "input",
+                "attributes": {
+                    "type": "email",
+                    "value": "jane@example.com",
+                    "data-value": "jane@example.com",
+                    "defaultvalue": "jane@example.com",
+                },
+            },
+            {
+                "tagName": "input",
+                "attributes": {
+                    "type": "email",
+                    "value": _marker("jane@example.com"),
+                    "data-value": _marker("jane@example.com"),
+                    "defaultvalue": _marker("jane@example.com"),
+                },
+            },
+        ),
+        (
+            {"tagName": "div", "children": [{"tagName": "textarea", "attributes": {"value": "note text"}}]},
+            {"tagName": "div", "children": [{"tagName": "textarea", "attributes": {"value": _marker("note text")}}]},
+        ),
+        ({"tagName": "input", "attributes": {"value": "untyped"}}, None),
+        ({"tagName": "input", "attributes": {"type": "hidden", "value": "tok123"}}, None),
+        ({"tagName": "input", "attributes": {"type": "text", "value": ""}}, "same"),
+        ({"tagName": "input", "attributes": {"type": "password", "value": "******"}}, "same"),
+        ({"tagName": "input", "attributes": {"type": "checkbox", "value": "on", "checked": True}}, "same"),
+        ({"tagName": "input", "attributes": {"type": "SUBMIT", "value": "Send now"}}, "same"),
+        ({"tagName": "button", "attributes": {"value": "go"}, "text": "Go"}, "same"),
+        ({"tagName": "button", "interactable": True, "attributes": {"name": "action", "value": "save"}}, "same"),
+        (
+            {"tagName": "textarea", "attributes": {"value": "synced body"}, "text": "synced body"},
+            {"tagName": "textarea", "attributes": {"value": _marker("synced body")}, "text": _marker("synced body")},
+        ),
+        ({"tagName": "textarea", "attributes": {"value": ""}, "text": ""}, "same"),
+        (
+            {
+                "tagName": "div",
+                "id": "ce-1",
+                "attributes": {"contenteditable": "true"},
+                "text": "typed in editor",
+                "children": [
+                    {"tagName": "p", "id": "ce-2", "text": "second line"},
+                    {"tagName": "a", "attributes": {"href": link}, "text": link},
+                ],
+            },
+            {
+                "tagName": "div",
+                "id": "ce-1",
+                "attributes": {"contenteditable": "true"},
+                "text": _marker("typed in editor"),
+                "children": [
+                    {"tagName": "p", "id": "ce-2", "text": _marker("second line")},
+                    {"tagName": "a", "attributes": {"href": _marker(link)}, "text": _marker(link)},
+                ],
+            },
+        ),
+        (
+            {"tagName": "a", "interactable": True, "attributes": {"href": "https://example.com/help"}, "text": "Help"},
+            "same",
+        ),
+        (
+            {
+                "tagName": "div",
+                "id": "dm-1",
+                "interactable": True,
+                "isContentEditable": True,
+                "text": "design mode text",
+            },
+            {
+                "tagName": "div",
+                "id": "dm-1",
+                "interactable": True,
+                "isContentEditable": True,
+                "text": _marker("design mode text"),
+            },
+        ),
+        (
+            {
+                "tagName": "div",
+                "interactable": True,
+                "isContentEditable": True,
+                "attributes": {"role": "spinbutton", "aria-valuenow": "1987", "aria-valuetext": "1987"},
+                "text": "1987",
+            },
+            {
+                "tagName": "div",
+                "interactable": True,
+                "isContentEditable": True,
+                "attributes": {
+                    "role": "spinbutton",
+                    "aria-valuenow": _marker("1987"),
+                    "aria-valuetext": _marker("1987"),
+                },
+                "text": _marker("1987"),
+            },
+        ),
+        (
+            {"tagName": "div", "interactable": True, "attributes": {"role": "slider", "aria-valuetext": "73 kg"}},
+            {
+                "tagName": "div",
+                "interactable": True,
+                "attributes": {"role": "slider", "aria-valuetext": _marker("73 kg")},
+            },
+        ),
+        (
+            {
+                "tagName": "input",
+                "attributes": {"type": "email", "value": "BADMAILjane", "invalid": True, "validationMessage": message},
+            },
+            {"tagName": "input", "attributes": {"type": "email", "value": _marker("BADMAILjane"), "invalid": True}},
+        ),
+        (
+            {
+                "tagName": "input",
+                "attributes": {
+                    "type": "text",
+                    "value": "",
+                    "invalid": True,
+                    "validationMessage": "Fill out this field.",
+                },
+            },
+            "same",
+        ),
+        (
+            {
+                "tagName": "x-input",
+                "interactable": True,
+                "attributes": {"type": "email", "invalid": True, "validationMessage": forwarded},
+            },
+            {"tagName": "x-input", "interactable": True, "attributes": {"type": "email", "invalid": True}},
+        ),
+        (
+            {"tagName": "x-field", "interactable": True, "attributes": {"role": "textbox", "value": "custom typed"}},
+            {
+                "tagName": "x-field",
+                "interactable": True,
+                "attributes": {"role": "textbox", "value": _marker("custom typed")},
+            },
+        ),
+        (
+            {"tagName": "x-entry", "attributes": {"type": "email", "value": "typed entry"}},
+            {"tagName": "x-entry", "attributes": {"type": "email", "value": _marker("typed entry")}},
+        ),
+        (
+            {
+                "tagName": "x-editor",
+                "isContentEditable": True,
+                "attributes": {"value": "draft42"},
+                "text": "draft body",
+            },
+            {
+                "tagName": "x-editor",
+                "isContentEditable": True,
+                "attributes": {"value": _marker("draft42")},
+                "text": _marker("draft body"),
+            },
+        ),
+        (
+            {"tagName": "div", "interactable": True, "attributes": {"role": "spinbutton"}, "text": "2001"},
+            {"tagName": "div", "interactable": True, "attributes": {"role": "spinbutton"}, "text": _marker("2001")},
+        ),
+        (
+            {"tagName": "div", "interactable": True, "attributes": {"role": "textbox"}, "text": "TBSECRET42"},
+            {"tagName": "div", "interactable": True, "attributes": {"role": "textbox"}, "text": _marker("TBSECRET42")},
+        ),
+        ({"tagName": "div", "interactable": True, "attributes": {"role": "combobox"}, "text": "Choose a plan"}, "same"),
+        (
+            {
+                "tagName": "x-input",
+                "interactable": True,
+                "attributes": {"value": "alice@example.com", "data-value": "alice@example.com"},
+                "children": [{"tagName": "input", "attributes": {"value": "alice@example.com"}}],
+            },
+            {
+                "tagName": "x-input",
+                "interactable": True,
+                "attributes": {"value": _marker("alice@example.com"), "data-value": _marker("alice@example.com")},
+                "children": [{"tagName": "input", "attributes": {"value": _marker("alice@example.com")}}],
+            },
+        ),
+        (
+            {
+                "tagName": "x-date",
+                "interactable": True,
+                "attributes": {"value": "1987-03-04"},
+                "children": [{"tagName": "input", "attributes": {"type": "date", "value": "1987-03-04"}}],
+            },
+            {
+                "tagName": "x-date",
+                "interactable": True,
+                "attributes": {"value": _marker("1987-03-04")},
+                "children": [{"tagName": "input", "attributes": {"type": "date", "value": _marker("1987-03-04")}}],
+            },
+        ),
+        (
+            {
+                "tagName": "x-pick",
+                "attributes": {"value": "pick-a"},
+                "children": [{"tagName": "input", "attributes": {"type": "hidden", "value": "pick-a"}}],
+            },
+            {
+                "tagName": "x-pick",
+                "attributes": {"value": "pick-a"},
+                "children": [{"tagName": "input", "attributes": {"type": "hidden", "value": _marker("pick-a")}}],
+            },
+        ),
+        (
+            {
+                "tagName": "x-choice",
+                "interactable": True,
+                "attributes": {"value": "choice-yes"},
+                "children": [{"tagName": "input", "attributes": {"type": "radio", "value": "choice-yes"}}],
+            },
+            "same",
+        ),
+        (
+            {
+                "tagName": "x-group",
+                "attributes": {"value": "group-a"},
+                "children": [
+                    {
+                        "tagName": "x-input",
+                        "attributes": {"value": "nested typed"},
+                        "children": [{"tagName": "input", "attributes": {"value": "nested typed"}}],
+                    }
+                ],
+            },
+            {
+                "tagName": "x-group",
+                "attributes": {"value": "group-a"},
+                "children": [
+                    {
+                        "tagName": "x-input",
+                        "attributes": {"value": _marker("nested typed")},
+                        "children": [{"tagName": "input", "attributes": {"value": _marker("nested typed")}}],
+                    }
+                ],
+            },
+        ),
+        ({"tagName": "x-option", "interactable": True, "attributes": {"value": "plan-annual"}}, "same"),
+        ({"tagName": "div", "attributes": {"type": "email", "value": "page constant"}}, "same"),
+        ({"tagName": "x-badge", "attributes": {"value": "page badge"}}, "same"),
+    ]
+    resolved: list[tuple[dict, dict]] = []
+    for live, stored in rows:
+        if stored == "same":
+            stored = copy.deepcopy(live)
+        elif stored is None:
+            stored = copy.deepcopy(live)
+            stored["attributes"]["value"] = _marker(live["attributes"]["value"])
+        resolved.append((live, stored))
+    return resolved
+
+
+def _typed_form_tree() -> list[dict]:
+    return [{"tagName": "form", "children": [live for live, _ in _form_rows()]}]
+
+
+def _redacted_form_tree() -> list[dict]:
+    return [{"tagName": "form", "children": [stored for _, stored in _form_rows()]}]
+
+
+def _trimmed(tree: list[dict]) -> list[dict]:
+    return trim_element_tree(copy.deepcopy(tree))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_archive", [True, False])
+async def test_persist_scrape_artifacts_stores_trees_without_input_values(
+    monkeypatch: pytest.MonkeyPatch, use_archive: bool
+) -> None:
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
     organization = make_organization(now)
     task = make_task(now, organization)
-    step = make_step(
-        now,
-        task,
-        step_id="step-artifacts",
-        status=StepStatus.created,
-        order=0,
-        output=None,
-    )
+    step = make_step(now, task, step_id="step-artifacts", status=StepStatus.created, order=0, output=None)
     browser_state, _, _ = make_browser_state()
 
     async def _dummy_cleanup(*_args, **_kwargs) -> list[dict]:
         return []
 
-    scraped_page = ScrapedPage(
-        elements=[],
-        element_tree=[{"tagName": "div"}],
-        element_tree_trimmed=[{"tagName": "div"}],
-        _browser_state=browser_state,
-        _clean_up_func=_dummy_cleanup,
-        _scrape_exclude=None,
-    )
-    scraped_page.html = "<html></html>"
-    scraped_page.id_to_css_dict = {"node-1": "#node"}
-    scraped_page.id_to_frame_dict = {"node-1": "frame-1"}
-    scraped_page.element_tree = [{"tagName": "div"}]
-    scraped_page.element_tree_trimmed = [{"tagName": "div"}]
+    stored: dict[str, bytes] = {}
 
-    economy_tree_mock = MagicMock(return_value="<economy>")
-    full_tree_mock = MagicMock(return_value="<full>")
-    monkeypatch.setattr(ScrapedPage, "build_economy_elements_tree", lambda self, *a, **kw: economy_tree_mock())
-    monkeypatch.setattr(ScrapedPage, "build_element_tree", lambda self, *a, **kw: full_tree_mock())
+    def record_archive(**kwargs: Any) -> None:
+        stored.update(
+            tree=kwargs["element_tree"],
+            trimmed=kwargs["element_tree_trimmed"],
+            in_prompt=kwargs["element_tree_in_prompt"],
+            html=kwargs["html"],
+            id_css_map=kwargs["id_css_map"],
+            id_frame_map=kwargs["id_frame_map"],
+        )
 
-    return task, step, scraped_page, economy_tree_mock, full_tree_mock
+    by_type = {
+        ArtifactType.VISIBLE_ELEMENTS_TREE: "tree",
+        ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED: "trimmed",
+        ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT: "in_prompt",
+        ArtifactType.HTML_SCRAPE: "html",
+        ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP: "id_css_map",
+        ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP: "id_frame_map",
+    }
 
+    async def record_create(*, step: Step, artifact_type: ArtifactType, data: bytes, **_kwargs: Any) -> str:
+        if artifact_type in by_type:
+            stored[by_type[artifact_type]] = data
+        return "artifact-id"
 
-@pytest.mark.asyncio
-async def test_persist_scrape_artifacts_uses_archive(monkeypatch: pytest.MonkeyPatch) -> None:
-    """All six scrape fields are collected in one archive call."""
-    agent = ForgeAgent()
-    now = datetime.now(UTC)
-    task, step, scraped_page, economy_tree_mock, full_tree_mock = _make_scrape_test_fixtures(now, monkeypatch)
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_scrape_to_archive", record_archive)
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.create_artifact", record_create)
 
-    accumulate_mock = MagicMock()
-    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_scrape_to_archive", accumulate_mock)
-
+    # The enriched tree keeps validation state in the trimmed tree, so its masking reaches IN_PROMPT.
     context = SkyvernContext(
         task_id=task.task_id,
-        step_id=None,
         organization_id=task.organization_id,
         workflow_run_id=task.workflow_run_id,
         tz_info=ZoneInfo("UTC"),
+        enrich_tree_mode=EnrichTreeMode.ENRICHED_TREE,
     )
+    with skyvern_context.scoped(context):
+        scraped_page = ScrapedPage(
+            elements=[],
+            element_tree=_typed_form_tree(),
+            element_tree_trimmed=_trimmed(_typed_form_tree()),
+            _browser_state=browser_state,
+            _clean_up_func=_dummy_cleanup,
+            _scrape_exclude=None,
+        )
+        scraped_page.html = "<html></html>"
+        scraped_page.id_to_css_dict = {"node-1": "#node"}
+        scraped_page.id_to_frame_dict = {"node-1": "frame-1"}
+        scraped_page.last_used_element_tree_html = "<prompt variant>"
+        live_tree = scraped_page.element_tree
+        live_trimmed = scraped_page.element_tree_trimmed
 
-    await agent._persist_scrape_artifacts(task=task, step=step, scraped_page=scraped_page, context=context)
+        await agent._persist_scrape_artifacts(
+            task=task, step=step, scraped_page=scraped_page, context=context if use_archive else None
+        )
 
-    accumulate_mock.assert_called_once()
-    call_kwargs = accumulate_mock.call_args.kwargs
-    assert call_kwargs["html"] == b"<html></html>"
-    assert "node-1" in call_kwargs["id_css_map"].decode()
-    assert "node-1" in call_kwargs["id_frame_map"].decode()
-    assert call_kwargs["element_tree_in_prompt"] == b"<full>"
-    full_tree_mock.assert_called_once()
-    economy_tree_mock.assert_not_called()
+        expected_trimmed = _trimmed(_redacted_form_tree())
+        expected_page = ScrapedPage(
+            elements=[],
+            element_tree=_redacted_form_tree(),
+            element_tree_trimmed=expected_trimmed,
+            _browser_state=browser_state,
+            _clean_up_func=_dummy_cleanup,
+            _scrape_exclude=None,
+        )
+        expected_in_prompt = expected_page.build_element_tree(ElementTreeFormat.HTML)
+        live_page = ScrapedPage(
+            elements=[],
+            element_tree=_typed_form_tree(),
+            element_tree_trimmed=_trimmed(_typed_form_tree()),
+            _browser_state=browser_state,
+            _clean_up_func=_dummy_cleanup,
+            _scrape_exclude=None,
+        )
+        expected_live_html = live_page.build_element_tree(ElementTreeFormat.HTML)
+        live_trimmed_again = _trimmed(_typed_form_tree())
+
+    assert stored["html"] == b"<html></html>"
+    assert json.loads(stored["id_css_map"]) == {"node-1": "#node"}
+    assert json.loads(stored["id_frame_map"]) == {"node-1": "frame-1"}
+    assert json.loads(stored["tree"]) == _redacted_form_tree()
+    assert json.loads(stored["trimmed"]) == expected_trimmed
+    assert stored["in_prompt"].decode() == expected_in_prompt
+    for blob in (stored["tree"], stored["trimmed"], stored["in_prompt"]):
+        for typed in (
+            b"jane@example.com",
+            b"note text",
+            b"untyped",
+            b"tok123",
+            b"synced body",
+            b"typed in editor",
+            b"second line",
+            b"SECRETTOKEN42",
+            b"design mode text",
+            b"1987",
+            b"73 kg",
+            b"BADMAILjane",
+            b"janedoe",
+            b"custom typed",
+            b"typed entry",
+            b"draft42",
+            b"draft body",
+            b"2001",
+            b"TBSECRET42",
+            b"alice@example.com",
+            b"nested typed",
+            b"1987-03-04",
+        ):
+            assert typed not in blob
+    in_prompt = stored["in_prompt"].decode()
+    for kept in (
+        'value="Send now"',
+        'value="go"',
+        ">Go</button>",
+        'value="save"',
+        'value="******"',
+        'checked="true"',
+        'invalid="true"',
+        "Fill out this field.",
+        'href="https://example.com/help"',
+        'value="plan-annual"',
+        'value="page constant"',
+        'value="page badge"',
+        ">Choose a plan</div>",
+        '<x-choice value="choice-yes">',
+        '<x-pick value="pick-a">',
+        '<x-group value="group-a">',
+    ):
+        assert kept in in_prompt
+    editable_node = {"tagName": "div", "isContentEditable": True, "text": "x"}
+    assert "isContentEditable" not in json.dumps(trim_element_tree([dict(editable_node)]))
+    assert hash_element(editable_node) == hash_element({"tagName": "div", "text": "x"})
+
+    assert scraped_page.element_tree is live_tree
+    assert scraped_page.element_tree_trimmed is live_trimmed
+    assert live_tree == _typed_form_tree()
+    assert live_trimmed == live_trimmed_again
+    assert scraped_page.last_used_element_tree_html == expected_live_html
+    assert 'value="jane@example.com"' in expected_live_html
+    assert scraped_page.last_used_element_tree is live_trimmed
 
 
 @pytest.mark.asyncio

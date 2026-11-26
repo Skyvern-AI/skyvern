@@ -240,7 +240,7 @@ function SingleRunReviewCard({
       }
       titleId={titleId}
       wrapTitle
-      collapsedTitle="Copilot is waiting on your review of a run"
+      collapsedTitle="Ember is waiting on your review of a run"
       collapsed={collapsed}
       onCollapsedChange={onCollapsedChange}
       minimizeLabel="Minimize run review"
@@ -254,7 +254,7 @@ function SingleRunReviewCard({
           <>
             <p className="text-muted-foreground">
               {review.workflow_title} · saved as a new version · one real run of
-              that version. It keeps running after Copilot replies.
+              that version. It keeps running after Ember replies.
             </p>
             <p className="flex flex-wrap items-center gap-x-2 text-muted-foreground">
               {review.draft_tested && review.tested_workflow_run_id ? (
@@ -290,7 +290,7 @@ function SingleRunReviewCard({
         ) : (
           <p className="text-muted-foreground">
             {review.workflow_title} · version {review.version} · one real run of
-            the saved workflow. It keeps running after Copilot replies.
+            the saved workflow. It keeps running after Ember replies.
           </p>
         )}
         <InputList inputs={review.common_inputs} />
@@ -390,7 +390,7 @@ function GroupReviewCard({
       }
       titleId={titleId}
       wrapTitle
-      collapsedTitle={`Copilot is waiting on your review of ${plural(review.rows.length, rowGroup ? "run" : "account")}`}
+      collapsedTitle={`Ember is waiting on your review of ${plural(review.rows.length, rowGroup ? "run" : "account")}`}
       collapsed={collapsed}
       onCollapsedChange={onCollapsedChange}
       minimizeLabel={
@@ -407,7 +407,7 @@ function GroupReviewCard({
             {review.workflow_title} · version {review.version} ·{" "}
             {plural(review.rows.length, "run")}, one per row,{" "}
             {atOnce === 1 ? "one at a time" : `${atOnce} at a time`}, each in a
-            fresh browser with that row's inputs. Runs keep going after Copilot
+            fresh browser with that row's inputs. Runs keep going after Ember
             replies.
           </p>
         ) : (
@@ -552,7 +552,7 @@ export function AccountGroupCancelCard({
       title={`Stop ${plural(count, "run")} that ${count === 1 ? "has" : "have"} not finished?`}
       titleId={titleId}
       wrapTitle
-      collapsedTitle={`Copilot is waiting on your answer about stopping ${plural(count, "run")}`}
+      collapsedTitle={`Ember is waiting on your answer about stopping ${plural(count, "run")}`}
       collapsed={collapsed}
       onCollapsedChange={onCollapsedChange}
       minimizeLabel="Minimize cancel review"

@@ -173,7 +173,11 @@ class CustomCredentialAPIClient:
             raise ValueError("Unsupported credential type from API")
 
     async def create_credential(
-        self, name: str, credential: PasswordCredential | CreditCardCredential | SecretCredential
+        self,
+        name: str,
+        credential: PasswordCredential | CreditCardCredential | SecretCredential,
+        *,
+        organization_id: str | None = None,
     ) -> str:
         """
         Create a credential using the custom API.
@@ -181,6 +185,7 @@ class CustomCredentialAPIClient:
         Args:
             name: Name of the credential
             credential: Credential data to store
+            organization_id: Organization the request is made for
 
         Returns:
             The credential ID returned by the API
@@ -209,6 +214,7 @@ class CustomCredentialAPIClient:
                 url=url,
                 headers=headers,
                 data=payload,
+                organization_id=organization_id,
             )
 
             if status_code < 200 or status_code >= 300:
@@ -258,13 +264,16 @@ class CustomCredentialAPIClient:
             )
             raise HttpException(500, url, f"Failed to create credential via custom API: {safe_error}") from e
 
-    async def get_credential(self, credential_id: str, name: str) -> CredentialItem:
+    async def get_credential(
+        self, credential_id: str, name: str, *, organization_id: str | None = None
+    ) -> CredentialItem:
         """
         Get a credential using the custom API.
 
         Args:
             credential_id: ID of the credential to retrieve
             name: Name of the credential (for constructing CredentialItem)
+            organization_id: Organization the request is made for
 
         Returns:
             The credential data
@@ -286,6 +295,7 @@ class CustomCredentialAPIClient:
                 method="GET",
                 url=url,
                 headers=headers,
+                organization_id=organization_id,
             )
 
             if status_code < 200 or status_code >= 300:
@@ -325,12 +335,13 @@ class CustomCredentialAPIClient:
             )
             raise HttpException(500, url, f"Failed to retrieve credential via custom API: {safe_error}") from e
 
-    async def delete_credential(self, credential_id: str) -> None:
+    async def delete_credential(self, credential_id: str, *, organization_id: str | None = None) -> None:
         """
         Delete a credential using the custom API.
 
         Args:
             credential_id: ID of the credential to delete
+            organization_id: Organization the request is made for
 
         Raises:
             HttpException: If the API request fails
@@ -349,6 +360,7 @@ class CustomCredentialAPIClient:
                 method="DELETE",
                 url=url,
                 headers=headers,
+                organization_id=organization_id,
             )
 
             if status_code < 200 or status_code >= 300:

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from sqlalchemy import ColumnElement, and_, delete, func, inspect, or_, select, tuple_, update
+from sqlalchemy.exc import IntegrityError
 
 from skyvern.errors.errors import is_anti_bot_system_error
 from skyvern.forge.failure_classifier import (
@@ -27,9 +28,10 @@ from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import TaskType
-from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.exceptions import NotFoundError, OTPRequestAlreadyBoundError
 from skyvern.forge.sdk.db.models import (
     ActionModel,
+    OTPRequestBindingModel,
     RunExecutionLeaseModel,
     StepModel,
     TaskModel,
@@ -65,6 +67,26 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.executor.run_liveness import RunWriteAuthority
 
 LOG = structlog.get_logger()
+_OTP_REQUEST_BINDING_PK = "otp_request_bindings_pkey"
+
+
+def _is_duplicate_otp_request_binding(error: IntegrityError) -> bool:
+    constraint_name = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
+    if constraint_name == _OTP_REQUEST_BINDING_PK:
+        return True
+    error_text = str(error.orig).lower()
+    return (
+        _OTP_REQUEST_BINDING_PK in error_text
+        or "unique constraint failed: otp_request_bindings.organization_id, otp_request_bindings.otp_request_id"
+        in error_text
+    )
+
+
+def _bound_otp_request_error(binding: OTPRequestBindingModel) -> OTPRequestAlreadyBoundError:
+    owner_id = binding.owner_task_id if binding.owner_type == "task" else binding.owner_workflow_run_id
+    if owner_id is None:
+        raise RuntimeError("OTP request binding has no owner")
+    return OTPRequestAlreadyBoundError(owner_type=binding.owner_type, owner_id=owner_id)
 
 
 def _task_attempt_filter(attempt_number: int | None) -> tuple[ColumnElement[bool], ...]:
@@ -105,7 +127,7 @@ def _without_inserted_user_errors(errors: list[dict[str, Any]], inserted: list[s
 class TasksRepository(BaseRepository):
     _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
 
-    @db_operation("create_task")
+    @db_operation("create_task", expected_errors=(OTPRequestAlreadyBoundError,))
     async def create_task(
         self,
         url: str,
@@ -119,6 +141,7 @@ class TasksRepository(BaseRepository):
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
+        otp_request_id: str | None = None,
         organization_id: str | None = None,
         proxy_location: ProxyLocationInput = None,
         extracted_information_schema: dict[str, Any] | list | str | None = None,
@@ -168,6 +191,28 @@ class TasksRepository(BaseRepository):
         started_at = naive_utc_now() if str(status) == TaskStatus.running.value else None
 
         async with self.Session() as session:
+            if workflow_run_id is not None:
+                owner = (
+                    await session.execute(
+                        select(WorkflowRunModel.organization_id, WorkflowRunModel.otp_request_id).where(
+                            WorkflowRunModel.workflow_run_id == workflow_run_id
+                        )
+                    )
+                ).one_or_none()
+                owner_organization_id = owner.organization_id if owner is not None else None
+                owner_marker = owner.otp_request_id if owner is not None else None
+                if owner_organization_id != organization_id and (
+                    owner_marker is not None or otp_request_id is not None
+                ):
+                    raise ValueError("Strict task organization does not match its workflow-run owner")
+                if owner_organization_id == organization_id and otp_request_id is None:
+                    otp_request_id = owner_marker
+                elif otp_request_id is not None and otp_request_id != owner_marker:
+                    raise ValueError("Task OTP request marker does not match its workflow-run owner")
+            if otp_request_id is not None and workflow_run_id is None:
+                existing_binding = await session.get(OTPRequestBindingModel, (organization_id, otp_request_id))
+                if existing_binding is not None:
+                    raise _bound_otp_request_error(existing_binding)
             new_task = TaskModel(
                 status=status,
                 started_at=started_at,
@@ -178,6 +223,7 @@ class TasksRepository(BaseRepository):
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
+                otp_request_id=otp_request_id,
                 navigation_goal=navigation_goal,
                 complete_criterion=complete_criterion,
                 terminate_criterion=terminate_criterion,
@@ -208,6 +254,26 @@ class TasksRepository(BaseRepository):
             session.add(new_task)
             # The flush fills every column default, so the row needs no re-read; convert it before commit expires it.
             await session.flush()
+            if otp_request_id is not None and workflow_run_id is None:
+                try:
+                    session.add(
+                        OTPRequestBindingModel(
+                            organization_id=organization_id,
+                            otp_request_id=otp_request_id,
+                            owner_type="task",
+                            owner_task_id=new_task.task_id,
+                            owner_store="tasks",
+                        )
+                    )
+                    await session.flush()
+                except IntegrityError as exc:
+                    if not _is_duplicate_otp_request_binding(exc):
+                        raise
+                    await session.rollback()
+                    existing_binding = await session.get(OTPRequestBindingModel, (organization_id, otp_request_id))
+                    if existing_binding is None:
+                        raise
+                    raise _bound_otp_request_error(existing_binding) from exc
             task = convert_to_task(new_task, self.debug_enabled)
             await session.commit()
             return task
@@ -314,6 +380,8 @@ class TasksRepository(BaseRepository):
         self, task_ids: list[str], organization_id: str | None = None
     ) -> tuple[int, int]:
         """Return (total_steps, completed_steps) counts without fetching full step objects."""
+        if not task_ids:
+            return 0, 0
         async with self.Session() as session:
             query = (
                 select(
@@ -814,6 +882,77 @@ class TasksRepository(BaseRepository):
             failure_category=failure_category,
             keep_final_status=keep_final_status,
         )
+
+    @db_operation("claim_task_for_temporal_dispatch")
+    async def claim_task_for_temporal_dispatch(
+        self,
+        task_id: str,
+        organization_id: str,
+        on_committed: Callable[[], None] | None = None,
+        on_confirmed_precommit_failure: Callable[[], None] | None = None,
+    ) -> Task | None:
+        """Atomically reserve a newly created strict task for its one Temporal dispatcher.
+
+        ``on_confirmed_precommit_failure`` runs only when reservation work fails before commit is attempted. A commit
+        failure is deliberately not signaled because the caller cannot prove whether the database accepted it.
+        """
+        now = naive_utc_now()
+        async with self.Session() as session:
+            try:
+                result = await session.execute(
+                    update(TaskModel)
+                    .where(
+                        TaskModel.task_id == task_id,
+                        TaskModel.organization_id == organization_id,
+                        TaskModel.status == TaskStatus.created,
+                        TaskModel.otp_request_id.is_not(None),
+                    )
+                    .values(
+                        status=TaskStatus.queued,
+                        queued_at=func.coalesce(TaskModel.queued_at, now),
+                    )
+                    .returning(TaskModel)
+                )
+                claimed = result.scalar_one_or_none()
+                task = convert_to_task(claimed, debug_enabled=self.debug_enabled) if claimed is not None else None
+            except BaseException:
+                if on_confirmed_precommit_failure is not None:
+                    on_confirmed_precommit_failure()
+                raise
+            await session.commit()
+            if task is not None and on_committed is not None:
+                on_committed()
+            return task
+
+    @db_operation("fail_task_for_temporal_dispatch_precommit")
+    async def fail_task_for_temporal_dispatch_precommit(
+        self,
+        task_id: str,
+        organization_id: str,
+        failure_reason: str,
+    ) -> Task | None:
+        """Fail a strict task only while no Temporal dispatcher has claimed it."""
+        async with self.Session() as session:
+            result = await session.execute(
+                update(TaskModel)
+                .where(
+                    TaskModel.task_id == task_id,
+                    TaskModel.organization_id == organization_id,
+                    TaskModel.status == TaskStatus.created,
+                    TaskModel.otp_request_id.is_not(None),
+                    TaskModel.finished_at.is_(None),
+                )
+                .values(
+                    status=TaskStatus.failed,
+                    failure_reason=failure_reason,
+                    finished_at=naive_utc_now(),
+                )
+                .returning(TaskModel)
+            )
+            failed = result.scalar_one_or_none()
+            task = convert_to_task(failed, debug_enabled=self.debug_enabled) if failed is not None else None
+            await session.commit()
+            return task
 
     @db_operation("update_task_and_claim_finish_for_cancel")
     async def update_task_and_claim_finish_for_cancel(
@@ -1505,10 +1644,7 @@ class TasksRepository(BaseRepository):
         async with self.Session() as session:
             query = select(*columns).where(TaskModel.workflow_run_id == workflow_run_id).order_by(TaskModel.created_at)
             rows = (await session.execute(query)).all()
-        return [
-            convert_to_task(TaskModel(**row._mapping, extracted_information=None), debug_enabled=self.debug_enabled)
-            for row in rows
-        ]
+        return [convert_to_task(row, debug_enabled=self.debug_enabled) for row in rows]
 
     @db_operation("delete_task_steps")
     async def delete_task_steps(self, organization_id: str, task_id: str) -> None:

@@ -188,6 +188,13 @@ async def _maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, orga
     if workflow_run.status not in RETRYABLE_STATUSES:
         return None
 
+    # Credential fallback is a new top-level run, not a child execution of this owner. Reusing the
+    # marker would collide with the original binding, while dropping it would silently downgrade a
+    # strict operation to legacy matching. Strict runs therefore fail closed; unmarked runs retain
+    # the existing automatic fallback behavior (including vault-backed credential selection).
+    if workflow_run.otp_request_id is not None:
+        return None
+
     if await app.AGENT_FUNCTION.get_workflow_run_retry_refusal(workflow_run) is not None:
         return None
 

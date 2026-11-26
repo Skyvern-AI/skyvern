@@ -26,6 +26,8 @@ from typing import Any, Awaitable, Callable, Collection
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from structlog.testing import capture_logs
 
 import skyvern.webeye.action_deadline as action_deadline_module
@@ -90,6 +92,7 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_STALL_TERMINATE_AFTER,
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
+    REQUEST_RECORD_DATA_KEY,
     STALE_READ_MAX_HOLDS,
     SUBMISSION_HELD_WAIT_MAX_SECONDS,
     TARGET_ACTION_ROUND_EVENT,
@@ -132,6 +135,7 @@ from skyvern.forge.taskv3.loop import (
     record_resolve_seconds,
     record_text_delta,
     run_agent_tool_loop,
+    set_request_record_on_error,
     submissions_across_contexts,
     submissions_since,
 )
@@ -291,6 +295,12 @@ def _erroring_tool(
         billable=billable,
         recordable=recordable,
     )
+
+
+def _finish_error_classes(logs: list[dict[str, Any]]) -> list[str | None]:
+    return [
+        e.get("tool_error_class") for e in logs if e["event"] == "taskv3 tool call finished" and e["tool"] == "finish"
+    ]
 
 
 async def _run(
@@ -518,7 +528,7 @@ def _look_tool(
     async def handler(args: dict[str, Any]) -> ToolResult:
         sink.append(("look", args))
         if fail_before_renumbering:
-            return ToolResult.error("look budget reached")
+            return ToolResult.error("look failed to capture the page: TimeoutError")
         return ToolResult.ok("[1] button 'Next'", data={"marks_renumbered": True}, screenshots=[image])
 
     return ToolSpec(
@@ -741,11 +751,13 @@ async def test_action_batching_multiple_tool_calls_one_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_max_turns_budget_exhausted() -> None:
-    click_calls: list[tuple[str, dict[str, Any]]] = []
-    tools = [_recording_tool("click", click_calls), make_finish_tool()]
-    script = [[("click", {})]] * 10  # never finishes
-    outcome, _ = await _run(script, tools, max_turns=3)
+@pytest.mark.parametrize("tool_name", ["click", "look"])
+async def test_max_turns_budget_exhausted(tool_name: str) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tool = _look_tool(calls) if tool_name == "look" else _recording_tool("click", calls)
+    tools = [tool, make_finish_tool()]
+    script = [[(tool_name, {})]] * 10  # never finishes
+    outcome, caller = await _run(script, tools, max_turns=3)
 
     assert outcome.status == "budget_exhausted"
     # Deliberate contract change: the first trip grants one final observed turn instead of ending
@@ -754,6 +766,7 @@ async def test_max_turns_budget_exhausted() -> None:
     assert "max_turns" not in outcome.reason
     assert outcome.cap_trip == "max_turns (3) reached"
     assert outcome.turns == 4
+    assert max(caller.image_blocks_per_call) <= 1
 
 
 @pytest.mark.asyncio
@@ -1136,8 +1149,10 @@ async def test_verification_blocker_refuses_completed_but_not_failed() -> None:
         [("finish", {"status": "completed", "reason": "done"})],
         [("finish", {"status": "failed", "reason": "verification never delivered a code"})],
     ]
-    outcome, _ = await _run(script, tools)
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
 
+    assert _finish_error_classes(logs) == ["verification_hold", None]
     tool_messages = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
     assert any("verification never delivered a code" in m["content"] for m in tool_messages)
     assert outcome.status == "failed"
@@ -1219,7 +1234,7 @@ async def test_transient_call_error_exhausts_retries_to_loop_error() -> None:
         max_call_retries=2,
         call_retry_base_delay=0.0,
     )
-    assert outcome.status == "loop_error"
+    assert (outcome.status, outcome.guard) == ("loop_error", "llm_call_failed")
     assert "llm_call_failed" in outcome.reason
 
 
@@ -6056,7 +6071,9 @@ async def test_finish_completed_defers_until_page_settles() -> None:
         [("finish", {"status": "completed", "reason": "looks done"})],
         [("finish", {"status": "completed", "reason": "confirmed on settled page"})],
     ]
-    outcome, _ = await _run(script, [make_finish_tool(page_fingerprint=fingerprint, settle_wait_seconds=0.0)])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [make_finish_tool(page_fingerprint=fingerprint, settle_wait_seconds=0.0)])
+    assert _finish_error_classes(logs) == ["unsettled_page_hold", None]
     assert outcome.status == "completed"
     assert outcome.reason == "confirmed on settled page"
     deferral_messages = [
@@ -6085,7 +6102,9 @@ async def test_finish_completed_is_held_once_on_page_text_no_result_carried() ->
         [("finish", {"status": "completed", "reason": "the list is empty"})],
         [("finish", {"status": "completed", "reason": "deleted the listed item"})],
     ]
-    outcome, _ = await _run(script, [finish], unseen_text=unseen)
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [finish], unseen_text=unseen)
+    assert _finish_error_classes(logs) == ["unseen_text_hold", None]
     assert (outcome.status, outcome.reason) == ("completed", "deleted the listed item")
     assert any('"Cart A"' in str(m.get("content")) for m in outcome.messages if m.get("name") == "finish")
 
@@ -6403,6 +6422,7 @@ _OBSERVE_SUMMARY_FIELDS = (
     "ready_state_when_empty",
     "links_listed",
     "link_capped",
+    "qualified_by_destination",
 )
 
 
@@ -7706,7 +7726,9 @@ async def test_finish_failed_after_captcha_defers_for_evidence_then_corrected_ve
         [("observe", {})],
         [("finish", {"status": "completed", "reason": "the page shows the application was submitted"})],
     ]
-    outcome, _ = await _run(script, tools, activity=activity)
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    assert _finish_error_classes(logs) == ["failure_evidence_hold", None]
     assert outcome.status == "completed"
     assert outcome.reason == "the page shows the application was submitted"
     deferrals = [
@@ -8285,7 +8307,7 @@ async def test_a_cancel_seen_while_waiting_on_a_request_sent_during_the_reask_ne
         deadline_at=time.monotonic() + FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS + 0.2,
     )
     result = await finish.handler({"status": "terminated", "reason": "r"})
-    assert (result.status, result.data) == ("error", None)
+    assert (result.status, result.data, result.error_class) == ("error", None, "canceled_during_finish")
 
 
 @pytest.mark.asyncio
@@ -8358,7 +8380,7 @@ async def test_submission_hold_wait_on_a_held_submission_ends_on_cancel() -> Non
     finish = make_finish_tool(activity=activity, intercepted_submissions=submissions, should_cancel=canceled)
     started = time.monotonic()
     result = await finish.handler({"status": "terminated", "reason": "r"})
-    assert result.status == "error"
+    assert (result.status, result.error_class) == ("error", "submission_hold")
     assert "still waiting" in result.content
     assert time.monotonic() - started < SUBMISSION_HELD_WAIT_MAX_SECONDS / 2
 
@@ -8477,7 +8499,8 @@ async def test_a_new_response_does_not_re_wait_on_a_submission_already_held_for(
     activity.turn += 1
     started = time.monotonic()
     second = await finish.handler({"status": "terminated", "reason": "r2"})
-    assert second.status == "error" and "got the site's response" in second.content
+    assert (second.status, second.error_class) == ("error", "submission_hold")
+    assert "got the site's response" in second.content
     assert time.monotonic() - started < 0.6
 
 
@@ -8579,6 +8602,7 @@ async def test_a_lone_typed_rejection_holds_a_give_up_once_for_the_permitted_ret
     outcome, logs = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=[_REJECTED])
     assert (outcome.status, outcome.reason) == ("terminated", "not retrying")
     assert [e["event"] for e in logs].count(_RETRY_HELD) == 1
+    assert _finish_error_classes(logs) == ["site_rejection_retry_hold", None]
 
 
 @pytest.mark.asyncio
@@ -8872,7 +8896,11 @@ async def test_justification_hold_stands_aside_without_room_to_continue(
     with capture_logs() as logs:
         result = await finish.handler({"status": "terminated", "reason": "r1"})
     if cause is None:
-        assert (result.status, result.content) == ("error", loop_module.JUSTIFY_HOLD_MESSAGE)
+        assert (result.status, result.content, result.error_class) == (
+            "error",
+            loop_module.JUSTIFY_HOLD_MESSAGE,
+            "justify_hold",
+        )
         assert [e["event"] for e in _justify_events(logs)] == [_JUSTIFY_HELD]
     else:
         assert result.status == "ok"
@@ -9416,7 +9444,9 @@ async def test_a_frozen_control_holds_the_verdict_once_and_then_gets_out_of_the_
         [("finish", {"status": "completed", "reason": "submitted the application"})],
         [("finish", {"status": "completed", "reason": "still looks submitted to me"})],
     ]
-    outcome, _ = await _run(script, [make_finish_tool(pending_marker=probe, submit_watch=watch)])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [make_finish_tool(pending_marker=probe, submit_watch=watch)])
+    assert _finish_error_classes(logs) == ["submission_in_flight_hold", None]
     assert outcome.status == "completed", outcome.status
     assert outcome.reason == "still looks submitted to me"
     assert len(_held_messages(outcome)) == 1, outcome.messages
@@ -10259,9 +10289,11 @@ async def test_disabling_the_stall_guard_silences_its_measurement_streams_too() 
 async def test_model_hidden_secret_values_are_scrubbed_from_the_tool_message_the_model_sees() -> None:
     """A model-hidden value (a magic sign-in link URL and its bare token) must never reach the
     LLM's view of a tool result — including a tool_error raised by a handler — while a
-    registered-but-not-hidden secret (a TOTP code) still passes through untouched."""
+    registered-but-not-hidden secret (a TOTP code) still passes through untouched. A raised error's driver call log
+    never reaches the model either: only the driver's last reason, as fixed wording from a closed list, does."""
     hidden_url = "https://example.test/magic?token=synthetictoken0123"
     hidden_token = "synthetictoken0123"
+    hidden_two_line = "splitsecrethead\nsplitsecrettail"
     visible_code = "123456"
 
     async def clean_handler(_args: dict[str, Any]) -> ToolResult:
@@ -10270,23 +10302,112 @@ async def test_model_hidden_secret_values_are_scrubbed_from_the_tool_message_the
     async def linky_handler(_args: dict[str, Any]) -> ToolResult:
         return ToolResult.ok(f"now at {hidden_url} code {visible_code}")
 
-    async def boom_handler(_args: dict[str, Any]) -> ToolResult:
-        raise ValueError(f"failed at {hidden_url}")
+    # The first line ends inside hidden_two_line, so cutting before scrubbing would leave its first half behind.
+    click_log = (
+        f"Locator.click: Timeout 15000ms exceeded at {hidden_url} {hidden_two_line}\n"
+        '    1) <button onclick="x">Go</button>\n\nCall log:\n'
+        '  - waiting for locator("#go")\n'
+        '    - locator resolved to <button id="go">Go</button>\n'
+        "  - attempting click action\n"
+        "    - element is outside of the viewport\n"
+        "  2 × retrying click action\n"
+        '      - <div style="position:fixed">blocking overlay</div> intercepts pointer events\n'
+        "      - waiting 500ms"
+    )
+    raised = {
+        "boom": ValueError(f"failed at {hidden_url}\nsecond line {hidden_two_line}"),
+        "long": RuntimeError("y" * 1200),
+        "covered": PlaywrightTimeoutError(click_log),
+        "in_flight": PlaywrightTimeoutError(f"{click_log}\n    - performing click action"),
+        "landed": PlaywrightTimeoutError(
+            f"{click_log}\n    - performing click action\n    - click action done\n"
+            "    - waiting for scheduled navigations to finish"
+        ),
+        "drag_pressing": PlaywrightTimeoutError(
+            "Locator.drag_to: Timeout 2000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#src")\n'
+            "  - attempting move and down action\n"
+            "    - element is not stable\n"
+            "  - retrying move and down action\n"
+            "    - performing move and down action"
+        ),
+        "drag_half_done": PlaywrightTimeoutError(
+            "Locator.drag_to: Timeout 2000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#src")\n'
+            "  - attempting move and down action\n"
+            "    - performing move and down action\n"
+            "    - move and down action done\n"
+            "    - waiting for scheduled navigations to finish\n"
+            "    - navigations have finished\n"
+            '  - waiting for locator("#dst")'
+        ),
+        "missing_option": PlaywrightTimeoutError(
+            "Page.select_option: Timeout 15000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#s")\n'
+            "  - attempting select option action\n"
+            "    2 × waiting for element to be visible and enabled\n"
+            "      - did not find some options\n"
+            "    - retrying select option action\n"
+            "      - waiting 20ms"
+        ),
+        "typed_echo": PlaywrightTimeoutError(
+            "Locator.fill: Timeout 15000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#n")\n'
+            '    - fill("abc intercepts pointer events\n- element is not visible\n  click action done\nz")\n'
+            "  - attempting fill action\n"
+            "    - waiting for element to be visible, enabled and editable"
+        ),
+        "press_hung": PlaywrightTimeoutError(
+            "Page.press: Timeout 2000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#q")\n'
+            '    - locator resolved to <input id="q">\n'
+            '  - elementHandle.press("Enter")'
+        ),
+        "type_hung": PlaywrightTimeoutError(
+            "Page.type: Timeout 2000ms exceeded.\nCall log:\n"
+            '  - waiting for locator("#q")\n'
+            '    - locator resolved to <input id="q">\n'
+            '  - elementHandle.type("hello")'
+        ),
+        "unknown_key": PlaywrightError(
+            'Page.press: Unknown key: "cmd"\nCall log:\n'
+            '  - waiting for locator("#q")\n'
+            '    - locator resolved to <input id="q">\n'
+            '  - elementHandle.press("cmd+a")'
+        ),
+        "crashed_after_click": PlaywrightError(
+            "Page.click: Target crashed\nCall log:\n"
+            '  - waiting for locator("#go")\n'
+            "    - performing click action\n"
+            "    - click action done\n"
+            "    - waiting for scheduled navigations to finish"
+        ),
+    }
+
+    def raiser(exc: Exception) -> Callable[[dict[str, Any]], Awaitable[ToolResult]]:
+        async def handler(_args: dict[str, Any]) -> ToolResult:
+            raise exc
+
+        return handler
 
     tools = [
         ToolSpec(name="clean", description="c", parameters={"type": "object", "properties": {}}, handler=clean_handler),
         ToolSpec(name="linky", description="l", parameters={"type": "object", "properties": {}}, handler=linky_handler),
-        ToolSpec(name="boom", description="b", parameters={"type": "object", "properties": {}}, handler=boom_handler),
+        *(
+            ToolSpec(name=name, description="b", parameters={"type": "object", "properties": {}}, handler=raiser(exc))
+            for name, exc in raised.items()
+        ),
         make_finish_tool(),
     ]
     script = [
-        [("clean", {}), ("linky", {}), ("boom", {})],
+        [("clean", {}), ("linky", {}), *((name, {}) for name in raised)],
         [("finish", {"status": "completed", "reason": "done"})],
     ]
 
     ctx = SkyvernContext(task_id="tsk_hidden_link")
     ctx.register_secret_value(hidden_url, hide_from_model=True)
     ctx.register_secret_value(hidden_token, hide_from_model=True)
+    ctx.register_secret_value(hidden_two_line, hide_from_model=True)
     ctx.register_secret_value(visible_code)
     skyvern_context.set(ctx)
     try:
@@ -10298,10 +10419,36 @@ async def test_model_hidden_secret_values_are_scrubbed_from_the_tool_message_the
     tool_messages = {m["name"]: m["content"] for m in caller.message_history if m.get("role") == "tool"}
     assert tool_messages["clean"] == "nothing sensitive here"
     assert tool_messages["linky"] == f"now at [withheld: sign-in link] code {visible_code}"
-    assert tool_messages["boom"] == "tool_error: ValueError: failed at [withheld: sign-in link]"
+    click_head = (
+        "tool_error: TimeoutError: Locator.click: Timeout 15000ms exceeded at [withheld: sign-in link] "
+        "[withheld: sign-in link] The driver last reported:"
+    )
+    assert {name: tool_messages[name] for name in raised} == {
+        "boom": "tool_error: ValueError: failed at [withheld: sign-in link]\nsecond line [withheld: sign-in link]",
+        "long": "tool_error: RuntimeError: " + "y" * 1000,
+        "covered": f"{click_head} another element intercepts pointer events.",
+        "in_flight": (
+            f"{click_head} the driver had started the action when the timeout came, so it may have gone through."
+        ),
+        "landed": f"{click_head} the action was performed, and the timeout came after it.",
+        "drag_pressing": "tool_error: TimeoutError: Locator.drag_to: Timeout 2000ms exceeded.",
+        "drag_half_done": "tool_error: TimeoutError: Locator.drag_to: Timeout 2000ms exceeded.",
+        "missing_option": (
+            "tool_error: TimeoutError: Page.select_option: Timeout 15000ms exceeded. "
+            "The driver last reported: did not find some options."
+        ),
+        "typed_echo": "tool_error: TimeoutError: Locator.fill: Timeout 15000ms exceeded.",
+        "press_hung": (
+            "tool_error: TimeoutError: Page.press: Timeout 2000ms exceeded. The driver last reported: "
+            "the driver had started the action when the timeout came, so it may have gone through."
+        ),
+        "type_hung": "tool_error: TimeoutError: Page.type: Timeout 2000ms exceeded.",
+        "unknown_key": 'tool_error: Error: Page.press: Unknown key: "cmd"',
+        "crashed_after_click": "tool_error: Error: Page.click: Target crashed",
+    }
 
-    assert ctx.runtime_secret_values == {hidden_url, hidden_token, visible_code}
-    assert ctx.model_hidden_values == {hidden_url, hidden_token}
+    assert ctx.runtime_secret_values == {hidden_url, hidden_token, hidden_two_line, visible_code}
+    assert ctx.model_hidden_values == {hidden_url, hidden_token, hidden_two_line}
 
 
 @pytest.mark.asyncio
@@ -10946,6 +11093,14 @@ _REPORT_LANDED = "Downloaded: report.csv (1.0 KB)"
         ("justification_hold_not_stacked", ["completed", "terminated"], [None, None], [0], []),
         ("no_verdict_turn_left", ["completed"], [None], [], []),
         ("read_raises", ["completed"], [None], [], []),
+        ("start_url_file_held", ["completed", "completed"], [_REPORT_LANDED, _REPORT_LANDED], [], [0]),
+        ("start_url_last_counted_turn", ["completed", "completed"], [_REPORT_LANDED, _REPORT_LANDED], [], [0]),
+        ("start_url_granted_final_turn", ["completed"], [_REPORT_LANDED], [], [0]),
+        ("start_url_unseen_refusal", ["completed", "completed"], [None, None], [], []),
+        ("start_url_unseen_then_unsaved", ["completed", "completed"], [None, None], [], []),
+        ("start_url_unseen_failed_verdict", ["failed"], [None], [], []),
+        ("start_url_unseen_limit_then_unsaved", ["completed", "completed", "completed"], [None, None, None], [1], []),
+        ("start_url_unseen_then_terminated", ["completed", "terminated"], [None, None], [], []),
     ],
 )
 async def test_a_completed_finish_with_no_file_and_unsaved_downloads_is_handed_back_once(
@@ -10962,31 +11117,73 @@ async def test_a_completed_finish_with_no_file_and_unsaved_downloads_is_handed_b
         reads.append(1)
         if case == "read_raises":
             raise RuntimeError("tally unavailable")
-        return {} if case == "nothing_unsaved" else {"capture_failed": 2}
+        return (
+            {}
+            if case in ("nothing_unsaved", "start_url_unseen_refusal", "start_url_unseen_failed_verdict")
+            else {"capture_failed": 2}
+        )
 
-    activity = None if case not in ("no_verdict_turn_left", "justification_hold_not_stacked") else ActivityRecency()
-    outcome, _ = await _run(
-        [[("finish", {"status": status, "reason": "the export finished"})] for status in statuses],
-        [
-            make_finish_tool(
-                download_settle=settle,
-                file_landed_hold=case != "hold_switched_off",
-                unsaved_downloads=unsaved_downloads,
-                activity=activity,
-                justify_stops=case == "justification_hold_not_stacked",
-            )
-        ],
-        **({"max_turns": 1} if case == "no_verdict_turn_left" else {}),
-        **({"activity": activity} if activity is not None else {}),
-    )
+    no_turn_left = case in ("no_verdict_turn_left", "start_url_last_counted_turn", "start_url_granted_final_turn")
+    # Turn 1 is spent on an observe, so the finish runs on the final turn the budget grants, with none after it.
+    final_turn = case == "start_url_granted_final_turn"
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    # A refusal recorded before the hand-off reaches no result when the agent's first call is finish; the watch
+    # reads it only when finish attaches it.
+    unseen_facts: DownloadFailureFacts | None = None
+    # The stacking row shows the failed save the unsaved-download hold would otherwise repeat.
+    reason = "capture_failed" if case == "start_url_unseen_then_unsaved" else "file_size_limit"
+    unseen_fact = f"Browser download not saved ({reason}): 1"
+    if case.startswith("start_url_unseen"):
+
+        async def attach() -> None:
+            assert unseen_facts is not None
+            unseen_facts.add(unseen_fact, repeat=True)
+
+        unseen_facts = DownloadFailureFacts(attach=attach)
+    justified = case in ("justification_hold_not_stacked", "start_url_unseen_then_terminated")
+    activity = None if not no_turn_left and not justified else ActivityRecency()
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            ([[("observe", {})]] if final_turn else [])
+            + [[("finish", {"status": status, "reason": "the export finished"})] for status in statuses],
+            [
+                *([_recording_tool("observe", observe_calls)] if final_turn else []),
+                make_finish_tool(
+                    download_settle=settle,
+                    file_landed_hold=case != "hold_switched_off",
+                    unsaved_downloads=unsaved_downloads,
+                    activity=activity,
+                    justify_stops=justified,
+                    hold_completed_on_landed_file=case.startswith("start_url"),
+                    download_facts=unseen_facts,
+                ),
+            ],
+            **({"max_turns": 1} if no_turn_left else {}),
+            **({"activity": activity} if activity is not None else {}),
+        )
 
     results = [str(m["content"]) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
     assert len(results) == len(statuses), results
-    assert outcome.status == statuses[-1]
+    unseen_held = [0] if unseen_facts is not None and statuses[0] == "completed" else []
+    held_classes = {
+        **dict.fromkeys(unsaved_held, "unsaved_download_hold"),
+        **dict.fromkeys(landed_held, "file_landed_hold"),
+        **dict.fromkeys(unseen_held, "unseen_download_facts_hold"),
+    }
+    assert _finish_error_classes(logs) == [held_classes.get(i) for i in range(len(statuses))]
+    # A start URL's file the agent was never shown cannot make the block completed; with no turn left the budget ends it.
+    assert outcome.status == ("budget_exhausted" if final_turn else statuses[-1])
     assert [i for i, result in enumerate(results) if "capture_failed: 2" in result] == unsaved_held
     assert [i for i, result in enumerate(results) if "these files landed" in result] == landed_held
     for index in unsaved_held:
         assert "no new file has landed" in results[index] and "retry it" in results[index]
+    if unseen_facts is not None and statuses[0] == "completed":
+        # A limit-only unseen hold leaves the unsaved-download hold for a later failed save; neither stacks a third.
+        # Held once for the unseen refusal, never again by the unsaved-download hold.
+        assert "were not shown to you yet" in results[0] and unseen_fact in results[0], results
+        assert "were not shown to you yet" not in results[1], results
+    if case == "start_url_unseen_failed_verdict":
+        assert "were not shown to you yet" not in results[0], results
     if case == "file_landed":
         assert reads == []
 
@@ -11091,8 +11288,10 @@ async def test_completion_gate_veto_refuses_the_finish_and_a_later_approved_fini
         [("click", {"selector": "#submit"})],
         [("finish", {"status": "completed", "reason": "submitted"})],
     ]
-    outcome, _ = await _run(script, tools, activity=activity, max_action_steps=5)
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity, max_action_steps=5)
 
+    assert _finish_error_classes(logs) == ["completion_gate_refusal", None]
     assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "submitted", True)
     assert click_calls == [("click", {"selector": "#submit"})]
     assert _gate_refusals(outcome) == 1
@@ -11117,7 +11316,7 @@ async def test_completion_gate_raise_ends_the_run_with_the_gates_reason(
         [[("finish", {"status": "completed", "reason": "done"})]], [make_finish_tool(completion_gate=gate)]
     )
 
-    assert outcome.status == status
+    assert (outcome.status, outcome.guard) == (status, "completion_gate")
     assert reason in outcome.reason
     assert not outcome.gate_passed
     assert outcome.model_status == "completed"
@@ -11629,113 +11828,6 @@ async def test_non_form_run_reads_false_on_the_partition_and_still_carries_canon
         assert key not in fields, (key, fields)
     # Load-bearing: the record has to carry the same-target churn, or it is an empty denominator.
     assert fields["peak_same_touches"] >= 4, fields
-
-
-@pytest.mark.asyncio
-async def test_telemetry_omits_the_ledger_fields_when_the_ledger_is_disabled() -> None:
-    # The partition must be TOTAL, not conditional on an unrelated flag. The canonical tracker is
-    # built and updated unconditionally, so its record does not depend on the ledger existing —
-    # gating it on `progress` would drop BOTH records whenever progress_window is None and silently
-    # restore the "floor, not prevalence" hole this record exists to close.
-    rounds = 4
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
-    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
-    script.append([("finish", {"status": "completed", "reason": "done"})])
-    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500, progress_window=None)
-
-    assert outcome.status == "completed"
-    assert outcome.telemetry is not None
-    fields = outcome.telemetry.log_fields()
-    assert fields["form_ever_armed"] is False
-    assert "would_fire" not in fields, fields
-
-
-@pytest.mark.asyncio
-async def test_telemetry_carries_the_ledger_fields_when_the_ledger_is_enabled() -> None:
-    # The other half of the partition, and the compatibility guarantee: the existing record's
-    # population is untouched, so run-level survival rates stay comparable across this change. Its
-    # field set is not — both records gained keys.
-    rounds = 10
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
-    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
-    script.append([("finish", {"status": "completed", "reason": "done"})])
-    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
-
-    assert outcome.status == "completed"
-    fields = outcome.telemetry.log_fields()
-    assert fields["form_ever_armed"] is True
-    assert "would_fire" in fields, fields
-
-
-@pytest.mark.asyncio
-async def test_telemetry_carries_a_count_for_every_clear_evidence_class_including_silent_ones() -> None:
-    # The clear reason was LOG.debug-only, which production INFO workers never emit, so the ring's
-    # clear behaviour was unmeasurable. Every class rides the terminal record with an explicit 0, so
-    # "never fired" cannot be read as "field missing", and a count survives every later clear.
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [
-        _form_observe("observe", [3, 3, 3]),
-        _billable_tool("click", clicks, data={"page_transitioned": True}),
-        make_finish_tool(),
-    ]
-    script: list[list[tuple[str, dict[str, Any]]]] = [
-        [("observe", {})],
-        [("observe", {})],
-        [("observe", {})],
-        [("click", {"selector": "#next"})],
-        [("finish", {"status": "completed", "reason": "done"})],
-    ]
-    outcome, _ = await _run(
-        script, tools, max_turns=200, max_tool_calls=500, semantic_commit_stats=SemanticCommitStats()
-    )
-
-    assert outcome.status == "completed"
-    record = outcome.telemetry.log_fields()
-    assert record["form_ever_armed"] is True
-    # Two observes landed distinct content digests, then a URL-moving click cleared on the
-    # transition: the earlier count must still be there after the later clear.
-    assert record["clear_perception_digest"] == 2, record
-    assert record["clear_page_transitioned"] == 1, record
-    fired = {_ProgressEvidence.PERCEPTION_DIGEST, _ProgressEvidence.PAGE_TRANSITIONED}
-    silent = {f"clear_{member.value}": 0 for member in _ProgressEvidence if member not in fired}
-    assert len(silent) == 7, silent
-    assert {key: record.get(key, "MISSING") for key in silent} == silent, record
-    # Both groups ride the same telemetry object, so moving either off it cannot stay green.
-    assert record["semantic_commit_opportunities"] == 0, record
-    assert record["semantic_commit_accepts"] == 0, record
-
-
-@pytest.mark.asyncio
-async def test_telemetry_reports_the_peak_page_state_stall_and_not_the_streak_recovery_erased() -> None:
-    # A run that stalls, recovers, then finishes leaves the live counter at 0, so a trailing read
-    # reports a frozen page as never having frozen. PAGE_STATE_STALL_TERMINATE_AFTER is tuned off
-    # this distribution, and a recovery-erased value biases it low, toward over-termination.
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    click = _recording_tool("click", clicks, billable=True)
-    fp_state = {"n": 0}
-
-    async def thawing_fingerprint() -> str:
-        fp_state["n"] += 1
-        # Two samples per round: frozen through round 4's after-sample (8 calls), moving after.
-        return "FROZEN" if fp_state["n"] <= 8 else f"dom-{fp_state['n']}"
-
-    script: list[list[tuple[str, dict[str, Any]]]] = [[("click", {"selector": f"#try-{i}"})] for i in range(7)]
-    script.append([("finish", {"status": "completed", "reason": "done"})])
-    outcome, _ = await _run(
-        script,
-        [click, make_finish_tool()],
-        page_fingerprint=thawing_fingerprint,
-        max_action_steps=24,
-        max_turns=60,
-        max_tool_calls=200,
-    )
-
-    assert outcome.status == "completed"
-    fields = outcome.telemetry.log_fields()
-    assert fields["form_ever_armed"] is False
-    assert fields["peak_page_state_stall_rounds"] == 4, fields
 
 
 @pytest.mark.asyncio
@@ -13777,17 +13869,35 @@ async def test_the_action_loop_verdict_never_lands_before_its_warning_was_delive
         # verdict landing at the 6th click is visible as a short count rather than hidden by a batch
         # that happened to end there anyway.
         [("click", {"selector": "#next"})] * 5,
+        [],
         [("finish", {"status": "completed"})],
     ]
     clicks: list[tuple[str, dict[str, Any]]] = []
     tools = [_billable_tool("click", clicks), make_finish_tool()]
+    # Request answers that arrive during the nudged batch, then during a turn with no tool call, still reach the model
+    # before its finish.
+    late = {3: "POST answered 422 after 0.4 s", 4: "POST answered 409 after 2.1 s"}
+    drains: list[int] = []
 
-    outcome, _ = await _run(
-        script, tools, max_turns=10, action_nudge_after=nudge_after, action_terminate_after=terminate_after
+    def late_request_lines() -> str | None:
+        drains.append(len(drains))
+        return late.get(len(drains))
+
+    outcome, caller = await _run(
+        script,
+        tools,
+        max_turns=10,
+        action_nudge_after=nudge_after,
+        action_terminate_after=terminate_after,
+        late_request_lines=late_request_lines,
     )
 
     assert outcome.guard != ACTION_LOOP_GUARD
     assert len(clicks) == 8
+    history = caller.message_history
+    # On messages of their own, which no read store entry can rebuild without them.
+    for line in late.values():
+        assert {"role": "user", "content": line} in history, history
 
 
 @pytest.mark.asyncio
@@ -14354,6 +14464,10 @@ def test_the_understood_tools_keep_their_existing_submit_verdicts() -> None:
     one name.
     """
     assert _may_submit("click", {}) is True
+    # download is a click for every guard except the failure-evidence one: it has already waited for its outcome.
+    assert _may_submit("download", {}) is True
+    assert _arms_failure_evidence("click", {}, True) is True
+    assert _arms_failure_evidence("download", {}, True) is False
     assert _may_submit("press_key", {"key": "Enter"}) is True
     assert _may_submit("type", {"text": "x", "press_enter": True}) is True
 
@@ -14428,7 +14542,7 @@ async def test_every_covered_row_carries_the_branch_the_control_count_and_the_la
     dropped and a probe that named the hit element itself, where there is nothing to dismiss."""
 
     async def covered(args: dict[str, Any]) -> ToolResult:
-        record_covered_layer("named", controls=0, layer_kind="hit_fallback")
+        record_covered_layer("named", controls=0, layer_kind="hit_fallback", after_wait=True)
         return ToolResult.error('#a is covered by "May"', error_class="covered")
 
     async def other_error(args: dict[str, Any]) -> ToolResult:
@@ -14451,6 +14565,7 @@ async def test_every_covered_row_carries_the_branch_the_control_count_and_the_la
     assert by_tool["click"]["covered_branch"] == "named"
     assert by_tool["click"]["covered_controls"] == 0
     assert by_tool["click"]["covered_layer_kind"] == "hit_fallback"
+    assert by_tool["click"]["covered_after_wait"] is True
     # A row that refused for another reason carries none of the three -- absent, not a fabricated
     # value: a groupBy on covered_branch must show the covered rows and nothing else.
     assert "covered_branch" not in by_tool["hover"]
@@ -14469,6 +14584,7 @@ async def test_every_covered_row_carries_the_branch_the_control_count_and_the_la
     rows = {e["tool"]: e for e in logs if e["event"] == "taskv3 tool call finished"}
     assert rows["click"]["covered_branch"] == "unnamed"
     assert rows["click"]["covered_layer_kind"] == "unnamed"
+    assert "covered_after_wait" not in rows["click"]
     assert "covered_branch" not in rows["hover"]
 
     # A covered refusal built somewhere other than the message helper records nothing, and must then
@@ -15157,6 +15273,38 @@ async def test_a_re_read_that_differs_only_by_a_download_failure_gets_the_marker
     assert reread.endswith(f"\n{failure}")
 
 
+@pytest.mark.asyncio
+async def test_request_record_lines_reach_the_model_without_becoming_page_content() -> None:
+    body = "<form #a>" + "y" * 2_000
+    line = "POST site.test/apply, sent while your click at turn 1 ran, answered 422 after 0.1 s."
+    results = [ToolResult.ok(body), ToolResult.ok(body, data={REQUEST_RECORD_DATA_KEY: line})]
+
+    # A read that raises after its record lines were built still delivers them.
+    async def get_html(_args: dict[str, Any]) -> ToolResult:
+        if not results:
+            set_request_record_on_error(line)
+            raise RuntimeError("page closed")
+        return results.pop(0)
+
+    reader = _get_html_tool()
+    reader.handler = get_html
+    script = [[("get_html", {"selector": "#a"})] for _ in range(3)]
+    script.append([("finish", {"status": "completed", "reason": "ok"})])
+    trail = ToolTrail()
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [reader, make_finish_tool()], tool_trail=trail, telemetry_salt=_SALT)
+
+    reread = _tool_contents(outcome, "get_html")[1]
+    assert reread.startswith("[get_html(selector=#a) returned the same "), reread[:120]
+    assert reread.endswith(f"\n{line}")
+    assert _tool_contents(outcome, "get_html")[2].endswith(f"\n{line}")
+    assert outcome.status == "completed"
+    records = [entry for entry in logs if entry["event"] == "taskv3 tool call finished" and entry["tool"] == "get_html"]
+    assert [entry["result_chars"] for entry in records][:2] == [len(body), len(body)]
+    assert records[0]["snapshot_digest"] == records[1]["snapshot_digest"]
+    assert [entry.content for entry in trail.entries] == [body, body, "tool_error: RuntimeError: page closed"]
+
+
 def test_perception_store_does_not_charge_the_unread_round() -> None:
     # SKY-16330. The prompt asks the model to batch, so one turn routinely lands several large reads.
     # Charging that unread round against the budget would let one batch evict every earlier read — and
@@ -15429,17 +15577,26 @@ async def test_navigation_guard_refuses_url_changing_tools_but_not_click(url_too
         [("click", {"selector": "#details"})],
         [("finish", {"status": "completed", "reason": "read"})],
     ]
+    # An answer that arrives while the loop refuses on its own, with no tool run to report it.
+    drains: list[int] = []
+
+    def late_request_lines() -> str | None:
+        drains.append(len(drains))
+        return "POST answered 422 after 0.4 s" if len(drains) == 2 else None
+
     with capture_logs() as logs:
-        outcome, caller = await _run(script, tools, refuse_navigation=refuse)
+        outcome, caller = await _run(script, tools, refuse_navigation=refuse, late_request_lines=late_request_lines)
 
     dispatched = [name for name, _ in calls]
     refusals = [e for e in logs if e["event"] == loop_module.VALIDATION_NAVIGATION_REFUSED_EVENT]
-    results = [m["content"].split(":")[0] for m in caller.message_history if m.get("role") == "tool"]
+    tool_messages = [m["content"] for m in caller.message_history if m.get("role") == "tool"]
+    results = [content.split(":")[0] for content in tool_messages]
     if refuse:
         assert dispatched == ["click"]
         assert [e["tool"] for e in refusals] == [url_tool]
         # The verdict batched behind the refused call was written as if it had landed.
         assert results[:2] == ["refused", "skipped"]
+        assert {"role": "user", "content": "POST answered 422 after 0.4 s"} in caller.message_history
         assert outcome.reason == "read"
     else:
         assert dispatched == [url_tool]
@@ -16515,11 +16672,13 @@ async def test_a_selected_candidate_that_fails_to_save_holds_the_finish(
     none = ("finish", {"status": "completed", "reason": "nothing to save", "accept_download_candidates": []})
     with patch.object(interceptor, "_atomically_write_bytes", side_effect=OSError("disk full")):
         # The first selection came before c1's facts were shown, so it holds; the next one fails to save.
-        outcome, _ = await _run(
-            [[accept], [accept], [none]],
-            [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
-        )
+        with capture_logs() as logs:
+            outcome, _ = await _run(
+                [[accept], [accept], [none]],
+                [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
+            )
 
+    assert _finish_error_classes(logs) == ["download_candidate_hold", "download_save_failed", None]
     finishes = _finish_contents(outcome)
     assert len(finishes) == 3, finishes
     assert "c1" in finishes[1] and "could not be saved" in finishes[1], finishes
@@ -16595,11 +16754,13 @@ async def test_selecting_a_candidate_the_block_no_longer_holds_does_not_complete
 
     stale = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c7"]})
     none = ("finish", {"status": "completed", "reason": "nothing to save", "accept_download_candidates": []})
-    outcome, _ = await _run(
-        [[stale], [none]],
-        [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
-    )
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            [[stale], [none]],
+            [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
+        )
 
+    assert _finish_error_classes(logs) == ["invalid_argument", None]
     finishes = _finish_contents(outcome)
     assert len(finishes) == 2 and "c7" in finishes[0], finishes
     assert outcome.reason == "nothing to save"
@@ -16624,6 +16785,7 @@ def _held_fact_count(outcome: Any, handle: str = "c1") -> int:
 @pytest.mark.parametrize("future_turns", [0, 1, 2], ids=["granted-final-turn", "one-turn-left", "two-turns-left"])
 @pytest.mark.parametrize("prefill", [{}, {"accept_download_candidates": []}], ids=["omitted", "empty"])
 @pytest.mark.parametrize("held", ["informed", "unseen", "arriving-in-settle"])
+@pytest.mark.parametrize("start_url", [False, True], ids=["page-download", "start-url-download"])
 @pytest.mark.asyncio
 async def test_a_held_candidate_is_held_once_while_a_verdict_turn_remains(
     tmp_path: Path,
@@ -16632,6 +16794,7 @@ async def test_a_held_candidate_is_held_once_while_a_verdict_turn_remains(
     prefill: dict[str, Any],
     future_turns: int,
     same_batch: bool,
+    start_url: bool,
 ) -> None:
     interceptor = _candidate_interceptor(tmp_path, monkeypatch)
     arriving = [held == "arriving-in-settle"]
@@ -16648,7 +16811,20 @@ async def test_a_held_candidate_is_held_once_while_a_verdict_turn_remains(
     facts = _candidate_facts(interceptor)
     if held == "informed":
         facts.mark_shown(list(interceptor.replay_candidates().values()))
-    finish = make_finish_tool(download_settle=settle, download_facts=facts, activity=activity)
+    if start_url:
+        # The watch's tally read adds each held candidate's fact once, as the start-URL hold's delivery sees it.
+        def refresh() -> None:
+            for fact in interceptor.replay_candidates().values():
+                facts.add(fact, repeat=False)
+
+        facts.refresh = refresh
+    finish = make_finish_tool(
+        download_settle=settle,
+        download_facts=facts,
+        activity=activity,
+        file_landed_hold=start_url,
+        hold_completed_on_landed_file=start_url,
+    )
     verdict = ("finish", {**_OMITTED[1], **prefill})
     script = [[("observe", {})], [verdict, verdict], [verdict]] if same_batch else _observe_then(verdict, verdict)
     tools = [_recording_tool("observe", []), finish]

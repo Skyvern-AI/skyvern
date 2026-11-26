@@ -1,6 +1,6 @@
 import { Status } from "@/api/types";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useLogging } from "@/hooks/useLogging";
@@ -10,6 +10,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
 import { generateClientId } from "@/routes/streaming/webSocketParams";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
+import { BrowserSessionConsole } from "@/routes/browserSessions/BrowserSessionConsole";
 import {
   StreamStatusPanel,
   type StreamDiagnostic,
@@ -77,6 +78,8 @@ interface Props {
   onStreamStateChange?: StreamStateChangeHandler;
   // Studio centers the frame; legacy keeps the zoomable image.
   centered?: boolean;
+  // Opt-in: the server still decides per org and role whether the console is available.
+  showConsole?: boolean;
 }
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
@@ -89,6 +92,7 @@ function WorkflowRunStream({
   onUrlChange,
   onStreamStateChange,
   centered,
+  showConsole = false,
 }: Props = {}) {
   // Held in a ref so a new callback identity doesn't reconnect the socket.
   const onUrlChangeRef = useRef(onUrlChange);
@@ -129,8 +133,17 @@ function WorkflowRunStream({
   // replacing it with a generic "closed with code 1000".
   const streamEndedDiagnosticRef = useRef<StreamDiagnostic | null>(null);
 
+  const [consoleOpen, setConsoleOpen] = useState(false);
+  const wasConsoleOpenRef = useRef(false);
+
+  const handleToggleConsole = useCallback(() => {
+    setConsoleOpen((wasOpen) => !wasOpen);
+  }, []);
+
+  const controllable = interactive || showControlButtons;
+
   const inputWsUrl =
-    interactive && workflowRunId
+    controllable && workflowRunId
       ? `${wssBaseUrl}/stream/cdp_input/workflow_run/${workflowRunId}`
       : null;
 
@@ -140,13 +153,30 @@ function WorkflowRunStream({
     inputReady,
     containerRef,
     handlers,
+    consoleAvailable,
+    evaluateExpression,
   } = useCdpInput({
     clientId,
     inputWsUrl,
-    interactive,
+    interactive: controllable,
     viewportWidth,
     viewportHeight,
+    onToggleConsole: showConsole ? handleToggleConsole : undefined,
   });
+
+  useEffect(() => {
+    if (!consoleAvailable || !showConsole) {
+      setConsoleOpen(false);
+    }
+  }, [consoleAvailable, showConsole]);
+
+  useEffect(() => {
+    const wasOpen = wasConsoleOpenRef.current;
+    wasConsoleOpenRef.current = consoleOpen;
+    if (wasOpen && !consoleOpen && userIsControlling) {
+      containerRef.current?.focus();
+    }
+  }, [consoleOpen, userIsControlling, containerRef]);
 
   useEffect(() => {
     if (!showStream) {
@@ -431,11 +461,11 @@ function WorkflowRunStream({
   }
 
   if (hasStream) {
-    return (
+    const streamView = (
       <InteractiveStreamView
         streamImgSrc={streamImgSrc}
         streamFormat={streamFormat}
-        interactive={interactive}
+        interactive={controllable}
         userIsControlling={userIsControlling}
         setUserIsControlling={setUserIsControlling}
         inputReady={inputReady}
@@ -444,6 +474,22 @@ function WorkflowRunStream({
         handlers={handlers}
         centered={centered}
       />
+    );
+    if (!showConsole) {
+      return streamView;
+    }
+    return (
+      <div className="flex h-full w-full flex-col">
+        <div className="min-h-0 w-full flex-1">{streamView}</div>
+        {consoleAvailable && (
+          <BrowserSessionConsole
+            canRun={userIsControlling}
+            onEvaluate={evaluateExpression}
+            open={consoleOpen}
+            onOpenChange={setConsoleOpen}
+          />
+        )}
+      </div>
     );
   }
 

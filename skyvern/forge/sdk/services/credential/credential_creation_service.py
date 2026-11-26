@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import functools
+from asyncio import CancelledError
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from skyvern.exceptions import HttpException as SkyvernHttpException
 from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event
+from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
+from skyvern.forge.sdk.db.id import generate_browser_profile_id
+from skyvern.forge.sdk.executor.async_executor import CredentialProfileCreation
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
@@ -30,6 +35,7 @@ from skyvern.forge.sdk.services.credential.credential_vault_service import Crede
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialConfigurationError
 from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 LOG = structlog.get_logger()
 
@@ -49,7 +55,7 @@ async def validate_credential_browser_profile_id(
     organization_id: str,
     current_credential_id: str | None = None,
 ) -> None:
-    """Only allow linking an unowned, unmanaged profile from the same organization."""
+    """Only allow linking an unmanaged profile from the same organization that no other credential links."""
     profile = await app.DATABASE.browser_sessions.get_browser_profile(
         profile_id=browser_profile_id, organization_id=organization_id
     )
@@ -57,7 +63,7 @@ async def validate_credential_browser_profile_id(
         raise HTTPException(
             status_code=400, detail=f"Browser profile not found, browser_profile_id={browser_profile_id}"
         )
-    if profile.is_managed or profile.workflow_permanent_id is not None:
+    if profile.is_managed:
         raise HTTPException(
             status_code=400,
             detail="A credential can only link a plain browser profile, not a workflow-managed one.",
@@ -131,6 +137,113 @@ async def get_credential_vault_service(
             # The vault service already reported this error; avoid double-counting it.
             raise HTTPException(status_code=400, detail=str(e)) from e
     return service
+
+
+async def delete_unlinked_temporary_test_login_credential(
+    credential_id: str, organization_id: str, *, reason: str
+) -> None:
+    credential = await app.DATABASE.credentials.claim_temporary_test_login_credential_for_deletion(
+        credential_id, organization_id
+    )
+    if credential is None:
+        return
+    vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
+    credential_service = await get_credential_vault_service(vault_type_override=vault_type)
+    await credential_service.delete_credential(credential)
+    LOG.info(
+        "Processed temporary credential cleanup",
+        credential_id=credential_id,
+        organization_id=organization_id,
+        reason=reason,
+    )
+
+
+async def save_new_credential_capture(
+    *,
+    storage: S3Storage,
+    creation: CredentialProfileCreation,
+    organization_id: str,
+    directory: str,
+    writer: str | None,
+    test_url: str,
+    require_encryption: bool = False,
+) -> None:
+    credential_id = creation.credential_id
+    credential = await app.DATABASE.credentials.get_credential(credential_id, organization_id)
+    if (
+        credential is None
+        or credential.browser_profile_id != creation.expected_browser_profile_id
+        or (
+            creation.expected_credential_modified_at is not None
+            and credential.modified_at != creation.expected_credential_modified_at
+        )
+    ):
+        return
+
+    profile_id = generate_browser_profile_id()
+    await storage.store_browser_profile(
+        organization_id, profile_id, directory, confirm_creation=True, require_encryption=require_encryption
+    )
+    rolled_back = False
+
+    def confirm_precommit_rollback() -> None:
+        nonlocal rolled_back
+        rolled_back = True
+
+    try:
+        published = await app.DATABASE.credentials.publish_credential_browser_profile(
+            app.DATABASE.browser_sessions,
+            credential_id=credential_id,
+            organization_id=organization_id,
+            expected_browser_profile_id=creation.expected_browser_profile_id,
+            expected_credential_modified_at=credential.modified_at,
+            profile_id=profile_id,
+            source_browser_type=writer,
+            test_url=test_url,
+            on_confirmed_precommit_failure=confirm_precommit_rollback,
+        )
+    except BaseException:
+        if rolled_back:
+            with suppress(Exception, CancelledError):
+                await storage.delete_browser_profile(organization_id, profile_id)
+        raise
+    if not published:
+        await storage.delete_browser_profile(organization_id, profile_id)
+        return
+    LOG.info("Saved new credential browser profile", credential_id=credential_id, browser_profile_id=profile_id)
+
+
+async def finalize_credential_profile_creation(
+    capture: BrowserArtifacts | None,
+    *,
+    creation: CredentialProfileCreation,
+    organization_id: str,
+    workflow_run_id: str,
+    test_url: str,
+) -> None:
+    storage = app.STORAGE
+    if (
+        capture is None
+        or not capture._credential_profile_writer
+        or not capture.browser_session_dir
+        or not isinstance(storage, S3Storage)
+    ):
+        return
+    try:
+        await save_new_credential_capture(
+            storage=storage,
+            creation=creation,
+            organization_id=organization_id,
+            directory=capture.browser_session_dir,
+            writer=capture._credential_profile_writer,
+            test_url=test_url,
+        )
+    except Exception:
+        LOG.exception(
+            "Failed to create browser profile from credential test",
+            credential_id=creation.credential_id,
+            workflow_run_id=workflow_run_id,
+        )
 
 
 async def prepare_credential_create(

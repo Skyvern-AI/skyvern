@@ -105,14 +105,35 @@ def test_workflow_status_formatter_reports_omitted_anchor_provenance_as_incomple
     assert "skyvern_workflow_status(run_id='wr_status', verbosity='full')" in marker["recovery_hint"]
 
 
-def test_workflow_formatter_handles_fastmcp_concise_shape_without_action() -> None:
+def _terminated_envelope_output() -> dict[str, Any]:
+    return {
+        **_nested_output()["collect_customer_data"],
+        "task_id": "tsk_terminated",
+        "status": "terminated",
+        "extracted_information": {"account_id": "acct_partial"},
+        "failure_reason": "The page stopped responding",
+    }
+
+
+@pytest.mark.parametrize(
+    ("outputs", "has_extracted_information"),
+    [
+        (_nested_output(), True),
+        ({"collect_customer_data": _terminated_envelope_output()}, False),
+        ({"each_row": [[{"loop_value": 0, "output_value": _terminated_envelope_output()}]]}, False),
+    ],
+    ids=["completed_payload", "terminated_envelope", "terminated_loop_iteration"],
+)
+def test_workflow_formatter_handles_fastmcp_concise_shape_without_action(
+    outputs: dict[str, Any], has_extracted_information: bool
+) -> None:
     response = {
         "ok": True,
         "data": {
             "run_id": "wr_fastmcp",
             "status": "completed",
             "workflow_id": "wpid_fastmcp",
-            "outputs": _nested_output(),
+            "outputs": outputs,
         },
     }
 
@@ -122,6 +143,7 @@ def test_workflow_formatter_handles_fastmcp_concise_shape_without_action() -> No
     assert result.value["data"]["workflow_id"] == "wpid_fastmcp"
     assert "outputs" not in result.value["data"]
     assert result.value["data"]["output_summary"]["artifact_id_count"] == 15
+    assert result.value["data"]["output_summary"]["has_extracted_information"] is has_extracted_information
     assert "wr_fastmcp" in result.value["_response_distillation"]["recovery_hint"]
 
 

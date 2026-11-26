@@ -17,7 +17,14 @@ from skyvern.forge.sdk.services.browser_session_artifacts import (
     browser_session_artifact_read_scope,
 )
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.services.request_reads import (
+    RunStatusLinks,
+    capture_run_status_links,
+    defer_file_link_issuance,
+    request_reads,
+    run_status_link_capture,
+)
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus, WorkflowRunWithWorkflowResponse
 from skyvern.forge.sdk.workflow.response_value_caps import (
     truncate_oversized_response_text,
     truncate_oversized_response_value,
@@ -51,6 +58,42 @@ Ts = TypeVarTuple("Ts")
 _IN_FLIGHT: dict[tuple[Hashable, ...], asyncio.Task[Any]] = {}
 
 
+async def build_workflow_and_run_from_workflow_run_id(
+    organization_id: str, workflow_run_id: str, cap_output_values: bool
+) -> WorkflowRunWithWorkflowResponse:
+    async with app.DATABASE.Session.reading():
+        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            filter_deleted=False,
+        )
+
+        workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            include_cost=True,
+            allow_deleted=True,
+            cap_output_values=cap_output_values,
+        )
+
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
+        runnable_id=workflow_run_id,
+        organization_id=organization_id,
+    )
+    workflow_run_status_api_response = workflow_run_status_response.model_dump(by_alias=True)
+    browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
+    workflow_run_status_api_response["browser_session_id"] = browser_session_id or workflow_run_status_api_response.get(
+        "browser_session_id"
+    )
+
+    workflow_run_status_api_response["workflow"] = workflow
+
+    response = WorkflowRunWithWorkflowResponse.model_validate(workflow_run_status_api_response)
+
+    return response
+
+
 async def coalesce_in_flight(build: Callable[[*Ts], Coroutine[Any, Any, T]], *args: *Ts) -> T:
     """Overlapping calls of one build with equal arguments await a single run of it, and a finished result is never
     reused. A caller that joins an in-flight build can get a result older than its own request."""
@@ -58,10 +101,21 @@ async def coalesce_in_flight(build: Callable[[*Ts], Coroutine[Any, Any, T]], *ar
     key = (build, browser_session_artifact_read_scope(), *args)
     task = _IN_FLIGHT.get(key)
     if task is None or task.done():
-        task = asyncio.create_task(build(*args))
+
+        async def build_with_status_links() -> tuple[T, RunStatusLinks | None]:
+            # create_task copies the creator's context. Only the individual waiters own collectors.
+            token = request_reads.set(None)
+            try:
+                with capture_run_status_links() as capture, defer_file_link_issuance():
+                    result = await build(*args)
+                return result, capture.links
+            finally:
+                request_reads.reset(token)
+
+        task = asyncio.create_task(build_with_status_links())
         _IN_FLIGHT[key] = task
 
-        def _forget(done: asyncio.Task[T]) -> None:
+        def _forget(done: asyncio.Task[tuple[T, RunStatusLinks | None]]) -> None:
             if _IN_FLIGHT.get(key) is done:
                 del _IN_FLIGHT[key]
             if not done.cancelled():
@@ -70,15 +124,24 @@ async def coalesce_in_flight(build: Callable[[*Ts], Coroutine[Any, Any, T]], *ar
 
         task.add_done_callback(_forget)
     # Shielded so one poller disconnecting does not cancel the build the other pollers are waiting on.
-    return await asyncio.shield(task)
+    result, links = await asyncio.shield(task)
+    capture = run_status_link_capture.get()
+    if capture is not None:
+        capture.links = links
+    return result
 
 
 async def get_run_response_coalesced(run_id: str, organization_id: str, cap_output_values: bool) -> RunResponse | None:
-    return await coalesce_in_flight(get_run_response, run_id, organization_id, cap_output_values)
+    # Unified GET omits the console log and task final screenshot URL. Workflow-backed screenshots are built separately.
+    return await coalesce_in_flight(get_run_response, run_id, organization_id, cap_output_values, False, False)
 
 
 async def get_run_response(
-    run_id: str, organization_id: str | None = None, cap_output_values: bool = False
+    run_id: str,
+    organization_id: str | None = None,
+    cap_output_values: bool = False,
+    need_browser_log: bool = True,
+    need_final_screenshot: bool = True,
 ) -> RunResponse | None:
     # Task responses are built outside this scope because they read storage between queries, which would hold its
     # connection; the workflow status build hands the connection back before its own storage reads.
@@ -109,7 +172,10 @@ async def get_run_response(
         # fetch task v1 from db and transform to task run response
         try:
             task_v1_response = await task_v1_service.get_task_v1_response(
-                task_id=run.run_id, organization_id=organization_id
+                task_id=run.run_id,
+                organization_id=organization_id,
+                need_browser_log=need_browser_log,
+                need_final_screenshot=need_final_screenshot,
             )
         except TaskNotFound:
             return None
@@ -149,6 +215,7 @@ async def get_run_response(
             downloaded_files=task_v1_response.downloaded_files,
             run_request=TaskRunRequest(
                 engine=run_engine,
+                otp_request_id=task_v1_response.request.otp_request_id,
                 # An extraction-only task has no navigation goal, so resolve the prompt the same
                 # way the agent resolves its first-turn goal instead of failing validation.
                 prompt=task_v1_response.request.navigation_goal or task_v1_response.request.data_extraction_goal or "",

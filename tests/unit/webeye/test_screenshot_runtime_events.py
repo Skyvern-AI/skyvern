@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import functools
-import time
 from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
@@ -30,6 +29,7 @@ from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 from tests.unit.conftest import DriverReplyProbe, settle_or_fail, stalling_async_mock
 from tests.unit.forge_log_capture import capture_runtime_logs
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 @pytest.fixture(autouse=True)
@@ -454,9 +454,26 @@ def _viewport_capture(png: bytes, *, frames: int, then: Callable[..., Any]) -> C
     return screenshot
 
 
-def _stall(entered: asyncio.Event) -> Callable[..., Any]:
+def _controlled_capture_timeout(monkeypatch: pytest.MonkeyPatch) -> asyncio.Timeout:
+    # Use the real capture timeout, but leave it disarmed until the scripted viewport reaches the target.
+    deadline = asyncio.timeout(None)
+    monkeypatch.setattr(page_module, "asyncio", ScopedAsyncio(timeout_at=lambda _: deadline))
+
+    async def capture_viewport(page: Page, full_page: bool, **kwargs: Any) -> bytes:
+        if full_page:
+            pytest.fail("Unexpected full-page fallback before the scripted viewport")
+        return await page.screenshot(full_page=full_page)
+
+    # Keep the outer deadline and viewport result/error mapping. Bypass the driver's separate per-frame clock.
+    monkeypatch.setattr(page_module, "_page_screenshot_helper", capture_viewport)
+    return deadline
+
+
+def _stall(entered: asyncio.Event, *, deadline: asyncio.Timeout | None = None) -> Callable[..., Any]:
     async def stall(**kwargs: Any) -> bytes:
         entered.set()
+        if deadline is not None:
+            deadline.reschedule(asyncio.get_running_loop().time())
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
@@ -470,9 +487,10 @@ async def test_post_action_screenshot_keeps_captured_viewports_at_its_own_deadli
 ) -> None:
     frame = await SkyvernFrame.create_instance(page)
     frame.scroll_to_next_page.side_effect = [30, 60, 90]
+    deadline = _controlled_capture_timeout(monkeypatch)
     entered = asyncio.Event()
     page.screenshot.side_effect = _viewport_capture(
-        page.screenshot.return_value, frames=frames_before_stall, then=_stall(entered)
+        page.screenshot.return_value, frames=frames_before_stall, then=_stall(entered, deadline=deadline)
     )
     monkeypatch.setattr(
         SkyvernFrame,
@@ -484,6 +502,7 @@ async def test_post_action_screenshot_keeps_captured_viewports_at_its_own_deadli
     with capture_logs() as logs:
         png = await state.take_post_action_screenshot(scrolling_number=3)
     assert entered.is_set()
+    assert deadline.expired()
     with Image.open(BytesIO(png)) as image:
         assert image.size == (80, 60 + 30 * (frames_before_stall - 1))
     [partial] = [entry for entry in logs if entry.get("incomplete_reason") == "capture_timeout"]
@@ -516,8 +535,9 @@ async def test_post_action_timeout_keeps_the_prefix_before_an_unsafe_seam(
     frame = await SkyvernFrame.create_instance(page)
     frame.scroll_to_next_page.side_effect = [40, third_position, 400]
     frames = iter([_solid_png(_RED), _solid_png(_GREEN), third_frame])
+    deadline = _controlled_capture_timeout(monkeypatch)
     entered = asyncio.Event()
-    stall = _stall(entered)
+    stall = _stall(entered, deadline=deadline)
 
     async def screenshot(**kwargs: Any) -> bytes:
         return next(frames, None) or await stall(**kwargs)
@@ -533,6 +553,7 @@ async def test_post_action_timeout_keeps_the_prefix_before_an_unsafe_seam(
     with capture_logs() as logs:
         png = await state.take_post_action_screenshot(scrolling_number=4)
     assert entered.is_set()
+    assert deadline.expired()
     with Image.open(BytesIO(png)) as image:
         rgb = image.convert("RGB")
     assert rgb.size == (80, 100)
@@ -550,12 +571,14 @@ async def test_post_action_timeout_keeps_the_prefix_before_an_unsafe_seam(
     [pytest.param(b"not-a-png", id="unreadable"), pytest.param(_solid_png(_BLUE)[:60], id="truncated")],
 )
 async def test_post_action_timeout_with_a_corrupt_later_frame_still_raises(
-    page: MagicMock, corrupt_frame: bytes
+    page: MagicMock, monkeypatch: pytest.MonkeyPatch, corrupt_frame: bytes
 ) -> None:
     frame = await SkyvernFrame.create_instance(page)
     frame.scroll_to_next_page.side_effect = [40, 5, 400]
     frames = iter([_solid_png(_RED), _solid_png(_GREEN), corrupt_frame])
-    stall = _stall(asyncio.Event())
+    deadline = _controlled_capture_timeout(monkeypatch)
+    entered = asyncio.Event()
+    stall = _stall(entered, deadline=deadline)
 
     async def screenshot(**kwargs: Any) -> bytes:
         return next(frames, None) or await stall(**kwargs)
@@ -565,22 +588,28 @@ async def test_post_action_timeout_with_a_corrupt_later_frame_still_raises(
         await SkyvernFrame.take_scrolling_screenshot(
             page, mode=ScreenshotMode.LITE, scrolling_number=4, timeout=150, keep_partial_on_timeout=True
         )
+    assert entered.is_set()
+    assert deadline.expired()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("keep_partial,frames", [(False, 2), (True, 0)])
 async def test_default_and_frameless_scrolling_screenshot_timeouts_still_raise(
-    page: MagicMock, keep_partial: bool, frames: int
+    page: MagicMock, monkeypatch: pytest.MonkeyPatch, keep_partial: bool, frames: int
 ) -> None:
     frame = await SkyvernFrame.create_instance(page)
     frame.scroll_to_next_page.side_effect = [30, 60, 90]
+    deadline = _controlled_capture_timeout(monkeypatch)
+    entered = asyncio.Event()
     page.screenshot.side_effect = _viewport_capture(
-        page.screenshot.return_value, frames=frames, then=_stall(asyncio.Event())
+        page.screenshot.return_value, frames=frames, then=_stall(entered, deadline=deadline)
     )
     with pytest.raises(TimeoutError):
         await SkyvernFrame.take_scrolling_screenshot(
             page, mode=ScreenshotMode.LITE, scrolling_number=3, timeout=100, keep_partial_on_timeout=keep_partial
         )
+    assert entered.is_set()
+    assert deadline.expired()
 
 
 @pytest.mark.asyncio
@@ -598,24 +627,24 @@ async def test_complete_capture_is_unchanged_when_keeping_partials(page: MagicMo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stop", ["external_cancel", "deadline_cancel_collision", "caller_deadline"])
-async def test_foreign_cancellation_never_becomes_a_partial_screenshot(page: MagicMock, stop: str) -> None:
+async def test_foreign_cancellation_never_becomes_a_partial_screenshot(
+    page: MagicMock, monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
     frame = await SkyvernFrame.create_instance(page)
     frame.scroll_to_next_page.side_effect = [30, 60, 90]
+    deadline = _controlled_capture_timeout(monkeypatch)
     entered = asyncio.Event()
     png = page.screenshot.return_value
-    capturing: list[asyncio.Task[bytes]] = []
-    if stop == "deadline_cancel_collision":
 
-        async def collide(**kwargs: Any) -> bytes:
-            # Block past the own deadline without yielding, then cancel the capture the way a foreign
-            # canceller does: both land together.
-            time.sleep(0.06)
-            capturing[0].cancel()
-            return await _stall(entered)(**kwargs)
+    async def collide(**kwargs: Any) -> bytes:
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        assert task is not None
+        # Queue both cancellations before the capture resumes from the stalled second viewport.
+        deadline.reschedule(loop.time())
+        loop.call_soon(task.cancel)
+        return await _stall(entered)(**kwargs)
 
-        page.screenshot.side_effect = _viewport_capture(png, frames=1, then=collide)
-    else:
-        page.screenshot.side_effect = _viewport_capture(png, frames=1, then=_stall(entered))
     capture = functools.partial(
         SkyvernFrame.take_scrolling_screenshot,
         page,
@@ -625,38 +654,51 @@ async def test_foreign_cancellation_never_becomes_a_partial_screenshot(page: Mag
     )
     if stop == "caller_deadline":
         with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.05):
+            async with asyncio.timeout(None) as caller_deadline:
+                page.screenshot.side_effect = _viewport_capture(
+                    png, frames=1, then=_stall(entered, deadline=caller_deadline)
+                )
                 await capture(timeout=5000)
+        assert caller_deadline.expired()
     else:
+        then = collide if stop == "deadline_cancel_collision" else _stall(entered)
+        page.screenshot.side_effect = _viewport_capture(png, frames=1, then=then)
         task = asyncio.create_task(capture(timeout=20 if stop == "deadline_cancel_collision" else 5000))
-        capturing.append(task)
         await asyncio.wait_for(entered.wait(), timeout=2)
         if stop == "external_cancel":
             task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=2)
     assert entered.is_set()
+    assert deadline.expired() == (stop == "deadline_cancel_collision")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["target_closed", "malformed_frame"])
-async def test_keeping_partials_preserves_target_closed_and_stitch_failures(page: MagicMock, failure: str) -> None:
+async def test_keeping_partials_preserves_target_closed_and_stitch_failures(
+    page: MagicMock, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
     frame = await SkyvernFrame.create_instance(page)
     frame.scroll_to_next_page.side_effect = [30, 60, 90]
+    deadline = _controlled_capture_timeout(monkeypatch)
+    entered = asyncio.Event()
     if failure == "target_closed":
 
         async def closed(**kwargs: Any) -> bytes:
+            entered.set()
             raise PlaywrightError("Target page, context or browser has been closed")
 
         page.screenshot.side_effect = _viewport_capture(page.screenshot.return_value, frames=1, then=closed)
         expected: type[Exception] = ScreenshotTargetClosed
     else:
-        page.screenshot.side_effect = _viewport_capture(b"not-a-png", frames=1, then=_stall(asyncio.Event()))
+        page.screenshot.side_effect = _viewport_capture(b"not-a-png", frames=1, then=_stall(entered, deadline=deadline))
         expected = TimeoutError
     with pytest.raises(expected):
         await SkyvernFrame.take_scrolling_screenshot(
             page, mode=ScreenshotMode.LITE, scrolling_number=3, timeout=150, keep_partial_on_timeout=True
         )
+    assert entered.is_set()
+    assert deadline.expired() == (failure == "malformed_frame")
 
 
 @pytest.mark.asyncio

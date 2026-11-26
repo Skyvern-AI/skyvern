@@ -5,7 +5,7 @@ const defaultWorkflowRequest: WorkflowCreateYAMLRequest = {
   description: "",
   ai_fallback: true,
   code_version: 2,
-  mask_secrets: false,
+  mask_secrets: true,
   run_with: "agent",
   workflow_definition: {
     version: 2,

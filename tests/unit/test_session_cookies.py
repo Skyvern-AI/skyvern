@@ -92,10 +92,26 @@ async def test_persist_cleans_tmp_on_replace_failure(tmp_path: Path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_restore_sanitizes_keys_and_filters_session_only(tmp_path: Path) -> None:
-    _sidecar(tmp_path).write_text(json.dumps([{**_SESSION, "partitionKey": "drop"}, _PERSISTENT]))
-    fake = FakeContext()
-    await restore_session_cookies(_ctx(fake), str(tmp_path))
+@pytest.mark.parametrize("mode", ["batch", "legacy-fallback", "encrypted-strict"])
+async def test_restore_sanitizes_keys_and_filters_session_only(tmp_path: Path, mode: str) -> None:
+    rejected = {**_SESSION, "name": "rejected"}
+    cookies = [{**_SESSION, "partitionKey": "drop"}, _PERSISTENT]
+    if mode != "batch":
+        cookies.append(rejected)
+    _sidecar(tmp_path).write_text(json.dumps(cookies))
+
+    class PartialBrowser(FakeContext):
+        async def add_cookies(self, items: list[dict]) -> None:
+            if any(cookie["name"] == "rejected" for cookie in items):
+                raise ValueError("unsupported cookie")
+            await super().add_cookies(items)
+
+    fake = PartialBrowser()
+    if mode == "encrypted-strict":
+        with pytest.raises(RuntimeError, match="Could not restore all profile session cookies"):
+            await restore_session_cookies(_ctx(fake), str(tmp_path), strict=True)
+    else:
+        await restore_session_cookies(_ctx(fake), str(tmp_path))
     assert len(fake.added) == 1
     assert [c["name"] for c in fake.added[0]] == ["sess"]
     assert "partitionKey" not in fake.added[0][0]

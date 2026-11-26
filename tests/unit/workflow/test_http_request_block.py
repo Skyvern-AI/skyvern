@@ -9,10 +9,16 @@ from urllib.parse import urljoin
 import aiohttp
 import pytest
 from aiohttp import web
+from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
+from skyvern.forge import app
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.core import aiohttp_helper
 from skyvern.forge.sdk.credential_site_policy import LoginSite
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import (
@@ -22,7 +28,8 @@ from skyvern.forge.sdk.workflow.models.block import (
     _secret_path_suffix,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.schemas.workflows import BlockStatus, HttpRequestBlockYAML
+from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
+from skyvern.schemas.workflows import BlockResult, BlockStatus, HttpRequestBlockYAML
 
 
 def _make_context(
@@ -533,16 +540,6 @@ class TestHttpRequestBlockYAMLValidation:
                 secret_response_paths=["data.token"],
             )
 
-    def test_allows_save_response_as_file_without_secret_response_paths(self) -> None:
-        block = HttpRequestBlockYAML(
-            label="http",
-            url="https://example.com/api",
-            save_response_as_file=True,
-        )
-
-        assert block.save_response_as_file is True
-        assert block.secret_response_paths is None
-
     def test_allows_secret_response_paths_without_save_response_as_file(self) -> None:
         block = HttpRequestBlockYAML(
             label="http",
@@ -774,6 +771,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
 
         assert result.success is True
         assert sent["data"] == {"order": "sku-2590"}
+        assert sent["use_controlled_egress"] is True
 
     @pytest.mark.asyncio
     async def test_execute_sends_a_request_that_merely_contains_the_username_text(
@@ -939,6 +937,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
 
         monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
         monkeypatch.setattr(block_module, "download_file", fake_download_file)
+        monkeypatch.setattr(block_module, "aiohttp_request", AsyncMock(return_value=(200, {}, {})))
         monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
 
         await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
@@ -969,6 +968,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
 
         monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
         monkeypatch.setattr(block_module, "download_file", fake_download_file)
+        monkeypatch.setattr(block_module, "aiohttp_request", AsyncMock(return_value=(200, {}, {})))
         monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
 
         result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
@@ -998,6 +998,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
 
         monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
         monkeypatch.setattr(block_module, "download_file", fake_download_file)
+        monkeypatch.setattr(block_module, "aiohttp_request", AsyncMock(return_value=(200, {}, {})))
         monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
 
         await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
@@ -1077,6 +1078,16 @@ class TestHttpRequestBlockCredentialSiteConfinement:
         monkeypatch.setattr(aiohttp_helper, "validate_and_pin_fetch_url", unpinned_fetch)
         monkeypatch.setattr(aiohttp_helper, "validate_and_pin_redirect_url", unpinned_redirect)
         monkeypatch.setattr(aiohttp_helper, "ssrf_guarded_tcp_connector", lambda *_a, **_k: aiohttp.TCPConnector())
+        monkeypatch.setattr(
+            aiohttp_helper.SSRFGuardedResolver,
+            "pinned_ips_for_url",
+            lambda _self, _url: ("127.0.0.1",),
+        )
+        monkeypatch.setattr(
+            aiohttp_helper.app.AGENT_FUNCTION,
+            "relay_http_request_hop",
+            AsyncMock(return_value=None),
+        )
         context = _context_with_credential(f"http://127.0.0.1:{port}/login")
         monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
         monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
@@ -1300,3 +1311,48 @@ class TestHttpRequestBlockLocalFileScope:
         assert result.success is False
         assert "No permission to access local file" in (result.failure_reason or "")
         assert sent == {}
+
+
+@pytest.mark.asyncio
+async def test_a_saved_response_is_a_run_file_when_the_block_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine
+) -> None:
+    database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
+    block = block_yaml_to_block(
+        HttpRequestBlockYAML(
+            label="http", method="GET", url="https://download.example.test/eeprom.bin", save_response_as_file=True
+        ),
+        {"http_output": _output_parameter()},
+    )
+    assert isinstance(block, HttpRequestBlock)
+
+    async def fake_download_file(_url: str, *, output_dir: str, **_kwargs: object) -> str:
+        path = Path(output_dir) / "eeprom.bin"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(bytes(range(256)))
+        return str(path)
+
+    async def fake_build_block_result(self: HttpRequestBlock, **kwargs: object) -> BlockResult:
+        kwargs.pop("organization_id", None)
+        return BlockResult(output_parameter=self.output_parameter, **kwargs)
+
+    monkeypatch.setattr(block_module.settings, "DOWNLOAD_PATH", str(tmp_path / "downloads"))
+    context = _make_context()
+    context.organization_id = "o_1"
+    monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _run_id: context)
+    monkeypatch.setattr(HttpRequestBlock, "record_output_parameter_value", AsyncMock())
+    monkeypatch.setattr(HttpRequestBlock, "build_block_result", fake_build_block_result)
+    monkeypatch.setattr(block_module, "download_file", fake_download_file)
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", ArtifactManager())
+    monkeypatch.setattr(app, "STORAGE", LocalStorage(str(tmp_path / "artifacts")))
+
+    result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1", organization_id="o_1")
+
+    rows = await database.artifacts.list_artifacts_for_run_by_type(
+        run_id="wr-1", organization_id="o_1", artifact_type=ArtifactType.DOWNLOAD
+    )
+    assert result.success is True
+    assert result.output_parameter_value["file_name"] == "eeprom.bin"
+    assert result.output_parameter_value["run_file"] == "eeprom.bin"
+    assert [Path(row.uri).name for row in rows] == ["eeprom.bin"]

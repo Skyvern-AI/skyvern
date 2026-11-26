@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -21,6 +23,28 @@ _RECONNECT_SCOPE_CODE = "reconnect_required"
 
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _DEFAULT_BACKOFF_SECONDS = 1.0
+
+# httpx pools connections on the event loop that opened them, so each loop keeps its own client.
+_CLIENTS_BY_LOOP: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = weakref.WeakKeyDictionary()
+_CLIENTS_BY_LOOP_LOCK = threading.Lock()
+
+
+def _shared_client() -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    with _CLIENTS_BY_LOOP_LOCK:
+        client = _CLIENTS_BY_LOOP.get(loop)
+        if client is None or client.is_closed:
+            for closed_loop in [known for known in _CLIENTS_BY_LOOP if known.is_closed()]:
+                del _CLIENTS_BY_LOOP[closed_loop]
+            client = httpx.AsyncClient(timeout=settings.GOOGLE_SHEETS_API_TIMEOUT_SECONDS)
+            _CLIENTS_BY_LOOP[loop] = client
+        return client
+
+
+def reset_shared_clients() -> None:
+    """Forget every loop's client so the next request builds one from the current ``httpx.AsyncClient``."""
+    with _CLIENTS_BY_LOOP_LOCK:
+        _CLIENTS_BY_LOOP.clear()
 
 
 def _compute_backoff(attempt: int, retry_after: str | None) -> float:
@@ -60,29 +84,36 @@ async def _request_with_retry(
     """
     last_response: httpx.Response | None = None
     max_attempts = max(1, settings.GOOGLE_SHEETS_API_MAX_RETRIES)
-    async with httpx.AsyncClient(timeout=settings.GOOGLE_SHEETS_API_TIMEOUT_SECONDS) as client:
-        for attempt in range(1, max_attempts + 1):
-            try:
-                response = await client.request(method, url, params=params, json=json_body, headers=headers)
-            except (httpx.TransportError, httpx.TimeoutException) as exc:
-                # Non-idempotent + transport failure: ambiguous (request may have landed),
-                # so surface immediately instead of replaying the mutation.
-                if not idempotent or attempt == max_attempts:
-                    raise GoogleSheetsAPIError(
-                        status=503,
-                        code="upstream_unavailable",
-                        message=f"Google Sheets transport failure: {exc}",
-                    ) from exc
-                await asyncio.sleep(_compute_backoff(attempt, None))
-                continue
-            if response.status_code not in _RETRYABLE_STATUSES:
-                return response
-            if not idempotent:
-                return response
-            last_response = response
-            if attempt == max_attempts:
-                break
-            await asyncio.sleep(_compute_backoff(attempt, response.headers.get("Retry-After")))
+    client = _shared_client()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = await client.request(
+                method,
+                url,
+                params=params,
+                json=json_body,
+                headers=headers,
+                timeout=settings.GOOGLE_SHEETS_API_TIMEOUT_SECONDS,
+            )
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            # Non-idempotent + transport failure: ambiguous (request may have landed),
+            # so surface immediately instead of replaying the mutation.
+            if not idempotent or attempt == max_attempts:
+                raise GoogleSheetsAPIError(
+                    status=503,
+                    code="upstream_unavailable",
+                    message=f"Google Sheets transport failure: {exc}",
+                ) from exc
+            await asyncio.sleep(_compute_backoff(attempt, None))
+            continue
+        if response.status_code not in _RETRYABLE_STATUSES:
+            return response
+        if not idempotent:
+            return response
+        last_response = response
+        if attempt == max_attempts:
+            break
+        await asyncio.sleep(_compute_backoff(attempt, response.headers.get("Retry-After")))
     if last_response is None:
         raise RuntimeError("retry loop exited without a response")
     return last_response
@@ -100,6 +131,7 @@ class SpreadsheetSummary:
 class PagedSpreadsheets:
     spreadsheets: list[SpreadsheetSummary] = field(default_factory=list)
     next_page_token: str | None = None
+    incomplete_search: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +215,7 @@ async def list_spreadsheets(
     query: str | None = None,
     page_token: str | None = None,
     page_size: int = 25,
+    search_all_drives: bool = False,
 ) -> PagedSpreadsheets:
     """List spreadsheets via Drive v3 files.list, filtered to Google Sheets MIME."""
     params: dict[str, Any] = {
@@ -197,6 +230,10 @@ async def list_spreadsheets(
         "supportsAllDrives": "true",
         "includeItemsFromAllDrives": "true",
     }
+    if search_all_drives:
+        # The default corpora=user only returns shared-drive files the user has already opened.
+        params["corpora"] = "allDrives"
+        params["fields"] = "nextPageToken,incompleteSearch,files(id,name,modifiedTime,webViewLink)"
     if page_token:
         params["pageToken"] = page_token
 
@@ -221,6 +258,7 @@ async def list_spreadsheets(
             if item.get("id")
         ],
         next_page_token=payload.get("nextPageToken"),
+        incomplete_search=search_all_drives and payload.get("incompleteSearch") is True,
     )
 
 

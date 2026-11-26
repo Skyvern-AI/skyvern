@@ -55,9 +55,12 @@ from skyvern.forge.sdk.api.files import (
     discard_temp_working_dir,
     get_current_run_dir,
     get_download_dir,
+    is_temp_working_dir,
     make_run_temp_directory,
     resolve_run_download_id,
 )
+from skyvern.forge.sdk.artifact.storage.base import BrowserProfileSnapshot
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_get_json
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
@@ -101,6 +104,7 @@ from skyvern.webeye.native_downloads import (
     NativeDownloads,
 )
 from skyvern.webeye.playwright_input import register_playwright_input_context
+from skyvern.webeye.profile_cookie_merge import clear_banked_cookies
 from skyvern.webeye.profile_download_state import strip_download_history_state
 from skyvern.webeye.session_cookies import (
     restore_banked_cookies,
@@ -297,8 +301,11 @@ async def _capture_seed_profile_state(
         return
     try:
         cookies = await browser_context.cookies()
-        etag = await app.STORAGE.get_browser_profile_etag(organization_id, browser_profile_id)
-        browser_artifacts.record_seed_profile_state([dict(cookie) for cookie in cookies], etag)
+        browser_artifacts.record_seed_profile_state(
+            [dict(cookie) for cookie in cookies], browser_artifacts._seed_profile_etag
+        )
+        if browser_artifacts._seed_profile_encrypted and browser_artifacts._seed_profile_etag is None:
+            browser_artifacts.mark_seed_capture_failed()
     except Exception:
         LOG.warning("Failed to capture seed profile state for the write-back freshness guard", exc_info=True)
         browser_artifacts.mark_seed_capture_failed()
@@ -863,8 +870,10 @@ class BrowserContextFactory:
         # Inside a run, its recordings and HAR go in <root>/<org>/<run>, which the run's teardown deletes.
         today = datetime.utcnow().strftime("%Y-%m-%d")
         video_dir = get_current_run_dir(settings.VIDEO_PATH) or f"{settings.VIDEO_PATH}/{today}"
-        har_folder = get_current_run_dir(settings.HAR_PATH) or f"{settings.HAR_PATH}/{today}"
-        har_dir = f"{har_folder}/{BrowserContextFactory.get_subdir()}.har"
+        har_dir: str | None = None
+        if settings.BROWSER_HAR_RECORDING_ENABLED:
+            har_folder = get_current_run_dir(settings.HAR_PATH) or f"{settings.HAR_PATH}/{today}"
+            har_dir = f"{har_folder}/{BrowserContextFactory.get_subdir()}.har"
 
         extension_paths = []
         if settings.EXTENSIONS and settings.EXTENSIONS_BASE_PATH:
@@ -952,13 +961,29 @@ class BrowserContextFactory:
         browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
         cleanup_func: BrowserCleanupFunc = None
+        local_profile_copy: str | None = None
+        relaunch = cast(BrowserArtifacts | None, kwargs.get("_relaunch_profile"))
         started_display_recorder = None
+        requested_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
+        profile_org_id = cast(str | None, kwargs.get("organization_id"))
+        profile_read_only = bool(kwargs.get("profile_read_only"))
+        workflow_run_id = cast(str | None, kwargs.get("workflow_run_id"))
+        workflow_owns_save = bool(workflow_run_id)
+        session_owns_save = bool(kwargs.get("browser_session_id"))
         browser_internal_headers, scoped_headers = _partition_browser_headers(kwargs.get("extra_http_headers"))
         creator_kwargs = {**kwargs, "extra_http_headers": browser_internal_headers}
         try:
             creator = cls._creators.get(browser_type)
             if not creator:
                 raise UnknownBrowserType(browser_type)
+            local_storage = None
+            if (
+                requested_profile_id
+                and profile_org_id
+                and not kwargs.get("browser_address")
+                and isinstance(app.STORAGE, LocalStorage)
+            ):
+                local_storage = app.STORAGE
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **creator_kwargs)
             # The creator acquired the whole-display recorder before creating the context
             # (prepare_local_display_recording) and stashed the acquisition. Register a NEWLY-started recorder
@@ -968,7 +993,14 @@ class BrowserContextFactory:
             if isinstance(acquisition, DisplayRecorderAcquisition) and acquisition.started:
                 started_display_recorder = acquisition.recorder
             browser_artifacts._display_recorder_acquisition = None
-            requested_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
+            if relaunch is not None:
+                capture_seed = browser_artifacts._capture_profile_seed
+                if capture_seed is None or capture_seed[0] is not browser_context:
+                    raise RuntimeError("Replacement browser did not apply the workflow's working profile")
+                browser_artifacts._seed_profile_etag = relaunch._seed_profile_etag
+                browser_artifacts._seed_cookie_snapshot = relaunch._seed_cookie_snapshot
+                browser_artifacts._seed_capture_failed = relaunch._seed_capture_failed
+                browser_artifacts._run_performed_fresh_login = relaunch._run_performed_fresh_login
             if requested_profile_id and browser_artifacts.applied_browser_profile_id != requested_profile_id:
                 LOG.warning(
                     "Browser profile was requested but not applied by the chosen browser creator — "
@@ -979,14 +1011,47 @@ class BrowserContextFactory:
                     task_id=kwargs.get("task_id"),
                     organization_id=kwargs.get("organization_id"),
                 )
-            await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir)
-            await restore_signin_cookies(browser_context, browser_artifacts.browser_session_dir)
-            # After session cookies so a verified-login heal (banked by the credential living-profile
-            # engine) wins over the profile's own older session cookies on a key clash. Gated on the
-            # engine kill-switch so a rollback also stops applying previously banked login state.
-            if await app.AGENT_FUNCTION.should_apply_banked_cookies(kwargs.get("organization_id")):
-                await restore_banked_cookies(browser_context, browser_artifacts.browser_session_dir)
-                await _capture_seed_profile_state(browser_context, browser_artifacts, kwargs)
+            elif local_storage is not None:
+                local_profile_copy = local_profile_working_copy(
+                    profile_org_id, requested_profile_id, browser_artifacts.browser_session_dir
+                )
+                browser_artifacts._local_profile_working_dir = local_profile_copy
+                if local_profile_copy:
+                    browser_artifacts._local_profile_workflow_pending = workflow_owns_save and not profile_read_only
+                    if workflow_run_id and not profile_read_only and profile_org_id and requested_profile_id:
+                        browser_artifacts._local_workflow_profile_identity = (
+                            workflow_run_id,
+                            profile_org_id,
+                            requested_profile_id,
+                        )
+                    cleanup_func = _profile_copy_cleanup(local_profile_copy, cleanup_func, browser_artifacts)
+            if (
+                local_profile_copy is None
+                and workflow_owns_save
+                and browser_artifacts.applied_browser_profile_id is None
+                and (working_dir := browser_artifacts._local_profile_working_dir)
+                and is_temp_working_dir(working_dir)
+            ):
+                local_profile_copy = working_dir
+                browser_artifacts._local_profile_workflow_pending = not profile_read_only
+                cleanup_func = _profile_copy_cleanup(working_dir, cleanup_func, browser_artifacts)
+            strict_restore = (
+                local_profile_copy
+                and not profile_read_only
+                and (browser_artifacts._seed_profile_encrypted or settings.SKYVERN_ENCRYPT_BROWSER_PROFILES)
+            )
+            restore_options = {"strict": True} if strict_restore else {}
+            await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir, **restore_options)
+            apply_banked_cookies = False
+            if relaunch is None:
+                await restore_signin_cookies(browser_context, browser_artifacts.browser_session_dir, **restore_options)
+                # Banked login state takes precedence over older saved cookies at the initial launch.
+                apply_banked_cookies = await app.AGENT_FUNCTION.should_apply_banked_cookies(profile_org_id)
+                if apply_banked_cookies:
+                    await restore_banked_cookies(
+                        browser_context, browser_artifacts.browser_session_dir, **restore_options
+                    )
+                    await _capture_seed_profile_state(browser_context, browser_artifacts, kwargs)
             if settings.BROWSER_LOGS_ENABLED:
                 set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             # Playwright popup/page video is the ONLY producer of video_artifacts here, so register it whenever no
@@ -1033,6 +1098,36 @@ class BrowserContextFactory:
                 context = ensure_context()
                 context.tz_info = get_tzinfo_from_proxy(proxy_location)
 
+            if (
+                local_storage is not None
+                and profile_org_id
+                and requested_profile_id
+                and browser_artifacts.applied_browser_profile_id == requested_profile_id
+                and not (profile_read_only or workflow_owns_save or browser_artifacts._seed_load_failed)
+                and (local_profile_copy or apply_banked_cookies)
+            ):
+                directory = local_profile_copy or browser_artifacts.browser_session_dir
+                assert directory is not None
+                save = functools.partial(
+                    local_storage.write_back_browser_profile,
+                    profile_org_id,
+                    requested_profile_id,
+                    seed_etag=browser_artifacts._seed_profile_etag,
+                )
+
+                async def writeback() -> None:
+                    if apply_banked_cookies:
+                        clear_banked_cookies(directory)
+                    if local_profile_copy and (
+                        not browser_artifacts._seed_profile_encrypted
+                        or browser_artifacts._seed_profile_etag is not None
+                    ):
+                        await save(directory)
+
+                if not session_owns_save:
+                    browser_artifacts._profile_writeback = writeback
+                else:
+                    browser_artifacts._local_profile_reuse_save = writeback
             # The whole-display recorder was already acquired by the creator before context creation and
             # consumed into ``started_display_recorder`` above; nothing to acquire here.
             return browser_context, browser_artifacts, cleanup_func
@@ -1063,6 +1158,8 @@ class BrowserContextFactory:
             if cleanup_func:
                 with suppress(Exception):
                     await cleanup_func()
+            if relaunch is None:
+                discard_temp_working_dir(local_profile_copy)
 
             if close_cancelled:
                 raise asyncio.CancelledError()
@@ -1174,24 +1271,144 @@ def _is_chrome_running() -> bool:
     return False
 
 
-def _read_only_copy_cleanup(read_only_copy: str | None) -> BrowserCleanupFunc:
-    if read_only_copy is None:
-        return None
-    copy_dir = read_only_copy
+def local_profile_working_copy(
+    organization_id: str | None, profile_id: str | None, directory: str | None
+) -> str | None:
+    if (
+        organization_id
+        and profile_id
+        and directory
+        and isinstance(app.STORAGE, LocalStorage)
+        and app.STORAGE.is_browser_profile_working_copy(organization_id, profile_id, directory)
+    ):
+        return directory
+    return None
+
+
+def _profile_copy_cleanup(
+    copy_dir: str | None, cleanup: BrowserCleanupFunc = None, artifacts: BrowserArtifacts | None = None
+) -> BrowserCleanupFunc:
+    if copy_dir is None:
+        return cleanup
 
     async def _discard() -> None:
-        await asyncio.to_thread(discard_temp_working_dir, copy_dir)
+        try:
+            if cleanup:
+                await cleanup()
+        finally:
+            if artifacts is not None:
+                artifacts._local_profile_context_closed = True
+            if artifacts is None or (
+                artifacts._local_profile_working_dir == copy_dir and not artifacts._local_profile_workflow_pending
+            ):
+                await asyncio.to_thread(discard_temp_working_dir, copy_dir)
 
     return _discard
 
 
+async def restore_session_profile(
+    organization_id: str,
+    profile_id: str,
+    on_snapshot: Callable[[BrowserProfileSnapshot], None] | None,
+    *,
+    read_only: bool = False,
+) -> str | None:
+    snapshot = await app.STORAGE.retrieve_browser_profile_snapshot(
+        organization_id, profile_id, **({"copy": True} if read_only else {})
+    )
+    if snapshot is None:
+        return None
+    if on_snapshot is not None:
+        on_snapshot(snapshot)
+    return snapshot.directory
+
+
+def cleanup_local_profile_on_launch_failure(creator: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    @functools.wraps(creator)
+    async def launch(*args: Any, **kwargs: Any) -> Any:
+        copies: list[BrowserProfileSnapshot] = []
+        launched: list[tuple[BrowserContext, BrowserArtifacts]] = []
+
+        def discard_copies() -> None:
+            for copy in copies:
+                if (
+                    copy.encrypted
+                    or copy.legacy_local_copy
+                    or not isinstance(app.STORAGE, LocalStorage)
+                    or local_profile_working_copy(
+                        kwargs.get("organization_id"), kwargs.get("browser_profile_id"), copy.directory
+                    )
+                ):
+                    discard_temp_working_dir(copy.directory)
+
+        kwargs["_track_profile_copy"] = copies.append
+        kwargs["_discard_profile_copies"] = discard_copies
+        kwargs["_track_launched_context"] = launched.append
+        try:
+            context, artifacts, cleanup = await creator(*args, **kwargs)
+        except BaseException:
+            try:
+                if launched:
+                    context, artifacts = launched[0]
+                    try:
+                        with suppress(Exception):
+                            await context.close()
+                    finally:
+                        await release_started_display_recording(artifacts)
+            finally:
+                discard_copies()
+            raise
+        for copy in copies:
+            if copy.directory == artifacts.browser_session_dir:
+                artifacts._seed_profile_encrypted = copy.encrypted
+                if artifacts.applied_browser_profile_id == kwargs.get("browser_profile_id"):
+                    artifacts._seed_profile_etag = copy.version
+                if (
+                    (copy.encrypted or copy.legacy_local_copy)
+                    and kwargs.get("workflow_run_id")
+                    and artifacts.applied_browser_profile_id is None
+                ):
+                    artifacts._local_profile_working_dir = copy.directory
+            elif copy.encrypted or copy.legacy_local_copy:
+                discard_temp_working_dir(copy.directory)
+
+        # Some creators also attach over CDP. Only the launch path can attest to the seed.
+        if not any(owned is context and record is artifacts for owned, record in launched):
+            return context, artifacts, cleanup
+        relaunch = cast(BrowserArtifacts | None, kwargs.get("_relaunch_profile"))
+        if relaunch is not None:
+            if (
+                relaunch._local_profile_working_dir is None
+                or artifacts.browser_session_dir != relaunch._local_profile_working_dir
+                or artifacts.applied_browser_profile_id != kwargs.get("browser_profile_id")
+            ):
+                return context, artifacts, cleanup
+            artifacts._seed_profile_encrypted = relaunch._seed_profile_encrypted
+        artifacts._capture_profile_seed = (context, artifacts._seed_profile_encrypted)
+        return context, artifacts, cleanup
+
+    return launch
+
+
+async def _retrieve_chromium_profile(organization_id: str, profile_id: str, kwargs: dict[str, Any]) -> str | None:
+    if relaunch := kwargs.get("_relaunch_profile"):
+        return relaunch._local_profile_working_dir
+    return await restore_session_profile(
+        organization_id,
+        profile_id,
+        kwargs["_track_profile_copy"],
+        read_only=bool(kwargs.get("profile_read_only") or kwargs.get("_profile_export_fork")),
+    )
+
+
 @_forbidden_in_attach_only_worker("a local headless Chromium launch")
+@cleanup_local_profile_on_launch_failure
 async def _create_headless_chromium(
     playwright: Playwright,
     proxy_location: ProxyLocationInput = None,
     extra_http_headers: dict[str, str] | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
-    **kwargs: dict,
+    **kwargs: Any,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
         return await _connect_to_cdp_browser(
@@ -1211,15 +1428,7 @@ async def _create_headless_chromium(
     loaded_from_saved_profile = False
 
     if browser_profile_id and organization_id_for_profile:
-        retrieve_profile = (
-            app.STORAGE.retrieve_browser_profile_copy
-            if kwargs.get("profile_read_only")
-            else app.STORAGE.retrieve_browser_profile
-        )
-        profile_dir = await retrieve_profile(
-            organization_id=organization_id_for_profile,
-            profile_id=browser_profile_id,
-        )
+        profile_dir = await _retrieve_chromium_profile(organization_id_for_profile, browser_profile_id, kwargs)
         if profile_dir:
             user_data_dir = profile_dir
             loaded_from_saved_profile = True
@@ -1270,14 +1479,18 @@ async def _create_headless_chromium(
         try:
             browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
         except Exception as launch_error:
-            if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
+            if (
+                loaded_from_saved_profile
+                and not kwargs.get("_relaunch_profile")
+                and _is_browser_profile_corruption_error(launch_error)
+            ):
                 LOG.warning(
                     "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
                     browser_profile_id=browser_profile_id,
                     organization_id=organization_id_for_profile,
                     error=str(launch_error),
                 )
-                discard_temp_working_dir(read_only_copy)
+                kwargs["_discard_profile_copies"]()
                 read_only_copy = None
                 fallback_dir = make_run_temp_directory(prefix="skyvern_browser_")
                 BrowserContextFactory.update_chromium_browser_preferences(
@@ -1294,8 +1507,10 @@ async def _create_headless_chromium(
             else:
                 raise
     except BaseException:
-        discard_temp_working_dir(read_only_copy)
+        if not loaded_from_saved_profile or browser_artifacts._seed_load_failed:
+            discard_temp_working_dir(browser_args["user_data_dir"])
         raise
+    kwargs["_track_launched_context"]((browser_context, browser_artifacts))
     browser_artifacts.note_requested_launch_args(browser_args.get("args"))
     browser_artifacts.attach_native_downloads(
         NativeDownloads.attach(
@@ -1309,16 +1524,17 @@ async def _create_headless_chromium(
             ),
         )
     )
-    return browser_context, browser_artifacts, _read_only_copy_cleanup(read_only_copy)
+    return browser_context, browser_artifacts, _profile_copy_cleanup(read_only_copy)
 
 
 @_forbidden_in_attach_only_worker("a local headful Chromium launch")
+@cleanup_local_profile_on_launch_failure
 async def _create_headful_chromium(
     playwright: Playwright,
     proxy_location: ProxyLocationInput = None,
     extra_http_headers: dict[str, str] | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
-    **kwargs: dict,
+    **kwargs: Any,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
         return await _connect_to_cdp_browser(
@@ -1338,15 +1554,7 @@ async def _create_headful_chromium(
     loaded_from_saved_profile = False
 
     if browser_profile_id and organization_id_for_profile:
-        retrieve_profile = (
-            app.STORAGE.retrieve_browser_profile_copy
-            if kwargs.get("profile_read_only")
-            else app.STORAGE.retrieve_browser_profile
-        )
-        profile_dir = await retrieve_profile(
-            organization_id=organization_id_for_profile,
-            profile_id=browser_profile_id,
-        )
+        profile_dir = await _retrieve_chromium_profile(organization_id_for_profile, browser_profile_id, kwargs)
         if profile_dir:
             user_data_dir = profile_dir
             loaded_from_saved_profile = True
@@ -1411,14 +1619,18 @@ async def _create_headful_chromium(
         try:
             browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
         except Exception as launch_error:
-            if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
+            if (
+                loaded_from_saved_profile
+                and not kwargs.get("_relaunch_profile")
+                and _is_browser_profile_corruption_error(launch_error)
+            ):
                 LOG.warning(
                     "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
                     browser_profile_id=browser_profile_id,
                     organization_id=organization_id_for_profile,
                     error=str(launch_error),
                 )
-                discard_temp_working_dir(read_only_copy)
+                kwargs["_discard_profile_copies"]()
                 read_only_copy = None
                 fallback_dir = make_run_temp_directory(prefix="skyvern_browser_")
                 BrowserContextFactory.update_chromium_browser_preferences(
@@ -1439,9 +1651,9 @@ async def _create_headful_chromium(
             else:
                 raise
     except BaseException:
-        discard_temp_working_dir(read_only_copy)
         await release_started_display_recording(browser_artifacts)
         raise
+    kwargs["_track_launched_context"]((browser_context, browser_artifacts))
     browser_artifacts.note_requested_launch_args(browser_args.get("args"))
     browser_artifacts.attach_native_downloads(
         NativeDownloads.attach(
@@ -1455,7 +1667,7 @@ async def _create_headful_chromium(
             ),
         )
     )
-    return browser_context, browser_artifacts, _read_only_copy_cleanup(read_only_copy)
+    return browser_context, browser_artifacts, _profile_copy_cleanup(read_only_copy)
 
 
 def default_user_data_dir() -> pathlib.Path:

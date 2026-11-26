@@ -621,6 +621,7 @@ async def _run_sync_trigger_fence(
     created_session_id: str | None,
     setup_raises: bool = False,
     target_workflow: SimpleNamespace | None = None,
+    session_creations: list[str | None] | None = None,
 ) -> tuple[MagicMock, dict[str, Any]]:
     child_run = MagicMock()
     child_run.workflow_run_id = "wr_child"
@@ -650,7 +651,13 @@ async def _run_sync_trigger_fence(
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=MagicMock(proxy_location=None))
         created_session = MagicMock()
         created_session.persistent_browser_session_id = created_session_id
-        mock_app.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=created_session)
+
+        async def _create_session(**_: Any) -> MagicMock:
+            if session_creations is not None:
+                session_creations.append(created_session_id)
+            return created_session
+
+        mock_app.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(side_effect=_create_session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
         if target_workflow is not None:
             mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=target_workflow)
@@ -690,6 +697,28 @@ async def test_sync_trigger_closes_fresh_session_when_fence_fires() -> None:
     mock_app.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with(
         "org_parent", "pbs_fresh", reason=BrowserSessionCloseReason.aborted
     )
+
+    strict_parent = SkyvernContext(
+        organization_id="org_parent",
+        workflow_run_id="wr_parent",
+        root_workflow_run_id="wr_parent",
+        otp_request_id="otpr_strict",
+        run_id="wr_parent",
+    )
+    skyvern_context.set(strict_parent)
+    strict_session_creations: list[str | None] = []
+    try:
+        _strict_app, strict_captured = await _run_sync_trigger_fence(
+            block,
+            created_session_id="pbs_strict",
+            session_creations=strict_session_creations,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert strict_session_creations == []
+    assert strict_captured["success"] is False
+    assert "local worker-owned browser" in strict_captured["failure_reason"]
 
 
 @pytest.mark.asyncio
@@ -835,6 +864,8 @@ async def test_async_trigger_restores_parent_context_on_success() -> None:
     # synchronous branch so the exact parent object is ambient again afterward.
     parent = _make_parent_context()
     child_identity = _make_child_identity_context()
+    parent.otp_request_id = "otpr_async_child"
+    child_identity.otp_request_id = "otpr_async_child"
     observed: dict[str, Any] = {}
 
     async def _run_workflow(**_: Any) -> Any:
@@ -852,6 +883,7 @@ async def test_async_trigger_restores_parent_context_on_success() -> None:
         # Dispatch runs under its own child scope — never the parent object.
         assert observed["entry"] is not None
         assert observed["entry"] is not parent
+        assert observed["entry"].otp_request_id == "otpr_async_child"
         assert observed["after_replace"] is child_identity
         # Dispatch succeeded and the parent's output was recorded under the restored parent.
         assert captured["success"] is True

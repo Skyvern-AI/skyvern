@@ -180,6 +180,7 @@ interface Props {
   // Mounted by the Doc for a step the canvas does not render: runs and registers
   // the play handle, and renders only the run dialogs.
   headless?: boolean;
+  integrationLogo?: string;
   // Driven by useSortable in the parent HOC; defaults to false so this
   // file ships a static affordance with no behavioural change at call sites.
   isDragging?: boolean;
@@ -275,6 +276,7 @@ function NodeHeader({
   editable,
   extraActions,
   headless = false,
+  integrationLogo,
   isDragging = false,
   nodeId,
   totpIdentifier,
@@ -1172,7 +1174,7 @@ function NodeHeader({
     playInert || demonstrationPending || runBlock.isPending
       ? "Wait for the current run to finish"
       : !startDemonstration
-        ? "Copilot can't start a demonstration right now"
+        ? "Ember can't start a demonstration right now"
         : null;
   const canRunDemonstrationPrefix = Boolean(
     demonstrationTarget &&
@@ -1240,12 +1242,12 @@ function NodeHeader({
                       demonstrationTarget.prefixLabels.length === 1
                         ? "it finishes"
                         : "they finish"
-                    }, the browser is yours: show how to do ${blockLabel}, then press Done. Copilot rewrites this block from what you show.`
+                    }, the browser is yours: show how to do ${blockLabel}, then press Done. Ember rewrites this block from what you show.`
                   : `${
                       demonstrationTarget.runUnavailableReason
                         ? `${demonstrationTarget.runUnavailableReason} Get the browser to ${blockLabel} yourself, then`
                         : "In the browser,"
-                    } show how to do ${blockLabel} and press Done. Copilot rewrites this block from what you show.`}
+                    } show how to do ${blockLabel} and press Done. Ember rewrites this block from what you show.`}
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -1342,7 +1344,11 @@ function NodeHeader({
           <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-border dark:border-slate-600">
             {/* Without shrink-0, a long label or subtitle in the sibling
             column steals width from this box before its own min-content. */}
-            <WorkflowBlockIcon workflowBlockType={type} className="size-6" />
+            <WorkflowBlockIcon
+              workflowBlockType={type}
+              className="size-6"
+              integrationLogo={integrationLogo}
+            />
           </div>
           <div className="flex min-w-0 flex-col gap-1">
             <EditableNodeTitle

@@ -178,6 +178,7 @@ async def execute_blocks(
                 workflow_run=workflow_run, workflow=saved_workflow
             )
             await app.AGENT_FUNCTION.prepare_gmail_hop_tokens(workflow_run=workflow_run, workflow=saved_workflow)
+            await app.AGENT_FUNCTION.prepare_google_drive_hop_tokens(workflow_run=workflow_run, workflow=saved_workflow)
     except Exception as exc:  # noqa: BLE001 - a missing capability must not prevent editor dispatch.
         LOG.warning("Could not prepare Power BI hop for block run", error_type=type(exc).__name__)
 

@@ -190,7 +190,7 @@ def test_powerbi_query_yaml_round_trips_through_workflow_union_and_converter() -
     assert runtime_block.max_rows == 1_000
 
 
-def test_powerbi_query_credential_source_defaults_to_nango_and_rejects_native() -> None:
+def test_powerbi_query_credential_source_defaults_to_nango_and_rejects_unknown_sources() -> None:
     block_yaml = PowerBIQueryBlockYAML(
         label="query_sales",
         connection_id="conn_test",
@@ -204,12 +204,12 @@ def test_powerbi_query_credential_source_defaults_to_nango_and_rejects_native() 
         PowerBIQueryBlockYAML(
             label="query_sales",
             connection_id="conn_test",
-            credential_source="native",  # type: ignore[arg-type]
+            credential_source="vault",  # type: ignore[arg-type]
             dataset_id=_DATASET,
             query="EVALUATE VALUES('Sales')",
         )
     with pytest.raises(ValidationError):
-        _block(credential_source="native")
+        _block(credential_source="vault")
 
 
 @pytest.mark.parametrize("max_rows", [0, 100_001, True, 1.0, "1000", "{{ row_cap }}"])

@@ -14,7 +14,7 @@ LOG = structlog.get_logger()
 
 @dataclass(frozen=True)
 class AuditEvent:
-    """Resource identifiers, field names, and explicitly selected non-secret metadata for an audited write."""
+    """Resource identifiers, field names, and explicitly selected non-secret metadata for an audited write or read."""
 
     organization_id: str
     action: str
@@ -26,6 +26,10 @@ class AuditEvent:
     oauth_client_id: str | None = None
     app_role: str | None = None
     metadata: Mapping[str, str | list[str]] = field(default_factory=dict)
+    # The user to record when the event is raised outside a request, where no principal exists.
+    actor_user_id: str | None = None
+    # Only the new read-audit cohort sets this. Existing audit producers retain their previous semantics.
+    data_access: Literal["read", "link_issued", "request"] | None = None
 
 
 async def record_run_cancel_audit(

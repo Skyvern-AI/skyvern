@@ -73,6 +73,7 @@ async function renderControllingInputHook(
     onClipboardPaste?: (text: string) => void;
     onClipboardCopy?: () => void;
     forwardCopyShortcut?: boolean;
+    onToggleConsole?: () => void;
   } = {},
 ) {
   const { result } = renderHook(() =>
@@ -142,7 +143,10 @@ function fakeKeyboardEvent(
   key: string,
   code: string,
   modifiers: Partial<
-    Pick<React.KeyboardEvent, "altKey" | "ctrlKey" | "metaKey" | "shiftKey">
+    Pick<
+      React.KeyboardEvent,
+      "altKey" | "ctrlKey" | "metaKey" | "shiftKey" | "repeat"
+    >
   > = {},
 ): React.KeyboardEvent {
   return {
@@ -152,6 +156,7 @@ function fakeKeyboardEvent(
     ctrlKey: modifiers.ctrlKey ?? false,
     metaKey: modifiers.metaKey ?? false,
     shiftKey: modifiers.shiftKey ?? false,
+    repeat: modifiers.repeat ?? false,
     preventDefault: vi.fn(),
   } as unknown as React.KeyboardEvent;
 }
@@ -754,6 +759,51 @@ describe("useCdpInput key handling", () => {
     expect(send.mock.calls.map((call) => JSON.parse(String(call[0])))).toEqual([
       expect.objectContaining({ eventType: "keyDown", code: "KeyV" }),
       expect.objectContaining({ eventType: "keyUp", code: "KeyV" }),
+    ]);
+  });
+
+  it("toggles the console on F12 without forwarding keyDown/keyUp when console is available", async () => {
+    const onToggleConsole = vi.fn();
+    const result = await renderControllingInputHook({ onToggleConsole });
+    const socket = MockWebSocket.instances[0]!;
+    act(() => {
+      socket.emitMessage(JSON.stringify({ kind: "console", available: true }));
+    });
+    socket.send.mockClear();
+
+    const keyDown = fakeKeyboardEvent("F12", "F12");
+    const repeatDown = fakeKeyboardEvent("F12", "F12", { repeat: true });
+    const keyUp = fakeKeyboardEvent("F12", "F12");
+
+    act(() => {
+      result.current.handlers.handleKeyDown(keyDown);
+      result.current.handlers.handleKeyDown(repeatDown);
+      result.current.handlers.handleKeyUp(keyUp);
+    });
+
+    expect(onToggleConsole).toHaveBeenCalledTimes(1);
+    expect(keyDown.preventDefault).toHaveBeenCalled();
+    expect(keyUp.preventDefault).toHaveBeenCalled();
+    expect(socket.send).not.toHaveBeenCalled();
+  });
+
+  it("still forwards F12 to the remote page when console is unavailable", async () => {
+    const onToggleConsole = vi.fn();
+    const result = await renderControllingInputHook({ onToggleConsole });
+    const socket = MockWebSocket.instances[0]!;
+    socket.send.mockClear();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(fakeKeyboardEvent("F12", "F12"));
+      result.current.handlers.handleKeyUp(fakeKeyboardEvent("F12", "F12"));
+    });
+
+    expect(onToggleConsole).not.toHaveBeenCalled();
+    expect(
+      socket.send.mock.calls.map((call) => JSON.parse(String(call[0]))),
+    ).toEqual([
+      expect.objectContaining({ eventType: "rawKeyDown", code: "F12" }),
+      expect.objectContaining({ eventType: "keyUp", code: "F12" }),
     ]);
   });
 });

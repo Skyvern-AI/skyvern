@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 import aiofiles
 import structlog
-from playwright.async_api import Page
+from playwright.async_api import Page, StorageState
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.webeye.native_downloads import NativeDownloads
@@ -86,6 +87,7 @@ class BrowserArtifacts(BaseModel):
     har_path: str | None = None
     traces_dir: str | None = None
     browser_session_dir: str | None = None
+    _credential_profile_writer: Literal["chrome", "msedge", "stealth-chromium"] | None = PrivateAttr(default=None)
     browser_console_log_path: str | None = None
     # Set by remote-CDP creators so RealBrowserManager attaches a CDP frame
     # publisher. Local Playwright contexts leave it False. Type must stay
@@ -129,9 +131,19 @@ class BrowserArtifacts(BaseModel):
     # _seed_load_failed flips true when a saved profile failed to launch (corruption/stale lock) and the
     # run fell back to a blank dir — its end-state is not this profile's, so write-back must be suppressed.
     _seed_load_failed: bool = PrivateAttr(default=False)
+    # Storage state an external browser held at cleanup, read before release detaches its driver.
+    _external_storage_state: StorageState | None = PrivateAttr(default=None)
     # _seed_capture_failed flips true when the seed fingerprint could not be captured — the guard then
     # treats the seed as UNKNOWN and never full-overwrites (a None etag would otherwise read "unchanged").
     _seed_capture_failed: bool = PrivateAttr(default=False)
+    _seed_profile_encrypted: bool = PrivateAttr(default=False)
+    _capture_profile_seed: tuple[object, bool] | None = PrivateAttr(default=None)
+    _local_profile_reuse_save: Callable[[], Awaitable[None]] | None = PrivateAttr(default=None)
+    _profile_writeback: Callable[[], Awaitable[None]] | None = PrivateAttr(default=None)
+    _local_profile_working_dir: str | None = PrivateAttr(default=None)
+    _local_workflow_profile_identity: tuple[str, str, str] | None = PrivateAttr(default=None)
+    _local_profile_workflow_pending: bool = PrivateAttr(default=False)
+    _local_profile_context_closed: bool = PrivateAttr(default=False)
     _action_download_source: ActionDownloadSource | None = PrivateAttr(default=None)
     # The GL flags (--use-gl / --use-angle) a local creator handed the driver, for launch telemetry; no other arg.
     _requested_graphics_flags: tuple[str, ...] | None = PrivateAttr(default=None)
@@ -199,6 +211,11 @@ class BrowserArtifacts(BaseModel):
     def cdp_context_for(self, browser_context: object) -> CdpContextReceipt | None:
         noted = self._cdp_context
         return noted[1] if noted is not None and noted[0] is browser_context else None
+
+    def capture_requires_encryption(self, context: object) -> bool:
+        """Apply source protection in addition to the storage writer and destination policy."""
+        receipt = self._capture_profile_seed
+        return self._seed_profile_encrypted or (receipt is not None and (receipt[0] is not context or receipt[1]))
 
     def attach_action_download_source(self, source: ActionDownloadSource | None) -> None:
         self._action_download_source = source
@@ -277,3 +294,6 @@ class BrowserArtifacts(BaseModel):
                 timeout=timeout,
             )
             return await self._read_console_log_file()
+
+
+CredentialProfileFinalizer = Callable[[BrowserArtifacts | None], Coroutine[Any, Any, None]]

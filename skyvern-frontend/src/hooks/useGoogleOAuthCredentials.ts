@@ -14,6 +14,7 @@ import { useHasCapability } from "@/store/PageSlots";
 import {
   GOOGLE_GMAIL_REQUIRED_SCOPES,
   GOOGLE_GMAIL_SEND_REQUIRED_SCOPES,
+  GOOGLE_REQUIRED_SCOPE_RULES,
 } from "@/util/googleScopes";
 
 const BROADCAST_CHANNEL_NAME = "skyvern:google-oauth-credentials";
@@ -100,8 +101,12 @@ export function hasGoogleOAuthCredentialScopes(
   credential: GoogleOAuthCredential,
   requiredScopes: readonly string[],
 ): boolean {
-  const granted = new Set(getGoogleOAuthCredentialScopesGranted(credential));
-  return requiredScopes.every((scope) => granted.has(scope));
+  const grantedScopes = getGoogleOAuthCredentialScopesGranted(credential);
+  const granted = new Set(grantedScopes);
+  return requiredScopes.every((scope) => {
+    const rule = GOOGLE_REQUIRED_SCOPE_RULES.get(scope);
+    return rule ? rule(grantedScopes) : granted.has(scope);
+  });
 }
 
 export function attemptedGoogleOAuthIntegrationScopes(

@@ -1,7 +1,12 @@
+import base64
+import os
 from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException
@@ -18,12 +23,42 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
 )
 from skyvern.schemas.workflows import BlockType
 
+V2_SECRET_KEY = "unit-test-v2-secret-key-please-0000"
+V2_SALT = "unit-test-v2-salt-000"
+
+
+def _encrypted_field_fixture(
+    plaintext: str,
+    *,
+    method: str,
+    organization_id: str,
+    field_name: str,
+) -> str:
+    secret_key = settings.ENCRYPTOR_AES_SECRET_KEY if method == "aesgcm-v1" else settings.ENCRYPTOR_AES_SECRET_KEY_V2
+    salt_value = settings.ENCRYPTOR_AES_SALT if method == "aesgcm-v1" else settings.ENCRYPTOR_AES_SALT_V2
+    assert secret_key
+    key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt_value.encode() if salt_value else None,
+        info=f"skyvern-file-destination-secret-{method}".encode(),
+    ).derive(secret_key.encode())
+    nonce = os.urandom(12)
+    version = method.removeprefix("aesgcm-")
+    aad = b"\x00".join(
+        (f"skyvern-file-destination-secret-{version}".encode(), organization_id.encode(), field_name.encode())
+    )
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext.encode(), aad)
+    return f"{ENCRYPTED_SECRET_PREFIX}{method}:{base64.b64encode(nonce + ciphertext).decode()}"
+
 
 @pytest.fixture
 def enabled_encryption(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENABLE_ENCRYPTION", True)
     monkeypatch.setattr(settings, "ENCRYPTOR_AES_SECRET_KEY", "unit-test-secret-key-please-0000")
     monkeypatch.setattr(settings, "ENCRYPTOR_AES_SALT", "unit-test-salt-000")
+    monkeypatch.setattr(settings, "ENCRYPTOR_AES_SECRET_KEY_V2", V2_SECRET_KEY)
+    monkeypatch.setattr(settings, "ENCRYPTOR_AES_SALT_V2", V2_SALT)
 
 
 @pytest.fixture
@@ -67,21 +102,61 @@ async def test_encrypt_secret_field_value_encrypts_literal(enabled_encryption: N
 
 
 @pytest.mark.asyncio
-async def test_decrypt_secret_field_value_round_trips(enabled_encryption: None) -> None:
+@pytest.mark.parametrize("method", ["aesgcm-v1", "aesgcm-v2"])
+async def test_decrypt_secret_field_value_round_trips(enabled_encryption: None, method: str) -> None:
     plaintext = "round-trip-test-value"
-    encrypted = await encrypt_secret_field_value(plaintext, organization_id="o_a", field_name="sftp_password")
+    encrypted = _encrypted_field_fixture(
+        plaintext,
+        method=method,
+        organization_id="o_a",
+        field_name="sftp_password",
+    )
 
-    assert encrypted is not None
     assert await decrypt_secret_field_value(encrypted, organization_id="o_a", field_name="sftp_password") == plaintext
 
 
 @pytest.mark.asyncio
-async def test_decrypt_failures_are_indistinguishable(enabled_encryption: None) -> None:
+async def test_decrypt_failures_are_indistinguishable(
+    enabled_encryption: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     encrypted = await encrypt_secret_field_value("hunter2", organization_id="o_a", field_name="sftp_password")
     assert encrypted is not None
+    v2_encrypted = _encrypted_field_fixture(
+        "hunter2-v2",
+        method="aesgcm-v2",
+        organization_id="o_a",
+        field_name="sftp_password",
+    )
+    wrong_version = v2_encrypted.replace("aesgcm-v2", "aesgcm-v1", 1)
+    monkeypatch.setattr(settings, "ENCRYPTOR_AES_SECRET_KEY_V2", f"{V2_SECRET_KEY}-wrong")
     tampered = encrypted[:-4] + ("AAAA" if not encrypted.endswith("AAAA") else "BBBB")
     errors = []
-    for value in ("plain text, never encrypted", tampered, f"{ENCRYPTED_SECRET_PREFIX}aesgcm-v1:not-base64!"):
+    for value in (
+        "plain text, never encrypted",
+        tampered,
+        v2_encrypted,
+        wrong_version,
+        f"{ENCRYPTED_SECRET_PREFIX}aesgcm-v1:not-base64!",
+        f"{ENCRYPTED_SECRET_PREFIX}aesgcm-v3:{encrypted}",
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            await decrypt_secret_field_value(value, organization_id="o_a", field_name="sftp_password")
+        assert excinfo.value.__cause__ is None
+        errors.append(str(excinfo.value))
+    for secret_key, salt in (
+        (None, None),
+        (settings.ENCRYPTOR_AES_SECRET_KEY, V2_SALT),
+        (V2_SECRET_KEY, settings.ENCRYPTOR_AES_SALT),
+    ):
+        monkeypatch.setattr(settings, "ENCRYPTOR_AES_SECRET_KEY_V2", secret_key)
+        monkeypatch.setattr(settings, "ENCRYPTOR_AES_SALT_V2", salt)
+        value = (
+            _encrypted_field_fixture(
+                "test-secret", method="aesgcm-v2", organization_id="o_a", field_name="sftp_password"
+            )
+            if secret_key and salt
+            else v2_encrypted
+        )
         with pytest.raises(ValueError) as excinfo:
             await decrypt_secret_field_value(value, organization_id="o_a", field_name="sftp_password")
         assert excinfo.value.__cause__ is None
@@ -90,14 +165,15 @@ async def test_decrypt_failures_are_indistinguishable(enabled_encryption: None) 
 
 
 @pytest.mark.asyncio
-async def test_encrypted_secret_cannot_move_to_another_field(enabled_encryption: None) -> None:
+@pytest.mark.parametrize("method", ["aesgcm-v1", "aesgcm-v2"])
+async def test_encrypted_secret_cannot_move_to_another_field(enabled_encryption: None, method: str) -> None:
     plaintext = "field-binding-test-value"
-    encrypted = await encrypt_secret_field_value(
+    encrypted = _encrypted_field_fixture(
         plaintext,
+        method=method,
         organization_id="o_a",
         field_name="aws_secret_access_key",
     )
-    assert encrypted is not None
 
     with pytest.raises(ValueError) as exc_info:
         await decrypt_secret_field_value(encrypted, organization_id="o_a", field_name="sftp_password")
@@ -108,14 +184,15 @@ async def test_encrypted_secret_cannot_move_to_another_field(enabled_encryption:
 
 
 @pytest.mark.asyncio
-async def test_encrypted_secret_cannot_move_to_another_organization(enabled_encryption: None) -> None:
+@pytest.mark.parametrize("method", ["aesgcm-v1", "aesgcm-v2"])
+async def test_encrypted_secret_cannot_move_to_another_organization(enabled_encryption: None, method: str) -> None:
     plaintext = "organization-binding-test-value"
-    encrypted = await encrypt_secret_field_value(
+    encrypted = _encrypted_field_fixture(
         plaintext,
+        method=method,
         organization_id="o_a",
         field_name="aws_secret_access_key",
     )
-    assert encrypted is not None
 
     with pytest.raises(ValueError) as exc_info:
         await decrypt_secret_field_value(encrypted, organization_id="o_b", field_name="aws_secret_access_key")
@@ -1123,69 +1200,27 @@ async def test_encrypt_workflow_definition_secrets_encrypts_send_email_custom_sm
 
 
 @pytest.mark.asyncio
-async def test_send_email_literal_password_with_jinja_chars_is_still_encrypted(enabled_encryption: None) -> None:
+@pytest.mark.parametrize(
+    ("password", "literal"), [("pa{{7*7}}ss", True), ("{{7*7}}", True), ("{{ smtp_password_param }}", False)]
+)
+async def test_send_email_only_preserves_bare_parameter_references(enabled_encryption, password, literal):
     send_email = SimpleNamespace(
         block_type=BlockType.SEND_EMAIL,
         custom_smtp_host="smtp.example.com",
         custom_smtp_username="user@example.com",
-        custom_smtp_password="pa{{7*7}}ss",
+        custom_smtp_password=password,
     )
-    definition = SimpleNamespace(blocks=[send_email])
-
-    await encrypt_workflow_definition_secrets(definition, organization_id="o_x")
-
-    assert is_encrypted_secret(send_email.custom_smtp_password)
-    assert (
-        await decrypt_secret_field_value(
-            send_email.custom_smtp_password,
-            organization_id="o_x",
-            field_name="custom_smtp_password",
+    await encrypt_workflow_definition_secrets(SimpleNamespace(blocks=[send_email]), organization_id="o_x")
+    if literal:
+        assert is_encrypted_secret(send_email.custom_smtp_password)
+        assert (
+            await decrypt_secret_field_value(
+                send_email.custom_smtp_password, organization_id="o_x", field_name="custom_smtp_password"
+            )
+            == password
         )
-        == "pa{{7*7}}ss"
-    )
-
-
-@pytest.mark.asyncio
-async def test_send_email_password_that_is_entirely_a_jinja_expression_is_encrypted(
-    enabled_encryption: None,
-) -> None:
-    # Only a bare parameter reference ("{{ name }}") may stay a template. A password that
-    # happens to be a full Jinja EXPRESSION ("{{7*7}}") must be treated as a literal:
-    # encrypted at rest, and never rendered (rendering would corrupt it to "49").
-    send_email = SimpleNamespace(
-        block_type=BlockType.SEND_EMAIL,
-        custom_smtp_host="smtp.example.com",
-        custom_smtp_username="user@example.com",
-        custom_smtp_password="{{7*7}}",
-    )
-    definition = SimpleNamespace(blocks=[send_email])
-
-    await encrypt_workflow_definition_secrets(definition, organization_id="o_x")
-
-    assert is_encrypted_secret(send_email.custom_smtp_password)
-    assert (
-        await decrypt_secret_field_value(
-            send_email.custom_smtp_password,
-            organization_id="o_x",
-            field_name="custom_smtp_password",
-        )
-        == "{{7*7}}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_send_email_bare_parameter_reference_stays_a_template(enabled_encryption: None) -> None:
-    send_email = SimpleNamespace(
-        block_type=BlockType.SEND_EMAIL,
-        custom_smtp_host="smtp.example.com",
-        custom_smtp_username="user@example.com",
-        custom_smtp_password="{{ smtp_password_param }}",
-    )
-    definition = SimpleNamespace(blocks=[send_email])
-
-    await encrypt_workflow_definition_secrets(definition, organization_id="o_x")
-
-    assert send_email.custom_smtp_password == "{{ smtp_password_param }}"
+    else:
+        assert send_email.custom_smtp_password == password
 
 
 def test_workflow_read_mask_covers_inline_secret_fields() -> None:
@@ -1263,3 +1298,32 @@ async def test_destination_fields_keep_partial_template_behavior(enabled_encrypt
     await encrypt_workflow_definition_secrets(definition, organization_id="o_x")
 
     assert upload.sftp_password == "prefix-{{ sftp_password_param }}"
+
+
+@pytest.mark.asyncio
+async def test_scoped_workflow_reader_and_writer_rollout(enabled_encryption, monkeypatch):
+    binding = {"organization_id": "org-a", "field_name": "sftp_password"}
+    with monkeypatch.context() as scoped_writer:
+        scoped_writer.setattr(settings, "ENCRYPTOR_AES_SECRET_KEY", "scoped-fixture")
+        candidate = await encrypt_secret_field_value("candidate", **binding)
+    monkeypatch.setattr(settings, "ENCRYPTOR_AES_SCOPED_SECRET_KEY", "scoped-fixture")
+    assert await decrypt_secret_field_value(candidate, **binding) == "candidate"
+    with pytest.raises(ValueError):
+        await decrypt_secret_field_value(candidate, **{**binding, "organization_id": "org-b"})
+    written = await encrypt_secret_field_value("shared", **binding)
+    monkeypatch.setattr(settings, "ENCRYPTOR_AES_SCOPED_SECRET_KEY", None)
+    assert await decrypt_secret_field_value(written, **binding) == "shared"
+    with pytest.raises(ValueError):
+        await decrypt_secret_field_value(candidate, **binding)
+
+    # Switch writers only after both readers have rolled out.
+    monkeypatch.setattr(settings, "ENCRYPTOR_AES_SCOPED_SECRET_KEY", "scoped-fixture")
+    monkeypatch.setattr(settings, "ENCRYPTOR_AES_WRITE_SCOPED", True)
+    written = await encrypt_secret_field_value("new", **binding)
+    monkeypatch.setattr(settings, "ENCRYPTOR_AES_SCOPED_SECRET_KEY", None)
+    with pytest.raises(ValueError):
+        await decrypt_secret_field_value(written, **binding)
+    with pytest.raises(RuntimeError, match="SCOPED_SECRET_KEY"):
+        await encrypt_secret_field_value("bad config", **binding)
+    monkeypatch.setattr(settings, "ENCRYPTOR_AES_SECRET_KEY", "scoped-fixture")
+    assert await decrypt_secret_field_value(written, **binding) == "new"

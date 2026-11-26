@@ -15,7 +15,11 @@ import {
   type TurnNarrativeState,
 } from "../narrativeState";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { ReviewGateCard, getReviewGateVerdict } from "./ReviewGateCard";
+import {
+  ReviewGateCard,
+  getReviewGateVerdict,
+  proposalUsesConnectedGmail,
+} from "./ReviewGateCard";
 
 const failedBlock = {
   workflowRunBlockId: "wrb_failed",
@@ -382,50 +386,110 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     expect(screen.queryByText(/Each step was tested on its own/)).toBeNull();
   });
 
-  it("warns that the run acts for real and starts it only once confirmed", () => {
-    let testRuns = 0;
-    render(
-      <ReviewGateCard
-        latestTurnCause={null}
-        turn={turn({ proposalDisposition: "review_untested", blocks: [] })}
-        pending
-        verdict="untested"
-        actionsEnabled
-        hasProposal
-        onAccept={noop}
-        onAlwaysAccept={noop}
-        onReject={noop}
-        onReview={noop}
-        onTestEndToEnd={() => {
-          testRuns += 1;
-        }}
-      />,
-    );
+  it.each([false, true])(
+    "warns that the run acts for real and starts it only once confirmed (Connected Gmail step: %s)",
+    (usesConnectedGmail) => {
+      let testRuns = 0;
+      render(
+        <ReviewGateCard
+          usesConnectedGmail={usesConnectedGmail}
+          latestTurnCause={null}
+          turn={turn({ proposalDisposition: "review_untested", blocks: [] })}
+          pending
+          verdict="untested"
+          actionsEnabled
+          hasProposal
+          onAccept={noop}
+          onAlwaysAccept={noop}
+          onReject={noop}
+          onReview={noop}
+          onTestEndToEnd={() => {
+            testRuns += 1;
+          }}
+        />,
+      );
 
-    expect(screen.queryByText(/Each step was tested on its own/)).toBeNull();
-    openMenu("More actions");
-    fireEvent.click(screen.getByRole("menuitem", { name: /Test end-to-end/ }));
-    expect(
-      screen.getByText(/performs real actions on the site/).textContent,
-    ).toContain("place orders");
-    expect(testRuns).toBe(0);
-    // The confirmation replaces the row that held focus, so it takes focus itself.
-    expect(document.activeElement).toBe(
-      screen.getByRole("button", { name: "Run test" }),
-    );
+      expect(screen.queryByText(/Each step was tested on its own/)).toBeNull();
+      openMenu("More actions");
+      fireEvent.click(
+        screen.getByRole("menuitem", { name: /Test end-to-end/ }),
+      );
+      expect(
+        screen.getByText(/performs real actions on the site/).textContent,
+      ).toContain("place orders");
+      // The click approves the person's Connected Gmail for this run, so the confirmation says so when a step uses it.
+      expect(screen.queryByText(/this run can use it, once/) !== null).toBe(
+        usesConnectedGmail,
+      );
+      expect(testRuns).toBe(0);
+      // The confirmation replaces the row that held focus, so it takes focus itself.
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Run test" }),
+      );
 
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(screen.queryByText(/performs real actions on the site/)).toBeNull();
-    expect(testRuns).toBe(0);
-    expect(document.activeElement).toBe(
-      screen.getByRole("button", { name: "More actions" }),
-    );
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(
+        screen.queryByText(/performs real actions on the site/),
+      ).toBeNull();
+      expect(testRuns).toBe(0);
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "More actions" }),
+      );
 
-    openMenu("More actions");
-    fireEvent.click(screen.getByRole("menuitem", { name: /Test end-to-end/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Run test" }));
-    expect(testRuns).toBe(1);
-  });
+      openMenu("More actions");
+      fireEvent.click(
+        screen.getByRole("menuitem", { name: /Test end-to-end/ }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Run test" }));
+      expect(testRuns).toBe(1);
+    },
+  );
+
+  it.each([
+    ["a send step", [{ block_type: "send_email", label: "send" }], true],
+    [
+      "an inbox read inside a loop",
+      [
+        {
+          block_type: "for_loop",
+          label: "loop",
+          loop_blocks: [{ block_type: "email_inbox", label: "inbox" }],
+        },
+      ],
+      true,
+    ],
+    [
+      "a Gmail app action",
+      [
+        {
+          block_type: "integration_action",
+          label: "a",
+          integration_id: "gmail",
+        },
+      ],
+      true,
+    ],
+    [
+      "a Sheets app action",
+      [
+        {
+          block_type: "integration_action",
+          label: "a",
+          integration_id: "google_sheets",
+        },
+      ],
+      false,
+    ],
+    ["no Gmail step", [{ block_type: "task", label: "t" }], false],
+  ])(
+    "names Connected Gmail in the Test confirmation for %s",
+    (_, blocks, expected) => {
+      const workflow = {
+        workflow_definition: { blocks },
+      } as unknown as WorkflowApiResponse;
+      expect(proposalUsesConnectedGmail(workflow)).toBe(expected);
+    },
+  );
 
   it("moves Reject into More actions when the row is too narrow to hold both", () => {
     let reportWidth: (width: number) => void = () => {};

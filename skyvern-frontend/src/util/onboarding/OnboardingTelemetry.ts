@@ -35,6 +35,7 @@ type QuestionnaireAnswerInput = QuestionnaireResponseInput & {
   primaryIntent: QuestionnaireUserIntentV1;
   answers: QuestionnaireAnswersV1;
   projectOwner?: ProjectOwnerReportV1 | null;
+  phoneNumberGiven?: boolean;
 };
 
 type QuestionnaireSkippedInput = QuestionnaireResponseInput & {
@@ -200,6 +201,7 @@ function questionnaireCompleted(input: QuestionnaireAnswerInput): void {
     ...questionnaireResponseProperties(input),
     primary_intent: input.primaryIntent,
     ...questionnaireAnswerProperties(input.answers),
+    phone_number_present: Boolean(input.phoneNumberGiven),
     ...projectOwnerProperties(input),
   });
 }
@@ -218,6 +220,7 @@ function questionnaireUpdated(input: QuestionnaireUpdatedInput): void {
     primary_intent: input.primaryIntent,
     previous_status: input.previousStatus,
     ...questionnaireAnswerProperties(input.answers),
+    phone_number_present: Boolean(input.phoneNumberGiven),
     ...projectOwnerProperties(input),
   });
 }

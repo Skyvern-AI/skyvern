@@ -1,6 +1,7 @@
 """Real implementations of Azure clients (Vault and Storage) and their factories."""
 
 import os
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from mimetypes import add_type, guess_type
 from typing import IO, Self
@@ -232,7 +233,15 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
         )
         return uri
 
-    async def download_file(self, uri: str, log_exception: bool = True, length: int | None = None) -> bytes | None:
+    async def download_file(
+        self,
+        uri: str,
+        log_exception: bool = True,
+        length: int | None = None,
+        *,
+        raise_on_error: bool = False,
+        on_version: Callable[[str], None] | None = None,
+    ) -> bytes | None:
         """The whole blob, or only its first ``length`` bytes."""
         parsed = AzureUri(uri)
         try:
@@ -243,7 +252,10 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
                 download = await blob_client.download_blob()
             else:
                 download = await blob_client.download_blob(offset=0, length=length)
-            return await download.readall()
+            data = await download.readall()
+            if on_version is not None and (etag := download.properties.etag):
+                on_version(etag)
+            return data
         except ResourceNotFoundError:
             if log_exception:
                 LOG.warning("Azure blob not found", uri=uri)
@@ -251,6 +263,8 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
         except Exception:
             if log_exception:
                 LOG.exception("Failed to download from Azure", uri=uri)
+            if raise_on_error:
+                raise
             return None
 
     async def open_blob_download(self, uri: str, etag: str) -> StorageStreamDownloader[bytes]:
@@ -406,6 +420,7 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
             "Metadata": props.get("metadata", {}),
             "LastModified": props.get("last_modified"),
             "ContentLength": props.get("size"),
+            "ETag": props.get("etag"),
         }
 
     async def delete_file(self, uri: str) -> None:

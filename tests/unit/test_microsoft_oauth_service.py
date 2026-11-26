@@ -12,7 +12,15 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from skyvern.forge.sdk.db.repositories.microsoft_oauth import ActiveCredentialCiphertext, PendingConsentContext
+from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
+from skyvern.forge.sdk.db.models import MicrosoftOAuthCredentialModel
+from skyvern.forge.sdk.db.repositories.microsoft_oauth import (
+    STATE_ACTIVE,
+    STATE_ERROR,
+    ActiveCredentialCiphertext,
+    MicrosoftOAuthRepository,
+    PendingConsentContext,
+)
 from skyvern.forge.sdk.encrypt import Encryptor
 from skyvern.forge.sdk.encrypt.aes import AES
 from skyvern.forge.sdk.encrypt.aes_gcm import AESGCMEncryptor
@@ -23,6 +31,7 @@ from skyvern.forge.sdk.schemas.microsoft_oauth import (
     MicrosoftOAuthCredentialBase,
 )
 from skyvern.forge.sdk.services import microsoft_oauth_service
+from tests.unit.conftest import SqliteEngineFactory
 
 # "rt-legacy" as the retired CBC writer stored it under legacy-test-key / legacy-salt / legacy-iv.
 LEGACY_CBC_REFRESH_TOKEN = "vAV6Q7iRBxtfQM2THvF6pQ=="
@@ -240,7 +249,11 @@ def test_email_from_id_token_prefers_email_claim() -> None:
 
 @pytest.mark.asyncio
 async def test_powerbi_authorization_requires_a_real_authenticated_user(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: True)
+    monkeypatch.setattr(
+        microsoft_oauth_routes.app.AGENT_FUNCTION,
+        "powerbi_native_connections_available",
+        AsyncMock(return_value=True),
+    )
     start = AsyncMock()
     monkeypatch.setattr(microsoft_oauth_routes.microsoft_oauth_service, "start_authorization", start)
 
@@ -260,7 +273,11 @@ async def test_powerbi_authorization_requires_a_real_authenticated_user(monkeypa
 
 @pytest.mark.asyncio
 async def test_powerbi_authorization_is_disabled_until_catalog_entry_is_live(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: False)
+    monkeypatch.setattr(
+        microsoft_oauth_routes.app.AGENT_FUNCTION,
+        "powerbi_native_connections_available",
+        AsyncMock(return_value=False),
+    )
     start = AsyncMock()
 
     with pytest.raises(HTTPException, match="Power BI connections are not currently available") as exc_info:
@@ -279,7 +296,11 @@ async def test_powerbi_authorization_is_disabled_until_catalog_entry_is_live(mon
 
 @pytest.mark.asyncio
 async def test_powerbi_authorization_binds_the_authenticated_owner(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: True)
+    monkeypatch.setattr(
+        microsoft_oauth_routes.app.AGENT_FUNCTION,
+        "powerbi_native_connections_available",
+        AsyncMock(return_value=True),
+    )
     start = AsyncMock(return_value=SimpleNamespace(authorize_url="https://login.example.test", state="state"))
     monkeypatch.setattr(microsoft_oauth_routes.microsoft_oauth_service, "start_authorization", start)
 
@@ -358,7 +379,11 @@ async def test_microsoft_reconnect_authorize_maps_safe_failures(
 async def test_powerbi_callback_requires_authenticated_consent_owner_before_exchange(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: True)
+    monkeypatch.setattr(
+        microsoft_oauth_routes.app.AGENT_FUNCTION,
+        "powerbi_native_connections_available",
+        AsyncMock(return_value=True),
+    )
     monkeypatch.setattr(
         microsoft_oauth_routes.microsoft_oauth_service,
         "load_pending_consent_context",
@@ -387,7 +412,11 @@ async def test_powerbi_callback_requires_authenticated_consent_owner_before_exch
 
 @pytest.mark.asyncio
 async def test_powerbi_callback_is_disabled_until_catalog_entry_is_live(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: False)
+    monkeypatch.setattr(
+        microsoft_oauth_routes.app.AGENT_FUNCTION,
+        "powerbi_native_connections_available",
+        AsyncMock(return_value=False),
+    )
     monkeypatch.setattr(
         microsoft_oauth_routes.microsoft_oauth_service,
         "load_pending_consent_context",
@@ -418,7 +447,11 @@ async def test_powerbi_callback_is_disabled_until_catalog_entry_is_live(monkeypa
 async def test_powerbi_callback_promotes_only_the_restricted_owner_bound_grant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: True)
+    monkeypatch.setattr(
+        microsoft_oauth_routes.app.AGENT_FUNCTION,
+        "powerbi_native_connections_available",
+        AsyncMock(return_value=True),
+    )
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     requested_scopes = list(microsoft_oauth_service.POWERBI_DATASET_READ_SCOPES)
     credential = MicrosoftOAuthCredentialBase(
@@ -1319,12 +1352,19 @@ async def test_gcm_credentials_are_dual_read_and_missing_key_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_invalid_grant_raises_reconnect_message(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_invalid_grant_raises_reconnect_message_and_expires_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine_factory: SqliteEngineFactory,
+) -> None:
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_SECRET", "secret", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
+    token_error = {"status": 400, "error": "invalid_grant"}
 
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, json={"error": "invalid_grant", "error_description": "expired"})
+        return httpx.Response(token_error["status"], json={"error": token_error["error"], "error_description": "x"})
 
     _install_microsoft_transport(monkeypatch, handler)
 
@@ -1333,6 +1373,44 @@ async def test_invalid_grant_raises_reconnect_message(monkeypatch: pytest.Monkey
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.error_code == "invalid_grant"
+
+    engine = sqlite_engine_factory()
+    repo = MicrosoftOAuthRepository(BaseAlchemyDB(engine).Session, debug_enabled=False)
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    async with engine.begin() as conn:
+        await conn.execute(
+            MicrosoftOAuthCredentialModel.__table__.insert().values(
+                id="cred-1",
+                organization_id="org-1",
+                credential_name="Default",
+                state=STATE_ACTIVE,
+                encrypted_refresh_token="stored-ciphertext",
+                encrypted_method="aes_gcm",
+                created_at=now,
+                modified_at=now,
+            )
+        )
+    monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repo))
+    secrets = microsoft_oauth_service.MicrosoftCredentialSecrets(
+        refresh_token="rt-1", scopes=["Mail.Read"], encrypted_refresh_token="stored-ciphertext"
+    )
+
+    async def stored_states() -> list[tuple[str, str]]:
+        return [(credential.id, credential.state) for credential in await repo.list_visible_for_org("org-1")]
+
+    token_error.update(status=503, error="temporarily_unavailable")
+    with pytest.raises(microsoft_oauth_service.MicrosoftOAuthError):
+        await microsoft_oauth_service.refresh_and_rotate(
+            organization_id="org-1", credential_id="cred-1", credential_secrets=secrets
+        )
+    assert await stored_states() == [("cred-1", STATE_ACTIVE)]
+
+    token_error.update(status=400, error="invalid_grant")
+    with pytest.raises(microsoft_oauth_service.MicrosoftOAuthError, match="Reconnect"):
+        await microsoft_oauth_service.refresh_and_rotate(
+            organization_id="org-1", credential_id="cred-1", credential_secrets=secrets
+        )
+    assert await stored_states() == [("cred-1", STATE_ERROR)]
 
 
 @pytest.mark.asyncio

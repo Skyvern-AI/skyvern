@@ -35,6 +35,7 @@ import stat
 import threading
 import time
 import uuid
+import weakref
 import zipfile
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
@@ -1404,6 +1405,7 @@ class CDPDownloadInterceptor:
             else None
         )
         self._cdp_sessions: list[CDPSession] = []
+        self._download_urls_by_page: weakref.WeakKeyDictionary[Page, list[str]] = weakref.WeakKeyDictionary()
         self._active_request_interceptors: dict[CDPSession, tuple[Page, Callable[[Page], None]]] = {}
         self._recovery_request_ids: OrderedDict[tuple[CDPSession, str], str] = OrderedDict()
         self._enrolling_pages: list[Page] = []
@@ -2072,6 +2074,9 @@ class CDPDownloadInterceptor:
         """True while the monitor owns the context's setDownloadBehavior binding ({deny, eventsEnabled:True},
         saving over HTTP), so re-sending allow/downloadPath would disable it on remote CDP."""
         return self._browser_session is not None
+
+    def download_urls_for_page(self, page: Page) -> list[str]:
+        return list(self._download_urls_by_page.get(page, ()))
 
     def has_pending_download_activity(self) -> bool:
         """True while a browser-download or CDP Fetch handler is scheduled or in flight. A file this
@@ -3948,6 +3953,9 @@ class CDPDownloadInterceptor:
 
         # Mark before any cap fast-fail so Browser.downloadWillBegin cannot race to re-fetch the same body.
         self._downloaded_urls.add(url)
+        registration = self._active_request_interceptors.get(cdp_session)
+        if registration is not None:
+            self._download_urls_by_page.setdefault(registration[0], []).append(url)
         content_length = _parse_content_length(headers)
         raw_filename = extract_filename(headers, url)
         attempt = self._new_download_attempt(content_length, failure_key=_download_failure_key(raw_filename, url))
@@ -4549,6 +4557,13 @@ def consume_unsolicited_download_error_for_context(browser_context: BrowserConte
         getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
     )
     return interceptor.consume_unsolicited_download_error() if isinstance(interceptor, CDPDownloadInterceptor) else None
+
+
+def download_urls_for_page(browser_context: BrowserContext | None, page: Page) -> list[str] | None:
+    """URLs of the downloads the interceptor has started saving from responses to this page, oldest first; one is
+    listed before its response is fulfilled, so a slow attachment shows while its navigation is still waiting."""
+    interceptor = _interceptor_for_context(browser_context)
+    return interceptor.download_urls_for_page(page) if interceptor is not None else None
 
 
 def _interceptor_for_context(browser_context: BrowserContext | None) -> CDPDownloadInterceptor | None:

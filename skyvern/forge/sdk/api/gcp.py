@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import IO, Protocol
 from urllib.parse import urlparse
 
@@ -66,7 +67,15 @@ class AsyncGcsStorageClient(Protocol):
         metadata: dict[str, str] | None = None,
     ) -> str: ...
 
-    async def download_file(self, uri: str, log_exception: bool = True, length: int | None = None) -> bytes | None: ...
+    async def download_file(
+        self,
+        uri: str,
+        log_exception: bool = True,
+        length: int | None = None,
+        *,
+        raise_on_error: bool = False,
+        on_version: Callable[[str], None] | None = None,
+    ) -> bytes | None: ...
 
     async def delete_file(self, uri: str) -> None: ...
 

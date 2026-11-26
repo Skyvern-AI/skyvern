@@ -32,9 +32,12 @@ import {
 } from "@/store/useEmberHeaderStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { usePageSlots } from "@/store/PageSlots";
+import { useTriggerFocusStore } from "@/store/TriggerFocusStore";
 import { cn } from "@/util/utils";
 
 import { deriveDropIndicator } from "../editor/sortable/dropIndicator";
+import { useGlobalWorkflowStatus } from "../hooks/useIsGlobalWorkflow";
 import { WorkflowRunVerificationCodeForm } from "../workflowRun/WorkflowRunVerificationCodeForm";
 
 import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
@@ -71,7 +74,6 @@ import {
   panesListEqual,
   panesWithoutDeletedBlocked,
   STUDIO_DOC_MIN_WIDTH,
-  STUDIO_PANE_IDS,
   STUDIO_PANE_MIN_WIDTH,
   STUDIO_PANE_STRIP_WIDTH_PX,
   STUDIO_STAGE_GAP_PX,
@@ -82,6 +84,7 @@ import { useStudioNarrow } from "./useStudioNarrow";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import {
+  StudioGlobalWorkflowContext,
   StudioPaneCompactContext,
   StudioShellContext,
   StudioWorkflowDeletedContext,
@@ -90,7 +93,7 @@ import { StudioStageLauncher } from "./StudioStageLauncher";
 import { useStudioOnboardingTour } from "./useStudioOnboardingTour";
 import { StudioTopBar } from "./StudioTopBar";
 import { StudioWorkflowPanels } from "./StudioWorkflowPanels";
-import { useStudioPanes } from "./useStudioPanes";
+import { useStudioPaneIds, useStudioPanes } from "./useStudioPanes";
 import { useStudioRunId } from "./useStudioRunId";
 import { useRunVisuals } from "./useRunVisuals";
 
@@ -484,7 +487,7 @@ function CollapsedPaneStrip({
             ) : awaiting ? (
               <StudioPaneAttentionDot
                 tone="waiting"
-                title={`Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`}
+                title={`Ember, ${EMBER_ATTENTION_LABEL[awaiting]}`}
               />
             ) : null}
           </span>
@@ -711,6 +714,7 @@ export function StudioShell(props: StudioWorkspaceProps) {
   const postHog = usePostHog();
   const openedWorkflowIds = useRef(new Set<string>());
   const workflowPermanentId = props.workflow.workflow_permanent_id;
+  const globalWorkflow = useGlobalWorkflowStatus();
 
   useEffect(() => {
     if (openedWorkflowIds.current.has(workflowPermanentId)) return;
@@ -731,11 +735,13 @@ export function StudioShell(props: StudioWorkspaceProps) {
     <StudioWorkflowDeletedContext.Provider
       value={props.workflow.deleted_at ?? null}
     >
-      <StudioPaneDefaultsProvider
-        hasBlocks={props.workflow.workflow_definition.blocks.length > 0}
-      >
-        <StudioStage {...props} />
-      </StudioPaneDefaultsProvider>
+      <StudioGlobalWorkflowContext.Provider value={globalWorkflow}>
+        <StudioPaneDefaultsProvider
+          hasBlocks={props.workflow.workflow_definition.blocks.length > 0}
+        >
+          <StudioStage {...props} />
+        </StudioPaneDefaultsProvider>
+      </StudioGlobalWorkflowContext.Provider>
     </StudioWorkflowDeletedContext.Provider>
   );
 }
@@ -796,6 +802,9 @@ function StudioStage(props: StudioWorkspaceProps) {
   const { panes, closePane, openPane, setPanesOrder } = useStudioPanes();
   // Embedded run views keep their own layout at any iframe width.
   const narrow = useStudioNarrow() && !embedded;
+  const paneIds = useStudioPaneIds();
+  const { workflowTriggersPanel: WorkflowTriggersPanel } = usePageSlots();
+  const triggerFocus = useTriggerFocusStore();
   const editorShowsDoc = useEditorShowsDoc();
   const {
     registerStageElement,
@@ -907,12 +916,14 @@ function StudioStage(props: StudioWorkspaceProps) {
     setSeenPanes(panes);
     if (added) setNarrowPick(added);
   }
+  // Closed panes stay mounted (CSS-hidden); Triggers waits for its first open
+  // so a visit that never opens it never loads the trigger list.
+  const [triggersOpened, setTriggersOpened] = useState(false);
+  if (!triggersOpened && panes.includes("triggers")) setTriggersOpened(true);
   const narrowShown =
     narrowPick !== null && panes.includes(narrowPick) ? narrowPick : panes[0];
   const narrowSwitchIds = (
-    workflowDeleted
-      ? panesWithoutDeletedBlocked(STUDIO_PANE_IDS)
-      : [...STUDIO_PANE_IDS]
+    workflowDeleted ? panesWithoutDeletedBlocked(paneIds) : [...paneIds]
   ).filter((id) => id !== "overview" || runId || panes.includes(id));
   const showNarrowPane = (id: StudioPaneId) => {
     setNarrowPick(id);
@@ -1252,6 +1263,25 @@ function StudioStage(props: StudioWorkspaceProps) {
                   <RunTab />
                 </PaneErrorBoundary>
               </StudioPane>
+              {WorkflowTriggersPanel &&
+              triggersOpened &&
+              paneIds.includes("triggers") ? (
+                <StudioPane {...paneProps("triggers")}>
+                  <PaneErrorBoundary
+                    key={`${props.workflow.workflow_permanent_id}:triggers`}
+                    pane="triggers"
+                    onError={(error, componentStack) =>
+                      reportPaneCrash("triggers", error, componentStack)
+                    }
+                  >
+                    <WorkflowTriggersPanel
+                      workflowPermanentId={props.workflow.workflow_permanent_id}
+                      focusTriggerId={triggerFocus.triggerId ?? undefined}
+                      focusRequest={triggerFocus.request}
+                    />
+                  </PaneErrorBoundary>
+                </StudioPane>
+              ) : null}
               {/* Dividers are the inter-pane gaps; stateless, so unlike the panes
                 they can re-render freely as the open list changes. */}
               {!narrow &&

@@ -44,12 +44,16 @@ from skyvern.forge.taskv3.tools import (
     PageProvider,
     TotpCodeAuthorizer,
 )
+from skyvern.services.otp_email import EmailOTPVerificationContext
 from skyvern.services.otp_service import (
     MagicLinkSurfacing,
     OTPValue,
+    RawOTPVerificationContext,
+    WebhookOTPVerificationContext,
     extract_totp_from_navigation_inputs,
     has_otp_source,
     is_usable_credential_totp_placeholder,
+    otp_sources_checked,
     resolve_otp_value,
 )
 from skyvern.utils.url_validators import strip_query_params, validate_fetch_url
@@ -171,11 +175,12 @@ def _time_left(remaining_seconds: float) -> str:
     return f"about {remaining_seconds / 60.0:.1f} minutes of polling time remain"
 
 
-def _code_not_yet(remaining_seconds: float, webhook_answers: str | None = None) -> str:
+def _code_not_yet(remaining_seconds: float, webhook_answers: str | None = None, sources: str = "") -> str:
     if _budget_spent(remaining_seconds):
-        return f"{_CODE_BUDGET_SPENT} It answered: {webhook_answers}." if webhook_answers else _CODE_BUDGET_SPENT
+        spent = f"{_CODE_BUDGET_SPENT} It answered: {webhook_answers}." if webhook_answers else _CODE_BUDGET_SPENT
+        return f"{spent}{sources}"
     answers = f" ({webhook_answers})" if webhook_answers else ""
-    return f"no verification code has arrived yet{answers}; {_time_left(remaining_seconds)}."
+    return f"no verification code has arrived yet{answers}; {_time_left(remaining_seconds)}.{sources}"
 
 
 def _code_source_error(detail: str, remaining_seconds: float) -> str:
@@ -332,6 +337,8 @@ class VerificationState:
     last_status: str | None = field(default=None, init=False)
     # The block's credential scope, set by `build_auth_tools`; the type tool's refusal reads it.
     allowed_credential_parameter_keys: Sequence[str] | None = field(default=None, init=False)
+    # Set with bind_credential_codes: a code typed from a credential's placeholder never reaches the model's view.
+    hide_codes_from_model: bool = field(default=False, init=False)
     # Set when the latest verification answer asked the model to keep waiting for a sign-in link.
     link_wait_since: float | None = field(default=None, init=False)
     giveup_deferrals: int = field(default=0, init=False)
@@ -445,7 +452,7 @@ class VerificationState:
             await authorize(code, owner_key)
         context = skyvern_context.current()
         if context is not None:
-            context.register_secret_value(code)
+            context.register_secret_value(code, hide_from_model=self.hide_codes_from_model)
         # The workflow-run registry is what redacts the code from this run's other blocks and artifacts.
         _register_runtime_otp_value_best_effort(workflow_run_id, code)
         self.record_delivery("type")
@@ -582,19 +589,36 @@ def _code_credential_not_in_use(task: Task, allowed_credential_parameter_keys: S
     )
 
 
+def _credential_totp_placeholder(task: Task, parameter_key: str | None) -> str | None:
+    """The TOTP placeholder of the run credential ``parameter_key``, or None when it cannot be read."""
+    workflow_run_id = task.workflow_run_id
+    if (
+        parameter_key is None
+        or not workflow_run_id
+        or not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id)
+    ):
+        return None
+    value = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id).values.get(parameter_key)
+    placeholder = value.get("totp") if isinstance(value, dict) else None
+    return placeholder if isinstance(placeholder, str) else None
+
+
 def build_auth_tools(
     task: Task,
     page_provider: PageProvider | None = None,
     state: VerificationState | None = None,
     allowed_credential_parameter_keys: Sequence[str] | None = None,
+    bind_credential_codes: bool = False,
 ) -> tuple[list[ToolSpec], str]:
     """Return (tools, system-prompt guidance) for verification handling. The code tool is always offered and
     answers with a status when no code source can produce a code; the link tool needs a link source and a
     page to navigate. `state`, if given, is mutated as the tools poll and deliver values; pass its
-    `block_finish` to `make_finish_tool`. A caller with no use for that gate can omit `state` entirely."""
+    `block_finish` to `make_finish_tool`. A caller with no use for that gate can omit `state` entirely.
+    `bind_credential_codes` hands a code made from a credential's seed out as that credential's placeholder."""
     if state is None:
         state = VerificationState(task=task)
     state.allowed_credential_parameter_keys = allowed_credential_parameter_keys
+    state.hide_codes_from_model = bind_credential_codes
     offer_link_tool = page_provider is not None and has_otp_source(
         task, expected_otp_type=OTPType.MAGIC_LINK, allowed_credential_parameter_keys=allowed_credential_parameter_keys
     )
@@ -616,6 +640,23 @@ def build_auth_tools(
     # polls were failing at its timeout. One says little about the source; a second in a row is a
     # verdict on it. Shared by both tools, like the budget, because they drain one source.
     empty_answer_streak = 0
+    # Fresh per poll call, so a code poll never marks a link poll's email as already read.
+    last_poll_contexts: (
+        tuple[EmailOTPVerificationContext, RawOTPVerificationContext, WebhookOTPVerificationContext] | None
+    ) = None
+
+    def _sources_checked(expected_otp_type: OTPType) -> str:
+        if not task.totp_identifier or last_poll_contexts is None:
+            return ""
+        email_context, raw_context, webhook_context = last_poll_contexts
+        sources = otp_sources_checked(
+            task.totp_identifier,
+            expected_otp_type,
+            email_context,
+            raw_context,
+            webhook_checked=webhook_context.responses > 0,
+        )
+        return f" {sources}"
 
     def _code_answer(text: str, *, arm: VerificationFailure | None = None) -> ToolResult:
         """A code-tool status that carries no code. Stays a ToolResult.error: the loop sends the model
@@ -628,7 +669,9 @@ def build_auth_tools(
 
     def _budget_exhausted(expected_otp_type: OTPType) -> ToolResult:
         if expected_otp_type == OTPType.TOTP:
-            return _code_answer(_CODE_BUDGET_SPENT, arm=VerificationFailure.BUDGET_EXHAUSTED)
+            return _code_answer(
+                f"{_CODE_BUDGET_SPENT}{_sources_checked(expected_otp_type)}", arm=VerificationFailure.BUDGET_EXHAUSTED
+            )
         state.arm(VerificationFailure.BUDGET_EXHAUSTED, _LINK_TOOL)
         return ToolResult.error(_LINK_BUDGET_EXHAUSTED)
 
@@ -660,7 +703,7 @@ def build_auth_tools(
         spent_out = _budget_spent(remaining)
         if expected_otp_type == OTPType.TOTP:
             return _code_answer(
-                _code_not_yet(remaining, webhook_answers),
+                _code_not_yet(remaining, webhook_answers, _sources_checked(expected_otp_type)),
                 arm=VerificationFailure.BUDGET_EXHAUSTED if spent_out else None,
             )
         state.awaiting_link_since = state.link_wait_since = time.monotonic()
@@ -691,7 +734,7 @@ def build_auth_tools(
 
     async def _poll(expected_otp_type: OTPType) -> ToolResult | OTPValue:
         """One budget-accounted polling slice. A ToolResult is the model-facing answer to return as-is."""
-        nonlocal first_poll_started_at, empty_answer_streak
+        nonlocal first_poll_started_at, empty_answer_streak, last_poll_contexts
         remaining = state.remaining_budget_seconds
         if remaining < _MIN_SLICE_SECONDS:
             return _budget_exhausted(expected_otp_type)
@@ -705,6 +748,10 @@ def build_auth_tools(
             if is_code and offer_link_tool
             else None
         )
+        email_context = EmailOTPVerificationContext()
+        raw_context = RawOTPVerificationContext()
+        webhook_context = WebhookOTPVerificationContext()
+        last_poll_contexts = (email_context, raw_context, webhook_context)
         started = time.monotonic()
         charged: float | None = None
 
@@ -725,11 +772,17 @@ def build_auth_tools(
                 allowed_credential_parameter_keys=allowed_credential_parameter_keys,
                 min_remaining_seconds=state.totp_min_remaining_seconds,
                 surface_magic_link=surface_magic_link,
+                email_context=email_context,
+                raw_context=raw_context,
+                webhook_context=webhook_context,
             )
             if otp_value is None:
                 if is_code:
                     return _code_empty(
-                        _code_not_yet(state.remaining_budget_seconds - _charged()),
+                        _code_not_yet(
+                            state.remaining_budget_seconds - _charged(),
+                            sources=_sources_checked(expected_otp_type),
+                        ),
                         reason=VerificationFailure.NO_CODE_TWICE,
                     )
                 return _empty_answer(_NO_LINK_ONCE, _NO_LINK_AVAILABLE, reason=VerificationFailure.NO_LINK_TWICE)
@@ -738,6 +791,8 @@ def build_auth_tools(
             # model -- a link when a code was asked for, a code when a link was, a link the browser
             # could not open -- and on all of them the run has stopped waiting on the SOURCE.
             state.awaiting_link_since = None
+            # A slice that delivered says nothing about why a later request came up empty.
+            last_poll_contexts = None
             return otp_value
         except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode) as exc:
             elapsed = _charged()
@@ -811,7 +866,7 @@ def build_auth_tools(
                 cached_otp_value = None
             else:
                 cached_otp_value = None
-                return _deliver_code(cached.value)
+                return _deliver_code(cached)
 
         polled = await _poll(OTPType.TOTP)
         if isinstance(polled, ToolResult):
@@ -844,9 +899,22 @@ def build_auth_tools(
                 _code_source_error("it returned a value that is not a code", state.remaining_budget_seconds),
                 arm=VerificationFailure.VALUE_NOT_A_CODE,
             )
-        return _deliver_code(otp_value.value)
+        return _deliver_code(otp_value)
 
-    def _deliver_code(code: str) -> ToolResult:
+    def _deliver_code(otp_value: OTPValue) -> ToolResult:
+        if bind_credential_codes and otp_value.from_credential_seed:
+            # The digits never reach the model. It types the credential's placeholder, and the field write
+            # judges that page against the credential's saved sites before it generates the code there.
+            placeholder = _credential_totp_placeholder(task, otp_value.credential_parameter_key)
+            if placeholder is None:
+                return _code_answer(NO_ONE_TIME_CODE_SOURCE)
+            # Counted as the digits were: whether the page still needs the code is the agent's verdict.
+            state.record_delivery("get_verification_code")
+            return ToolResult.ok(
+                f"verification_code: {placeholder}\n"
+                "Type this placeholder exactly as given; the field receives the one-time code."
+            )
+        code = otp_value.value
         context = skyvern_context.current()
         if context is not None:
             # Redact the code from this task's artifacts/logs (task-scoped, so bare tasks are covered).

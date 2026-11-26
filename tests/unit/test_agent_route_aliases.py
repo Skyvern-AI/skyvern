@@ -11,6 +11,7 @@ from collections.abc import Iterator
 import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
+from starlette.routing import BaseRoute
 
 from skyvern.forge.api_app import (
     _schema_refs,
@@ -18,7 +19,8 @@ from skyvern.forge.api_app import (
     register_agent_route_aliases,
     strip_internal_schema_properties,
 )
-from skyvern.forge.sdk.routes.routers import base_router
+from skyvern.forge.sdk.routes.otp_bound import otp_bound_route_marker
+from skyvern.forge.sdk.routes.routers import base_router, legacy_v2_router
 from tests.unit.shared_route_app import shared_route_app
 
 
@@ -82,6 +84,37 @@ def test_task_endpoints_hidden_from_docs_but_kept_in_sdk(app: FastAPI) -> None:
     run_task = app.openapi()["paths"]["/v1/run/tasks"]["post"]
     assert run_task["x-hidden"] is True
     assert run_task["x-fern-sdk-method-name"] == "run_task"
+    callable_paths = {route.path for route in app.router.routes if isinstance(route, APIRoute)}
+    assert {
+        "/v1/otp-bound/run/tasks",
+        "/v1/otp-bound/run/agents",
+        "/api/v1/otp-bound/tasks",
+        "/api/v1/otp-bound/workflows/{workflow_id}/run",
+        "/v1/otp-bound/workflows/runs/{workflow_run_id}/retry",
+    }.issubset(callable_paths)
+    assert "/otp-bound/tasks" in {route.path for route in legacy_v2_router.routes if isinstance(route, APIRoute)}
+
+    def otp_bound_paths(routes: list[BaseRoute]) -> set[str]:
+        return {
+            route.path
+            for route in routes
+            if isinstance(route, APIRoute)
+            and any(dependency.dependency is otp_bound_route_marker for dependency in route.dependencies)
+        }
+
+    assert otp_bound_paths(app.router.routes) == {
+        f"{prefix}/otp-bound/{path}{slash}"
+        for prefix, path in [
+            ("/v1", "run/tasks"),
+            ("/v1", "run/agents"),
+            ("/v1", "workflows/runs/{workflow_run_id}/retry"),
+            ("/v1", "credentials/totp"),
+            ("/api/v1", "tasks"),
+            ("/api/v1", "workflows/{workflow_id}/run"),
+        ]
+        for slash in ("", "/")
+    }
+    assert otp_bound_paths(legacy_v2_router.routes) == {"/otp-bound/tasks", "/otp-bound/tasks/"}
 
 
 def test_block_note_fields_stay_out_of_the_public_schema() -> None:

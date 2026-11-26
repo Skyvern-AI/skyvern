@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import stat
 import sys
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
-from skyvern.cli.setup_commands import _build_local_mcp_entry, _cursor_config_path, _windsurf_config_path, setup_app
+from skyvern.cli.setup_commands import _cursor_config_path, _windsurf_config_path, setup_app
 
 _FAKE_ENV = ("test-key", "https://api.skyvern.com")
 
@@ -60,12 +61,32 @@ def test_setup_claude_local_without_node_still_writes_stdio_config(
     assert data["mcpServers"]["skyvern"]["env"]["SKYVERN_API_KEY"] == "test-key"
 
 
-def test_local_mcp_entry_appends_non_default_scope_only() -> None:
-    default_entry = _build_local_mcp_entry("test-key", "http://localhost:8000")
-    scoped_entry = _build_local_mcp_entry("test-key", "http://localhost:8000", scope="operate")
+def test_setup_claude_code_project_backup_is_written_to_user_config_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_user_config_dir: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    config = project / ".mcp.json"
+    prior = '{"mcpServers": {"other": {"command": "other"}}}\n'
+    config.write_text(prior, encoding="utf-8")
+    monkeypatch.chdir(project)
+    _patch_env(monkeypatch)
+    monkeypatch.setattr("skyvern.cli.setup_commands._install_skills", lambda *a, **kw: None)
 
-    assert default_entry["args"] == ["-m", "skyvern", "run", "mcp"]
-    assert scoped_entry["args"][-4:] == ["run", "mcp", "--scope", "operate"]
+    result = CliRunner().invoke(setup_app, ["claude-code", "--project", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(config.read_text())
+    assert data["mcpServers"]["other"] == {"command": "other"}
+    assert data["mcpServers"]["skyvern"]["headers"]["x-api-key"] == "test-key"
+    assert [p.name for p in project.iterdir()] == [".mcp.json"]
+    backups = list((isolated_user_config_dir / "skyvern" / "mcp-backups").glob(".mcp.json.bak-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == prior
+    assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+    assert "Backup saved" in result.output
 
 
 def test_setup_claude_code_local_scope_operate_writes_args_suffix(

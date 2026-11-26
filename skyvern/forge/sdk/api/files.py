@@ -9,7 +9,7 @@ import shutil
 import tempfile
 import time
 import zipfile
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -20,7 +20,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlparse
 import aiohttp
 import filetype
 import structlog
-from multidict import CIMultiDictProxy
+from multidict import CIMultiDict, CIMultiDictProxy
 from yarl import URL
 
 from skyvern.config import settings
@@ -41,18 +41,20 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import (
     SSRFGuardedResolver,
     _url_origin,
+    prepare_redirect_credentials,
     ssrf_guarded_tcp_connector,
-    strip_cross_origin_redirect_credentials,
     validate_and_pin_fetch_url,
     validate_and_pin_redirect_url,
 )
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import (
+    GuardedHTTPResponseLimitExceeded,
     RedirectHopAuthorization,
     RedirectHopAuthorizer,
     authorize_request_hop_once,
 )
 from skyvern.forge.sdk.db.id import is_uploaded_file_id
+from skyvern.forge.sdk.services.artifact_reference_access import check_managed_file_reference
 from skyvern.services import uploaded_file_service
 from skyvern.utils.url_validators import (
     MAX_SAFE_REDIRECTS,
@@ -68,6 +70,8 @@ LOG = structlog.get_logger()
 _ORIGINAL_FILENAME_MARKER = "__skyvern_original_filename__"
 _ORIGINAL_FILENAME_TEMPLATE_RE = re.compile(r"\{\{\s*original_filename\s*\}\}")
 _LOCAL_DOWNLOAD_ROOTS: set[str] = {os.path.realpath(os.path.join(settings.ARTIFACT_STORAGE_PATH, "downloads"))}
+_GUARDED_FILE_REQUEST_TIMEOUT_SECONDS = 300.0
+_DEFAULT_RELAY_DOWNLOAD_LIMIT_BYTES = 500 * 1024 * 1024
 
 
 def register_local_download_root(download_root: str) -> None:
@@ -184,9 +188,9 @@ def _is_html_content_type(content_type: str | None) -> bool:
     return content_type.split(";")[0].strip().lower() == "text/html"
 
 
-async def _read_bounded_response_text(response: aiohttp.ClientResponse, max_bytes: int) -> str:
+async def _read_bounded_chunks_text(chunks: AsyncIterator[bytes], max_bytes: int) -> str:
     body = bytearray()
-    async for chunk in response.content.iter_chunked(1024):
+    async for chunk in chunks:
         body.extend(chunk)
         if len(body) >= max_bytes:
             break
@@ -349,11 +353,26 @@ def _raise_download_response_for_status(response: aiohttp.ClientResponse) -> Non
     )
 
 
+def _raise_relay_download_response_for_status(status: int, headers: dict[str, str]) -> None:
+    if status < HTTPStatus.BAD_REQUEST:
+        return
+
+    redacted_url = URL("https://redacted.invalid/")
+    response_headers = CIMultiDictProxy(CIMultiDict(headers))
+    raise aiohttp.ClientResponseError(
+        request_info=aiohttp.RequestInfo(redacted_url, "GET", response_headers),
+        history=(),
+        status=status,
+        headers=response_headers,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class GuardedFileRedirect:
     """Internal hop result surfaced only through the authorization dispatcher."""
 
     location: str
+    set_cookies: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,8 +449,10 @@ async def fetch_file_bytes(
     )
 
     request_headers = dict(headers or {})
+    request_cookies: dict[str, str] | None = None
     source_url: str | None = None
     max_size_bytes = max_size_mb * 1024 * 1024
+    relay_limit_bytes = min(max_size_bytes, _DEFAULT_RELAY_DOWNLOAD_LIMIT_BYTES)
     async with aiohttp.ClientSession(connector=ssrf_guarded_tcp_connector(resolver)) as session:
         for _ in range(MAX_SAFE_REDIRECTS + 1):
             check_active()
@@ -440,8 +461,43 @@ async def fetch_file_bytes(
 
             async def dispatch(_resolved_values: tuple[str, ...]) -> GuardedFileFetchHopResult:
                 check_active()
+                try:
+                    async with app.AGENT_FUNCTION.relay_http_download_hop(
+                        target_url=encoded_url,
+                        headers=request_headers,
+                        cookies=request_cookies,
+                        timeout_seconds=_GUARDED_FILE_REQUEST_TIMEOUT_SECONDS,
+                        response_limit_bytes=relay_limit_bytes,
+                        resolved_ips=lambda: resolver.pinned_ips_for_url(current_url),
+                    ) as relay_response:
+                        if relay_response is not None:
+                            check_active()
+                            location = relay_response.header("location")
+                            if relay_response.status_code in SAFE_REDIRECT_STATUS_CODES and location:
+                                return GuardedFileRedirect(location=location, set_cookies=relay_response.set_cookies)
+                            _raise_relay_download_response_for_status(
+                                relay_response.status_code, relay_response.headers
+                            )
+                            response_headers = CIMultiDictProxy(CIMultiDict(relay_response.headers))
+                            body = bytearray()
+                            async for chunk in relay_response.body:
+                                check_active()
+                                body.extend(chunk)
+                                if len(body) > relay_limit_bytes:
+                                    raise DownloadFileMaxSizeExceeded(relay_limit_bytes // (1024 * 1024))
+                            return GuardedFileResponse(
+                                body=bytes(body),
+                                content_type=response_headers.get("Content-Type", ""),
+                                filename=_determine_download_filename(filename, response_headers, current_url),
+                                status=relay_response.status_code,
+                            )
+                except GuardedHTTPResponseLimitExceeded as exc:
+                    raise DownloadFileMaxSizeExceeded(relay_limit_bytes // (1024 * 1024)) from exc
                 async with session.get(
-                    URL(encoded_url, encoded=True), headers=request_headers, allow_redirects=False
+                    URL(encoded_url, encoded=True),
+                    headers=request_headers,
+                    cookies=request_cookies,
+                    allow_redirects=False,
                 ) as response:
                     check_active()
                     location = response.headers.get("Location")
@@ -494,12 +550,13 @@ async def fetch_file_bytes(
                 raise HttpException(400, "[redacted]", "Redirect has no browser-canonicalizable HTTP origin")
             if allowed_redirect_origin is not None and _url_origin(next_url) != _url_origin(allowed_redirect_origin):
                 raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
-            request_headers, _ = strip_cross_origin_redirect_credentials(
+            request_headers, request_cookies = prepare_redirect_credentials(
                 request_headers,
-                None,
+                request_cookies,
                 current_url,
                 next_url,
                 cookie_jar=session.cookie_jar,
+                set_cookies=result.set_cookies,
             )
             source_url, current_url = current_url, next_url
 
@@ -632,6 +689,7 @@ async def download_file(
     staging_dir: str | None = None,
     *,
     limit_managed_file_size: bool = False,
+    require_managed_file_size: bool = False,
 ) -> str:
     if not url or not url.strip():
         raise ValueError("Download URL is empty — no file download was triggered by the browser")
@@ -665,10 +723,13 @@ async def download_file(
                 raise PermissionError(f"No permission to access storage URI: {url}")
 
             app.STORAGE.assert_managed_file_access(url, organization_id)
+            await check_managed_file_reference(url, organization_id)
             managed_limit_mb = max_size_mb if limit_managed_file_size else None
             if managed_limit_mb:
                 # Checked from storage metadata so an oversized object is refused before its bytes are loaded.
                 managed_size = await app.STORAGE.managed_file_size(url, organization_id)
+                if managed_size is None and require_managed_file_size:
+                    raise DownloadFileMaxSizeExceeded(managed_limit_mb)
                 if managed_size is not None and managed_size > managed_limit_mb * 1024 * 1024:
                     raise DownloadFileMaxSizeExceeded(managed_limit_mb)
 
@@ -714,95 +775,137 @@ async def download_file(
         if authorize_redirect is not None and not authorize_redirect(current_url):
             raise HttpException(400, "[redacted]", "Request blocked by policy")
         request_headers = dict(headers or {})
+        request_cookies: dict[str, str] | None = None
         source_url: str | None = None
         async with aiohttp.ClientSession(connector=ssrf_guarded_tcp_connector(resolver)) as session:
             LOG.info("Starting guarded file download")
+
+            async def consume_response_body(
+                response_headers: CIMultiDictProxy[str] | dict[str, str],
+                content_length: int | None,
+                chunks: AsyncIterator[bytes],
+                size_limit_mb: int | None,
+            ) -> str | GuardedFileRedirect:
+                if is_google_drive_download and _is_html_content_type(response_headers.get("Content-Type")):
+                    # Drive quirk: an HTML response is an interstitial or access-denied page, never the file.
+                    interstitial_body = await _read_bounded_chunks_text(chunks, _GOOGLE_DRIVE_INTERSTITIAL_MAX_BYTES)
+                    continuation_url = _extract_google_drive_interstitial_url(interstitial_body)
+                    if continuation_url is None:
+                        raise GoogleDriveFileNotAccessible(url=requested_url)
+                    LOG.info("Following Google Drive download interstitial", url=current_url)
+                    return GuardedFileRedirect(location=continuation_url)
+                if size_limit_mb and content_length and content_length > size_limit_mb * 1024 * 1024:
+                    raise DownloadFileMaxSizeExceeded(size_limit_mb)
+
+                if output_dir:
+                    download_dir_path = Path(output_dir)
+                    download_dir_path.mkdir(parents=True, exist_ok=True)
+                else:
+                    download_dir_path = Path(make_temp_directory(prefix="skyvern_downloads_"))
+
+                download_dir_resolved = download_dir_path.resolve()
+                file_name = _determine_download_filename(filename, response_headers, url)
+                allowed_dir = os.path.realpath(download_dir_resolved)
+                resolved_final_path = os.path.realpath(os.path.join(allowed_dir, file_name))
+                if (
+                    resolved_final_path == allowed_dir
+                    or not resolved_final_path.startswith(allowed_dir + os.sep)
+                    or os.path.dirname(resolved_final_path) != allowed_dir
+                ):
+                    raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
+                final_path = Path(resolved_final_path)
+
+                temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
+                file_path = Path(temp_file.name).resolve()
+                if file_path != download_dir_resolved and not file_path.is_relative_to(download_dir_resolved):
+                    temp_file.close()
+                    raise ValueError("Unsafe temporary file path created for download")
+
+                LOG.info("Downloading file to temporary path", file_path=str(file_path))
+                try:
+                    with temp_file as f:
+                        total_bytes_downloaded = 0
+                        async for chunk in chunks:
+                            f.write(chunk)
+                            total_bytes_downloaded += len(chunk)
+                            if size_limit_mb and total_bytes_downloaded > size_limit_mb * 1024 * 1024:
+                                raise DownloadFileMaxSizeExceeded(size_limit_mb)
+
+                    if preserve_existing_files:
+                        # Off the loop: a name collision compares whole files, and this
+                        # loop also drives every live browser session in the worker.
+                        final_path = await asyncio.to_thread(_publish_preserving_existing, file_path, final_path)
+                        # Linking leaves the temp name behind, unlike replace. Cleanup, not
+                        # publication: the file is staged, so failing to remove the spent
+                        # name must not fail the download.
+                        try:
+                            file_path.unlink(missing_ok=True)
+                        except OSError:
+                            LOG.warning("Failed to remove the temp download file", file_path=str(file_path))
+                    else:
+                        file_path.replace(final_path)
+                except BaseException:
+                    file_path.unlink(missing_ok=True)
+                    raise
+
+                LOG.info(f"File downloaded successfully to {final_path}")
+                return str(final_path)
+
             for _ in range(MAX_SAFE_REDIRECTS + 1):
                 encoded_url = encode_url(current_url)
 
                 async def dispatch(_resolved_values: tuple[str, ...]) -> str | GuardedFileRedirect:
+                    relay_limit_bytes = min(
+                        max_size_mb * 1024 * 1024 if max_size_mb else _DEFAULT_RELAY_DOWNLOAD_LIMIT_BYTES,
+                        _DEFAULT_RELAY_DOWNLOAD_LIMIT_BYTES,
+                    )
+                    relay_limit_mb = relay_limit_bytes // (1024 * 1024)
+                    try:
+                        async with app.AGENT_FUNCTION.relay_http_download_hop(
+                            organization_id=organization_id,
+                            target_url=encoded_url,
+                            headers=request_headers,
+                            cookies=request_cookies,
+                            timeout_seconds=_GUARDED_FILE_REQUEST_TIMEOUT_SECONDS,
+                            response_limit_bytes=relay_limit_bytes,
+                            resolved_ips=lambda: resolver.pinned_ips_for_url(current_url),
+                        ) as relay_response:
+                            if relay_response is not None:
+                                location = relay_response.header("location")
+                                if relay_response.status_code in SAFE_REDIRECT_STATUS_CODES and location:
+                                    return GuardedFileRedirect(
+                                        location=location, set_cookies=relay_response.set_cookies
+                                    )
+                                _raise_relay_download_response_for_status(
+                                    relay_response.status_code, relay_response.headers
+                                )
+                                response_headers = CIMultiDictProxy(CIMultiDict(relay_response.headers))
+                                result = await consume_response_body(
+                                    response_headers, None, relay_response.body, relay_limit_mb
+                                )
+                                if isinstance(result, GuardedFileRedirect):
+                                    return GuardedFileRedirect(result.location, relay_response.set_cookies)
+                                return result
+                    except GuardedHTTPResponseLimitExceeded as exc:
+                        raise DownloadFileMaxSizeExceeded(relay_limit_mb) from exc
+
                     async with session.get(
-                        URL(encoded_url, encoded=True), headers=request_headers, allow_redirects=False
+                        URL(encoded_url, encoded=True),
+                        headers=request_headers,
+                        cookies=request_cookies,
+                        allow_redirects=False,
                     ) as response:
                         location = response.headers.get("Location")
                         if response.status in SAFE_REDIRECT_STATUS_CODES and location:
                             return GuardedFileRedirect(location=location)
 
                         _raise_download_response_for_status(response)
-                        if is_google_drive_download and _is_html_content_type(response.headers.get("Content-Type")):
-                            # Drive quirk: uc?export=download answers with an HTML interstitial — a
-                            # virus-scan confirm form for large files, a sign-in page for
-                            # inaccessible ones — so an HTML body is never the requested file.
-                            interstitial_body = await _read_bounded_response_text(
-                                response, _GOOGLE_DRIVE_INTERSTITIAL_MAX_BYTES
-                            )
-                            continuation_url = _extract_google_drive_interstitial_url(interstitial_body)
-                            if continuation_url is None:
-                                raise GoogleDriveFileNotAccessible(url=requested_url)
-                            LOG.info("Following Google Drive download interstitial", url=current_url)
-                            return GuardedFileRedirect(location=continuation_url)
-                        if (
-                            max_size_mb
-                            and response.content_length
-                            and response.content_length > max_size_mb * 1024 * 1024
-                        ):
-                            raise DownloadFileMaxSizeExceeded(max_size_mb)
-
-                        if output_dir:
-                            download_dir_path = Path(output_dir)
-                            download_dir_path.mkdir(parents=True, exist_ok=True)
-                        else:
-                            download_dir_path = Path(make_temp_directory(prefix="skyvern_downloads_"))
-
-                        download_dir_resolved = download_dir_path.resolve()
-                        file_name = _determine_download_filename(filename, response.headers, url)
-                        allowed_dir = os.path.realpath(download_dir_resolved)
-                        resolved_final_path = os.path.realpath(os.path.join(allowed_dir, file_name))
-                        if (
-                            resolved_final_path == allowed_dir
-                            or not resolved_final_path.startswith(allowed_dir + os.sep)
-                            or os.path.dirname(resolved_final_path) != allowed_dir
-                        ):
-                            raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
-                        final_path = Path(resolved_final_path)
-
-                        temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
-                        file_path = Path(temp_file.name).resolve()
-                        if file_path != download_dir_resolved and not file_path.is_relative_to(download_dir_resolved):
-                            temp_file.close()
-                            raise ValueError("Unsafe temporary file path created for download")
-
-                        LOG.info("Downloading file to temporary path", file_path=str(file_path))
-                        try:
-                            with temp_file as f:
-                                total_bytes_downloaded = 0
-                                async for chunk in response.content.iter_chunked(1024):
-                                    f.write(chunk)
-                                    total_bytes_downloaded += len(chunk)
-                                    if max_size_mb and total_bytes_downloaded > max_size_mb * 1024 * 1024:
-                                        raise DownloadFileMaxSizeExceeded(max_size_mb)
-
-                            if preserve_existing_files:
-                                # Off the loop: a name collision compares whole files, and this
-                                # loop also drives every live browser session in the worker.
-                                final_path = await asyncio.to_thread(
-                                    _publish_preserving_existing, file_path, final_path
-                                )
-                                # Linking leaves the temp name behind, unlike replace. Cleanup, not
-                                # publication: the file is staged, so failing to remove the spent
-                                # name must not fail the download.
-                                try:
-                                    file_path.unlink(missing_ok=True)
-                                except OSError:
-                                    LOG.warning("Failed to remove the temp download file", file_path=str(file_path))
-                            else:
-                                file_path.replace(final_path)
-                        except BaseException:
-                            file_path.unlink(missing_ok=True)
-                            raise
-
-                        LOG.info(f"File downloaded successfully to {final_path}")
-                        return str(final_path)
+                        return await consume_response_body(
+                            response.headers,
+                            response.content_length,
+                            response.content.iter_chunked(1024).__aiter__(),
+                            max_size_mb,
+                        )
 
                 authorization = RedirectHopAuthorization(
                     source_url=source_url,
@@ -826,12 +929,13 @@ async def download_file(
                     raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
                 if authorize_redirect is not None and not authorize_redirect(next_url):
                     raise HttpException(400, "[redacted]", "Redirect blocked by policy")
-                request_headers, _ = strip_cross_origin_redirect_credentials(
+                request_headers, request_cookies = prepare_redirect_credentials(
                     request_headers,
-                    None,
+                    request_cookies,
                     current_url,
                     next_url,
                     cookie_jar=session.cookie_jar,
+                    set_cookies=result.set_cookies,
                 )
                 source_url, current_url = current_url, next_url
             raise SkyvernHTTPException(
@@ -1308,6 +1412,37 @@ async def wait_for_pending_extension_rename(download_dir: str, filename: str) ->
     if not os.path.exists(path):
         return _resolve_extension_rename_twin(download_dir, filename)
     return filename
+
+
+async def downloads_to_save(
+    download_dir: str, files: Mapping[str, str] | None, retry_attempt_started_at: datetime | None
+) -> list[tuple[str, str]]:
+    """Each file to save as (key under the run's download prefix, local path): without ``files``, the settled files at
+    the top of the download directory; with it, each name in the folder its path has inside that directory, else at
+    the top."""
+    if files is not None:
+        root = Path(download_dir).resolve()
+        entries = []
+        for name, path in files.items():
+            source = Path(path).resolve()
+            if name != os.path.basename(name) or name in {"", ".", ".."} or not source.is_file():
+                LOG.warning("Run file not saved: bad name or missing file", run_file=name, path=path)
+                continue
+            folder = source.parent.relative_to(root) if source.is_relative_to(root) else Path()
+            entries.append(((folder / name).as_posix(), str(source)))
+        return entries
+    entries = []
+    for file in os.listdir(download_dir):
+        if file.endswith(BROWSER_DOWNLOADING_SUFFIX) or not os.path.isfile(os.path.join(download_dir, file)):
+            continue
+        file = await wait_for_pending_extension_rename(download_dir, file)
+        path = os.path.join(download_dir, file)
+        if not os.path.isfile(path):
+            continue
+        if retry_attempt_started_at is not None and not is_file_from_retry_attempt(path, retry_attempt_started_at):
+            continue
+        entries.append((file, path))
+    return entries
 
 
 def _resolve_extension_rename_twin(download_dir: str, filename: str) -> str:

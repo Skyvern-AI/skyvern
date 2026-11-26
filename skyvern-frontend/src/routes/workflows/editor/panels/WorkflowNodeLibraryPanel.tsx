@@ -95,9 +95,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
     onNodeClick({
       nodeType,
       integrationAction,
-      label: integrationAction
-        ? `${integrationAction.integrationId}_${integrationAction.actionId}`
-        : undefined,
+      label: integrationAction ? integrationAction.integrationId : undefined,
       next: workflowPanelData?.next ?? null,
       parent: workflowPanelData?.parent,
       previous: workflowPanelData?.previous ?? null,

@@ -23,7 +23,7 @@ keywords:
   - coding agent
 ---
 
-Skyvern's MCP server gives your AI client 121 browser and automation tools. Your assistant can open a cloud browser, click and type, extract data, log in with stored credentials, and build and run agents, all from a chat or a coding session.
+Skyvern's MCP server gives your AI client 128 browser and automation tools. Your assistant can open a cloud browser, click and type, extract data, log in with stored credentials, and build and run agents, all from a chat or a coding session.
 
 The hosted server is at:
 
@@ -45,7 +45,7 @@ The sections below show the same setups.
 
 Use this for Claude Code, Cursor, Codex CLI, Grok Build, ChatGPT and Claude custom connectors. There is no API key in the config. The client opens your browser, you sign in to Skyvern, and the client stores the token.
 
-When a Member signs in, the token the client stores is a key bound to that Member, not the organization API key. It acts as that Member and can't read or rotate the organization's key.
+When an Admin or a Member signs in, the token the client stores is a key bound to that person, not the organization API key. It acts as that person and can't read or rotate the organization's key. A Billing Admin can't sign in to the MCP server.
 
 <Tabs>
 <Tab title="Claude Code">
@@ -299,19 +299,20 @@ Your assistant picks tools from your request. "Go to Hacker News and get the top
 | Logins | `skyvern_login`, `skyvern_credential_list` | Log in with stored credentials, including 2FA |
 | Agents | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status` | Build, run and monitor agents |
 | Schedules and code | `skyvern_schedule_create`, `skyvern_script_get_code` | Schedule agents and inspect cached code |
+| Ember | `skyvern_ember_send`, `skyvern_ember_check`, `skyvern_ember_list`, `skyvern_ember_stop`, `skyvern_ember_answer`, `skyvern_ember_decide` | Ask Ember (the new name for Skyvern's Workflow Copilot; the app may still say Copilot) to build, test or fix an agent, then watch, steer or stop its turn, and pass on the user's answers and decisions |
 | Feedback | `skyvern_feedback` | Report a Skyvern problem or missing capability to the team that runs the server |
 
 Other tools cover tabs, iframes, file upload, network and console inspection, browser profiles, folders and stored browser state.
 
 ### Limit the tool list with scopes
 
-121 tools is a lot of context for some clients. A scope serves a smaller set:
+128 tools is a lot of context for some clients. A scope serves a smaller set:
 
 | Scope | Tools | Use it to |
 |---|---:|---|
-| `all` (default) | 121 | Everything |
-| `operate` | 31 | Run, monitor and inspect agents that already exist. No browser tools. |
-| `build` | 63 | Create and edit agents, with a browser for inspecting pages |
+| `all` (default) | 128 | Everything |
+| `operate` | 37 | Run, monitor and inspect agents that already exist, and ask Ember to build. No browser tools. |
+| `build` | 69 | Create and edit agents, with a browser for inspecting pages |
 | `browser` | 55 | Drive a browser directly |
 | `lean` | 34 | A small browser set with direct actions and schema-constrained output |
 
@@ -384,7 +385,7 @@ skyvern browser extract --prompt "Get the title of the top post"
 skyvern browser session close
 ```
 
-`skyvern setup claude-code`, run inside a project, also installs the bundled skills into `.claude/skills/`, including `/qa`. `/qa` reads your git diff, writes browser tests for the change and runs them against your dev server.
+`skyvern setup claude-code`, run inside a project, also installs the bundled skills into `.claude/skills/`, including `/qa`. `/qa` reads your git diff, picks how to check the change (browser QA for frontend changes, API checks or your repo's own tests for backend changes) and reports pass or fail with evidence.
 
 To have a coding agent write SDK code instead, use the prompt in [Hand it to your coding agent](/developers/getting-started/quickstart#hand-it-to-your-coding-agent).
 

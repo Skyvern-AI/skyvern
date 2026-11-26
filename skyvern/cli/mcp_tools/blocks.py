@@ -98,7 +98,9 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "download_to_s3": "Download a URL directly to S3 storage",
     "data_export": "Write schema-defined workflow records to a Parquet file",
     "upload_to_s3": "Upload local content to S3",
-    "file_url_parser": "Parse a file (CSV/Excel/PDF/image/DOCX) from a URL; ZIP archives are unzipped to a file list",
+    "file_url_parser": "Parse a file (CSV/Excel/PDF/image/DOCX) from a URL. A ZIP archive returns its files; each "
+    "is saved as one of the run's downloaded files and has a file_path that file_url_parser and split_pdf take as "
+    "file_url.",
     "pdf_parser": "Extract structured data from a PDF document",
     "human_interaction": "Pause workflow for human approval via email",
     "print_page": "Print the current page to PDF",
@@ -369,6 +371,7 @@ WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
     "text_prompt_block": "** TEXT PROMPT BLOCK (text_prompt) **",
     "http_request_block": "** HTTP REQUEST BLOCK (http_request) **",
     "google_sheets_write_block": "** GOOGLE SHEETS WRITE BLOCK (google_sheets_write) **",
+    "agent_step_block": "** AGENT STEP BLOCK (agent_step) **",
     "parameter_templating": "** PARAMETER TEMPLATING **",
     "error_handling_and_retries": "** ERROR HANDLING AND RETRIES **",
     "workflow_execution_flow": "** WORKFLOW EXECUTION FLOW **",
@@ -384,6 +387,7 @@ _knowledge_topic_cache: dict[str, dict[str, str]] | None = None
 
 CODE_BLOCK_RUNTIME_TOPIC = "code_block_runtime"
 NOTES_KNOWLEDGE_TOPIC = "notes_between_blocks"
+AGENT_STEP_KNOWLEDGE_TOPIC = "agent_step_block"
 
 
 def _code_block_runtime_topic() -> dict[str, str]:
@@ -605,6 +609,8 @@ async def skyvern_workflow_knowledge(
             ),
         )
     knowledge = {**knowledge, CODE_BLOCK_RUNTIME_TOPIC: _code_block_runtime_topic()}
+    if not await _agent_step_enabled():
+        knowledge.pop(AGENT_STEP_KNOWLEDGE_TOPIC)
     catalog = list(knowledge)
 
     if topics is None:

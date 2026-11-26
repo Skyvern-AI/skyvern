@@ -51,6 +51,12 @@ class FakeWorkflowRunContext:
     def get_powerbi_hop_refusal(self, block_label: str) -> str | None:
         return self._powerbi_hop_refusals.get(block_label)
 
+    def get_google_drive_hop_token(self, block_label: str) -> str | None:
+        return self.get_powerbi_hop_token(block_label)
+
+    def get_google_drive_hop_refusal(self, block_label: str) -> str | None:
+        return self.get_powerbi_hop_refusal(block_label)
+
     def get_block_metadata(self, label: str | None) -> dict[str, Any]:
         if not label:
             return {}
@@ -83,9 +89,6 @@ class FakeWorkflowRunContext:
     def build_workflow_run_summary(self) -> dict[str, Any]:
         return {}
 
-    def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
-        return data
-
     def get_original_secret_value_or_none(self, secret_id_or_value: Any) -> Any:
         if isinstance(secret_id_or_value, str) and secret_id_or_value in self.secrets:
             return self.secrets[secret_id_or_value]
@@ -99,3 +102,4 @@ class FakeWorkflowRunContext:
     reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
     record_block_outcome = WorkflowRunContext.record_block_outcome
     get_block_outcome = WorkflowRunContext.get_block_outcome
+    mask_secrets_in_data = WorkflowRunContext.mask_secrets_in_data

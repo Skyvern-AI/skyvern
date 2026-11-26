@@ -1,3 +1,4 @@
+import base64
 import logging
 import os
 import platform
@@ -6,7 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
@@ -81,7 +82,7 @@ class CodeBlockMode(StrEnum):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=_DEFAULT_ENV_FILES, extra="ignore")
+    model_config = SettingsConfigDict(env_file=_DEFAULT_ENV_FILES, extra="ignore", hide_input_in_errors=True)
 
     # settings for experimentation
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
@@ -137,6 +138,7 @@ class Settings(BaseSettings):
     VIDEO_COMPRESSION_TIMEOUT_SECONDS: float = 300.0
     VIDEO_FINAL_SYNC_TIMEOUT_SECONDS: float = 750.0
     HAR_PATH: str | None = "./har"
+    BROWSER_HAR_RECORDING_ENABLED: bool = True
     LOG_PATH: str = "./log"
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
@@ -481,11 +483,19 @@ class Settings(BaseSettings):
 
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
+    USE_STAGING_PLATFORM_SECRETS: bool = False
     MAX_UPLOAD_FILE_SIZE: int = 30 * 1024 * 1024  # 30 MB
     # Extensions added to the /v1/upload_file allowlist. Set it as a JSON list, e.g. '["gz","epub"]';
     # a bare comma list fails at startup. The executable and markup denylist still applies.
     UPLOAD_EXTRA_ALLOWED_EXTENSIONS: list[str] = []
     MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
+    # Cluster-local gRPC endpoint for credential-free FileParserBlock decoding. Empty keeps the OSS/local parser;
+    # managed worker charts always set it and therefore fail closed rather than parsing beside worker credentials.
+    FILE_PARSER_SERVICE_TARGET: str = ""
+    # CSV and Excel parse limits for the local FileParserBlock; the isolated parser service uses the constants.
+    FILE_PARSER_MAX_ROWS: int = Field(default=constants.FILE_PARSER_MAX_ROWS, gt=0)
+    FILE_PARSER_MAX_CELLS: int = Field(default=constants.FILE_PARSER_MAX_CELLS, gt=0)
+    FILE_PARSER_MAX_DECODED_BYTES: int = Field(default=constants.FILE_PARSER_MAX_DECODED_BYTES, gt=0)
     # Most memory a pdfplumber child may add (RLIMIT_AS on Linux, an RSS watchdog everywhere); rendering a 300 dpi A0
     # or A1 scan for OCR can need more than 512 MiB. A pod with less free memory than this, after a 256 MiB margin and
     # the result reserve, gets what is left, and under 128 MiB the call fails, because memory.oom.group kills the whole
@@ -900,6 +910,12 @@ class Settings(BaseSettings):
     AZURE_GPT6_1_TERRA_API_BASE: str | None = None
     AZURE_GPT6_1_TERRA_API_VERSION: str = "2025-04-01-preview"
 
+    ENABLE_AZURE_GPT6_2_SOL: bool = False
+    AZURE_GPT6_2_SOL_DEPLOYMENT: str = "gpt-6.2-sol"
+    AZURE_GPT6_2_SOL_API_KEY: str | None = None
+    AZURE_GPT6_2_SOL_API_BASE: str | None = None
+    AZURE_GPT6_2_SOL_API_VERSION: str = "2025-04-01-preview"
+
     ENABLE_AZURE_GPT6_LUNA: bool = False
     AZURE_GPT6_LUNA_DEPLOYMENT: str = "gpt-6-luna"
     AZURE_GPT6_LUNA_API_KEY: str | None = None
@@ -1028,6 +1044,9 @@ class Settings(BaseSettings):
 
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_SECRET_ARTIFACT_REDACTION: bool = True
+    # On by default: runs without Mask Secrets still have known secret values of 8+ characters scrubbed from
+    # stored text artifacts. Set false to turn that tier off; Mask Secrets runs are not affected.
+    ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS: bool = True
     ENABLE_SECRET_VISUAL_MASKING: bool = True
     CODE_BLOCK_MODE: CodeBlockMode = CodeBlockMode.enabled
     DISABLE_CODE_BLOCK_EXECUTION: bool | None = None
@@ -1049,6 +1068,12 @@ class Settings(BaseSettings):
     PYLON_IDENTITY_VERIFICATION_SECRET: str | None = None
     """
     The secret used to sign the email/identity of the user.
+    """
+
+    ARTIFACT_REFERENCE_READ_CHECK: bool = True
+    """
+    Withhold the artifacts a workflow run's outputs and file inputs name when that run cannot read them, and the
+    file inputs of a task that runs outside a workflow run. False only logs each decision.
     """
 
     ARTIFACT_CONTENT_HMAC_KEYRING: str | None = None
@@ -1100,9 +1125,16 @@ class Settings(BaseSettings):
     """
 
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
+    ENCRYPTOR_AES_SCOPED_SECRET_KEY: str | None = None
+    ENCRYPTOR_AES_WRITE_SCOPED: bool = False
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
+    ENCRYPTOR_AES_SECRET_KEY_V2: str | None = None
+    ENCRYPTOR_AES_SALT_V2: str | None = None
+    ENCRYPTOR_AES_WRITE_VERSION: Literal["v1"] = "v1"
     ENABLE_ENCRYPTION: bool = False
+    SKYVERN_ENCRYPT_BROWSER_PROFILES: bool = False
+    SKYVERN_ARTIFACT_ENCRYPTION_KEYS: tuple[SecretStr, ...] = ()
 
     # Google OAuth settings (used by the Google Sheets connector)
     GOOGLE_OAUTH_CLIENT_ID: str | None = None
@@ -1221,6 +1253,23 @@ class Settings(BaseSettings):
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
 
+    def artifact_encryption_roots(self) -> tuple[bytes, ...]:
+        try:
+            roots = tuple(
+                base64.b64decode(key.get_secret_value(), validate=True) for key in self.SKYVERN_ARTIFACT_ENCRYPTION_KEYS
+            )
+        except ValueError:
+            raise RuntimeError("SKYVERN_ARTIFACT_ENCRYPTION_KEYS must contain base64-encoded 32-byte roots") from None
+        if not roots or any(len(root) != 32 for root in roots):
+            raise RuntimeError("SKYVERN_ARTIFACT_ENCRYPTION_KEYS must contain base64-encoded 32-byte roots")
+        return roots
+
+    @model_validator(mode="after")
+    def _validate_artifact_writer(self) -> "Settings":
+        if self.SKYVERN_ENCRYPT_BROWSER_PROFILES:
+            self.artifact_encryption_roots()
+        return self
+
     @model_validator(mode="after")
     def _resolve_legacy_code_block_settings(self) -> "Settings":
         # Must be captured before CODE_BLOCK_MODE is assigned below: pydantic adds an assigned
@@ -1291,6 +1340,12 @@ class Settings(BaseSettings):
     @property
     def is_skyvern_base_url_explicitly_configured(self) -> bool:
         return "SKYVERN_BASE_URL" in self.model_fields_set
+
+    def platform_secret_name(self, name: str) -> str:
+        """Resolve an approved platform secret name immediately before a Secrets Manager read."""
+        if self.USE_STAGING_PLATFORM_SECRETS and self.ENV == "staging" and self.AWS_REGION == "us-east-1":
+            return f"{name}_staging"
+        return name
 
     def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """

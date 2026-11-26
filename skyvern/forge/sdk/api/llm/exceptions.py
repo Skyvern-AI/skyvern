@@ -1,4 +1,5 @@
 from skyvern.exceptions import SkyvernException
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 
 # Exception type name constants
 LLM_PROVIDER_ERROR_TYPE = "LLMProviderError"
@@ -57,17 +58,69 @@ class InvalidLLMConfigError(BaseLLMError):
         super().__init__(f"LLM config with key {llm_key} is not a valid LLMConfig")
 
 
+class CustomLLMNeedsResaveError(BaseLLMError):
+    def __init__(self, llm_key: str) -> None:
+        self.llm_key = llm_key
+        super().__init__(
+            "This custom model must be saved again before it can run: remove the routing parameter from its "
+            "advanced parameters and re-enter its API key in Settings."
+        )
+
+
+def _cause_detail(cause: BaseException | None) -> str:
+    return f" — {type(cause).__name__}: {cause}" if cause else ""
+
+
+class WithheldProviderError(Exception):
+    """Stands in for a provider error whose message may quote the document content it was sent."""
+
+    def __init__(self, error: BaseException) -> None:
+        status_code = getattr(error, "status_code", None)
+        self.status_code = status_code if isinstance(status_code, int) else None
+        self.error_type = f"{type(error).__module__}.{type(error).__name__}"
+        self.message_fingerprint = diagnostic_fingerprint(str(error))
+        details = [f"status {self.status_code}"] if self.status_code is not None else []
+        if self.status_code == 429 or "RateLimit" in type(error).__name__:
+            # The run failure classifier attributes a rate limit to the LLM only when these words appear.
+            details.append("an LLM rate limit")
+        suffix = f" ({', '.join(details)})" if details else ""
+        super().__init__(
+            f"{type(error).__name__}{suffix}; provider message withheld, fingerprint {self.message_fingerprint}"
+        )
+
+
+def cause_type_name(error: BaseException) -> str | None:
+    cause = error.__cause__
+    if isinstance(cause, WithheldProviderError):
+        return cause.error_type.rpartition(".")[2]
+    return type(cause).__name__ if cause is not None else None
+
+
 class LLMProviderError(BaseLLMError):
     def __init__(self, llm_key: str, cause: Exception | None = None) -> None:
-        detail = f" — {type(cause).__name__}: {cause}" if cause else ""
-        super().__init__(f"Error while using LLMProvider {llm_key}{detail}")
+        super().__init__(f"Error while using LLMProvider {llm_key}{_cause_detail(cause)}")
 
 
 class LLMProviderErrorRetryableTask(LLMProviderError):
     def __init__(self, llm_key: str, cause: Exception | None = None) -> None:
-        detail = f" — {type(cause).__name__}: {cause}" if cause else ""
         # Skip LLMProviderError.__init__ to set our own message prefix
-        SkyvernException.__init__(self, f"Retryable error while using LLMProvider {llm_key}{detail}")
+        SkyvernException.__init__(self, f"Retryable error while using LLMProvider {llm_key}{_cause_detail(cause)}")
+
+
+def withhold_provider_text(error: LLMProviderError) -> None:
+    cause = error.__cause__
+    if cause is None or isinstance(cause, WithheldProviderError):
+        return
+    stand_in = WithheldProviderError(cause)
+    message = str(error)
+    if message.endswith(old_detail := _cause_detail(cause)):
+        message = message[: -len(old_detail)] + _cause_detail(stand_in)
+    error.message = message
+    error.args = (message,)
+    error.__cause__ = stand_in
+    # The original error stays reachable through __context__ unless it is dropped too.
+    error.__context__ = None
+    error.__suppress_context__ = True
 
 
 class LLMOutputTruncatedError(InvalidLLMResponseFormat):

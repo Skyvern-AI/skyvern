@@ -48,7 +48,8 @@ function PowerBIQueryEditorBody({
     editable: data.editable,
   });
   const scopeReadOnly = useWorkflowScopeReadOnly();
-  const { powerBIDatasetPicker: DatasetPicker } = usePageSlots();
+  const { powerBIDatasetPicker: DatasetPicker, powerBIDaxAssist: DaxAssist } =
+    usePageSlots();
   const [showTemplate, setShowTemplate] = useState(
     () => data.datasetId.includes("{{") || data.datasetId.includes("{%"),
   );
@@ -74,6 +75,7 @@ function PowerBIQueryEditorBody({
         </div>
         <CredentialSourceSelector
           provider="powerbi"
+          nodeId={blockId}
           credentialSource={data.credentialSource ?? "native"}
           connectionId={data.connectionId}
           disabled={!canEdit}
@@ -89,8 +91,12 @@ function PowerBIQueryEditorBody({
         </Label>
         {DatasetPicker ? (
           <DatasetPicker
+            credentialSource={data.credentialSource}
             connectionId={
-              data.credentialSource === "nango" ? data.connectionId : ""
+              data.credentialSource === "nango" ||
+              data.credentialSource === "native"
+                ? data.connectionId
+                : ""
             }
             value={data.datasetId}
             disabled={!canEdit}
@@ -124,6 +130,18 @@ function PowerBIQueryEditorBody({
           />
         ) : null}
       </div>
+
+      {DaxAssist ? (
+        <DaxAssist
+          credentialSource={data.credentialSource}
+          connectionId={data.connectionId}
+          datasetId={data.datasetId}
+          currentQuery={data.query}
+          maxRows={data.maxRows}
+          disabled={!canEdit}
+          onUse={(query) => update({ query })}
+        />
+      ) : null}
 
       <div className="space-y-2">
         <div className="flex gap-2">

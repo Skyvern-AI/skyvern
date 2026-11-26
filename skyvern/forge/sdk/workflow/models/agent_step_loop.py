@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -36,7 +38,8 @@ from openai.types.shared import Reasoning
 from pydantic import JsonValue, ValidationError
 
 from skyvern.config import settings
-from skyvern.exceptions import WorkflowRunNotFound
+from skyvern.constants import EMBER_RUN_CREATOR
+from skyvern.exceptions import ScrapingFailed, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.agents.skills import (
     EVERYONE_SKILL_LABEL,
@@ -48,33 +51,28 @@ from skyvern.forge.sdk.agents.skills import (
     SkillSession,
     render_skills_catalog,
 )
+from skyvern.forge.sdk.api.llm.agents_model import current_model_attempt_telemetry, model_attempt_telemetry_scope
+from skyvern.forge.sdk.api.llm.agents_model_resolver import resolve_agents_model
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.copilot_model_usage import copilot_usage_observer
+from skyvern.forge.sdk.api.llm.model_usage import model_usage_observer
+from skyvern.forge.sdk.api.llm.prompt_cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
-from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-from skyvern.forge.sdk.copilot.model_telemetry import (
-    CopilotLitellmModel,
-    current_model_attempt_telemetry,
-    model_attempt_telemetry_scope,
-)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.integrations.account_fit import block_fit, block_needs, connection_fit
 from skyvern.forge.sdk.integrations.catalog import IntegrationAction, IntegrationEntry
 from skyvern.forge.sdk.integrations.connected_accounts import (
-    COPILOT_RUN_CREATOR,
     OrgConnection,
     org_connections_by_id,
     run_connection_ids,
     settable_connected_account_fields,
 )
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext, _is_platform_smtp_aws_key
 from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
-from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.agent_step_tools import (
     CATALOG_ACTION_TOOLS,
     DEDICATED_BLOCK_TOOLS,
@@ -112,10 +110,12 @@ from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, IntegrationActionBlockYAML
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.secret_redaction import redact_secrets_from_text
-from skyvern.webeye.actions.actions import UploadFileAction
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action, GotoUrlAction, UploadFileAction, reasoning_is_turn_scoped
 
 if TYPE_CHECKING:
     from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
+    from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 
 LOG = structlog.get_logger()
 _MAX_TOOL_RESULT_CHARS = 20_000
@@ -123,8 +123,25 @@ _MAX_TRAIL_ARGUMENT_CHARS = 4_000
 _MAX_TRAIL_BLOCK_CHARS = 64_000
 _MAX_TRAIL_BYTES = 512 * 1024
 _TRAIL_WRITE_SECONDS = 2
+_PAGE_TITLE_SECONDS = 2
 _MASK = "*****"
 _Fact = str | list[dict[str, str]]
+# Characters that render as nothing and that json.dumps(ensure_ascii=False) leaves raw; written as the escape
+# ensure_ascii would give, so hidden page text stays visible to the model.
+_INVISIBLE_ESCAPES = {
+    code_point: json.dumps(chr(code_point))[1:-1]
+    for first, last in (
+        (0x85, 0x85),
+        (0x200B, 0x200F),
+        (0x2028, 0x202E),
+        (0x2060, 0x2060),
+        (0x2066, 0x2069),
+        (0xFEFF, 0xFEFF),
+        (0xE0000, 0xE007F),
+    )
+    for code_point in range(first, last + 1)
+}
+_OPAQUE_TOKEN = re.compile(rf"{_TOKEN_PREFIX}[0-9a-f]{{8}}")
 
 _INSTRUCTIONS = (
     "You are one step of an unattended workflow run; nobody can answer questions. "
@@ -164,11 +181,10 @@ class _RunState:
     actions: dict[str, tuple[IntegrationEntry, IntegrationAction, list[OrgConnection]]] = field(default_factory=dict)
     workflow_system_prompt: str | None = None
     tools: list[str] | None = None
-    file_keys: list[str] = field(default_factory=list)
     # Kept out of run_context.parameters, which outlives this execution while child labels repeat in the next one.
     child_outputs: dict[str, OutputParameter] = field(default_factory=dict)
     calls: list[dict[str, Any]] = field(default_factory=list)
-    # The report each child block returned, by label, so read_run_data can page the text the model was shown.
+    # The report each child block or page command returned, by name, so read_run_data can page what the model saw.
     results: dict[str, dict[str, Any]] = field(default_factory=dict)
     answer: dict[str, Any] | None = None
     drained: bool = False
@@ -498,18 +514,28 @@ def _record_call(
 
 
 def resolve_agent_model(llm_key: str) -> tuple[str | Model, RunConfig]:
-    model_name, copilot_run_config, _, _ = resolve_model_config(None, llm_key_override=llm_key)
-    model = copilot_run_config.model
-    # Copilot's RunConfig also carries session callbacks that read its chat context, and an input filter that rewrites
-    # recent tool outputs. Without that filter this history only grows, so its newest tool output can be cached.
-    if isinstance(model, CopilotLitellmModel):
-        model.history_append_only = True
-    return model_name, RunConfig(
-        model=model,
-        model_provider=copilot_run_config.model_provider,
-        model_settings=copilot_run_config.model_settings,
+    resolved = resolve_agents_model(llm_key, agent_name="agent_step")
+    return resolved.model_name, RunConfig(
+        model=resolved.model,
+        model_provider=resolved.provider,
+        model_settings=resolved.model_settings,
         tracing_disabled=True,
     )
+
+
+def _finish_argument_facts(answer: JsonValue, schema: dict[str, Any]) -> list[str]:
+    properties = schema.get("properties")
+    if not isinstance(answer, dict) or not isinstance(properties, dict):
+        return []
+    absent = [key for key in properties if key not in answer]
+    facts = []
+    for key, value in answer.items():
+        inside = [name for name in absent if f'<parameter name="{name}">' in value] if isinstance(value, str) else []
+        if inside:
+            tags = " and ".join(f'<parameter name="{name}">' for name in inside)
+            facts.append(f"The value of {key} contains {tags}, and the arguments have no {' or '.join(inside)} key.")
+    facts += [f"{key} is not one of finish's fields." for key in answer if key not in properties]
+    return facts
 
 
 def _finish_tool(schema: dict[str, Any], state: _RunState) -> FunctionTool:
@@ -522,7 +548,8 @@ def _finish_tool(schema: dict[str, Any], state: _RunState) -> FunctionTool:
         error = _validate_response_against_json_schema(answer, schema, "finish")
         _record_call(state, answer, tool="finish", status="invalid_arguments" if error else "completed")
         if error:
-            return f"{error.rstrip('.')}. Call finish again with arguments that match its schema."
+            facts = "".join(f" {fact}" for fact in _finish_argument_facts(answer, schema))
+            return f"{error.rstrip('.')}.{facts} Call finish again with arguments that match its schema."
         state.answer = answer
         return "Answer recorded."
 
@@ -615,7 +642,10 @@ def _account_choices(accounts: list[OrgConnection], state: _RunState, needs: Seq
     return f"one of the run's connected accounts: {json.dumps(choices)}"
 
 
-def _yaml_arguments(tool: BlockTool, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
+async def _yaml_arguments(
+    tool: BlockTool, written: dict[str, Any], state: _RunState, output_key: str
+) -> tuple[dict[str, Any], dict[str, FileInfo]]:
+    """The block's YAML arguments, and the run files that reach it only as a parameter for this one call."""
     if unknown := sorted(set(written) - set(tool.arguments)):
         raise ValueError(f"Unknown arguments {unknown}; the allowed arguments are {list(tool.arguments)}.")
     arguments = dict(written)
@@ -634,14 +664,24 @@ def _yaml_arguments(tool: BlockTool, written: dict[str, Any], state: _RunState) 
             raise ValueError(f"credential must be one of {state.credential_keys}.")
         parameter_keys.append(credential)
     files = arguments.pop("files", []) if "files" in pseudo else []
-    if not isinstance(files, list) or not all(isinstance(name, str) and name in state.file_keys for name in files):
-        raise ValueError(f"files must be names from {state.file_keys}.")
+    handed: dict[str, FileInfo] = {}
+    if files != []:
+        run_files = await _run_files(state)
+        accepted = [*run_files, *state.child_outputs]
+        if not isinstance(files, list) or not all(isinstance(name, str) and name in accepted for name in files):
+            raise ValueError(f"files must be names from {accepted}.")
+        for name in files:
+            if name in state.child_outputs or state.run_context.has_parameter(name):
+                continue
+            if state.run_context.has_value(name) or name == output_key:
+                raise ValueError(f"The file {name!r} can't be handed over: the run already has a value named {name!r}.")
+            handed[name] = run_files[name]
     parameter_keys += dict.fromkeys(files)
     if parameter_keys:
         arguments["parameter_keys"] = parameter_keys
     if tool.nested_agent:
         arguments |= {"engine": RunEngine.skyvern_v3, "engine_pinned": True}
-    return arguments
+    return arguments, handed
 
 
 def _dedicated_tool(block_type: BlockType, tool: BlockTool, state: _RunState) -> FunctionTool:
@@ -721,10 +761,13 @@ def _masked_text(report: dict[str, Any], run_context: WorkflowRunContext) -> str
         run_context.mask_platform_smtp_for_agent(report),
         excluded_secret_ids=run_context.agent_unmasked_platform_secret_ids(),
     )
-    return redact_secrets_from_text(
-        json.dumps(data, default=lambda value: run_context.mask_platform_smtp_for_agent(str(value))),
-        run_context.agent_redactable_secret_values(),
+    text = json.dumps(
+        data, ensure_ascii=False, default=lambda value: run_context.mask_platform_smtp_for_agent(str(value))
     )
+    # A lone surrogate can't be encoded as UTF-8 and would fail the model request, so it stays escaped.
+    return redact_secrets_from_text(
+        text.encode("utf-8", "backslashreplace").decode(), run_context.agent_redactable_secret_values()
+    ).translate(_INVISIBLE_ESCAPES)
 
 
 def _window(text: str, offset: int = 0, name: str | None = None) -> str:
@@ -759,16 +802,22 @@ def _run_tool(
             return f"Arguments are not valid JSON ({e})."
         try:
             state.run_context.reject_platform_smtp_references(written)
-            report = {"status": "completed", "output": await run(state, **written), "error": None}
+            if name in _PAGE_COMMANDS:
+                report = await _page_report(state, name, run, written)
+            else:
+                report = {"status": "completed", "output": await run(state, **written), "error": None}
         except InvalidWorkflowDefinition:
             raise
         except Exception as e:
-            report = {"status": "failed", "output": None, "error": f"{type(e).__name__}: {e}"}
+            report = {"status": "failed", "output": None, "error": _error_text(e)}
+        result_name = f"{state.label}_{name}_{len(state.trail) + 1}" if name in _PAGE_COMMANDS else None
         _record_call(state, describe(written)[1] if describe else written, tool=name, status=report["status"])
         # A read_run_data window is already masked text cut from a longer result.
         if name == "read_run_data" and report["status"] == "completed":
             return report["output"]
-        return _window(_masked_text(report, state.run_context))
+        if result_name is not None:
+            state.results[result_name] = report
+        return _window(_masked_text(report, state.run_context), 0, result_name)
 
     return FunctionTool(
         name=name,
@@ -784,39 +833,129 @@ def _run_tool(
     )
 
 
+def _is_recorded_category(value: JsonValue) -> bool:
+    # A recorded category is null or a non-empty list of entries, each holding a category or a diagnostic reason_code
+    # (writers store null, never []); a key of that name holding anything else is the author's or the page's data.
+    return value is None or (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(entry, dict) and ("category" in entry or "reason_code" in entry) for entry in value)
+    )
+
+
+def _without_failure_category(output: JsonValue) -> JsonValue:
+    if isinstance(output, dict):
+        return {
+            key: _without_failure_category(value)
+            for key, value in output.items()
+            if not (key == "failure_category" and _is_recorded_category(value))
+        }
+    if isinstance(output, list):
+        return [_without_failure_category(item) for item in output]
+    return output
+
+
+def _block_labels(run_context: WorkflowRunContext) -> list[str]:
+    return [*run_context.workflow_run_outputs, *sorted(run_context.carried_block_labels)]
+
+
+def _block_report(run_context: WorkflowRunContext, label: str, output: JsonValue) -> dict[str, JsonValue]:
+    outcome = run_context.get_block_outcome(label)
+    return {"output": _without_failure_category(output), "outcome": asdict(outcome) if outcome else None}
+
+
+def _reserved_names(state: _RunState) -> frozenset[str]:
+    return frozenset([*state.results, *state.child_outputs])
+
+
+async def _run_files(state: _RunState) -> dict[str, FileInfo]:
+    return await state.run_context.run_files(reserved=_reserved_names(state))
+
+
+def _error_text(e: Exception) -> str:
+    text = f"{type(e).__name__}: {e}"
+    return f"{text} {e.reason}" if isinstance(e, ScrapingFailed) and e.reason else text
+
+
+async def _page_report(
+    state: _RunState, name: str, run: Callable[..., Awaitable[Any]], written: dict[str, JsonValue]
+) -> dict[str, JsonValue]:
+    # A call the command can't take never reaches the page, so a page left from an earlier command isn't its page.
+    try:
+        inspect.signature(run).bind(state, **written)
+    except TypeError as e:
+        return {"status": "failed", "output": None, "error": _error_text(e)}
+    status = "completed"
+    output: JsonValue = None
+    error: str | None = None
+    scrape_url: str | None = None
+    try:
+        if name == "page_extract":
+            output, scrape_url = await run(state, **written)
+        else:
+            await run(state, **written)
+    except InvalidWorkflowDefinition:
+        raise
+    except Exception as e:
+        status, error = "failed", _error_text(e)
+    report: dict[str, JsonValue] = {"status": status}
+    if name == "page_extract" and status == "completed":
+        if scrape_url is not None:
+            report["url"] = scrape_url
+    elif state.page is not None:
+        report["url"] = state.page.page.url
+        if name != "page_extract" and (title := await _page_title(state, state.page)) is not None:
+            report["title"] = title
+    return {**report, "output": output, "error": error}
+
+
+async def _page_title(state: _RunState, page: ScriptSkyvernPage) -> str | None:
+    # The browser defers page evaluation while a main-frame navigation is pending, so a hung goto would hang this too.
+    try:
+        async with asyncio.timeout(_PAGE_TITLE_SECONDS):
+            return await page.page.title()
+    except Exception:
+        LOG.warning("Could not read the page title after a page command", label=state.label, exc_info=True)
+        return None
+
+
 async def _read_run_data(state: _RunState, name: str | None = None) -> object:
     run_context = state.run_context
     platform_keys = run_context.platform_smtp_parameter_keys()
+    file_keys = run_context.file_url_parameter_keys()
     parameters = {
         key: parameter
         for key, parameter in run_context.parameters.items()
-        if parameter.parameter_type != ParameterType.OUTPUT and key not in platform_keys
+        if parameter.parameter_type != ParameterType.OUTPUT and key not in platform_keys and key not in file_keys
     }
-    if name in run_context.workflow_run_outputs:
-        outcome = run_context.get_block_outcome(name)
-        return {"output": run_context.workflow_run_outputs[name], "outcome": asdict(outcome) if outcome else None}
+    if name is not None and name in run_context.workflow_run_outputs:
+        return _block_report(run_context, name, run_context.workflow_run_outputs[name])
+    # Registering a secret overwrites a carried output of the same name with the secret's placeholder.
+    if name in parameters and is_sensitive_workflow_parameter(parameters[name]):
+        return _MASK
+    if name is not None and name in run_context.carried_block_labels:
+        return _block_report(run_context, name, run_context.values.get(name))
     if name in parameters:
-        return _MASK if is_sensitive_workflow_parameter(parameters[name]) else run_context.values.get(name)
-    files = (
-        await app.STORAGE.get_downloaded_files(state.organization_id, state.workflow_run_id)
-        if state.organization_id
-        else []
-    )
+        return run_context.values.get(name)
+    files = await _run_files(state)
     if name is None:
         return {
             "parameters": list(parameters),
             "blocks": {
                 label: outcome.status if (outcome := run_context.get_block_outcome(label)) else None
-                for label in run_context.workflow_run_outputs
+                for label in _block_labels(run_context)
             },
-            "downloaded_files": [file.filename for file in files],
+            "files": list(files),
         }
-    if file := next((file for file in files if file.filename == name), None):
+    if file := files.get(name):
         return file.model_dump(mode="json")
     raise ValueError(f"Nothing in this run is named {name!r}. Call read_run_data without a name for the names.")
 
 
 async def _read_run_data_window(state: _RunState, name: str | None = None, offset: int = 0) -> str:
+    labels = _block_labels(state.run_context)
+    if name not in state.results and name not in labels:
+        name = next((label for label in labels if f"{label}_output" == name), name)
     report = state.results.get(name) if name is not None else None
     if report is None:
         report = {"status": "completed", "output": await _read_run_data(state, name), "error": None}
@@ -866,9 +1005,10 @@ async def _run_page(state: _RunState) -> AsyncIterator[ScriptSkyvernPage]:
     )
     try:
         if state.page is not None:
+            page, state.page = state.page, None
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(state.workflow_run_id)
-            if browser_state is None or await browser_state.get_working_page() is not state.page.page:
-                state.page = None
+            if browser_state is not None and await browser_state.get_working_page() is page.page:
+                state.page = page
         if state.page is None:
             state.page = await ScriptSkyvernPage.create(browser_session_id=state.browser_session_id)
         yield state.page
@@ -876,27 +1016,24 @@ async def _run_page(state: _RunState) -> AsyncIterator[ScriptSkyvernPage]:
         context.task_id, context.step_id, context.workflow_run_block_id = previous
 
 
-async def _page_goto(state: _RunState, url: str) -> dict[str, str]:
+async def _page_goto(state: _RunState, url: str) -> None:
     async with _run_page(state) as page:
-        await page.goto(_template_literal(url))
-        return {"url": page.page.url}
+        await page.goto(_template_literal(url), max_retries=1)
 
 
-async def _page_click(state: _RunState, prompt: str) -> dict[str, str]:
+async def _page_click(state: _RunState, prompt: str) -> None:
     async with _run_page(state) as page:
         await page.click(prompt=prompt, ai="proactive")
-        return {"url": page.page.url}
 
 
-async def _page_fill(state: _RunState, prompt: str, value: str) -> dict[str, str]:
+async def _page_fill(state: _RunState, prompt: str, value: str) -> None:
     async with _run_page(state) as page:
         await page.fill(prompt=prompt, value=value, ai="proactive")
-        return {"url": page.page.url}
 
 
 async def _page_extract(
     state: _RunState, prompt: str, schema: dict[str, Any] | None = None
-) -> dict[str, Any] | list | str | None:
+) -> tuple[JsonValue, str | None]:
     # The page's AI has no block label, so an omitted system prompt resolves to the run-wide one.
     opt_out: dict[str, str | None] = (
         {"system_prompt": None}
@@ -906,7 +1043,20 @@ async def _page_extract(
         else {}
     )
     async with _run_page(state) as page:
-        return await page.extract(prompt=_template_literal(prompt), schema=schema, **opt_out)
+        value = await page.extract(prompt=_template_literal(prompt), schema=schema, **opt_out)
+        return value, _scrape_url(state, page)
+
+
+def _scrape_url(state: _RunState, page: ScriptSkyvernPage) -> str | None:
+    # Imported here for the same import cycle as ScriptSkyvernPage in _run_page.
+    from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
+
+    # The extract re-scrapes into its page AI's scraped_page and gives that scrape's URL to its model.
+    ai = page.page_ai
+    if isinstance(ai, RealSkyvernPageAi):
+        return ai.scraped_page.url
+    LOG.warning("Page extract ran without a scraping page AI", label=state.label, ai=type(ai).__name__)
+    return None
 
 
 _TEXT = {"type": "string"}
@@ -917,6 +1067,7 @@ _RUN_TOOLS: tuple[tuple[str, dict[str, Any], list[str], Callable[..., Awaitable[
     ("page_fill", {"prompt": _TEXT, "value": _TEXT}, ["prompt", "value"], _page_fill),
     ("page_extract", {"prompt": _TEXT, "schema": {"type": "object"}}, ["prompt"], _page_extract),
 )
+_PAGE_COMMANDS = frozenset(name for name, *_ in _RUN_TOOLS) - {"read_run_data"}
 if {name for name, *_ in _RUN_TOOLS} != set(RUN_TOOL_DESCRIPTIONS) - {LOAD_SKILL_TOOL_NAME}:
     raise RuntimeError("_RUN_TOOLS and RUN_TOOL_DESCRIPTIONS must name the same tools.")
 
@@ -1184,13 +1335,30 @@ async def _run_child_block(
         if not isinstance(written, dict):
             raise ValueError("arguments must be a JSON object.")
         state.run_context.reject_platform_smtp_references(written)
+        arguments, handed = await _yaml_arguments(tool, written, state, output_parameter.key)
         block_yaml = tool.yaml_class(
-            **_yaml_arguments(tool, written, state),
+            **arguments,
             label=label,
             ignore_workflow_system_prompt=state.ignore_workflow_system_prompt,
         )
+        handed_parameters = {
+            name: WorkflowParameter(
+                workflow_parameter_id=str(uuid.uuid4()),
+                workflow_parameter_type=WorkflowParameterType.FILE_URL,
+                workflow_id=state.workflow_id,
+                key=name,
+                created_at=now,
+                modified_at=now,
+            )
+            for name in handed
+        }
         # The send-email converter adds the platform SMTP parameters to this dict.
-        parameters = {**state.child_outputs, **state.run_context.parameters, output_parameter.key: output_parameter}
+        parameters = {
+            **state.child_outputs,
+            **handed_parameters,
+            **state.run_context.parameters,
+            output_parameter.key: output_parameter,
+        }
         child = block_yaml_to_block(block_yaml, parameters)  # type: ignore[arg-type]
     except InvalidWorkflowDefinition:
         raise
@@ -1218,6 +1386,8 @@ async def _run_child_block(
             and not state.run_context.has_parameter(parameter.key)
         ]
         try:
+            for name, file in handed.items():
+                state.run_context.values[name] = file.url
             for parameter in parameters.values():
                 if not isinstance(parameter, AWSSecretParameter):
                     continue
@@ -1234,23 +1404,27 @@ async def _run_child_block(
             report, child_block_id = await _execute_child(child, written, state)
             if page_url is not None:
                 facts["page_url_at_start"] = page_url
-            if "files" in tool.fields:
-                attempts = await _upload_attempts(state, child_block_id, written.get("files") or [])
-                if attempts is not None:
-                    facts["upload_attempts"] = attempts
+            # The note stays off the call's tool_calls entry, which names the child's row that already holds it.
+            note: dict[str, str] = {}
+            if tool.nested_agent:
+                files = (written.get("files") or []) if "files" in tool.fields else None
+                action_facts, finish_reason = await _child_action_facts(state, child_block_id, files, report["status"])
+                facts.update(action_facts)
+                note = {"finish_reason": finish_reason} if finish_reason else {}
             # Ahead of output, so the window that cuts a long output keeps them.
-            report = {"status": report["status"], **facts, **report}
+            report = {"status": report["status"], **facts, **note, **report}
             if (
                 report["status"] == BlockStatus.completed
                 and state.run_context.has_value(output_parameter.key)
                 and output_parameter.key not in state.run_context.parameters
             ):
                 state.child_outputs[output_parameter.key] = output_parameter
-                state.file_keys.append(output_parameter.key)
         finally:
             for key in temporary_smtp_keys:
                 state.run_context.parameters.pop(key, None)
                 state.run_context.values.pop(key, None)
+            for name in handed:
+                state.run_context.values.pop(name, None)
     _record_call(
         state,
         written,
@@ -1268,21 +1442,23 @@ async def _run_child_block(
 
 async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> tuple[dict[str, Any], str | None]:
     child._agent_smtp_isolation = True
+    child._run_file_reserved_names = _reserved_names(state)
     child.mark_fields_prerendered(written)
     # Children write their own LLM cost to their own rows.
-    with copilot_usage_observer(None):
+    with model_usage_observer(None):
         result = await child.execute_safe(
             workflow_run_id=state.workflow_run_id,
             parent_workflow_run_block_id=state.workflow_run_block_id,
             organization_id=state.organization_id,
             browser_session_id=state.browser_session_id,
         )
-    report = {"status": result.status, "output": result.output_parameter_value, "error": result.failure_reason}
+    output = _without_failure_category(result.output_parameter_value)
+    report = {"status": result.status, "output": output, "error": result.failure_reason}
     return report, result.workflow_run_block_id
 
 
 def _url_fact(url: str) -> str:
-    if url == "about:blank" or url.startswith(_TOKEN_PREFIX):
+    if url == "about:blank" or _OPAQUE_TOKEN.fullmatch(url):
         return url
     return sanitize_handoff_url(url) or "unparseable url"
 
@@ -1297,40 +1473,67 @@ async def _page_url_at_start(state: _RunState) -> str | None:
         return None
 
 
-async def _upload_attempts(
-    state: _RunState, workflow_run_block_id: str | None, files: list[str]
-) -> list[dict[str, str]] | None:
+async def _child_action_facts(
+    state: _RunState, workflow_run_block_id: str | None, files: list[str] | None, status: BlockStatus
+) -> tuple[dict[str, _Fact], str | None]:
+    if workflow_run_block_id is None:
+        return {}, None
     try:
-        if workflow_run_block_id is None:
-            return None
         run_block = await app.DATABASE.observer.get_workflow_run_block(
             workflow_run_block_id, organization_id=state.organization_id
         )
-        if run_block.task_id is None:
-            return None
+    except Exception:
+        LOG.warning("Could not read a nested agent's block", label=state.label, exc_info=True)
+        return {}, None
+    # A failed or terminated child's note is its failure_reason, which the result already gives as error.
+    finish_reason = run_block.finish_reason if status == BlockStatus.completed else None
+    if run_block.task_id is None:
+        return {}, finish_reason
+    try:
         actions = await app.DATABASE.tasks.get_task_actions_hydrated(
             run_block.task_id, organization_id=state.organization_id
         )
-        handed = {key: state.run_context.values.get(key) for key in files}
-        attempts = []
-        for action in actions:
-            if not isinstance(action, UploadFileAction):
-                continue
-            # Task V3 stores the file argument as its model wrote it, so a handed signed URL is its opaque_url_ token.
-            parameter = next(
-                (
-                    key
-                    for key, value in handed.items()
-                    if mask_opaque_urls({key: value}).resolve(action.file_url) in string_leaves(value)
-                ),
-                None,
-            )
-            named = {"parameter": parameter} if parameter else {"source": _url_fact(action.file_url)}
-            attempts.append({**named, "status": action.status.value})
-        return attempts
+        facts: dict[str, _Fact] = {} if files is None else {"upload_attempts": _upload_attempts(state, actions, files)}
+        return facts | _recorded_actions(actions), finish_reason
     except Exception:
-        LOG.warning("Could not read a nested agent's uploads", label=state.label, exc_info=True)
-        return None
+        LOG.warning("Could not read a nested agent's actions", label=state.label, exc_info=True)
+        return {}, finish_reason
+
+
+def _upload_attempts(state: _RunState, actions: list[Action], files: list[str]) -> list[dict[str, str]]:
+    handed = {key: state.run_context.values.get(key) for key in files}
+    attempts = []
+    for action in actions:
+        if not isinstance(action, UploadFileAction):
+            continue
+        # Task V3 stores the file argument as its model wrote it, so a handed signed URL is its opaque_url_ token.
+        parameter = next(
+            (
+                key
+                for key, value in handed.items()
+                if mask_opaque_urls({key: value}).resolve(action.file_url) in string_leaves(value)
+            ),
+            None,
+        )
+        named = {"parameter": parameter} if parameter else {"source": _url_fact(action.file_url)}
+        attempts.append({**named, "status": action.status.value})
+    return attempts
+
+
+def _recorded_actions(actions: list[Action]) -> dict[str, _Fact]:
+    # Only Task V3 rows carry an LLM-free target label in intention; a navigation's intention holds its raw URL.
+    if not all(reasoning_is_turn_scoped(action.description) for action in actions):
+        return {}
+    entries = []
+    for action in actions:
+        if action.action_type == ActionType.GOTO_URL:
+            entry = {"action": "navigate"}
+            if isinstance(action, GotoUrlAction):
+                entry["url"] = _url_fact(action.url)
+        else:
+            entry = {"action": action.intention or action.action_type.value}
+        entries.append({**entry, "status": action.status.value})
+    return {"recorded_actions": entries}
 
 
 def _credential_keys(parameters: list[PARAMETER_TYPE]) -> list[str]:
@@ -1375,7 +1578,7 @@ async def _connected_accounts(organization_id: str | None, workflow_run_id: str)
         )
         return []
     connections = await org_connections_by_id(organization_id, workflow_run.created_by)
-    if root.created_by == COPILOT_RUN_CREATOR:
+    if root.created_by == EMBER_RUN_CREATOR:
         allowed = await run_connection_ids(organization_id, root.workflow_run_id)
         # A record is always enforced. Without one, narrowing on means none; off, the dispatching API predates
         # the record and required every account, so every account stays offered. That is why every worker turns
@@ -1413,12 +1616,6 @@ async def run_agent_step(
         browser_session_id=browser_session_id,
         run_context=run_context,
         credential_keys=_credential_keys(block.parameters),
-        file_keys=[
-            key
-            for key, parameter in run_context.parameters.items()
-            if isinstance(parameter, WorkflowParameter)
-            and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
-        ],
         ignore_workflow_system_prompt=block.ignore_workflow_system_prompt,
         workflow_system_prompt=block.workflow_system_prompt,
         tools=block.tools,
@@ -1457,11 +1654,11 @@ async def run_agent_step(
     agent = Agent(
         name=block.label,
         # LiteLLM's chat-to-Responses bridge drops the served service tier, which leaves GPT calls unpriced;
-        # Copilot's cacheable instructions take its direct Responses path, which keeps it.
+        # Cacheable instructions take the model's direct Responses path, which keeps it.
         # web_search needs today's date, which follows the cached prefix and stays fixed for the run.
         instructions=CacheableSystemInstructions(
             _INSTRUCTIONS,
-            f"\n\nCurrent UTC datetime: {datetime.now(UTC).isoformat(timespec='seconds')}"
+            f"\n\nStep started at (UTC): {datetime.now(UTC).isoformat(timespec='seconds')}"
             + (f"\n\n{block.workflow_system_prompt}" if block.workflow_system_prompt else "")
             + (f"\n\n{state.skill_list}" if state.skill_list else "")
             + _withheld_note(withheld, state.saved_block_gmail),
@@ -1543,7 +1740,7 @@ async def run_agent_step(
                         await asyncio.shield(_publish_trail(state))
 
     try:
-        with copilot_usage_observer(lambda event: costs.append(event.cost or 0.0)), model_attempt_telemetry_scope():
+        with model_usage_observer(lambda event: costs.append(event.cost or 0.0)), model_attempt_telemetry_scope():
             result = await Runner.run(
                 agent,
                 prompt,

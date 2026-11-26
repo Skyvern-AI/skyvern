@@ -123,8 +123,8 @@ def test_reset_browser_profile_clears_managed_profile_blobs_and_rows(
         include_deleted=True,
     )
     assert mocks.delete_profile_blob.await_args_list == [
-        call(organization_id="org_oss", profile_id="bp_one"),
-        call(organization_id="org_oss", profile_id="bp_two"),
+        call(organization_id="org_oss", profile_id="bp_one", hard_delete=True),
+        call(organization_id="org_oss", profile_id="bp_two", hard_delete=True),
     ]
     assert mocks.delete_db_profile.await_args_list == [
         call(profile_id="bp_one", organization_id="org_oss"),
@@ -154,7 +154,7 @@ def test_reset_browser_profile_clears_segmented_legacy_archives(
         "wpid_123/profile_segments/abc123digest",
         "wpid_123/profile_segments/def456digest",
     }
-    mocks.delete_profile_blob.assert_awaited_once_with(organization_id="org_oss", profile_id="bp_seg")
+    mocks.delete_profile_blob.assert_awaited_once_with(organization_id="org_oss", profile_id="bp_seg", hard_delete=True)
     mocks.delete_db_profile.assert_awaited_once_with(profile_id="bp_seg", organization_id="org_oss")
 
 

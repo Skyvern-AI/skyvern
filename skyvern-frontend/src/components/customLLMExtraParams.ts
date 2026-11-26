@@ -1,8 +1,8 @@
 export type ExtraParamRow = { key: string; value: string };
 
-// Mirrors RESERVED_EXTRA_PARAMETER_KEYS in skyvern/forge/sdk/schemas/custom_llms.py — these are
-// derived from the config or passed explicitly at the invocation boundary, so the backend rejects
-// them. Flag them client-side too so the user gets an inline error instead of a 400.
+// Mirrors RESERVED_EXTRA_PARAMETER_KEYS and LITELLM_ROUTING_EXTRA_PARAMETER_KEYS in
+// skyvern/forge/sdk/schemas/custom_llms.py — the backend rejects both on save. Flag them
+// client-side too so the user gets an inline error instead of a 400.
 export const RESERVED_EXTRA_PARAM_KEYS = new Set([
   "model",
   "messages",
@@ -14,6 +14,12 @@ export const RESERVED_EXTRA_PARAM_KEYS = new Set([
   "drop_params",
   "stream",
   "tools",
+  "base_url",
+  "fallbacks",
+  "context_window_fallback_dict",
+  "model_list",
+  "deployment_id",
+  "azure",
 ]);
 
 export const MAX_EXTRA_PARAM_COUNT = 30;

@@ -19,7 +19,6 @@ BLOCK_ATTRIBUTED_METHODS = {
     "_generate_workflow_run_block_description",  # BaseBlock description gen
     "send_prompt",  # TextPromptBlock
     "_ocr_pdf_pages",  # FileParserBlock per-page PDF vision OCR
-    "_parse_image_file",  # FileParserBlock image OCR
     "_extract_with_ai",  # FileParserBlock schema extract
     "execute",  # PDFParserBlock (deprecated) execute
 }

@@ -10,7 +10,7 @@ export function SteerReceipt({ text, sending }: Props) {
       <div className="max-w-[85%] rounded-xl border border-white/5 bg-slate-elevation4 px-3.5 py-2.5 text-[13.5px] leading-[1.5] text-foreground">
         <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{text}</p>
         <p role="status" className="mt-1 text-[11px] text-muted-foreground">
-          {sending ? "Sending now…" : "Sent while Copilot was working"}
+          {sending ? "Sending now…" : "Sent while Ember was working"}
         </p>
       </div>
     </div>

@@ -1,35 +1,47 @@
 import asyncio
 import io
 import os
-import shutil
+import re
+import threading
 import uuid
 import zipfile
+from collections.abc import Mapping
+from contextlib import aclosing
 from datetime import datetime, timezone
+from functools import partial
 from typing import BinaryIO, cast
 
 import structlog
 import zstandard as zstd
+from anyio import CancelScope, CapacityLimiter, to_thread
+from anyio.lowlevel import RunVar
 from botocore.exceptions import ClientError
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
 from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
-from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3ObjectStream, S3StorageClass, S3Uri, _recording_content_type
+from skyvern.forge.sdk.api.aws import (
+    AsyncAWSClient,
+    S3ObjectStream,
+    S3StorageClass,
+    S3Uri,
+    _recording_content_type,
+    s3_object_info_if_exists,
+)
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
-    create_named_temporary_file,
+    downloads_to_save,
     dump_download_visibility_inputs,
     get_download_dir,
     get_skyvern_temp_dir,
-    unzip_bytes_to_temp_directory,
-    wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
+    BrowserProfileSnapshot,
     StoredObjectChangedError,
     StoredObjectVersion,
     StreamingArtifactStorage,
@@ -37,18 +49,25 @@ from skyvern.forge.sdk.artifact.storage.base import (
     _file_infos_from_download_artifacts,
     dedupe_run_scoped_download_artifacts,
     download_checksums_by_uri,
-    is_file_from_retry_attempt,
     key_is_org_scoped,
     presign_with_sensitive_cap,
     resolve_download_attempt_fail_open,
 )
 from skyvern.forge.sdk.artifact.storage.bounded_file import BoundedFileReader
-from skyvern.forge.sdk.artifact.storage.browser_profile_archive import extract_profile_archive, write_profile_archive
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
+    WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+    find_profile_object,
+    profile_archive_uris,
+    retrieve_remote_profile,
+    store_remote_profile,
+    workflow_session_archive_uris,
+)
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
     RUN_RECORDING_PATH_SEGMENT,
     sync_run_recording_clips,
 )
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import settle
 from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -62,6 +81,165 @@ LOG = structlog.get_logger()
 
 
 S3_ZSTD_COMPRESSED_SUFFIX = ".zst"
+_ZIP_READ_BLOCK_BYTES = 1024 * 1024
+_ZIP_TAIL_BYTES = 8 * 1024
+_ZIP_LOCAL_HEADER_MAX_BYTES = 30 + 2 * 65535
+_ZIP_THREAD_LIMITER: RunVar[CapacityLimiter] = RunVar("s3_zip_thread_limiter")
+_STRONG_ETAG = re.compile(r'"[^"\r\n]*"')
+
+
+def _archive_thread_limiter() -> CapacityLimiter:
+    limiter = _ZIP_THREAD_LIMITER.get(None)
+    if limiter is None:
+        limiter = CapacityLimiter(40)
+        _ZIP_THREAD_LIMITER.set(limiter)
+    return limiter
+
+
+class _ArchiveReadError(Exception):
+    pass
+
+
+class _S3ZipReader(io.RawIOBase):
+    def __init__(self, client: AsyncAWSClient, uri: str, size: int, etag: str) -> None:
+        super().__init__()
+        self._client = client
+        self._uri = uri
+        self._size = size
+        self._etag = etag
+        self._position = 0
+        self._tail_start = max(0, size - _ZIP_TAIL_BYTES)
+        self._tail: bytes | None = None
+        self._member_start = self._member_end = 0
+        self._block_start = 0
+        self._block = b""
+        self._loop = asyncio.get_running_loop()
+        self._stop = threading.Event()
+        self._started = threading.Event()
+        self._active_read: asyncio.Task | None = None
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_CUR:
+            offset += self._position
+        elif whence == io.SEEK_END:
+            offset += self._size
+        elif whence != io.SEEK_SET:
+            raise ValueError("invalid seek origin")
+        if offset < 0:
+            raise OSError("seek before start of archive")
+        self._position = offset
+        return offset
+
+    def read(self, size: int = -1) -> bytes:
+        if self._stop.is_set():
+            raise asyncio.CancelledError
+        stop = self._size if size < 0 else min(self._size, self._position + size)
+        result = io.BytesIO()
+        while self._position < stop:
+            start = self._position
+            if start >= self._tail_start:
+                # The ordinary central directory and footer often fit in one suffix read.
+                if self._tail is None:
+                    self._tail = self._read_from_worker(self._tail_start, self._size - 1)
+                end = stop
+                result.write(self._tail[start - self._tail_start : end - self._tail_start])
+            elif self._member_start <= start < self._member_end:
+                block_end = self._block_start + len(self._block)
+                if not self._block_start <= start < block_end:
+                    block_end = min(start + _ZIP_READ_BLOCK_BYTES, self._member_end, self._tail_start)
+                    # Release the previous input block before fetching its replacement.
+                    self._block = b""
+                    self._block = self._read_from_worker(start, block_end - 1)
+                    self._block_start = start
+                end = min(stop, block_end)
+                result.write(self._block[start - self._block_start : end - self._block_start])
+            else:
+                end = min(stop, start + _ZIP_READ_BLOCK_BYTES, self._tail_start)
+                result.write(self._read_from_worker(start, end - 1))
+            self._position = end
+        return result.getvalue()
+
+    def _read_from_worker(self, start: int, end: int) -> bytes:
+        return asyncio.run_coroutine_threadsafe(self._fetch_range(start, end), self._loop).result()
+
+    async def _fetch_range(self, start: int, end: int) -> bytes:
+        if self._stop.is_set():
+            raise asyncio.CancelledError
+        self._active_read = asyncio.current_task()
+        expected = end - start + 1
+        try:
+            stream = await self._client.open_download_stream(self._uri, byte_range=(start, end), if_match=self._etag)
+            async with aclosing(stream):
+                if (
+                    stream.status != 206
+                    or stream.content_range != f"bytes {start}-{end}/{self._size}"
+                    or stream.content_length != expected
+                    or stream.etag != self._etag
+                ):
+                    raise _ArchiveReadError("Unexpected archive range response metadata")
+                data = bytearray()
+                async for chunk in stream.iter_chunks(64 * 1024):
+                    if len(data) + len(chunk) > expected:
+                        raise _ArchiveReadError("Archive range exceeded its declared length")
+                    data.extend(chunk)
+                if len(data) != expected:
+                    raise _ArchiveReadError("Incomplete archive range")
+                return bytes(data)
+        except Exception as exc:
+            raise _ArchiveReadError from exc
+        finally:
+            self._active_read = None
+
+    def _extract_member(self, name: str) -> bytes:
+        self._started.set()
+        if self._stop.is_set():
+            raise asyncio.CancelledError
+        with self, zipfile.ZipFile(self) as archive, io.BytesIO() as output:
+            entry = archive.getinfo(name)
+            self._member_start = entry.header_offset
+            next_header = min(
+                (item.header_offset for item in archive.infolist() if item.header_offset > entry.header_offset),
+                default=archive.start_dir,
+            )
+            # Local filenames and extra fields each have a 16-bit length. The local extra field can differ from entry.extra.
+            self._member_end = min(
+                self._size,
+                archive.start_dir,
+                next_header,
+                entry.header_offset + entry.compress_size + _ZIP_LOCAL_HEADER_MAX_BYTES,
+            )
+            with archive.open(entry) as member:
+                while not self._stop.is_set():
+                    chunk = member.read(_ZIP_READ_BLOCK_BYTES)
+                    if not chunk:
+                        return output.getvalue()
+                    output.write(chunk)
+        raise asyncio.CancelledError
+
+    async def extract(self, name: str) -> bytes:
+        # ZIP workers wait on S3. Keep that queue separate from other AnyIO work and asyncio DNS.
+        worker = asyncio.create_task(to_thread.run_sync(self._extract_member, name, limiter=_archive_thread_limiter()))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            self._stop.set()
+            if not self._started.is_set():
+                # Cancel a waiter on the thread limiter without delaying behind unrelated reads.
+                worker.cancel()
+            elif self._active_read is not None:
+                self._active_read.cancel()
+            with CancelScope(shield=True):
+                await settle(worker)
+            raise
 
 
 def _safe_get_file_size(path: str) -> int | None:
@@ -263,25 +441,41 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             self.async_client.log_download_failure(e, artifact.uri)
             return None
 
+    async def _retrieve_zip_member(self, uri: str, bundle_key: str) -> bytes | None:
+        try:
+            info = await self.async_client.get_object_info(uri)
+            size, etag = info.get("ContentLength"), info.get("ETag")
+            if size == 0:
+                return b""
+            if not isinstance(size, int) or size < 0 or not isinstance(etag, str) or not _STRONG_ETAG.fullmatch(etag):
+                raise _ArchiveReadError("Archive size or strong ETag unavailable")
+        except Exception as exc:
+            raise _ArchiveReadError from exc
+        return await _S3ZipReader(self.async_client, uri, size, etag).extract(bundle_key)
+
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
-        data = await self.async_client.download_file(artifact.uri)
-        # Decompress zstd-compressed files (HAR only)
-        if data and artifact.uri.endswith(S3_ZSTD_COMPRESSED_SUFFIX):
-            dctx = zstd.ZstdDecompressor()
-            data = dctx.decompress(data)
-        # Extract a named entry from a ZIP archive (STEP_ARCHIVE / TASK_ARCHIVE)
-        if data and artifact.bundle_key:
-            try:
+        compressed = artifact.uri.endswith(S3_ZSTD_COMPRESSED_SUFFIX)
+        try:
+            if artifact.bundle_key and not compressed:
+                return await self._retrieve_zip_member(artifact.uri, artifact.bundle_key)
+            data = await self.async_client.download_file(artifact.uri)
+            if data and compressed:
+                data = zstd.ZstdDecompressor().decompress(data)
+            if data and artifact.bundle_key:
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     return zf.read(artifact.bundle_key)
-            except (KeyError, zipfile.BadZipFile):
-                LOG.warning(
-                    "Failed to extract entry from archive",
-                    bundle_key=artifact.bundle_key,
-                    artifact_id=artifact.artifact_id,
-                )
-                return None
-        return data
+            return data
+        except (KeyError, zipfile.BadZipFile):
+            LOG.warning(
+                "Failed to extract entry from archive",
+                bundle_key=artifact.bundle_key,
+                artifact_id=artifact.artifact_id,
+            )
+            return None
+        except _ArchiveReadError as exc:
+            cause = exc.__cause__
+            self.async_client.log_download_failure(cause if isinstance(cause, Exception) else exc, artifact.uri)
+            return None
 
     async def check_archived_uris(self, uris: list[str]) -> dict[str, bool]:
         if not uris:
@@ -392,58 +586,77 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         return await self.async_client.download_file(path, log_exception=False)
 
-    async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
-        # Zip the directory to a temp file
-        temp_zip_file = create_named_temporary_file()
-        zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
-        browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
+    @staticmethod
+    def _workflow_session_uris(organization_id: str, storage_key: str) -> tuple[str, str]:
+        base = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}"
+        return workflow_session_archive_uris(base, organization_id, storage_key)
+
+    async def store_browser_session(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        directory: str,
+        *,
+        require_encryption: bool = False,
+        strict_traversal: bool = False,
+    ) -> None:
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_BROWSER_SESSIONS)
-        LOG.debug(
-            "Storing browser session",
-            organization_id=organization_id,
-            workflow_permanent_id=workflow_permanent_id,
-            zip_file_path=zip_file_path,
-            browser_session_uri=browser_session_uri,
-            storage_class=sc,
+        await store_remote_profile(
+            self._workflow_session_uris(organization_id, workflow_permanent_id),
+            organization_id,
+            workflow_permanent_id,
+            directory,
+            stat=self._profile_object_info,
+            upload=partial(self.async_client.upload_file_from_path, storage_class=sc, raise_exception=True),
+            delete=partial(self.async_client.delete_file, raise_on_error=True),
+            require_encryption=require_encryption,
+            strict_traversal=strict_traversal,
+            purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
         )
-        await self.async_client.upload_file_from_path(browser_session_uri, zip_file_path, storage_class=sc)
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
-        browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
-        downloaded_zip_bytes = await self.async_client.download_file(browser_session_uri, log_exception=True)
-        if not downloaded_zip_bytes:
-            return None
-        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_session_")
+        snapshot = await self.retrieve_browser_session_snapshot(organization_id, workflow_permanent_id)
+        return snapshot.directory if snapshot is not None else None
+
+    async def retrieve_browser_session_snapshot(
+        self, organization_id: str, workflow_permanent_id: str, *, allow_sealed_fallback: bool = False
+    ) -> BrowserProfileSnapshot | None:
+        return await retrieve_remote_profile(
+            self._workflow_session_uris(organization_id, workflow_permanent_id),
+            organization_id,
+            workflow_permanent_id,
+            download=self.async_client.download_file,
+            stat=self._profile_object_info,
+            purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+            allow_sealed_fallback=allow_sealed_fallback,
+        )
 
     async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
-        browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
-        LOG.info(
-            "Deleting persisted browser session",
-            organization_id=organization_id,
-            workflow_permanent_id=workflow_permanent_id,
-            browser_session_uri=browser_session_uri,
-        )
-        # S3 DeleteObject is idempotent: deleting a missing key is a no-op, so only real
-        # failures (AccessDenied, network, etc.) will raise here.
-        await self.async_client.delete_file(browser_session_uri, log_exception=True, raise_on_error=True)
+        for uri in self._workflow_session_uris(organization_id, workflow_permanent_id):
+            await self.async_client.delete_file(uri, log_exception=True, raise_on_error=True)
 
-    async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
+    @staticmethod
+    def _profile_uris(organization_id: str, profile_id: str) -> tuple[str, str]:
+        base = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}"
+        return profile_archive_uris(base, organization_id, profile_id)
+
+    async def _profile_object_info(self, uri: str) -> dict | None:
+        return await s3_object_info_if_exists(self.async_client, uri)
+
+    async def store_browser_profile(
+        self,
+        organization_id: str,
+        profile_id: str,
+        directory: str,
+        *,
+        require_encryption: bool = False,
+        confirm_creation: bool = False,
+        strict_traversal: bool = False,
+    ) -> None:
         """Store browser profile to S3."""
-        temp_zip_file = create_named_temporary_file()
-        # make_archive writes base_name + ".zip", a separate file the NamedTemporaryFile cleanup never
-        # removes. Name it up front and clean it in a finally that also covers the archive step, so a
-        # partial .zip from an archive that fails partway can't leak into TEMP_PATH.
-        zip_file_path = f"{temp_zip_file.name}.zip"
-        profile_uri = (
-            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
-        )
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_BROWSER_SESSIONS)
-        try:
-            # Off the event loop: the credential living-profile engine calls this mid-run, where a
-            # sync archive of a large profile dir would stall every other coroutine on the worker.
-            await asyncio.to_thread(
-                write_profile_archive, directory, zip_file_path, organization_id=organization_id, profile_id=profile_id
-            )
+
+        async def upload_profile(profile_uri: str, zip_file_path: str) -> None:
             LOG.debug(
                 "Storing browser profile",
                 organization_id=organization_id,
@@ -452,61 +665,62 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
                 profile_uri=profile_uri,
                 storage_class=sc,
             )
-            await self.async_client.upload_file_from_path(profile_uri, zip_file_path, storage_class=sc)
-        finally:
-            if os.path.exists(zip_file_path):
-                os.remove(zip_file_path)
+            await self.async_client.upload_file_from_path(
+                profile_uri, zip_file_path, storage_class=sc, raise_exception=True
+            )
+
+        await store_remote_profile(
+            self._profile_uris(organization_id, profile_id),
+            organization_id,
+            profile_id,
+            directory,
+            stat=self._profile_object_info,
+            upload=upload_profile,
+            delete=partial(self.async_client.delete_file, raise_on_error=True),
+            require_encryption=require_encryption,
+            confirm_creation=confirm_creation,
+            strict_traversal=strict_traversal,
+        )
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve browser profile from S3."""
-        profile_uri = (
-            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        snapshot = await self.retrieve_browser_profile_snapshot(organization_id, profile_id)
+        return snapshot.directory if snapshot is not None else None
+
+    async def retrieve_browser_profile_snapshot(
+        self, organization_id: str, profile_id: str, *, copy: bool = False
+    ) -> BrowserProfileSnapshot | None:
+        return await retrieve_remote_profile(
+            self._profile_uris(organization_id, profile_id),
+            organization_id,
+            profile_id,
+            download=self.async_client.download_file,
+            stat=self._profile_object_info,
         )
-        downloaded_zip_bytes = await self.async_client.download_file(profile_uri, log_exception=True)
-        if not downloaded_zip_bytes:
-            return None
-        return extract_profile_archive(downloaded_zip_bytes, organization_id=organization_id, profile_id=profile_id)
+
+    async def _saved_profile_info(self, organization_id: str, profile_id: str) -> dict | None:
+        uri, sealed_uri = self._profile_uris(organization_id, profile_id)
+        saved, _ = await find_profile_object(uri, sealed_uri, self._profile_object_info)
+        return saved
 
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
         """Cheap existence check (head_object) — avoids downloading the archive just to know it exists."""
-        profile_uri = (
-            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
-        )
-        try:
-            await self.async_client.get_object_info(profile_uri)
-        except ClientError as exc:
-            if self.async_client._is_not_found_error(exc):
-                return False
-            # Transient/authz errors propagate so the has-content fail-safe treats a flaky read as
-            # existing content instead of reseeding a run to fresh and overwriting its saved archive.
-            raise
-        return True
+        return await self._saved_profile_info(organization_id, profile_id) is not None
 
-    async def get_browser_profile_etag(self, organization_id: str, profile_id: str) -> str | None:
-        profile_uri = (
-            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
-        )
-        try:
-            info = await self.async_client.get_object_info(profile_uri)
-        except ClientError as exc:
-            if self.async_client._is_not_found_error(exc):
-                # Missing object = no prior version = no conflict possible → a full write is fine.
-                return None
-            # Transient/authz errors propagate: the write path skips this run rather than reading None
-            # as "unchanged" and fail-open overwriting a possibly-concurrently-updated archive.
-            raise
+    async def get_browser_profile_etag(
+        self, organization_id: str, profile_id: str, *, encrypted: bool | None = None
+    ) -> str | None:
+        info = await self._saved_profile_info(organization_id, profile_id)
         etag = info.get("ETag") if info else None
         return str(etag) if etag else None
 
     async def delete_browser_profile(self, organization_id: str, profile_id: str, hard_delete: bool = False) -> None:
         """Delete a browser profile from S3. The bucket is Suspended (no versioning), so a plain
-        DeleteObject genuinely erases the single profile archive. hard_delete=True RAISES on an S3
+        DeleteObject genuinely erases each profile archive. hard_delete=True RAISES on an S3
         failure so the caller can't falsely report a cookie-bearing archive erased (the reap then leaves
         the profile row for retry/discovery instead of a silent orphan); soft delete is best-effort — a
         reap failure must not break the promote or the soft-delete that triggered it."""
-        profile_uri = (
-            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
-        )
+        profile_uri, sealed_uri = self._profile_uris(organization_id, profile_id)
         LOG.info(
             "Deleting browser profile",
             organization_id=organization_id,
@@ -516,7 +730,13 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         )
         # DeleteObject is idempotent: deleting a missing key is a no-op. A hard delete propagates a real
         # failure (raise_on_error) so the erasure is never silently reported complete; soft delete swallows.
-        await self.async_client.delete_file(profile_uri, log_exception=True, raise_on_error=hard_delete)
+        # Erase legacy first so a failed deletion cannot expose stale plaintext as the current profile.
+        try:
+            for uri in (profile_uri, sealed_uri):
+                await self.async_client.delete_file(uri, raise_on_error=True)
+        except Exception:
+            if hard_delete:
+                raise
 
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
@@ -834,6 +1054,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         run_id: str | None,
         *,
         attempt_number: int | None = None,
+        files: Mapping[str, str] | None = None,
     ) -> None:
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_UPLOADS)
         base_uri = (
@@ -846,6 +1067,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             base_uri=base_uri,
             storage_class=sc,
             attempt_number=attempt_number,
+            files=files,
         )
 
     async def _save_downloaded_files_from_local(
@@ -855,11 +1077,11 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         base_uri: str,
         storage_class: S3StorageClass,
         attempt_number: int | None = None,
+        files: Mapping[str, str] | None = None,
     ) -> None:
         """Save files from local download directory to S3."""
         download_dir = get_download_dir(run_id=run_id)
-        files = os.listdir(download_dir)
-        if not files:
+        if files is None and not os.listdir(download_dir):
             return
         retry_workflow_run_id, attempt_number, retry_attempt_started_at = await resolve_download_attempt_fail_open(
             organization_id, run_id, attempt_number=attempt_number
@@ -876,19 +1098,10 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         )
         skipped_files: list[str] = []
         unchanged_file_count = 0
-        for file in files:
-            if file.endswith(BROWSER_DOWNLOADING_SUFFIX):
-                continue
-            fpath = os.path.join(download_dir, file)
-            if not os.path.isfile(fpath):
-                continue
-            file = await wait_for_pending_extension_rename(download_dir, file)
-            fpath = os.path.join(download_dir, file)
-            if not os.path.isfile(fpath):
-                continue
-            if retry_attempt and not is_file_from_retry_attempt(fpath, retry_attempt_started_at):
-                continue
-            uri = f"{base_uri}/{file}"
+        entries = await downloads_to_save(download_dir, files, retry_attempt_started_at if retry_attempt else None)
+        for key, fpath in entries:
+            file = os.path.basename(key)
+            uri = f"{base_uri}/{key}"
             checksum = calculate_sha256_for_file(fpath)
             # Cleanup runs repeatedly over a growing download dir; re-sending bytes that are
             # already in the uploads bucket is what outgrows SAVE_DOWNLOADED_FILES_TIMEOUT.
@@ -960,7 +1173,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
                 organization_id=organization_id,
                 run_id=run_id,
                 unchanged_file_count=unchanged_file_count,
-                total_file_count=len(files),
+                total_file_count=len(entries),
             )
         if skipped_files:
             raise DownloadSaveIncompleteError(skipped_files)

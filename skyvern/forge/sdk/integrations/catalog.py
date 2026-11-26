@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Collection, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from functools import partial
 from typing import Any, Literal
 
@@ -18,10 +18,13 @@ from skyvern.forge.sdk.schemas.google_oauth import GOOGLE_GMAIL_SEND_SCOPE, Goog
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, microsoft_oauth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.schemas.emails import ORGANIZE_ACTIONS_WITH_LABEL, EmailOrganizeAction
 from skyvern.schemas.workflows import (
     BlockType,
     BlockYAML,
     EmailInboxBlockYAML,
+    FileDownloadBlockYAML,
+    FileDownloadTarget,
     FileStorageType,
     FileUploadBlockYAML,
     GoogleSheetsReadBlockYAML,
@@ -46,7 +49,10 @@ IntegrationCategory = Literal[
     "Credentials",
 ]
 OAuthProvider = Literal["google", "microsoft"]
+CredentialBackend = Literal["native", "nango"]
+DriveHopOperation = Literal["get", "list", "download"]
 AccountsUnavailable = Literal["not_enabled", "read_failed"]
+IntegrationUnavailableReason = Literal["hipaa"]
 OAUTH_ACCOUNT_PROVIDERS: frozenset[str] = frozenset({"google", "microsoft"})
 ACCOUNT_READ_TIMEOUT_SECONDS = 5.0
 
@@ -75,7 +81,12 @@ class IntegrationAction(BaseModel):
     # Provider scope strings, compared against IntegrationAccount.scopes_granted.
     needs: list[str] = Field(default_factory=list)
     acts: bool = False
-    # "block:<BlockType value>": the existing block that runs the action.
+    # None preserves the entry-level backend contract for existing actions. A declared list narrows this action.
+    credential_backends: list[CredentialBackend] | None = None
+    # Nonempty only when a broker-backed Drive action needs run-scoped access to these internal operations.
+    drive_hop_operations: list[DriveHopOperation] | None = None
+    # "block:<BlockType value>", the existing block that runs the action, or "runner:<name>", our own code in
+    # action_runners.ACTION_RUNNERS that only the integration_action block calls. There is no "nango:" kind.
     runs_via: str
     agent_step: Literal["tool", "saved_block_only"] = "tool"
 
@@ -119,6 +130,8 @@ class IntegrationEntry(BaseModel):
     triggers: list[IntegrationTrigger] = Field(default_factory=list)
     accounts: list[IntegrationAccount] | None = None
     accounts_unavailable: AccountsUnavailable | None = None
+    # Set only on the page's list: the page shows the entry's managed connection as disabled, with this reason.
+    unavailable_reason: IntegrationUnavailableReason | None = None
 
 
 def serialize_oauth_account(
@@ -149,7 +162,7 @@ def page_payload(entry: IntegrationEntry) -> dict[str, Any]:
     return entry.model_dump(by_alias=True, exclude_none=True, exclude=excluded)
 
 
-def copilot_payload(entry: IntegrationEntry) -> dict[str, Any]:
+def ember_payload(entry: IntegrationEntry) -> dict[str, Any]:
     data = entry.model_dump(exclude_none=True, exclude={"accounts", "keywords", "logo"})
     data["accounts"] = None if entry.accounts is None else [a.model_dump(exclude_none=True) for a in entry.accounts]
     return data
@@ -164,6 +177,22 @@ def entry_action(
                 if action.id == action_id:
                     return entry, action
     return None
+
+
+def entry_credential_backends(entry: IntegrationEntry) -> frozenset[CredentialBackend]:
+    backends: set[CredentialBackend] = {"native"} if entry.oauth_provider is not None else set()
+    if entry.credential_backend is not None:
+        backends.add(entry.credential_backend)
+    backends.update(entry.additional_credential_backends or [])
+    return frozenset(backends)
+
+
+def action_credential_backends(entry: IntegrationEntry, action: IntegrationAction) -> frozenset[CredentialBackend]:
+    return (
+        frozenset(action.credential_backends)
+        if action.credential_backends is not None
+        else entry_credential_backends(entry)
+    )
 
 
 def block_inputs(yaml_class: type[BlockYAML], fields: Sequence[str], **fixed: str) -> dict[str, Any]:
@@ -215,6 +244,39 @@ def _read_inbox_action(email_client: str, needs: list[str]) -> IntegrationAction
     )
 
 
+_ORGANIZE_FIELDS = ("folder", "prompt", "sender", "subject", "newer_than_days", "max_results")
+
+
+def _organize_action(action_id: str, action: EmailOrganizeAction, name: str, description: str) -> IntegrationAction:
+    fields = (*_ORGANIZE_FIELDS, "organize_label") if action in ORGANIZE_ACTIONS_WITH_LABEL else _ORGANIZE_FIELDS
+    inputs = block_inputs(
+        EmailInboxBlockYAML,
+        fields,
+        email_client="gmail",
+        credential_source="nango",
+        organize_action=action.value,
+    )
+    if action in ORGANIZE_ACTIONS_WITH_LABEL:
+        label = inputs["properties"]["organize_label"]
+        inputs["properties"]["organize_label"] = {
+            **label["anyOf"][0],
+            "title": label["title"],
+            "description": label["description"],
+            "pattern": r"\S",
+        }
+        inputs["required"].append("organize_label")
+    return IntegrationAction(
+        id=action_id,
+        name=name,
+        description=f"{description} Works only with a Connected Gmail account.",
+        inputs=inputs,
+        acts=True,
+        runs_via=_block(BlockType.EMAIL_INBOX),
+        # Connected accounts report no scopes, so needs stays empty; a saved block is what the run capability binds.
+        agent_step="saved_block_only",
+    )
+
+
 def listed_oauth_accounts(integrations: Sequence[Any]) -> list[dict[str, Any]]:
     # Older captures listed the accounts themselves as rows; current results nest them per entry.
     rows: list[dict[str, Any]] = []
@@ -233,6 +295,109 @@ def listed_oauth_accounts(integrations: Sequence[Any]) -> list[dict[str, Any]]:
             rows.append(account)
     return rows
 
+
+_DRIVE_FOLDER_HELP = "A folder ID or link, a shared drive's ID for its top level, or root for My Drive."
+# Every text input of these actions is required: a move names both ends, and nothing defaults to a folder.
+_DRIVE_TEXT_INPUTS: dict[str, dict[str, str]] = {
+    "google_drive_folder_id": {
+        "format": "google_drive_folder",
+        "title": "Folder",
+        "description": _DRIVE_FOLDER_HELP,
+    },
+    "parent_folder_id": {
+        "format": "google_drive_folder",
+        "title": "Parent folder",
+        "description": _DRIVE_FOLDER_HELP,
+    },
+    "folder_name": {"title": "Folder name", "description": "Name of the new folder."},
+    "file_id": {
+        "format": "google_drive_file",
+        "title": "File or folder to move",
+        "description": "The file's or folder's ID or Drive link.",
+    },
+    "destination_folder_id": {
+        "format": "google_drive_folder",
+        "title": "Destination folder",
+        "description": _DRIVE_FOLDER_HELP,
+    },
+}
+
+
+def _drive_field(
+    inputs: dict[str, Any], field: str, *, title: str, description: str, fmt: str | None = None
+) -> dict[str, Any]:
+    properties = inputs["properties"]
+    prop = {**properties[field]}
+    if fmt is not None:
+        prop["format"] = fmt
+    prop["title"] = title
+    prop["description"] = description
+    return {
+        **inputs,
+        "properties": {
+            **properties,
+            field: prop,
+        },
+    }
+
+
+def _drive_folder_action(
+    action_id: str,
+    name: str,
+    description: str,
+    fields: tuple[str, ...],
+    *,
+    acts: bool,
+    credential_backends: list[CredentialBackend],
+    drive_hop_operations: list[DriveHopOperation] | None = None,
+    **extra: dict[str, Any],
+) -> IntegrationAction:
+    properties: dict[str, Any] = {
+        field: {"type": "string", **_DRIVE_TEXT_INPUTS[field], "pattern": r"\S"} for field in fields
+    }
+    return IntegrationAction(
+        id=action_id,
+        name=name,
+        description=description,
+        inputs={"type": "object", "properties": properties | extra, "required": list(fields)},
+        needs=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+        acts=acts,
+        credential_backends=credential_backends,
+        drive_hop_operations=drive_hop_operations,
+        runs_via="runner:google_drive_folder",
+        agent_step="saved_block_only",
+    )
+
+
+_GOOGLE_DRIVE_ENTRY_ID = "google_drive"
+DRIVE_FOLDER_ACTIONS: tuple[IntegrationAction, ...] = (
+    _drive_folder_action(
+        "list_folder",
+        "List folder",
+        "List the files and folders directly inside a Google Drive folder, including one in a shared drive.",
+        ("google_drive_folder_id",),
+        acts=False,
+        credential_backends=["native", "nango"],
+        drive_hop_operations=["list"],
+        max_results={"type": "integer", "minimum": 1, "maximum": 1000, "default": 100, "title": "Max results"},
+    ),
+    _drive_folder_action(
+        "create_folder",
+        "Create subfolder",
+        "Create a folder inside a Google Drive folder, including one in a shared drive.",
+        ("parent_folder_id", "folder_name"),
+        acts=True,
+        credential_backends=["native"],
+    ),
+    _drive_folder_action(
+        "move_file",
+        "Move file",
+        "Move a file or folder into another Google Drive folder, within or between My Drive and shared drives.",
+        ("file_id", "destination_folder_id"),
+        acts=True,
+        credential_backends=["native"],
+    ),
+)
 
 _GOOGLE_GMAIL_ENTRY_ID = "gmail"
 
@@ -288,7 +453,7 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         id=_GOOGLE_GMAIL_ENTRY_ID,
         name="Gmail",
         category="Communication",
-        description="Read verification codes and send email from your agents.",
+        description="Read emails, including verification codes, and send emails from your agents.",
         keywords=[
             "email",
             "mail",
@@ -296,6 +461,7 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
             "2fa",
             "otp",
             "verification",
+            "read verification codes",
             "magic link",
             "google mail",
             "send",
@@ -333,6 +499,30 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
                 acts=True,
                 runs_via=_block(BlockType.SEND_EMAIL),
             ),
+            _organize_action(
+                "label_email",
+                EmailOrganizeAction.LABEL,
+                "Label email",
+                "Find emails by sender, subject or age and add an existing label to each.",
+            ),
+            _organize_action(
+                "archive_email",
+                EmailOrganizeAction.ARCHIVE,
+                "Archive email",
+                "Find emails by sender, subject or age and archive each.",
+            ),
+            _organize_action(
+                "move_email",
+                EmailOrganizeAction.MOVE,
+                "Move email",
+                "Find emails by sender, subject or age and move each from its folder to an existing label.",
+            ),
+            _organize_action(
+                "mark_email_read",
+                EmailOrganizeAction.MARK_READ,
+                "Mark email read",
+                "Find emails by sender, subject or age and mark each read.",
+            ),
         ],
     ),
     IntegrationEntry(
@@ -366,10 +556,10 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         position=4,
     ),
     IntegrationEntry(
-        id="google_drive",
+        id=_GOOGLE_DRIVE_ENTRY_ID,
         name="Google Drive",
         category="Workspace",
-        description="Upload workflow files to Google Drive folders.",
+        description="Upload workflow files and downloaded files to Google Drive folders.",
         keywords=["cloud storage", "files", "folders", "upload", "download", "shared drive", "google workspace"],
         status="live",
         kind="oauth",
@@ -383,14 +573,106 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
                 id="upload_files",
                 name="Upload files",
                 description="Upload this run's downloaded files to a Google Drive folder.",
-                inputs=block_inputs(
-                    FileUploadBlockYAML,
-                    ("google_drive_folder_id", "prompt", "path"),
-                    storage_type=FileStorageType.GOOGLE_DRIVE.value,
+                inputs=_drive_field(
+                    _drive_field(
+                        _drive_field(
+                            block_inputs(
+                                FileUploadBlockYAML,
+                                ("google_drive_folder_id", "prompt", "path"),
+                                storage_type=FileStorageType.GOOGLE_DRIVE.value,
+                            ),
+                            "google_drive_folder_id",
+                            fmt="google_drive_folder",
+                            title="Save to folder",
+                            description=_DRIVE_FOLDER_HELP,
+                        ),
+                        "prompt",
+                        fmt="textarea",
+                        title="Files to upload",
+                        description="Describe which downloaded files to upload. Leave empty to upload all downloaded files.",
+                    ),
+                    "path",
+                    title="Path (not used for Drive)",
+                    description="Not used when uploading to Google Drive. Kept so older workflows still load.",
                 ),
                 needs=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
                 acts=True,
+                credential_backends=["native"],
                 runs_via=_block(BlockType.FILE_UPLOAD),
+            ),
+            IntegrationAction(
+                id="download_files",
+                name="Save website downloads to Drive",
+                description="Open a website, download the files you describe, and save them to a Google Drive folder.",
+                inputs=_drive_field(
+                    _drive_field(
+                        _drive_field(
+                            block_inputs(
+                                FileDownloadBlockYAML,
+                                ("url", "navigation_goal", "google_drive_folder_id"),
+                                download_target=FileDownloadTarget.GOOGLE_DRIVE.value,
+                            ),
+                            "url",
+                            fmt="uri",
+                            title="Website",
+                            description=(
+                                "Where Skyvern starts. Leave empty to continue from the previous step's page."
+                            ),
+                        ),
+                        "navigation_goal",
+                        fmt="textarea",
+                        title="What to download",
+                        description=("Describe the file to find and download, e.g. 'the latest invoice PDF'."),
+                    ),
+                    "google_drive_folder_id",
+                    fmt="google_drive_folder",
+                    title="Save to folder",
+                    description=_DRIVE_FOLDER_HELP,
+                ),
+                needs=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+                acts=True,
+                credential_backends=["native"],
+                runs_via=_block(BlockType.FILE_DOWNLOAD),
+                agent_step="saved_block_only",
+            ),
+            *DRIVE_FOLDER_ACTIONS,
+            IntegrationAction(
+                id="download_from_drive",
+                name="Download from Google Drive",
+                description="Download selected Drive files or folders into this workflow.",
+                inputs={
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "title": "Files and folders",
+                            "description": "Drive file or folder IDs or links.",
+                            "items": {"type": "string", "format": "google_drive_file", "minLength": 1},
+                            "minItems": 1,
+                            "maxItems": 1000,
+                        },
+                        "recursive": {
+                            "type": "boolean",
+                            "title": "Include subfolders",
+                            "default": False,
+                        },
+                    },
+                    "required": ["items"],
+                },
+                outputs={
+                    "type": "object",
+                    "properties": {
+                        "downloaded_file_urls": {"type": "array", "items": {"type": "string"}},
+                        "files": {"type": "array", "items": {"type": "object"}},
+                        "errors": {"type": "array", "items": {"type": "object"}},
+                    },
+                },
+                needs=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+                acts=False,
+                credential_backends=["native", "nango"],
+                drive_hop_operations=["get", "list", "download"],
+                runs_via="runner:google_drive_download",
+                agent_step="saved_block_only",
             ),
         ],
     ),
@@ -492,6 +774,18 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
     ),
 )
 
+
+def drive_hop_action_ids(operation: DriveHopOperation | None = None) -> frozenset[str]:
+    drive = next(entry for entry in SKYVERN_INTEGRATIONS if entry.id == _GOOGLE_DRIVE_ENTRY_ID)
+    return frozenset(
+        action.id
+        for action in drive.actions
+        if action.drive_hop_operations and (operation is None or operation in action.drive_hop_operations)
+    )
+
+
+DRIVE_READ_ACTION_IDS = drive_hop_action_ids()
+
 AccountsById = dict[str, list[IntegrationAccount] | AccountsUnavailable]
 AccountSource = Callable[[str], Awaitable[AccountsById]]
 
@@ -556,17 +850,18 @@ async def _google_accounts(organization_id: str) -> AccountsById:
     }
 
 
-async def _microsoft_accounts(organization_id: str, user_id: str | None = None) -> AccountsById:
-    entries = _entries_for_provider("microsoft")
+async def _microsoft_accounts(
+    organization_id: str, user_id: str | None = None, entries: Sequence[IntegrationEntry] | None = None
+) -> AccountsById:
+    entries = _entries_for_provider("microsoft") if entries is None else entries
     if not entries:
         return {}
-    credentials = await microsoft_oauth_service.get_credentials_for_org(organization_id, user_id=user_id)
+    credentials = await microsoft_oauth_service.get_visible_credentials_for_org(organization_id, user_id=user_id)
     return {
         entry.id: [
             oauth_account(credential, "microsoft")
             for credential in credentials
-            if credential.state == "active"
-            and microsoft_oauth_service.has_required_scopes(
+            if microsoft_oauth_service.has_required_scopes(
                 credential.scopes_requested or credential.scopes_granted, entry.required_scopes or []
             )
         ]
@@ -645,7 +940,10 @@ def integration_entries(
     email_forwarding_available: bool = True,
     powerbi_available: bool = False,
     gmail_available: bool = False,
+    google_drive_available: bool = False,
     hidden_ids: frozenset[str] = frozenset(),
+    powerbi_native_available: bool = False,
+    unavailable: Mapping[str, IntegrationUnavailableReason] | None = None,
 ) -> list[IntegrationEntry]:
     added_triggers = app.AGENT_FUNCTION.get_cloud_integration_triggers()
     entries = [
@@ -656,11 +954,23 @@ def integration_entries(
     ]
     if not email_forwarding_available:
         hidden_ids = hidden_ids | {"email_forwarding"}
-    entries = [entry for entry in entries if entry.id not in hidden_ids]
+    unavailable = unavailable or {}
+    entries = [
+        entry.model_copy(update={"unavailable_reason": unavailable[entry.id]}) if entry.id in unavailable else entry
+        for entry in entries
+        if entry.id not in hidden_ids or entry.id in unavailable
+    ]
     if gmail_available:
         entries = [
             entry.model_copy(update={"additional_credential_backends": ["nango"]})
             if entry.id == _GOOGLE_GMAIL_ENTRY_ID
+            else entry
+            for entry in entries
+        ]
+    if google_drive_available:
+        entries = [
+            entry.model_copy(update={"additional_credential_backends": ["nango"]})
+            if entry.id == _GOOGLE_DRIVE_ENTRY_ID
             else entry
             for entry in entries
         ]
@@ -680,15 +990,40 @@ def integration_entries(
             else entry
             for entry in entries
         ]
+    elif powerbi_native_available:
+        entries = [entry.model_copy(update={"status": "live"}) if entry.id == "powerbi" else entry for entry in entries]
     return sorted(entries, key=lambda entry: entry.position)
+
+
+def runner_action(integration_id: str, action_id: str) -> tuple[IntegrationEntry, IntegrationAction] | None:
+    """A built-in action that runs as our own code (``runner:``), with its entry; None for any other action."""
+    for entry in SKYVERN_INTEGRATIONS:
+        for action in entry.actions:
+            if entry.id == integration_id and action.id == action_id and action.runs_via.startswith("runner:"):
+                return entry, action
+    return None
 
 
 def all_integration_entries() -> list[IntegrationEntry]:
     """Every entry with every backend it can have, for lookups that must not depend on an org's availability gates."""
-    return integration_entries(powerbi_available=True, gmail_available=True)
+    return integration_entries(powerbi_available=True, gmail_available=True, google_drive_available=True)
 
 
-async def integration_entries_for_org(organization_id: str) -> list[IntegrationEntry]:
+async def _unavailable_reasons(organization_id: str) -> dict[str, IntegrationUnavailableReason]:
+    try:
+        return await app.AGENT_FUNCTION.integration_unavailable_reasons(organization_id)
+    except Exception:
+        LOG.warning(
+            "Integration unavailable reasons failed; leaving those entries as they were",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return {}
+
+
+async def integration_entries_for_org(
+    organization_id: str, *, include_unavailable: bool = False
+) -> list[IntegrationEntry]:
     try:
         email_forwarding_available = await app.AGENT_FUNCTION.ensure_email_forwarding_available(
             organization_id, fresh=False
@@ -721,11 +1056,22 @@ async def integration_entries_for_org(organization_id: str) -> list[IntegrationE
         gmail_available = await app.AGENT_FUNCTION.nango_gmail_catalog_available(organization_id)
     except Exception:  # noqa: BLE001 - availability failures leave Gmail dark.
         gmail_available = False
+    try:
+        google_drive_available = await app.AGENT_FUNCTION.nango_google_drive_catalog_available(organization_id)
+    except Exception:  # noqa: BLE001 - availability failures leave Drive's Nango option dark.
+        google_drive_available = False
+    try:
+        powerbi_native_available = await app.AGENT_FUNCTION.powerbi_native_connections_available(organization_id)
+    except Exception:  # noqa: BLE001 - availability failures leave native Power BI dark.
+        powerbi_native_available = False
     entries = integration_entries(
         email_forwarding_available=email_forwarding_available,
         powerbi_available=powerbi_available,
         gmail_available=gmail_available,
+        google_drive_available=google_drive_available,
         hidden_ids=await app.AGENT_FUNCTION.hidden_integration_ids(organization_id),
+        powerbi_native_available=powerbi_native_available,
+        unavailable=await _unavailable_reasons(organization_id) if include_unavailable else None,
     )
     # Neither the page nor Copilot's integration list has a use for an entry with nothing to connect yet;
     # Copilot reads every trigger through its trigger tools.
@@ -737,15 +1083,22 @@ def integration_is_live(integration_id: str) -> bool:
 
 
 async def integrations_for_org(organization_id: str, user_id: str | None = None) -> list[IntegrationEntry]:
-    microsoft_entry_ids = frozenset(entry.id for entry in _entries_for_provider("microsoft"))
-    microsoft_reader = read_account_source(
-        organization_id,
-        microsoft_entry_ids,
-        partial(_microsoft_accounts, user_id=user_id),
-    )
+    entries_read = asyncio.ensure_future(integration_entries_for_org(organization_id))
+
+    async def microsoft_reader() -> AccountsById:
+        # The org's own catalog: an entry this org has live, such as native Power BI, gets its Microsoft accounts.
+        microsoft_entries = [
+            entry for entry in await entries_read if entry.status == "live" and entry.oauth_provider == "microsoft"
+        ]
+        return await read_account_source(
+            organization_id,
+            frozenset(entry.id for entry in microsoft_entries),
+            partial(_microsoft_accounts, user_id=user_id, entries=microsoft_entries),
+        )
+
     reads = await asyncio.gather(
         *(read_account_source(organization_id, entry_ids, source) for entry_ids, source in _ACCOUNT_SOURCES),
-        microsoft_reader,
+        microsoft_reader(),
         app.AGENT_FUNCTION.get_cloud_integration_accounts(organization_id, user_id),
     )
     accounts: dict[str, list[IntegrationAccount]] = {}
@@ -756,5 +1109,5 @@ async def integrations_for_org(organization_id: str, user_id: str | None = None)
                 accounts.setdefault(entry_id, []).extend(value)
             elif unavailable.get(entry_id) != "read_failed":
                 unavailable[entry_id] = value
-    entries = await integration_entries_for_org(organization_id)
+    entries = await entries_read
     return [with_accounts(entry, accounts.get(entry.id), unavailable.get(entry.id)) for entry in entries]

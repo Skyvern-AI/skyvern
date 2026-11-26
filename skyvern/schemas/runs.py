@@ -262,6 +262,17 @@ class TaskRunRequest(BaseModel):
         description=TOTP_IDENTIFIER_DOC_STRING,
         examples=TOTP_IDENTIFIER_EXAMPLES,
     )
+    otp_request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^otpr_[A-Za-z0-9_-]+$",
+        description=(
+            "Explicit request marker for strict run-bound OTP delivery. This field is accepted only "
+            "on the otp-bound run endpoint; omit it to retain legacy behavior."
+        ),
+        examples=["otpr_example"],
+    )
     totp_url: str | None = Field(
         default=None,
         description=TOTP_URL_DOC_STRING,
@@ -441,6 +452,17 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description=TOTP_IDENTIFIER_DOC_STRING,
         examples=TOTP_IDENTIFIER_EXAMPLES,
+    )
+    otp_request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^otpr_[A-Za-z0-9_-]+$",
+        description=(
+            "Explicit request marker for strict run-bound OTP delivery. This field is accepted only "
+            "on the otp-bound run endpoint; omit it to retain legacy behavior."
+        ),
+        examples=["otpr_example"],
     )
     browser_session_id: str | None = Field(
         default=None,

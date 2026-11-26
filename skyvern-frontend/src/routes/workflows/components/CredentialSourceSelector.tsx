@@ -32,6 +32,7 @@ export function CredentialSourceSelector(props: BrokerCredentialSelectorProps) {
                 : GOOGLE_GMAIL_REQUIRED_SCOPES
           }
           gmailSendOnly={props.purpose === "send" || props.purpose === "reply"}
+          allowTemplates={props.allowTemplates}
           disabled={props.disabled}
           ariaLabel="Gmail account"
           showEmail

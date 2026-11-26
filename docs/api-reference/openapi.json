@@ -468,10 +468,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Idempotency-Key must contain 1 to 255 visible ASCII bytes.",
+              "description": "Makes the create safe to retry: a repeat request with the same key returns the agent the first request created instead of creating another. Must contain 1 to 255 visible ASCII bytes. When this header is sent, the returned `workflow_permanent_id` is derived from the key: `wpid_` followed by 64 hexadecimal characters, instead of the usual `wpid_` followed by digits. The ID is permanent and works like any other agent ID. Omit the header to get the usual format.",
               "title": "Idempotency-Key"
             },
-            "description": "Idempotency-Key must contain 1 to 255 visible ASCII bytes."
+            "description": "Makes the create safe to retry: a repeat request with the same key returns the agent the first request created instead of creating another. Must contain 1 to 255 visible ASCII bytes. When this header is sent, the returned `workflow_permanent_id` is derived from the key: `wpid_` followed by 64 hexadecimal characters, instead of the usual `wpid_` followed by digits. The ID is permanent and works like any other agent ID. Omit the header to get the usual format."
           }
         ],
         "requestBody": {
@@ -5978,6 +5978,15 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_retry_workflow_run_v1_workflows_runs__workflow_run_id__retry_post"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successfully retried workflow run",
@@ -7093,63 +7102,32 @@
         "summary": "Extract a job application posting",
         "description": "Start a workflow run that extracts structured details from a job posting.",
         "operationId": "extract_job_application_v1_recipes_jobs_extract_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "properties": {
-                  "webhook_url": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "format": "uri",
-                    "title": "Webhook Url",
-                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
-                    "examples": [
-                      "https://my-site.com/webhook"
-                    ]
-                  },
-                  "proxy_location": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/components/schemas/ProxyLocation"
-                      },
-                      {
-                        "$ref": "#/components/schemas/GeoTarget"
-                      },
-                      {
-                        "additionalProperties": true,
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Proxy Location",
-                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
-                  },
-                  "job_url": {
-                    "type": "string",
-                    "format": "uri",
-                    "title": "Job Url"
-                  }
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "x-max-steps-override",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
                 },
-                "additionalProperties": false,
-                "type": "object",
-                "required": [
-                  "job_url"
-                ],
-                "title": "JobRecipeExtractRequest"
-              }
-            }
-          },
-          "required": true
-        },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Maximum steps each task in the run may take. Overrides the organization limit.",
+              "title": "X-Max-Steps-Override"
+            },
+            "description": "Maximum steps each task in the run may take. Overrides the organization limit."
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successfully started job application extraction",
@@ -7177,26 +7155,13 @@
             "description": "Workflow launch failed"
           }
         },
-        "security": [
-          {
-            "ApiKeyAuth": []
-          }
-        ],
-        "x-fern-sdk-method-name": "extract_job_application"
-      }
-    },
-    "/v1/recipes/jobs/apply": {
-      "post": {
-        "tags": [
-          "Recipes"
-        ],
-        "summary": "Apply to a job",
-        "description": "Start a workflow run that applies to a job with a résumé and optional credentials.",
-        "operationId": "apply_to_job_v1_recipes_jobs_apply_post",
+        "x-fern-sdk-method-name": "extract_job_application",
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
+                "additionalProperties": false,
                 "properties": {
                   "webhook_url": {
                     "anyOf": [
@@ -7207,12 +7172,12 @@
                         "type": "null"
                       }
                     ],
-                    "format": "uri",
-                    "title": "Webhook Url",
                     "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
                     "examples": [
                       "https://my-site.com/webhook"
-                    ]
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url"
                   },
                   "proxy_location": {
                     "anyOf": [
@@ -7230,24 +7195,171 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Proxy Location",
-                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL.",
+                    "title": "Proxy Location"
                   },
                   "job_url": {
-                    "type": "string",
                     "format": "uri",
-                    "title": "Job Url"
+                    "title": "Job Url",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "job_url"
+                ],
+                "title": "JobRecipeExtractRequest",
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/recipes/jobs/apply": {
+      "post": {
+        "tags": [
+          "Recipes"
+        ],
+        "summary": "Apply to a job",
+        "description": "Start a workflow run that applies to a job with a résumé and optional credentials.",
+        "operationId": "apply_to_job_v1_recipes_jobs_apply_post",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "x-max-steps-override",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Maximum steps each task in the run may take. Overrides the organization limit.",
+              "title": "X-Max-Steps-Override"
+            },
+            "description": "Maximum steps each task in the run may take. Overrides the organization limit."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully started job application",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRecipeRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid multipart structure"
+          },
+          "402": {
+            "description": "Insufficient credits or required billing state"
+          },
+          "403": {
+            "description": "Unauthorized or insufficient organization permission"
+          },
+          "413": {
+            "description": "Résumé file exceeds the upload limit"
+          },
+          "422": {
+            "description": "Invalid apply request"
+          },
+          "429": {
+            "description": "Workflow submission rate limit exceeded"
+          },
+          "500": {
+            "description": "Upload or workflow launch failed"
+          },
+          "502": {
+            "description": "Credential service failed"
+          },
+          "503": {
+            "description": "Saved credential check is temporarily unavailable"
+          }
+        },
+        "x-fern-sdk-method-name": "apply_to_job",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url"
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL.",
+                    "title": "Proxy Location"
+                  },
+                  "job_url": {
+                    "format": "uri",
+                    "title": "Job Url",
+                    "type": "string"
                   },
                   "custom_prompt": {
-                    "type": "string",
-                    "title": "Custom Prompt"
+                    "title": "Custom Prompt",
+                    "type": "string"
                   },
                   "resume_url": {
-                    "type": "string",
                     "format": "uri",
-                    "title": "Resume Url"
+                    "title": "Resume Url",
+                    "type": "string"
                   },
                   "other_information": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "items": {},
+                        "type": "array"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "Extra applicant details as a JSON object or array, for example {\"location\": \"New York, NY\", \"salary_expectation\": \"120000\"}. Plain text is rejected.",
                     "title": "Other Information"
                   },
                   "terminate_criterion": {
@@ -7259,9 +7371,9 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Terminate Criterion",
+                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient.",
                     "description": "Condition that stops Apply. Omit to use the recipe default; null or empty text disables it.",
-                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient."
+                    "title": "Terminate Criterion"
                   },
                   "error_code_mapping": {
                     "anyOf": [
@@ -7275,17 +7387,17 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Error Code Mapping",
-                    "description": "Error codes and descriptions. Omit for the recipe default; null or {} disables mapping. A supplied mapping replaces the default independently of terminate_criterion.",
                     "default": {
                       "job_expired": "The requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications."
-                    }
+                    },
+                    "description": "Error codes and descriptions. Omit for the recipe default; null or {} disables mapping. A supplied mapping replaces the default independently of terminate_criterion.",
+                    "title": "Error Code Mapping"
                   },
                   "username": {
                     "anyOf": [
                       {
-                        "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "type": "string"
                       },
                       {
                         "type": "null"
@@ -7325,34 +7437,48 @@
                       }
                     ],
                     "title": "2Fa Identifier"
+                  },
+                  "credential_id": {
+                    "anyOf": [
+                      {
+                        "pattern": "^cred_[A-Za-z0-9_-]{1,64}$",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "ID of a password credential saved in your organization, such as one an earlier Apply call saved with persist_credentials. Use it in place of username, password, and persist_credentials. The job_url must be on a website saved on the credential (its tested_url or one of its extra_site_urls). Before the run types the credential's password, or a one-time code made from it, it checks that the receiving page is on one of those websites. Change a credential's saved websites in the Skyvern app's credential editor.",
+                    "title": "Credential Id"
                   }
                 },
-                "additionalProperties": false,
-                "type": "object",
                 "required": [
                   "job_url",
                   "custom_prompt",
                   "resume_url"
                 ],
-                "title": "JobRecipeApplyJSONRequest"
+                "title": "JobRecipeApplyJSONRequest",
+                "type": "object"
               }
             },
             "multipart/form-data": {
               "schema": {
+                "additionalProperties": false,
+                "description": "OpenAPI representation of the text and file parts accepted by Apply.",
                 "properties": {
                   "job_url": {
-                    "type": "string",
                     "format": "uri",
-                    "title": "Job Url"
+                    "title": "Job Url",
+                    "type": "string"
                   },
                   "custom_prompt": {
-                    "type": "string",
-                    "title": "Custom Prompt"
+                    "title": "Custom Prompt",
+                    "type": "string"
                   },
                   "resume_file": {
-                    "type": "string",
                     "format": "binary",
-                    "title": "Resume File"
+                    "title": "Resume File",
+                    "type": "string"
                   },
                   "webhook_url": {
                     "anyOf": [
@@ -7363,9 +7489,9 @@
                         "type": "null"
                       }
                     ],
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
                     "format": "uri",
-                    "title": "Webhook Url",
-                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details."
+                    "title": "Webhook Url"
                   },
                   "proxy_location": {
                     "anyOf": [
@@ -7376,8 +7502,8 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Proxy Location",
-                    "description": "A ProxyLocation name such as RESIDENTIAL_GB, or JSON text for a GeoTarget or custom proxy object. Omit it or send blank text to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                    "description": "A ProxyLocation name such as RESIDENTIAL_GB, or JSON text for a GeoTarget or custom proxy object. Omit it or send blank text to use the default; Skyvern Cloud then uses RESIDENTIAL.",
+                    "title": "Proxy Location"
                   },
                   "other_information": {
                     "anyOf": [
@@ -7388,6 +7514,7 @@
                         "type": "null"
                       }
                     ],
+                    "description": "JSON text containing an object or array of extra applicant details, for example {\"location\": \"New York, NY\"}. Plain text is rejected.",
                     "title": "Other Information"
                   },
                   "terminate_criterion": {
@@ -7399,9 +7526,9 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Terminate Criterion",
+                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient.",
                     "description": "Condition that stops Apply. Omit for the recipe default; empty text disables it.",
-                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient."
+                    "title": "Terminate Criterion"
                   },
                   "error_code_mapping": {
                     "anyOf": [
@@ -7412,15 +7539,15 @@
                         "type": "null"
                       }
                     ],
-                    "title": "Error Code Mapping",
+                    "default": "{\"job_expired\": \"The requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications.\"}",
                     "description": "JSON text containing an object of error codes and descriptions. Omit for the recipe default; JSON null or {} disables mapping. A supplied mapping replaces the default independently of terminate_criterion.",
-                    "default": "{\"job_expired\": \"The requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications.\"}"
+                    "title": "Error Code Mapping"
                   },
                   "username": {
                     "anyOf": [
                       {
-                        "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "type": "string"
                       },
                       {
                         "type": "null"
@@ -7442,8 +7569,8 @@
                   "persist_credentials": {
                     "anyOf": [
                       {
-                        "type": "string",
-                        "pattern": "^true$"
+                        "pattern": "^true$",
+                        "type": "string"
                       },
                       {
                         "type": "null"
@@ -7461,64 +7588,32 @@
                       }
                     ],
                     "title": "2Fa Identifier"
+                  },
+                  "credential_id": {
+                    "anyOf": [
+                      {
+                        "pattern": "^cred_[A-Za-z0-9_-]{1,64}$",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "ID of a password credential saved in your organization, such as one an earlier Apply call saved with persist_credentials. Use it in place of username, password, and persist_credentials. The job_url must be on a website saved on the credential (its tested_url or one of its extra_site_urls). Before the run types the credential's password, or a one-time code made from it, it checks that the receiving page is on one of those websites. Change a credential's saved websites in the Skyvern app's credential editor.",
+                    "title": "Credential Id"
                   }
                 },
-                "additionalProperties": false,
-                "type": "object",
                 "required": [
                   "job_url",
                   "custom_prompt",
                   "resume_file"
                 ],
                 "title": "JobRecipeApplyMultipartRequest",
-                "description": "OpenAPI representation of the text and file parts accepted by Apply."
+                "type": "object"
               }
             }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successfully started job application",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/JobRecipeRunResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid multipart structure"
-          },
-          "402": {
-            "description": "Insufficient credits or required billing state"
-          },
-          "403": {
-            "description": "Unauthorized or insufficient organization permission"
-          },
-          "413": {
-            "description": "Résumé file exceeds the upload limit"
-          },
-          "422": {
-            "description": "Invalid apply request"
-          },
-          "429": {
-            "description": "Workflow submission rate limit exceeded"
-          },
-          "500": {
-            "description": "Upload or workflow launch failed"
-          },
-          "502": {
-            "description": "Credential service failed"
           }
-        },
-        "security": [
-          {
-            "ApiKeyAuth": []
-          }
-        ],
-        "x-fern-sdk-method-name": "apply_to_job"
+        }
       }
     },
     "/v1/recipes/jobs/runs": {
@@ -10933,6 +11028,26 @@
           "integration_action"
         ],
         "title": "BlockType"
+      },
+      "Body_retry_workflow_run_v1_workflows_runs__workflow_run_id__retry_post": {
+        "properties": {
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id"
+          }
+        },
+        "type": "object",
+        "title": "Body_retry_workflow_run_v1_workflows_runs__workflow_run_id__retry_post"
       },
       "Body_upload_file_v1_upload_file_post": {
         "properties": {
@@ -14857,6 +14972,27 @@
             "title": "Download Attachments",
             "default": false
           },
+          "organize_action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailOrganizeAction"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "organize_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organize Label"
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -15105,6 +15241,30 @@
             "description": "Download non-inline attachments from matched emails for downstream blocks.",
             "default": false
           },
+          "organize_action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailOrganizeAction"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Change every matched email: add a label, archive, move to a label, or mark read. Needs a Connected Gmail account (credential_source nango)."
+          },
+          "organize_label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organize Label",
+            "description": "Existing Gmail label name for organize_action label or move. Must be literal text."
+          },
           "parameter_keys": {
             "anyOf": [
               {
@@ -15126,6 +15286,17 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "EmailOrganizeAction": {
+        "type": "string",
+        "enum": [
+          "label",
+          "archive",
+          "move",
+          "mark_read"
+        ],
+        "title": "EmailOrganizeAction",
+        "description": "One change an Email Inbox block applies to every email it matched."
       },
       "EmailTransport": {
         "type": "string",
@@ -17502,6 +17673,11 @@
           "storage_type": {
             "$ref": "#/components/schemas/FileStorageType",
             "default": "s3"
+          },
+          "google_drive_save_as_sheet": {
+            "type": "boolean",
+            "title": "Google Drive Save As Sheet",
+            "default": false
           }
         },
         "type": "object",
@@ -17692,6 +17868,11 @@
               }
             ],
             "title": "Google Drive Folder Id"
+          },
+          "google_drive_save_as_sheet": {
+            "type": "boolean",
+            "title": "Google Drive Save As Sheet",
+            "default": false
           },
           "sftp_host": {
             "anyOf": [
@@ -19173,6 +19354,7 @@
           "create_sheet_if_missing": {
             "type": "boolean",
             "title": "Create Sheet If Missing",
+            "description": "Add the tab named by sheet_name to the spreadsheet when it has no tab with that name. The spreadsheet itself must already exist.",
             "default": false
           },
           "parameter_keys": {
@@ -19328,6 +19510,7 @@
           },
           "timeout": {
             "type": "integer",
+            "minimum": 1.0,
             "title": "Timeout",
             "default": 30
           },
@@ -19542,6 +19725,7 @@
           },
           "timeout": {
             "type": "integer",
+            "minimum": 1.0,
             "title": "Timeout",
             "default": 30
           },
@@ -23468,7 +23652,10 @@
           },
           "credential_source": {
             "type": "string",
-            "const": "nango",
+            "enum": [
+              "nango",
+              "native"
+            ],
             "title": "Credential Source",
             "default": "nango"
           },
@@ -23615,12 +23802,15 @@
             "description": "Power BI connection ID for this user.",
             "x-skyvern-connected-account": true,
             "x-skyvern-connected-account-when": {
-              "credential_source": "nango"
+              "credential_source": "native"
             }
           },
           "credential_source": {
             "type": "string",
-            "const": "nango",
+            "enum": [
+              "nango",
+              "native"
+            ],
             "title": "Credential Source",
             "default": "nango"
           },
@@ -25672,6 +25862,24 @@
               "wr_123456"
             ]
           },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound delivery. Omit this field to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
+            ]
+          },
           "source": {
             "anyOf": [
               {
@@ -25766,6 +25974,52 @@
               }
             ],
             "description": "The type of the OTP code."
+          },
+          "claimed_by_task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed By Task Id"
+          },
+          "claimed_by_workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed By Workflow Run Id"
+          },
+          "claimed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed At"
+          },
+          "rejected_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rejected At"
           }
         },
         "type": "object",
@@ -25835,6 +26089,24 @@
             "description": "The workflow run id that the TOTP code is for. It can be the workflow run id of the workflow run that the TOTP code is for.",
             "examples": [
               "wr_123456"
+            ]
+          },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound delivery. Omit this field to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
             ]
           },
           "source": {
@@ -27286,6 +27558,24 @@
               "user_123"
             ]
           },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound OTP delivery. This field is accepted only on the otp-bound run endpoint; omit it to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
+            ]
+          },
           "totp_url": {
             "anyOf": [
               {
@@ -27625,6 +27915,24 @@
               "john.doe@example.com",
               "4155555555",
               "user_123"
+            ]
+          },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound OTP delivery. This field is accepted only on the otp-bound run endpoint; omit it to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
             ]
           },
           "totp_url": {
@@ -31939,7 +32247,7 @@
                 "type": "null"
               }
             ],
-            "description": "Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began."
+            "description": "Which surface wrote this version: ui, copilot (Ember), mcp, cli, api, or internal. Null before tracking began."
           },
           "copilot_authored": {
             "type": "boolean",
@@ -31967,7 +32275,7 @@
               }
             ],
             "title": "Original Created By",
-            "description": "Who created the agent's first version. Populated by the list endpoint only."
+            "description": "Who created the agent's first version. Populated by the list and detail endpoints only."
           },
           "original_created_at": {
             "anyOf": [
@@ -32037,7 +32345,7 @@
           "internal"
         ],
         "title": "WorkflowBuildSource",
-        "description": "Which surface wrote a workflow version.\n\n- ui: the Skyvern app\n- copilot: the workflow copilot\n- mcp: a first-party MCP client\n- cli: the Skyvern CLI\n- api: any other API or SDK caller\n- internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)"
+        "description": "Which surface wrote a workflow version.\n\n- ui: the Skyvern app\n- copilot: Ember, Skyvern's agent builder (the value keeps the old name)\n- mcp: a first-party MCP client\n- cli: the Skyvern CLI\n- api: any other API or SDK caller\n- internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)"
       },
       "WorkflowCreateYAMLRequest": {
         "properties": {
@@ -32131,7 +32439,7 @@
               }
             ],
             "title": "Mask Secrets",
-            "description": "Mask secret values across this workflow's runs: hide them while they are typed (screenshots, recordings, live view) and redact them from stored artifacts, network logs, and LLM-bound text."
+            "description": "Mask secret values across this workflow's runs. A new workflow defaults to true; on PUT updates, omission keeps the stored value. With this off, stored text artifacts (page HTML, element trees, LLM prompts and responses, logs and network logs) are still scrubbed of known secret values of 8 or more characters. With it on, shorter secret values are scrubbed too, secrets are hidden while they are typed (screenshots, recordings, live view), and they are redacted from LLM-bound text and failure reasons."
           },
           "pin_saved_session_ip": {
             "type": "boolean",
@@ -34511,6 +34819,24 @@
               "user_123"
             ]
           },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound OTP delivery. This field is accepted only on the otp-bound run endpoint; omit it to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
+            ]
+          },
           "browser_session_id": {
             "anyOf": [
               {
@@ -34808,6 +35134,24 @@
               "john.doe@example.com",
               "4155555555",
               "user_123"
+            ]
+          },
+          "otp_request_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1,
+                "pattern": "^otpr_[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otp Request Id",
+            "description": "Explicit request marker for strict run-bound OTP delivery. This field is accepted only on the otp-bound run endpoint; omit it to retain legacy behavior.",
+            "examples": [
+              "otpr_example"
             ]
           },
           "browser_session_id": {

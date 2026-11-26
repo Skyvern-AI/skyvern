@@ -1,14 +1,30 @@
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.config import settings
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
+from skyvern.forge.sdk.encrypt.files import FILE_MAGIC
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.webeye import default_persistent_sessions_manager as manager_mod
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.default_persistent_sessions_manager import BrowserSession, DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE
+from skyvern.webeye.profile_cookie_merge import BANKED_COOKIES_FILENAME
+from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.session_cookies import read_persisted_session_cookies
+from tests.unit.forge.sdk.artifact.storage.test_helpers import (
+    ProfileTransport,
+    artifact_root,
+    install_s3_profile_transport,
+)
+from tests.unit.forge.sdk.test_create_browser_profile_from_session_route import _session as _profile_session
+from tests.unit.test_browser_context_factory_marker import _factory_harness, _stub_local_launch
 
 
 class _LaunchBrowserSessionsRepository:
@@ -119,19 +135,45 @@ async def test_close_session_skips_in_memory_export_for_mismatched_org(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "legacy",
+        "encrypted",
+        "encrypted-read-only",
+        "encrypted-failed-seed",
+        "fork",
+        "reuse",
+        "stale-seed",
+        "deleted-seed",
+        "legacy-reuse",
+        "legacy-fork",
+        "legacy-remote-reuse",
+        "legacy-stale-seed",
+        "legacy-deleted-seed",
+        "remote-fork",
+        "remote-reuse",
+        "remote-failed-close",
+    ],
+)
 async def test_close_session_exports_and_closes_for_matching_org(
     manager: DefaultPersistentSessionsManager,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
 ) -> None:
+    if mode != "legacy":
+        await _assert_persistent_profile_export(manager, monkeypatch, tmp_path, mode)
+        return
     browser_state = MagicMock()
     browser_state.close = AsyncMock()
     browser_state.browser_context = MagicMock()
-    browser_state.browser_artifacts = SimpleNamespace(
-        browser_session_dir="/tmp/pbs_owned",
-        video_artifacts=[],
-    )
+    browser_state.profile_read_only = False
+    browser_state.browser_artifacts = BrowserArtifacts(browser_session_dir="/tmp/pbs_owned")
     storage = MagicMock()
     storage.store_browser_profile = AsyncMock()
     persisted_session = MagicMock()
+    persisted_session.generate_browser_profile = True
     persisted_session.should_export_profile.return_value = True
     manager.database.browser_sessions.get_persistent_browser_session.return_value = persisted_session
 
@@ -157,6 +199,7 @@ async def test_close_session_exports_and_closes_for_matching_org(
         organization_id="org_owner",
         profile_id="pbs_owned",
         directory="/tmp/pbs_owned",
+        require_encryption=False,
     )
     browser_state.close.assert_awaited_once()
     assert cached.retirement.reason == "session_ending"
@@ -165,6 +208,132 @@ async def test_close_session_exports_and_closes_for_matching_org(
         "pbs_owned",
         "org_owner",
     )
+
+
+async def _assert_persistent_profile_export(
+    manager: DefaultPersistentSessionsManager, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+) -> None:
+    legacy_seed = mode.startswith("legacy-")
+    mode = mode.removeprefix("legacy-")
+    monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(tmp_path / "storage"))
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
+    monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", (artifact_root(),))
+    monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", not legacy_seed)
+    working_dir = tmp_path / "profile"
+    working_dir.mkdir()
+    remote = mode.startswith("remote-")
+    storage = S3Storage() if remote else LocalStorage()
+    transport = ProfileTransport()
+    if isinstance(storage, S3Storage):
+        monkeypatch.setattr(settings, "AWS_S3_BUCKET_BROWSER_SESSIONS", "profile-test")
+        install_s3_profile_transport(storage, transport, monkeypatch)
+    cookie = {"name": "session", "value": "persisted", "domain": "fixture.invalid", "path": "/", "expires": -1}
+    context = MagicMock()
+    context.cookies = AsyncMock(return_value=[cookie])
+    playwright = MagicMock()
+    artifacts = BrowserArtifacts(browser_session_dir=str(working_dir))
+    cleanup = None
+    fork = mode in {"fork", "remote-fork"}
+    seeded = fork or remote or mode in {"reuse", "stale-seed", "deleted-seed"}
+    if seeded:
+        (working_dir / "seed").write_text("before")
+        (working_dir / BANKED_COOKIES_FILENAME).write_text("[]")
+        await storage.store_browser_profile("org_owner", "bp_seed", str(working_dir))
+        monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
+        monkeypatch.setattr(settings, "BROWSER_TYPE", "chromium-headless")
+        _factory_harness(monkeypatch, storage=storage)
+        from skyvern.webeye import browser_factory
+
+        monkeypatch.setattr(
+            browser_factory.app.AGENT_FUNCTION, "should_apply_banked_cookies", AsyncMock(return_value=True)
+        )
+        playwright = _stub_local_launch(monkeypatch, tmp_path)
+        playwright.chromium.launch_persistent_context = AsyncMock(return_value=context)
+        _, artifacts, cleanup = await BrowserContextFactory.create_browser_context(
+            playwright,
+            organization_id="org_owner",
+            browser_profile_id="bp_seed",
+            browser_session_id="pbs_owned",
+            _profile_export_fork=fork,
+        )
+        assert artifacts._seed_profile_encrypted is not legacy_seed
+        if legacy_seed and not remote:
+            durable = tmp_path / "storage" / "org_owner" / "profiles" / "bp_seed"
+            assert (Path(artifacts.browser_session_dir or "") == durable) is not fork
+            if mode in {"stale-seed", "deleted-seed"}:
+                # Simulate Chromium closing after the durable profile was deleted or migrated.
+                context.cookies.return_value = []
+
+        if mode == "stale-seed":
+            (working_dir / "seed").write_text("newer")
+            await storage.store_browser_profile(
+                "org_owner", "bp_seed", str(working_dir), require_encryption=legacy_seed
+            )
+        elif mode == "deleted-seed":
+            await storage.delete_browser_profile("org_owner", "bp_seed", hard_delete=True)
+    uploads_before_close = transport.objects.copy()
+
+    async def close_context() -> None:
+        if not legacy_seed:
+            assert transport.objects == uploads_before_close or fork
+        if mode == "remote-failed-close":
+            raise RuntimeError("context close failed")
+        if Path(str(artifacts.browser_session_dir)).is_dir():
+            (Path(str(artifacts.browser_session_dir)) / "closed").touch()
+
+    playwright.stop = AsyncMock()
+    context.close = close_context
+    state = RealBrowserState(
+        pw=playwright, browser_context=context, browser_artifacts=artifacts, browser_cleanup=cleanup
+    )
+    state.profile_read_only = mode == "encrypted-read-only"
+    if mode == "encrypted-failed-seed":
+        artifacts.mark_seed_load_failed()
+    manager._browser_sessions["pbs_owned"] = BrowserSession(browser_state=state, organization_id="org_owner")
+    manager.database.browser_sessions.get_persistent_browser_session.return_value = _profile_session(
+        persistent_browser_session_id="pbs_owned",
+        organization_id="org_owner",
+        browser_profile_id="bp_seed" if seeded else None,
+        profile_read_only=state.profile_read_only,
+        generate_browser_profile=fork or not seeded,
+    )
+    with (
+        patch.object(manager_mod, "app", SimpleNamespace(STORAGE=storage)),
+        patch.object(manager_mod.settings, "BROWSER_STREAMING_MODE", "vnc"),
+    ):
+        await manager.close_session("org_owner", "pbs_owned")
+
+    assert "pbs_owned" not in manager._browser_sessions
+    if seeded:
+        seed = await storage.retrieve_browser_profile_snapshot("org_owner", "bp_seed")
+        assert (seed is None) == (mode == "deleted-seed")
+        exported_ok = fork or mode == "remote-reuse"
+        assert await storage.browser_profile_exists("org_owner", "pbs_owned") is exported_ok
+        if seed:
+            reused = mode == "reuse"
+            assert seed.encrypted is (not legacy_seed or mode == "stale-seed")
+            assert read_persisted_session_cookies(seed.directory) == ([cookie] if reused else [])
+            assert (Path(seed.directory) / "seed").read_text() == ("newer" if mode == "stale-seed" else "before")
+            assert (Path(seed.directory) / "closed").exists() is reused
+            if mode == "reuse":
+                assert not (Path(seed.directory) / BANKED_COOKIES_FILENAME).exists()
+        if exported_ok:
+            assert all(transport.objects[uri] == content for uri, content in uploads_before_close.items())
+            assert all(uri.endswith(".zip.enc") is not legacy_seed for uri in transport.objects)
+            exported = await storage.retrieve_browser_profile_snapshot("org_owner", "pbs_owned")
+            assert exported and exported.encrypted is not legacy_seed
+            assert read_persisted_session_cookies(exported.directory) == [cookie]
+        if mode == "remote-failed-close":
+            assert transport.objects == uploads_before_close
+        return
+    files = list((tmp_path / "storage").rglob("*.enc"))
+    if mode != "encrypted":
+        assert files == []
+        return
+    (sealed,) = files
+    assert sealed.name == "pbs_owned.zip.enc" and sealed.read_bytes().startswith(FILE_MAGIC)
+    restored = await storage.retrieve_browser_profile("org_owner", "pbs_owned")
+    assert read_persisted_session_cookies(restored) == [cookie]
 
 
 @pytest.mark.asyncio
@@ -203,11 +372,10 @@ async def test_cancelled_close_retains_browser_and_port_cleanup(
     browser_state = MagicMock()
     browser_state.close = AsyncMock()
     browser_state.browser_context = MagicMock()
-    browser_state.browser_artifacts = SimpleNamespace(
-        browser_session_dir="/tmp/pbs_cancelled",
-        video_artifacts=[],
-    )
+    browser_state.profile_read_only = False
+    browser_state.browser_artifacts = BrowserArtifacts(browser_session_dir="/tmp/pbs_cancelled")
     persisted_session = MagicMock()
+    persisted_session.generate_browser_profile = False
     persisted_session.should_export_profile.return_value = False
     manager.database.browser_sessions.get_persistent_browser_session.return_value = persisted_session
     manager._browser_sessions["pbs_cancelled"] = BrowserSession(
@@ -223,7 +391,7 @@ async def test_cancelled_close_retains_browser_and_port_cleanup(
         patch.object(manager_mod.settings, "BROWSER_STREAMING_MODE", "vnc"),
     ):
         close_task = asyncio.create_task(manager.close_session("org_owner", "pbs_cancelled"))
-        await persist_started.wait()
+        await asyncio.wait_for(persist_started.wait(), timeout=5)
         close_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await close_task
@@ -309,7 +477,8 @@ async def test_launch_standalone_browser_publishes_cdp_address() -> None:
         retry_timeout=0.25,
         timeout=1,
     )
-    assert browser_manager._create_browser_state.await_args.kwargs["cdp_port"] == 9242
+    launch_args = browser_manager._create_browser_state.await_args.kwargs
+    assert (launch_args["cdp_port"], launch_args["browser_session_id"]) == (9242, "pbs_local")
     assert manager._browser_sessions["pbs_local"].cdp_port == 9242
     assert repository.session.status == "running"
     assert repository.session.started_at is not None
@@ -380,6 +549,7 @@ async def test_launch_records_whether_the_requested_profile_loaded_before_the_se
 ) -> None:
     manager, repository = _launch_manager()
     repository.session.browser_profile_id = "bp_saved"
+    repository.session.generate_browser_profile = False
     browser_state = MagicMock()
     browser_state.browser_artifacts = BrowserArtifacts(applied_browser_profile_id=applied_browser_profile_id)
     browser_state.get_or_create_page = AsyncMock(return_value=MagicMock())

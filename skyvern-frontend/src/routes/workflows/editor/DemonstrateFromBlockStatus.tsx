@@ -135,7 +135,7 @@ function DemonstrateFromBlockStatus() {
             </p>
             <p className="mt-1 text-xs text-slate-400">
               {step === "start" && !startDemonstration
-                ? "Recording starts once Copilot and the browser are ready."
+                ? "Recording starts once Ember and the browser are ready."
                 : `Running ${pending.prefixLabels.join(", ")}. You'll demonstrate ${pending.blockLabel} when they finish.`}
             </p>
           </div>

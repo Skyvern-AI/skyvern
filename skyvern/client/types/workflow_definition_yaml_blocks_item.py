@@ -13,6 +13,7 @@ from .branch_condition_yaml import BranchConditionYaml
 from .branch_criteria_yaml import BranchCriteriaYaml
 from .code_block_step_yaml import CodeBlockStepYaml
 from .code_block_yaml_data_schema import CodeBlockYamlDataSchema
+from .email_organize_action import EmailOrganizeAction
 from .email_inbox_block_yaml_email_client import EmailInboxBlockYamlEmailClient
 from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
 from .file_storage_type import FileStorageType
@@ -131,6 +132,8 @@ class WorkflowDefinitionYamlBlocksItem_EmailInbox(UniversalBaseModel):
     ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     email_client: EmailInboxBlockYamlEmailClient
+    credential_source: typing.Optional[typing.Literal["native", "nango"]] = None
+    connection_id: typing.Optional[str] = None
     credential_id: typing.Optional[str] = None
     folder: typing.Optional[str] = None
     prompt: typing.Optional[str] = None
@@ -139,6 +142,8 @@ class WorkflowDefinitionYamlBlocksItem_EmailInbox(UniversalBaseModel):
     newer_than_days: typing.Optional[int] = None
     max_results: typing.Optional[int] = None
     include_body: typing.Optional[bool] = None
+    organize_action: typing.Optional[EmailOrganizeAction] = None
+    organize_label: typing.Optional[str] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:
@@ -230,6 +235,7 @@ class WorkflowDefinitionYamlBlocksItem_FileUpload(UniversalBaseModel):
     azure_folder_path: typing.Optional[str] = None
     google_credential_id: typing.Optional[str] = None
     google_drive_folder_id: typing.Optional[str] = None
+    google_drive_save_as_sheet: typing.Optional[bool] = None
     sftp_host: typing.Optional[str] = None
     sftp_port: typing.Optional[int] = None
     sftp_username: typing.Optional[str] = None

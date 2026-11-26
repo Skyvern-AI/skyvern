@@ -54,7 +54,7 @@ export function QueuedMessageStrip({
       {onSendNow ? (
         <TooltipProvider>
           <ControlTooltip
-            content="Copilot reads it at its next step instead of after this turn"
+            content="Ember reads it at its next step instead of after this turn"
             side="top"
           >
             <button

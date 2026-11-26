@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, replace
 from os import PathLike, fspath
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -232,6 +232,51 @@ class CredentialReleaseGuard:
         self._armed: list[ArmedSecret] = []
         self._workflow_run_id = workflow_run_id
         self._block_label = block_label
+        # Set only on a confined run's guard, by `hold_typed_literals`.
+        self._typed_literals: set[str] | None = None
+        self._code_sources: list[tuple[Callable[[], Iterable[str]], tuple[ArmedSecret, ...]]] = []
+
+    @property
+    def workflow_run_id(self) -> str | None:
+        return self._workflow_run_id
+
+    @property
+    def confined(self) -> bool:
+        return self._typed_literals is not None
+
+    def hold_typed_literals(self, values: Iterable[object]) -> None:
+        """Make this a confined run's guard: these armed values, and the codes of `hold_codes`, are judged in every
+        written value, whether a placeholder resolved them or the model typed them."""
+        if self._typed_literals is None:
+            self._typed_literals = set()
+        self._typed_literals.update(value for value in values if isinstance(value, str) and value)
+
+    def hold_codes(self, parameter_key: str, live_codes: Callable[[], Iterable[str]]) -> None:
+        """On a confined run, judge each code that ``live_codes`` returns at a write like a secret of the credential
+        ``parameter_key``. Made from its seed, they are the same in every block's guard, also after a restart."""
+        if self._typed_literals is None:
+            return
+        owners = {
+            (entry.allowed_url, entry.whole_site, entry.enforced): entry
+            for entry in self._armed
+            if entry.parameter_key == parameter_key
+        }
+        if owners:
+            self._code_sources.append((live_codes, tuple(owners.values())))
+
+    def literal_matches(self, value: object) -> list[ArmedSecret]:
+        """The held values that a written value contains, at any length: a copied short password cannot be told
+        from a coincidence, so off-site text that merely contains one is refused too."""
+        if self._typed_literals is None or not isinstance(value, str) or not value:
+            return []
+        found = [
+            entry for entry in self._armed if entry.secret_value in self._typed_literals and entry.secret_value in value
+        ]
+        for live_codes, owners in self._code_sources:
+            for code in live_codes():
+                if code and code in value:
+                    found.extend(replace(owner, secret_value=code) for owner in owners)
+        return found
 
     def arm(
         self,

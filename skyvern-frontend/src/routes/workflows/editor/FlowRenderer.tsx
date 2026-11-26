@@ -158,6 +158,7 @@ import {
   getOrderedChildrenBlocks,
   getWorkflowBlocks,
   getWorkflowSettings,
+  keepUneditedBlockFields,
   layout,
   removeJinjaReferenceFromNodes,
   removeKeyFromNodesParameterKeys,
@@ -1268,7 +1269,10 @@ function FlowRenderer({
   }, [nodes, edges, onDebuggableBlockCountChange]);
 
   const constructSaveData = useCallback((): WorkflowSaveData => {
-    const blocks = getWorkflowBlocks(nodes, edges);
+    const blocks = keepUneditedBlockFields(
+      getWorkflowBlocks(nodes, edges),
+      workflow,
+    );
     const { blocks: upgradedBlocks, version: workflowDefinitionVersion } =
       upgradeWorkflowDefinitionToVersionTwo(
         blocks,
@@ -1360,6 +1364,18 @@ function FlowRenderer({
     };
   }, [embedded, readOnly, showDoc]);
 
+  // Must run before the dirtiness effect below, which reads getSaveData: on a
+  // remount (e.g. leaving Version history) it would otherwise diff the old draft.
+  useEffect(() => {
+    if (readOnly) {
+      // Comparison canvases mount FlowRenderer twice and must not stomp the
+      // editor's getSaveData callback that header-level save/navigation-save
+      // actions read from.
+      return;
+    }
+    setGetSaveDataRef.current(constructSaveData);
+  }, [constructSaveData, readOnly]);
+
   // Debounced for user edits: constructSaveData changes per-frame during a node
   // drag, and recomputing dirtiness serializes the whole graph — coalesce to
   // once the draft settles (the dot updating a moment late is imperceptible).
@@ -1395,16 +1411,6 @@ function FlowRenderer({
     }
     return subscribeToYamlDraftChanges(scheduleUserDirtyRefresh);
   }, [embedded, readOnly, scheduleUserDirtyRefresh]);
-
-  useEffect(() => {
-    if (readOnly) {
-      // Comparison canvases mount FlowRenderer twice and must not stomp the
-      // editor's getSaveData callback that header-level save/navigation-save
-      // actions read from.
-      return;
-    }
-    setGetSaveDataRef.current(constructSaveData);
-  }, [constructSaveData, readOnly]);
 
   const hasBlockNode = nodes.some(isWorkflowBlockNode);
   useEffect(() => {

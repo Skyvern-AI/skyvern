@@ -206,8 +206,8 @@ def _prompt_mcp_scope_for_wizard(
 
     return MCPToolScope(
         Prompt.ask(
-            "Tool scope for this local MCP install: all=full 112-tool surface, "
-            "operate=run/monitor/inspect existing automations, build=author/modify automations, "
+            "Tool scope for this local MCP install: all=full tool surface, "
+            "operate=run/monitor/inspect existing automations and ask Ember to build, build=author/modify automations, "
             "browser=drive a browser directly, lean=focused direct browser actions",
             choices=[option.value for option in MCPToolScope],
             default=MCPToolScope.all.value,
@@ -492,9 +492,37 @@ def _find_server_key(servers: dict[object, object], preferred: str = "skyvern") 
     return None
 
 
-def _backup_config_path(config_path: Path) -> Path:
+def _skyvern_user_config_dir() -> Path:
+    if platform.system() == "Windows":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "skyvern"
+
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config_home:
+        return Path(xdg_config_home) / "skyvern"
+
+    return Path.home() / ".config" / "skyvern"
+
+
+def _backup_config(config_path: Path) -> Path:
+    """Copy a config file into the user's Skyvern config directory, readable only by the owner."""
+    backup_dir = _skyvern_user_config_dir() / "mcp-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    return config_path.with_name(f"{config_path.name}.bak-{timestamp}")
+    base_name = f"{config_path.name}.bak-{timestamp}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    attempt = 0
+    while True:
+        backup_path = backup_dir / (base_name if attempt == 0 else f"{base_name}-{attempt}")
+        try:
+            fd = os.open(backup_path, flags, 0o600)
+            break
+        except FileExistsError:
+            attempt += 1
+    with os.fdopen(fd, "wb") as backup_file:
+        backup_file.write(config_path.read_bytes())
+    return backup_path
 
 
 def _write_mcp_config(config_path: Path, config: dict, create_backup: bool = True) -> Path | None:
@@ -502,8 +530,7 @@ def _write_mcp_config(config_path: Path, config: dict, create_backup: bool = Tru
     backup_path: Path | None = None
     config_path.parent.mkdir(parents=True, exist_ok=True)
     if create_backup and config_path.exists():
-        backup_path = _backup_config_path(config_path)
-        shutil.copy2(config_path, backup_path)
+        backup_path = _backup_config(config_path)
 
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     return backup_path
@@ -948,8 +975,8 @@ _scope_opt = typer.Option(
     MCPToolScope.all,
     "--scope",
     help=(
-        "Tool scope for this MCP install: all (default), operate (run/monitor existing workflows), "
-        "build (author workflows), browser (direct browser control), or lean (focused browser surface: direct actions with selector-scoped page reading; 32 tools). Applies to --local stdio setup."
+        "Tool scope for this MCP install: all (default), operate (run/monitor existing workflows, ask Ember to build), "
+        "build (author workflows), browser (direct browser control), or lean (focused browser surface: direct actions with selector-scoped page reading). Applies to --local stdio setup."
     ),
 )
 _python_path_opt = typer.Option(
@@ -1681,9 +1708,7 @@ def setup_hermes(
             continue
         data["mcp_servers"][server_key] = hermes_entry
         if cp.exists():
-            backup = _backup_config_path(cp)
-            shutil.copy2(cp, backup)
-            backups.append(backup)
+            backups.append(_backup_config(cp))
         _save_yaml_config(cp, data)
         updated.append(str(cp))
 
@@ -1700,6 +1725,8 @@ def setup_hermes(
             border_style="green",
         )
     )
+    for backup in backups:
+        console.print(f"[dim]Backup saved to {backup}[/dim]")
 
 
 @setup_app.command("mcporter")

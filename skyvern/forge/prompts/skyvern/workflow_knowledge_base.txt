@@ -108,7 +108,7 @@ The interaction blocks differ by how specifically you describe the step — from
 - file_download — the step's purpose is to download a file (detects when the download completes).
 - extraction — capturing structured data, validated against data_schema.
 
-For non-interaction steps, use the purpose-built block directly: goto_url (load a known URL), wait, conditional, for_loop/while_loop, http_request, file_url_parser, file_upload, send_email, text_prompt.
+For non-interaction steps, use the purpose-built block directly: goto_url (load a known URL), wait, conditional, for_loop/while_loop, http_request, web_search (query Google or Exa over an API for result links, titles and snippets, optionally processed with a prompt; it does not open a browser or read the pages — pass a result link to goto_url/navigation/extraction to read it), file_url_parser, file_upload, send_email, text_prompt.
 
 For connected-service outcomes, use the purpose-built integration helper directly rather than automating that service through its browser UI. For Google Sheets, use google_sheets_read to read rows and google_sheets_write to append or update rows. Resolve a compatible connection with list_integrations, then inspect the selected block schema. When the request identifies an active, scope-compatible row, bind its exact connection_id as the native block's credential_id; do not ask the user to repeat an opaque ID already returned by the tool. A connection name or account email the user wrote in this turn is also accepted in credential_id: the server resolves it, rewrites the slot to the connection_id, and reports resolved/ambiguous/not_found with the eligible rows. For a build-and-test request, use the available native workflow update-and-run surface in the same turn; do not stop at a draft.
 
@@ -674,10 +674,10 @@ Use Cases:
 - Parse a PDF invoice into structured fields
 - Extract rows from a CSV file
 - Read Excel sheets for downstream processing
-- Unzip a ZIP archive (always outputs [{file_name, file_path, file_size}]; json_schema is ignored for ZIPs) and parse each extracted file in a loop
+- Unzip a ZIP archive (always outputs [{file_name, file_path, file_size, run_file}]; json_schema is ignored for ZIPs) and parse each extracted file in a loop
 
 ZIP behavior:
-- A File Parser pointed at a ZIP always unzips it and outputs [{file_name, file_path, file_size}].
+- A File Parser pointed at a ZIP always unzips it and outputs [{file_name, file_path, file_size, run_file}]. Each extracted file becomes one of the run's downloaded files, named run_file.
 - json_schema is ignored for ZIP archives.
 - To extract structured data from contained files, use File Parser (ZIP to file list) -> for-loop over the output -> File Parser for each run-local file_path, passed as file_url.
 
@@ -904,11 +904,22 @@ Purpose: Write rows to a Google Sheet, appended below existing data or written o
 Every cell is a JSON value, so a string cell must be quoted. `| tojson` quotes and escapes a referenced value: `[[{{ extract_metric.output.metric | tojson }}]]` renders `[["30 %"]]`, while `[[{{ extract_metric.output.metric }}]]` renders `[[30 %]]`, which is not JSON. A bare scalar such as 30 %, 6.97K or 10200 fails with "Invalid values payload".
 A reference must match the producer's output shape. A browser-task block (extraction, navigation, action, login) holds its payload under `.output`: `{{ extract_metric.output.metric }}`. A code or text_prompt block holds its returned fields on the label itself: `{{ compute_metric.metric }}` (a text_prompt without json_schema returns `llm_response`). An http_request block holds the parsed response body under `.body`: `{{ fetch_metric.body.metric }}`.
 A reference to a value no upstream block produced fails the block, and nothing is written.
+`spreadsheet_url` must point to a spreadsheet that already exists; the block never creates one. `create_sheet_if_missing: true` adds only the tab named by `sheet_name`, so a sheet with several tabs takes one block per tab.
 
 Use Cases:
 - Write an extracted metric into one cell
 - Append one row per extracted record
 - Update a fixed range with computed values
+
+** AGENT STEP BLOCK (agent_step) **
+
+Purpose: The agent step is one model-driven step that decides and acts with this run's blocks, with or without the browser, so it can look things up across sites, branch on what it finds and write the answer. It returns fields matching its data_schema. The editor labels it the Agent block (block type `agent_step`). It signs in with a saved login when a credential parameter is in its parameter_keys (the editor's Inputs) and `login` is in its tools.
+
+Signing in and people:
+- The step is offered its `login` tool only when its parameter_keys lists a credential parameter and `login` is in its tools. A username, password or login named in the prompt text gives the step no credential.
+- With `human_interaction` in its tools, the step can email a person mid-run and wait for them to approve or reject. The person sends back that decision only, not typed values.
+- A connected account needs no parameter. When a tool the step calls reads a connected account, the step picks one of the run's connected accounts that it can use.
+- The agent_step block schema lists every field. A tool name the step does not support is rejected with the list of valid tool names.
 
 ** PARAMETER TEMPLATING **
 

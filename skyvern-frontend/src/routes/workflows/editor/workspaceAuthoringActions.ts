@@ -102,7 +102,7 @@ function stageSopFile(file: File, draft: string) {
   const stage = useEmberActionStore.getState().stageAttachment;
   if (!stage) {
     toast({
-      title: "Copilot can't take a file right now",
+      title: "Ember can't take a file right now",
       description:
         "Answer its question or wait for it to finish, then try again.",
     });

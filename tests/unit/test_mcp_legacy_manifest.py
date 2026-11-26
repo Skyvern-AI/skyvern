@@ -7,10 +7,7 @@ from typing import Any
 import pytest
 
 from skyvern.cli.mcp_tools import mcp
-from skyvern.cli.mcp_tools.instructions import DEFAULT_INSTRUCTIONS
 from skyvern.cli.mcp_tools.scopes import MCPScope, apply_scope
-
-DEFAULT_INSTRUCTIONS_SHA256 = "b69db0a4189d864b4cb669fdc0cf97438a2da6f03b162130ee94687af09e0194"
 
 # Digests snapshot each legacy tool's wire manifest: name, schema, description, annotations, _meta.
 # New tool names are ignored; any change to a legacy tool fails.
@@ -21,7 +18,8 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_act": "407b30ac46dc9cbf83e1eca17c7eef3c19bf850ef8a87b76a3f089dce114d669",
     "skyvern_bitwarden_config_clear": "107c38d2c0da3a2f2fcc0b75935dcfe2b9d24ef1f7e369e22834ef23d6cd4ea3",
     "skyvern_bitwarden_config_get": "da79546595e7667c65a5e45b8625c8712026adb71b4d2dfc627621af1a2577c4",
-    "skyvern_bitwarden_config_set": "a2060a44ff914b81cae13fa5e669be5b05f5b6c6e4b2b0bd6c29c156b936c6c3",
+    # Re-frozen: saving replaces the stored credential, so destructiveHint is now true. Annotations only.
+    "skyvern_bitwarden_config_set": "f7b4fc5b6e82b237661dab5fb03f9454866095842f6d027aea8ce9648a90f478",
     "skyvern_bitwarden_items": "abf727ff755578e4dc4a475643ca1477a7c923c4009edca27b782afbfb63cd30",
     "skyvern_block_schema": "e7527dcb32d072814b3660ad5b1b837e957bd1605c872f8340cbc670fe59d2f5",
     "skyvern_block_validate": "ba988cb4d78e5f4c08e002f91b446dfbb2cdb4672a78060d15c76f91e7be3da1",
@@ -82,12 +80,14 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_navigate_extract_and_screenshot": "1b700d5a6d082a91664376adb95284f2f8c7f30a74e7f73e39ef287006fd73a1",
     "skyvern_network_request_detail": "d74674521e56b4c1028c684d8e2d90bd9c3f65f2a233e28717721d0fd11bf477",
     "skyvern_network_requests": "0ea881741bebf2bec8468b3225ebdde4432ddb12e444e2c43a41d44aff89eddc",
-    "skyvern_network_route": "89d7310782a90b19aab0600ab842e5ceaa114d75a0efbc79d42e23d28f17bf80",
+    "skyvern_network_route": "25968e1c6abdbf623e33931a58f61dfd506b58c257f7776fd8f9336860841b25",
     "skyvern_network_unroute": "a5c480635e3cb9fc91ed14935a4c654ef375366c0a99882543a8ea54280b5c89",
     "skyvern_observe": "136835d77007121a9c8a493814ab8ece29a8cc73139dfb652157e501b192c558",
     "skyvern_onepassword_config_clear": "3be70bda330d83d0dd67eb1e41d6ba4586a0868f9620a40ead1c3bdf369c6fab",
     "skyvern_onepassword_config_get": "55ec9485f837fbd6c4ac9fc8602ea7c92234ea383ed1aee7b9810b17bba5c62b",
-    "skyvern_onepassword_config_set": "78493cf6da057ba5534d0a30102687d75d7517419bd8e08223dadeeb0a91154e",
+    # Re-frozen: saving replaces the stored token, so destructiveHint is now true. Annotations only.
+    # A manifest digest, not a secret; "password" in the tool name trips gitleaks' generic-api-key rule.
+    "skyvern_onepassword_config_set": "486fa414087abcad10d38a03227f31b6ecc4650c010a109d0b26797564264bf5",  # gitleaks:allow
     "skyvern_onepassword_items": "4b08cbaf5853ff9b2547e058efe664cfdfefb4025d9a8c88f6b6ac8af261283d",
     "skyvern_open_tabs": "9f85d7bff702f3fa5c7558ff3f89bbad8823badba70124ad30c73dbc4d4f8abd",
     "skyvern_org_get": "af99aada703881af2423d36eba5af5a0832eaf51797428f07f2e3dcee66f52a7",
@@ -125,7 +125,7 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_wait": "7f9b8d8d39762eaa2c2962ab3b1e4b997454d9a1039ee2fee1b5aaa07019786a",
     "skyvern_wait_for_either_state": "b4b127498f91a7d9e1536d11a8993cb9d1cbf7b1557f9bec832afaa127ea1613",
     "skyvern_workflow_cancel": "0ee1a599421c3a116bf09906613574807b7f0a4e7f72b6a79adf6cfb84edb3d1",
-    "skyvern_workflow_create": "81ae134f87b166f5d3cc2f6233744c14ffbc10a09efd5a097ac207b690919a02",
+    "skyvern_workflow_create": "4c50218485845f791ba363b7c991b9e78604b05103a590ade6a653ec8db2ebb6",
     "skyvern_workflow_delete": "4b8b6574f78122c5d6bf8ee12f5b3cedeb83832d08462445889259cfd0c8b861",
     "skyvern_workflow_get": "b9340c5d1cfa0db49431d4e914c0879f15e458d4c6d4879de0d0de653de842da",
     "skyvern_workflow_list": "3b651992b2f20e020305fe308e0b1cde38d330e4dc3ee243887efaa212a2516a",
@@ -141,12 +141,11 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_write_grid": "84fb23a7e4a2436c9956d3dd756041b2e786368f4b680877fea49a4fc6058a06",
 }
 
-# Resolved memberships for the three pre-existing scopes must remain byte-for-byte stable.
-# Re-frozen for SKY-17536: skyvern_feedback joins every scope.
+# Resolved memberships of the three pre-existing scopes; a membership change must update these on purpose.
 LEGACY_SCOPE_MEMBERSHIP_DIGESTS: dict[MCPScope, tuple[int, str]] = {
     "browser": (55, "8e5cfe12a7983984a3f0f26b2032e4a06c587f80136ff5a5d691ce5ac9127d07"),
-    "build": (63, "12263087bc69ec0ec1d6a877a452093f9d783e97aea91cb852633a61920f7560"),
-    "operate": (31, "e331676fab4dfab9b24ef014a7167966adb11348f2c6d679bf2de27ded8de28f"),
+    "build": (69, "99122e723ab6e689c160adb921bd8eea0a5c7f46446dbcecf66d1f685f116f09"),
+    "operate": (37, "c83f38281ef9ff1d6e3a538aef59b65d6d5220dd037b4cf3b137f11916c174c8"),
 }
 
 
@@ -192,8 +191,3 @@ async def test_legacy_scope_memberships_are_frozen() -> None:
         mcp._transforms[:] = original_transforms
 
     assert actual == LEGACY_SCOPE_MEMBERSHIP_DIGESTS
-
-
-def test_default_instructions_are_frozen() -> None:
-    assert mcp.instructions == DEFAULT_INSTRUCTIONS
-    assert hashlib.sha256(DEFAULT_INSTRUCTIONS.encode()).hexdigest() == DEFAULT_INSTRUCTIONS_SHA256

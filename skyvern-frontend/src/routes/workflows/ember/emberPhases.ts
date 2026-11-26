@@ -1,5 +1,6 @@
 import {
   AUTHORING_TOOLS,
+  BlockState,
   RUN_TOOLS,
   TurnNarrativeState,
   latestBlocksByLabel,
@@ -23,6 +24,30 @@ export function hasFailedTestBlock(turn: TurnNarrativeState): boolean {
   return latestBlocksByLabel(turn.blocks)
     .filter((b) => b.state !== "drafted")
     .some((b) => b.state === "failed");
+}
+
+// The backend's refusal code for a Copilot test run denied an account (EMBER_TEST_RUN_UNSUPPORTED_CODE).
+const ACCESS_REFUSED_FAILURE_CODES = new Set(["copilot_test_run_unsupported"]);
+
+// True when the test failed only because it was refused access, so it says nothing about the draft. A loop row
+// carries no code of its own, so it counts as refused when every failed block under it was refused.
+export function failedOnlyOnRefusedAccess(turn: TurnNarrativeState): boolean {
+  const refused = (b: BlockState): boolean => {
+    if (b.failureCode !== undefined) {
+      return ACCESS_REFUSED_FAILURE_CODES.has(b.failureCode);
+    }
+    const failedChildren = turn.blocks.filter(
+      (child) =>
+        child.state === "failed" &&
+        child.parentWorkflowRunBlockId !== undefined &&
+        child.parentWorkflowRunBlockId === b.workflowRunBlockId,
+    );
+    return failedChildren.length > 0 && failedChildren.every(refused);
+  };
+  const failed = latestBlocksByLabel(turn.blocks).filter(
+    (b) => b.state === "failed",
+  );
+  return failed.length > 0 && failed.every(refused);
 }
 
 export function everyTestBlockExecuted(turn: TurnNarrativeState): boolean {

@@ -19,6 +19,7 @@ import {
 } from "@/hooks/useGoogleOAuthCredentials";
 import { useOAuthCredentialAutoFill } from "@/routes/workflows/editor/hooks/useOAuthCredentialAutoFill";
 import { PlusIcon } from "@radix-ui/react-icons";
+import { stripBidiIsolates } from "@/util/bidiText";
 import {
   GOOGLE_GMAIL_REQUIRED_SCOPES,
   GOOGLE_GMAIL_SEND_REQUIRED_SCOPES,
@@ -40,6 +41,7 @@ type Props = {
   };
   // Offer only accounts the server reports as able to send mail, and never pick one for the user.
   gmailSendOnly?: boolean;
+  allowTemplates?: boolean;
 };
 
 const ADVANCED_OPTION = "__advanced__";
@@ -55,6 +57,7 @@ function GoogleOAuthCredentialSelector({
   requiredScopes,
   optional = false,
   gmailSendOnly = false,
+  allowTemplates = true,
   disabled = false,
   ariaLabel,
   showEmail = false,
@@ -80,8 +83,9 @@ function GoogleOAuthCredentialSelector({
   // If the value looks like a Jinja template, default to advanced mode
   const isTemplateValue = value.includes("{{") || value.includes("{%");
   const hasAdditionalSelection = additionalAccounts?.selectedId !== undefined;
+  const templatesAllowed = allowTemplates && !gmailSendOnly;
   const useAdvanced =
-    !gmailSendOnly &&
+    templatesAllowed &&
     !hasAdditionalSelection &&
     (showAdvanced || isTemplateValue);
 
@@ -333,6 +337,7 @@ function GoogleOAuthCredentialSelector({
                   key={account.id}
                   value={`${ADDITIONAL_PREFIX}${account.id}`}
                   disabled={account.disabled}
+                  textValue={stripBidiIsolates(account.label)}
                 >
                   {account.label}
                 </SelectItem>
@@ -349,14 +354,14 @@ function GoogleOAuthCredentialSelector({
                 </div>
               </SelectItem>
 
-              {gmailSendOnly ? null : (
+              {templatesAllowed ? (
                 <SelectItem value={ADVANCED_OPTION}>
                   <div className="flex items-center gap-2">
                     <span className="font-mono text-xs">{"{{}}"}</span>
                     <span>Use template expression</span>
                   </div>
                 </SelectItem>
-              )}
+              ) : null}
             </SelectContent>
           </Select>
         </>

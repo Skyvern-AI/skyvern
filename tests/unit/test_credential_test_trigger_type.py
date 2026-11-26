@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
@@ -37,6 +37,10 @@ def _setup_mock() -> AsyncMock:
             workflow_permanent_id="wpid_test",
         )
     )
+
+
+async def _scoped_by_workflow_only(*, organization_id: str, profile: SimpleNamespace) -> bool:
+    return profile.workflow_permanent_id is not None
 
 
 def _patch_executor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -92,13 +96,21 @@ async def test_test_credential_trigger_type_from_user_agent(
 
 
 @pytest.mark.asyncio
-async def test_test_credential_seeds_proxy_pin_workflow_request(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("linked_profile_workflow", "requester_may_use_profile"),
+    [(None, False), ("wpid_restricted", True), ("wpid_restricted", False)],
+    ids=["no_linked_profile", "workflow_bound_profile_usable", "workflow_bound_profile_not_usable"],
+)
+async def test_test_credential_seeds_proxy_pin_workflow_request(
+    monkeypatch: pytest.MonkeyPatch, linked_profile_workflow: str | None, requester_may_use_profile: bool
+) -> None:
     setup_mock = _setup_mock()
+    linked_profile_id = "bp_linked" if linked_profile_workflow else None
     mock_credentials = SimpleNamespace(
         get_credential=AsyncMock(
             return_value=SimpleNamespace(
                 credential_type=CredentialType.PASSWORD,
-                browser_profile_id=None,
+                browser_profile_id=linked_profile_id,
                 totp_identifier=None,
                 name="Test Credential",
                 proxy_location=ProxyLocation.RESIDENTIAL_ISP,
@@ -106,15 +118,47 @@ async def test_test_credential_seeds_proxy_pin_workflow_request(monkeypatch: pyt
             )
         )
     )
-    monkeypatch.setattr(credentials.app, "DATABASE", SimpleNamespace(credentials=mock_credentials))
+    browser_sessions = SimpleNamespace(
+        get_browser_profile=AsyncMock(
+            return_value=SimpleNamespace(browser_profile_id="bp_linked", workflow_permanent_id=linked_profile_workflow)
+        ),
+        is_browser_profile_access_scoped=_scoped_by_workflow_only,
+    )
+    monkeypatch.setattr(
+        credentials.app,
+        "DATABASE",
+        SimpleNamespace(credentials=mock_credentials, browser_sessions=browser_sessions),
+    )
     monkeypatch.setattr(credentials.app, "WORKFLOW_SERVICE", _workflow_service(setup_mock))
     _patch_cloud_proxy_session_headers(monkeypatch)
+    monkeypatch.setattr(
+        credentials.app.AGENT_FUNCTION,
+        "workflow_run_can_use_browser_profile",
+        AsyncMock(return_value=requester_may_use_profile),
+        raising=False,
+    )
     _patch_executor(monkeypatch)
+    request = CredentialTestRequest(
+        url="https://example.com/login", save_browser_profile=linked_profile_workflow is not None
+    )
+
+    if linked_profile_workflow and not requester_may_use_profile:
+        # Saving would overwrite a profile tied to a workflow the requester cannot see.
+        with pytest.raises(HTTPException) as exc_info:
+            await credentials.test_credential(
+                background_tasks=BackgroundTasks(),
+                credential_id="cred_test",
+                data=request,
+                current_org=SimpleNamespace(organization_id="org_test"),
+                x_user_agent=None,
+            )
+        assert exc_info.value.status_code == 403
+        return
 
     await credentials.test_credential(
         background_tasks=BackgroundTasks(),
         credential_id="cred_test",
-        data=CredentialTestRequest(url="https://example.com/login", save_browser_profile=False),
+        data=request,
         current_org=SimpleNamespace(organization_id="org_test"),
         x_user_agent=None,
     )

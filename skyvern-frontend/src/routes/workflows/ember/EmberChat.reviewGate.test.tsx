@@ -2285,7 +2285,7 @@ describe("EmberChat — g2 review gate", () => {
       await act(async () => {
         fireEvent.click(
           within(
-            screen.getByText(/Could not confirm whether Copilot saved changes/)
+            screen.getByText(/Could not confirm whether Ember saved changes/)
               .parentElement!,
           ).getByRole("button", { name: "Retry" }),
         );
@@ -3087,7 +3087,7 @@ describe("EmberChat — g2 review gate", () => {
       if (expired) {
         await act(async () => vi.advanceTimersByTimeAsync(1_500_000));
         expect(
-          screen.getByText(/Could not confirm whether Copilot saved changes/),
+          screen.getByText(/Could not confirm whether Ember saved changes/),
         ).toBeTruthy();
         expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
         await act(async () =>
@@ -3626,13 +3626,13 @@ describe("EmberChat — g2 review gate", () => {
     );
     expect(toast).toHaveBeenCalledWith(
       expect.objectContaining({
-        title: "Wait for the Copilot change to finish",
+        title: "Wait for the Ember change to finish",
       }),
     );
     expect(await commitYamlDraft(true)).toBe(false);
     expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
     expect(useWorkflowYamlEditorStore.getState().error).toBe(
-      "Wait for the Copilot change to finish",
+      "Wait for the Ember change to finish",
     );
     expect(commit).not.toHaveBeenCalled();
     await act(async () => {
@@ -3684,7 +3684,7 @@ describe("EmberChat — g2 review gate", () => {
       expect(speech.takeAudioBlob).not.toHaveBeenCalled();
       expect(toast).toHaveBeenCalledWith(
         expect.objectContaining({
-          title: "Wait for the Copilot change to finish",
+          title: "Wait for the Ember change to finish",
         }),
       );
       finishEmberAcceptance(token);
@@ -3742,7 +3742,7 @@ describe("EmberChat — g2 review gate", () => {
     await renderChat({ onWorkflowUpdate: apply });
     const canonical = {
       ...saveData.workflow,
-      title: "Canonical Copilot change",
+      title: "Canonical Ember change",
       version: 2,
     };
     historyGet.mockImplementation((path: string) =>
@@ -3966,7 +3966,7 @@ describe("EmberChat — g2 review gate", () => {
         await act(async () => vi.advanceTimersByTimeAsync(1));
         expect(apply).not.toHaveBeenCalled();
         expect(
-          screen.getByText(/Could not confirm whether Copilot saved changes/),
+          screen.getByText(/Could not confirm whether Ember saved changes/),
         ).toBeTruthy();
         expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
         expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
@@ -4769,7 +4769,7 @@ describe("EmberChat — g2 review gate", () => {
     expect(cancelPost).not.toHaveBeenCalled();
     expect(toast).toHaveBeenCalledWith(
       expect.objectContaining({
-        title: "Wait for the Copilot change to finish",
+        title: "Wait for the Ember change to finish",
       }),
     );
     finishEmberAcceptance(competingAcceptance);
@@ -4798,7 +4798,7 @@ describe("EmberChat — g2 review gate", () => {
     });
     expect(commit).not.toHaveBeenCalled();
     expect(useWorkflowYamlEditorStore.getState().error).toBe(
-      "Wait for the Copilot change to finish",
+      "Wait for the Ember change to finish",
     );
     expect(apply).not.toHaveBeenCalled();
     await act(async () => resolveAccept({ data: proposedWorkflowPayload() }));
@@ -4951,7 +4951,7 @@ describe("EmberChat — g2 review gate", () => {
         expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
         expect(toast).not.toHaveBeenCalledWith(
           expect.objectContaining({
-            title: "Could not recover the Copilot turn controls",
+            title: "Could not recover the Ember turn controls",
           }),
         );
         expect(
@@ -4962,7 +4962,7 @@ describe("EmberChat — g2 review gate", () => {
         expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
         expect(toast).toHaveBeenCalledWith(
           expect.objectContaining({
-            title: "Could not recover the Copilot turn controls",
+            title: "Could not recover the Ember turn controls",
             description: expect.stringContaining("no cancellation token"),
           }),
         );
@@ -5004,7 +5004,7 @@ describe("EmberChat — g2 review gate", () => {
         );
         expect(toast).toHaveBeenCalledWith(
           expect.objectContaining({
-            title: "Could not recover the Copilot turn controls",
+            title: "Could not recover the Ember turn controls",
             description: expect.stringContaining("no cancellation token"),
           }),
         );
@@ -7155,7 +7155,7 @@ describe("EmberChat — g2 review gate", () => {
 
     expect(
       await screen.findByText(
-        "This workflow changed, so your Accept didn't go through and the proposal is gone. Send Copilot a new message to propose it again.",
+        "This workflow changed, so your Accept didn't go through and the proposal is gone. Send Ember a new message to propose it again.",
       ),
     ).toBeTruthy();
     expect(screen.queryByText("Confirming…")).toBeNull();
@@ -10068,7 +10068,7 @@ describe("EmberChat — g2 review gate", () => {
     );
     // And the hold names itself on the card, not only in a title a disabled button may never fire.
     expect(
-      screen.getAllByText(/Copilot is checking|may have saved/i).length,
+      screen.getAllByText(/Ember is checking|may have saved/i).length,
     ).toBeGreaterThan(0);
   });
 
@@ -11119,7 +11119,7 @@ describe("EmberChat — g2 review gate", () => {
 
     const history = screen.getByRole("button", {
       name: "History",
-      description: "Copilot is saving your accepted changes.",
+      description: "Ember is saving your accepted changes.",
     });
     expect(history.matches(":disabled")).toBe(true);
     const wrapper = history.closest<HTMLElement>("[tabindex='0']");
@@ -11453,7 +11453,7 @@ describe("EmberChat — g2 review gate", () => {
         fireEvent.click(screen.getByRole("button", { name: "Reject" })),
       );
       expect(screen.getByRole("alert").textContent).toContain(
-        "Cancelling the Copilot turn",
+        "Cancelling the Ember turn",
       );
       expect(
         useWorkflowYamlEditorStore.getState().emberAcceptance,
@@ -11856,7 +11856,7 @@ describe("EmberChat — g2 review gate", () => {
       act(editLoop);
       expect(editorNodes).toEqual(retainedNodes);
       expect(toast).toHaveBeenCalledExactlyOnceWith({
-        title: "Wait for the Copilot change to finish",
+        title: "Wait for the Ember change to finish",
         variant: "destructive",
       });
       historyGet.mockImplementation((path: string) =>
@@ -12248,7 +12248,7 @@ describe("EmberChat — g2 review gate", () => {
       expect(reservation).not.toBeNull();
       await advance(Math.max(0, deadline - Date.now()));
       expect(screen.getByRole("alert").textContent).toContain(
-        "Could not confirm whether Copilot saved changes",
+        "Could not confirm whether Ember saved changes",
       );
       expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
       expect(useWorkflowYamlEditorStore.getState().emberAcceptance).toBe(
@@ -12318,7 +12318,7 @@ describe("EmberChat — g2 review gate", () => {
         expect(screen.getByText("Saved the workflow.")).toBeTruthy();
         expect(
           screen.queryByText(
-            "The connection dropped, so Copilot is checking whether this turn finished.",
+            "The connection dropped, so Ember is checking whether this turn finished.",
           ),
         ).toBeNull();
         historyGet.mockClear();
@@ -13222,7 +13222,7 @@ describe("EmberChat — g2 review gate", () => {
     await renderChat({ onWorkflowUpdate: apply });
     const canonical = {
       ...saveData.workflow,
-      title: "Canonical Copilot change",
+      title: "Canonical Ember change",
       version: 2,
     };
     historyGet.mockImplementation((path: string) =>
@@ -13887,7 +13887,7 @@ describe("A46 Accept recovery", () => {
     expect(toast).toHaveBeenCalledWith(
       expect.objectContaining({
         title: "Auto-accept is still on",
-        description: "Wait for the Copilot change to finish",
+        description: "Wait for the Ember change to finish",
       }),
     );
     await act(async () => finishSaveTransaction(owner));
@@ -14093,7 +14093,7 @@ describe("A46 Accept recovery", () => {
     await renderChat();
     await screen.findByRole("button", { name: "Retry" });
     expect(
-      screen.getByText(/Copilot is checking for saved changes/),
+      screen.getByText(/Ember is checking for saved changes/),
     ).toBeTruthy();
     await act(async () =>
       reject({
@@ -14108,7 +14108,7 @@ describe("A46 Accept recovery", () => {
     );
     expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
     expect(
-      screen.queryByText(/Copilot is checking for saved changes/),
+      screen.queryByText(/Ember is checking for saved changes/),
     ).toBeNull();
     expect(toast).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -14717,7 +14717,7 @@ describe("editor-state rollback lifecycle", () => {
     expect(close).not.toHaveBeenCalled();
     expect(toast).toHaveBeenCalledWith(
       expect.objectContaining({
-        title: "Copilot is saving your accepted changes.",
+        title: "Ember is saving your accepted changes.",
       }),
     );
   });
@@ -14772,7 +14772,7 @@ describe("editor-state rollback lifecycle", () => {
           call.onMessage({
             type: "title_update",
             workflow_permanent_id: "wpid_1",
-            title: "Copilot generated title",
+            title: "Ember generated title",
           });
           call.onMessage(plainReplyResponse("Done."));
           call.resolve();
@@ -15605,7 +15605,7 @@ describe("editor-state rollback lifecycle", () => {
         streamCalls[0]!.reject(new Error("connection dropped")),
       );
       const notice =
-        "The connection dropped, so Copilot is checking whether this turn finished.";
+        "The connection dropped, so Ember is checking whether this turn finished.";
       expect(screen.getByText(notice)).toBeTruthy();
       historyGet.mockImplementation((path: string) =>
         Promise.resolve(

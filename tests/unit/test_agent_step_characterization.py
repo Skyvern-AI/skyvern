@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.exceptions import FailedToReloadPage, NoTOTPVerificationCodeFound, ScrapingFailedBlankPage
 from skyvern.forge import app
@@ -29,6 +30,7 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     ExtractAction,
+    InputTextAction,
     ReloadPageAction,
     TerminateAction,
     WaitAction,
@@ -347,18 +349,23 @@ async def test_failed_action_with_continue_flag_executes_remaining(monkeypatch: 
 async def test_failed_action_skip_remaining_controls_duplicate_element_retry(
     monkeypatch: pytest.MonkeyPatch, skip: bool, expected_calls: int
 ) -> None:
-    first, duplicate = _click("node-1"), _click("node-1")
+    first = _click("node-1")
+    duplicate = InputTextAction(**first.model_dump(exclude={"action_type", "text"}), text="typed-sample")
     failure = ActionFailure(Exception("unverified click"))
     failure.skip_remaining_actions = skip
     action_handler = AsyncMock(return_value=[failure])
     rig = make_agent_step_rig(monkeypatch, parsed_actions=[first, duplicate], action_handler=action_handler)
 
-    step, output = await rig.run()
+    with capture_logs() as logs:
+        step, output = await rig.run()
 
     assert step.status == StepStatus.failed
     assert action_handler.await_count == expected_calls
     assert output.actions_and_results is not None
     assert [action for action, _ in output.actions_and_results] == ([first] if skip else [first, duplicate])
+    duplicate_warnings = [log for log in logs if str(log["event"]).startswith("Action failed, but have duplicated")]
+    assert len(duplicate_warnings) == expected_calls - 1
+    assert all("typed-sample" not in str(log) for log in duplicate_warnings)
 
 
 @pytest.mark.asyncio
@@ -680,10 +687,20 @@ async def test_non_blank_scrape_failure_is_not_recovered(monkeypatch: pytest.Mon
     # A generic scrape failure (not a dead blank) must propagate untouched: recovery only ever adds a
     # path for the blank signature, never intercepts other terminal scrape errors.
     rig = make_agent_step_rig(monkeypatch)
-    rig.agent.build_and_record_step_prompt = AsyncMock(side_effect=ScrapingFailed())
+
+    async def refreshed_step(step: Step, status: StepStatus | None = None, **_: Any) -> Step:
+        return step.model_copy(update={"status": status})
+
+    async def fail_after_model(_task: Task, step: Step, *_args: Any, **_kwargs: Any) -> None:
+        step.last_llm_model = "known-model"
+        raise ScrapingFailed()
+
+    rig.agent.update_step = AsyncMock(side_effect=refreshed_step)
+    rig.agent.build_and_record_step_prompt = AsyncMock(side_effect=fail_after_model)
 
     with pytest.raises(ScrapingFailed):
         await rig.run()
+    assert rig.step.last_llm_model == "known-model"
     assert rig.action_handler.await_count == 0
     assert rig.task.task_id not in rig.context.empty_page_recovery_attempts
 

@@ -119,6 +119,14 @@ def mock_block_execute_deps(
     agent.create_task_and_step_from_block = AsyncMock(return_value=(task, step))
     agent.execute_step = AsyncMock()
 
+    async def _navigate_to_block_url(
+        *, browser_state: MagicMock, page: object, url: str, wait_until: str, **_kwargs: object
+    ) -> bool:
+        await browser_state.navigate_to_url(page=page, url=url, wait_until=wait_until)
+        return False
+
+    agent.navigate_to_block_url = _navigate_to_block_url
+
     with (
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         patch(

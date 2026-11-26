@@ -12,13 +12,14 @@ import litellm
 import structlog
 from PIL import Image
 
-from skyvern.constants import MAX_IMAGE_BLOCKS
+from skyvern.constants import MAX_DECODED_IMAGE_PIXELS, MAX_IMAGE_BLOCKS, MAX_TOTAL_DECODED_IMAGE_PIXELS
 from skyvern.forge.sdk.api.llm import commentjson
 from skyvern.forge.sdk.api.llm.exceptions import (
     EmptyLLMResponseError,
     InvalidLLMResponseFormat,
     InvalidLLMResponseType,
     LLMOutputTruncatedError,
+    cause_type_name,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
@@ -26,12 +27,7 @@ from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 LOG = structlog.get_logger()
 
 _PASS_THROUGH_IMAGE_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
-# A file under the upload cap can still decode to hundreds of megapixels, which RGBA conversion
-# would expand to gigabytes in the worker process.
-_MAX_DECODED_IMAGE_PIXELS = 25_000_000
 _MAX_DECODED_IMAGE_FRAMES = MAX_IMAGE_BLOCKS
-# Keep the frame cap as the limiting guard for roughly 4 MP fax pages.
-_MAX_TOTAL_DECODED_IMAGE_PIXELS = _MAX_DECODED_IMAGE_FRAMES * 4_000_000
 
 
 def is_anthropic_model(model: str) -> bool:
@@ -85,11 +81,11 @@ def _reencode_llm_image_as_png(image: bytes, media_type: str) -> tuple[str, byte
                         refusal = "it stores more than 8 bits per channel"
                         break
                     frame_pixels = decoded.width * decoded.height
-                    if frame_pixels > _MAX_DECODED_IMAGE_PIXELS:
-                        refusal = f"it decodes to more than {_MAX_DECODED_IMAGE_PIXELS} pixels"
+                    if frame_pixels > MAX_DECODED_IMAGE_PIXELS:
+                        refusal = f"it decodes to more than {MAX_DECODED_IMAGE_PIXELS} pixels"
                         break
-                    if total_pixels + frame_pixels > _MAX_TOTAL_DECODED_IMAGE_PIXELS:
-                        refusal = f"it decodes to more than {_MAX_TOTAL_DECODED_IMAGE_PIXELS} pixels across frames"
+                    if total_pixels + frame_pixels > MAX_TOTAL_DECODED_IMAGE_PIXELS:
+                        refusal = f"it decodes to more than {MAX_TOTAL_DECODED_IMAGE_PIXELS} pixels across frames"
                         break
                     total_pixels += frame_pixels
                     buffer = io.BytesIO()
@@ -286,8 +282,8 @@ def llm_prompt_log_metadata(prompt: str) -> dict[str, int]:
 def llm_error_log_metadata(error: BaseException) -> dict[str, str]:
     """Return content-free metadata suitable for logging an LLM call error."""
     metadata = exception_log_fields(error)
-    if error.__cause__ is not None:
-        metadata["cause_type"] = type(error.__cause__).__name__
+    if (cause_name := cause_type_name(error)) is not None:
+        metadata["cause_type"] = cause_name
     return metadata
 
 

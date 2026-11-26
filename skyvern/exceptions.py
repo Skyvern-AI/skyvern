@@ -464,6 +464,12 @@ class FailedToSendWebhook(SkyvernException):
         super().__init__(f"Failed to send webhook. {workflow_run_str} {workflow_str} {task_str} {task_v2_str}")
 
 
+class ProxyPolicyError(ValueError):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"Proxy policy refused ({reason})")
+
+
 class ProxyLocationNotSupportedError(SkyvernException):
     def __init__(self, proxy_location: str | None = None):
         super().__init__(f"Unknown proxy location: {proxy_location}")
@@ -642,6 +648,10 @@ class BrowserProfileNotApplied(SkyvernException):
 class MissingWorkflowRunBrowserState(SkyvernException):
     def __init__(self, workflow_run_id: str, task_id: str) -> None:
         super().__init__(f"Browser state for workflow run {workflow_run_id} and task {task_id} is missing.")
+
+
+class GestureNotSent(RuntimeError):
+    """A click or key was refused before it reached the page."""
 
 
 class CaptchaSolveError(SkyvernException):
@@ -874,7 +884,7 @@ class SyncTriggeredSequentialCredentialUnsupported(SkyvernException):
         )
 
 
-class CopilotInlineSequentialCredentialUnsupported(SkyvernException):
+class EmberInlineSequentialCredentialUnsupported(SkyvernException):
     def __init__(self, workflow_run_id: str) -> None:
         super().__init__(
             f"Copilot run {workflow_run_id} resolves to a sequential credential, but the copilot inline "
@@ -912,6 +922,15 @@ class BlockedNavigationDestination(FailedToNavigateToUrl):
     def __init__(self, url: str, reason: str) -> None:
         self.reason = reason
         super().__init__(url=url, error_message=f"blocked navigation destination: {reason}")
+
+
+class NavigationStartedDownload(FailedToNavigateToUrl):
+    """The URL is a file: the browser started downloading it instead of loading a page. Every retry
+    would start another copy of the same download, so navigation stops at the first attempt."""
+
+
+class StartUrlDownloadFailed(NavigationStartedDownload):
+    """The file download a start URL began was not saved."""
 
 
 # Leads the error_message below, and so the run's failure_reason. A consumer that only ever sees
@@ -1745,8 +1764,17 @@ class UnresolvableHost(BlockedHost):
 
 
 class InvalidWorkflowParameter(SkyvernHTTPException):
-    def __init__(self, expected_parameter_type: str, value: str, workflow_permanent_id: str | None = None) -> None:
-        message = f"Invalid workflow parameter. Expected parameter type: {expected_parameter_type}. Value: {value}."
+    # The message reaches the response body, the request log and the run's failure reason, so it names the
+    # parameter and never the rejected value; the caller already has what it sent.
+    def __init__(
+        self,
+        expected_parameter_type: str,
+        parameter_key: str | None = None,
+        workflow_permanent_id: str | None = None,
+    ) -> None:
+        message = f"Invalid workflow parameter. Expected parameter type: {expected_parameter_type}."
+        if parameter_key:
+            message += f" Parameter: {parameter_key}."
         if workflow_permanent_id:
             message += f" Workflow permanent id: {workflow_permanent_id}"
         super().__init__(
@@ -1832,6 +1860,8 @@ class NoTOTPVerificationCodeFound(SkyvernHTTPException):
     # Status-code summary of what totp_verification_url returned, set only when the
     # endpoint answered every poll without ever honoring the documented response shape.
     webhook_diagnostics: str | None = None
+    # Counts-only sentence naming the sources the poll tried; never carries a code, identifier or URL.
+    sources_checked: str | None = None
 
     def __init__(
         self,
@@ -1841,8 +1871,10 @@ class NoTOTPVerificationCodeFound(SkyvernHTTPException):
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         webhook_diagnostics: str | None = None,
+        sources_checked: str | None = None,
     ) -> None:
         self.webhook_diagnostics = webhook_diagnostics
+        self.sources_checked = sources_checked
         msg = "No TOTP verification code found."
         if task_id:
             msg += f" task_id={task_id}"
@@ -2147,7 +2179,9 @@ class BrowserProfileNotFound(SkyvernHTTPException):
 
 class APIKeyNotFound(SkyvernHTTPException):
     def __init__(self, organization_id: str) -> None:
-        super().__init__(f"No valid API key token found for organization {organization_id}")
+        super().__init__(
+            f"No valid API key token found for organization {organization_id}. Create one in Settings > API Keys."
+        )
 
 
 class ElementOutOfCurrentViewport(SkyvernException):

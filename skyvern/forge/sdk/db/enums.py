@@ -77,7 +77,7 @@ class WorkflowBuildSource(StrEnum):
     """Which surface wrote a workflow version.
 
     - ui: the Skyvern app
-    - copilot: the workflow copilot
+    - copilot: Ember, Skyvern's agent builder (the value keeps the old name)
     - mcp: a first-party MCP client
     - cli: the Skyvern CLI
     - api: any other API or SDK caller
@@ -85,18 +85,11 @@ class WorkflowBuildSource(StrEnum):
     """
 
     ui = "ui"
-    copilot = "copilot"
+    ember = "copilot"
     mcp = "mcp"
     cli = "cli"
     api = "api"
     internal = "internal"
-
-    @classmethod
-    def _missing_(cls, value: object) -> "WorkflowBuildSource | None":
-        # Newer releases store "ember" for this member, so this image must still load those rows after a rollback.
-        if value == "ember":
-            return cls.copilot
-        return None
 
 
 MANUAL_LIKE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(

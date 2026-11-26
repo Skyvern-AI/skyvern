@@ -16,6 +16,7 @@ from playwright.async_api import Page
 
 from skyvern.cli.mcp_tools import blocks, mcp
 from skyvern.cli.mcp_tools.blocks import (
+    AGENT_STEP_KNOWLEDGE_TOPIC,
     CODE_BLOCK_RUNTIME_TOPIC,
     NOTES_KNOWLEDGE_TOPIC,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
@@ -381,6 +382,8 @@ async def test_agent_step_is_described_and_validated_only_for_a_flagged_request_
         listing = await skyvern_block_schema()
         lookup = await skyvern_block_schema(block_type="agent_step")
         unknown = await skyvern_block_schema(block_type="no_such_block")
+        knowledge = await skyvern_workflow_knowledge()
+        topic = await skyvern_workflow_knowledge(topics=[AGENT_STEP_KNOWLEDGE_TOPIC])
         validations = [
             await skyvern_block_validate(block_json=json.dumps(block))
             for block in (_AGENT_STEP_BLOCK, _LOOPED_AGENT_STEP_BLOCK)
@@ -390,6 +393,8 @@ async def test_agent_step_is_described_and_validated_only_for_a_flagged_request_
     assert ("agent_step" in listing["data"]["block_types"]) is enabled
     assert ("agent_step" in unknown["error"]["hint"]) is enabled
     assert lookup["ok"] is enabled
+    assert (AGENT_STEP_KNOWLEDGE_TOPIC in knowledge["data"]["topics"]) is enabled
+    assert topic["ok"] is enabled
     for result in validations:
         assert result["ok"] is enabled
     if enabled:
@@ -398,6 +403,7 @@ async def test_agent_step_is_described_and_validated_only_for_a_flagged_request_
         assert {"prompt", "data_schema", "tools", "max_turns", "parameter_keys"} <= set(
             lookup["data"]["schema"]["properties"]
         )
+        assert AGENT_STEP_BLOCK_SUMMARY in topic["data"]["sections"][AGENT_STEP_KNOWLEDGE_TOPIC]["content"]
     else:
         assert "agent_step" not in lookup["error"]["hint"]
         for refusal in (lookup, *validations):

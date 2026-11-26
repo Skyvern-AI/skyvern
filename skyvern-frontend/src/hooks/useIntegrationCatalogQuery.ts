@@ -36,7 +36,8 @@ export function useIntegrationCatalogQuery<
 >() {
   const credentialGetter = useCredentialGetter();
   const activeOrgId = useActiveOrgId();
-  return useQuery(
-    integrationCatalogQueryOptions<T>(credentialGetter, activeOrgId),
-  );
+  return useQuery({
+    ...integrationCatalogQueryOptions<T>(credentialGetter, activeOrgId),
+    select: (catalog) => catalog.map((entry) => entry),
+  });
 }

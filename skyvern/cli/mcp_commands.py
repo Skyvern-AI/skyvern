@@ -5,9 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
-import platform
 import re
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, cast
@@ -24,7 +22,7 @@ from rich.table import Table
 from .console import console
 from .lazy import SkyvernTyperGroup
 from .setup_commands import (
-    _backup_config_path,
+    _backup_config,
     _claude_code_global_config_path,
     _claude_code_project_config_path,
     _claude_desktop_config_path,
@@ -42,6 +40,7 @@ from .setup_commands import (
     _openclaw_config_path,
     _opencode_config_path,
     _save_yaml_config,
+    _skyvern_user_config_dir,
     _walk_nested_path,
     _warn_openclaw_json_normalization,
     _windsurf_config_path,
@@ -121,16 +120,7 @@ def _ask_choice(prompt: str, *, choices: list[str], default: str | None = None) 
 
 
 def _profile_store_dir() -> Path:
-    if platform.system() == "Windows":
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            return Path(appdata) / "skyvern" / "mcp-profiles"
-
-    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
-    if xdg_config_home:
-        return Path(xdg_config_home) / "skyvern" / "mcp-profiles"
-
-    return Path.home() / ".config" / "skyvern" / "mcp-profiles"
+    return _skyvern_user_config_dir() / "mcp-profiles"
 
 
 def _profile_slug(name: str) -> str:
@@ -322,8 +312,7 @@ def _write_codex_config(config_path: Path, config: dict, create_backup: bool = T
     backup_path: Path | None = None
     config_path.parent.mkdir(parents=True, exist_ok=True)
     if create_backup and config_path.exists():
-        backup_path = _backup_config_path(config_path)
-        shutil.copy2(config_path, backup_path)
+        backup_path = _backup_config(config_path)
 
     content = toml.dumps(config)
     if not content.endswith("\n"):
@@ -341,8 +330,7 @@ def _write_switch_config(config_path: Path, config: dict, config_format: str) ->
     if config_format == _CONFIG_FORMAT_YAML:
         backup_path: Path | None = None
         if config_path.exists():
-            backup_path = _backup_config_path(config_path)
-            shutil.copy2(config_path, backup_path)
+            backup_path = _backup_config(config_path)
         _save_yaml_config(config_path, config)
         return backup_path
     return _write_mcp_config(config_path, config, create_backup=True)

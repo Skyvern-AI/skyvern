@@ -32,6 +32,15 @@ class NotFoundError(Exception):
     pass
 
 
+class OTPRequestAlreadyBoundError(Exception):
+    """A strict OTP request marker already has a durable original owner."""
+
+    def __init__(self, *, owner_type: str, owner_id: str) -> None:
+        super().__init__("OTP request marker is already bound")
+        self.owner_type = owner_type
+        self.owner_id = owner_id
+
+
 class CredentialSitesChangedError(Exception):
     """The login's saved sites no longer match the ones the edit was made from."""
 
@@ -50,13 +59,17 @@ class RunsListSearchCanceled(Exception):
         self.statement_timeout_seconds = statement_timeout_seconds
 
 
-class DuplicateCopilotTurnError(Exception):
+class EmberTurnRunningError(Exception):
+    """Another live turn holds the chat, and the new turn asked not to stop it."""
+
+
+class DuplicateEmberTurnError(Exception):
     def __init__(self, turn_id: str) -> None:
         super().__init__(f"Copilot turn {turn_id} already owns this idempotency key")
         self.turn_id = turn_id
 
 
-CopilotProposalConflictReason = Literal[
+EmberProposalConflictReason = Literal[
     "token_changed",
     "candidate_missing",
     "metadata_invalid",
@@ -69,10 +82,10 @@ CopilotProposalConflictReason = Literal[
 ]
 
 
-class CopilotProposalConflictError(Exception):
+class EmberProposalConflictError(Exception):
     """The candidate changed after the caller read its owner/revision token."""
 
-    def __init__(self, message: str, *, reason: CopilotProposalConflictReason) -> None:
+    def __init__(self, message: str, *, reason: EmberProposalConflictReason) -> None:
         super().__init__(message)
         self.reason = reason
 

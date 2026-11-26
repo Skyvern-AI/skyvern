@@ -53,7 +53,14 @@ from skyvern.schemas.agent_step_tool_names import (
     is_known_tool_name,
 )
 from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
-from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
+from skyvern.schemas.emails import (
+    GMAIL_IMMUTABLE_LABELS,
+    GMAIL_ORGANIZE_FORBIDDEN_TARGETS,
+    ORGANIZE_ACTIONS_WITH_LABEL,
+    EmailBodyFormat,
+    EmailOrganizeAction,
+    EmailTransport,
+)
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
@@ -710,6 +717,7 @@ class FileUploadDestination(BaseModel):
 
     google_access_token: str | None = None
     google_drive_folder_id: str | None = None
+    google_drive_save_as_sheet: bool = False
     sftp_host: str | None = None
     sftp_port: int | None = None
     sftp_username: str | None = None
@@ -1351,6 +1359,7 @@ class FileUploadBlockYAML(BlockYAML):
         json_schema_extra=_connected_account_field(acts=True, storage_type=FileStorageType.GOOGLE_DRIVE.value),
     )
     google_drive_folder_id: str | None = None
+    google_drive_save_as_sheet: bool = False
     sftp_host: str | None = None
     sftp_port: int | None = None
     sftp_username: str | None = None
@@ -1844,7 +1853,7 @@ class HttpRequestBlockYAML(BlockYAML):
     headers: dict[str, str] | None = None
     body: dict[str, Any] | None = None  # Changed to consistently be dict only
     files: dict[str, str] | None = None  # Dictionary mapping field names to file paths/URLs for multipart file uploads
-    timeout: int = 30
+    timeout: int = Field(default=30, ge=1)
     follow_redirects: bool = True
     download_filename: str | None = None
     save_response_as_file: bool = False
@@ -1949,7 +1958,49 @@ class EmailInboxBlockYAML(BlockYAML):
     download_attachments: bool = Field(
         default=False, description="Download non-inline attachments from matched emails for downstream blocks."
     )
+    organize_action: EmailOrganizeAction | None = Field(
+        default=None,
+        description="Change every matched email: add a label, archive, move to a label, or mark read. Needs a "
+        "Connected Gmail account (credential_source nango).",
+    )
+    organize_label: str | None = Field(
+        default=None,
+        max_length=256,
+        description="Existing Gmail label name for organize_action label or move. Must be literal text.",
+    )
     parameter_keys: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _validate_organize(self) -> "EmailInboxBlockYAML":
+        if self.organize_action is None:
+            if self.organize_label is not None:
+                raise ValueError("organize_label is only used with organize_action")
+            return self
+        if self.email_client != "gmail":
+            raise ValueError("organize_action is only supported with gmail")
+        if self.credential_source != "nango":
+            raise ValueError("organize_action requires a Connected Gmail account")
+        if self.message_id:
+            raise ValueError("organize_action does not support message_id")
+        if (self.organize_action in ORGANIZE_ACTIONS_WITH_LABEL) != bool(
+            self.organize_label and self.organize_label.strip()
+        ):
+            raise ValueError("organize_label is required for label and move, and not allowed otherwise")
+        if any(
+            marker in value for value in (self.organize_label or "", self.folder or "") for marker in ("{{", "{%", "{#")
+        ):
+            raise ValueError("organize_label and folder must be literal for organize actions")
+        if (self.organize_label or "").strip().upper() in GMAIL_ORGANIZE_FORBIDDEN_TARGETS or (
+            self.organize_action == EmailOrganizeAction.MOVE
+            and (self.folder or "").strip().upper() in GMAIL_IMMUTABLE_LABELS
+        ):
+            raise ValueError("SENT, DRAFT, SPAM and TRASH cannot be organize targets; SENT and DRAFT cannot be sources")
+        if (
+            self.organize_action == EmailOrganizeAction.MOVE
+            and (self.organize_label or "").strip().casefold() == ((self.folder or "").strip() or "INBOX").casefold()
+        ):
+            raise ValueError("move source and target must differ")
+        return self
 
 
 class GoogleSheetsWriteBlockYAML(BlockYAML):
@@ -1961,7 +2012,11 @@ class GoogleSheetsWriteBlockYAML(BlockYAML):
     write_mode: Literal["append", "update"] = "append"
     values: str = ""
     column_mapping: dict[str, str] | None = None
-    create_sheet_if_missing: bool = False
+    create_sheet_if_missing: bool = Field(
+        default=False,
+        description="Add the tab named by sheet_name to the spreadsheet when it has no tab with that name. "
+        "The spreadsheet itself must already exist.",
+    )
     parameter_keys: list[str] | None = None
 
 
@@ -1972,9 +2027,9 @@ class PowerBIQueryBlockYAML(BlockYAML):
     connection_id: str = Field(
         min_length=1,
         description="Power BI connection ID for this user.",
-        json_schema_extra=_connected_account_field(credential_source="nango"),
+        json_schema_extra=_connected_account_field(credential_source="native"),
     )
-    credential_source: Literal["nango"] = "nango"
+    credential_source: Literal["nango", "native"] = "nango"
     dataset_id: str = Field(min_length=1)
     query: str = Field(min_length=1, description="A single read-only DAX query.")
     max_rows: int = Field(default=1_000, ge=1, le=100_000, strict=True)
@@ -2207,7 +2262,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     mask_secrets: bool | None = Field(
         default=None,
         title="Mask Secrets",
-        description="Mask secret values across this workflow's runs: hide them while they are typed (screenshots, recordings, live view) and redact them from stored artifacts, network logs, and LLM-bound text.",
+        description="Mask secret values across this workflow's runs. A new workflow defaults to true; on PUT updates, omission keeps the stored value. With this off, stored text artifacts (page HTML, element trees, LLM prompts and responses, logs and network logs) are still scrubbed of known secret values of 8 or more characters. With it on, shorter secret values are scrubbed too, secrets are hidden while they are typed (screenshots, recordings, live view), and they are redacted from LLM-bound text and failure reasons.",
     )
     pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None

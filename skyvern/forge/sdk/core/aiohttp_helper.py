@@ -1,21 +1,31 @@
 import asyncio
+import codecs
 import ipaddress
+import json
 import os
 import socket
-from collections.abc import Callable
+import zlib
+from collections.abc import Callable, Mapping
+from http.cookies import SimpleCookie
 from typing import Any
 from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
+import httpx
 import structlog
 from aiohttp.abc import AbstractCookieJar, AbstractResolver, ResolveResult
+from aiohttp.helpers import parse_mimetype
 from aiohttp.resolver import DefaultResolver
+from yarl import URL
 
 from skyvern.exceptions import HttpException, InvalidUrl
+from skyvern.forge import app
+from skyvern.forge.sdk.core.http_request_authorization import GuardedHTTPHopResponse
 from skyvern.utils.url_validators import (
     MAX_SAFE_REDIRECTS,
     SAFE_REDIRECT_STATUS_CODES,
+    redact_url_for_display,
     resolve_fetch_host_ips,
     validate_fetch_url_with_resolved_ips,
     validate_redirect_url_with_resolved_ips,
@@ -23,6 +33,7 @@ from skyvern.utils.url_validators import (
 
 LOG = structlog.get_logger()
 DEFAULT_REQUEST_TIMEOUT = 30
+DEFAULT_GUARDED_HTTP_RESPONSE_LIMIT_BYTES = 100 * 1024 * 1024
 _SAFE_CROSS_ORIGIN_REDIRECT_HEADERS = frozenset({"accept", "accept-language", "user-agent"})
 
 
@@ -49,6 +60,34 @@ def strip_cross_origin_redirect_credentials(
     return {key: value for key, value in headers.items() if key.lower() in _SAFE_CROSS_ORIGIN_REDIRECT_HEADERS}, None
 
 
+def prepare_redirect_credentials(
+    headers: dict[str, str],
+    cookies: dict[str, str] | None,
+    current_url: str,
+    next_url: str,
+    *,
+    cookie_jar: AbstractCookieJar,
+    set_cookies: tuple[str, ...] = (),
+) -> tuple[dict[str, str], dict[str, str] | None]:
+    for cookie in set_cookies:
+        response_cookies = SimpleCookie()
+        response_cookies.load(cookie)
+        cookie_jar.update_cookies(response_cookies, response_url=URL(current_url))
+    if _url_origin(current_url) == _url_origin(next_url):
+        next_cookies = {name: morsel.value for name, morsel in cookie_jar.filter_cookies(URL(next_url)).items()}
+        if next_cookies:
+            cookie_header = next((name for name in headers if name.lower() == "cookie"), None)
+            merged_cookies: dict[str, str] = {}
+            if cookie_header is not None:
+                existing_cookies = SimpleCookie()
+                existing_cookies.load(headers.pop(cookie_header))
+                merged_cookies.update({name: morsel.value for name, morsel in existing_cookies.items()})
+            merged_cookies.update(cookies or {})
+            merged_cookies.update(next_cookies)
+            cookies = merged_cookies
+    return strip_cross_origin_redirect_credentials(headers, cookies, current_url, next_url, cookie_jar=cookie_jar)
+
+
 class SSRFGuardedResolver(AbstractResolver):
     def __init__(self) -> None:
         self._pinned_host_ips: dict[str, tuple[str, ...]] = {}
@@ -69,6 +108,15 @@ class SSRFGuardedResolver(AbstractResolver):
         if not host:
             raise InvalidUrl(url=url)
         self.pin_host_ips(host, ips)
+
+    def pinned_ips_for_url(self, url: str) -> tuple[str, ...]:
+        host = urlparse(url).hostname
+        if not host:
+            raise InvalidUrl(url=url)
+        try:
+            return self._pinned_host_ips[self._host_key(host)]
+        except KeyError as exc:
+            raise OSError(f"No safe addresses pinned for host: {host}") from exc
 
     def trust_proxy_url(self, proxy: str) -> None:
         host = urlparse(proxy).hostname
@@ -125,11 +173,159 @@ def ssrf_guarded_tcp_connector(resolver: SSRFGuardedResolver | None = None) -> a
     return aiohttp.TCPConnector(resolver=resolver or SSRFGuardedResolver(), use_dns_cache=False)
 
 
+async def read_response_body_limited(response: aiohttp.ClientResponse, limit_bytes: int, url: str) -> bytes:
+    # response.content yields decoded bytes, so a compressed body is counted at its expanded size.
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        body.extend(chunk)
+        if len(body) > limit_bytes:
+            raise HttpException(
+                413, redact_url_for_display(url) or "[redacted]", "Response body exceeds its size limit"
+            )
+    return bytes(body)
+
+
+class _DeflateResponseDecoder:
+    def __init__(self) -> None:
+        self._decoder = zlib.decompressobj()
+        self._first_attempt = True
+
+    def decompress(self, data: bytes, max_length: int) -> bytes:
+        first_attempt = self._first_attempt
+        self._first_attempt = False
+        try:
+            return self._decoder.decompress(data, max_length)
+        except zlib.error:
+            if not first_attempt:
+                raise
+            self._decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+            return self._decoder.decompress(data, max_length)
+
+    def flush(self, max_length: int) -> bytes:
+        return self._decoder.flush(max_length)
+
+    @property
+    def eof(self) -> bool:
+        return self._decoder.eof
+
+    @property
+    def unconsumed_tail(self) -> bytes:
+        return self._decoder.unconsumed_tail
+
+    @property
+    def unused_data(self) -> bytes:
+        return self._decoder.unused_data
+
+
+def _httpx_response_decoder(content_encoding: str) -> Any | None:
+    encodings = [encoding.strip().lower() for encoding in content_encoding.split(",") if encoding.strip()]
+    if not encodings or encodings == ["identity"]:
+        return None
+    if len(encodings) != 1:
+        raise httpx.DecodingError("Unsupported response content encoding")
+    if encodings[0] == "gzip":
+        return zlib.decompressobj(16 + zlib.MAX_WBITS)
+    if encodings[0] == "deflate":
+        return _DeflateResponseDecoder()
+    raise httpx.DecodingError("Unsupported response content encoding")
+
+
+def _httpx_response_has_body(response: httpx.Response) -> bool:
+    return response.request.method.upper() != "HEAD" and not (
+        100 <= response.status_code < 200 or response.status_code in {204, 205, 304}
+    )
+
+
+async def read_httpx_response_body_limited(response: httpx.Response, limit_bytes: int) -> tuple[bytes, bool]:
+    if not _httpx_response_has_body(response):
+        return b"", False
+
+    content_encoding = response.headers.get("content-encoding", "")
+    decoder = _httpx_response_decoder(content_encoding)
+    body = bytearray()
+    saw_wire_bytes = False
+
+    try:
+        async for raw_chunk in response.aiter_raw():
+            if raw_chunk:
+                saw_wire_bytes = True
+            if decoder is None:
+                body.extend(raw_chunk[: limit_bytes - len(body) + 1])
+                if len(body) > limit_bytes:
+                    return bytes(body[:limit_bytes]), True
+                continue
+
+            pending = raw_chunk
+            while pending:
+                assert decoder is not None
+                chunk = decoder.decompress(pending, min(limit_bytes - len(body) + 1, 64 * 1024))
+                pending = decoder.unconsumed_tail
+                body.extend(chunk)
+                if len(body) > limit_bytes:
+                    return bytes(body[:limit_bytes]), True
+                if decoder.eof and decoder.unused_data:
+                    if content_encoding.strip().lower() != "gzip":
+                        raise httpx.DecodingError("Trailing bytes after compressed response")
+                    pending = decoder.unused_data
+                    decoder = _httpx_response_decoder(content_encoding)
+
+        if decoder is not None and saw_wire_bytes:
+            body.extend(decoder.flush(limit_bytes - len(body) + 1))
+            if not decoder.eof:
+                raise httpx.DecodingError("Incomplete compressed response")
+    except zlib.error as exc:
+        raise httpx.DecodingError("Invalid compressed response") from exc
+
+    return bytes(body[:limit_bytes]), len(body) > limit_bytes
+
+
+def buffered_httpx_response(response: httpx.Response, body: bytes) -> httpx.Response:
+    headers = {
+        name: value
+        for name, value in response.headers.items()
+        if name.lower() not in {"content-encoding", "content-length"}
+    }
+    return httpx.Response(
+        status_code=response.status_code,
+        headers=headers,
+        content=body,
+        request=response.request,
+        extensions=response.extensions,
+    )
+
+
+def declared_charset(content_type: str) -> str | None:
+    charset = parse_mimetype(content_type).parameters.get("charset")
+    if not charset:
+        return None
+    try:
+        return codecs.lookup(charset).name
+    except LookupError:
+        return None
+
+
+def decode_bounded_response_body(content_type: str, body: bytes) -> Any:
+    charset = declared_charset(content_type)
+    mimetype = parse_mimetype(content_type)
+    if mimetype.type == "application" and (mimetype.subtype == "json" or mimetype.suffix == "json"):
+        try:
+            # Decode before stripping: byte-level strip corrupts UTF-16/32. Without a charset, json.loads
+            # detects the encoding and a BOM from the bytes; with one, utf-8-sig drops a UTF-8 BOM.
+            document = body.decode("utf-8-sig" if charset == "utf-8" else charset) if charset else body
+            if not document.strip():
+                return None
+            return json.loads(document)
+        except (ValueError, RecursionError):
+            pass
+    return body.decode(charset or "utf-8", errors="replace")
+
+
 async def aiohttp_request(
     method: str,
     url: str,
     headers: dict[str, str] | None = None,
     *,
+    organization_id: str | None = None,
     data: Any | None = None,
     json_data: dict[str, Any] | None = None,
     files: dict[str, str] | None = None,
@@ -138,6 +334,9 @@ async def aiohttp_request(
     follow_redirects: bool = True,
     proxy: str | None = None,
     authorize_redirect: Callable[[str], bool] | None = None,
+    use_controlled_egress: bool = False,
+    response_limit_bytes: int = DEFAULT_GUARDED_HTTP_RESPONSE_LIMIT_BYTES,
+    read_body: bool = True,
 ) -> tuple[int, dict[str, str], Any]:
     """
     Generic HTTP request function that supports all HTTP methods.
@@ -146,6 +345,7 @@ async def aiohttp_request(
         method: HTTP method (GET, POST, etc.)
         url: Request URL
         headers: Request headers
+        organization_id: Organization used to resolve managed egress routing
         data: Request body data (dict for form data, or other types)
         json_data: JSON data to send (takes precedence over data)
         files: Dictionary mapping field names to file paths for multipart file uploads
@@ -155,6 +355,9 @@ async def aiohttp_request(
         proxy: Proxy URL
         authorize_redirect: Refuses a redirect (rather than following it) when it returns False for
             the next URL; the caller decides which destinations the request's contents may reach
+        use_controlled_egress: Route each validated hop through the deployment's controlled relay
+        response_limit_bytes: Most body bytes accepted
+        read_body: When False, skip reading the body on the direct path and return None for it
 
     Returns:
         Tuple of (status_code, response_headers, response_body)
@@ -173,11 +376,18 @@ async def aiohttp_request(
         timeout=aiohttp.ClientTimeout(total=timeout), connector=ssrf_guarded_tcp_connector(resolver)
     ) as session:
 
-        async def build_request_kwargs() -> dict[str, Any]:
+        def headers_for_hop() -> dict[str, str]:
             headers_dict = dict(request_headers)
             if strip_body_headers:
                 headers_dict.pop("Content-Length", None)
                 headers_dict.pop("content-length", None)
+            if files and request_method != "GET":
+                headers_dict.pop("Content-Type", None)
+                headers_dict.pop("content-type", None)
+            return headers_dict
+
+        async def build_request_kwargs() -> dict[str, Any]:
+            headers_dict = headers_for_hop()
             request_kwargs: dict[str, Any] = {
                 "headers": headers_dict,
                 "cookies": request_cookies,
@@ -203,8 +413,6 @@ async def aiohttp_request(
                         form.add_field(key, str(value))
 
                 request_kwargs["data"] = form
-                headers_dict.pop("Content-Type", None)
-                headers_dict.pop("content-type", None)
             elif json_data is not None:
                 request_kwargs["json"] = json_data
             elif data is not None:
@@ -212,52 +420,105 @@ async def aiohttp_request(
                 request_kwargs["json" if "application/json" in content_type.lower() else "data"] = data
             return request_kwargs
 
+        def response_header(response_headers: Mapping[str, str], name: str) -> str | None:
+            normalized = name.lower()
+            return next((value for key, value in response_headers.items() if key.lower() == normalized), None)
+
+        async def follow_response_redirect(
+            status: int,
+            response_headers: Mapping[str, str],
+            set_cookies: tuple[str, ...] = (),
+        ) -> bool:
+            nonlocal current_url, request_cookies, request_headers, request_method, strip_body_headers
+            location = response_header(response_headers, "location")
+            if not follow_redirects or status not in SAFE_REDIRECT_STATUS_CODES or not location:
+                return False
+            next_url = await validate_and_pin_redirect_url(current_url, location, resolver)
+            if authorize_redirect is not None and not authorize_redirect(next_url):
+                raise HttpException(400, current_url, "Redirect blocked by policy")
+            redirects_to_get = status == 303 or (status in (301, 302) and request_method == "POST")
+            data_is_json = (
+                "application/json"
+                in (request_headers.get("Content-Type") or request_headers.get("content-type") or "").lower()
+            )
+            replays_entity = (
+                not redirects_to_get
+                and request_method != "GET"
+                and (json_data is not None or bool(files) or (data is not None and (bool(data) or data_is_json)))
+            )
+            if _url_origin(current_url) != _url_origin(next_url) and replays_entity:
+                raise HttpException(400, "[redacted]", "Cross-origin redirect would replay a request entity")
+            request_headers, request_cookies = prepare_redirect_credentials(
+                request_headers,
+                request_cookies,
+                current_url,
+                next_url,
+                cookie_jar=session.cookie_jar,
+                set_cookies=set_cookies,
+            )
+            current_url = next_url
+            if redirects_to_get:
+                request_method = "GET"
+                strip_body_headers = True
+            return True
+
+        def decode_relay_response(response: GuardedHTTPHopResponse) -> Any:
+            content_type = response.header("content-type") or ""
+            media_type = content_type.split(";", 1)[0].strip().lower()
+            if media_type == "application/json" or media_type.endswith("+json"):
+                if not response.body:
+                    return None
+                try:
+                    return json.loads(response.body)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+            charset = parse_mimetype(content_type).parameters.get("charset", "utf-8")
+            try:
+                return response.body.decode(charset, errors="replace")
+            except LookupError:
+                return response.body.decode("utf-8", errors="replace")
+
         for _ in range(MAX_SAFE_REDIRECTS + 1):
+            if use_controlled_egress:
+                relay_response = await app.AGENT_FUNCTION.relay_http_request_hop(
+                    organization_id=organization_id,
+                    method=request_method,
+                    target_url=current_url,
+                    headers=headers_for_hop(),
+                    data=data,
+                    json_data=json_data,
+                    files=files,
+                    cookies=request_cookies,
+                    timeout_seconds=timeout,
+                    response_limit_bytes=response_limit_bytes,
+                    resolved_ips=lambda: resolver.pinned_ips_for_url(current_url),
+                )
+                if relay_response is not None:
+                    if await follow_response_redirect(
+                        relay_response.status_code,
+                        relay_response.headers,
+                        relay_response.set_cookies,
+                    ):
+                        continue
+                    return relay_response.status_code, relay_response.headers, decode_relay_response(relay_response)
+
             request_kwargs = await build_request_kwargs()
             request_kwargs["url"] = current_url
             async with session.request(request_method, **request_kwargs) as response:
-                if (
-                    follow_redirects
-                    and response.status in SAFE_REDIRECT_STATUS_CODES
-                    and response.headers.get("Location")
-                ):
-                    next_url = await validate_and_pin_redirect_url(current_url, response.headers["Location"], resolver)
-                    if authorize_redirect is not None and not authorize_redirect(next_url):
-                        raise HttpException(400, current_url, "Redirect blocked by policy")
-                    redirects_to_get = response.status == 303 or (
-                        response.status in (301, 302) and request_method == "POST"
-                    )
-                    data_is_json = (
-                        "application/json"
-                        in (request_headers.get("Content-Type") or request_headers.get("content-type") or "").lower()
-                    )
-                    replays_entity = (
-                        not redirects_to_get
-                        and request_method != "GET"
-                        and (
-                            json_data is not None or bool(files) or (data is not None and (bool(data) or data_is_json))
-                        )
-                    )
-                    cross_origin = _url_origin(current_url) != _url_origin(next_url)
-                    if cross_origin and replays_entity:
-                        raise HttpException(400, "[redacted]", "Cross-origin redirect would replay a request entity")
-                    request_headers, request_cookies = strip_cross_origin_redirect_credentials(
-                        request_headers, request_cookies, current_url, next_url, cookie_jar=session.cookie_jar
-                    )
-                    current_url = next_url
-                    if redirects_to_get:
-                        request_method = "GET"
-                        strip_body_headers = True
+                if await follow_response_redirect(response.status, response.headers):
                     continue
 
                 response_headers = dict(response.headers)
 
-                try:
-                    response_body = await response.json()
-                except (aiohttp.ContentTypeError, Exception):
-                    response_body = await response.text()
+                if not read_body:
+                    return response.status, response_headers, None
 
-                return response.status, response_headers, response_body
+                limited_body = await read_response_body_limited(response, response_limit_bytes, current_url)
+                return (
+                    response.status,
+                    response_headers,
+                    decode_bounded_response_body(response.headers.get("Content-Type", ""), limited_body),
+                )
         raise HttpException(400, current_url, "Too many redirects while making HTTP request")
 
 

@@ -1,0 +1,1396 @@
+"""Tests for the run poll loop inside ``_run_blocks_and_collect_debug``: its exits, error strings and cancellation."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from structlog.testing import capture_logs
+
+from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.ember.agent_context import OriginRunRedactionRegistry
+from skyvern.forge.sdk.ember.blocker_signal import (
+    assert_clean_user_facing_text,
+    contains_internal_machinery_leak,
+)
+from skyvern.forge.sdk.ember.context import EmberContext
+from skyvern.forge.sdk.ember.repair_origin_run import (
+    OriginBlockOutput,
+    OriginExecutionSettings,
+    OriginOutputSnapshot,
+    SelectedOutputSource,
+)
+from skyvern.forge.sdk.ember.tools import (
+    RUN_BLOCKS_SAFETY_CEILING_SECONDS,
+    WatchdogExitReason,
+    _fallback_page_info,
+    _read_progress_sources,
+    _run_blocks_and_collect_debug,
+    _shared,
+    _watchdog_error_message,
+    run_execution,
+)
+from skyvern.forge.sdk.ember.tools.run_execution import (
+    _watchdog_user_facing_summary,
+)
+from skyvern.forge.sdk.ember.turn_origin import TurnOrigin
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
+from tests.unit._mcp_browser_fakes import crash_free_browser_state
+from tests.unit.ember_test_helpers import (
+    SEARCH_THEN_SELECT_WORKFLOW_YAML,
+    adopted_detached_tasks,
+    install_fresh_run_browser,
+)
+from tests.unit.ember_test_helpers import install_run_blocks_harness as _install_run_harness
+from tests.unit.ember_test_helpers import (
+    make_ember_ctx,
+    refuse_seeded_origin_output_once,
+    run_result_action_row,
+    terminal_extraction_block,
+)
+
+
+def _fake_run(status: str = "running", modified_at: datetime | None = None) -> Any:
+    return SimpleNamespace(
+        status=status,
+        modified_at=modified_at or datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc),
+        browser_session_id=None,
+        failure_reason=None,
+        credits_used=0,
+        cached_credits_used=0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _read_progress_sources: delegation + graceful DB-failure handling.
+# ---------------------------------------------------------------------------
+
+
+class _FakeTasksRepo:
+    def __init__(
+        self,
+        *,
+        block_ts: datetime | None = None,
+        raise_on_call: Exception | None = None,
+    ) -> None:
+        self.block_ts = block_ts
+        self.raise_on_call = raise_on_call
+        self.call_count = 0
+
+    async def get_workflow_run_block_progress_timestamp(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> datetime | None:
+        self.call_count += 1
+        if self.raise_on_call is not None:
+            raise self.raise_on_call
+        return self.block_ts
+
+
+class _FakeWorkflowRunsRepo:
+    def __init__(self, run: Any | None = None, raise_on_call: Exception | None = None) -> None:
+        self.run = run
+        self.raise_on_call = raise_on_call
+
+    async def get_workflow_run(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> Any:
+        if self.raise_on_call is not None:
+            raise self.raise_on_call
+        return self.run
+
+
+class _FakeDatabase:
+    def __init__(self, tasks: _FakeTasksRepo, workflow_runs: _FakeWorkflowRunsRepo) -> None:
+        self.tasks = tasks
+        self.workflow_runs = workflow_runs
+
+
+class _FakeCtx:
+    organization_id = "o_test"
+
+
+@pytest.mark.asyncio
+async def test_read_progress_sources_returns_run_and_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge import app as forge_app
+
+    run = _fake_run()
+    block_ts = datetime(2026, 4, 21, 12, 0, 11, tzinfo=timezone.utc)
+    db = _FakeDatabase(
+        tasks=_FakeTasksRepo(block_ts=block_ts),
+        workflow_runs=_FakeWorkflowRunsRepo(run=run),
+    )
+    monkeypatch.setattr(forge_app, "DATABASE", db)
+
+    assert await _read_progress_sources(_FakeCtx(), "wr_1") == (run, block_ts)
+
+
+@pytest.mark.asyncio
+async def test_read_progress_sources_swallows_workflow_run_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB read failure on the workflow-run row must not crash the watchdog —
+    ``_safe_read_workflow_run`` returns None and the poll continues."""
+    from skyvern.forge import app as forge_app
+
+    db = _FakeDatabase(
+        tasks=_FakeTasksRepo(block_ts=None),
+        workflow_runs=_FakeWorkflowRunsRepo(raise_on_call=RuntimeError("DB flake")),
+    )
+    monkeypatch.setattr(forge_app, "DATABASE", db)
+
+    assert await _read_progress_sources(_FakeCtx(), "wr_1") == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_read_progress_sources_swallows_progress_timestamps_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB read failure on the block timestamp must also not crash — the caller still gets the run
+    (if readable) and ``None`` for the timestamp."""
+    from skyvern.forge import app as forge_app
+
+    run = _fake_run()
+    db = _FakeDatabase(
+        tasks=_FakeTasksRepo(raise_on_call=RuntimeError("aggregate query failed")),
+        workflow_runs=_FakeWorkflowRunsRepo(run=run),
+    )
+    monkeypatch.setattr(forge_app, "DATABASE", db)
+
+    assert await _read_progress_sources(_FakeCtx(), "wr_1") == (run, None)
+
+
+# ---------------------------------------------------------------------------
+# _watchdog_error_message: the regression-guard strings.
+# ---------------------------------------------------------------------------
+
+
+class _ErrorCtx:
+    """Minimal ``AgentContext`` stand-in for the error-message path."""
+
+    organization_id = "o_test"
+    browser_session_id = None
+    origin_run_redaction_registry = None
+
+
+def _install_fallback_page(
+    monkeypatch: pytest.MonkeyPatch, page: SimpleNamespace
+) -> tuple[SimpleNamespace, SimpleNamespace]:
+    browser_state = crash_free_browser_state(get_or_create_page=AsyncMock(return_value=page))
+    session_manager = SimpleNamespace(get_browser_state=AsyncMock(return_value=browser_state))
+    monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", session_manager)
+    ctx = SimpleNamespace(
+        organization_id="o_test",
+        browser_session_id="pbs_copilot",
+        turn_origin=TurnOrigin.interactive,
+        attached_browser_drivers={},
+        page_crash_records_by_browser_session={},
+    )
+    return session_manager, ctx
+
+
+@pytest.mark.asyncio
+async def test_fallback_page_info_uses_persistent_session_state_without_sdk_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = SimpleNamespace(url="https://example.test/current", title=AsyncMock(return_value="Current page"))
+    session_manager, ctx = _install_fallback_page(monkeypatch, page)
+
+    current_url, page_title = await _fallback_page_info(ctx)
+
+    assert current_url == "https://example.test/current"
+    assert page_title == "Current page"
+    session_manager.get_browser_state.assert_awaited_once_with(
+        session_id="pbs_copilot",
+        organization_id="o_test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_page_info_bounds_a_title_that_never_resolves_and_keeps_the_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wedged renderer hangs `title()` rather than raising it. The bound has to return, and it
+    has to keep the url — `page.url` is synchronous, so it is already in hand when the title
+    stalls, and most callers of this helper want only the url."""
+
+    async def _never_resolves() -> str:
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    page = SimpleNamespace(url="https://example.test/wedged", title=_never_resolves)
+    _, ctx = _install_fallback_page(monkeypatch, page)
+    monkeypatch.setattr(_shared, "_DISCOVERY_PER_CALL_TIMEOUT_SECONDS", 0.05)
+
+    current_url, page_title = await asyncio.wait_for(_fallback_page_info(ctx), timeout=5)
+
+    assert current_url == "https://example.test/wedged"
+    assert page_title == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title_raises", [False, True])
+async def test_fallback_page_info_never_pairs_a_title_with_another_documents_url(
+    monkeypatch: pytest.MonkeyPatch, title_raises: bool
+) -> None:
+    page = SimpleNamespace(url="https://portal.fixture.test/login")
+
+    async def _title_across_navigation() -> str:
+        page.url = "https://portal.fixture.test/dashboard"
+        if title_raises:
+            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+        return "Ops Portal"
+
+    page.title = _title_across_navigation
+    _, ctx = _install_fallback_page(monkeypatch, page)
+
+    assert await _fallback_page_info(ctx) == ("https://portal.fixture.test/dashboard", "")
+
+
+@pytest.mark.asyncio
+async def test_ceiling_error_message_advises_splitting() -> None:
+    """The error must tell the LLM to split the workflow, not retry — a longer run won't fit either."""
+    quiet_budget = RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10
+    msg = await _watchdog_error_message("ceiling", _ErrorCtx(), "wr_test", _fake_run(), quiet_budget)
+
+    assert "timed out" not in msg.lower()
+    assert str(quiet_budget) in msg
+    assert "split" in msg.lower()
+    assert "Run ID: wr_test" in msg
+    assert "get_run_results" in msg
+    assert "Do NOT re-invoke block-running tools" in msg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("handoff_arrived", "url_reported"), [(False, False), (True, True)])
+async def test_a_non_terminal_exit_reports_the_live_url_only_once_the_runs_secrets_are_registered(
+    monkeypatch: pytest.MonkeyPatch, handoff_arrived: bool, url_reported: bool
+) -> None:
+    registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_test",
+        parameters={"password": "hunter2-password"},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=handoff_arrived,
+        awaiting_runtime_secret_values=not handoff_arrived,
+    )
+    monkeypatch.setattr(
+        run_execution,
+        "_fallback_page_info",
+        AsyncMock(return_value=("https://portal.fixture.test/verify?code=424242", "")),
+    )
+
+    msg = await _watchdog_error_message("ceiling", _ErrorCtx(), "wr_test", _fake_run(), 240, origin_registry=registry)
+
+    assert ("Browser was on: https://portal.fixture.test/verify?code=424242" in msg) is url_reported
+
+
+@pytest.mark.asyncio
+async def test_task_exit_unfinalized_message_reports_last_observed_status() -> None:
+    """When ``execute_workflow`` naturally exits but the row isn't terminal,
+    the error must name the last-observed status so the LLM has a concrete
+    anchor for the follow-up ``get_run_results`` call."""
+    run = _fake_run(status="running")
+    msg = await _watchdog_error_message(
+        "task_exit_unfinalized", _ErrorCtx(), "wr_test", run, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10
+    )
+
+    assert "timed out" not in msg.lower()
+    assert "last observed status: running" in msg
+    assert "Run ID: wr_test" in msg
+    assert "get_run_results" in msg
+
+
+@pytest.mark.asyncio
+async def test_task_exit_unfinalized_message_tolerates_unreadable_run() -> None:
+    """If the post-drain reread also fails (``run is None``), the message must
+    still be well-formed and mention the unreadable state rather than
+    crashing on a ``None.status`` access."""
+    msg = await _watchdog_error_message(
+        "task_exit_unfinalized", _ErrorCtx(), "wr_test", None, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10
+    )
+
+    assert "unreadable" in msg.lower()
+    assert "Run ID: wr_test" in msg
+    assert "get_run_results" in msg
+
+
+@pytest.mark.asyncio
+async def test_paused_error_message_reports_a_wait_not_an_uncertain_outcome() -> None:
+    """A pause is a wait on a person, so the message states the waiting facts and must not inherit
+    the "outcome is uncertain" tail. The text must clear the output guard if the model relays it."""
+    msg = await _watchdog_error_message("paused", _ErrorCtx(), "wr_test", _fake_run(status="paused"), 240)
+
+    assert "paused" in msg.lower()
+    assert "waiting for a person" in msg.lower()
+    assert "wr_test" not in msg
+    assert contains_internal_machinery_leak(msg) is False
+    assert "uncertain" not in msg.lower()
+    assert "nothing was cancelled" in msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_non_paused_error_messages_keep_the_run_id_for_the_model() -> None:
+    """The run id is the model's only handle on a run whose outcome is uncertain."""
+    exit_reasons: tuple[WatchdogExitReason, ...] = ("ceiling", "task_exit_unfinalized")
+    for exit_reason in exit_reasons:
+        msg = await _watchdog_error_message(exit_reason, _ErrorCtx(), "wr_test", _fake_run(), 240)
+
+        assert "Run ID: wr_test" in msg
+        assert "tell the user" not in msg.lower()
+
+
+@pytest.mark.parametrize(
+    ("exit_reason", "run", "expected"),
+    [
+        (
+            "paused",
+            _fake_run(status="paused"),
+            "The run is paused, waiting for a person to approve or reject it.",
+        ),
+        (
+            "ceiling",
+            _fake_run(),
+            f"The run did not finish within the {RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10}s absolute ceiling.",
+        ),
+        (
+            "task_exit_unfinalized",
+            _fake_run(status="running"),
+            "The run ended before recording a trustworthy terminal status. Last observed status: running.",
+        ),
+        (
+            "task_exit_unfinalized",
+            None,
+            "The run ended before recording a trustworthy terminal status.",
+        ),
+    ],
+)
+def test_watchdog_user_relayed_text_is_id_free_and_clears_the_output_guard(
+    exit_reason: WatchdogExitReason, run: SimpleNamespace | None, expected: str
+) -> None:
+    reason = _watchdog_user_facing_summary(exit_reason, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10, run)
+
+    assert reason == expected
+    assert contains_internal_machinery_leak(reason) is False
+    assert_clean_user_facing_text(reason)
+
+
+_HUMAN_INTERACTION_WORKFLOW_YAML = """
+title: human approval example
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: wait
+      label: request_access
+      wait_sec: 1
+    - block_type: human_interaction
+      label: approve_login
+      timeout_seconds: 3600
+      sender: automation@example.com
+      recipients: ["ops@example.com"]
+      subject: Manual sign-in needed
+      body: A workflow run is paused and needs someone to sign in.
+"""
+
+_EXTRACTION_WORKFLOW_YAML = """
+title: extraction example
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: extraction
+      label: extract_heading
+      url: https://example.com
+      data_extraction_goal: Extract the page heading.
+"""
+
+_NAVIGATION_WORKFLOW_YAML = """
+title: navigation example
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: navigation
+      label: open_page
+      url: https://example.com
+      navigation_goal: Open the page.
+"""
+
+_CODE_WORKFLOW_YAML = """
+title: code example
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: click_submit
+      code: |
+        await page.locator("#submit").click()
+"""
+
+
+def _install_advancing_clock(monkeypatch: pytest.MonkeyPatch, step_seconds: float = 600.0) -> Callable[[], float]:
+    elapsed = 0.0
+
+    def _monotonic() -> float:
+        nonlocal elapsed
+        elapsed += step_seconds
+        return elapsed
+
+    monkeypatch.setattr(run_execution, "time", SimpleNamespace(monotonic=_monotonic))
+    return lambda: elapsed
+
+
+@pytest.mark.asyncio
+async def test_paused_run_is_reported_as_a_pause_and_left_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run paused at a human_interaction block with nobody responding: the watchdog must leave
+    the poll loop immediately, report the pause, and tear nothing down — the executor task, the run
+    itself and the pane's run-session association all have to outlive the tool call for an approval
+    to be able to resume the run."""
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_HUMAN_INTERACTION_WORKFLOW_YAML,
+        polled_status="paused",
+    )
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    ctx.repair_origin_outputs_run_id = "wr_origin"
+    origin = OriginOutputSnapshot(
+        definition=harness["workflow"].workflow_definition,
+        outputs={
+            "request_access": OriginBlockOutput(
+                status=BlockStatus.completed, has_value=True, created_at=datetime.now(UTC), value={"sent": True}
+            )
+        },
+        settings=OriginExecutionSettings.of(harness["workflow"]),
+    )
+    ctx.repair_origin_outputs = origin
+    ctx.frontier_selected_output_sources = {
+        "request_access": SelectedOutputSource("request_access", "wr_origin", "origin", origin)
+    }
+    ctx.frontier_origin_reused_labels = ["request_access"]
+    before = set(run_execution._DETACHED_CLEANUP_TASKS)
+
+    started = time.monotonic()
+    result = await _run_blocks_and_collect_debug({"block_labels": ["approve_login"], "parameters": {}}, ctx)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < RUN_BLOCKS_SAFETY_CEILING_SECONDS / 10
+    assert result["ok"] is False, result
+    assert result["data"]["control_signal"]["kind"] == "watchdog_paused", result
+    assert "paused" in result["data"]["user_facing_summary"].lower()
+    assert "uncertain" not in result["error"].lower()
+    assert result["data"]["reused_origin_output_labels"] == ["request_access"]
+    assert result["data"]["origin_workflow_run_id"] == "wr_origin"
+
+    harness["cancel_run_task"].assert_not_awaited()
+    harness["cooperative_cancel"].assert_not_awaited()
+    harness["clear"].assert_not_awaited()
+    harness["publish"].assert_awaited_once()
+    assert ctx.budget_expiry_state.leavable_run_ids == []
+
+    adopted = adopted_detached_tasks(before)
+    assert len(adopted) == 1
+    await asyncio.sleep(0)
+    assert harness["executor_cancelled"] is False
+    assert not adopted[0].done()
+
+    adopted[0].cancel()
+    await asyncio.gather(*adopted, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_tool_cancelled_while_paused_leaves_the_run_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pause is decided several awaits before the result is returned. A tool timeout landing in
+    that window must still leave the run alive, or the person's approval has nothing to resume."""
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_HUMAN_INTERACTION_WORKFLOW_YAML,
+        polled_status="paused",
+    )
+
+    async def _cancel_mid_flight(*_args: Any, **_kwargs: Any) -> str:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(run_execution, "_watchdog_error_message", _cancel_mid_flight)
+
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    before = set(run_execution._DETACHED_CLEANUP_TASKS)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run_blocks_and_collect_debug({"block_labels": ["approve_login"], "parameters": {}}, ctx)
+
+    harness["cancel_run_task"].assert_not_awaited()
+    harness["cooperative_cancel"].assert_not_awaited()
+
+    adopted = adopted_detached_tasks(before)
+    assert len(adopted) == 1
+    await asyncio.sleep(0)
+    assert harness["executor_cancelled"] is False
+
+    adopted[0].cancel()
+    await asyncio.gather(*adopted, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_watchdog_terminated_run_still_carries_its_per_block_page_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML,
+        polled_status="running",
+        terminal_blocks=[
+            terminal_extraction_block(
+                "failed",
+                label="select_first_result",
+                final_url="https://fixture.test/results/widget",
+                task_id="tsk_select",
+            ).model_copy(update={"modified_at": datetime(2026, 4, 21, 12, 7, tzinfo=UTC)}),
+            terminal_extraction_block(
+                "completed",
+                label="run_search",
+                final_url="https://fixture.test/results/widget/page-1",
+                task_id="tsk_search",
+            ),
+        ],
+        recent_actions=[
+            run_result_action_row("tsk_select", ActionType.WAIT, ActionStatus.failed, code_line=9),
+            run_result_action_row("tsk_search", ActionType.CLICK, ActionStatus.completed),
+        ],
+    )
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": ["run_search", "select_first_result"], "parameters": {}}, ctx
+    )
+    data = result["data"]
+
+    assert data["control_signal"]["kind"] == "watchdog_ceiling"
+    assert data["run_duration_seconds"] > 0
+    assert {block["label"]: block["duration_seconds"] for block in data["blocks"]} == {
+        "select_first_result": 120,
+        "run_search": 0,
+    }
+    assert data["observed_block_end_urls"] == {
+        "run_search": "https://fixture.test/results/widget/page-1",
+        "select_first_result": "https://fixture.test/results/widget",
+    }
+    assert data["per_block_action_observations"]["run_search"] == ["click completed"]
+    assert data["per_block_action_observations"]["select_first_result"] == ["wait failed code_line=9"]
+    assert all("action_trace" not in block for block in data["blocks"])
+
+
+@pytest.mark.asyncio
+async def test_non_paused_watchdog_exit_still_cancels_and_clears(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pause carve-out is scoped to the pause: a run that reaches the ceiling still gets cancelled
+    and still releases the run-session association."""
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+    )
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    before = set(run_execution._DETACHED_CLEANUP_TASKS)
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_ceiling"
+    assert result["data"]["browser_start"]["kind"] == "separate_context_continued_from_earlier_test"
+    harness["cancel_run_task"].assert_awaited_once()
+    harness["clear"].assert_awaited_once()
+    assert adopted_detached_tasks(before) == []
+
+    for relayed in (
+        result["data"]["failure_reason"],
+        result["data"]["user_facing_summary"],
+        result["data"]["control_signal"]["user_facing_summary"],
+    ):
+        assert relayed
+        assert contains_internal_machinery_leak(relayed) is False
+        assert_clean_user_facing_text(relayed)
+    assert "Run ID:" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chat_session_id", "resume_session_id", "acquired_session_id", "kind", "inherited_browser_state"),
+    [
+        ("pbs_chat", None, "pbs_chat", "chat_browser_context", True),
+        ("pbs_chat", "pbs_chat", "pbs_chat", "chat_browser_context_continued_from_earlier_test", True),
+        (None, None, "pbs_chat", "chat_browser_context_opened_for_this_run", False),
+        ("pbs_chat", "pbs_chat", "pbs_chat_replacement", "chat_browser_context_opened_for_this_run", False),
+    ],
+)
+async def test_a_chat_browser_run_at_the_ceiling_says_which_browser_it_started_in(
+    monkeypatch: pytest.MonkeyPatch,
+    chat_session_id: str | None,
+    resume_session_id: str | None,
+    acquired_session_id: str,
+    kind: str,
+    inherited_browser_state: bool,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch, workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML, polled_status="running"
+    )
+    _install_advancing_clock(monkeypatch)
+
+    async def _acquire(ctx: EmberContext, **_kwargs: object) -> None:
+        ctx.browser_session_id = acquired_session_id
+
+    monkeypatch.setattr(run_execution, "acquire_build_test_browser_session", _acquire)
+    ctx = make_ember_ctx(browser_session_id=chat_session_id)
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = resume_session_id
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["select_first_result"], "parameters": {}}, ctx)
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_ceiling"
+    assert result["data"]["browser_start"] == {
+        "kind": kind,
+        "restored_saved_profile": False,
+        "inherited_browser_state": inherited_browser_state,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_retry_after_a_refused_earlier_output_keeps_the_chat_browser_it_opened_as_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch, workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML, polled_status="running"
+    )
+    _install_advancing_clock(monkeypatch)
+    install_fresh_run_browser(monkeypatch, "pbs_chat")
+    ctx = make_ember_ctx(browser_session_id=None)
+    ctx.staged_workflow = harness["workflow"]
+    refusals = refuse_seeded_origin_output_once(monkeypatch, ctx)
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["select_first_result"], "parameters": {}}, ctx)
+
+    assert refusals == []
+    assert result["data"]["browser_start"] == {
+        "kind": "chat_browser_context_opened_for_this_run",
+        "restored_saved_profile": False,
+        "inherited_browser_state": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_non_success_watchdog_result_types_selected_failed_block_locators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_CODE_WORKFLOW_YAML,
+        polled_status="running",
+    )
+    monkeypatch.setattr(
+        forge_app.AGENT_FUNCTION,
+        "allow_ember_inline_code_execution",
+        MagicMock(return_value=True),
+    )
+    forge_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(
+        return_value=[
+            WorkflowRunBlock(
+                label="click_submit",
+                block_type=BlockType.CODE,
+                status="failed",
+                workflow_run_block_id="wrb_click_submit",
+                workflow_run_id="wr_paused",
+                organization_id="org-1",
+                created_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+                modified_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+            )
+        ]
+    )
+    observe = AsyncMock(return_value=[{"authored_selector": "#submit", "unobserved_reason": "run_page_unavailable"}])
+    monkeypatch.setattr(run_execution, "_observe_authored_locators", observe)
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["click_submit"], "parameters": {}}, ctx)
+
+    assert result["data"].get("authored_locator_observations") == [
+        {"authored_selector": "#submit", "unobserved_reason": "run_page_unavailable"}
+    ], result
+    observe.assert_awaited_once_with(
+        ctx,
+        run_session_id="pbs_run",
+        failed_block_code='await page.locator("#submit").click()\n',
+        worker_owned=False,
+        observation_deadline_exceeded=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_progressing_worker_run_crosses_legacy_boundary_and_returns_terminal_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+        terminal_blocks=[
+            WorkflowRunBlock(
+                label="extract_heading",
+                block_type=BlockType.EXTRACTION,
+                status="completed",
+                failure_reason=None,
+                error_codes=[],
+                output={"heading": "Example Domain"},
+                workflow_run_block_id="wrb_terminal",
+                workflow_run_id="wr_paused",
+                organization_id="org-1",
+                task_id=None,
+                final_url="https://example.com/result",
+                created_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+                modified_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+            )
+        ],
+    )
+    elapsed = 0.0
+    progress = iter(
+        (
+            (0.0, "running"),
+            (120.0, "running"),
+            (241.0, "running"),
+            (300.0, "completed"),
+        )
+    )
+
+    async def _read_progress(_ctx: EmberContext, _run_id: str) -> tuple[Any, datetime]:
+        nonlocal elapsed
+        elapsed, status = next(progress)
+        marker = datetime(2026, 4, 21, 12, 0, 0, tzinfo=UTC) + timedelta(seconds=elapsed)
+        return _fake_run(status=status, modified_at=marker), marker
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+    monkeypatch.setattr(run_execution, "time", SimpleNamespace(monotonic=lambda: elapsed))
+
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert elapsed == 300.0
+    assert result["ok"] is True, result
+    assert result["data"]["workflow_run_id"] == "wr_paused"
+    assert result["data"]["overall_status"] == "completed"
+    assert result["data"]["run_duration_seconds"] == 300
+    assert result["data"]["current_url"] == "https://example.com/result"
+    assert result["data"]["blocks"] == [
+        {
+            "label": "extract_heading",
+            "block_type": "EXTRACTION",
+            "status": "completed",
+            "workflow_run_block_id": "wrb_terminal",
+            "output": {"heading": "Example Domain"},
+            "duration_seconds": 0,
+            "extracted_data": {"heading": "Example Domain"},
+        }
+    ]
+    assert "failure_categories" not in result["data"]
+    harness["worker_execute"].assert_awaited_once()
+    harness["cooperative_cancel"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_yaml", "label", "block_type"),
+    [
+        (_NAVIGATION_WORKFLOW_YAML, "open_page", BlockType.NAVIGATION),
+        (_EXTRACTION_WORKFLOW_YAML, "extract_heading", BlockType.EXTRACTION),
+    ],
+    ids=["navigation", "extraction"],
+)
+async def test_silent_worker_run_finishes_pending_model_call_without_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_yaml: str,
+    label: str,
+    block_type: BlockType,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=workflow_yaml,
+        polled_status="running",
+        dispatch_to_worker=True,
+        terminal_blocks=[
+            WorkflowRunBlock(
+                label=label,
+                block_type=block_type,
+                status="completed",
+                workflow_run_block_id="wrb_terminal",
+                workflow_run_id="wr_paused",
+                organization_id="org-1",
+                created_at=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+                modified_at=datetime(2026, 4, 21, 12, 3, 3, tzinfo=UTC),
+            )
+        ],
+    )
+    elapsed = 0.0
+    progress = iter(
+        (
+            (0.0, "running"),
+            (89.0, "running"),
+            (91.0, "running"),
+            (182.0, "running"),
+            (183.0, "completed"),
+        )
+    )
+    marker = datetime(2026, 4, 21, 12, 0, tzinfo=UTC)
+
+    async def _read_progress(_ctx: EmberContext, _run_id: str) -> tuple[Any, datetime]:
+        nonlocal elapsed
+        elapsed, status = next(progress)
+        return _fake_run(status=status, modified_at=marker), marker
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+    monkeypatch.setattr(run_execution, "time", SimpleNamespace(monotonic=lambda: elapsed))
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": [label], "parameters": {}}, ctx)
+
+    harness["cooperative_cancel"].assert_not_awaited()
+    assert elapsed == 183.0
+    assert result["ok"] is True, result
+    assert result["data"]["workflow_run_id"] == "wr_paused"
+    assert result["data"]["overall_status"] == "completed"
+    harness["worker_execute"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_never_terminal_worker_run_is_cancelled_at_the_safety_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+    )
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert result["ok"] is False, result
+    assert result["data"]["control_signal"]["kind"] == "watchdog_ceiling"
+    assert f"{RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10}s" in result["data"]["user_facing_summary"]
+    harness["cooperative_cancel"].assert_awaited_once_with("wr_paused")
+
+
+@pytest.mark.asyncio
+async def test_a_watchdog_exit_that_cannot_read_the_run_row_reports_unknown_credits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+    )
+    forge_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(side_effect=RuntimeError("DB flake"))
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_ceiling", result
+    assert result["data"]["credits_used"] is None
+    assert run_execution.build_test_evidence_packet(ctx, result).run.credits_used is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_row_written_before_the_ceiling_cancel_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+    )
+    forge_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_run(status="completed"))
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    harness["cooperative_cancel"].assert_not_awaited()
+    assert result["ok"] is True, result
+    assert result["data"]["overall_status"] == "completed"
+
+
+_LOOP_WORKFLOW_YAML = """
+title: loop example
+workflow_definition:
+  parameters:
+    - key: rows
+      parameter_type: workflow
+      workflow_parameter_type: json
+      default_value: [0, 1, 2]
+  blocks:
+    - block_type: for_loop
+      label: each_row
+      loop_over_parameter_key: rows
+      loop_blocks:
+        - block_type: extraction
+          label: fill_dates
+          continue_on_failure: true
+          next_block_label: save_row
+          url: https://example.com
+          data_extraction_goal: Read the date fields.
+        - block_type: extraction
+          label: save_row
+          url: https://example.com
+          data_extraction_goal: Read the saved row.
+"""
+
+_LOOP_T0 = datetime(2026, 11, 5, 12, 0, tzinfo=UTC)
+_ROW_ZERO_ERROR = "Locator.fill: Timeout 10000ms exceeded waiting for #prior-expiration"
+
+
+def _loop_row(
+    block_id: str,
+    label: str,
+    status: str,
+    second: int,
+    *,
+    index: int | None = None,
+    failure_reason: str | None = None,
+    run_id: str = "wr_paused",
+) -> WorkflowRunBlock:
+    is_loop = index is None
+    return WorkflowRunBlock(
+        workflow_run_block_id=block_id,
+        workflow_run_id=run_id,
+        organization_id="org-1",
+        parent_workflow_run_block_id=None if is_loop else "wrb_loop",
+        block_type=BlockType.FOR_LOOP if is_loop else BlockType.EXTRACTION,
+        label=label,
+        status=status,
+        failure_reason=failure_reason,
+        current_index=index,
+        loop_values=list(range(120)) if is_loop else None,
+        created_at=_LOOP_T0 + timedelta(seconds=second),
+        modified_at=_LOOP_T0 + timedelta(seconds=second),
+    )
+
+
+def _row_zero_failed_then_row_one_started(run_id: str = "wr_paused") -> list[WorkflowRunBlock]:
+    return [
+        _loop_row("wrb_loop", "each_row", "running", 0, run_id=run_id),
+        _loop_row("wrb_0", "fill_dates", "failed", 1, index=0, failure_reason=_ROW_ZERO_ERROR, run_id=run_id),
+        _loop_row("wrb_1", "fill_dates", "running", 2, index=1, run_id=run_id),
+    ]
+
+
+def _row_zero_failed_inside_a_conditional() -> list[WorkflowRunBlock]:
+    condition = _loop_row("wrb_cond", "pick_branch", "completed", 1, index=0).model_copy(
+        update={"block_type": BlockType.CONDITIONAL}
+    )
+    branch = _loop_row("wrb_0", "fill_dates", "failed", 2, index=0, failure_reason=_ROW_ZERO_ERROR).model_copy(
+        update={"parent_workflow_run_block_id": "wrb_cond"}
+    )
+    return [
+        _loop_row("wrb_loop", "each_row", "running", 0),
+        condition,
+        branch,
+        _loop_row("wrb_1", "pick_branch", "running", 3, index=1),
+    ]
+
+
+def _install_moving_block_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    ticks = 0
+
+    async def _read_progress(_ctx: EmberContext, _run_id: str) -> tuple[Any, datetime]:
+        nonlocal ticks
+        ticks += 1
+        return _fake_run(status="running"), _LOOP_T0 + timedelta(seconds=ticks)
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_to_worker", [True, False], ids=["worker_run", "inline_run"])
+@pytest.mark.parametrize(
+    "rows",
+    [_row_zero_failed_then_row_one_started(), _row_zero_failed_inside_a_conditional()],
+    ids=["loop_child_failed", "conditional_branch_failed"],
+)
+async def test_a_loop_iteration_that_ended_on_a_failed_block_stops_the_test(
+    monkeypatch: pytest.MonkeyPatch, dispatch_to_worker: bool, rows: list[WorkflowRunBlock]
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_LOOP_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=dispatch_to_worker,
+        terminal_blocks=rows,
+    )
+    _install_moving_block_progress(monkeypatch)
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    with capture_logs() as logs:
+        result = await _run_blocks_and_collect_debug({"block_labels": ["each_row"], "parameters": {}}, ctx)
+
+    used_cancel, unused_cancel = (
+        (harness["cooperative_cancel"], harness["cancel_run_task"])
+        if dispatch_to_worker
+        else (harness["cancel_run_task"], harness["cooperative_cancel"])
+    )
+    used_cancel.assert_awaited_once()
+    unused_cancel.assert_not_awaited()
+    assert result["ok"] is False, result
+    assert result["data"]["control_signal"]["kind"] == "watchdog_loop_iteration_failed"
+    error = result["error"]
+    assert _ROW_ZERO_ERROR in error
+    assert "118 of 120 iterations did not run" in error
+    assert "run_every_loop_iteration=true" in error
+    assert "uncertain" not in error.lower()
+    assert "timed out" not in error.lower()
+    summary = result["data"]["user_facing_summary"]
+    assert summary == "Stopped the test after row 1 failed; 118 of 120 rows did not run."
+    assert contains_internal_machinery_leak(summary) is False
+    assert_clean_user_facing_text(summary)
+    stops = [log for log in logs if log["event"] == "ember_test_stopped_at_failed_iteration"]
+    assert [
+        (s["loop_label"], s["failed_iteration_index"], s["iterations_started"], s["loop_length"]) for s in stops
+    ] == [("each_row", 0, 2, 120)]
+
+
+@pytest.mark.asyncio
+async def test_a_failure_recorded_before_the_first_poll_still_stops_the_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The harness's progress reader returns one fixed timestamp, so block progress never moves after the first read.
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_LOOP_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+        terminal_blocks=_row_zero_failed_then_row_one_started(),
+    )
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["each_row"], "parameters": {}}, ctx)
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_loop_iteration_failed", result
+    harness["cooperative_cancel"].assert_awaited_once_with("wr_paused")
+
+
+_RUNTIME_VALUE = "runtime-obtained-4412"
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_test_scrubs_typed_input_from_the_failed_blocks_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    echoed_reason = (
+        "Locator.fill: Timeout 10000ms exceeded.\nCall log:\n"
+        f'  -   fill("{_RUNTIME_VALUE}")\n'
+        "  - waiting for element to be visible, enabled and editable\n"
+        f'  - <input id="pw" value="{_RUNTIME_VALUE}">'
+    )
+    rows = _row_zero_failed_then_row_one_started()
+    rows[1] = rows[1].model_copy(update={"failure_reason": echoed_reason})
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_LOOP_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+        terminal_blocks=rows,
+    )
+    _install_moving_block_progress(monkeypatch)
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["each_row"], "parameters": {}}, ctx)
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_loop_iteration_failed"
+    assert "Locator.fill: Timeout 10000ms exceeded." in result["error"]
+    assert _RUNTIME_VALUE not in str(result)
+
+
+def _failed_row_then_success_in_the_same_iteration() -> list[WorkflowRunBlock]:
+    return [
+        _loop_row("wrb_loop", "each_row", "running", 0),
+        _loop_row("wrb_0", "fill_dates", "failed", 1, index=0, failure_reason=_ROW_ZERO_ERROR),
+        _loop_row("wrb_0b", "save_row", "completed", 2, index=0),
+        _loop_row("wrb_1", "fill_dates", "running", 3, index=1),
+    ]
+
+
+def _failed_final_iteration() -> list[WorkflowRunBlock]:
+    return [
+        _loop_row("wrb_loop", "each_row", "running", 0),
+        _loop_row("wrb_0", "save_row", "completed", 1, index=0),
+        _loop_row("wrb_1", "fill_dates", "failed", 2, index=1, failure_reason=_ROW_ZERO_ERROR),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows_for_run", "run_every_loop_iteration"),
+    [
+        (lambda _run_id: _failed_row_then_success_in_the_same_iteration(), False),
+        (lambda _run_id: _failed_final_iteration(), False),
+        (lambda run_id: _row_zero_failed_then_row_one_started(run_id) if run_id == "wr_child" else [], False),
+        (_row_zero_failed_then_row_one_started, True),
+    ],
+    ids=["later_block_succeeded", "final_iteration_failed", "failure_in_child_run", "run_every_loop_iteration"],
+)
+async def test_the_test_keeps_waiting_when_no_iteration_failed_past_its_end(
+    monkeypatch: pytest.MonkeyPatch,
+    rows_for_run: Callable[[str], list[WorkflowRunBlock]],
+    run_every_loop_iteration: bool,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_LOOP_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+    )
+
+    async def _rows(*, workflow_run_id: str, **_kwargs: object) -> list[WorkflowRunBlock]:
+        return rows_for_run(workflow_run_id)
+
+    forge_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(side_effect=_rows)
+    _install_moving_block_progress(monkeypatch)
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": ["each_row"], "parameters": {}, "run_every_loop_iteration": run_every_loop_iteration}, ctx
+    )
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_ceiling", result
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_row_written_before_the_failed_iteration_cancel_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_LOOP_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+        terminal_blocks=_row_zero_failed_then_row_one_started(),
+    )
+    forge_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_run(status="completed"))
+    _install_moving_block_progress(monkeypatch)
+    _install_advancing_clock(monkeypatch)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["each_row"], "parameters": {}}, ctx)
+
+    harness["cooperative_cancel"].assert_not_awaited()
+    assert result["data"]["overall_status"] == "completed", result
+    assert "control_signal" not in result["data"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "ok"), [("completed", True), ("failed", False)])
+async def test_immediate_terminal_worker_result_is_returned_as_recorded(
+    monkeypatch: pytest.MonkeyPatch, status: str, ok: bool
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status=status,
+        dispatch_to_worker=True,
+    )
+    clock = _install_advancing_clock(monkeypatch, step_seconds=1.0)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert clock() < RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10
+    harness["cooperative_cancel"].assert_not_awaited()
+    assert result["ok"] is ok, result
+    assert result["data"]["overall_status"] == status
+    assert "control_signal" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_externally_cancelled_worker_run_still_cooperatively_cancels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+    )
+    polling = asyncio.Event()
+    reads = 0
+
+    async def _read_progress(_ctx: EmberContext, _run_id: str) -> tuple[Any, datetime]:
+        nonlocal reads
+        reads += 1
+        marker = datetime(2026, 4, 21, 12, 0, reads, tzinfo=UTC)
+        if reads > 1:
+            polling.set()
+            await asyncio.Event().wait()
+        return _fake_run(status="running", modified_at=marker), marker
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    run = asyncio.create_task(
+        _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    )
+    await asyncio.wait_for(polling.wait(), timeout=5)
+
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    harness["cooperative_cancel"].assert_awaited_once_with("wr_paused")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_to_worker", [True, False], ids=["worker_run", "inline_run"])
+async def test_the_turn_deadline_ends_the_wait_and_leaves_the_run_with_its_executor(
+    monkeypatch: pytest.MonkeyPatch, dispatch_to_worker: bool
+) -> None:
+    """ADR-0025: the turn cap never cancels a run. The turn's hard deadline cancels this call's wait;
+    the run keeps executing, and the turn still knows the cut step started it."""
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=dispatch_to_worker,
+    )
+    polling = asyncio.Event()
+
+    async def _read_progress(_ctx: EmberContext, _run_id: str) -> tuple[Any, datetime]:
+        polling.set()
+        return _fake_run(status="running"), datetime(2026, 4, 21, 12, 0, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+    monkeypatch.setattr(run_execution, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 3600)
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    before = set(run_execution._DETACHED_CLEANUP_TASKS)
+    tool_calls: list[asyncio.Task[Any]] = []
+
+    async def _turn_stream() -> None:
+        # Shaped like _run_streamed_with_deadline over the SDK: the tool runs in its own task, the
+        # stream's immediate cancel does not await it, and the deadline is cleared on the way out.
+        try:
+            async with asyncio.timeout(None) as deadline:
+                ctx.model_stream_deadline = deadline
+                tool_calls.append(
+                    asyncio.create_task(
+                        _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+                    )
+                )
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    tool_calls[0].cancel()
+                    raise
+        finally:
+            ctx.model_stream_deadline = None
+
+    turn = asyncio.create_task(_turn_stream())
+    await asyncio.wait_for(polling.wait(), timeout=5)
+    assert ctx.model_stream_deadline is not None
+    ctx.model_stream_deadline.reschedule(asyncio.get_running_loop().time())
+    with pytest.raises(TimeoutError):
+        await turn
+    with pytest.raises(asyncio.CancelledError):
+        await tool_calls[0]
+
+    harness["cooperative_cancel"].assert_not_awaited()
+    harness["cancel_run_task"].assert_not_awaited()
+    harness["clear"].assert_not_awaited()
+    assert harness["executor_cancelled"] is False
+    assert ctx.open_step_run_ids == ["wr_paused"]
+
+    adopted = adopted_detached_tasks(before)
+    for task in adopted:
+        task.cancel()
+    await asyncio.gather(*adopted, return_exceptions=True)
+
+
+def test_paused_result_records_last_test_ok_as_none() -> None:
+    """``None`` is the only honest value: at ``False`` the finalizer rewrites the reply into a
+    failed test, and ``True`` would let an unapproved draft count as verified."""
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+
+    run_execution._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {"workflow_run_id": "wr_paused", "control_signal": {"kind": "watchdog_paused"}},
+        },
+    )
+
+    assert ctx.last_test_ok is None
+
+
+def test_non_paused_failure_still_records_last_test_ok_as_false() -> None:
+    ctx = make_ember_ctx(browser_session_id="pbs_chat")
+
+    run_execution._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {"workflow_run_id": "wr_ceiling", "control_signal": {"kind": "watchdog_ceiling"}},
+        },
+    )
+
+    assert ctx.last_test_ok is False
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation guard message: regression guard on "timed out" phrasing.
+# The guard itself is tested in test_ember_cancel_helpers.py; this test is
+# specifically about the LLM-facing STRING, which previously said "timed out"
+# and read as a retry-invite when combined with LLM priors.
+# ---------------------------------------------------------------------------

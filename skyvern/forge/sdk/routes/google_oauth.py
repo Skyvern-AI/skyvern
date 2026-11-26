@@ -205,7 +205,9 @@ async def google_oauth_authorize(
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
-    return GoogleOAuthAuthorizeResponse(authorize_url=start.authorize_url, state=start.state)
+    return GoogleOAuthAuthorizeResponse(
+        authorize_url=start.authorize_url, state=start.state, credential_id=start.credential_id
+    )
 
 
 @google_oauth_router.post("/oauth/callback")
@@ -280,8 +282,9 @@ async def google_oauth_callback(
         google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE in context.scopes_requested
         and google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE not in context.scopes_granted
     )
+    requested_drive_file = google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE in context.scopes_requested
     is_reconnect = context.state in {google_oauth_service.STATE_ACTIVE, google_oauth_service.STATE_ERROR}
-    if requested_gmail_send or is_reconnect:
+    if requested_gmail_send or requested_drive_file or is_reconnect:
         try:
             identity = await google_oauth_service.verify_gmail_send_consent(
                 context,
@@ -297,7 +300,15 @@ async def google_oauth_callback(
                 credential_id=context.credential_id,
                 rejection=exc.rejection.value,
             )
-            raise HTTPException(status_code=409, detail=str(exc))
+            detail = str(exc)
+            if exc.missing_scopes and exc.missing_scopes <= google_oauth_service.GOOGLE_DRIVE_CONSENT_SCOPES:
+                detail = (
+                    "Not every requested Google Drive permission was granted. The previous connection is unchanged."
+                    if is_reconnect
+                    else "Google didn't grant full Google Drive access, so the account wasn't connected. "
+                    "Connect again and allow Google Drive access."
+                )
+            raise HTTPException(status_code=409, detail=detail)
     if identity is None:
         identity = await google_oauth_service.verify_google_identity(
             token_data.get("id_token"),

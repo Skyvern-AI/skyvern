@@ -1,0 +1,1865 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from dataclasses import replace
+from functools import partial
+from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlsplit, urlunsplit
+
+import structlog
+
+from skyvern.cli.core.session_manager import get_page
+from skyvern.forge import app
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_login_sites, same_release_scope
+from skyvern.forge.sdk.ember.agent_context import (
+    CredentialOriginDeclineStatus,
+    CredentialOriginRecovery,
+    ScoutedSelectorCandidate,
+)
+from skyvern.forge.sdk.ember.blocker_signal import (
+    CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE,
+    CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE,
+    EmberToolBlockerSignal,
+    clear_tool_blocker_signals_for_reason_codes,
+)
+from skyvern.forge.sdk.ember.config import EmberConfig
+from skyvern.forge.sdk.ember.context import EmberContext, advertises
+from skyvern.forge.sdk.ember.credential_fill_fields import CREDENTIAL_FILL_FIELD_NAMES, CREDENTIAL_FILL_FIELDS
+from skyvern.forge.sdk.ember.credential_generation import (
+    REGISTRATION_PASSWORD_MAX_LENGTH,
+    REGISTRATION_PASSWORD_MIN_LENGTH,
+)
+from skyvern.forge.sdk.ember.credential_pause import (
+    CredentialPauseResolution,
+    SignedInProfile,
+    credential_pause_transport_ready,
+    defang_card_text,
+    login_saved_for_site,
+    raw_secret_card_urls,
+    request_credential_pause,
+    signed_in_facts,
+    site_answer_unused_text,
+)
+from skyvern.forge.sdk.ember.credential_resolution import (
+    is_resolved_page_url,
+    load_credentials,
+    url_parts,
+)
+from skyvern.forge.sdk.ember.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.ember.page_identity import safe_page_origin
+from skyvern.forge.sdk.ember.request_policy import (
+    CREDENTIAL_BINDING_FACTS,
+    DemonstrationNavigationSiteURLSource,
+    QuestionResponseSiteURLSource,
+    RequestPolicy,
+    SiteURLSource,
+    SteerMessageSiteURLSource,
+    UserMessageSiteURLSource,
+    admit_credential_for_live_page,
+    admit_vault_login_for_live_page,
+    credential_binding,
+    loggable_origin,
+    still_on_admitted_site,
+    user_provided_site_url_match,
+)
+from skyvern.forge.sdk.ember.runtime import (
+    AgentContext,
+    browser_evidence_commit_lock,
+    browser_session_turn,
+    effective_browser_session_id,
+    ensure_browser_session,
+    mcp_browser_context,
+)
+from skyvern.forge.sdk.ember.secret_scrub import register_secret_scrub_value, scrub_secrets_from_text
+from skyvern.forge.sdk.ember.vault_logins import VAULT_LOGIN_REF_PREFIX, load_vault_logins
+from skyvern.forge.sdk.ember.workflow_credential_utils import (
+    workflow_credential_origins,
+)
+from skyvern.forge.sdk.schemas.credentials import (
+    Credential,
+    CredentialItem,
+    CredentialType,
+    CredentialVaultType,
+    PasswordCredential,
+    TotpType,
+)
+from skyvern.forge.sdk.schemas.ember import CredentialRegistration, EmberCredentialRegistration
+from skyvern.forge.sdk.services.audit_events import AuditEvent
+from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
+from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
+from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
+from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
+
+from ._shared import _emit_tool_blocker_signal
+from .banned_blocks import _ember_authoring_capability
+from .credentials import _missing_credential_reference_tool_error, import_vault_login
+from .guardrails import _authority_tool_error
+from .mcp_hooks import (
+    _TYPE_READBACK_SETTLE_SECONDS,
+    ScoutReadbackOutcome,
+    _scout_readback_outcome,
+    _scout_type_landing_failure,
+)
+from .scouting import (
+    _attach_scout_observation_step,
+    _attach_scout_page_summary,
+    _capture_enclosing_form_submits,
+    _capture_post_interaction_screenshot,
+    _capture_scout_source_url,
+    _clear_pending_browser_interaction_observation,
+    _consume_scout_source_url,
+    _live_working_page_url,
+    _mark_pending_browser_interaction_observation,
+    _non_negative_count,
+    _packet_role_name,
+    _parse_selector_candidates,
+    _probe_target_facts,
+    _record_scouted_interaction,
+    _register_scout_interaction_observation,
+    _selector_live_match_count,
+)
+
+if TYPE_CHECKING:
+    from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
+
+LOG = structlog.get_logger()
+
+_CREDENTIAL_FILL_FIELDS = CREDENTIAL_FILL_FIELDS
+_CREDENTIAL_FILL_TIMEOUT_MS = 15000
+_CREDENTIAL_FILL_READBACK_TIMEOUT_SECONDS = 3.0
+_CREDENTIAL_SUBMIT_TIMEOUT_MS = 5000
+
+
+@dataclass(frozen=True)
+class _CredentialFillOriginGrant:
+    intended_url: str
+    # Only a vault entry or a pasted site URL names a whole site; any other proving page vouches for its origin.
+    whole_site: bool = False
+    # The login's saved sites; the saved run releases on each one's whole site, so the fill may too.
+    saved_site_urls: tuple[str, ...] = ()
+    # The vault item's own sites, when it scopes them; the saved run holds the secret to them too.
+    vault_sites: tuple[LoginSite, ...] | None = None
+
+
+async def _normalize_totp_config_for_organization(totp_secret: str, organization_id: str) -> str:
+    enterprise_totp_secret = await app.AGENT_FUNCTION.parse_enterprise_totp_secret(
+        totp_secret,
+        organization_id=organization_id,
+    )
+    if enterprise_totp_secret is not None:
+        return enterprise_totp_secret
+    return normalize_totp_config(totp_secret)
+
+
+def _runtime_otp_steering_error(credential_id: str) -> str:
+    return (
+        f"Credential `{credential_id}` receives one-time codes by email/SMS, so the code cannot be retrieved "
+        "during scouting without a workflow run/task context to anchor polling. "
+        "Persist the OTP step in a code block as `await <credential_parameter>.otp()` after the action that "
+        "triggers delivery; the runtime will poll for the fresh code during the workflow run without exposing it."
+    )
+
+
+def _scrub_secret_from_text(text: str, secret_value: str) -> str:
+    if not secret_value:
+        return text
+    return text.replace(secret_value, REDACTED_SECRET_PLACEHOLDER)
+
+
+def _credential_fill_prerequisite_error(ember_ctx: AgentContext, credential_id: str) -> str | None:
+    if not _ember_authoring_capability(ember_ctx).code_blocks:
+        return (
+            "fill_credential_field is only available when this turn may author code blocks. "
+            "Author a `login` block bound to the credential parameter instead."
+        )
+    policy = getattr(ember_ctx, "request_policy", None)
+    if not isinstance(policy, RequestPolicy):
+        return "Saved-credential scouting is unavailable because this turn has no safe credential provenance."
+    return None
+
+
+def _within_grant(current_url: str | None, grant: _CredentialFillOriginGrant) -> bool:
+    if grant.vault_sites is not None:
+        # The run releases on the vault item's own sites when it scopes them (login_release_sites).
+        return same_release_scope(current_url, grant.intended_url) and any(
+            site.admits(current_url) for site in grant.vault_sites
+        )
+    if still_on_admitted_site(current_url, grant.intended_url):
+        return True
+    return same_release_scope(current_url, grant.intended_url) and (
+        grant.whole_site or any(same_release_scope(current_url, url) for url in grant.saved_site_urls)
+    )
+
+
+class _CredentialFillOriginMismatchError(Exception):
+    def __init__(self, target_url: str | None) -> None:
+        super().__init__()
+        self.target_url = target_url
+
+
+def _no_frame_origin_result() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "no_frame_origin",
+        "error": (
+            "Nothing was filled: the origin of the document holding this field could not be determined "
+            "(for example about:blank), so it cannot be matched to a site this credential may be filled on."
+        ),
+    }
+
+
+def _credential_origin_declined_text(origin: str) -> str:
+    return (
+        f"No login authorized for {origin} was connected, and the saved login will not be released on that site. "
+        f"The sign-in on {origin} needs its own saved login."
+    )
+
+
+def _credential_origin_recovery_error(recovery: CredentialOriginRecovery) -> str:
+    if recovery.state == "declined":
+        return _credential_origin_declined_text(recovery.origin)
+    return (
+        f"The sign-in continues on {recovery.origin}, which the selected credential is not authorized for. "
+        f"Connect a login for {recovery.origin} through request_credential."
+    )
+
+
+def _start_credential_origin_recovery(ember_ctx: AgentContext, origin: str, credential_id: str) -> dict[str, Any]:
+    ember_ctx.credential_origin_refusals.add((origin, credential_id))
+    current = ember_ctx.credential_origin_recovery
+    if current is not None and (current.state != "pending" or current.origin != origin):
+        return {"ok": False, "error": _credential_origin_recovery_error(current)}
+    ember_ctx.credential_origin_recovery = current or CredentialOriginRecovery(origin, "pending", credential_id)
+    steering = _emit_tool_blocker_signal(
+        ember_ctx,
+        EmberToolBlockerSignal(
+            blocker_kind="authority_denied",
+            blocked_tool="fill_credential_field",
+            internal_reason_code=CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE,
+            agent_steering_text=(
+                f"Nothing was filled: this credential is not authorized for {origin}, where this sign-in field is. "
+                f"Call request_credential with the sign-in page URL on {origin} so the user can connect a login "
+                "for that site before testing the workflow."
+            ),
+            user_facing_reason=f"The sign-in continues on {origin}, which this saved login is not authorized for.",
+            recovery_hint="ask_user_clarifying",
+            preserves_workflow_draft=True,
+            renders_final_reply=False,
+            extra={"observed_origin": origin},
+        ),
+    )
+    return {
+        "ok": False,
+        "error": steering,
+        "recovery": {"observed_origin": origin, "next_action": "request_credential"},
+    }
+
+
+def _decline_credential_origin_recovery(
+    ember_ctx: AgentContext, recovery: CredentialOriginRecovery, status: CredentialOriginDeclineStatus
+) -> dict[str, Any]:
+    origin = recovery.origin
+    ember_ctx.credential_origin_recovery = replace(recovery, state="declined")
+    clear_tool_blocker_signals_for_reason_codes(ember_ctx, frozenset({CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE}))
+    declined = EmberToolBlockerSignal(
+        blocker_kind="authority_denied",
+        blocked_tool="request_credential",
+        internal_reason_code=CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE,
+        agent_steering_text=_credential_origin_declined_text(origin),
+        user_facing_reason=(
+            f"The sign-in continues on {origin}, and no saved login authorized for that site was connected. "
+            f"Add a login for {origin} and ask me again."
+        ),
+        recovery_hint="report_blocker_to_user",
+        preserves_workflow_draft=True,
+        renders_final_reply=False,
+        extra={"observed_origin": origin},
+    )
+    _emit_tool_blocker_signal(ember_ctx, declined)
+    return {"ok": True, "status": status, "next": _credential_origin_declined_text(origin)}
+
+
+def _refused_login_recovery_card_text(origin: str) -> str:
+    return f"The login tried on {origin} is saved for a different site. Pick the login to use on {origin}."
+
+
+async def _credential_evidence_admits_origin(
+    ember_ctx: AgentContext, recovery: CredentialOriginRecovery, credential: Credential
+) -> bool:
+    """Whether a site the credential is saved for and every site its vault entry names cover the recovery origin,
+    and no standing fill refusal on that site names it."""
+    refused_on_site = {recovery.refused_credential_id} | {
+        refused_id
+        for origin, refused_id in ember_ctx.credential_origin_refusals
+        if same_release_scope(origin, recovery.origin)
+    }
+    if credential.credential_id in refused_on_site:
+        return False
+    try:
+        vault_sites = await _read_vault_named_sites(ember_ctx, credential.credential_id)
+    except PermissionError:
+        return False
+    if vault_sites is None:
+        return False
+    saved = saved_site_urls(credential.tested_url, credential.extra_site_urls)
+    return bool(saved or vault_sites) and (
+        (not saved or login_saved_for_site(credential, recovery.origin))
+        and all(site.admits(recovery.origin) for site in vault_sites)
+    )
+
+
+def _credential_submit_origin_mismatch_notice() -> str:
+    return (
+        "The field was filled, but the browser left this credential's login origin before the submit "
+        "control could be clicked, so it was not clicked. The form may already have been submitted — "
+        "inspect the current page before filling this field again."
+    )
+
+
+def _credential_submit_target_gone_notice() -> str:
+    return (
+        "The field was filled, but the submit control was no longer on the page, so it was not clicked. "
+        "A form that submits itself once the code is complete may already have been submitted, though a "
+        "re-render or an error state can also remove the control — inspect the current page before "
+        "filling this field again."
+    )
+
+
+def _credential_submit_already_committed_notice() -> str:
+    return (
+        "The field was filled and the page moved on before the submit control could be clicked, so it "
+        "was not clicked: the form submitted itself. Inspect the current page to see where the sign-in "
+        "got to rather than filling this field again."
+    )
+
+
+def _credential_submit_unconfirmed_readback_notice() -> str:
+    # Deliberately does not tell the model to read the field: a field that differs usually holds a
+    # mutation of the secret, which the scrubber cannot match and so would not redact.
+    return (
+        "The code field does not hold what was typed, so the submit control was not clicked: submitting "
+        "a code the field does not hold voids it. Fill again with a selector for the intended field, or "
+        "click the submit control yourself if this page reformats the code on the way in."
+    )
+
+
+def _credential_submit_ambiguous_notice(selector: str, match_count: int) -> str:
+    return (
+        f"The field was filled, but the submit selector {selector} matches {match_count} controls, so "
+        "nothing was clicked rather than guessing between them — on a one-time-code form the wrong one "
+        "can resend the code and void the one just typed. Fill again with a selector that matches only "
+        "the submit control."
+    )
+
+
+def _credential_submit_selector_never_matched_notice(selector: str) -> str:
+    return (
+        f"The field was filled, but the submit selector {selector} matched nothing on this page either "
+        "before or after the fill, so nothing was clicked and the form was not submitted. Inspect the "
+        "page for the real submit control; a one-time code is still waiting to be submitted."
+    )
+
+
+def _credential_submit_page_unreadable_notice() -> str:
+    return (
+        "The field was filled, but the page could not be read to confirm the browser was still on this "
+        "credential's login origin, so the submit control was not clicked. Inspect the current page; a "
+        "one-time code is still waiting to be submitted."
+    )
+
+
+def _credential_fill_release_guard(grant: _CredentialFillOriginGrant) -> Callable[[str | None], None]:
+    """Bind the fill grant to the resolved element's document at the release seam."""
+
+    def guard(target_url: str | None) -> None:
+        if not _within_grant(target_url, grant):
+            raise _CredentialFillOriginMismatchError(target_url)
+
+    return guard
+
+
+def _credential_fill_authority_error(ember_ctx: AgentContext, credential_id: str) -> str | None:
+    policy = ember_ctx.request_policy
+    resolved_ids = {
+        credential.credential_id
+        for credential in (policy.resolved_credentials if isinstance(policy, RequestPolicy) else [])
+    }
+    if credential_id not in resolved_ids:
+        return (
+            f"The credential `{credential_id}` is not in the credentials resolved for this request, so it "
+            "cannot be filled into the live browser yet. Use `list_credentials(exact_reference=...)` "
+            "for a credential the user already chose or the saved workflow binds. If the login is still "
+            "unresolved, call `request_credential` with the sign-in page URL so the user can pick or add "
+            "a credential in chat, then continue."
+        )
+    return None
+
+
+async def _vault_named_sites(ember_ctx: AgentContext, credential_id: str) -> list[LoginSite]:
+    return await _read_vault_named_sites(ember_ctx, credential_id) or []
+
+
+async def _read_vault_named_sites(ember_ctx: AgentContext, credential_id: str) -> list[LoginSite] | None:
+    """Sites the credential's own vault entry names, or None when the read failed."""
+    await app.AGENT_FUNCTION.enforce_credential_use(
+        ember_ctx.organization_id,
+        credential_id,
+        principal=get_request_principal(),
+    )
+    scoped = ember_ctx.scoped_login_sites_by_credential_id.get(credential_id)
+    if scoped is not None:
+        return scoped
+    cached = ember_ctx.vault_login_uris_by_credential_id.get(credential_id)
+    if cached is not None:
+        return [LoginSite(uri, whole_site=True) for uri in cached]
+    item: CredentialItem | None = None
+    try:
+        db_credential = await app.DATABASE.credentials.get_credential(
+            credential_id, organization_id=ember_ctx.organization_id
+        )
+        if db_credential is not None:
+            service = app.CREDENTIAL_VAULT_SERVICES.get(db_credential.vault_type or CredentialVaultType.BITWARDEN)
+            if service is not None:
+                item = await service.get_credential_item(db_credential)
+    except Exception:
+        # Not cached: a vault read that failed once says nothing about where the credential belongs,
+        # and caching the empty answer would refuse every later fill this turn for a transient fault.
+        LOG.info("ember could not read the vault entry's sites", credential_id=credential_id, exc_info=True)
+        return None
+    if item is None:
+        ember_ctx.vault_login_uris_by_credential_id[credential_id] = []
+        return []
+    if item.login_sites is not None:
+        ember_ctx.scoped_login_sites_by_credential_id[credential_id] = item.login_sites
+    else:
+        ember_ctx.vault_login_uris_by_credential_id[credential_id] = list(item.login_uris)
+    return item.named_login_sites()
+
+
+def _missing_credential_origin_error(credential_id: str, page_url: str | None, *, user_named: bool = False) -> str:
+    if page_url:
+        origin = loggable_origin(page_url)
+        if user_named:
+            return (
+                f"Credential `{credential_id}` has no established login origin for {origin}. "
+                f"The user already named this login; they have not yet confirmed it for {origin}. "
+                f"Call `request_credential` with the sign-in page URL on {origin} and without `credential_id`; "
+                "the card offers this login for the user to confirm for that site. Unless that call says the "
+                "card is unavailable, do not ask the user to select or add a login again."
+            )
+        return (
+            f"Credential `{credential_id}` has no established login origin for {origin}. "
+            f"Call `request_credential` with the sign-in page URL on {origin} so the user can "
+            "select or add its login in chat, then continue."
+        )
+    return (
+        f"Credential `{credential_id}` cannot be filled: no live page is open. "
+        "Navigate to the sign-in page first, then retry."
+    )
+
+
+def _vault_login_off_site_error(credential_id: str, page_url: str, sites: Iterable[LoginSite]) -> str:
+    return (
+        f"`{credential_id}` is not filled on {loggable_origin(page_url)}: as saved in its vault, it fills only on "
+        f"{describe_login_sites(sites)}."
+    )
+
+
+def _log_fill_grant(
+    route: str,
+    url: str,
+    credential_id: str,
+    source: SiteURLSource | None = None,
+) -> None:
+    source_fields: dict[str, str | int] = {}
+    if isinstance(source, UserMessageSiteURLSource):
+        source_fields = {"source_kind": source.kind, "source_user_message": source.message_index}
+    elif isinstance(source, QuestionResponseSiteURLSource):
+        source_fields = {"source_kind": source.kind, "source_interaction_id": source.interaction_id}
+    elif isinstance(source, SteerMessageSiteURLSource):
+        source_fields = {"source_kind": source.kind, "source_steer_id": source.steer_id}
+    elif isinstance(source, DemonstrationNavigationSiteURLSource):
+        source_fields = {"source_kind": source.kind}
+    LOG.info(
+        "ember credential fill grant",
+        route=route,
+        page_origin=loggable_origin(url),
+        credential_id=credential_id,
+        **source_fields,
+    )
+
+
+_CREDENTIAL_CARD_FALLBACK = (
+    "Ask the user in prose to add the login on the Credentials page and reply with its exact saved name."
+)
+
+_REGISTRATION_OUTCOME_NOTES: dict[str, dict[str, str]] = {
+    "rejected": {
+        "registration_outcome": "rejected",
+        "registration_detail": (
+            "Generate and save saved nothing: validation or the vault refused it, or the pre-check timed out."
+        ),
+    },
+    "unknown": {
+        "registration_outcome": "unknown",
+        "registration_detail": "Generate and save was not confirmed, so a credential under this name may exist.",
+    },
+}
+
+
+def _registration_ask_error(
+    registration: CredentialRegistration, policy: RequestPolicy, credential_id: str | None
+) -> dict[str, Any] | None:
+    if credential_id:
+        return {"ok": False, "error": "Pass either `registration` or `credential_id`, not both."}
+    if policy.raw_secret_detected:
+        return {"ok": False, "error": "Generating a credential is unavailable on a turn that contains a secret."}
+    if not registration.username.strip() or not registration.credential_name.strip():
+        return {"ok": False, "error": "`registration` needs a non-empty `username` and `credential_name`."}
+    if not REGISTRATION_PASSWORD_MIN_LENGTH <= registration.password_length <= REGISTRATION_PASSWORD_MAX_LENGTH:
+        return {
+            "ok": True,
+            "status": "unsupported_constraints",
+            "detail": (
+                f"Generated passwords are {REGISTRATION_PASSWORD_MIN_LENGTH} to "
+                f"{REGISTRATION_PASSWORD_MAX_LENGTH} characters, so no card was shown."
+            ),
+        }
+    return None
+
+
+def _missing_totp_card_fallback(credential_name: str) -> str:
+    return (
+        f"Ask the user in prose to edit the saved credential {defang_card_text(credential_name)} on the "
+        "Credentials page and add its authenticator (2FA), then say when it is done. Never ask for the "
+        "authenticator secret or a code in chat."
+    )
+
+
+def _password_totp_method(credential: PasswordCredential) -> Literal["authenticator", "out_of_band", "none"]:
+    if credential.totp:
+        return "authenticator"
+    # A saved OTP identifier means the code is delivered out-of-band; only runtime polling has the
+    # run/task context needed to resolve it.
+    if credential.totp_identifier or credential.totp_type in {TotpType.EMAIL, TotpType.TEXT}:
+        return "out_of_band"
+    return "none"
+
+
+_HAS_CODE_METHOD_DETAIL = "This credential already has a one-time-code method, so no update card was shown."
+
+
+def _rejected_credential_card_fallback(credential_name: str) -> str:
+    return (
+        f"Ask the user in prose to update the saved credential {defang_card_text(credential_name)} on the "
+        "Credentials page, then say when it is done. Never ask for a raw secret value (for example, a password) "
+        "in chat."
+    )
+
+
+async def _update_ask_target(
+    ember_ctx: EmberContext, credential_id: str, *, site_rejected: bool = False
+) -> tuple[str | None, dict[str, Any] | None]:
+    """The credential's saved name when an update card should ask about it, else the tool result.
+
+    A missing-authenticator ask needs a credential with no one-time-code method at all. A site-rejected
+    one asks whatever methods it has, since the saved values themselves were turned away."""
+    policy = ember_ctx.request_policy
+    # A saved workflow's own binding, read from its row at turn start, is authority to edit that record
+    # even when the chat never named it; the card grants no origin, so no fill grant is needed.
+    bound_by_saved_workflow = (
+        isinstance(policy, RequestPolicy) and credential_id in policy.persisted_workflow_credential_ids
+    )
+    authority_error = None if bound_by_saved_workflow else _credential_fill_authority_error(ember_ctx, credential_id)
+    if authority_error:
+        return None, {"ok": False, "error": authority_error}
+    credential_item, load_error = await _load_vault_credential_item(ember_ctx, credential_id, for_update_card=True)
+    if credential_item is None:
+        return None, {"ok": False, "error": load_error}
+    credential = credential_item.credential
+    if not isinstance(credential, PasswordCredential):
+        return None, {"ok": False, "error": f"Credential `{credential_id}` is not a username/password credential."}
+    if site_rejected:
+        return credential_item.name, None
+    method = _password_totp_method(credential)
+    if method == "authenticator":
+        result: dict[str, Any] = {
+            "ok": True,
+            "status": "has_code_method",
+            "method": "authenticator",
+            "detail": _HAS_CODE_METHOD_DETAIL,
+        }
+        if advertises(ember_ctx, CREDENTIAL_FILL_TOOL_NAME):
+            result["next"] = (
+                f"Fill the code with `{CREDENTIAL_FILL_TOOL_NAME}` field=totp for `{credential_id}`, passing the "
+                "same `target` that reached the verification step."
+            )
+        return None, result
+    if method == "out_of_band":
+        return None, {
+            "ok": True,
+            "status": "has_code_method",
+            "method": "email_or_text",
+            "detail": _HAS_CODE_METHOD_DETAIL,
+            "next": _runtime_otp_steering_error(credential_id),
+        }
+    return credential_item.name, None
+
+
+def _log_credential_card_unavailable(ember_ctx: EmberContext, config: EmberConfig | None) -> None:
+    LOG.info(
+        "ember_credential_card_unavailable",
+        flag_enabled=config is not None and config.credential_pause_enabled,
+        client_supports=ember_ctx.client_supports_credential_pause,
+        shared_cache=getattr(getattr(app, "CACHE", None), "is_shared", False),
+    )
+
+
+async def _request_credential(
+    login_page_url: str,
+    reason: str,
+    ember_ctx: EmberContext,
+    credential_id: str | None = None,
+    rejected_by_site: bool = False,
+    anchor_tool_call_id: str | None = None,
+    registration: CredentialRegistration | None = None,
+) -> dict[str, Any]:
+    policy = ember_ctx.request_policy
+    if not isinstance(policy, RequestPolicy) or (policy.raw_secret_detected and not policy.raw_secret_redacted_draft):
+        return {"ok": False, "error": "Credential selection is unavailable on a raw-secret or ungrounded turn."}
+    ask_origin = canonicalize_origin(login_page_url)
+    if not is_resolved_page_url(login_page_url) or ask_origin is None:
+        return {"ok": False, "error": "Provide the absolute HTTP(S) sign-in page URL for the credential card."}
+    card_registration: EmberCredentialRegistration | None = None
+    if registration is not None:
+        registration_error = _registration_ask_error(registration, policy, credential_id)
+        if registration_error is not None:
+            return registration_error
+        if ember_ctx.credential_generation_spent:
+            return {
+                "ok": True,
+                "status": "already_generated",
+                "detail": "Generate and save already ran on this turn, so no second generate card was shown.",
+            }
+        if not ember_ctx.client_supports_credential_generation:
+            return {
+                "ok": True,
+                "status": "unavailable",
+                "detail": "Generating a credential from the card is not available on this turn.",
+            }
+        card_registration = EmberCredentialRegistration(
+            username=registration.username.strip(),
+            credential_name=registration.credential_name.strip(),
+            password_length=registration.password_length,
+            charset=registration.charset,
+        )
+    if policy.raw_secret_redacted_draft:
+        if credential_id:
+            return {
+                "ok": False,
+                "error": "Updating a saved credential (authenticator or rejected values) is unavailable on a raw-secret turn.",
+            }
+        # Only the user's own site may reach the card on a raw-secret turn: a model or page URL can point elsewhere.
+        login_page_url = next(iter(raw_secret_card_urls(policy, [login_page_url])), "")
+        if not login_page_url:
+            return {
+                "ok": False,
+                "error": (
+                    "This turn withheld a value that may be a secret, so the credential card opens only for a "
+                    "sign-in site the user gave. Ask the user for the site's sign-in URL, then call "
+                    "`request_credential` with it."
+                ),
+            }
+
+    recovery_open = ember_ctx.credential_origin_recovery
+    refused_here = [
+        earlier
+        for earlier in (
+            recovery_open,
+            *(
+                CredentialOriginRecovery(origin, "declined", refused_id)
+                for origin, refused_id in sorted(ember_ctx.credential_origin_refusals)
+            ),
+        )
+        if earlier is not None and same_release_scope(login_page_url, earlier.origin)
+    ]
+    # An update ask for the login a fill refused on this site cannot help, so it opens the recovery pick card instead.
+    update_ask_replaced = bool(credential_id) and any(
+        earlier.refused_credential_id == credential_id for earlier in refused_here
+    )
+    if update_ask_replaced:
+        credential_id = None
+        rejected_by_site = False
+        reason = _refused_login_recovery_card_text(ask_origin.canonical)
+    # The authenticator update card grants no origin, so it has its own latch and never spends the recovery's.
+    # Any pick ask on a site where a fill was refused this turn gets a recovery card, so a plain card cannot bind a
+    # refused login there.
+    on_recovery_site = None if credential_id else next(iter(refused_here), None)
+    recovery: CredentialOriginRecovery | None = None
+    if on_recovery_site is not None:
+        if recovery_open is not None and recovery_open.state == "pending" and on_recovery_site is not recovery_open:
+            return {"ok": False, "error": _credential_origin_recovery_error(recovery_open)}
+        recovery = (
+            on_recovery_site
+            if on_recovery_site.state == "pending" and on_recovery_site.origin == ask_origin.canonical
+            else CredentialOriginRecovery(ask_origin.canonical, "pending", on_recovery_site.refused_credential_id)
+        )
+
+    update_name: str | None = None
+    site_rejected = bool(credential_id) and rejected_by_site
+    if credential_id:
+        update_name, early_result = await _update_ask_target(ember_ctx, credential_id, site_rejected=site_rejected)
+        if early_result is not None:
+            return early_result
+    update_ask = update_name is not None
+
+    # The update ask awaits the vault above, so a card raised meanwhile by a parallel call must still win.
+    if ember_ctx.credential_ask_in_flight:
+        return {
+            "ok": True,
+            "status": "already_asked",
+            "next": "A credential card is already open; its answer returns on the call that opened it.",
+        }
+    if update_ask and ember_ctx.credential_totp_update_asked:
+        return {
+            "ok": True,
+            "status": "already_asked",
+            "detail": "An update card was already shown this turn; another one cannot open until the next turn.",
+        }
+
+    config = ember_ctx.ember_config
+    if config is None or not credential_pause_transport_ready(ember_ctx, config):
+        _log_credential_card_unavailable(ember_ctx, config)
+        if recovery is not None:
+            return _decline_credential_origin_recovery(ember_ctx, recovery, "unavailable")
+        return {
+            "ok": True,
+            "status": "unavailable",
+            "detail": "The in-chat credential card cannot be shown on this turn.",
+            "fallback": (
+                _CREDENTIAL_CARD_FALLBACK
+                if update_name is None
+                else _rejected_credential_card_fallback(update_name)
+                if site_rejected
+                else _missing_totp_card_fallback(update_name)
+            ),
+        }
+
+    admit_connected = None
+    if recovery is not None:
+        login_page_url = urlunsplit(urlsplit(login_page_url)._replace(query="", fragment=""))
+        ember_ctx.credential_origin_recovery = replace(recovery, state="asked")
+        ember_ctx.credential_origin_refusals.add((recovery.origin, recovery.refused_credential_id))
+        admit_connected = partial(_credential_evidence_admits_origin, ember_ctx, recovery)
+    named_before_ask = set(policy.current_turn_named_credential_ids)
+    if update_name is None:
+        policy.credential_ask_login_page_urls = [login_page_url]
+    try:
+        resolution = await request_credential_pause(
+            ember_ctx,
+            login_page_url=login_page_url,
+            message=defang_card_text(reason),
+            stream=ember_ctx.stream,
+            ember_config=config,
+            update_credential_id=credential_id if update_name is not None else None,
+            update_reason="credential_rejected_by_site" if site_rejected else "credential_missing_totp",
+            admit_connected=admit_connected,
+            anchor_tool_call_id=anchor_tool_call_id,
+            registration=card_registration,
+            lead_credential_id=recovery.refused_credential_id if recovery is not None else None,
+        )
+    except BaseException:
+        if recovery is not None:
+            _decline_credential_origin_recovery(ember_ctx, recovery, "error")
+        raise
+    credential = resolution.credential if resolution is not None else None
+    if update_name is not None and credential_id:
+        if resolution is not None and resolution.signed_in is not None:
+            signed_in = _signed_in_result(resolution.signed_in)
+            binding = CREDENTIAL_BINDING_FACTS[credential_binding(policy, credential_id)]
+            signed_in["detail"] += f" {defang_card_text(update_name)} was not updated. {binding}"
+            return signed_in
+        if site_rejected:
+            return _rejected_credential_ask_outcome(credential, update_name, credential_id, policy, answered=resolution)
+        return await _missing_totp_ask_outcome(
+            ember_ctx, credential, update_name, credential_id, policy, answered=resolution
+        )
+    if recovery is not None:
+        bound_origin = (
+            canonicalize_origin(policy.live_page_admitted_urls.get(credential.credential_id))
+            if credential is not None and ember_ctx.credential_pause_outcome == "connected"
+            else None
+        )
+        if bound_origin is None or bound_origin.canonical != recovery.origin:
+            status: CredentialOriginDeclineStatus
+            if resolution is None:
+                status = "unanswered"
+            elif resolution.action == "skip":
+                status = "skipped"
+            elif credential is None:
+                status = "connected_unresolved"
+            else:
+                status = "connected_other_site"
+            return _decline_credential_origin_recovery(ember_ctx, recovery, status)
+        ember_ctx.credential_origin_recovery = None
+        if credential is not None and resolution is not None and resolution.site_answer is not None:
+            # The user saved this login for the site, so its earlier refusals there no longer stand.
+            ember_ctx.credential_origin_refusals -= {
+                (origin, refused_id)
+                for origin, refused_id in ember_ctx.credential_origin_refusals
+                if refused_id == credential.credential_id and same_release_scope(origin, recovery.origin)
+            }
+        policy.origin_recovery_kept_named_credential_ids |= named_before_ask & {recovery.refused_credential_id}
+        clear_tool_blocker_signals_for_reason_codes(
+            ember_ctx,
+            frozenset(
+                {CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE, CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE}
+            ),
+        )
+    registration_outcome = ember_ctx.credential_registration_outcome if card_registration is not None else None
+    registration_note = _REGISTRATION_OUTCOME_NOTES[registration_outcome] if registration_outcome is not None else {}
+    if resolution is None:
+        unanswered: dict[str, Any] = {
+            "ok": True,
+            "status": "unanswered",
+            "outcome": ember_ctx.credential_pause_outcome or "timeout",
+            **registration_note,
+        }
+        if card_registration is None:
+            unanswered["next"] = (
+                "The user did not answer the card, so no credential was connected. Keep the credential parameter "
+                "placeholder in the draft."
+            )
+        return unanswered
+    if resolution.signed_in is not None:
+        return _signed_in_result(resolution.signed_in)
+    if resolution.action == "connected" and credential is None:
+        return {
+            "ok": True,
+            "status": "connected_unresolved",
+            "next": (
+                "The credential the user connected could not be loaded, so none was connected. Keep the credential "
+                "parameter placeholder in the draft."
+            ),
+        }
+    if credential is None:
+        skipped: dict[str, Any] = {"ok": True, "status": "skipped", **registration_note}
+        if card_registration is None:
+            skipped["next"] = (
+                "The user chose not to connect a credential on this card. Keep the credential parameter placeholder "
+                "in the draft, and say a test run may stop at the login step."
+            )
+        return skipped
+    site_answer = resolution.site_answer
+    if site_answer is not None and ember_ctx.credential_pause_outcome == "not_admitted":
+        return {
+            "ok": True,
+            "status": "declined_site" if site_answer.action == "no" else "site_change_unconfirmed",
+            "next": site_answer_unused_text(credential, site_answer),
+        }
+    connected: dict[str, Any] = {
+        "ok": True,
+        "status": "connected",
+        "credential_id": credential.credential_id,
+        "credential_name": credential.name,
+    }
+    if update_ask_replaced:
+        connected["update_card"] = (
+            "not shown: a fill on this site refused the login it named, so the card asked the user to pick a login"
+        )
+    if site_answer is not None:
+        connected["saved_site_change"] = (
+            f"The user allowed this login on {site_answer.site_b}; it still signs in on {site_answer.saved_sites_text}."
+        )
+    if card_registration is not None:
+        if resolution.generated:
+            connected["generated"] = True
+            connected["site_effect"] = "none"
+    else:
+        connected["next"] = (
+            "Bind this credential as the workflow's credential parameter and continue the build; run the "
+            "blocks that were waiting on the login."
+        )
+    return connected
+
+
+def _signed_in_result(signed_in: SignedInProfile) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "signed_in",
+        "site": signed_in.site,
+        "browser_profile_id": signed_in.browser_profile_id,
+        "browser_profile_name": defang_card_text(signed_in.profile_name),
+        "cookie_count": signed_in.cookie_count,
+        "credential_provided": False,
+        "detail": signed_in_facts(signed_in),
+    }
+
+
+async def _missing_totp_ask_outcome(
+    ember_ctx: EmberContext,
+    credential: Credential | None,
+    credential_name: str,
+    credential_id: str,
+    policy: RequestPolicy,
+    *,
+    answered: CredentialPauseResolution | None,
+) -> dict[str, Any]:
+    """Report the update card from the saved record, never from the answer alone: a save can leave 2FA unset."""
+    name = defang_card_text(credential_name)
+    binding = CREDENTIAL_BINDING_FACTS[credential_binding(policy, credential_id)]
+    if credential is None:
+        return {
+            "ok": True,
+            "status": "unanswered" if answered is None else "skipped",
+            "detail": f"{name} was not updated. It still has no authenticator. {binding}",
+        }
+    still_missing_name, rechecked = await _update_ask_target(ember_ctx, credential.credential_id)
+    if rechecked is None:
+        return {
+            "ok": True,
+            "status": "saved_without_authenticator",
+            "credential_id": credential.credential_id,
+            "credential_name": still_missing_name,
+            "detail": f"{name} was saved but still has no authenticator. {binding}",
+        }
+    if rechecked.get("status") != "has_code_method":
+        return rechecked
+    return {
+        **rechecked,
+        "status": "authenticator_added",
+        "detail": f"The saved credential now has a one-time-code method. {binding}",
+        "credential_id": credential.credential_id,
+        "credential_name": credential.name,
+    }
+
+
+def _rejected_credential_ask_outcome(
+    credential: Credential | None,
+    credential_name: str,
+    credential_id: str,
+    policy: RequestPolicy,
+    *,
+    answered: CredentialPauseResolution | None,
+) -> dict[str, Any]:
+    binding = CREDENTIAL_BINDING_FACTS[credential_binding(policy, credential_id)]
+    if credential is None:
+        return {
+            "ok": True,
+            "status": "unanswered" if answered is None else "skipped",
+            "detail": f"{defang_card_text(credential_name)} was not updated. {binding}",
+        }
+    return {
+        "ok": True,
+        "status": "updated",
+        "credential_id": credential.credential_id,
+        "credential_name": credential.name,
+        "detail": f"The user saved new values for {defang_card_text(credential.name)}. {binding}",
+    }
+
+
+def _request_settled_credential(policy: RequestPolicy, credential_id: str) -> bool:
+    """A user selection settles identity; a saved binding alone remains scoped to its saved origin."""
+    if policy.current_turn_named_credential_ids == {credential_id}:
+        return True
+    if credential_id in policy.persisted_workflow_credential_ids:
+        return credential_id in policy.prior_approved_credential_ids
+    return {credential.credential_id for credential in policy.resolved_credentials} == {credential_id}
+
+
+async def _sole_org_password_credential_id(
+    load_org_credentials: Callable[[], Awaitable[list[Credential]]],
+) -> str | None:
+    """The one saved password credential carrying no login URL, where elimination answers the
+    which-credential question a name would otherwise have to. Counts the pool turn start resolves from
+    (``allow_urlless_sole``), so a credential resolved there is never re-asked about here.
+    """
+    unbound = [
+        credential
+        for credential in await load_org_credentials()
+        if credential.credential_type == CredentialType.PASSWORD and not credential.tested_url
+    ]
+    return unbound[0].credential_id if len(unbound) == 1 else None
+
+
+def _ambiguous_unbound_credential_steer(credential_id: str, page_url: str) -> str:
+    origin = loggable_origin(page_url)
+    return (
+        f"`{credential_id}` has no saved login page, so it is not established that it belongs to {origin}. "
+        f"Call `request_credential` with the sign-in page URL on {origin}; the user's card selection "
+        "settles both the credential and the site so the build can continue."
+    )
+
+
+async def _credential_fill_origin_grant(
+    ember_ctx: AgentContext, credential_id: str
+) -> tuple[_CredentialFillOriginGrant | None, str | None]:
+    """Authorize a fill only when something other than the model binds this credential to an origin; the
+    grant is consumed at the release seam, so a credential nothing vouches for gets none and cannot release.
+    """
+    prerequisite_error = _credential_fill_prerequisite_error(ember_ctx, credential_id)
+    if prerequisite_error:
+        return None, prerequisite_error
+    policy = ember_ctx.request_policy
+
+    async def load_once() -> list[Credential]:
+        if ember_ctx.org_credentials_for_turn is None:
+            ember_ctx.org_credentials_for_turn = await load_credentials(ember_ctx.organization_id)
+        return ember_ctx.org_credentials_for_turn
+
+    if (
+        isinstance(policy, RequestPolicy)
+        and credential_id in policy.persisted_workflow_credential_ids
+        and credential_id not in {credential.credential_id for credential in policy.resolved_credentials}
+    ):
+        saved = next((item for item in await load_once() if item.credential_id == credential_id), None)
+        if saved is not None:
+            policy.resolved_credentials.append(saved)
+    authority_error = _credential_fill_authority_error(ember_ctx, credential_id)
+
+    if not authority_error:
+        if not isinstance(policy, RequestPolicy):
+            return None, _missing_credential_origin_error(credential_id, None)
+        saved_sites = policy.credential_saved_site_urls(credential_id)
+        if len(saved_sites) > 1:
+            # A login saved for several sites is granted from the saved site this page is on, not the first one.
+            page_url = await _live_working_page_url(ember_ctx) or ""
+            saved_on_page = next((url for url in saved_sites if still_on_admitted_site(page_url, url)), None)
+            if saved_on_page is not None:
+                _log_fill_grant("saved_site", page_url, credential_id)
+                return _CredentialFillOriginGrant(saved_on_page), None
+        intended_url = policy.credential_intended_url(credential_id)
+        if intended_url:
+            _log_fill_grant("admitted_or_tested", intended_url, credential_id)
+            return _CredentialFillOriginGrant(intended_url), None
+        page_url = await _live_working_page_url(ember_ctx) or ""
+        if page_url and any(
+            still_on_admitted_site(page_url, origin)
+            for origin in workflow_credential_origins(
+                ember_ctx.persisted_workflow_yaml or "", require_canonical_origin=True
+            ).get(credential_id, [])
+        ):
+            _log_fill_grant("saved_workflow", page_url, credential_id)
+            return _CredentialFillOriginGrant(page_url), None
+        # The vault entry names the site the user filed this credential under, so it answers where
+        # the secret belongs without anyone having to run the test flow first.
+        vault_site = next(
+            (site for site in await _vault_named_sites(ember_ctx, credential_id) if site.admits(page_url)), None
+        )
+        if page_url and vault_site is not None:
+            _log_fill_grant("vault_site", page_url, credential_id)
+            return _CredentialFillOriginGrant(page_url, whole_site=vault_site.whole_site), None
+        if page_url:
+            matched_url, site_level = user_provided_site_url_match(policy, page_url)
+            if matched_url is not None:
+                settled = _request_settled_credential(policy, credential_id)
+                if not settled and credential_id in policy.persisted_workflow_credential_ids:
+                    admission = await admit_credential_for_live_page(
+                        policy,
+                        organization_id=ember_ctx.organization_id,
+                        credential_id=credential_id,
+                        page_url=page_url,
+                        load_org_credentials=load_once,
+                    )
+                    if admission.steer:
+                        return None, admission.steer
+                if settled or credential_id == await _sole_org_password_credential_id(load_once):
+                    _log_fill_grant(
+                        "user_url",
+                        page_url,
+                        credential_id,
+                        policy.user_site_url_sources.get(matched_url),
+                    )
+                    return _CredentialFillOriginGrant(page_url, whole_site=site_level), None
+                return None, _ambiguous_unbound_credential_steer(credential_id, page_url)
+        return None, _missing_credential_origin_error(
+            credential_id,
+            page_url or None,
+            user_named=policy.current_turn_named_credential_ids == {credential_id},
+        )
+
+    if not isinstance(policy, RequestPolicy):
+        return None, authority_error
+
+    admission = await admit_credential_for_live_page(
+        policy,
+        organization_id=ember_ctx.organization_id,
+        credential_id=credential_id,
+        page_url=await _live_working_page_url(ember_ctx) or "",
+        load_org_credentials=load_once,
+    )
+    if admission.admitted and admission.page_url:
+        _log_fill_grant("live_page_admission", admission.page_url, credential_id)
+        return _CredentialFillOriginGrant(admission.page_url), None
+    if admission.admitted:
+        return None, _missing_credential_origin_error(credential_id, None)
+    return None, admission.steer or authority_error
+
+
+async def _import_vault_login_for_fill(
+    ember_ctx: AgentContext, credential_id: str
+) -> tuple[str, _CredentialFillOriginGrant | None, str | None] | None:
+    """A listed vault login not yet imported is imported only once its own sites cover the live page, with nothing
+    else standing in for them; one already imported takes the saved path. None for any other credential id."""
+    policy = ember_ctx.request_policy
+    if not isinstance(policy, RequestPolicy):
+        return None
+    logins = policy.vault_logins
+    if credential_id.startswith(VAULT_LOGIN_REF_PREFIX):
+        logins, _ = await load_vault_logins(ember_ctx.organization_id, policy)
+    login = (logins or {}).get(credential_id)
+    if login is None:
+        return None
+    if login.credential_id is not None:
+        return login.credential_id, *await _credential_fill_origin_grant(ember_ctx, login.credential_id)
+    if prerequisite_error := _credential_fill_prerequisite_error(ember_ctx, credential_id):
+        return credential_id, None, prerequisite_error
+    page_url = await _live_working_page_url(ember_ctx) or ""
+    if not page_url:
+        return credential_id, None, _missing_credential_origin_error(credential_id, None)
+    if credential_id in {credential.credential_id for credential in policy.resolved_credentials}:
+        site = next((site for site in login.sites if site.admits(page_url)), None)
+        if site is None:
+            return credential_id, None, _vault_login_off_site_error(credential_id, page_url, login.sites)
+        whole_site = site.whole_site
+    else:
+
+        async def load_once() -> list[Credential]:
+            if ember_ctx.org_credentials_for_turn is None:
+                ember_ctx.org_credentials_for_turn = await load_credentials(ember_ctx.organization_id)
+            return ember_ctx.org_credentials_for_turn
+
+        admission = await admit_vault_login_for_live_page(
+            policy,
+            organization_id=ember_ctx.organization_id,
+            credential_id=credential_id,
+            login=login,
+            page_url=page_url,
+            load_org_credentials=load_once,
+        )
+        if not admission.admitted:
+            return credential_id, None, _credential_fill_authority_error(ember_ctx, credential_id)
+        whole_site = admission.whole_site
+    imported_id = await import_vault_login(ember_ctx.organization_id, login)
+    policy.adopt_imported_vault_login(credential_id, imported_id)
+    _log_fill_grant("vault_site", page_url, imported_id)
+    return imported_id, _CredentialFillOriginGrant(page_url, whole_site=whole_site), None
+
+
+_READ_ONLY_VAULT_NAMES = {
+    CredentialVaultType.ONEPASSWORD: "1Password",
+    CredentialVaultType.BITWARDEN_CONNECTED: "the connected Bitwarden vault",
+}
+
+
+async def _load_vault_credential_item(
+    ember_ctx: AgentContext, credential_id: str, *, for_update_card: bool = False
+) -> tuple[CredentialItem | None, str]:
+    principal = get_request_principal()
+    try:
+        await app.AGENT_FUNCTION.enforce_credential_use(
+            ember_ctx.organization_id,
+            credential_id,
+            principal=principal,
+        )
+    except PermissionError:
+        return None, "Credential not accessible."
+    try:
+        db_credential = await app.DATABASE.credentials.get_credential(
+            credential_id, organization_id=ember_ctx.organization_id
+        )
+    except Exception:
+        LOG.warning(
+            "fill_credential_field could not read the credential record",
+            credential_id=credential_id,
+            organization_id=ember_ctx.organization_id,
+            exc_info=True,
+        )
+        return None, f"Could not read credential `{credential_id}`. Ask the user to verify it exists."
+    if db_credential is None:
+        return None, _missing_credential_reference_tool_error([credential_id])
+
+    vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
+    if for_update_card and (vault_name := _READ_ONLY_VAULT_NAMES.get(vault_type)):
+        return None, (
+            f"`{credential_id}` is a login imported from {vault_name}, which the credential card cannot edit. "
+            f"The user updates it in {vault_name}."
+        )
+    credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+    if credential_service is None:
+        return None, f"The credential vault for `{credential_id}` is not configured on this deployment."
+    try:
+        credential_item = await credential_service.get_credential_item(db_credential)
+    except Exception as exc:
+        LOG.warning(
+            "fill_credential_field could not fetch the credential from the vault",
+            credential_id=credential_id,
+            vault_type=str(vault_type),
+            exc_info=True,
+        )
+        return None, f"Could not fetch credential `{credential_id}` from the vault: {type(exc).__name__}."
+    try:
+        await app.AGENT_FUNCTION.record_audit_event(
+            principal,
+            AuditEvent(
+                ember_ctx.organization_id,
+                "credential.use",
+                "credential",
+                credential_id,
+                metadata={"source": "ember"},
+                data_access="read",
+            ),
+        )
+    except Exception as exc:
+        LOG.warning(
+            "Failed to record Ember credential use",
+            credential_id=credential_id,
+            organization_id=ember_ctx.organization_id,
+            error_type=type(exc).__name__,
+        )
+    if credential_item.login_sites is not None:
+        ember_ctx.scoped_login_sites_by_credential_id[credential_id] = credential_item.login_sites
+    return credential_item, ""
+
+
+MISSING_AUTHENTICATOR = "missing_authenticator"
+
+
+@dataclass(frozen=True)
+class MissingAuthenticator:
+    """The resolver's non-prose failure: the credential has no one-time-code method at all."""
+
+
+def _missing_authenticator_fill_error(
+    ember_ctx: AgentContext, credential_id: str, credential_name: str
+) -> dict[str, Any]:
+    already_asked = isinstance(ember_ctx, EmberContext) and ember_ctx.credential_totp_update_asked
+    if already_asked:
+        next_step = (
+            "The user was already shown an update card for this credential this turn; another one cannot open "
+            "until the next turn."
+        )
+    else:
+        next_step = (
+            f"Call `request_credential` with credential_id `{credential_id}` so the user can add its "
+            "authenticator, then retry this fill with the same `target`."
+        )
+    return {
+        "ok": False,
+        "status": MISSING_AUTHENTICATOR,
+        "error": "The saved credential has no authenticator (2FA) method.",
+        "next": next_step,
+        "update_ask": "already_asked" if already_asked else "available",
+        "data": {"credential_id": credential_id, "credential_name": credential_name, "credential_field": "totp"},
+    }
+
+
+async def _resolve_credential_fill_value(
+    ember_ctx: AgentContext,
+    credential_id: str,
+    field: str,
+) -> tuple[str | None, str, str | MissingAuthenticator | None]:
+    """Resolve (secret_value, credential_name, error) for one credential field, server-side only."""
+    credential_item, load_error = await _load_vault_credential_item(ember_ctx, credential_id)
+    if credential_item is None:
+        return None, "", load_error
+    credential = credential_item.credential
+    if not isinstance(credential, PasswordCredential):
+        return None, "", f"Credential `{credential_id}` is not a username/password credential."
+
+    if field == "username":
+        value: str | None = credential.username
+    elif field == "password":
+        value = credential.password
+        register_secret_scrub_value(ember_ctx, value)
+    else:
+        method = _password_totp_method(credential)
+        if method == "out_of_band":
+            return None, credential_item.name, _runtime_otp_steering_error(credential_id)
+        if not credential.totp:
+            return None, credential_item.name, MissingAuthenticator()
+        try:
+            value = generate_totp_code(
+                await _normalize_totp_config_for_organization(
+                    credential.totp,
+                    ember_ctx.organization_id,
+                )
+            )
+        except Exception:
+            LOG.warning(
+                "fill_credential_field could not generate a TOTP code",
+                credential_id=credential_id,
+                exc_info=True,
+            )
+            return None, "", f"Could not generate a TOTP code for credential `{credential_id}`."
+        register_secret_scrub_value(ember_ctx, value)
+    if not value:
+        return None, "", f"Credential `{credential_id}` has no `{field}` value."
+    ember_ctx.scouted_credential_field_inventory_by_credential_id[credential_id] = frozenset(
+        field_name
+        for field_name, field_value in (
+            ("username", credential.username),
+            ("password", credential.password),
+            ("totp", credential.totp),
+        )
+        if field_value
+    )
+    return value, credential_item.name, None
+
+
+async def _read_filled_field_value(page: SkyvernBrowserPage, selector: str) -> str | None:
+    """Read a field back on the same page handle that filled it.
+
+    The tool-layer read path replaces registered secrets with a placeholder, so a credential
+    readback taken through it describes the scrubber rather than the field.
+    """
+
+    async def read() -> str | None:
+        try:
+            # `.first` matches the direct fill's narrowing — the un-narrowed locator raises strict
+            # mode on a multi-match, and a read that stalls means an auto-submit already moved on.
+            value = await asyncio.wait_for(
+                page.locator(selector).first.input_value(), timeout=_CREDENTIAL_FILL_READBACK_TIMEOUT_SECONDS
+            )
+        except Exception:
+            LOG.debug("credential fill readback failed; leaving the value unread")
+            return None
+        return value if isinstance(value, str) else None
+
+    value = await read()
+    if value is not None and value.strip() == "":
+        # A controlled/React input can mirror its value asynchronously, so a first read may be
+        # transiently empty; settle briefly and re-read once before declaring the fill lost.
+        await asyncio.sleep(_TYPE_READBACK_SETTLE_SECONDS)
+        value = await read()
+    return value
+
+
+@dataclass(frozen=True)
+class _ScoutTargetProbe:
+    """A target's factual identity, read before the secret-bearing action reaches the page."""
+
+    selector: str
+    selector_candidates: list[ScoutedSelectorCandidate]
+    selector_match_count: int | None = None
+    role: str = ""
+    accessible_name: str = ""
+    role_name_match_count: int | None = None
+    fingerprint: dict[str, str] = dataclass_field(default_factory=dict)
+
+
+def _fill_observed_effects(outcome: ScoutReadbackOutcome, *, landing_inferred_from_navigation: bool) -> dict[str, bool]:
+    """A landing is recorded only where one was observed, so `value_landed` is absent rather than
+    False whenever the field did not read back what was typed."""
+    if landing_inferred_from_navigation:
+        return {"landing_inferred_from_navigation": True}
+    return {"value_landed": True} if outcome is ScoutReadbackOutcome.EXACT_MATCH else {}
+
+
+async def _probe_scout_target(ember_ctx: AgentContext, selector: str, *, fingerprint: bool) -> _ScoutTargetProbe:
+    ember_ctx.pending_scout_selector_candidates = None
+    packet, element_fingerprint = await _probe_target_facts(ember_ctx, selector, fingerprint=fingerprint)
+    selector_candidates: list[ScoutedSelectorCandidate] = [
+        {"selector": selector, "source": "requested", "match_count": None}
+    ]
+    for candidate in _parse_selector_candidates(packet.get("selector_candidates")):
+        existing = next(
+            (item for item in selector_candidates if item["selector"] == candidate["selector"]),
+            None,
+        )
+        if existing is None:
+            selector_candidates.append(candidate)
+        elif existing["match_count"] is None:
+            existing["match_count"] = candidate["match_count"]
+    role, accessible_name = _packet_role_name(packet)
+    return _ScoutTargetProbe(
+        selector=selector,
+        selector_candidates=selector_candidates,
+        selector_match_count=_non_negative_count(packet.get("selector_match_count")),
+        role=role,
+        accessible_name=accessible_name,
+        role_name_match_count=(
+            _non_negative_count(packet.get("role_name_match_count")) if role and accessible_name else None
+        ),
+        fingerprint=element_fingerprint,
+    )
+
+
+@dataclass(frozen=True)
+class _CredentialSubmitOutcome:
+    clicked: bool
+    result_url: str = ""
+    mint_to_submit_ms: int | None = None
+    skipped: str | None = None
+    error: str | None = None
+    live_match_count: int | None = None
+
+
+async def _submit_after_credential_fill(
+    ember_ctx: AgentContext,
+    *,
+    probe: _ScoutTargetProbe,
+    grant: _CredentialFillOriginGrant,
+    source_url: str,
+    mint_started: float,
+    secret_value: str,
+) -> _CredentialSubmitOutcome:
+    """Click the submit control the fill was aimed at, without ever costing the fill itself."""
+    if not _within_grant(source_url, grant):
+        # An unreadable page is not a page that moved; both fail closed, but only one of them knows
+        # where the browser went, and the model acts on what this says.
+        notice = (
+            _credential_submit_origin_mismatch_notice() if source_url else _credential_submit_page_unreadable_notice()
+        )
+        return _CredentialSubmitOutcome(clicked=False, skipped=notice)
+    # A form that submits itself on the last digit takes its own submit control off the page. Clicking
+    # anyway spends the full click timeout and reports a failure for a login that already succeeded.
+    # None is an unreadable page, not an absent control: skipping on it would strand a fresh code.
+    live_match_count = await _selector_live_match_count(ember_ctx, probe.selector)
+    # Whichever read actually saw the page decides. An unreadable count at dispatch does not unsee
+    # what the probe counted before the fill, and neither read being able to see is not a verdict.
+    known_match_count = live_match_count if live_match_count is not None else probe.selector_match_count
+    if known_match_count == 0:
+        # A control that was never there is a wrong selector, not a form that submitted itself. Both
+        # skip the click, but telling the model the login went through when it did not strands the code.
+        gone = (
+            _credential_submit_selector_never_matched_notice(probe.selector)
+            if probe.selector_match_count == 0
+            else _credential_submit_target_gone_notice()
+        )
+        return _CredentialSubmitOutcome(clicked=False, skipped=gone, live_match_count=live_match_count)
+    # A direct click resolves to `.first`, so an ambiguous selector picks by document order. On a
+    # one-time-code form the neighbour is often "Resend code", which would void the code just typed.
+    if known_match_count is not None and known_match_count > 1:
+        return _CredentialSubmitOutcome(
+            clicked=False,
+            skipped=_credential_submit_ambiguous_notice(probe.selector, known_match_count),
+            live_match_count=live_match_count,
+        )
+    engine_selection = None
+    error_text: str | None = None
+    clicked = False
+    try:
+        session_id = effective_browser_session_id(ember_ctx)
+        async with mcp_browser_context(ember_ctx, session_id_override=session_id):
+            page, _ = await get_page(session_id=session_id)
+            engine_selection = page.engine_selection
+            try:
+                await page.click(probe.selector, mode="direct", timeout=_CREDENTIAL_SUBMIT_TIMEOUT_MS)
+                clicked = True
+            except Exception as exc:
+                # A submit that navigates away leaves the post-click auto-wait timing out after the
+                # click was already dispatched; the form was submitted, so this is not a failure.
+                if is_post_dispatch_click_timeout(exc, engine_selection):
+                    clicked = True
+                else:
+                    error_text = scrub_secrets_from_text(ember_ctx, _scrub_secret_from_text(str(exc), secret_value))
+    except Exception as exc:
+        # Raised entering or leaving the browser context rather than by the click. Reporting a failure
+        # for a click that already went out invites the model to submit the form a second time.
+        if not clicked:
+            error_text = scrub_secrets_from_text(ember_ctx, _scrub_secret_from_text(str(exc), secret_value))
+    if not clicked:
+        LOG.info(
+            "ember fill_credential_field submit click failed",
+            selector=probe.selector,
+        )
+        return _CredentialSubmitOutcome(
+            clicked=False,
+            error=(
+                f"{error_text or 'The submit control could not be clicked.'} Whether the click reached "
+                "the page before this failed is not known, so the form may already have been submitted. "
+                "Inspect the current page before submitting again — a second attempt spends another code."
+            ),
+            live_match_count=live_match_count,
+        )
+    mint_to_submit_ms = int((time.monotonic() - mint_started) * 1000)
+    return _CredentialSubmitOutcome(
+        clicked=True,
+        result_url=await _live_working_page_url(ember_ctx) or "",
+        mint_to_submit_ms=mint_to_submit_ms,
+        live_match_count=live_match_count,
+    )
+
+
+async def fill_credential_field(
+    ember_ctx: AgentContext,
+    selector: str,
+    credential_id: str,
+    field: str,
+    submit_selector: str | None = None,
+    frame: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    lock = getattr(ember_ctx, "credential_fill_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        ember_ctx.credential_fill_lock = lock
+    async with lock, browser_session_turn(ember_ctx), browser_evidence_commit_lock(ember_ctx):
+        return await _fill_credential_field_impl_serial(
+            ember_ctx, selector, credential_id, field, submit_selector, frame
+        )
+
+
+async def _fill_credential_field_impl_serial(
+    ember_ctx: AgentContext,
+    selector: str,
+    credential_id: str,
+    field: str,
+    submit_selector: str | None = None,
+    frame: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    arguments: dict[str, Any] = {"selector": selector, "credential_id": credential_id, "field": field}
+    if submit_selector:
+        arguments["submit_selector"] = submit_selector
+
+    def finish(result: dict[str, Any]) -> dict[str, Any]:
+        record_tool_step_result_for_ctx(ember_ctx, "fill_credential_field", arguments, result)
+        return result
+
+    authority_error = _authority_tool_error(ember_ctx, "fill_credential_field")
+    if authority_error:
+        return finish({"ok": False, "error": authority_error})
+
+    selector = (selector or "").strip()
+    submit_selector = (submit_selector or "").strip()
+    field = (field or "").strip().lower()
+    credential_id = (credential_id or "").strip()
+    if not selector:
+        return finish({"ok": False, "error": "fill_credential_field requires a CSS selector for the input field."})
+    if field not in _CREDENTIAL_FILL_FIELDS:
+        return finish(
+            {
+                "ok": False,
+                "error": f"fill_credential_field `field` must be one of: {', '.join(CREDENTIAL_FILL_FIELD_NAMES)}.",
+            }
+        )
+    try:
+        imported = await _import_vault_login_for_fill(ember_ctx, credential_id)
+        if imported is None:
+            origin_grant, policy_error = await _credential_fill_origin_grant(ember_ctx, credential_id)
+        else:
+            credential_id, origin_grant, policy_error = imported
+    except PermissionError:
+        return finish({"ok": False, "error": "Credential not accessible."})
+    if policy_error or origin_grant is None:
+        LOG.info(
+            "ember fill_credential_field rejected tool-side",
+            credential_id=credential_id,
+            field=field,
+            organization_id=ember_ctx.organization_id,
+        )
+        return finish({"ok": False, "error": policy_error or _missing_credential_origin_error(credential_id, None)})
+
+    # A fill aimed at a run's own browser must not provision the chat's; that browser is checked by the fill.
+    if effective_browser_session_id(ember_ctx) == ember_ctx.browser_session_id:
+        session_error = await ensure_browser_session(ember_ctx)
+        if session_error:
+            return finish(session_error)
+    await _capture_scout_source_url(ember_ctx)
+    # Capture each target's factual identity before the secret-bearing action; a fill can change
+    # attributes, trigger framework replacement, or navigate, so a later read describes a different
+    # element. These facts never include the credential value.
+    fill_probe = await _probe_scout_target(ember_ctx, selector, fingerprint=True)
+    submit_probe = await _probe_scout_target(ember_ctx, submit_selector, fingerprint=False) if submit_selector else None
+    fingerprint = fill_probe.fingerprint
+
+    value, credential_name, resolve_error = await _resolve_credential_fill_value(ember_ctx, credential_id, field)
+    # Started here rather than before the resolver, whose credential read and enterprise-secret
+    # normalization precede the generation and would be counted as code age they are not. Nothing
+    # between the generation and this line touches the network. From here only the fill's own readback
+    # and the reads the submit needs to re-check its origin and target may sit before the click.
+    mint_started = time.monotonic()
+    if isinstance(resolve_error, MissingAuthenticator):
+        return finish(_missing_authenticator_fill_error(ember_ctx, credential_id, credential_name))
+    if resolve_error or value is None:
+        error_result: dict[str, Any] = {
+            "ok": False,
+            "error": resolve_error or "Could not resolve the credential value.",
+        }
+        if credential_name:
+            error_result["data"] = {
+                "credential_id": credential_id,
+                "credential_name": credential_name,
+                "credential_field": field,
+            }
+        return finish(error_result)
+    # A vault item that scopes its sites holds the fill to them, whichever route granted it.
+    scoped_sites = ember_ctx.scoped_login_sites_by_credential_id.get(credential_id)
+    if scoped_sites is not None:
+        if not any(site.admits(origin_grant.intended_url) for site in scoped_sites):
+            return finish(
+                {
+                    "ok": False,
+                    "error": _vault_login_off_site_error(credential_id, origin_grant.intended_url, scoped_sites),
+                }
+            )
+        origin_grant = replace(origin_grant, vault_sites=tuple(scoped_sites))
+    if isinstance(policy := ember_ctx.request_policy, RequestPolicy):
+        origin_grant = replace(origin_grant, saved_site_urls=tuple(policy.credential_saved_site_urls(credential_id)))
+    fill_outcome: ScoutReadbackOutcome | None = None
+    try:
+        session_id = effective_browser_session_id(ember_ctx)
+        async with mcp_browser_context(ember_ctx, session_id_override=session_id):
+            page, _ = await get_page(session_id=session_id)
+            # The page wrapper is per call, so this scopes only this fill and its readback.
+            if frame and frame.get("name"):
+                await page.frame_switch(name=frame["name"])
+            elif frame and frame.get("owner_selector"):
+                await page.frame_switch(selector=frame["owner_selector"])
+            await page.fill(
+                selector,
+                value,
+                mode="direct",
+                timeout=_CREDENTIAL_FILL_TIMEOUT_MS,
+                _direct_fill_release_guard=_credential_fill_release_guard(origin_grant),
+            )
+            readback = await _read_filled_field_value(page, selector)
+            fill_outcome = _scout_readback_outcome(readback, value)
+    except _CredentialFillOriginMismatchError as mismatch:
+        observed = canonicalize_origin(mismatch.target_url)
+        if observed is None:
+            return finish(_no_frame_origin_result())
+        if origin_grant.vault_sites is not None and same_release_scope(mismatch.target_url, origin_grant.intended_url):
+            return finish(
+                {
+                    "ok": False,
+                    "error": _vault_login_off_site_error(credential_id, observed.canonical, origin_grant.vault_sites),
+                }
+            )
+        return finish(_start_credential_origin_recovery(ember_ctx, observed.canonical, credential_id))
+    except Exception as exc:
+        error_text = scrub_secrets_from_text(ember_ctx, _scrub_secret_from_text(str(exc), value))
+        LOG.info(
+            "ember fill_credential_field fill failed",
+            selector=selector,
+            credential_id=credential_id,
+            field=field,
+            error_type=type(exc).__name__,
+        )
+        return finish(
+            {
+                "ok": False,
+                "error": (
+                    f"fill_credential_field could not fill {selector!r}: {error_text} "
+                    "Verify the selector matches a single visible, editable input on the current page "
+                    "(inspect the page again if needed), then retry."
+                ),
+            }
+        )
+
+    assert fill_outcome is not None
+
+    _clear_pending_browser_interaction_observation(ember_ctx)
+    source_url = _consume_scout_source_url(ember_ctx)
+    landing_failure = _scout_type_landing_failure(
+        fill_outcome,
+        tool_name="fill_credential_field",
+        selector=selector,
+    )
+    landing_inferred_from_navigation = False
+    if landing_failure is not None and fill_outcome is ScoutReadbackOutcome.EMPTY:
+        # A form that commits on the last character clears its own field and moves on, so the field
+        # reads empty because the fill worked, not because it was lost. Only the page having left the
+        # one the fill acted on distinguishes the two, and it is read here rather than up front
+        # because every other path reaches this point having already landed.
+        landed_url = await _live_working_page_url(ember_ctx) or ""
+        # Compared at origin+path, not as raw strings: a rejected code re-renders the same page at
+        # ?error=..., and reading that as a navigation would report a fill nobody saw land.
+        landed_parts = url_parts(landed_url) if landed_url else None
+        source_parts = url_parts(source_url) if source_url else None
+        landed_page = landed_parts[1] if landed_parts else None
+        source_page = source_parts[1] if source_parts else None
+        if landed_page and source_page and landed_page != source_page:
+            LOG.info(
+                "ember fill_credential_field field cleared by a navigation, treating the fill as landed",
+                selector=selector,
+                credential_id=credential_id,
+                field=field,
+            )
+            landing_failure = None
+            landing_inferred_from_navigation = True
+    LOG.info(
+        "ember fill_credential_field readback outcome",
+        selector=selector,
+        credential_id=credential_id,
+        field=field,
+        outcome=fill_outcome.value,
+        inferred_from_navigation=landing_inferred_from_navigation,
+    )
+    if landing_failure is not None:
+        landing_failure["data"] = {
+            "selector": selector,
+            "credential_id": credential_id,
+            "field": field,
+            "typed_length": len(value),
+            "readback_outcome": fill_outcome.value,
+            "landing_inferred_from_navigation": landing_inferred_from_navigation,
+        }
+        return finish(landing_failure)
+    url = await _live_working_page_url(ember_ctx) or ""
+    _record_scouted_interaction(
+        ember_ctx,
+        tool_name="fill_credential_field",
+        selector=selector,
+        selector_candidates=fill_probe.selector_candidates,
+        selector_match_count=fill_probe.selector_match_count,
+        source_url=source_url,
+        result_url=url,
+        observed_effects=_fill_observed_effects(
+            fill_outcome, landing_inferred_from_navigation=landing_inferred_from_navigation
+        ),
+        typed_length=len(value),
+        role=fill_probe.role,
+        accessible_name=fill_probe.accessible_name,
+        role_name_match_count=fill_probe.role_name_match_count,
+        credential_id=credential_id,
+        credential_field=field,
+        credential_name=credential_name,
+        element_fingerprint_id=fingerprint.get("id"),
+        element_fingerprint_name=fingerprint.get("name"),
+        element_fingerprint_type=fingerprint.get("type"),
+        element_fingerprint_placeholder=fingerprint.get("placeholder"),
+        element_fingerprint_label=fingerprint.get("label"),
+        element_fingerprint_test_id=fingerprint.get("test_id"),
+        element_fingerprint_tag=fingerprint.get("tag"),
+        element_fingerprint_probed=fingerprint.get("probed"),
+    )
+    if fingerprint:
+        LOG.info(
+            "element_fingerprint_captured",
+            selector=selector,
+            fingerprint_keys=list(fingerprint.keys()),
+        )
+    data: dict[str, Any] = {
+        "selector": selector,
+        "credential_id": credential_id,
+        "field": field,
+        "typed_length": len(value),
+        "url": url,
+        "credential_name": credential_name,
+        "readback_outcome": fill_outcome.value,
+        "landing_inferred_from_navigation": landing_inferred_from_navigation,
+        # Stated rather than left to be read off which other keys are present: whether the form went
+        # in is the one thing here the model must not have to infer.
+        "submitted": False,
+    }
+    submit: _CredentialSubmitOutcome | None = None
+    if submit_probe is not None and landing_inferred_from_navigation:
+        # The page moved on under the fill, which is the form having committed itself. The probed
+        # control belongs to the page that is gone, so clicking now would act on a different one.
+        data["submit_skipped"] = _credential_submit_already_committed_notice()
+    elif submit_probe is not None and fill_outcome is ScoutReadbackOutcome.DIFFERENT and field == "totp":
+        # Submitting a code the field does not hold voids it, which no retry recovers; a username or
+        # password that submits wrong just fails the sign-in, and the run says so. A field that
+        # reformats what it accepts also reads back different, so this trades one round trip for the
+        # code, and is scoped to the field where that trade is worth making.
+        data["submit_skipped"] = _credential_submit_unconfirmed_readback_notice()
+    elif submit_probe is not None:
+        submit = await _submit_after_credential_fill(
+            ember_ctx,
+            probe=submit_probe,
+            grant=origin_grant,
+            source_url=url,
+            mint_started=mint_started,
+            secret_value=value,
+        )
+        if submit.clicked:
+            data["submitted"] = True
+            data["submit_selector"] = submit_probe.selector
+            # The fill can render a second matching control, so the count at dispatch is what the
+            # click actually faced; the pre-fill count is only a fallback when that read failed. No
+            # `ambiguous` flag rides along because a click only happens once both reads agree the
+            # selector is singular — an ambiguous one is declined rather than clicked and re-anchored.
+            _record_scouted_interaction(
+                ember_ctx,
+                tool_name="click",
+                selector=submit_probe.selector,
+                selector_candidates=submit_probe.selector_candidates,
+                selector_match_count=(
+                    submit.live_match_count
+                    if submit.live_match_count is not None
+                    else submit_probe.selector_match_count
+                ),
+                source_url=url,
+                result_url=submit.result_url,
+                role=submit_probe.role,
+                accessible_name=submit_probe.accessible_name,
+                role_name_match_count=submit_probe.role_name_match_count,
+            )
+        elif submit.skipped is not None:
+            data["submit_skipped"] = submit.skipped
+        elif submit.error is not None:
+            data["submit_error"] = submit.error
+            # `submitted: false` on its own reads as "nothing went out, retry freely". A click that
+            # raised may still have reached the page, and a blind retry spends a second code.
+            data["submit_uncertain"] = True
+
+    submitted = submit is not None and submit.clicked
+    observed_tool = "click" if submitted else "fill_credential_field"
+    observed_selector = submit_probe.selector if submitted and submit_probe is not None else selector
+    observed_source_url = url if submitted else source_url
+    observed_url = submit.result_url if submitted and submit is not None else url
+    if submitted:
+        # The submit mints no page evidence of its own, so without this observation the fill and
+        # its submit are invisible to anything that reconstructs what the scout touched.
+        await _register_scout_interaction_observation(
+            ember_ctx,
+            tool_name="fill_credential_field",
+            selector=selector,
+            source_url=source_url,
+            url=url,
+        )
+    _mark_pending_browser_interaction_observation(ember_ctx, tool_name=observed_tool, url=observed_url)
+    # An act-observe that cannot reach the discovery server leaves the previous click's outcome in
+    # place, which would be stamped onto this submit's evidence as though it described this page.
+    ember_ctx.last_scout_act_observe_outcome = None
+    ember_ctx.last_scout_act_observe_packet = None
+    observation_step, page_evidence = await _register_scout_interaction_observation(
+        ember_ctx,
+        tool_name=observed_tool,
+        selector=observed_selector,
+        source_url=observed_source_url,
+        url=observed_url,
+    )
+    _attach_scout_observation_step(
+        ember_ctx,
+        tool_name=observed_tool,
+        selector=observed_selector,
+        observation_step=observation_step,
+    )
+    result: dict[str, Any] = {"ok": True, "data": data}
+    if observation_step is not None:
+        result["observation_step"] = observation_step
+        data["observation_step"] = observation_step
+    if submitted:
+        data["submit_url"] = safe_page_origin(observed_url) or ""
+        if page_evidence is not None:
+            _attach_scout_page_summary(ember_ctx, result, page_evidence)
+    else:
+        form_submits = await _capture_enclosing_form_submits(ember_ctx, selector)
+        if form_submits:
+            data["form_submit_controls"] = form_submits
+    await _capture_post_interaction_screenshot(
+        ember_ctx,
+        source_tool=observed_tool,
+        captured_url=observed_url,
+        observation_step=observation_step,
+    )
+    LOG.info(
+        "ember fill_credential_field filled a saved credential field",
+        selector=selector,
+        credential_id=credential_id,
+        field=field,
+        typed_length=len(value),
+        url=url or None,
+        submit_selector=submit_probe.selector if submit_probe is not None else None,
+        totp_mint_to_submit_ms=submit.mint_to_submit_ms if submit is not None else None,
+    )
+    return finish(result)

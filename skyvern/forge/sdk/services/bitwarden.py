@@ -3,6 +3,7 @@ import atexit
 import base64
 import contextlib
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -48,6 +49,7 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
 from skyvern.forge.sdk.credential_site_policy import LoginSite
+from skyvern.forge.sdk.encrypt.bootstrap import PLACEHOLDER_SECRET_KEY
 from skyvern.forge.sdk.schemas.credentials import (
     BitwardenItemOverview,
     CredentialItem,
@@ -90,6 +92,12 @@ def _attempt_deadline_seconds(timeout: int, identity: "_VaultIdentity") -> int:
 # vault identity at its own directory lets sessions for different organizations coexist, so a run
 # never has to log another organization out to make room for its own login.
 _BITWARDEN_APPDATA_ENV_VAR = "BITWARDENCLI_APPDATA_DIR"
+# The Bitwarden CLI names its device from this key of data.json; a legacy top-level "appId" is ignored.
+# Checked against @bitwarden/cli 2026.9.0; check again when the pinned CLI version changes.
+_CLI_DEVICE_ID_STATE_KEY = "global_applicationId_appId"
+_CLI_STATE_FILE_NAME = "data.json"
+# Changing this label or the derivation gives every account a new device, and Bitwarden emails each one.
+_DEVICE_ID_DERIVATION_LABEL = "skyvern.bitwarden.cli-device.v1"
 
 # Each `bw` invocation is a Node process. Bound how many run at once so a burst of runs cannot starve
 # the browsers sharing the pod, and so one slow command no longer blocks every other run's fetch.
@@ -275,6 +283,20 @@ class _VaultIdentity:
         return bool(self.email and self.master_password)
 
     @cached_property
+    def device_id(self) -> str | None:
+        """Keep the device stable because Bitwarden emails the account for each sign-in from an unseen device."""
+        if self.uses_email_auth or not self.client_id or not self.client_secret:
+            return None
+        if not settings.ENCRYPTOR_AES_SECRET_KEY or settings.ENCRYPTOR_AES_SECRET_KEY == PLACEHOLDER_SECRET_KEY:
+            # Without a deployment secret, an API key holder could present this device and avoid the new-device email.
+            return None
+        material = "\x00".join(
+            [_DEVICE_ID_DERIVATION_LABEL, settings.ENCRYPTOR_AES_SALT or "", self.client_id, self.client_secret]
+        )
+        digest = hmac.new(settings.ENCRYPTOR_AES_SECRET_KEY.encode(), material.encode(), hashlib.sha256).digest()
+        return str(uuid.UUID(bytes=digest[:16], version=4))
+
+    @cached_property
     def fingerprint(self) -> str:
         """A stable, non-reversible name for this identity, safe to log and to use as a directory."""
         material = (
@@ -296,9 +318,10 @@ class _VaultIdentity:
 class _CliSession:
     """A logged-in, unlocked CLI session and the data directory holding its copy of the vault."""
 
-    def __init__(self, identity: _VaultIdentity, appdata_dir: str) -> None:
+    def __init__(self, identity: _VaultIdentity, appdata_dir: str, fixed_device: bool = False) -> None:
         self.identity = identity
         self.appdata_dir = appdata_dir
+        self.fixed_device = fixed_device
         # Serializes the steps that write to the data directory (login, unlock, sync). Reads against
         # an established session run concurrently.
         self.lock = asyncio.Lock()
@@ -344,6 +367,29 @@ class _CliSession:
         shutil.rmtree(self.appdata_dir, ignore_errors=True)
 
 
+def _seed_cli_device(appdata_dir: str, identity: _VaultIdentity) -> bool:
+    device_id = identity.device_id
+    if device_id is None:
+        return False
+    path = os.path.join(appdata_dir, _CLI_STATE_FILE_NAME)
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as state_file:
+        state_file.write(json.dumps({_CLI_DEVICE_ID_STATE_KEY: device_id}))
+    return True
+
+
+# A read signs in as a new device only after Bitwarden refused this many of its own fixed-device logins in a row.
+# One refusal is not enough: the next attempt of the read heals a short failure as the fixed device, with no email.
+_FIXED_DEVICE_REFUSALS_BEFORE_NEW_DEVICE = 2
+# (vault fingerprint, refused fixed-device logins in a row) of the read in progress. Per read, not per vault:
+# a batch of concurrent reads would otherwise reach the limit inside one short failure.
+_fixed_device_refusals: ContextVar[tuple[str, int]] = ContextVar("bitwarden_fixed_device_refusals", default=("", 0))
+
+
+def _refused_fixed_device_logins(identity: _VaultIdentity) -> int:
+    fingerprint, refusals = _fixed_device_refusals.get()
+    return refusals if fingerprint == identity.fingerprint else 0
+
+
 class _CliSessionCache:
     """Per-process store of live CLI sessions, keyed by vault identity and bounded by an LRU."""
 
@@ -374,7 +420,9 @@ class _CliSessionCache:
                 # request still held it must never be able to delete its own replacement's data.
                 self._generation += 1
                 appdata_dir = os.path.join(self._root_dir(), f"{identity.fingerprint[:16]}-{self._generation}")
-                session = _CliSession(identity, appdata_dir)
+                os.makedirs(appdata_dir, mode=0o700, exist_ok=True)
+                fixed_device = _seed_cli_device(appdata_dir, identity)
+                session = _CliSession(identity, appdata_dir, fixed_device=fixed_device)
                 self._sessions[identity.fingerprint] = session
             os.makedirs(session.appdata_dir, mode=0o700, exist_ok=True)
             self._sessions.move_to_end(identity.fingerprint)
@@ -1016,6 +1064,21 @@ class BitwardenService:
         """Log in (which already runs a full sync), then unlock unless an email login printed a key to trust.
         The caller holds `session.lock`."""
         identity = session.identity
+        refusals = _refused_fixed_device_logins(identity)
+        new_device = refusals >= _FIXED_DEVICE_REFUSALS_BEFORE_NEW_DEVICE
+        if identity.device_id is not None and (new_device or not session.fixed_device):
+            # This session never finished logging in, so nothing in its directory is in use. The device follows the
+            # read that logs in now: a read that waited out another read's failed new-device login starts fixed.
+            shutil.rmtree(session.appdata_dir, ignore_errors=True)
+            os.makedirs(session.appdata_dir, mode=0o700, exist_ok=True)
+            session.fixed_device = not new_device and _seed_cli_device(session.appdata_dir, identity)
+            if new_device:
+                _fixed_device_refusals.set((identity.fingerprint, 0))
+                LOG.warning(
+                    "Bitwarden refused the fixed device; signing in as a new device",
+                    fingerprint=identity.fingerprint[:12],
+                    refusals=refusals,
+                )
         usage = _session_usage.get()
         started = time.monotonic()
         try:
@@ -1028,6 +1091,28 @@ class BitwardenService:
                 appdata_dir=session.appdata_dir,
                 use_api_key=not identity.uses_email_auth,
             )
+            if session.fixed_device:
+                _fixed_device_refusals.set((identity.fingerprint, 0))
+            LOG.info(
+                "Bitwarden CLI session logged in",
+                fingerprint=identity.fingerprint[:12],
+                fixed_device=session.fixed_device,
+            )
+        except BitwardenLoginError as error:
+            # No error text is known that names a refused device, so each other login error counts, a network or
+            # server error included. A timeout is not a BitwardenLoginError: no answer says nothing about the device.
+            if session.fixed_device and not isinstance(
+                error, (BitwardenCredentialsRejectedError, BitwardenVerificationRequiredError)
+            ):
+                refusals = _refused_fixed_device_logins(identity) + 1
+                _fixed_device_refusals.set((identity.fingerprint, refusals))
+                LOG.warning(
+                    "Bitwarden login with the fixed device failed",
+                    fingerprint=identity.fingerprint[:12],
+                    refusals=refusals,
+                    reason=_bitwarden_failure_reason(error),
+                )
+            raise
         finally:
             if usage is not None:
                 usage.login_seconds = (usage.login_seconds or 0.0) + time.monotonic() - started
@@ -1365,6 +1450,7 @@ class BitwardenService:
 
         await BitwardenService._apply_jitter()
         identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+        _fixed_device_refusals.set(("", 0))
         async with asyncio.timeout(timeout):
             # Someone browsing their own vault expects to see an item they just added, so this path
             # always syncs first. It still reuses the login, which is what a run's fetch pays for.
@@ -1406,6 +1492,7 @@ class BitwardenService:
         attempt_deadline = _attempt_deadline_seconds(
             timeout, _VaultIdentity.resolve(client_id, client_secret, email, master_password)
         )
+        _fixed_device_refusals.set(("", 0))
         for attempt in range(max_retries):
             try:
                 # A cold login (and an API-key unlock) gets `login_timeout` and every other CLI command gets
@@ -1636,6 +1723,7 @@ class BitwardenService:
         if not bw_organization_id and bw_collection_ids and collection_id not in bw_collection_ids:
             raise BitwardenAccessDeniedError()
         if not fail_reasons:
+            _fixed_device_refusals.set(("", 0))
             await BitwardenService._apply_jitter()
         try:
             vault_identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
@@ -1805,7 +1893,7 @@ class BitwardenService:
         if login_result.stderr and not BitwardenService._is_ignorable_login_stderr(login_result.stderr):
             raise _login_failure(login_result.stderr)
 
-        LOG.info("Bitwarden login successful")
+        LOG.info("Bitwarden login successful", api_key_login=login_command == ["bw", "login", "--apikey"])
         return BitwardenService._extract_session_key(login_result.stdout)
 
     @staticmethod
@@ -1967,6 +2055,7 @@ class BitwardenService:
             raise BitwardenGetItemError(f"Invalid item ID: {item_id}. Check if the item ID is correct")
 
         if not fail_reasons:
+            _fixed_device_refusals.set(("", 0))
             await BitwardenService._apply_jitter()
         try:
             timeout = settings.BITWARDEN_TIMEOUT_SECONDS
@@ -2180,7 +2269,7 @@ class BitwardenService:
         master_password = settings.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD
         if not master_password:
             secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD
-            master_password = await get_aws_client().get_secret(secret_key)
+            master_password = await get_aws_client().get_secret(settings.platform_secret_name(secret_key))
         if not master_password:
             raise BitwardenSecretError("Skyvern auth master password is not set")
         return master_password
@@ -2190,7 +2279,7 @@ class BitwardenService:
         bw_organization_id = settings.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID
         if not bw_organization_id:
             secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID
-            bw_organization_id = await get_aws_client().get_secret(secret_key)
+            bw_organization_id = await get_aws_client().get_secret(settings.platform_secret_name(secret_key))
         if not bw_organization_id:
             raise BitwardenSecretError("Skyvern auth organization ID is not set")
         return bw_organization_id
@@ -2200,7 +2289,7 @@ class BitwardenService:
         client_id = settings.SKYVERN_AUTH_BITWARDEN_CLIENT_ID
         if not client_id:
             secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_ID
-            client_id = await get_aws_client().get_secret(secret_key)
+            client_id = await get_aws_client().get_secret(settings.platform_secret_name(secret_key))
         if not client_id:
             raise BitwardenSecretError("Skyvern auth client ID is not set")
         return client_id
@@ -2210,7 +2299,7 @@ class BitwardenService:
         client_secret = settings.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET
         if not client_secret:
             secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET
-            client_secret = await get_aws_client().get_secret(secret_key)
+            client_secret = await get_aws_client().get_secret(settings.platform_secret_name(secret_key))
         if not client_secret:
             raise BitwardenSecretError("Skyvern auth client secret is not set")
         return client_secret

@@ -1,6 +1,7 @@
-import type {
-  IntegrationActionSpec,
-  IntegrationCatalogEntryWithActions,
+import {
+  isGenericActionAvailable,
+  type IntegrationActionSpec,
+  type IntegrationCatalogEntryWithActions,
 } from "../nodes/IntegrationActionNode/types";
 
 export type AppRow = {
@@ -15,12 +16,11 @@ export function appRows(
   isConnected: (entry: IntegrationCatalogEntryWithActions) => boolean,
 ): AppRow[] {
   const rows = (catalog ?? [])
-    // The integration action block cannot run on a Nango-only account yet, so those apps offer no actions.
-    .map((entry) =>
-      entry.credentialBackend === "nango" && !entry.oauthProvider
-        ? { ...entry, actions: [] }
-        : entry,
-    )
+    // Actions pinned to a Nango account are not offered by this generic block.
+    .map((entry) => ({
+      ...entry,
+      actions: entry.actions?.filter(isGenericActionAvailable),
+    }))
     .filter(
       (entry) =>
         entry.status === "live" &&

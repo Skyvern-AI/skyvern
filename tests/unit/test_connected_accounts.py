@@ -55,9 +55,9 @@ async def test_a_sheets_credential_reaches_only_a_backend_that_can_call_google(r
 
 
 @pytest.mark.asyncio
-async def test_an_unpinned_caller_resolves_only_a_known_account_id() -> None:
-    assert await connected_accounts.resolve_account_access("o_1", "msac_1") == "microsoft:msac_1"
-    assert await connected_accounts.resolve_account_access("o_1", "Work") is None
+async def test_a_pinned_caller_uses_the_requested_api() -> None:
+    assert await connected_accounts.resolve_account_access("o_1", "msac_1", api="microsoft") == "microsoft:msac_1"
+    assert await connected_accounts.resolve_account_access("o_1", "Work", api="microsoft") == "microsoft:Work"
 
 
 @pytest.mark.asyncio
@@ -109,11 +109,11 @@ def test_account_fit_compares_needs_with_granted_scopes_and_nango_is_unknown() -
     # Full Drive access covers Sheets, so a Drive-connected account is a clear "yes" for reading and writing.
     drive = OrgConnection("goac_d", "google", "Drive", None, "active", ("https://www.googleapis.com/auth/drive",))
     assert block_fit(drive, BlockType.GOOGLE_SHEETS_READ) == block_fit(drive, BlockType.GOOGLE_SHEETS_WRITE) == "yes"
-    # The Drive upload block itself requires full drive and refuses drive.file, so that grant is a clear "no".
+    # A narrow-only Drive grant reaches only the files a person chose, so whether an upload works is unknown.
     drive_file = OrgConnection(
         "goac_f", "google", "Drive", None, "active", ("https://www.googleapis.com/auth/drive.file",)
     )
-    assert block_fit(drive_file, BlockType.FILE_UPLOAD) == "no"
+    assert block_fit(drive_file, BlockType.FILE_UPLOAD) == "unknown"
     # The grant older Sheets connections hold, which reconnects keep: it can read and write sheets, not upload.
     legacy_sheets = OrgConnection(
         "goac_l",

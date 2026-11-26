@@ -48,6 +48,26 @@ describe("FailureCategoryBadge", () => {
     expect(screen.getByText("ACCESS_DENIED")).toBeTruthy();
   });
 
+  it("labels no category for a model verdict, and still shows a diagnostic after it", () => {
+    const modelVerdict: FailureCategory = {
+      category: "UNKNOWN",
+      confidence_float: 1.0,
+      reasoning: "model_verdict",
+      reason_code: "model_verdict",
+    };
+    const { container } = render(
+      <FailureCategoryBadge failureCategory={[modelVerdict]} />,
+    );
+    expect(container.textContent).toBe("");
+    cleanup();
+
+    render(
+      <FailureCategoryBadge failureCategory={[modelVerdict, diagnostic({})]} />,
+    );
+    expect(screen.getByText("Bot protection seen during the run")).toBeTruthy();
+    expect(screen.queryByText(/unknown/i)).toBeNull();
+  });
+
   it("shows only the primary when no diagnostic was recorded", () => {
     render(<FailureCategoryBadge failureCategory={[primary]} />);
 

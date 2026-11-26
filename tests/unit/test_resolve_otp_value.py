@@ -32,6 +32,7 @@ def _make_task(
         task_id=task_id,
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
+        otp_request_id=None,
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
         navigation_payload=navigation_payload,

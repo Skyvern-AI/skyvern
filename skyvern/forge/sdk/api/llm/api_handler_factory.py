@@ -2,16 +2,17 @@ import asyncio
 import copy
 import dataclasses
 import functools
+import inspect
 import json
 import re
 import time
 import warnings
 from asyncio import CancelledError
-from collections.abc import Collection
+from collections.abc import Awaitable, Callable, Collection
 from contextvars import ContextVar, Token
 from json import JSONDecodeError
 from types import MappingProxyType
-from typing import Any, AsyncIterator, Literal, Protocol, TypeVar, runtime_checkable
+from typing import Any, AsyncIterator, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 import litellm
 import structlog
@@ -37,18 +38,17 @@ from skyvern.forge import app
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_handler
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.copilot_model_usage import (
-    CopilotModelUsageEvent,
-    _emit_direct_copilot_model_usage,
-)
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CUSTOM_LLM_KEY_PREFIX,
     custom_llm_passthrough_parameters,
+    is_custom_llm_blocked,
     is_custom_llm_key,
     is_custom_llm_owned_by_organization,
+    raise_if_custom_llm_blocked,
 )
 from skyvern.forge.sdk.api.llm.exceptions import (
     BaseLLMError,
+    CustomLLMNeedsResaveError,
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
     InvalidLLMResponseFormat,
@@ -56,10 +56,16 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMOutputTruncatedError,
     LLMProviderError,
     LLMProviderErrorRetryableTask,
+    WithheldProviderError,
+    withhold_provider_text,
 )
 from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
 from skyvern.forge.sdk.api.llm.litellm_usage import use_anthropic_reported_thinking_tokens
+from skyvern.forge.sdk.api.llm.model_usage import (
+    ModelUsageEvent,
+    _emit_direct_ember_model_usage,
+)
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
     is_content_filtered_response,
@@ -74,10 +80,16 @@ from skyvern.forge.sdk.api.llm.utils import (
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import is_manual_like_workflow_run_trigger_type
 from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_schema_variant
-from skyvern.forge.sdk.forge_log import _generated_log_value, _model_log_value, is_generated_log_field
+from skyvern.forge.sdk.forge_log import (
+    _generated_log_value,
+    _model_log_value,
+    exception_log_fields,
+    is_generated_log_field,
+)
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -133,7 +145,12 @@ _NOT_LLM_EXHAUSTION: tuple[type[BaseException], ...] = (
     InvalidLLMResponseFormat,
     InvalidLLMConfigError,
 )
-_STATUS_CODED_LLM_ERRORS = (APIStatusError, AnthropicAPIStatusError, litellm.exceptions.APIError)
+_STATUS_CODED_LLM_ERRORS = (
+    APIStatusError,
+    AnthropicAPIStatusError,
+    litellm.exceptions.APIError,
+    WithheldProviderError,
+)
 # A dead upstream can answer HTTP 200 with an empty body, which surfaces as a JSONDecodeError.
 _LLM_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
     APIConnectionError,
@@ -389,6 +406,53 @@ VISION_FALLBACK_PROMPT_NAMES = {
     "ui-tars-system-prompt",
     *VISION_REQUIRED_PROMPT_NAMES,
 }
+# Prompts that carry a document's content: OCR of a page image, parsed file text, a PDF to split or fill,
+# and the text prompt block that workflows hand parsed file text to.
+DOCUMENT_CONTENT_PROMPT_NAMES = frozenset(
+    {
+        "extract-information-from-file-text",
+        "extract-text-from-image",
+        "pdf-fill-field-mapping",
+        "pdf-fill-flat-placement",
+        "split-pdf",
+        "text-prompt",
+    }
+)
+UNEXPECTED_LLM_ERROR_MESSAGE = "LLM request failed unexpectedly"
+
+
+def _log_unexpected_llm_error(error: Exception, prompt_name: str | None, /, **fields: Any) -> None:
+    if prompt_name not in DOCUMENT_CONTENT_PROMPT_NAMES:
+        LOG.exception(UNEXPECTED_LLM_ERROR_MESSAGE, **fields)
+        return
+    # A provider rejection can quote the document it was sent, so neither its message nor its traceback is logged.
+    status_code = getattr(error, "status_code", None)
+    LOG.error(
+        UNEXPECTED_LLM_ERROR_MESSAGE,
+        **fields,
+        **exception_log_fields(error),
+        status_code=status_code if isinstance(status_code, int) else None,
+        error_message_fingerprint=diagnostic_fingerprint(str(error)),
+    )
+
+
+_AsyncHandler = TypeVar("_AsyncHandler", bound=Callable[..., Awaitable[Any]])
+
+
+def _withholds_document_provider_text(handler: _AsyncHandler) -> _AsyncHandler:
+    signature = inspect.signature(handler)
+
+    @functools.wraps(handler)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await handler(*args, **kwargs)
+        except LLMProviderError as error:
+            if signature.bind_partial(*args, **kwargs).arguments.get("prompt_name") in DOCUMENT_CONTENT_PROMPT_NAMES:
+                withhold_provider_text(error)
+            raise
+
+    return cast(_AsyncHandler, wrapper)
+
 
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
 EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
@@ -416,7 +480,8 @@ def _set_llm_context_attrs(
     span.set_attribute("speculative", bool(is_speculative_step))
 
 
-def _current_secret_values_for_redaction() -> set[str]:
+def _current_secret_values_for_redaction() -> set[str] | None:
+    """None when the lookup failed: the call's prompt cannot be scrubbed, so its artifacts are not stored."""
     if not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
         return set()
 
@@ -427,7 +492,20 @@ def _current_secret_values_for_redaction() -> set[str]:
             exclude_runtime_otp=True,
         )
     except Exception:
-        return set()
+        LOG.warning(
+            "Secret lookup failed; not storing this LLM call's artifacts",
+            artifact_types=[
+                "hashed_href_map",
+                "screenshot_llm",
+                "llm_prompt",
+                "llm_request",
+                "llm_response",
+                "llm_response_parsed",
+                "llm_response_rendered",
+            ],
+            exc_info=True,
+        )
+        return None
     return secret_values
 
 
@@ -627,7 +705,7 @@ def _enrich_llm_span(
         span.set_attribute(key, value)
     ctx = skyvern_context.current()
     if ctx is not None and ctx.copilot_session_id is not None:
-        span.set_attribute("copilot.session_id", ctx.copilot_session_id)
+        span.set_attribute("ember.session_id", ctx.copilot_session_id)
     if not mark_completed:
         return
     span.set_attribute("status", "ok")
@@ -872,14 +950,14 @@ def _cache_creation_tokens(usage: Any) -> int | None:
     return tokens
 
 
-def _copilot_model_usage_event(
+def _ember_model_usage_event(
     response: object,
     *,
     request_model: str,
     provider_name: str | None,
     cost: float | None,
     prompt_name: str | None,
-) -> CopilotModelUsageEvent:
+) -> ModelUsageEvent:
     try:
         response_model = getattr(response, "model", None)
     except Exception:
@@ -901,7 +979,7 @@ def _copilot_model_usage_event(
         cache_read_tokens = None
         cache_creation_tokens = None
     hidden_params = getattr(response, "_hidden_params", None)
-    return CopilotModelUsageEvent(
+    return ModelUsageEvent(
         request_model=request_model,
         response_model=response_model if isinstance(response_model, str) else None,
         provider_name=provider_name,
@@ -923,7 +1001,7 @@ def _copilot_model_usage_event(
     )
 
 
-def _emit_copilot_model_usage_for_response(
+def _emit_ember_model_usage_for_response(
     response: object,
     *,
     request_model: str,
@@ -932,8 +1010,8 @@ def _emit_copilot_model_usage_for_response(
 ) -> None:
     try:
         provider_name = _response_provider(response)
-        _emit_direct_copilot_model_usage(
-            _copilot_model_usage_event(
+        _emit_direct_ember_model_usage(
+            _ember_model_usage_event(
                 response,
                 request_model=request_model,
                 provider_name=provider_name,
@@ -944,7 +1022,7 @@ def _emit_copilot_model_usage_for_response(
         )
     except Exception:
         try:
-            LOG.warning("Failed to emit Copilot model usage", exc_info=True)
+            LOG.warning("Failed to emit model usage", exc_info=True)
         except Exception:
             pass
 
@@ -2034,6 +2112,8 @@ class LLMAPIHandlerFactory:
                 default,
             )
         organization_id = context.organization_id if context is not None else None
+        if is_custom_llm_key(override_llm_key):
+            raise_if_custom_llm_blocked(override_llm_key, organization_id)
         if is_custom_llm_key(override_llm_key) and not _custom_key_belongs_to_run_org(
             override_llm_key, organization_id
         ):
@@ -2076,6 +2156,7 @@ class LLMAPIHandlerFactory:
             fallback_groups = list(llm_config.fallback_model_group)
 
         @traced(name=LLM_REQUEST_SPAN_NAME, tags=[llm_key])
+        @_withholds_document_provider_text
         async def llm_api_handler_with_router_and_fallback(
             prompt: str,
             prompt_name: str,
@@ -2142,7 +2223,9 @@ class LLMAPIHandlerFactory:
             LLMAPIHandlerFactory._apply_pinned_parameters(parameters, llm_config)
 
             context = skyvern_context.current()
-            secret_values = _current_secret_values_for_redaction()
+            looked_up_secret_values = _current_secret_values_for_redaction()
+            secret_lookup_failed = looked_up_secret_values is None
+            secret_values = looked_up_secret_values or set()
             placeholder_ids = _current_placeholder_ids_for_redaction()
             prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids) or ""
             system_prompt = _redact_prompt_text(system_prompt, secret_values, placeholder_ids)
@@ -2153,6 +2236,10 @@ class LLMAPIHandlerFactory:
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
             )
+            should_persist_llm_artifacts = should_persist_llm_artifacts and not secret_lookup_failed
+            if secret_lookup_failed and step and is_speculative_step:
+                # A stash left by an earlier call on this step must not be stored as this call's record.
+                step.speculative_llm_metadata = None
             _should_bundle = step is not None and not is_speculative_step and context is not None
 
             artifacts: list[BulkArtifactCreationRequest | None] = []
@@ -2391,7 +2478,7 @@ class LLMAPIHandlerFactory:
                                 cache_resource_name,
                                 cache_variant,
                             )
-                            _emit_copilot_model_usage_for_response(
+                            _emit_ember_model_usage_for_response(
                                 response,
                                 request_model=direct_model_used,
                                 prompt_name=prompt_name,
@@ -2416,7 +2503,7 @@ class LLMAPIHandlerFactory:
 
                     if response is None:
                         response, llm_request_json = await _call_router_without_cache()
-                        _emit_copilot_model_usage_for_response(
+                        _emit_ember_model_usage_for_response(
                             response,
                             request_model=main_model_group,
                             prompt_name=prompt_name,
@@ -2475,7 +2562,7 @@ class LLMAPIHandlerFactory:
                                 **fallback_params,
                             )
                             LLMAPIHandlerFactory._record_served_service_tier(router, response)
-                            _emit_copilot_model_usage_for_response(
+                            _emit_ember_model_usage_for_response(
                                 response,
                                 request_model=fallback_model,
                                 prompt_name=prompt_name,
@@ -2530,7 +2617,7 @@ class LLMAPIHandlerFactory:
                                     **parameters,
                                 )
                                 LLMAPIHandlerFactory._record_served_service_tier(router, response)
-                                _emit_copilot_model_usage_for_response(
+                                _emit_ember_model_usage_for_response(
                                     response,
                                     request_model=fallback_model,
                                     prompt_name=prompt_name,
@@ -2640,8 +2727,9 @@ class LLMAPIHandlerFactory:
                 except Exception as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "error")
-                    LOG.exception(
-                        "LLM request failed unexpectedly",
+                    _log_unexpected_llm_error(
+                        e,
+                        prompt_name,
                         llm_key=llm_key,
                         model=main_model_group,
                         prompt_name=prompt_name,
@@ -2721,6 +2809,8 @@ class LLMAPIHandlerFactory:
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
                         last_llm_model=actual_model,
                     )
+                    if actual_model is not None:
+                        step.last_llm_model = actual_model
                 if thought:
                     await app.DATABASE.observer.update_thought(
                         thought_id=thought.observer_thought_id,
@@ -2863,7 +2953,7 @@ class LLMAPIHandlerFactory:
 
                 enrich_llm_span()
 
-                if step and is_speculative_step:
+                if step and is_speculative_step and not secret_lookup_failed:
                     step.speculative_llm_metadata = SpeculativeLLMMetadata(
                         prompt=llm_prompt_value,
                         llm_request_json=llm_request_json,
@@ -2951,6 +3041,7 @@ class LLMAPIHandlerFactory:
             return handler
 
         @traced(name=LLM_REQUEST_SPAN_NAME, tags=[llm_key])
+        @_withholds_document_provider_text
         async def llm_api_handler(
             prompt: str,
             prompt_name: str,
@@ -3018,7 +3109,9 @@ class LLMAPIHandlerFactory:
             LLMAPIHandlerFactory._apply_pinned_parameters(active_parameters, llm_config)
 
             context = skyvern_context.current()
-            secret_values = _current_secret_values_for_redaction()
+            looked_up_secret_values = _current_secret_values_for_redaction()
+            secret_lookup_failed = looked_up_secret_values is None
+            secret_values = looked_up_secret_values or set()
             placeholder_ids = _current_placeholder_ids_for_redaction()
             prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids) or ""
             system_prompt = _redact_prompt_text(system_prompt, secret_values, placeholder_ids)
@@ -3029,6 +3122,10 @@ class LLMAPIHandlerFactory:
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
             )
+            should_persist_llm_artifacts = should_persist_llm_artifacts and not secret_lookup_failed
+            if secret_lookup_failed and step and is_speculative_step:
+                # A stash left by an earlier call on this step must not be stored as this call's record.
+                step.speculative_llm_metadata = None
             _should_bundle = step is not None and not is_speculative_step and context is not None
 
             artifacts: list[BulkArtifactCreationRequest | None] = []
@@ -3234,7 +3331,7 @@ class LLMAPIHandlerFactory:
                         **active_parameters,
                     )
                     llm_duration_seconds = time.perf_counter() - t_llm_request
-                    _emit_copilot_model_usage_for_response(
+                    _emit_ember_model_usage_for_response(
                         response,
                         request_model=model_name,
                         prompt_name=prompt_name,
@@ -3325,8 +3422,9 @@ class LLMAPIHandlerFactory:
                 except Exception as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "error")
-                    LOG.exception(
-                        "LLM request failed unexpectedly",
+                    _log_unexpected_llm_error(
+                        e,
+                        prompt_name,
                         llm_key=llm_key,
                         model=model_name,
                         prompt_name=prompt_name,
@@ -3399,6 +3497,8 @@ class LLMAPIHandlerFactory:
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
                         last_llm_model=actual_model,
                     )
+                    if actual_model is not None:
+                        step.last_llm_model = actual_model
                 if thought:
                     await app.DATABASE.observer.update_thought(
                         thought_id=thought.observer_thought_id,
@@ -3535,7 +3635,7 @@ class LLMAPIHandlerFactory:
 
                 enrich_llm_span()
 
-                if step and is_speculative_step:
+                if step and is_speculative_step and not secret_lookup_failed:
                     step.speculative_llm_metadata = SpeculativeLLMMetadata(
                         prompt=llm_prompt_value,
                         llm_request_json=llm_request_json,
@@ -3722,11 +3822,23 @@ def _custom_key_belongs_to_run_org(llm_key: str, organization_id: str | None) ->
     return is_custom_llm_owned_by_organization(custom_llm_id, organization_id)
 
 
+def _blocked_custom_llm_handler(llm_key: str) -> LLMAPIHandler:
+    async def blocked_custom_llm_handler(*args: Any, **kwargs: Any) -> Any:
+        raise CustomLLMNeedsResaveError(llm_key)
+
+    blocked_custom_llm_handler.llm_key = llm_key  # type: ignore[attr-defined]
+    return blocked_custom_llm_handler
+
+
 def _resolve_org_default_llm_handler(
     llm_key: str,
     organization_id: str | None,
     fallback: LLMAPIHandler,
 ) -> LLMAPIHandler:
+    # Callers resolve the org default before applying an explicit model, so a blocked default
+    # fails only if it is actually called.
+    if is_custom_llm_key(llm_key) and is_custom_llm_blocked(llm_key, organization_id):
+        return _blocked_custom_llm_handler(llm_key)
     try:
         if is_custom_llm_key(llm_key) and not _custom_key_belongs_to_run_org(llm_key, organization_id):
             LOG.warning(
@@ -3922,6 +4034,7 @@ class LLMCaller:
         )
 
     @traced(name=LLM_REQUEST_SPAN_NAME)
+    @_withholds_document_provider_text
     async def call(
         self,
         prompt: str | None = None,
@@ -3982,7 +4095,9 @@ class LLMCaller:
                 )
 
         context = skyvern_context.current()
-        secret_values = _current_secret_values_for_redaction()
+        looked_up_secret_values = _current_secret_values_for_redaction()
+        secret_lookup_failed = looked_up_secret_values is None
+        secret_values = looked_up_secret_values or set()
         placeholder_ids = _current_placeholder_ids_for_redaction()
         original_prompt = prompt
         prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids)
@@ -3990,6 +4105,10 @@ class LLMCaller:
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
         )
+        should_persist_llm_artifacts = should_persist_llm_artifacts and not secret_lookup_failed
+        if secret_lookup_failed and step and is_speculative_step:
+            # A stash left by an earlier call on this step must not be stored as this call's record.
+            step.speculative_llm_metadata = None
         _should_bundle = step is not None and not is_speculative_step and context is not None
 
         artifacts: list[BulkArtifactCreationRequest | None] = []
@@ -4228,7 +4347,7 @@ class LLMCaller:
                 raise
             except Exception as e:
                 _llm_span.set_attribute("status", "error")
-                LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
+                _log_unexpected_llm_error(e, prompt_name, llm_key=self.llm_key)
                 if not caller_owns_exhaustion_receipt:
                     self.emit_retry_chain_exhausted(e, prompt_name)
                 raise LLMProviderError(self.llm_key, cause=e) from e
@@ -4242,7 +4361,7 @@ class LLMCaller:
             try:
                 call_stats = await self.get_call_stats(response)
             finally:
-                _emit_copilot_model_usage_for_response(
+                _emit_ember_model_usage_for_response(
                     response,
                     request_model=self.llm_config.model_name,
                     prompt_name=prompt_name,
@@ -4279,6 +4398,8 @@ class LLMCaller:
                     incremental_cached_tokens=call_stats.cached_tokens,
                     last_llm_model=actual_model,
                 )
+                if actual_model is not None:
+                    step.last_llm_model = actual_model
             if thought:
                 await app.DATABASE.observer.update_thought(
                     thought_id=thought.observer_thought_id,
@@ -4418,7 +4539,7 @@ class LLMCaller:
 
             enrich_llm_span()
 
-            if step and is_speculative_step:
+            if step and is_speculative_step and not secret_lookup_failed:
                 step.speculative_llm_metadata = SpeculativeLLMMetadata(
                     prompt=llm_prompt_value,
                     llm_request_json=llm_request_json,
@@ -4547,7 +4668,7 @@ class LLMCaller:
     ) -> LLMCallStats:
         """Usage for a response this call is throwing away; its tokens were still spent and still bill."""
         stats = await self.get_call_stats(response)
-        _emit_copilot_model_usage_for_response(
+        _emit_ember_model_usage_for_response(
             response,
             request_model=self.llm_config.model_name,
             prompt_name=prompt_name,

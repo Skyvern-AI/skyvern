@@ -48,6 +48,12 @@ const catalog: IntegrationCatalogEntryWithActions[] = [
     actions: [
       sendEmail(["gmail.send"]),
       { id: "read_inbox", name: "Read inbox", description: "", inputs: {} },
+      {
+        id: "archive_email",
+        name: "Archive email",
+        description: "",
+        inputs: { properties: { credential_source: { const: "nango" } } },
+      },
     ],
     triggers: [{ id: "new_email", name: "New email" }],
   },
@@ -79,13 +85,26 @@ describe("integration action library and validation", () => {
 
   test("lists live apps connected first and finds an action in every app", () => {
     const rows = appRows(catalog, (entry) => entry.id === "gmail");
-    expect(rows.map((row) => row.entry.id)).toEqual(["gmail", "outlook"]);
+    expect(rows.map((row) => row.entry.id)).toEqual([
+      "gmail",
+      "outlook",
+      "powerbi",
+    ]);
     expect(
       matchingAppActions(rows, "send email").map(
         ({ entry, action }) => `${entry.name}: ${action.name}`,
       ),
-    ).toEqual(["Gmail: Send email", "Outlook: Send email"]);
+    ).toEqual([
+      "Gmail: Send email",
+      "Outlook: Send email",
+      "Power BI: Send email",
+    ]);
     expect(matchingAppActions(rows, "gmail inbox")).toHaveLength(1);
+    expect(rows[0]?.entry.actions?.map((action) => action.id)).toEqual([
+      "send_email",
+      "read_inbox",
+    ]);
+    expect(matchingAppActions(rows, "archive")).toEqual([]);
   });
 
   test("flags a missing account, missing required inputs and bad typed text", () => {
@@ -109,9 +128,12 @@ describe("integration action library and validation", () => {
     });
     expect(validateIntegrationActionNode(ok, catalog)).toEqual([]);
     expect(validateIntegrationActionNode(ok, undefined)).toEqual([]);
-    expect(validateIntegrationActionNode(actionNode({}), undefined)).toEqual([
-      "send: Pick an app action.",
-    ]);
+    expect(
+      validateIntegrationActionNode(
+        actionNode({ integrationId: "gmail" }),
+        undefined,
+      ),
+    ).toEqual(["send: Action is required."]);
     const list = actionNode({
       ...ok.data,
       inputs: { ...ok.data.inputs, headers: [], priority: 1.5 },

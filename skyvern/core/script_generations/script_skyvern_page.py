@@ -963,6 +963,7 @@ class ScriptSkyvernPage(SkyvernPage):
                     organization_id=organization_id,
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
+                    otp_request_id=context.otp_request_id,
                     totp_verification_url=totp_url,
                     totp_identifier=totp_identifier,
                     expected_otp_type=OTPType.TOTP,
@@ -981,6 +982,12 @@ class ScriptSkyvernPage(SkyvernPage):
             return False
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
         return bool(workflow_run_context and workflow_run_context.get_original_secret_value_or_none(value) is not None)
+
+    def _mask_secrets_enabled(self) -> bool:
+        context = skyvern_context.current()
+        return context is not None and app.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run(
+            context.workflow_run_id
+        )
 
     def _is_card_secret_reference(self, value: str) -> bool:
         context = skyvern_context.current()
@@ -1200,6 +1207,7 @@ class ScriptSkyvernPage(SkyvernPage):
             organization_id=organization_id,
             task_id=context.task_id if context else None,
             workflow_run_id=context.workflow_run_id if context else None,
+            otp_request_id=context.otp_request_id if context else None,
             totp_verification_url=totp_url,
             totp_identifier=totp_identifier,
             created_after=naive_utc_now() - MAGIC_LINK_ANCHOR_GRACE,

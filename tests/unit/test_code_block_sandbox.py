@@ -1834,6 +1834,7 @@ class _FakeWorkflowRun:
     def __init__(self) -> None:
         self.workflow_id = "w"
         self.workflow_permanent_id = "wpid"
+        self.otp_request_id = "otpr_code_block"
         # Naive, like workflow_runs.started_at (Column(DateTime)). An aware value here would let a
         # local-clock anchor pass the call-time assertion below in every timezone.
         self.started_at = datetime(2026, 6, 14, 0, 0, 0)
@@ -2032,6 +2033,7 @@ class TestCodeBlockOtpIdentifierFetch:
         assert captured["totp_identifier"] == "otp@example.com"
         assert captured["created_after"] == fake_run.started_at
         assert captured["organization_id"] == _ORG_ID
+        assert captured["otp_request_id"] == "otpr_code_block"
         # The budget is the in-block setting, never the legacy 15-minute window.
         assert "timeout" not in captured
 
@@ -2862,10 +2864,10 @@ class TestCodeBlockOtpNoLeak:
 
         import pyotp
 
-        from skyvern.forge.sdk.copilot.output_utils import build_run_blocks_response, sanitize_tool_result_for_llm
-        from skyvern.forge.sdk.copilot.tools import _attach_action_traces
-        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
-        from skyvern.forge.sdk.copilot.tools.run_execution import _summarize_action_trace
+        from skyvern.forge.sdk.ember.output_utils import build_run_blocks_response, sanitize_tool_result_for_llm
+        from skyvern.forge.sdk.ember.tools import _attach_action_traces
+        from skyvern.forge.sdk.ember.tools import run_execution as run_execution_module
+        from skyvern.forge.sdk.ember.tools.run_execution import _summarize_action_trace
         from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
         from skyvern.webeye.actions.actions import Action
 
@@ -4361,9 +4363,10 @@ class TestClearBrowserDataHelperBinding:
         assert await user_function() == {"value": "keep"}
 
     @pytest.mark.asyncio
-    async def test_publish_file_in_process_refuses_with_its_reason(self) -> None:
+    @pytest.mark.parametrize("call", ['publish_file("report.txt", text="hi")', 'read_run_file("report.txt")'])
+    async def test_secure_runner_file_helpers_in_process_refuse_with_their_reason(self, call: str) -> None:
         user_function = self._block().generate_async_user_function(
-            'await publish_file("report.txt", text="hi")\nreturn {}\n',
+            f"await {call}\nreturn {{}}\n",
             SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
         )
 

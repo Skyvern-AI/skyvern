@@ -14,7 +14,9 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.exceptions import AzureConfigurationError, BlockedHost, DownloadSaveIncompleteError, UnresolvableHost
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.experimentation.drive_shared_drive_search import DRIVE_SHARED_DRIVE_SEARCH_FLAG
 from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, sftp_service
@@ -242,7 +244,7 @@ async def test_google_drive_source_asks_only_google_for_a_non_google_account(tmp
     execution.get_google_workspace_credentials.assert_awaited_once_with(
         organization_id="organization-id",
         credential_id="msac_1",
-        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_STEP_SCOPES),
     )
 
 
@@ -288,7 +290,7 @@ async def test_google_drive_target_downloads_private_drive_source_without_browse
     execution.get_google_workspace_credentials.assert_awaited_once_with(
         organization_id="organization-id",
         credential_id="google-credential-id",
-        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_STEP_SCOPES),
     )
     execution.storage_save.assert_awaited_once_with(
         organization_id="organization-id",
@@ -431,7 +433,22 @@ async def test_google_drive_native_document_falls_back_to_browser(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_google_drive_api_file_not_downloadable_does_not_fall_back_to_browser(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("status", "code", "flag_on", "expected"),
+    [
+        (403, "fileNotDownloadable", True, "Drive rejected a regular blob download"),
+        (404, "notFound", False, "Drive rejected a regular blob download"),
+        (404, "notFound", True, "cannot see this Drive folder or file"),
+        (403, "insufficientFilePermissions", True, "cannot download this Drive file"),
+    ],
+)
+async def test_google_drive_api_error_does_not_fall_back_to_browser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int, code: str, flag_on: bool, expected: str
+) -> None:
+    async def shared_drive_flag(feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
+        return flag_on and feature_name == DRIVE_SHARED_DRIVE_SEARCH_FLAG and distinct_id == "organization-id"
+
+    monkeypatch.setattr(forge_app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", shared_drive_flag)
     block = _file_download_block(
         FileDownloadTarget.GOOGLE_DRIVE,
         url="https://drive.google.com/file/d/file_123/view",
@@ -444,15 +461,18 @@ async def test_google_drive_api_file_not_downloadable_does_not_fall_back_to_brow
         _browser_result(block),
         tmp_path / "downloads",
         drive_download_side_effect=google_drive_service.GoogleDriveAPIError(
-            status=403,
-            code="fileNotDownloadable",
+            status=status,
+            code=code,
             message="Drive rejected a regular blob download",
         ),
     )
 
     assert execution.result.success is False
     assert execution.result.failure_reason is not None
-    assert "Drive rejected a regular blob download" in execution.result.failure_reason
+    assert expected in execution.result.failure_reason
+    if flag_on and code != "fileNotDownloadable":
+        assert "Drive rejected a regular blob download" not in execution.result.failure_reason
+        assert "Contributor" not in execution.result.failure_reason
     execution.browser_execute.assert_not_awaited()
     execution.record_output.assert_awaited_once()
 
@@ -1801,7 +1821,7 @@ async def test_google_drive_unwraps_credential_id_and_requests_drive_scopes(tmp_
     execution.get_google_workspace_credentials.assert_awaited_once_with(
         organization_id="organization-id",
         credential_id="actual-google-credential",
-        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_STEP_SCOPES),
     )
     destination = execution.upload.await_args.kwargs["destination"]
     assert destination.storage_type == FileStorageType.GOOGLE_DRIVE

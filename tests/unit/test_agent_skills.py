@@ -12,7 +12,7 @@ from skyvern.forge.sdk.agents.skills import (
     SkillSession,
     skill_result_chars,
 )
-from tests.unit.copilot_test_helpers import available_skill, skill_md
+from tests.unit.ember_test_helpers import available_skill, skill_md
 
 LOGIN_BODY = "Tick 'Remember this device' at https://example.com/login before submitting.\n"
 

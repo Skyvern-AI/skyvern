@@ -27,8 +27,8 @@ Every integration with a **Connect**, **Configure** or **Set up →** button is 
 | Integration | Category | What it does | Button |
 |---|---|---|---|
 | Google Sheets | Workspace | Read and write sheets in your agents | **Connect** |
-| Google Drive | Workspace | Upload run files to Drive folders | **Connect** |
-| Gmail | Communication | Read verification codes and send email from your agents | **Connect** |
+| Google Drive | Workspace | Upload files to Drive, download Drive files, and list, create and move folders and files | **Connect** |
+| Gmail | Communication | Read emails, including verification codes, and send emails from your agents | **Connect** |
 | Outlook | Communication | Find verification codes and emails in your inbox | **Connect** |
 | 1Password | Credentials | Use logins from your 1Password vaults | **Configure** |
 | Bitwarden | Credentials | Use logins from your Bitwarden vault | **Configure** |
@@ -62,12 +62,14 @@ Google Sheets, Google Drive, Gmail and Outlook connect through Google or Microso
 
 Copilot offers these connections in the Studio chat too. When an agent needs Gmail or Google Sheets, it shows a card with a **Connect** button that opens Google's consent window, then lets you pick the account on the card. Each of the two gets its own card, the Gmail card asks for read-only mail access, and with role-based access control on, a role without the grant sees **Admin required** on the card's button. [Your first agent with Copilot](/cloud/quickstart) shows where the card appears.
 
+Ask Copilot in the chat for a new Google Sheet and it creates one. It asks you to pick a connected Google account, creates an empty spreadsheet in that account's My Drive, and puts the sheet's URL in each **Google Sheets Write** block it builds, one block per tab. Ask again for the same title and account in the same chat and it reuses the sheet it already made. With role-based access control on, creating needs the `google_sheet.create` grant; without it nothing is created and Copilot tells you the permission is missing. Give Copilot the URL of an existing sheet instead and it writes to that sheet and creates nothing. The **Google Sheets Write** block itself never creates a spreadsheet.
+
 What each connection asks for, and where you use it:
 
 | Integration | Access requested | Where you use it |
 |---|---|---|
 | Google Sheets | Read and write spreadsheets, read Drive file metadata | **Google Sheets Read** and **Google Sheets Write** blocks |
-| Google Drive | Full Drive access | **Cloud Storage** block with storage type **Google Drive**; **File Download** block for Drive links |
+| Google Drive | Full Drive access | **Cloud Storage** block with storage type **Google Drive**; **File Download** block with **Download Target** set to **Google Drive**, and for Drive links |
 | Gmail | **Read inbox**: read-only mail. **Send email**: send mail as the account. | **Email Inbox** block and email-based 2FA on [credentials](/credentials) (read); **Send Email** block with **Send with** set to the account (send) |
 | Outlook | Read mail (`Mail.Read`) | **Email Inbox** block, and email-based 2FA on [credentials](/credentials) |
 
@@ -110,6 +112,8 @@ For Bitwarden, **Email** and **Master Password** are the default. Add a **Person
 In the Bitwarden web app, open **Settings > Security > Keys > View API key**. Copy `client_id` (starts with `user.`) and `client_secret` into the form. Organization API keys do not work.
 
 The key plus your master password open the vault without a code or two-step check. Store and share the key like your master password.
+
+With a personal API key, Skyvern signs in to Bitwarden with the same device identifier on each run, so the runs present one device to Bitwarden, not a new device each time. Skyvern uses a new identifier after you rotate the key. After two consecutive sign-in errors with this device identifier during one credential read, Skyvern uses a new device identifier for that read's next sign-in attempt. Rejected credentials, verification prompts, timeouts and errors after sign-in do not count. A connection with only an email and master password is unchanged: each sign-in uses a new device identifier.
 
 To rotate the key, select **Rotate API key** in Bitwarden, then save the new secret in Skyvern. Saving replaces the whole credential, so enter your master password again too. Saving Bitwarden settings with the `skyvern_bitwarden_config_set` MCP tool also replaces the whole credential and removes any saved API key.
 

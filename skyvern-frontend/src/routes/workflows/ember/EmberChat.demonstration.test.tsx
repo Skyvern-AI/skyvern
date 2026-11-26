@@ -192,7 +192,7 @@ async function renderChat(props: ComponentProps<typeof EmberChat> = {}) {
   );
   await waitFor(() =>
     expect(
-      screen.getByRole("group", { name: "Copilot message composer" }),
+      screen.getByRole("group", { name: "Ember message composer" }),
     ).toBeTruthy(),
   );
   return (next: ComponentProps<typeof EmberChat>) =>
@@ -239,7 +239,7 @@ async function renderStudioChat(props: ComponentProps<typeof EmberChat> = {}) {
   );
   await waitFor(() =>
     expect(
-      screen.getByRole("group", { name: "Copilot message composer" }),
+      screen.getByRole("group", { name: "Ember message composer" }),
     ).toBeTruthy(),
   );
   return () => portalTarget.remove();

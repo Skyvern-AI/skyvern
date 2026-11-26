@@ -6,12 +6,13 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import structlog
-from sqlalchemy import Select, and_, case, desc, exists, func, or_, select, update
+from sqlalchemy import Select, and_, case, desc, exists, func, or_, select, union, update
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from skyvern.config import settings
+from skyvern.constants import EMBER_RUN_CREATOR
 from skyvern.exceptions import (
     BrowserProfileNotFound,
     BrowserSessionAlreadyEndedError,
@@ -61,7 +62,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     resolve_terminal_status,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.schemas.browser_session_kind import COPILOT_PRESTART_RUNNABLE_TYPE
+from skyvern.schemas.browser_session_kind import EMBER_PRESTART_RUNNABLE_TYPE
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, parse_proxy_location_input
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -115,14 +116,14 @@ def _managed_browser_profile_query(
     )
 
 
-def unattributed_copilot_session(organization_id: str) -> ColumnElement[bool]:
+def unattributed_ember_session(organization_id: str) -> ColumnElement[bool]:
     """A Copilot browser that names no workflow and that no run, task, debug session, recording, binding or managed
     profile ties to one: it predates the record of the workflow it authors, so whose browser it is cannot be known."""
     browser = PersistentBrowserSessionModel
     session_id = browser.persistent_browser_session_id
     return and_(
         # NULL-safe: a plain session has no creator, and NOT of a NULL comparison would hide it from every list.
-        browser.created_by.is_not_distinct_from("copilot"),
+        browser.created_by.is_not_distinct_from(EMBER_RUN_CREATOR),
         browser.created_for_workflow_permanent_id.is_(None),
         browser.created_for_workflow_run_id.is_(None),
         browser.bound_workflow_permanent_id.is_(None),
@@ -173,7 +174,7 @@ async def _session_folder_filter(organization_id: str) -> ColumnElement[bool] | 
         return None
     if not hidden:
         # Restrictions exist but hide no workflow from this caller: only the unattributed rule applies, as in authorize.
-        return ~unattributed_copilot_session(organization_id)
+        return ~unattributed_ember_session(organization_id)
     session_id = PersistentBrowserSessionModel.persistent_browser_session_id
     bound = PersistentBrowserSessionModel.bound_workflow_permanent_id
     created_for = PersistentBrowserSessionModel.created_for_workflow_permanent_id
@@ -182,7 +183,7 @@ async def _session_folder_filter(organization_id: str) -> ColumnElement[bool] | 
         # A Copilot chat's own browser belongs to the workflow being authored. One from before that was recorded is
         # judged by whatever else links it, and hidden only when nothing does.
         or_(created_for.is_(None), created_for.not_in(hidden)),
-        ~unattributed_copilot_session(organization_id),
+        ~unattributed_ember_session(organization_id),
         # A session being provisioned for a run belongs to that run before the run row records it.
         ~exists().where(
             WorkflowRunModel.organization_id == organization_id,
@@ -227,6 +228,10 @@ async def _session_folder_filter(organization_id: str) -> ColumnElement[bool] | 
 class BrowserSessionsRepository(BaseRepository):
     """Database operations for browser profiles and persistent browser sessions."""
 
+    def _session_from_row(self, row: PersistentBrowserSessionModel) -> PersistentBrowserSession:
+        # Every session read goes through here so a subclass can derive fields the row stores in reduced form.
+        return PersistentBrowserSession.model_validate(row)
+
     @db_operation("create_browser_profile")
     async def create_browser_profile(
         self,
@@ -236,9 +241,15 @@ class BrowserSessionsRepository(BaseRepository):
         source_browser_type: str | None = None,
         proxy_location: ProxyLocationInput = None,
         proxy_session_id: str | None = None,
+        *,
+        browser_profile_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+        source_browser_session_id: str | None = None,
+        source_workflow_run_id: str | None = None,
+        session: AsyncSession | None = None,
     ) -> BrowserProfile:
-        async with self.Session() as session:
-            browser_profile_id = generate_browser_profile_id()
+        async with nullcontext(session) if session is not None else self.Session() as connection:
+            browser_profile_id = browser_profile_id or generate_browser_profile_id()
             proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
                 proxy_location=proxy_location,
                 proxy_session_id=proxy_session_id,
@@ -252,11 +263,145 @@ class BrowserSessionsRepository(BaseRepository):
                 source_browser_type=source_browser_type,
                 proxy_location=serialize_proxy_location(proxy_location),
                 proxy_session_id=proxy_session_id,
+                workflow_permanent_id=workflow_permanent_id,
+                source_browser_session_id=source_browser_session_id,
+                source_workflow_run_id=source_workflow_run_id,
             )
-            session.add(browser_profile)
-            await session.commit()
-            await session.refresh(browser_profile)
+            connection.add(browser_profile)
+            if session is None:
+                await connection.commit()
+            else:
+                await connection.flush()
+            await connection.refresh(browser_profile)
             return BrowserProfile.model_validate(browser_profile)
+
+    @db_operation("get_browser_session_workflow_permanent_ids")
+    async def get_browser_session_workflow_permanent_ids(
+        self, *, organization_id: str, browser_session_id: str
+    ) -> frozenset[str]:
+        """Every workflow a session's browser state came from, by the same links the session folder rule counts."""
+        browser = PersistentBrowserSessionModel
+        run = WorkflowRunModel
+        this_session = and_(
+            browser.organization_id == organization_id, browser.persistent_browser_session_id == browser_session_id
+        )
+        sources = [
+            select(browser.bound_workflow_permanent_id.label("wpid")).where(this_session),
+            select(browser.created_for_workflow_permanent_id.label("wpid")).where(this_session),
+            select(run.workflow_permanent_id.label("wpid")).where(
+                this_session,
+                run.organization_id == organization_id,
+                run.workflow_run_id == browser.created_for_workflow_run_id,
+            ),
+            select(BrowserProfileModel.workflow_permanent_id.label("wpid")).where(
+                this_session,
+                BrowserProfileModel.organization_id == organization_id,
+                BrowserProfileModel.browser_profile_id == browser.browser_profile_id,
+            ),
+            *(
+                select(model.workflow_permanent_id.label("wpid")).where(
+                    model.organization_id == organization_id, model.browser_session_id == browser_session_id
+                )
+                for model in (WorkflowRunModel, DebugSessionModel, BrowserRecordingModel, TaskV2Model)
+            ),
+            *(
+                select(run.workflow_permanent_id.label("wpid")).where(
+                    task.organization_id == organization_id,
+                    task.browser_session_id == browser_session_id,
+                    run.organization_id == organization_id,
+                    run.workflow_run_id == task.workflow_run_id,
+                )
+                for task in (TaskModel, TaskV2Model)
+            ),
+            select(run.workflow_permanent_id.label("wpid")).where(
+                WorkflowRunAttemptModel.organization_id == organization_id,
+                WorkflowRunAttemptModel.pinned_browser_session_id == browser_session_id,
+                run.organization_id == organization_id,
+                run.workflow_run_id == WorkflowRunAttemptModel.workflow_run_id,
+            ),
+        ]
+        async with self.Session() as session:
+            rows = await session.scalars(union(*sources))
+            return frozenset(workflow_permanent_id for workflow_permanent_id in rows if workflow_permanent_id)
+
+    @db_operation("get_browser_profile_sources")
+    async def get_browser_profile_sources(
+        self, *, organization_id: str, browser_profile_ids: set[str]
+    ) -> dict[str, tuple[str | None, str | None]]:
+        """(source session, source run) for each profile that was saved from one."""
+        if not browser_profile_ids:
+            return {}
+        async with self.Session() as session:
+            rows = await session.execute(
+                select(
+                    BrowserProfileModel.browser_profile_id,
+                    BrowserProfileModel.source_browser_session_id,
+                    BrowserProfileModel.source_workflow_run_id,
+                ).where(
+                    BrowserProfileModel.organization_id == organization_id,
+                    BrowserProfileModel.browser_profile_id.in_(browser_profile_ids),
+                    or_(
+                        BrowserProfileModel.source_browser_session_id.is_not(None),
+                        BrowserProfileModel.source_workflow_run_id.is_not(None),
+                    ),
+                )
+            )
+            return {profile_id: (session_id, run_id) for profile_id, session_id, run_id in rows.all()}
+
+    @db_operation("get_browser_session_seed_profile_ids")
+    async def get_browser_session_seed_profile_ids(
+        self, *, organization_id: str, browser_session_ids: set[str]
+    ) -> dict[str, str]:
+        """The profile each session was started from, for sessions started from one."""
+        if not browser_session_ids:
+            return {}
+        async with self.Session() as session:
+            rows = await session.execute(
+                select(
+                    PersistentBrowserSessionModel.persistent_browser_session_id,
+                    PersistentBrowserSessionModel.browser_profile_id,
+                ).where(
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.persistent_browser_session_id.in_(browser_session_ids),
+                    PersistentBrowserSessionModel.browser_profile_id.is_not(None),
+                )
+            )
+            return {browser_session_id: browser_profile_id for browser_session_id, browser_profile_id in rows.all()}
+
+    @db_operation("get_browser_profile_source_seed_ids")
+    async def get_browser_profile_source_seed_ids(
+        self, *, organization_id: str, browser_session_id: str | None, workflow_run_id: str | None
+    ) -> set[str]:
+        """Profiles the source session or run was seeded from; their state is part of what the source holds."""
+        seeds: list[Select[tuple[str | None]]] = []
+        if browser_session_id:
+            seeds.append(
+                select(PersistentBrowserSessionModel.browser_profile_id).where(
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.persistent_browser_session_id == browser_session_id,
+                )
+            )
+        if workflow_run_id:
+            seeds.append(
+                select(WorkflowRunModel.browser_profile_id).where(
+                    WorkflowRunModel.organization_id == organization_id,
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                )
+            )
+        if not seeds:
+            return set()
+        async with self.Session() as session:
+            rows = await session.scalars(union(*seeds))
+            return {browser_profile_id for browser_profile_id in rows.all() if browser_profile_id}
+
+    async def is_browser_profile_access_scoped(self, *, organization_id: str, profile: BrowserProfile) -> bool:
+        """Whether a profile carries a workflow's or a source's access rules beyond the organization."""
+        if profile.workflow_permanent_id is not None:
+            return True
+        sources = await self.get_browser_profile_sources(
+            organization_id=organization_id, browser_profile_ids={profile.browser_profile_id}
+        )
+        return profile.browser_profile_id in sources
 
     @db_operation("get_or_create_managed_browser_profile")
     async def get_or_create_managed_browser_profile(
@@ -742,7 +887,7 @@ class BrowserSessionsRepository(BaseRepository):
                 query = query.filter(_NOT_EXTERNAL_CDP)
             result = await session.execute(query)
             sessions = result.scalars().all()
-            return [PersistentBrowserSession.model_validate(session) for session in sessions]
+            return [self._session_from_row(session) for session in sessions]
 
     @db_operation("get_persistent_browser_sessions_history")
     async def get_persistent_browser_sessions_history(
@@ -778,7 +923,7 @@ class BrowserSessionsRepository(BaseRepository):
                 .limit(page_size)
             )
             sessions = result.scalars().all()
-            return [PersistentBrowserSession.model_validate(session) for session in sessions]
+            return [self._session_from_row(session) for session in sessions]
 
     @db_operation("get_persistent_browser_sessions_history_count")
     async def get_persistent_browser_sessions_history_count(
@@ -847,7 +992,7 @@ class BrowserSessionsRepository(BaseRepository):
             persistent_browser_session = (await session.scalars(query)).first()
             if persistent_browser_session is None:
                 return None
-            return PersistentBrowserSession.model_validate(persistent_browser_session)
+            return self._session_from_row(persistent_browser_session)
 
     @db_operation("clear_persistent_browser_session_binding")
     async def clear_persistent_browser_session_binding(
@@ -922,7 +1067,7 @@ class BrowserSessionsRepository(BaseRepository):
                 query = query.filter_by(organization_id=organization_id)
             persistent_browser_session = (await session.scalars(query)).first()
             if persistent_browser_session:
-                return PersistentBrowserSession.model_validate(persistent_browser_session)
+                return self._session_from_row(persistent_browser_session)
             return None
 
     @read_retry()
@@ -963,7 +1108,7 @@ class BrowserSessionsRepository(BaseRepository):
                 query = query.filter_by(organization_id=organization_id)
             persistent_browser_session = (await session.scalars(query)).first()
             if persistent_browser_session:
-                return PersistentBrowserSession.model_validate(persistent_browser_session)
+                return self._session_from_row(persistent_browser_session)
             return None
 
     @db_operation("create_imported_persistent_browser_session")
@@ -987,7 +1132,7 @@ class BrowserSessionsRepository(BaseRepository):
             session.add(browser_session)
             await session.commit()
             await session.refresh(browser_session)
-            return PersistentBrowserSession.model_validate(browser_session)
+            return self._session_from_row(browser_session)
 
     @db_operation("create_vendor_cdp_browser_session")
     async def create_vendor_cdp_browser_session(
@@ -1021,7 +1166,7 @@ class BrowserSessionsRepository(BaseRepository):
                 exc.hide_parameters = True
                 raise
             await session.refresh(browser_session)
-            return PersistentBrowserSession.model_validate(browser_session)
+            return self._session_from_row(browser_session)
 
     @db_operation("get_persistent_browser_session_unscoped")
     async def get_persistent_browser_session_unscoped(self, session_id: str) -> PersistentBrowserSession | None:
@@ -1035,7 +1180,7 @@ class BrowserSessionsRepository(BaseRepository):
             )
             persistent_browser_session = (await session.scalars(query)).first()
             if persistent_browser_session:
-                return PersistentBrowserSession.model_validate(persistent_browser_session)
+                return self._session_from_row(persistent_browser_session)
             return None
 
     @db_operation("touch_last_activity")
@@ -1179,14 +1324,14 @@ class BrowserSessionsRepository(BaseRepository):
             return result.first() is not None
 
     @db_operation("claim_copilot_prestart")
-    async def claim_copilot_prestart(self, *, session_id: str, organization_id: str) -> bool:
+    async def claim_ember_prestart(self, *, session_id: str, organization_id: str) -> bool:
         async with self.Session() as session:
             result = await session.scalars(
                 update(PersistentBrowserSessionModel)
                 .where(
                     PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
                     PersistentBrowserSessionModel.organization_id == organization_id,
-                    PersistentBrowserSessionModel.runnable_type == COPILOT_PRESTART_RUNNABLE_TYPE,
+                    PersistentBrowserSessionModel.runnable_type == EMBER_PRESTART_RUNNABLE_TYPE,
                     PersistentBrowserSessionModel.runnable_id.is_(None),
                     PersistentBrowserSessionModel.deleted_at.is_(None),
                     PersistentBrowserSessionModel.completed_at.is_(None),
@@ -1305,7 +1450,7 @@ class BrowserSessionsRepository(BaseRepository):
                 run.browser_session_id = browser_session.persistent_browser_session_id
             # Validate after this flush (the proxy pin's UPDATE stamps modified_at) and before commit expires the row.
             await session.flush()
-            created = PersistentBrowserSession.model_validate(browser_session)
+            created = self._session_from_row(browser_session)
             await session.commit()
             return created
 
@@ -1429,7 +1574,7 @@ class BrowserSessionsRepository(BaseRepository):
                 exc.hide_parameters = True
                 raise
             await session.refresh(persistent_browser_session)
-            return PersistentBrowserSession.model_validate(persistent_browser_session)
+            return self._session_from_row(persistent_browser_session)
 
     @db_operation("set_persistent_browser_session_browser_address", expected_errors=(BrowserSessionAlreadyEndedError,))
     async def set_persistent_browser_session_browser_address(
@@ -1708,7 +1853,7 @@ class BrowserSessionsRepository(BaseRepository):
                     return None
                 await session.commit()
                 await session.refresh(persistent_browser_session)
-                return PersistentBrowserSession.model_validate(persistent_browser_session)
+                return self._session_from_row(persistent_browser_session)
 
             statement = select(PersistentBrowserSessionModel).where(*base_filters)
             if not allow_retirement_release:
@@ -1733,7 +1878,7 @@ class BrowserSessionsRepository(BaseRepository):
             persistent_browser_session.download_run_id = None
             await session.commit()
             await session.refresh(persistent_browser_session)
-            return PersistentBrowserSession.model_validate(persistent_browser_session)
+            return self._session_from_row(persistent_browser_session)
 
     @db_operation("close_persistent_browser_session")
     async def close_persistent_browser_session(
@@ -1757,7 +1902,7 @@ class BrowserSessionsRepository(BaseRepository):
             ).first()
             if persistent_browser_session:
                 if persistent_browser_session.completed_at:
-                    return PersistentBrowserSession.model_validate(persistent_browser_session)
+                    return self._session_from_row(persistent_browser_session)
                 persistent_browser_session.completed_at = naive_utc_now()
                 persistent_browser_session.close_reason = persistent_browser_session.close_reason or close_reason
                 persistent_browser_session.status = resolve_terminal_status(
@@ -1766,7 +1911,7 @@ class BrowserSessionsRepository(BaseRepository):
                 clear_terminal_session_fields(persistent_browser_session)
                 await session.commit()
                 await session.refresh(persistent_browser_session)
-                return PersistentBrowserSession.model_validate(persistent_browser_session)
+                return self._session_from_row(persistent_browser_session)
             raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
 
     @db_operation("get_all_active_persistent_browser_sessions")
@@ -1861,4 +2006,4 @@ class BrowserSessionsRepository(BaseRepository):
             session.add(reserved)
             await session.commit()
             await session.refresh(reserved)
-            return PersistentBrowserSession.model_validate(reserved)
+            return self._session_from_row(reserved)

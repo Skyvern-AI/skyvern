@@ -22,7 +22,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncAttrs
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, deferred
+from sqlalchemy.sql.functions import FunctionElement
 
 from skyvern.forge.sdk.db._soft_delete import SoftDeleteMixin
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
@@ -44,6 +46,9 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_parameter_id,
     generate_debug_session_id,
     generate_email_config_id,
+    generate_ember_chat_id,
+    generate_ember_chat_message_id,
+    generate_ember_completion_criteria_set_id,
     generate_folder_id,
     generate_forwarding_address_id,
     generate_gmail_send_dispatch_id,
@@ -78,9 +83,6 @@ from skyvern.forge.sdk.db.id import (
     generate_thought_id,
     generate_totp_code_id,
     generate_uploaded_file_id,
-    generate_workflow_copilot_chat_id,
-    generate_workflow_copilot_chat_message_id,
-    generate_workflow_copilot_completion_criteria_set_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
@@ -140,6 +142,7 @@ class TaskModel(Base):
     webhook_failure_reason = Column(String, nullable=True)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
+    otp_request_id = Column(String, nullable=True)
     title = Column(String)
     task_type = Column(String, default=TaskType.general)
     url = Column(String)
@@ -865,6 +868,7 @@ class WorkflowScheduleModel(Base):
     name = Column(String, nullable=True)
     description = Column(String, nullable=True)
     created_by = Column(String, nullable=True)
+    requested_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -1028,6 +1032,7 @@ class WorkflowRunModel(Base):
     webhook_delivery_finalized_at = Column(DateTime, nullable=True)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
+    otp_request_id = Column(String, nullable=True)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     max_elapsed_time_minutes = Column(Integer, nullable=True)
     browser_runtime = Column(String, nullable=True)
@@ -1080,7 +1085,7 @@ class WorkflowRunModel(Base):
     # mid-run flag edit strand the run on a cluster with no runner. NULL means the run predates
     # the pin, and the gates resolve the flag as before.
     secure_runner_pinned = Column(Boolean, nullable=True)
-    copilot_session_id = Column(String, nullable=True)
+    ember_session_id = Column("copilot_session_id", String, nullable=True)
     created_by = Column(String, nullable=True)
     # The actor that authorized the start when it is not created_by: the person Copilot started the run for, or the
     # org's synthetic user for an API key. Run start and its Trigger children are judged as them.
@@ -1473,11 +1478,61 @@ class AISuggestionModel(Base):
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
+class _StrictOTPCodeIndexKey(FunctionElement):
+    inherit_cache = True
+    name = "strict_otp_code_index_key"
+
+
+@compiles(_StrictOTPCodeIndexKey, "postgresql")
+def _compile_strict_otp_code_index_key_postgresql(element: FunctionElement, compiler: object, **kw: object) -> str:
+    code = next(iter(element.clauses))
+    return f"skyvern_sha256_text_utf8({compiler.process(code, **kw)})"  # type: ignore[attr-defined]
+
+
+@compiles(_StrictOTPCodeIndexKey)
+def _compile_strict_otp_code_index_key_default(element: FunctionElement, compiler: object, **kw: object) -> str:
+    return compiler.process(next(iter(element.clauses)), **kw)  # type: ignore[attr-defined,no-any-return]
+
+
 class TOTPCodeModel(Base):
     __tablename__ = "totp_codes"
     __table_args__ = (
         Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),
         Index("ix_totp_codes_otp_type", "organization_id", "otp_type"),
+        Index(
+            "ix_totp_codes_strict_claim",
+            "organization_id",
+            "otp_request_id",
+            "totp_identifier",
+            "created_at",
+            postgresql_where=text("otp_request_id IS NOT NULL AND claimed_at IS NULL"),
+            sqlite_where=text("otp_request_id IS NOT NULL AND claimed_at IS NULL"),
+        ),
+        Index(
+            "uq_totp_codes_strict_code",
+            "organization_id",
+            "otp_request_id",
+            "totp_identifier",
+            _StrictOTPCodeIndexKey(sqlalchemy.column("code")),
+            unique=True,
+            postgresql_where=text("otp_request_id IS NOT NULL AND code IS NOT NULL"),
+            sqlite_where=text("otp_request_id IS NOT NULL AND code IS NOT NULL"),
+        ),
+        Index(
+            "uq_totp_codes_strict_webhook_code",
+            "organization_id",
+            "otp_request_id",
+            _StrictOTPCodeIndexKey(sqlalchemy.column("code")),
+            unique=True,
+            postgresql_where=text(
+                "otp_request_id IS NOT NULL AND totp_identifier IS NULL "
+                "AND source = 'verification_url' AND code IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "otp_request_id IS NOT NULL AND totp_identifier IS NULL "
+                "AND source = 'verification_url' AND code IS NOT NULL"
+            ),
+        ),
         Index(
             "uq_totp_codes_org_external_message_id",
             "organization_id",
@@ -1489,11 +1544,19 @@ class TOTPCodeModel(Base):
     )
 
     totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
-    totp_identifier = Column(String, nullable=False, index=True)
+    # External pushed deliveries always carry an identifier. Strict verification-URL
+    # responses use the explicit request marker as their source scope and therefore do
+    # not fabricate an email/phone identifier.
+    totp_identifier = Column(String, nullable=True, index=True)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     task_id = Column(String, ForeignKey("tasks.task_id"))
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"))
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
+    otp_request_id = Column(String, nullable=True)
+    claimed_by_task_id = Column(String, nullable=True)
+    claimed_by_workflow_run_id = Column(String, nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
+    rejected_at = Column(DateTime, nullable=True)
     content = Column(String, nullable=False)
     code = Column(String)
     source = Column(String)
@@ -1503,6 +1566,88 @@ class TOTPCodeModel(Base):
     expired_at = Column(DateTime, index=True)
     otp_type = Column(String, server_default=sqlalchemy.text("'totp'"))
     parse_status = Column(String, nullable=False, server_default=sqlalchemy.text("'parsed'"))
+
+
+class OTPRequestBindingModel(Base):
+    """Durable original owner and strict browser lifecycle receipt for one marker."""
+
+    __tablename__ = "otp_request_bindings"
+    __table_args__ = (
+        CheckConstraint(
+            "(owner_type = 'task' AND owner_task_id IS NOT NULL AND owner_workflow_run_id IS NULL) OR "
+            "(owner_type = 'workflow_run' AND owner_task_id IS NULL AND owner_workflow_run_id IS NOT NULL)",
+            name="ck_otp_request_bindings_single_owner",
+        ),
+    )
+
+    organization_id = Column(
+        String,
+        ForeignKey("organizations.organization_id"),
+        primary_key=True,
+        nullable=False,
+    )
+    otp_request_id = Column(String, primary_key=True, nullable=False)
+    owner_type = Column(String, nullable=False)
+    owner_task_id = Column(String, ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=True)
+    owner_workflow_run_id = Column(
+        String,
+        ForeignKey("workflow_runs.workflow_run_id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    owner_store = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class OTPRequestAcquisitionModel(Base):
+    """One immutable strict browser acquisition attempt beneath an OTP binding."""
+
+    __tablename__ = "otp_request_acquisitions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "otp_request_id"],
+            ["otp_request_bindings.organization_id", "otp_request_bindings.otp_request_id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "otp_request_id",
+            "execution_owner_type",
+            "execution_owner_id",
+            "execution_attempt",
+            name="uq_otp_request_acquisitions_attempt",
+        ),
+    )
+
+    acquisition_id = Column(String, primary_key=True)
+    organization_id = Column(String, nullable=False)
+    otp_request_id = Column(String, nullable=False)
+    execution_owner_type = Column(String, nullable=False)
+    execution_owner_id = Column(String, nullable=False)
+    execution_attempt = Column(String, nullable=False)
+    browser_type = Column(String, nullable=True)
+    browser_engine = Column(String, nullable=True)
+    worker_pid = Column(Integer, nullable=False)
+    worker_process_started_at = Column(String, nullable=False)
+    pod_uid = Column(String, nullable=True)
+    container_identity = Column(String, nullable=True)
+    lifecycle_state = Column(String, nullable=False, default="sealed", server_default="sealed")
+    acquisition_sealed_at = Column(DateTime, nullable=False)
+    stop_started_at = Column(DateTime, nullable=True)
+    stop_confirmed_at = Column(DateTime, nullable=True)
+    failure_reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
 
 
 class OrganizationEmailConfigModel(Base):
@@ -1744,6 +1889,7 @@ class TaskV2Model(Base):
     webhook_failure_reason = Column(String, nullable=True)
     totp_verification_url = Column(String, nullable=True)
     totp_identifier = Column(String, nullable=True)
+    otp_request_id = Column(String, nullable=True)
     proxy_location = Column(String, nullable=True)
     extracted_information_schema = Column(JSON, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
@@ -1951,6 +2097,9 @@ class BrowserProfileModel(Base):
     is_managed = Column(Boolean, nullable=False, server_default=sqlalchemy.false(), default=False)
     workflow_permanent_id = Column(String, nullable=True)
     browser_profile_key_digest = Column(String, nullable=True)
+    # The session or workflow run a profile was saved from; the profile keeps that source's access rules.
+    source_browser_session_id = Column(String, nullable=True)
+    source_workflow_run_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
@@ -2184,6 +2333,8 @@ class ScriptModel(Base):
     # The workflow run or task run id that this script is generated
     run_id = Column(String, nullable=True)
     version = Column(Integer, default=1, nullable=False)
+    # Set only when the platform pins one of its static modules; a main.py header naming any other module is ignored.
+    static_module = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -2292,11 +2443,11 @@ class ScriptBlockModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
-class WorkflowCopilotChatModel(Base):
+class EmberChatModel(Base):
     __tablename__ = "workflow_copilot_chats"
     __table_args__ = (Index("wcc_org_created_at_index", "organization_id", "created_at"),)
 
-    workflow_copilot_chat_id = Column(String, primary_key=True, default=generate_workflow_copilot_chat_id)
+    ember_chat_id = Column("workflow_copilot_chat_id", String, primary_key=True, default=generate_ember_chat_id)
     organization_id = Column(String, nullable=False)
     workflow_permanent_id = Column(String, nullable=False, index=True)
     proposed_workflow = Column(JSON, nullable=True)
@@ -2305,6 +2456,7 @@ class WorkflowCopilotChatModel(Base):
     pending_turns = Column(JSON, nullable=True)
     work_plan = Column(JSON, nullable=True)
     accepted_tested_run = Column(JSON, nullable=True)
+    created_spreadsheets = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -2315,14 +2467,14 @@ class WorkflowCopilotChatModel(Base):
     )
 
 
-class WorkflowCopilotChatMessageModel(Base):
+class EmberChatMessageModel(Base):
     __tablename__ = "workflow_copilot_chat_messages"
     __table_args__ = (Index("wccm_org_chat_index", "organization_id", "workflow_copilot_chat_id"),)
 
-    workflow_copilot_chat_message_id = Column(
-        String, primary_key=True, default=generate_workflow_copilot_chat_message_id
+    ember_chat_message_id = Column(
+        "workflow_copilot_chat_message_id", String, primary_key=True, default=generate_ember_chat_message_id
     )
-    workflow_copilot_chat_id = Column(String, nullable=False, index=True)
+    ember_chat_id = Column("workflow_copilot_chat_id", String, nullable=False, index=True)
     organization_id = Column(String, nullable=False)
     sender = Column(String, nullable=False)
     content = Column(UnicodeText, nullable=False)
@@ -2344,15 +2496,13 @@ class WorkflowCopilotChatMessageModel(Base):
     )
 
 
-class WorkflowCopilotCompletionCriteriaSetModel(Base):
+class EmberCompletionCriteriaSetModel(Base):
     __tablename__ = "workflow_copilot_completion_criteria_sets"
     __table_args__ = (Index("wcccs_org_chat_index", "organization_id", "workflow_copilot_chat_id"),)
 
-    completion_criteria_set_id = Column(
-        String, primary_key=True, default=generate_workflow_copilot_completion_criteria_set_id
-    )
+    completion_criteria_set_id = Column(String, primary_key=True, default=generate_ember_completion_criteria_set_id)
     organization_id = Column(String, nullable=False)
-    workflow_copilot_chat_id = Column(String, nullable=False)
+    ember_chat_id = Column("workflow_copilot_chat_id", String, nullable=False)
     goal_epoch = Column(Integer, nullable=False)
     status = Column(String, nullable=False, default="active")
     criteria = Column(JSON, nullable=False)
@@ -2534,6 +2684,8 @@ class GoogleOAuthCredentialModel(Base):
     consent_app_origin = Column(String, nullable=True)
     consent_expires_at = Column(DateTime, nullable=True)
     client_id = Column(String, nullable=True)
+    # The user whose consent last made this row active; null when no signed-in person completed it.
+    initiating_user_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

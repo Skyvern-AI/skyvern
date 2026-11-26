@@ -27,6 +27,8 @@ from skyvern.cli.mcp_commands import (
     mcp_app,
 )
 
+pytestmark = pytest.mark.usefixtures("isolated_user_config_dir")
+
 
 def test_save_profile_and_list_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skyvern.cli.mcp_commands._profile_store_dir", lambda: tmp_path)

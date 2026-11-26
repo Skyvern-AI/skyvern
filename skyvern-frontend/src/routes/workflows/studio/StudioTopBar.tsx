@@ -21,7 +21,6 @@ import { AxiosError } from "axios";
 import {
   CalendarIcon,
   InputIcon,
-  LightningBoltIcon,
   Pencil1Icon,
   PlayIcon,
   ReloadIcon,
@@ -31,7 +30,6 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { usePostHog } from "posthog-js/react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-import { usePageSlots } from "@/store/PageSlots";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
@@ -169,7 +167,7 @@ export function SaveButton() {
   const proposalPending = useEmberProposalStore((s) => s.proposal !== null);
   const saveUnavailable = saveLockReason !== null || proposalPending;
   const saveUnavailableReason = proposalPending
-    ? "Resolve the Copilot proposal before saving."
+    ? "Resolve the Ember proposal before saving."
     : saveLockReason;
   const onSave = useSaveWorkflow();
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -331,7 +329,7 @@ function PanelToggle({
   label,
   icon,
 }: {
-  content: "parameters" | "schedules" | "triggers";
+  content: "parameters" | "schedules";
   label: string;
   icon: ReactNode;
 }) {
@@ -400,7 +398,7 @@ export function InputsToggle() {
 
 // The top bar's secondary controls as More actions items at phone width, so
 // the title and Run keep their room.
-function PhoneTopBarItems({ triggers }: { triggers: boolean }) {
+function PhoneTopBarItems() {
   const narrow = useStudioNarrow();
   const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
   const count = useWorkflowParametersStore((s) => s.parameters.length);
@@ -424,14 +422,6 @@ function PhoneTopBarItems({ triggers }: { triggers: boolean }) {
         <CalendarIcon className="mr-2 size-4" aria-hidden />
         Schedule
       </DropdownMenuItem>
-      {triggers ? (
-        <DropdownMenuItem
-          onSelect={() => setState({ active: true, content: "triggers" })}
-        >
-          <LightningBoltIcon className="mr-2 size-4" aria-hidden />
-          Triggers
-        </DropdownMenuItem>
-      ) : null}
       <DropdownMenuSeparator />
     </>
   );
@@ -440,7 +430,7 @@ function PhoneTopBarItems({ triggers }: { triggers: boolean }) {
 const NO_DOC_PROBLEMS: DocRunCheckProblem[] = [];
 
 const NO_BLOCKS_RUN_TOOLTIP =
-  "Add a block or ask Copilot to build the agent before running";
+  "Add a block or ask Ember to build the agent before running";
 
 // stopOnly: global (read-only) workflows can't start runs from the studio, but
 // runs started elsewhere (e.g. the recipe pages run templates in place) still
@@ -813,7 +803,6 @@ function DocProblemsRunDialog({
 export function StudioTopBar() {
   const workflowPermanentId = useWorkflowPermanentId();
   const workflowTitle = useWorkflowTitleStore((state) => state.title);
-  const { workflowTriggersPanel } = usePageSlots();
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const workflowDeletedAt = useStudioWorkflowDeletedAt();
   const { panes, setOpenPanes } = useStudioPanes();
@@ -875,22 +864,11 @@ export function StudioTopBar() {
                       label="Schedule"
                       icon={<CalendarIcon className="size-4" />}
                     />
-                    {workflowTriggersPanel ? (
-                      <PanelToggle
-                        content="triggers"
-                        label="Triggers"
-                        icon={<LightningBoltIcon className="size-4" />}
-                      />
-                    ) : null}
                     <EditorOverflowMenu
                       triggerClassName="h-8 w-8 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
                       onVersionHistory={openVersionHistory}
                       embedded
-                      leadingItems={
-                        <PhoneTopBarItems
-                          triggers={Boolean(workflowTriggersPanel)}
-                        />
-                      }
+                      leadingItems={<PhoneTopBarItems />}
                     />
                   </>
                 ) : null}

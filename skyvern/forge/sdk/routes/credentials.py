@@ -28,6 +28,12 @@ modifying existing ones, ensure that:
 Violating this invariant would allow any caller with a valid API key to
 exfiltrate stored passwords, card numbers, and secrets — which is the
 exact threat the vault architecture is designed to prevent.
+
+The invariant also covers the secrets an organization saves to connect its
+own vault. The Bitwarden and 1Password responses have no field for the secret.
+The Azure and custom credential service responses do, so each route that
+returns one must first pass it through ``_redact_azure_client_secret`` or
+``_redact_custom_credential_secret``; no type enforces that.
 """
 
 import asyncio
@@ -36,12 +42,13 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
+from functools import partial
 from typing import Annotated, Any, NoReturn
 
 import pyotp
 import structlog
-from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response, status
+from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Request, Response, status
 from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 from onepassword.types import Item
@@ -66,12 +73,15 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.agent_functions import OnePasswordTelemetryErrorClass, record_request_audit_event
 from skyvern.forge.sdk.api.files import discard_temp_working_dir
+from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowBuildSource
 from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError
 from skyvern.forge.sdk.db.models import CredentialFolderModel
+from skyvern.forge.sdk.executor.async_executor import CredentialProfileCreation
+from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_PYTHON,
@@ -89,6 +99,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_CREDENTIAL_CODE_SAMPLE_PYTHON,
     UPDATE_CREDENTIAL_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.otp_bound import OTP_BOUND_ROUTE, is_otp_bound_route
 from skyvern.forge.sdk.routes.pagination import MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
@@ -184,10 +195,10 @@ from skyvern.forge.sdk.services.credentials import (
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token, to_status
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal, synthetic_user_id
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
-from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
+from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_snapshot
 from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
     CredentialFolder,
     CredentialFolderCreate,
@@ -541,10 +552,44 @@ def _cache_totp_code_preview(
     responses={402: {"description": "Insufficient credits to parse OTP content"}},
     include_in_schema=False,
 )
+@base_router.post(
+    "/otp-bound/credentials/totp",
+    response_model=TOTPCode,
+    responses={402: {"description": "Insufficient credits to parse OTP content"}},
+    include_in_schema=False,
+    dependencies=[OTP_BOUND_ROUTE],
+)
+@base_router.post(
+    "/otp-bound/credentials/totp/",
+    response_model=TOTPCode,
+    responses={402: {"description": "Insufficient credits to parse OTP content"}},
+    include_in_schema=False,
+    dependencies=[OTP_BOUND_ROUTE],
+)
 async def send_totp_code(
     data: TOTPCodeCreate,
     curr_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    request: Request = None,  # type: ignore[assignment]
 ) -> TOTPCode:
+    guarded = is_otp_bound_route(request)
+    if guarded and data.otp_request_id is None:
+        raise HTTPException(status_code=400, detail="otp_request_id is required on the otp-bound delivery endpoint")
+    if not guarded and data.otp_request_id is not None:
+        raise HTTPException(
+            status_code=400, detail="otp_request_id is accepted only on the otp-bound delivery endpoint"
+        )
+    if data.otp_request_id is not None and data.task_id is None and data.workflow_run_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Strict OTP delivery requires an exact task_id or workflow_run_id owner",
+        )
+    if (
+        data.otp_request_id is not None
+        and data.expired_at is not None
+        and to_naive_utc(data.expired_at) <= naive_utc_now()
+    ):
+        raise HTTPException(status_code=400, detail="Strict OTP delivery is already expired")
+
     totp_identifier = normalize_identifier_if_email(data.totp_identifier)
     redacted_totp_identifier = redact_otp_identifier_for_log(data.totp_identifier)
     LOG.info(
@@ -556,24 +601,72 @@ async def send_totp_code(
         workflow_run_id=data.workflow_run_id,
     )
     # validate task_id, workflow_id, workflow_run_id are valid ids in db if provided
+    task = None
+    task_v2 = None
+    workflow_run = None
+    resolved_task_id = data.task_id
+    resolved_workflow_run_id = data.workflow_run_id
     if data.task_id:
         task = await app.DATABASE.tasks.get_task(data.task_id, curr_org.organization_id)
         if not task:
-            raise HTTPException(status_code=400, detail=f"Invalid task id: {data.task_id}")
+            if data.otp_request_id is not None:
+                task_v2 = await app.DATABASE.observer.get_task_v2(data.task_id, curr_org.organization_id)
+            if task_v2 is None:
+                raise HTTPException(status_code=400, detail=f"Invalid task id: {data.task_id}")
+            if task_v2.otp_request_id != data.otp_request_id:
+                raise HTTPException(status_code=400, detail="OTP request marker does not match the task-v2 owner")
+            if task_v2.status.is_final():
+                raise HTTPException(status_code=409, detail="Strict OTP delivery task-v2 owner is terminal")
+            if task_v2.workflow_run_id is None:
+                raise HTTPException(status_code=409, detail="Strict OTP delivery task-v2 owner has no backing run")
+            resolved_task_id = None
+            resolved_workflow_run_id = task_v2.workflow_run_id
+        else:
+            if data.otp_request_id is not None and task.otp_request_id != data.otp_request_id:
+                raise HTTPException(status_code=400, detail="OTP request marker does not match the task owner")
+            if data.otp_request_id is not None and task.status.is_final():
+                raise HTTPException(status_code=409, detail="Strict OTP delivery task owner is terminal")
     if data.workflow_id:
         workflow = await app.DATABASE.workflows.get_workflow(data.workflow_id, curr_org.organization_id)
         if not workflow:
             raise HTTPException(status_code=400, detail=f"Invalid workflow id: {data.workflow_id}")
     if data.workflow_run_id:
-        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(data.workflow_run_id, curr_org.organization_id)
+        if resolved_workflow_run_id is not None and resolved_workflow_run_id != data.workflow_run_id:
+            raise HTTPException(status_code=400, detail="Task and workflow-run owners do not match")
+        resolved_workflow_run_id = data.workflow_run_id
+    if resolved_workflow_run_id is not None:
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+            resolved_workflow_run_id, curr_org.organization_id
+        )
         if not workflow_run:
-            raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
+            raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {resolved_workflow_run_id}")
+        if data.otp_request_id is not None and workflow_run.otp_request_id != data.otp_request_id:
+            raise HTTPException(status_code=400, detail="OTP request marker does not match the workflow-run owner")
+        if data.otp_request_id is not None and workflow_run.status.is_final():
+            raise HTTPException(status_code=409, detail="Strict OTP delivery workflow-run owner is terminal")
+    if data.otp_request_id is not None and task is not None and task.workflow_run_id is not None:
+        if resolved_workflow_run_id is not None and resolved_workflow_run_id != task.workflow_run_id:
+            raise HTTPException(status_code=400, detail="Task and workflow-run owners do not match")
+        resolved_workflow_run_id = task.workflow_run_id
+        if workflow_run is None:
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                resolved_workflow_run_id, curr_org.organization_id
+            )
+            if workflow_run is None or workflow_run.otp_request_id != data.otp_request_id:
+                raise HTTPException(
+                    status_code=400, detail="OTP request marker does not match the task's workflow owner"
+                )
+    resolved_workflow_id = data.workflow_id
+    if data.otp_request_id is not None and workflow_run is not None:
+        if resolved_workflow_id is not None and resolved_workflow_id != workflow_run.workflow_id:
+            raise HTTPException(status_code=400, detail="Workflow and workflow-run owners do not match")
+        resolved_workflow_id = workflow_run.workflow_id
     workflow_references = {
         (kind, value)
         for kind, value in (
-            ("task_id", data.task_id),
-            ("workflow_id", data.workflow_id),
-            ("workflow_run_id", data.workflow_run_id),
+            ("task_id", resolved_task_id),
+            ("workflow_id", resolved_workflow_id),
+            ("workflow_run_id", resolved_workflow_run_id),
         )
         if value is not None
     }
@@ -627,8 +720,9 @@ async def send_totp_code(
             organization_id=curr_org.organization_id,
             totp_identifier=redacted_totp_identifier,
             task_id=data.task_id,
-            workflow_id=data.workflow_id,
-            workflow_run_id=data.workflow_run_id,
+            workflow_id=resolved_workflow_id,
+            workflow_run_id=resolved_workflow_run_id,
+            otp_request_id=data.otp_request_id,
             content_length=len(data.content),
             exception_type=parse_exception_type_name,
         )
@@ -638,13 +732,15 @@ async def send_totp_code(
         )
 
     if not otp_value:
+        if data.otp_request_id is not None:
+            raise HTTPException(status_code=400, detail="Strict OTP delivery must contain a parseable code")
         if len(data.content) > settings.TOTP_RAW_CONTENT_MAX_LENGTH:
             raise HTTPException(status_code=400, detail="Failed to parse otp login")
         raw_row = await app.DATABASE.otp.create_raw_otp_code(
             organization_id=curr_org.organization_id,
             totp_identifier=totp_identifier,
             content=data.content,
-            task_id=data.task_id,
+            task_id=resolved_task_id,
             workflow_id=data.workflow_id,
             workflow_run_id=data.workflow_run_id,
             source=data.source,
@@ -662,18 +758,25 @@ async def send_totp_code(
             content=pending.model_dump_json(), status_code=200, media_type="application/json"
         )
 
-    return await app.DATABASE.otp.create_otp_code(
+    create = (
+        app.DATABASE.otp.create_otp_code_if_new if data.otp_request_id is not None else app.DATABASE.otp.create_otp_code
+    )
+    created = await create(
         organization_id=curr_org.organization_id,
         totp_identifier=totp_identifier,
         content=data.content,
         code=otp_value.value,
-        task_id=data.task_id,
-        workflow_id=data.workflow_id,
-        workflow_run_id=data.workflow_run_id,
+        task_id=resolved_task_id,
+        workflow_id=resolved_workflow_id,
+        workflow_run_id=resolved_workflow_run_id,
+        otp_request_id=data.otp_request_id,
         source=data.source,
         expired_at=data.expired_at,
         otp_type=otp_value.get_otp_type(),
     )
+    if created is None:
+        raise HTTPException(status_code=409, detail="Strict OTP delivery is a duplicate")
+    return created
 
 
 @base_router.get(
@@ -1202,10 +1305,12 @@ async def test_login(
         title=f"Login Test - {data.username}",
         description="Auto-generated workflow to test login credentials",
         persist_browser_session=True,
+        mask_secrets=False,
         workflow_definition=workflow_definition_yaml,
         status=WorkflowStatus.auto_generated,
     )
 
+    workflow_run: WorkflowRun | None = None
     try:
         # Mark before workflow setup so any member cleanup can only target this test-login row.
         credential = await app.DATABASE.credentials.update_credential(**update_kwargs)
@@ -1236,57 +1341,37 @@ async def test_login(
             created_by=current_user_id,
         )
 
-        await AsyncExecutorFactory.get_executor().execute_workflow(
-            request=None,
+        await _execute_credential_test_workflow(
             background_tasks=background_tasks,
             organization=current_org,
-            workflow_id=workflow_run.workflow_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            workflow_permanent_id=workflow_run.workflow_permanent_id,
-            max_steps_override=None,
-            api_key=None,
-            browser_session_id=None,
-            block_labels=None,
-            block_outputs=None,
-        )
-    except Exception:
-        # Clean up the orphaned temporary credential if workflow setup fails
-        LOG.exception(
-            "Workflow setup failed for test_login, cleaning up temporary credential",
+            workflow_run=workflow_run,
             credential_id=credential_id,
-            organization_id=organization_id,
-        )
-        try:
-            await _delete_temporary_test_login_credential(
-                credential_id=credential_id,
-                organization_id=organization_id,
-                reason="workflow setup error",
-            )
-        except Exception:
-            LOG.warning(
-                "Failed to clean up temporary credential after workflow setup error",
-                credential_id=credential_id,
-                exc_info=True,
-            )
-        raise
-
-    # Always schedule profile creation for test_login — the entire purpose of this
-    # endpoint is to create a temporary credential with a browser profile. This differs
-    # from test_credential, which conditionally checks data.save_browser_profile because
-    # that endpoint tests an existing credential that may or may not need a profile.
-    task = asyncio.create_task(
-        _create_browser_profile_after_workflow(
-            credential_id=credential_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            workflow_id=workflow_run.workflow_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            organization_id=organization_id,
             credential_name=f"_test_login_{data.username}",
             test_url=data.url,
+            save_browser_profile=True,
+            clean_up_temporary_login_on_timeout=True,
+            expected_credential_modified_at=credential.modified_at if isinstance(app.STORAGE, S3Storage) else None,
         )
-    )
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    except Exception:
+        LOG.exception(
+            "Workflow setup or dispatch failed for test_login",
+            credential_id=credential_id,
+            organization_id=organization_id,
+        )
+        if workflow_run is None:
+            try:
+                await _delete_temporary_test_login_credential(
+                    credential_id=credential_id,
+                    organization_id=organization_id,
+                    reason="workflow setup error",
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to clean up temporary credential after workflow setup error",
+                    credential_id=credential_id,
+                    exc_info=True,
+                )
+        raise
 
     LOG.info(
         "Login test started",
@@ -1361,6 +1446,16 @@ async def test_credential(
                 browser_profile_id=existing_browser_profile_id,
             )
             existing_browser_profile_id = None
+        elif (
+            data.save_browser_profile
+            and await app.DATABASE.browser_sessions.is_browser_profile_access_scoped(
+                organization_id=organization_id, profile=profile
+            )
+            and not await app.AGENT_FUNCTION.workflow_run_can_use_browser_profile(
+                organization_id, None, existing_browser_profile_id
+            )
+        ):
+            raise HTTPException(status_code=403, detail="Browser profile not accessible")
 
     LOG.info(
         "Testing credential",
@@ -1400,6 +1495,7 @@ async def test_credential(
         title=f"Credential Test - {credential.name}",
         description=f"Auto-generated workflow to test credential {credential_id}",
         persist_browser_session=data.save_browser_profile,
+        mask_secrets=False,
         workflow_definition=workflow_definition_yaml,
         status=WorkflowStatus.auto_generated,
     )
@@ -1434,18 +1530,23 @@ async def test_credential(
             created_by=current_user_id,
         )
 
-        await AsyncExecutorFactory.get_executor().execute_workflow(
-            request=None,
+        await _execute_credential_test_workflow(
             background_tasks=background_tasks,
             organization=current_org,
-            workflow_id=workflow_run.workflow_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            workflow_permanent_id=workflow_run.workflow_permanent_id,
-            max_steps_override=None,
-            api_key=None,
-            browser_session_id=None,
-            block_labels=None,
-            block_outputs=None,
+            workflow_run=workflow_run,
+            credential_id=credential_id,
+            credential_name=credential.name,
+            test_url=data.url,
+            save_browser_profile=data.save_browser_profile,
+            existing_browser_profile_id=existing_browser_profile_id,
+            expected_browser_profile_id=credential.browser_profile_id,
+            expected_credential_modified_at=(
+                credential.modified_at
+                if data.save_browser_profile
+                and existing_browser_profile_id is None
+                and isinstance(app.STORAGE, S3Storage)
+                else None
+            ),
         )
     except Exception:
         LOG.exception(
@@ -1454,22 +1555,6 @@ async def test_credential(
             organization_id=organization_id,
         )
         raise
-
-    if data.save_browser_profile:
-        task = asyncio.create_task(
-            _create_browser_profile_after_workflow(
-                credential_id=credential_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-                workflow_id=workflow_run.workflow_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                organization_id=organization_id,
-                credential_name=credential.name,
-                test_url=data.url,
-                existing_browser_profile_id=existing_browser_profile_id,
-            )
-        )
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
 
     LOG.info(
         "Credential test started",
@@ -1728,6 +1813,71 @@ async def cancel_credential_test(
     return CancelTestResponse(status="canceled")
 
 
+async def _execute_credential_test_workflow(
+    *,
+    background_tasks: BackgroundTasks,
+    organization: Organization,
+    workflow_run: WorkflowRun,
+    credential_id: str,
+    credential_name: str,
+    test_url: str,
+    save_browser_profile: bool,
+    clean_up_temporary_login_on_timeout: bool = False,
+    existing_browser_profile_id: str | None = None,
+    expected_browser_profile_id: str | None = None,
+    expected_credential_modified_at: datetime | None = None,
+) -> None:
+    executor = AsyncExecutorFactory.get_executor()
+    execute = executor.execute_workflow
+    if save_browser_profile:
+        task = asyncio.create_task(
+            _create_browser_profile_after_workflow(
+                credential_id=credential_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_id=workflow_run.workflow_id,
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
+                organization_id=organization.organization_id,
+                credential_name=credential_name,
+                test_url=test_url,
+                clean_up_temporary_login_on_timeout=clean_up_temporary_login_on_timeout,
+                existing_browser_profile_id=existing_browser_profile_id,
+                expected_browser_profile_id=expected_browser_profile_id,
+                expected_credential_modified_at=expected_credential_modified_at,
+            )
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        if existing_browser_profile_id is None and isinstance(app.STORAGE, S3Storage):
+            creation = CredentialProfileCreation(
+                credential_id, expected_browser_profile_id, expected_credential_modified_at
+            )
+            if isinstance(executor, BackgroundTaskExecutor):
+                finalizer = partial(
+                    credential_creation_service.finalize_credential_profile_creation,
+                    creation=creation,
+                    organization_id=organization.organization_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    test_url=test_url,
+                )
+                execute = partial(execute, credential_profile_options={"finalizer": finalizer})
+            else:
+                execute = partial(execute, credential_profile_options={"creation": creation})
+
+    await execute(
+        request=None,
+        background_tasks=background_tasks,
+        organization=organization,
+        workflow_id=workflow_run.workflow_id,
+        workflow_run_id=workflow_run.workflow_run_id,
+        workflow_permanent_id=workflow_run.workflow_permanent_id,
+        max_steps_override=None,
+        api_key=None,
+        browser_session_id=None,
+        block_labels=None,
+        block_outputs=None,
+    )
+
+
 async def _create_browser_profile_after_workflow(
     credential_id: str,
     workflow_run_id: str,
@@ -1737,12 +1887,34 @@ async def _create_browser_profile_after_workflow(
     credential_name: str,
     test_url: str,
     existing_browser_profile_id: str | None = None,
+    expected_browser_profile_id: str | None = None,
+    expected_credential_modified_at: datetime | None = None,
+    *,
+    clean_up_temporary_login_on_timeout: bool = False,
 ) -> None:
     """Poll the run and persist the captured session on success: a re-save overwrites
     ``existing_browser_profile_id`` in place, otherwise a new profile is created and linked."""
     max_polls = 120  # ~10 minutes at 5s intervals
     poll_interval = 5
     session_dir: str | None = None
+
+    async def clean_up_temporary_login(reason: str) -> None:
+        if not credential_name.startswith("_test_login_"):
+            return
+        try:
+            await _delete_temporary_test_login_credential(
+                credential_id=credential_id,
+                organization_id=organization_id,
+                reason=reason,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to delete temporary credential after login test",
+                credential_id=credential_id,
+                organization_id=organization_id,
+                reason=reason,
+                exc_info=True,
+            )
 
     try:
         for _ in range(max_polls):
@@ -1769,23 +1941,23 @@ async def _create_browser_profile_after_workflow(
                     workflow_run_id=workflow_run_id,
                     status=status,
                 )
-                # Clean up temporary credentials created by test-login
-                if credential_name.startswith("_test_login_"):
-                    try:
-                        await _delete_temporary_test_login_credential(
-                            credential_id=credential_id,
-                            organization_id=organization_id,
-                            reason="failed test",
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to delete temporary credential after failed test",
-                            credential_id=credential_id,
-                            organization_id=organization_id,
-                            exc_info=True,
-                        )
+                await clean_up_temporary_login("failed test")
                 return
 
+            storage = app.STORAGE
+            if isinstance(storage, S3Storage) and existing_browser_profile_id is None:
+                credential = await app.DATABASE.credentials.get_credential(credential_id, organization_id)
+                if (
+                    credential is None
+                    or credential.browser_profile_id != expected_browser_profile_id
+                    or (
+                        expected_credential_modified_at is not None
+                        and credential.modified_at != expected_credential_modified_at
+                    )
+                ):
+                    return
+
+            max_retries = _SESSION_PERSIST_MAX_RETRIES
             # Session persistence lags the run reaching completed (see clean_up_workflow),
             # so retrieval retries on a budget sized to that lag.
             workflow = await app.DATABASE.workflows.get_workflow(
@@ -1800,14 +1972,14 @@ async def _create_browser_profile_after_workflow(
                     workflow_permanent_id=workflow_permanent_id,
                 )
                 return
-            max_retries = _SESSION_PERSIST_MAX_RETRIES
             for attempt in range(max_retries):
-                session_dir = await retrieve_persisted_workflow_browser_state_dir(
+                snapshot = await retrieve_persisted_workflow_browser_snapshot(
                     organization_id=organization_id,
                     workflow=workflow,
                     workflow_run=workflow_run,
                 )
-                if session_dir:
+                if snapshot is not None:
+                    session_dir = snapshot.directory
                     break
                 if attempt < max_retries - 1:
                     LOG.info(
@@ -1851,6 +2023,21 @@ async def _create_browser_profile_after_workflow(
                 if not reused_existing:
                     target_profile_id = None
 
+            require_encryption = snapshot is not None and snapshot.encrypted
+            if isinstance(storage, S3Storage) and not reused_existing:
+                await credential_creation_service.save_new_credential_capture(
+                    storage=storage,
+                    creation=CredentialProfileCreation(
+                        credential_id, expected_browser_profile_id, expected_credential_modified_at
+                    ),
+                    organization_id=organization_id,
+                    directory=session_dir,
+                    writer=None,
+                    test_url=test_url,
+                    require_encryption=require_encryption,
+                )
+                return
+
             should_update_existing_profile_pin = False
             if not target_profile_id:
                 profile = await app.DATABASE.browser_sessions.create_browser_profile(
@@ -1880,10 +2067,11 @@ async def _create_browser_profile_after_workflow(
                     )
 
             # Overwrites in place when reusing an existing id.
-            await app.STORAGE.store_browser_profile(
+            await storage.store_browser_profile(
                 organization_id=organization_id,
                 profile_id=target_profile_id,
                 directory=session_dir,
+                require_encryption=require_encryption,
             )
             if reused_existing:
                 if should_update_existing_profile_pin:
@@ -1922,40 +2110,14 @@ async def _create_browser_profile_after_workflow(
             credential_id=credential_id,
             workflow_run_id=workflow_run_id,
         )
-        # Clean up temporary credentials on poll timeout
-        if credential_name.startswith("_test_login_"):
-            try:
-                await _delete_temporary_test_login_credential(
-                    credential_id=credential_id,
-                    organization_id=organization_id,
-                    reason="poll timeout",
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to delete temporary credential after poll timeout",
-                    credential_id=credential_id,
-                    exc_info=True,
-                )
+        if clean_up_temporary_login_on_timeout:
+            await clean_up_temporary_login("workflow polling timeout")
     except Exception:
         LOG.exception(
             "Failed to create browser profile from credential test",
             credential_id=credential_id,
             workflow_run_id=workflow_run_id,
         )
-        # Clean up temporary credentials on unexpected error
-        if credential_name.startswith("_test_login_"):
-            try:
-                await _delete_temporary_test_login_credential(
-                    credential_id=credential_id,
-                    organization_id=organization_id,
-                    reason="profile persistence error",
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to delete temporary credential after error",
-                    credential_id=credential_id,
-                    exc_info=True,
-                )
     finally:
         discard_temp_working_dir(session_dir)
 
@@ -2404,8 +2566,22 @@ async def delete_organization_credential(
         profile_id = credential.browser_profile_id
         if profile_id and await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(organization_id):
             try:
+                profile = await app.DATABASE.browser_sessions.get_browser_profile(
+                    profile_id=profile_id, organization_id=organization_id
+                )
+                # A profile tied to a workflow or saved from a source keeps that access, so deleting the
+                # credential only drops the link.
+                if profile is not None and await app.DATABASE.browser_sessions.is_browser_profile_access_scoped(
+                    organization_id=organization_id, profile=profile
+                ):
+                    LOG.warning(
+                        "browser_memory.credential_profile_kept",
+                        organization_id=organization_id,
+                        credential_id=credential_id,
+                        browser_profile_id=profile_id,
+                    )
                 # Narrow accepted race: a concurrent re-link between this check and the delete below.
-                if await app.DATABASE.browser_sessions.has_live_browser_profile_references(
+                elif await app.DATABASE.browser_sessions.has_live_browser_profile_references(
                     profile_id=profile_id,
                     organization_id=organization_id,
                     exclude_credential_id=credential_id,
@@ -4032,7 +4208,7 @@ async def update_bitwarden_credential(
     "/credentials/azure_credential/get",
     response_model=AzureClientSecretCredentialResponse,
     summary="Get Azure Client Secret Credential",
-    description="Retrieves the current Azure Client Secret Credential for the organization.",
+    description="Retrieves the current Azure Client Secret Credential for the organization. The client_secret is always masked.",
     include_in_schema=False,
 )
 @base_router.get(
@@ -4058,9 +4234,7 @@ async def get_azure_client_secret_credential(
                 detail="No Azure Client Secret Credential found for this organization",
             )
 
-        if await _should_redact_org_credential_secrets(current_org.organization_id):
-            auth_token = _redact_azure_client_secret(auth_token)
-        return AzureClientSecretCredentialResponse(token=auth_token)
+        return AzureClientSecretCredentialResponse(token=_redact_azure_client_secret(auth_token))
 
     except HTTPException:
         raise
@@ -4102,8 +4276,6 @@ async def update_azure_client_secret_credential(
     """
     try:
         credential = request.credential
-        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
-        # A redacted form echoes the sentinel even if the caller's role changed since the read.
         if credential.client_secret == _REDACTED_ORG_CREDENTIAL_SECRET:
             existing = await app.DATABASE.organizations.get_valid_org_auth_token(
                 organization_id=current_org.organization_id,
@@ -4143,9 +4315,7 @@ async def update_azure_client_secret_credential(
             OrganizationAuthTokenType.azure_client_secret_credential.value,
         )
 
-        if redact_secrets:
-            auth_token = _redact_azure_client_secret(auth_token)
-        return AzureClientSecretCredentialResponse(token=auth_token)
+        return AzureClientSecretCredentialResponse(token=_redact_azure_client_secret(auth_token))
 
     except HTTPException:
         raise
@@ -4186,7 +4356,7 @@ async def get_custom_credential_service_status(
     "/credentials/custom_credential/get",
     response_model=CustomCredentialServiceConfigResponse,
     summary="Get Custom Credential Service Configuration",
-    description="Retrieves the current custom credential service configuration for the organization.",
+    description="Retrieves the current custom credential service configuration for the organization. The api_token is always masked.",
     include_in_schema=False,
 )
 @base_router.get(
@@ -4212,10 +4382,7 @@ async def get_custom_credential_service_config(
                 detail="No custom credential service configuration found for this organization",
             )
 
-        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
-        if redact_secrets:
-            auth_token = _redact_custom_credential_secret(auth_token)
-        return CustomCredentialServiceConfigResponse(token=auth_token)
+        return CustomCredentialServiceConfigResponse(token=_redact_custom_credential_secret(auth_token))
 
     except HTTPException:
         raise
@@ -4256,7 +4423,6 @@ async def update_custom_credential_service_config(
     If a valid configuration already exists, it will be invalidated before creating the new one.
     """
     try:
-        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
         config = await _restore_redacted_custom_credential_secret(current_org.organization_id, request.config)
 
         # Invalidate any existing valid custom credential service configuration for this organization
@@ -4287,9 +4453,7 @@ async def update_custom_credential_service_config(
             OrganizationAuthTokenType.custom_credential_service.value,
         )
 
-        if redact_secrets:
-            auth_token = _redact_custom_credential_secret(auth_token)
-        return CustomCredentialServiceConfigResponse(token=auth_token)
+        return CustomCredentialServiceConfigResponse(token=_redact_custom_credential_secret(auth_token))
 
     except HTTPException:
         raise
@@ -4345,6 +4509,7 @@ async def test_custom_credential_service_connection(
             url=validated_url,
             headers={"Authorization": f"Bearer {api_token}"},
             timeout=10,
+            read_body=False,
         )
 
         if 200 <= status_code < 300:
@@ -4387,19 +4552,6 @@ async def _delete_temporary_test_login_credential(
     organization_id: str,
     reason: str,
 ) -> None:
-    credential = await app.DATABASE.credentials.get_credential(
-        credential_id=credential_id,
-        organization_id=organization_id,
-    )
-    if not credential or not credential.name.startswith("_test_login_"):
-        return
-
-    vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
-    credential_service = await _get_credential_vault_service(vault_type_override=vault_type)
-    await credential_service.delete_credential(credential)
-    LOG.info(
-        "Deleted temporary credential",
-        credential_id=credential_id,
-        organization_id=organization_id,
-        reason=reason,
+    await credential_creation_service.delete_unlinked_temporary_test_login_credential(
+        credential_id, organization_id, reason=reason
     )

@@ -97,7 +97,7 @@ async def test_update_credential_reclaims_new_item_when_repoint_fails(
     with pytest.raises(failure_type):
         await service.update_credential(_credential(), _password_request())
 
-    delete_credential.assert_awaited_with("item_new")
+    delete_credential.assert_awaited_with("item_new", organization_id="org_test")
 
 
 @pytest.mark.asyncio
@@ -115,7 +115,7 @@ async def test_update_credential_enqueues_orphan_when_cancelled_inline_cleanup_f
     with pytest.raises(asyncio.CancelledError):
         await service.update_credential(_credential(), _password_request())
 
-    delete_credential.assert_awaited_with("item_new")
+    delete_credential.assert_awaited_with("item_new", organization_id="org_test")
     orphaned.assert_awaited_with(
         organization_id="org_test",
         item_id="item_new",

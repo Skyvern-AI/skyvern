@@ -519,7 +519,7 @@ def test_omitted_block_images_carry_forward_and_an_explicit_clear_wins() -> None
     assert [image.file_id for image in dropped.prompt_images or []] == ["file_902"]
 
 
-def test_a_copilot_that_cannot_see_notes_submits_no_image_fields_so_the_saved_ones_are_kept() -> None:
+def test_a_ember_that_cannot_see_notes_submits_no_image_fields_so_the_saved_ones_are_kept() -> None:
     blocks = [_nav("a", doc_images=[], prompt_images=[_image("file_903")])]
     submitted = dump_workflow_yaml({"title": "t", "workflow_definition": {"parameters": [], "blocks": blocks}})
 

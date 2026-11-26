@@ -1433,6 +1433,8 @@ async def test_capped_read_returns_the_stored_capped_copy_and_leaves_the_value_w
     factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
     repo = WorkflowRunsRepository(session_factory=factory)
     value = _oversized_sheet_rows(cap)
+    extracted_information = value.pop("extracted_information")
+    value["rows"].append({"extracted_information": extracted_information})
 
     await repo.create_or_update_workflow_run_output_parameter(
         workflow_run_id="wr_1", output_parameter_id="op_1", value=value
@@ -1456,7 +1458,7 @@ async def test_capped_read_returns_the_stored_capped_copy_and_leaves_the_value_w
     assert capped[0].value == row.capped_value
     assert capped[0].value["rows"][-1]["truncated"] is True
     # Capping drops most rows, so the extracted information has to come from the write.
-    assert capped[0].precomputed_extracted_information == [{"row": index} for index in range(5)]
+    assert capped[0].precomputed_extracted_information == extracted_information
 
     uncapped = await repo.get_workflow_run_output_parameters("wr_1")
     assert uncapped[0].value == value

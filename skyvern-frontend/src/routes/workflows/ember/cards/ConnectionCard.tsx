@@ -23,11 +23,13 @@ import {
 } from "@/routes/integrations/googleOAuth";
 import { markGoogleOAuthPopup } from "@/routes/integrations/googleOAuthPopup";
 import { useCurrentOrgId } from "@/hooks/useCurrentOrgId";
+import { stripBidiIsolates } from "@/util/bidiText";
 import {
   type ConnectedGmailFlow,
   useHasCapability,
   usePageSlots,
 } from "@/store/PageSlots";
+import { parseServerStamp } from "@/util/utils";
 
 import {
   connectionCardKey,
@@ -35,7 +37,10 @@ import {
 } from "../narrativeState";
 import type { ConnectedAccountChoice } from "../emberTypes";
 import { ConnectedAccountChoiceCard } from "./ConnectedAccountChoiceCard";
-import { googleConnectionChanged } from "./googleConnectionChanged";
+import {
+  type GoogleConnectionAttempt,
+  googleConnectionOutcome,
+} from "./googleConnectionOutcome";
 
 const GOOGLE_SCOPE_PROFILES: readonly GoogleOAuthScopeProfile[] = [
   "google_sheets",
@@ -47,15 +52,58 @@ const GOOGLE_SCOPE_PROFILES: readonly GoogleOAuthScopeProfile[] = [
 
 const POPUP_POLL_MS = 500;
 
-type AttemptState =
-  | "idle"
-  | "open"
-  | "not_completed"
-  | "popup_blocked"
-  | "forbidden"
-  | "start_failed";
+const ATTEMPT_STATES = [
+  "idle",
+  "open",
+  "not_completed",
+  "partial",
+  "popup_blocked",
+  "forbidden",
+  "start_failed",
+] as const;
+
+type AttemptState = (typeof ATTEMPT_STATES)[number];
+
+// The partial row stays the reconnect target until a later attempt settles, so it rides along with every state.
+type Outcome = { attempt: AttemptState; partialConnectionId?: string };
+
+const IDLE: Outcome = { attempt: "idle" };
+
+const OUTCOME_STORAGE_PREFIX = "skyvern-ember-connection-outcome:";
+
+// A reload loses the popup, so an open attempt comes back idle; settled outcomes come back as they were.
+function readOutcome(storageKey: string | null): Outcome {
+  if (!storageKey) return IDLE;
+  try {
+    const stored = JSON.parse(sessionStorage.getItem(storageKey) ?? "null");
+    const attempt = ATTEMPT_STATES.find((state) => state === stored?.attempt);
+    if (!attempt) return IDLE;
+    return {
+      attempt: attempt === "open" ? "idle" : attempt,
+      ...(typeof stored.partialConnectionId === "string"
+        ? { partialConnectionId: stored.partialConnectionId }
+        : {}),
+    };
+  } catch {
+    return IDLE;
+  }
+}
+
+function writeOutcome(storageKey: string | null, outcome: Outcome) {
+  if (!storageKey) return;
+  try {
+    if (outcome.attempt === "idle" && !outcome.partialConnectionId) {
+      sessionStorage.removeItem(storageKey);
+    } else {
+      sessionStorage.setItem(storageKey, JSON.stringify(outcome));
+    }
+  } catch {
+    // Storage can be unavailable; the outcome then lasts until a reload.
+  }
+}
 
 const ATTEMPT_FAILURES: Partial<Record<AttemptState, string>> = {
+  not_completed: "The connection was not completed.",
   popup_blocked:
     "Your browser blocked the sign-in window. Allow pop-ups for this site, then try again.",
   forbidden: "Organization admin access is required to connect an account.",
@@ -74,43 +122,71 @@ function googleScopeProfile(
 
 type ConnectionCardProps = {
   card: ConnectionCardData;
+  turnId?: string | null;
+  // Server time the card's turn was posted. An account created after it shows as Connected, whoever made it, but is
+  // sent as the pick only when it is this card's own attempt.
+  postedAt?: string | null;
   selectedConnectionId?: string | null;
   disabled?: boolean;
   onSelect?: (connectionId: string) => void;
+  // The account the card shows as picked, so the pick's receipt can name it.
+  onSelectionShown?: (choice: ConnectedAccountChoice) => void;
 };
 
 export function ConnectionCard(props: ConnectionCardProps) {
-  const { connectedGmailFlow: GmailFlow } = usePageSlots();
+  const { connectedGmailFlow: GmailFlow, connectedGoogleDriveFlow: DriveFlow } =
+    usePageSlots();
   // A reconnect keeps its native credential; only a new Gmail connection follows the Connected Gmail default.
+  // Cards saved before credentialBackends existed keep their prior Drive choices.
+  const offersDriveBroker =
+    props.card.credentialBackends?.includes("nango") ?? true;
   if (
-    !GmailFlow ||
-    props.card.integrationId !== "gmail" ||
-    props.card.reconnectConnectionId
+    props.card.integrationId === "google_drive" &&
+    offersDriveBroker &&
+    DriveFlow
   ) {
-    return <ConnectionCardBody {...props} />;
+    return (
+      <DriveFlow>
+        {(flow) => <ConnectionCardBody {...props} connectedDrive={flow} />}
+      </DriveFlow>
+    );
   }
-  return (
+  return GmailFlow &&
+    props.card.integrationId === "gmail" &&
+    !props.card.reconnectConnectionId ? (
     <GmailFlow>
       {(flow) => <ConnectionCardBody {...props} connectedGmail={flow} />}
     </GmailFlow>
+  ) : (
+    <ConnectionCardBody {...props} />
   );
 }
 
 function ConnectionCardBody({
   card,
+  turnId = null,
+  postedAt = null,
   selectedConnectionId = null,
   disabled = false,
   onSelect,
+  onSelectionShown,
   connectedGmail,
-}: ConnectionCardProps & { connectedGmail?: ConnectedGmailFlow }) {
+  connectedDrive,
+}: ConnectionCardProps & {
+  connectedGmail?: ConnectedGmailFlow;
+  connectedDrive?: ConnectedGmailFlow;
+}) {
   // Once the server answers native sign-in with 409, Connected Gmail is the card's flow while it can connect, so its
   // failure and retry show; a flow that can no longer connect falls back to native sign-in like any non-live flow.
   const [switchedToConnectedGmail, setSwitchedToConnectedGmail] =
     useState(false);
   // An existing Connected Gmail account stays a choice even when a native credential makes it no longer the default.
+  // A step that runs only on Connected Gmail always takes that flow, even one that cannot connect: native sign-in would
+  // add an account the step cannot use.
   const gmailFlow =
     connectedGmail?.status === "default" ||
-    (switchedToConnectedGmail && connectedGmail?.canConnect)
+    (switchedToConnectedGmail && connectedGmail?.canConnect) ||
+    card.connectedGmailOnly
       ? connectedGmail
       : undefined;
   const gmailFlowLoading = connectedGmail?.status === "loading";
@@ -134,35 +210,84 @@ function ConnectionCardBody({
     ? true
     : gmailFlow
       ? gmailFlow.canConnect
-      : isGoogle
-        ? canGoogleAuthorize
-        : canMicrosoftAuthorize;
+      : card.connectedGmailOnly
+        ? false
+        : isGoogle
+          ? canGoogleAuthorize
+          : canMicrosoftAuthorize;
+  // An admin whose Connected Gmail flow cannot connect is blocked by the flow, not by their role.
+  const connectedGmailUnavailable =
+    Boolean(card.connectedGmailOnly) && !canAuthorize && canGoogleAuthorize;
   const [isStarting, setIsStarting] = useState(false);
   const [confirmSetAccount, setConfirmSetAccount] = useState(false);
-  const [attempt, setAttempt] = useState<AttemptState>("idle");
+  const outcomeKey = turnId
+    ? `${OUTCOME_STORAGE_PREFIX}${turnId}:${connectionCardKey(card)}`
+    : null;
+  const [outcome, setOutcomeState] = useState<Outcome>(() =>
+    readOutcome(outcomeKey),
+  );
+  const settle = (next: Outcome) => {
+    setOutcomeState(next);
+    writeOutcome(outcomeKey, next);
+  };
+  const settleRef = useRef(settle);
+  settleRef.current = settle;
+  // An account this card's own sign-in brought in is the user's pick, sent as one at once so the chat stores it.
+  // A pick that arrives while the card is disabled is dropped and the picker asks instead; an account is sent at
+  // most once per card.
+  const pickedIdRef = useRef<string | null>(null);
+  const pickRef = useRef<(connectionId: string) => void>(() => {});
+  pickRef.current = (connectionId: string) => {
+    if (disabled || !onSelect || pickedIdRef.current === connectionId) return;
+    pickedIdRef.current = connectionId;
+    onSelect(connectionId);
+  };
+  const { attempt, partialConnectionId } = outcome;
   const popupRef = useRef<Window | null>(null);
   const snapshotRef = useRef<GoogleOAuthCredential[]>([]);
+  const attemptRef = useRef<GoogleConnectionAttempt | null>(null);
   const refetchGoogle = google.refetchCredentials;
-  const reconnectConnectionId = card.reconnectConnectionId;
-  const [initialIds, setInitialIds] = useState<Set<string> | null>(null);
-  // Connected Gmail accounts join the baseline, so one that already existed never reads as just connected.
-  const credentialsLoading =
-    (isGoogle ? google.isLoading : microsoft.isLoading) || gmailFlowLoading;
-  const loadedIds = [
-    ...(isGoogle ? google.credentials : microsoft.credentials).map(
-      (credential) => credential.id,
-    ),
-    ...(connectedGmail?.connections ?? []).map(
-      (connection) => connection.connection_id,
-    ),
-  ];
-  const loadedIdsKey = loadedIds.join(" ");
-
+  const targetConnectionId =
+    card.reconnectConnectionId ?? partialConnectionId ?? null;
+  const requiredScopesKey = card.requiredScopes.join(" ");
+  const postedMs = postedAt ? parseServerStamp(postedAt) : Number.NaN;
+  // Connected Gmail rows carry no creation time, so they keep a baseline taken once the flow has loaded; one that
+  // already existed then never reads as just connected.
+  const [initialGmailIds, setInitialGmailIds] = useState<Set<string> | null>(
+    null,
+  );
+  const gmailIdsKey = (connectedGmail?.connections ?? [])
+    .map((connection) => connection.connection_id)
+    .join(" ");
   useEffect(() => {
-    if (initialIds === null && !credentialsLoading) {
-      setInitialIds(new Set(loadedIdsKey.split(" ").filter(Boolean)));
+    if (initialGmailIds === null && !gmailFlowLoading) {
+      setInitialGmailIds(new Set(gmailIdsKey.split(" ").filter(Boolean)));
     }
-  }, [initialIds, credentialsLoading, loadedIdsKey]);
+  }, [initialGmailIds, gmailFlowLoading, gmailIdsKey]);
+  // Only the flow's own finished sign-in counts, never an account that appears in the list some other way.
+  const completedGmailId = connectedGmail?.completedConnectionId ?? null;
+  useEffect(() => {
+    if (!completedGmailId) return;
+    // Out of the effect, since the send flushes editor state synchronously.
+    queueMicrotask(() => pickRef.current(completedGmailId));
+  }, [completedGmailId]);
+  const completedDriveId = connectedDrive?.completedConnectionId ?? null;
+  useEffect(() => {
+    if (completedDriveId)
+      queueMicrotask(() => pickRef.current(completedDriveId));
+  }, [completedDriveId]);
+  const newIds = new Set([
+    ...(isGoogle ? google.credentials : microsoft.credentials)
+      .filter(
+        (credential) => parseServerStamp(credential.created_at) > postedMs,
+      )
+      .map((credential) => credential.id),
+    ...gmailIdsKey
+      .split(" ")
+      .filter(
+        (id) => id && initialGmailIds !== null && !initialGmailIds.has(id),
+      ),
+  ]);
 
   useEffect(() => {
     if (attempt !== "open") return;
@@ -173,22 +298,34 @@ function ConnectionCardBody({
       popupRef.current = null;
       void refetchGoogle()
         .then(({ data }) =>
-          googleConnectionChanged(
+          googleConnectionOutcome(
             snapshotRef.current,
             data ?? [],
-            reconnectConnectionId,
+            attemptRef.current,
+            requiredScopesKey.split(" ").filter(Boolean),
           ),
         )
-        .catch(() => false)
-        .then((changed) => {
-          if (!cancelled) setAttempt(changed ? "idle" : "not_completed");
+        .catch(() => ({ kind: "not_completed" }) as const)
+        .then((result) => {
+          if (cancelled) return;
+          if (result.kind === "connected") pickRef.current(result.connectionId);
+          settleRef.current(
+            result.kind === "connected" || result.kind === "unattributed"
+              ? IDLE
+              : result.kind === "partial"
+                ? {
+                    attempt: "partial",
+                    partialConnectionId: result.connectionId,
+                  }
+                : { attempt: "not_completed", partialConnectionId },
+          );
         });
     }, POPUP_POLL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [attempt, refetchGoogle, reconnectConnectionId]);
+  }, [attempt, refetchGoogle, partialConnectionId, requiredScopesKey]);
 
   const nativeChoices: ConnectedAccountChoice[] = isGoogle
     ? google.credentials
@@ -216,12 +353,18 @@ function ConnectionCardBody({
           email_address: credential.email_address ?? null,
         }));
   const choices: ConnectedAccountChoice[] = [
-    ...nativeChoices,
+    ...(card.connectedGmailOnly ? [] : nativeChoices),
     ...(connectedGmail?.connections ?? []).map((connection) => ({
       connection_id: connection.connection_id,
       name: connection.name,
       state: "active" as const,
-      email_address: null,
+      email_address: connection.email_address ?? null,
+    })),
+    ...(connectedDrive?.connections ?? []).map((connection) => ({
+      connection_id: connection.connection_id,
+      name: connection.name,
+      state: "active" as const,
+      email_address: connection.email_address ?? null,
     })),
   ];
 
@@ -248,17 +391,18 @@ function ConnectionCardBody({
     gmailFlow.start();
   };
 
-  const reconnectCredential = google.credentials.find(
-    (credential) => credential.id === card.reconnectConnectionId,
+  const targetCredential = google.credentials.find(
+    (credential) => credential.id === targetConnectionId,
   );
 
   const startGoogle = async (setAccount = false) => {
-    if (!setAccount && reconnectCredential?.account_recorded === false) {
+    if (!setAccount && targetCredential?.account_recorded === false) {
       setConfirmSetAccount(true);
       return;
     }
     captureConnectStarted();
     snapshotRef.current = google.credentials;
+    attemptRef.current = null;
     // One named window per card, so starting a sibling card's consent cannot take over this card's popup.
     const authTab = window.open(
       "",
@@ -266,24 +410,28 @@ function ConnectionCardBody({
       "popup,width=600,height=760",
     );
     if (!authTab) {
-      setAttempt("popup_blocked");
+      settle({ attempt: "popup_blocked", partialConnectionId });
       return;
     }
     markGoogleOAuthPopup(authTab);
     authTab.opener = null;
     popupRef.current = null;
-    setAttempt("idle");
+    settle({ attempt: "idle", partialConnectionId });
     setIsStarting(true);
     try {
       const response = await google.startAuthorize({
         redirect_uri: buildGoogleOAuthRedirectUri(),
         app_origin: getGoogleOAuthAppOrigin(),
-        ...(card.reconnectConnectionId
-          ? { credential_id: card.reconnectConnectionId }
-          : {}),
+        ...(targetConnectionId ? { credential_id: targetConnectionId } : {}),
         scope_profile: googleScopeProfile(card.scopeProfile),
         ...(setAccount ? { set_account: true } : {}),
       });
+      attemptRef.current = response.credential_id
+        ? {
+            credentialId: response.credential_id,
+            reconnect: Boolean(targetConnectionId),
+          }
+        : null;
       storeGoogleOAuthIntegrationIdForState(response.state, card.integrationId);
       storeGoogleOAuthIntegrationIdForState(
         response.state,
@@ -292,34 +440,44 @@ function ConnectionCardBody({
       );
       authTab.location.assign(response.authorize_url);
       popupRef.current = authTab;
-      setAttempt("open");
+      settle({ attempt: "open", partialConnectionId });
     } catch (startError) {
       authTab.close();
       // The server found Connected Gmail is the way for this org after this card fell back to native (409).
       if (responseStatus(startError) === 409 && connectedGmail?.canConnect) {
-        setAttempt("idle");
+        settle({ attempt: "idle", partialConnectionId });
         setSwitchedToConnectedGmail(true);
         connectedGmail.start();
         return;
       }
-      setAttempt(
-        responseStatus(startError) === 403 ? "forbidden" : "start_failed",
-      );
+      // The partly granted account was deleted or can no longer be reauthorized, so the card offers a fresh connect.
+      if (
+        responseStatus(startError) === 404 &&
+        partialConnectionId &&
+        !card.reconnectConnectionId
+      ) {
+        settle(IDLE);
+        return;
+      }
+      settle({
+        attempt:
+          responseStatus(startError) === 403 ? "forbidden" : "start_failed",
+        partialConnectionId,
+      });
     } finally {
       setIsStarting(false);
     }
   };
 
   // Read back from the credential rows rather than this card's attempt, so the outcome survives a reload.
-  const connected = reconnectConnectionId
-    ? choices.find((choice) => choice.connection_id === reconnectConnectionId)
+  const connected = card.reconnectConnectionId
+    ? choices.find(
+        (choice) => choice.connection_id === card.reconnectConnectionId,
+      )
     : (choices.find(
         (choice) => choice.connection_id === selectedConnectionId,
       ) ??
-      choices.find(
-        (choice) =>
-          initialIds !== null && !initialIds.has(choice.connection_id),
-      ) ??
+      choices.find((choice) => newIds.has(choice.connection_id)) ??
       // A user's one Connected Gmail account is already the way to use Gmail, so the card settles on it.
       (gmailFlow && !gmailFlow.canConnect
         ? choices.find((choice) =>
@@ -328,31 +486,94 @@ function ConnectionCardBody({
             ),
           )
         : undefined));
+  // Google shows an administrator block on its own page and never returns to the callback, so a popup closed
+  // with nothing changed carries no cause and the card does not guess one.
   const failure =
+    connectedDrive?.failure ||
     gmailFlow?.failure ||
-    (attempt === "not_completed"
-      ? `The connection was not completed. If your ${isGoogle ? "Google Workspace" : "Microsoft 365"} administrator blocks this app, ask them to allow it, then try again.`
+    (attempt === "partial"
+      ? `${targetCredential?.credential_name ?? "The account"} was connected without the ${card.integrationName} permission. Reconnect it and leave every permission checked.`
       : ATTEMPT_FAILURES[attempt]);
-  const actionLabel = card.reconnectConnectionId ? "Reconnect" : "Connect";
+  const actionLabel = targetConnectionId ? "Reconnect" : "Connect";
+  // The account a new Gmail card cannot add to: the user's one Connected Gmail, there before this card.
+  const onlyConnectedGmail =
+    !card.reconnectConnectionId &&
+    connected &&
+    gmailFlow &&
+    !gmailFlow.canConnect &&
+    !newIds.has(connected.connection_id) &&
+    gmailFlow.connections.some(
+      (connection) => connection.connection_id === connected.connection_id,
+    );
+  const shown = choices.find(
+    (choice) => choice.connection_id === selectedConnectionId,
+  );
+  const shownId = shown?.connection_id;
+  const shownName = shown?.name;
+  const shownEmail = shown?.email_address ?? null;
+  useEffect(() => {
+    if (shownId && shownName !== undefined) {
+      onSelectionShown?.({
+        connection_id: shownId,
+        name: shownName,
+        state: "active",
+        email_address: shownEmail,
+      });
+    }
+  }, [shownId, shownName, shownEmail, onSelectionShown]);
 
   if (connected) {
     return (
       <div className="space-y-2">
         <div className="rounded-lg border border-success/40 bg-success/10 p-3 text-sm">
-          <div className="font-medium">Connected</div>
-          <div className="mt-1 text-xs text-muted-foreground">
-            {connected.name}
-            {connected.email_address ? ` (${connected.email_address})` : ""} can
-            use {card.integrationName}.
-          </div>
+          {onlyConnectedGmail ? (
+            <>
+              <div className="font-medium">Connected</div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                {connected.connection_id === selectedConnectionId
+                  ? "Using your Connected Gmail account "
+                  : "Your Connected Gmail account "}
+                <bdi>
+                  {connected.email_address ?? stripBidiIsolates(connected.name)}
+                </bdi>
+                {connected.connection_id === selectedConnectionId
+                  ? ". "
+                  : " is shown below. Pick it to use it here. "}
+                To use a different Gmail account, reconnect or disconnect it on
+                the Integrations page.
+              </div>
+              <a
+                className="mt-2 inline-block text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                href="/integrations"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Open the Integrations page
+              </a>
+            </>
+          ) : (
+            <>
+              <div className="font-medium">Connected</div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                <bdi>{stripBidiIsolates(connected.name)}</bdi>
+                {connected.email_address
+                  ? ` (${connected.email_address})`
+                  : ""}{" "}
+                can use {card.integrationName}.
+              </div>
+            </>
+          )}
         </div>
-        <ConnectedAccountChoiceCard
-          choices={choices}
-          accountKind={accountKind}
-          selectedConnectionId={selectedConnectionId}
-          disabled={disabled || !onSelect}
-          onSelect={(connectionId) => onSelect?.(connectionId)}
-        />
+        {choices.length === 1 &&
+        choices[0]?.connection_id === selectedConnectionId ? null : (
+          <ConnectedAccountChoiceCard
+            choices={choices}
+            accountKind={accountKind}
+            selectedConnectionId={selectedConnectionId}
+            disabled={disabled || !onSelect}
+            onSelect={(connectionId) => onSelect?.(connectionId)}
+          />
+        )}
       </div>
     );
   }
@@ -366,7 +587,7 @@ function ConnectionCardBody({
         <div className="mt-1 text-xs text-muted-foreground">
           {choices.length > 0
             ? `Choose an account below, or connect another one for ${card.integrationName}.`
-            : card.reconnectConnectionId
+            : targetConnectionId
               ? `Reconnect this account so it can use ${card.integrationName}.`
               : `Connect an account to use ${card.integrationName}.`}
         </div>
@@ -391,14 +612,17 @@ function ConnectionCardBody({
             disabled={
               isStarting ||
               Boolean(connectedGmail?.busy) ||
+              Boolean(connectedDrive?.busy) ||
               gmailFlowLoading ||
               !canAuthorize ||
-              (Boolean(card.reconnectConnectionId) && google.isLoading)
+              (Boolean(targetConnectionId) && google.isLoading)
             }
             title={
               canAuthorize
                 ? undefined
-                : "Organization admin access is required."
+                : connectedGmailUnavailable
+                  ? "Connected Gmail is not available right now. Reload the page and try again."
+                  : "Organization admin access is required."
             }
             onClick={() =>
               gmailFlow ? startConnectedGmail() : void startGoogle()
@@ -407,10 +631,12 @@ function ConnectionCardBody({
             {isStarting
               ? "Opening…"
               : !canAuthorize
-                ? "Admin required"
+                ? connectedGmailUnavailable
+                  ? "Unavailable"
+                  : "Admin required"
                 : attempt === "open" || connectedGmail?.busy
                   ? "Waiting for sign-in…"
-                  : failure
+                  : failure && attempt !== "partial"
                     ? `${actionLabel} again`
                     : actionLabel}
           </button>
@@ -425,6 +651,21 @@ function ConnectionCardBody({
             page
           </a>
         )}
+        {isGoogle && connectedDrive?.canConnect ? (
+          <button
+            type="button"
+            className="ml-2 mt-3 rounded border border-input px-3 py-1.5 text-xs font-medium disabled:opacity-60"
+            disabled={isStarting || connectedDrive.busy || disabled}
+            onClick={() => {
+              captureConnectStarted();
+              connectedDrive.start();
+            }}
+          >
+            {connectedDrive.busy
+              ? "Waiting for sign-in…"
+              : "Connect with Nango"}
+          </button>
+        ) : null}
       </div>
       <ConfirmDialog
         open={confirmSetAccount}

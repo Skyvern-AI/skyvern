@@ -86,7 +86,9 @@ def _make_service_with_mocks(
     batch_side_effect: Exception | None = None,
     single_side_effect: Exception | None = None,
     persist_browser_session: bool = False,
+    reuse_browser_session: bool = False,
     browser_profile_id: str | None = None,
+    browser_type: str | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
     definition_parameters: list | None = None,
 ) -> tuple[WorkflowService, SimpleNamespace, WorkflowRun]:
@@ -102,6 +104,8 @@ def _make_service_with_mocks(
         cdp_connect_headers=cdp_connect_headers,
         browser_profile_id=browser_profile_id,
         persist_browser_session=persist_browser_session,
+        reuse_browser_session=reuse_browser_session,
+        browser_type=browser_type,
         browser_profile_key=None,
         title="Workflow",
         max_elapsed_time_minutes=None,
@@ -1094,13 +1098,14 @@ async def test_setup_workflow_run_defaults_missing_trigger_type_to_api() -> None
 
         await service.setup_workflow_run(
             request_id="req_test",
-            workflow_request=WorkflowRequestBody(data={}),
+            workflow_request=WorkflowRequestBody(data={}, otp_request_id="otpr_test"),
             workflow_permanent_id="wpid_test",
             organization=organization,
         )
 
     service.create_workflow_run.assert_awaited_once()
     assert service.create_workflow_run.await_args.kwargs["trigger_type"] == WorkflowRunTriggerType.api
+    assert service.create_workflow_run.await_args.kwargs["code_gen"] is False
     mock_app.AGENT_FUNCTION.should_use_flex_llm_routing.assert_awaited_once()
     assert (
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing.await_args.kwargs["trigger_type"]
@@ -1109,6 +1114,102 @@ async def test_setup_workflow_run_defaults_missing_trigger_type_to_api() -> None
     current_context = skyvern_context.current()
     assert current_context is not None
     assert current_context.trigger_type == WorkflowRunTriggerType.api
+
+    await _assert_effective_strict_browser_resources_are_rejected_before_create()
+    await _assert_strict_fresh_browser_policy_is_allowed()
+
+
+async def _assert_effective_strict_browser_resources_are_rejected_before_create() -> None:
+    cases: list[tuple[dict[str, object], dict[str, object], str | None, str]] = [
+        ({"browser_profile_id": "bp_workflow"}, {}, None, "browser_profile_id"),
+        ({"reuse_browser_session": True}, {}, None, "reuse_browser_session"),
+        ({"persist_browser_session": True}, {}, None, "persist_browser_session"),
+        ({"browser_type": "chrome"}, {}, "otpr_parent", "browser_type"),
+    ]
+    for service_kwargs, request_kwargs, parent_marker, unsupported_field in cases:
+        service, organization, _ = _make_service_with_mocks(
+            workflow_parameters=[],
+            **service_kwargs,  # type: ignore[arg-type]
+        )
+        created_runs: list[object] = []
+
+        async def record_create(**kwargs: object) -> object:
+            created_runs.append(kwargs)
+            return object()
+
+        service.create_workflow_run = record_create  # type: ignore[method-assign]
+        request = WorkflowRequestBody(
+            data={},
+            otp_request_id=None if parent_marker else "otpr_root",
+            **request_kwargs,
+        )
+        parent_workflow_run_id = "wr_parent" if parent_marker else None
+
+        with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+            mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+            mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(
+                return_value=SimpleNamespace(otp_request_id=parent_marker, organization_id="org_test")
+            )
+
+            with pytest.raises(SkyvernHTTPException, match=unsupported_field):
+                await service.setup_workflow_run(
+                    request_id="req_test",
+                    workflow_request=request,
+                    workflow_permanent_id="wpid_test",
+                    organization=organization,
+                    parent_workflow_run_id=parent_workflow_run_id,
+                )
+
+        assert created_runs == []
+
+
+async def _assert_strict_fresh_browser_policy_is_allowed() -> None:
+    service, organization, _ = _make_service_with_mocks(
+        workflow_parameters=[],
+        reuse_browser_session=True,
+    )
+    request = WorkflowRequestBody(data={}, otp_request_id="otpr_root", reuse_browser_session=False)
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        workflow_run = await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    assert workflow_run.workflow_run_id == "wr_test"
+
+    fresh_service, organization, _ = _make_service_with_mocks(
+        workflow_parameters=[],
+        browser_profile_id="bp_workflow",
+        persist_browser_session=True,
+        reuse_browser_session=True,
+    )
+    fresh_request = WorkflowRequestBody(
+        data={},
+        otp_request_id="otpr_fresh",
+        start_fresh_browser=True,
+    )
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        fresh_workflow_run = await fresh_service.setup_workflow_run(
+            request_id="req_fresh",
+            workflow_request=fresh_request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    assert fresh_workflow_run.workflow_run_id == "wr_test"
+    assert fresh_request.browser_profile_id is None
 
 
 @pytest.mark.asyncio
@@ -1631,14 +1732,16 @@ class RunSubmissionLab:
     workflow_permanent_id: str
     execute_workflow: AsyncMock
 
-    async def submit(self, route: str, parameters: dict[str, object], *, user_agent: str = "") -> httpx.Response:
+    async def submit(
+        self, route: str, parameters: dict[str, object], *, user_agent: str = "", otp_request_id: str | None = None
+    ) -> httpx.Response:
         headers = {"user-agent": user_agent}
-        if route == "run":
-            return await self.client.post(
-                "/v1/run/workflows",
-                json={"workflow_id": self.workflow_permanent_id, "parameters": parameters},
-                headers=headers,
-            )
+        if route in ("run", "otp-bound-run"):
+            body: dict[str, object] = {"workflow_id": self.workflow_permanent_id, "parameters": parameters}
+            if otp_request_id is not None:
+                body["otp_request_id"] = otp_request_id
+            path = "/v1/otp-bound/run/agents" if route == "otp-bound-run" else "/v1/run/workflows"
+            return await self.client.post(path, json=body, headers=headers)
         return await self.client.post(
             f"/api/v1/workflows/{self.workflow_permanent_id}/run", json={"data": parameters}, headers=headers
         )
@@ -1755,11 +1858,14 @@ async def run_submission_lab(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("otp_request_id", [None, "otpr_lab_submission"], ids=["unmarked", "marked"])
 async def test_run_submission_carries_user_agent_platform_through_real_prepare_and_post_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_engine: AsyncEngine,
+    otp_request_id: str | None,
 ) -> None:
     async with run_submission_lab(monkeypatch, sqlite_engine) as lab:
+        monkeypatch.setattr(app.AGENT_FUNCTION, "strict_otp_execution_available", lambda: True)
         apply_system_tags = AsyncMock()
         monkeypatch.setattr(lab.database.tags, "apply_system_run_tag_changes", apply_system_tags)
         setup_workflow_run = AsyncMock(wraps=lab.workflow_service.setup_workflow_run)
@@ -1770,12 +1876,18 @@ async def test_run_submission_carries_user_agent_platform_through_real_prepare_a
 
         lab.execute_workflow.side_effect = check_tag_is_deferred
         response = await lab.submit(
-            "run",
+            "otp-bound-run" if otp_request_id else "run",
             {"login": "cred_live", "email": "a@example.com"},
             user_agent="Make/production",
+            otp_request_id=otp_request_id,
         )
 
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
+        [stored] = await lab.run_rows()
+        # A marked run is stored as running before it starts; the create response reports it as queued.
+        assert (stored.status, stored.started_at, response.json()["status"]) == (
+            ("running", None, "queued") if otp_request_id else ("created", None, "created")
+        )
         setup_workflow_run.assert_awaited_once()
         assert setup_workflow_run.await_args.kwargs["integration_platform"] == "make"
         apply_system_tags.assert_awaited_once()
@@ -1801,7 +1913,7 @@ async def test_run_submission_carries_user_agent_platform_through_real_prepare_a
         pytest.param(
             "run",
             {"email": "a@example.com", "count": "three"},
-            "Invalid workflow parameter. Expected parameter type: integer. Value: three.",
+            "Invalid workflow parameter. Expected parameter type: integer. Parameter: count.",
             id="invalid-parameter-value",
         ),
         pytest.param(
@@ -1813,7 +1925,7 @@ async def test_run_submission_carries_user_agent_platform_through_real_prepare_a
         pytest.param(
             "run",
             {"login": "cred_live", "email": "a@example.com", "vault_item": "not-a-uuid"},
-            "Invalid workflow parameter. Expected parameter type: Bitwarden item ID (UUID). Value: not-a-uuid.",
+            "Invalid workflow parameter. Expected parameter type: Bitwarden item ID (UUID). Parameter: vault_login.",
             id="invalid-bitwarden-item-id",
         ),
         pytest.param(
@@ -1838,6 +1950,7 @@ async def test_run_submission_refuses_unusable_parameters_without_writing_a_run(
 
         assert refused.status_code == 400
         assert refused.json()["detail"].startswith(detail.format(wpid=lab.workflow_permanent_id))
+        assert not {"three", "not-a-uuid"} & set(refused.json()["detail"].rstrip(".").split())
         assert await lab.run_rows() == []
         lab.execute_workflow.assert_not_awaited()
 

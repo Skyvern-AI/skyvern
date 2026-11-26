@@ -113,7 +113,7 @@ The body is the run object that `get_run` returns. Agent-run webhooks also carry
 | Field | Meaning |
 |---|---|
 | `status` | Terminal status of the run. |
-| `output` | Extracted data. Still present when webhook delivery fails. |
+| `output` | Extracted data. Still present when webhook delivery fails. A run that didn't complete can carry partial data here, so check `status` before using it. |
 | `failure_reason` | Free-text reason the run failed. For logs, not for branching. |
 | `errors` | Structured errors. Your mapped codes appear here as `errors[].error_code`. |
 | `recording_url`, `screenshot_urls` | Signed links, valid for 1 hour. Fetch the run again for fresh ones. |

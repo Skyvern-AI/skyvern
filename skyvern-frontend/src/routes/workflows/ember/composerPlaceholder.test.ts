@@ -43,7 +43,7 @@ describe("composerPlaceholder", () => {
 
   it("returns to the standing invitation once the ask is answered", () => {
     expect(composerPlaceholder(base)).toBe(
-      "Ask Copilot to build or change your workflow…",
+      "Ask Ember to build or change your workflow…",
     );
   });
 
@@ -52,7 +52,7 @@ describe("composerPlaceholder", () => {
       composerPlaceholder({ ...base, latestTurnIsAsk: true, isLoading: true }),
     ).toBe("Type to queue a message…");
     expect(composerPlaceholder({ ...base, isDemonstrating: true })).toBe(
-      "Add context Copilot can't see…",
+      "Add context Ember can't see…",
     );
   });
 });

@@ -131,7 +131,7 @@ def _profile(
 
 
 def _mock_storage(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_session", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_session_snapshot", AsyncMock(return_value=None))
     monkeypatch.setattr(app.STORAGE, "store_browser_profile", AsyncMock())
 
 
@@ -398,6 +398,7 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         webhook_callback_url=request.webhook_callback_url,
         totp_verification_url=request.totp_verification_url,
         totp_identifier=request.totp_identifier,
+        otp_request_id=None,
         parent_workflow_run_id=None,
         max_screenshot_scrolling_times=request.max_screenshot_scrolls,
         max_elapsed_time_minutes=None,

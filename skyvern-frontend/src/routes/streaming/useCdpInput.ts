@@ -14,6 +14,22 @@ import {
 // leaves a channel the user still believes is live; without a reconnect, input is dead until reload.
 const RECONNECTABLE_CODES = new Set([1006, 1011, 4408, 4410, 4411]);
 const MOUSE_MOVE_BUFFER_THRESHOLD = 64 * 1024;
+// The server gives up after 35 s; this only covers a reply lost with the socket.
+const CONSOLE_CLIENT_TIMEOUT_MS = 45_000;
+
+export type ConsoleStatus =
+  | "ok"
+  | "error"
+  | "navigated"
+  | "timeout"
+  | "rejected"
+  | "unavailable";
+
+export interface ConsoleResult {
+  status: ConsoleStatus;
+  text: string;
+  url?: string;
+}
 
 interface UseCdpInputOptions {
   clientId: string;
@@ -28,6 +44,7 @@ interface UseCdpInputOptions {
   // selection model (canvas grids, editors) still copy there.
   forwardCopyShortcut?: boolean;
   onInput?: () => void;
+  onToggleConsole?: () => void;
 }
 
 interface UseCdpInputReturn {
@@ -47,6 +64,8 @@ interface UseCdpInputReturn {
   historyNavigate: (action: HistoryAction) => void;
   navigateError: string | null;
   pasteClipboard: () => void;
+  consoleAvailable: boolean;
+  evaluateExpression: (expression: string) => Promise<ConsoleResult>;
 }
 
 export type HistoryAction = "back" | "forward" | "reload";
@@ -81,10 +100,16 @@ export function useCdpInput({
   onClipboardCopy,
   forwardCopyShortcut = false,
   onInput,
+  onToggleConsole,
 }: UseCdpInputOptions): UseCdpInputReturn {
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [inputReady, setInputReady] = useState(false);
   const [navigateError, setNavigateError] = useState<string | null>(null);
+  const [consoleAvailable, setConsoleAvailable] = useState(false);
+  const pendingEvaluationsRef = useRef(
+    new Map<string, (result: ConsoleResult) => void>(),
+  );
+  const consoleRequestCounterRef = useRef(0);
   const credentialGetter = useCredentialGetter();
   const logging = useLogging();
 
@@ -109,6 +134,11 @@ export function useCdpInput({
   const wheelAnimationFrameRef = useRef<number | null>(null);
   const pendingMouseMoveRef = useRef<Record<string, unknown> | null>(null);
   const mouseMoveAnimationFrameRef = useRef<number | null>(null);
+  const settlePendingEvaluations = (text: string) => {
+    const pending = Array.from(pendingEvaluationsRef.current.values());
+    pendingEvaluationsRef.current.clear();
+    pending.forEach((resolve) => resolve({ status: "error", text }));
+  };
   const cancelPendingMouseMove = () => {
     if (mouseMoveAnimationFrameRef.current !== null) {
       cancelAnimationFrame(mouseMoveAnimationFrameRef.current);
@@ -116,17 +146,21 @@ export function useCdpInput({
     }
     pendingMouseMoveRef.current = null;
   };
-  const interceptedClipboardKeysRef = useRef(new Set<string>());
+  const interceptedKeysRef = useRef(new Set<string>());
   const onClipboardPasteRef = useRef(onClipboardPaste);
   const onClipboardPasteErrorRef = useRef(onClipboardPasteError);
   const onClipboardCopyRef = useRef(onClipboardCopy);
   const onInputRef = useRef(onInput);
+  const onToggleConsoleRef = useRef(onToggleConsole);
+  const consoleAvailableRef = useRef(consoleAvailable);
   onClipboardPasteRef.current = onClipboardPaste;
   onClipboardPasteErrorRef.current = onClipboardPasteError;
   onClipboardCopyRef.current = onClipboardCopy;
   const forwardCopyShortcutRef = useRef(forwardCopyShortcut);
   forwardCopyShortcutRef.current = forwardCopyShortcut;
   onInputRef.current = onInput;
+  onToggleConsoleRef.current = onToggleConsole;
+  consoleAvailableRef.current = consoleAvailable;
 
   const pasteClipboard = useCallback(() => {
     if (!interactive || !userIsControlling || !onClipboardPasteRef.current) {
@@ -198,6 +232,20 @@ export function useCdpInput({
               ws.send(JSON.stringify({ kind: "take-control" }));
             }
           }
+          if (msg.kind === "console") {
+            setConsoleAvailable(msg.available === true);
+          }
+          if (msg.kind === "evaluateResult" && typeof msg.id === "string") {
+            const resolve = pendingEvaluationsRef.current.get(msg.id);
+            if (resolve) {
+              pendingEvaluationsRef.current.delete(msg.id);
+              resolve({
+                status: msg.status as ConsoleStatus,
+                text: typeof msg.text === "string" ? msg.text : "",
+                url: typeof msg.url === "string" ? msg.url : undefined,
+              });
+            }
+          }
           if (msg.kind === "navigate-error") {
             setNavigateError(
               NAVIGATE_ERROR_MESSAGES[msg.reason] ??
@@ -219,6 +267,8 @@ export function useCdpInput({
         console.log("[cdp-input] WebSocket closed", event.code, event.reason);
         if (inputSocketRef.current !== ws) return;
         setInputReady(false);
+        setConsoleAvailable(false);
+        settlePendingEvaluations("The connection to the browser closed.");
         userIsControllingRef.current = false;
         setUserIsControlling(false);
         inputSocketRef.current = null;
@@ -276,6 +326,8 @@ export function useCdpInput({
         inputSocketRef.current.close();
         inputSocketRef.current = null;
       }
+      setConsoleAvailable(false);
+      settlePendingEvaluations("The connection to the browser closed.");
       cancelPendingMouseMove();
     };
   }, [interactive, inputWsUrl, credentialGetter, clientId, logging]);
@@ -506,20 +558,36 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
+      if (
+        e.key === "F12" &&
+        !e.altKey &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.shiftKey &&
+        onToggleConsoleRef.current &&
+        consoleAvailableRef.current
+      ) {
+        interceptedKeysRef.current.add(e.code);
+        if (!e.repeat) {
+          onToggleConsoleRef.current();
+        }
+        return;
+      }
       const clipboardModifier = e.metaKey || e.ctrlKey;
       const key = e.key.toLowerCase();
       if (clipboardModifier && key === "v" && onClipboardPasteRef.current) {
-        interceptedClipboardKeysRef.current.add(e.code);
+        interceptedKeysRef.current.add(e.code);
         pasteClipboard();
         return;
       }
       if (clipboardModifier && key === "c" && onClipboardCopyRef.current) {
         onClipboardCopyRef.current();
         if (!forwardCopyShortcutRef.current) {
-          interceptedClipboardKeysRef.current.add(e.code);
+          interceptedKeysRef.current.add(e.code);
           return;
         }
       }
+      interceptedKeysRef.current.delete(e.code);
       const isPrintable = e.key.length === 1;
       const windowsVirtualKeyCode = virtualKeyCodeFor(e);
       const payload: Record<string, unknown> = {
@@ -555,7 +623,7 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
-      if (interceptedClipboardKeysRef.current.delete(e.code)) {
+      if (interceptedKeysRef.current.delete(e.code)) {
         return;
       }
       const windowsVirtualKeyCode = virtualKeyCodeFor(e);
@@ -592,6 +660,33 @@ export function useCdpInput({
     [interactive, userIsControlling, sendInputEvent],
   );
 
+  const evaluateExpression = useCallback(
+    (expression: string): Promise<ConsoleResult> => {
+      const ws = inputSocketRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return Promise.resolve({
+          status: "error",
+          text: "Not connected to the browser.",
+        });
+      }
+      consoleRequestCounterRef.current += 1;
+      const id = `console-${consoleRequestCounterRef.current}`;
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          if (pendingEvaluationsRef.current.delete(id)) {
+            resolve({ status: "timeout", text: "No reply from the browser." });
+          }
+        }, CONSOLE_CLIENT_TIMEOUT_MS);
+        pendingEvaluationsRef.current.set(id, (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        });
+        ws.send(JSON.stringify({ kind: "evaluate", id, expression }));
+      });
+    },
+    [],
+  );
+
   return {
     userIsControlling,
     setUserIsControlling,
@@ -609,5 +704,7 @@ export function useCdpInput({
     historyNavigate,
     navigateError,
     pasteClipboard,
+    consoleAvailable,
+    evaluateExpression,
   };
 }

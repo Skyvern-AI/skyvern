@@ -1,9 +1,12 @@
-from typing import Annotated
+from collections.abc import Awaitable, Callable
+from typing import Annotated, TypeVar
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.exc import SQLAlchemyError
 
+from skyvern.forge import app
+from skyvern.forge.sdk.experimentation.drive_shared_drive_search import drive_shared_drive_search_enabled
 from skyvern.forge.sdk.schemas.google_sheets import (
     CreateGoogleSheetTabRequest,
     CreateGoogleSheetTabResponse,
@@ -25,11 +28,17 @@ LOG = structlog.get_logger()
 
 google_sheets_router = APIRouter()
 
+T = TypeVar("T")
 
-async def _mint_access_token(organization_id: str, credential_id: str) -> str:
-    """Load credential secrets, then refresh without holding the session."""
+# Blocks wait up to 125 s for another pod's mint; a picker call stops after this and mints without caching.
+_TOKEN_CACHE_LOCK_WAIT_SECONDS = 10
+
+
+async def _load_credential_secrets(
+    organization_id: str, credential_id: str
+) -> google_oauth_service.GoogleCredentialSecrets:
     try:
-        secrets = await google_oauth_service.load_credential_secrets(
+        return await google_oauth_service.load_credential_secrets(
             organization_id=organization_id,
             credential_id=credential_id,
         )
@@ -50,15 +59,34 @@ async def _mint_access_token(organization_id: str, credential_id: str) -> str:
                 "message": f"Could not load stored Google credential: {exc}",
             },
         )
-    try:
+
+
+async def _mint_access_token(organization_id: str, credential_id: str, rejected_token: str | None = None) -> str:
+    """Reuse the credential's cached access token; on a miss, load secrets and refresh without holding the session."""
+    secrets: google_oauth_service.GoogleCredentialSecrets | None = None
+
+    async def mint() -> str:
+        nonlocal secrets
+        secrets = await _load_credential_secrets(organization_id, credential_id)
         return await google_oauth_service.access_token_from_secrets(secrets, organization_id=organization_id)
+
+    try:
+        return await app.AGENT_FUNCTION.get_or_mint_google_access_token(
+            organization_id,
+            credential_id,
+            mint,
+            lock_wait_seconds=_TOKEN_CACHE_LOCK_WAIT_SECONDS,
+            rejected_token=rejected_token,
+        )
+    except HTTPException:
+        raise
     except google_oauth_service.ExpiredRefreshTokenError as exc:
         # Google rejected the refresh token as revoked/expired; record the needs-reconnect state so
         # the integrations UI reflects it, then route the caller to the reconnect flow.
         await google_oauth_service.mark_credential_expired(
             organization_id,
             credential_id,
-            expected_version=secrets.credential_version,
+            expected_version=secrets.credential_version if secrets is not None else None,
         )
         raise HTTPException(
             status_code=409,
@@ -82,6 +110,19 @@ async def _mint_access_token(organization_id: str, credential_id: str) -> str:
         raise HTTPException(status_code=502, detail=f"Failed to refresh access token: {exc}")
 
 
+async def _with_access_token(organization_id: str, credential_id: str, call: Callable[[str], Awaitable[T]]) -> T:
+    access_token = await _mint_access_token(organization_id, credential_id)
+    try:
+        return await call(access_token)
+    except google_sheets_service.GoogleSheetsAPIError as exc:
+        if exc.status != 401:
+            raise
+    # Google revokes a cached token early when access is removed on its side; mint once more so the caller gets a
+    # fresh token or the 409 reconnect, not a 401 the frontend reads as a Skyvern logout. Google acted on nothing
+    # it answered 401, so resending a write is safe.
+    return await call(await _mint_access_token(organization_id, credential_id, rejected_token=access_token))
+
+
 def _translate_api_error(exc: google_sheets_service.GoogleSheetsAPIError) -> HTTPException:
     if exc.status == 403 and exc.code == "reconnect_required":
         return HTTPException(
@@ -101,7 +142,8 @@ def _translate_api_error(exc: google_sheets_service.GoogleSheetsAPIError) -> HTT
     return HTTPException(status_code=502, detail=exc.message)
 
 
-@google_sheets_router.get("/spreadsheets")
+# exclude_unset keeps incomplete_search out of the body unless the shared-drive search set it.
+@google_sheets_router.get("/spreadsheets", response_model_exclude_unset=True)
 async def list_spreadsheets(
     credential_id: Annotated[str, Query(description="Stored Google OAuth credential id")],
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
@@ -109,17 +151,22 @@ async def list_spreadsheets(
     page_token: Annotated[str | None, Query(description="Drive v3 pagination token")] = None,
     page_size: Annotated[int, Query(ge=1, le=100)] = 25,
 ) -> ListGoogleSpreadsheetsResponse:
-    access_token = await _mint_access_token(current_org.organization_id, credential_id)
+    search_all_drives = await drive_shared_drive_search_enabled(current_org.organization_id)
     try:
-        paged = await google_sheets_service.list_spreadsheets(
-            access_token=access_token,
-            query=q,
-            page_token=page_token,
-            page_size=page_size,
+        paged = await _with_access_token(
+            current_org.organization_id,
+            credential_id,
+            lambda access_token: google_sheets_service.list_spreadsheets(
+                access_token=access_token,
+                query=q,
+                page_token=page_token,
+                page_size=page_size,
+                search_all_drives=search_all_drives,
+            ),
         )
     except google_sheets_service.GoogleSheetsAPIError as exc:
         raise _translate_api_error(exc)
-    return ListGoogleSpreadsheetsResponse(
+    response = ListGoogleSpreadsheetsResponse(
         spreadsheets=[
             GoogleSpreadsheetSummary(
                 id=s.id,
@@ -131,6 +178,9 @@ async def list_spreadsheets(
         ],
         next_page_token=paged.next_page_token,
     )
+    if search_all_drives:
+        response.incomplete_search = paged.incomplete_search
+    return response
 
 
 @google_sheets_router.get("/spreadsheets/{spreadsheet_id}")
@@ -141,11 +191,14 @@ async def get_spreadsheet(
 ) -> GoogleSpreadsheetSummary:
     """Look up a spreadsheet's Drive metadata by id so the block picker can show the
     human name after a workflow reload (the stored payload only carries the URL)."""
-    access_token = await _mint_access_token(current_org.organization_id, credential_id)
     try:
-        summary = await google_sheets_service.get_spreadsheet_summary(
-            access_token=access_token,
-            spreadsheet_id=spreadsheet_id,
+        summary = await _with_access_token(
+            current_org.organization_id,
+            credential_id,
+            lambda access_token: google_sheets_service.get_spreadsheet_summary(
+                access_token=access_token,
+                spreadsheet_id=spreadsheet_id,
+            ),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -165,11 +218,14 @@ async def get_spreadsheet_tabs(
     credential_id: Annotated[str, Query(description="Stored Google OAuth credential id")],
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
 ) -> ListGoogleSheetTabsResponse:
-    access_token = await _mint_access_token(current_org.organization_id, credential_id)
     try:
-        tabs = await google_sheets_service.get_spreadsheet_tabs(
-            access_token=access_token,
-            spreadsheet_id=spreadsheet_id,
+        tabs = await _with_access_token(
+            current_org.organization_id,
+            credential_id,
+            lambda access_token: google_sheets_service.get_spreadsheet_tabs(
+                access_token=access_token,
+                spreadsheet_id=spreadsheet_id,
+            ),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -187,12 +243,15 @@ async def get_spreadsheet_headers(
     credential_id: Annotated[str, Query(description="Stored Google OAuth credential id")],
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
 ) -> GetSheetHeadersResponse:
-    access_token = await _mint_access_token(current_org.organization_id, credential_id)
     try:
-        rows = await google_sheets_service.get_sheet_headers(
-            access_token=access_token,
-            spreadsheet_id=spreadsheet_id,
-            sheet_title=sheet_title,
+        rows = await _with_access_token(
+            current_org.organization_id,
+            credential_id,
+            lambda access_token: google_sheets_service.get_sheet_headers(
+                access_token=access_token,
+                spreadsheet_id=spreadsheet_id,
+                sheet_title=sheet_title,
+            ),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -210,8 +269,10 @@ async def get_spreadsheet_dimensions(
     include_merges: Annotated[bool, Query(description="Include all merged ranges in the tab")] = False,
 ) -> GetSheetDimensionsResponse:
     """Return the named tab's grid size + row-1 headers so the editor can preview the destination."""
-    access_token = await _mint_access_token(current_org.organization_id, credential_id)
-    try:
+
+    async def read_tab(
+        access_token: str,
+    ) -> tuple[google_sheets_service.SheetGridProperties, list[google_sheets_service.SheetHeader]]:
         grid = await google_sheets_service.get_sheet_grid_properties(
             access_token=access_token,
             spreadsheet_id=spreadsheet_id,
@@ -227,6 +288,10 @@ async def get_spreadsheet_dimensions(
             spreadsheet_id=spreadsheet_id,
             sheet_title=sheet_title,
         )
+        return grid, rows
+
+    try:
+        grid, rows = await _with_access_token(current_org.organization_id, credential_id, read_tab)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except google_sheets_service.GoogleSheetsAPIError as exc:
@@ -249,11 +314,14 @@ async def create_spreadsheet(
     request: CreateGoogleSpreadsheetRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
 ) -> CreateGoogleSpreadsheetResponse:
-    access_token = await _mint_access_token(current_org.organization_id, request.credential_id)
     try:
-        created = await google_sheets_service.create_spreadsheet(
-            access_token=access_token,
-            title=request.title,
+        created = await _with_access_token(
+            current_org.organization_id,
+            request.credential_id,
+            lambda access_token: google_sheets_service.create_spreadsheet(
+                access_token=access_token,
+                title=request.title,
+            ),
         )
     except google_sheets_service.GoogleSheetsAPIError as exc:
         raise _translate_api_error(exc)
@@ -273,12 +341,15 @@ async def create_sheet_tab(
     request: CreateGoogleSheetTabRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
 ) -> CreateGoogleSheetTabResponse:
-    access_token = await _mint_access_token(current_org.organization_id, request.credential_id)
     try:
-        tab = await google_sheets_service.create_sheet_tab(
-            access_token=access_token,
-            spreadsheet_id=spreadsheet_id,
-            title=request.title,
+        tab = await _with_access_token(
+            current_org.organization_id,
+            request.credential_id,
+            lambda access_token: google_sheets_service.create_sheet_tab(
+                access_token=access_token,
+                spreadsheet_id=spreadsheet_id,
+                title=request.title,
+            ),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

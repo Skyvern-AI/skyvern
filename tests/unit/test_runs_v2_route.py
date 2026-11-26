@@ -21,18 +21,26 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
-from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
-from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunAttemptModel
+from skyvern.forge.sdk.db.exceptions import OTPRequestAlreadyBoundError, RunsListSearchCanceled
+from skyvern.forge.sdk.db.models import WorkflowModel
+from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunAttemptSummary
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow import retry_policy
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    WorkflowRequestBody,
+    WorkflowRun,
+    WorkflowRunStatus,
+    workflow_run_status_for_reads,
+)
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TaskRunRequest
+from tests.unit._otp_route_fakes import matched_route_request
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 from tests.unit.shared_route_app import shared_route_app
 from tests.unit.statement_timeout_fakes import statement_timeout_error
@@ -74,33 +82,25 @@ async def test_get_runs_enriches_retry_state_preserving_tasks_and_order(monkeypa
     )
     task_before = task.model_dump()
     attempts = make_workflow_run_attempts_fake()
-    attempts.get_latest_attempts_for_runs.return_value = {
-        "wr_retrying": WorkflowRunAttemptModel(
+    attempts.get_latest_attempt_summaries_for_runs.return_value = {
+        "wr_retrying": WorkflowRunAttemptSummary(
             workflow_run_id="wr_retrying",
-            organization_id="org_123",
             attempt_number=1,
-            status="failed",
-            finished_at=now,
             retry_decision="retry",
             next_attempt_at=next_attempt_at,
             next_attempt_prepared_at=None,
         ),
-        "wr_completed": WorkflowRunAttemptModel(
+        "wr_completed": WorkflowRunAttemptSummary(
             workflow_run_id="wr_completed",
-            organization_id="org_123",
             attempt_number=2,
-            status="completed",
-            finished_at=now,
             retry_decision="final",
             next_attempt_at=None,
+            next_attempt_prepared_at=None,
         ),
         # A cancel during the delay keeps the scheduled time on the row; the list must not advertise it.
-        "wr_revoked": WorkflowRunAttemptModel(
+        "wr_revoked": WorkflowRunAttemptSummary(
             workflow_run_id="wr_revoked",
-            organization_id="org_123",
             attempt_number=1,
-            status="failed",
-            finished_at=now,
             retry_decision="revoked",
             next_attempt_at=next_attempt_at,
             next_attempt_prepared_at=None,
@@ -144,31 +144,72 @@ async def test_get_runs_enriches_retry_state_preserving_tasks_and_order(monkeypa
         page_size=5,
         status=[WorkflowRunStatus.failed, WorkflowRunStatus.completed],
         search_key="example",
+        project_status_for_reads=True,
     )
+    await _assert_get_runs_projects_strict_unstarted_reservation_as_queued(monkeypatch)
+
+
+async def _assert_get_runs_projects_strict_unstarted_reservation_as_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 11, 20, tzinfo=UTC)
+    reserved = WorkflowRun(
+        workflow_run_id="wr_reserved",
+        workflow_id="wf_123",
+        workflow_permanent_id="wpid_123",
+        organization_id="org_123",
+        status=WorkflowRunStatus.running,
+        otp_request_id="otp_reserved",
+        created_at=now,
+        modified_at=now,
+    )
+    workflow_runs = SimpleNamespace(get_all_runs=AsyncMock(return_value=[reserved]))
+    monkeypatch.setattr(
+        agent_protocol.app,
+        "DATABASE",
+        SimpleNamespace(workflow_runs=workflow_runs, workflow_run_attempts=make_workflow_run_attempts_fake()),
+    )
+    monkeypatch.setattr(agent_protocol.app, "WORKFLOW_SERVICE", WorkflowService())
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+
+    response = await agent_protocol.get_runs(
+        current_org=SimpleNamespace(organization_id="org_123"),
+        page=1,
+        page_size=10,
+        status=[WorkflowRunStatus.queued],
+        search_key=None,
+    )
+
+    assert orjson.loads(response.body)[0]["status"] == WorkflowRunStatus.queued.value
+    assert reserved.status == WorkflowRunStatus.running
 
 
 @pytest.mark.asyncio
-async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "run_types", [(RunType.workflow_run,), (RunType.task_v1,), (RunType.workflow_run, RunType.task_v1)]
+)
+async def test_get_runs_v2_serializes_mapping_rows_from_database(
+    monkeypatch: pytest.MonkeyPatch, run_types: tuple[RunType, ...]
+) -> None:
+    rows = [
+        {
+            "task_run_id": f"tr_{run_type.value}",
+            "run_id": "wr_123" if run_type == RunType.workflow_run else "tsk_123",
+            "task_run_type": run_type.value,
+            "status": "completed",
+            "title": "Run",
+            "started_at": None,
+            "finished_at": None,
+            "created_at": "2026-04-01T00:00:00Z",
+            "workflow_permanent_id": "wpid_123" if run_type == RunType.workflow_run else None,
+            "workflow_deleted": False,
+            "script_run": False,
+            "trigger_type": "mcp" if run_type == RunType.workflow_run else None,
+        }
+        for run_type in run_types
+    ]
     mock_workflow_runs = SimpleNamespace(
-        get_all_runs_v2=AsyncMock(
-            return_value=[
-                {
-                    "task_run_id": "tr_123",
-                    "run_id": "wr_123",
-                    "task_run_type": "workflow_run",
-                    "status": "completed",
-                    "title": "Workflow run",
-                    "started_at": None,
-                    "finished_at": None,
-                    "created_at": "2026-04-01T00:00:00Z",
-                    "workflow_permanent_id": "wpid_123",
-                    "workflow_deleted": False,
-                    "script_run": False,
-                    "trigger_type": "mcp",
-                    "searchable_text": "Workflow run",
-                }
-            ]
-        )
+        get_all_runs_v2=AsyncMock(return_value=[dict(row, searchable_text="Run") for row in rows])
     )
     mock_database = SimpleNamespace(
         workflow_runs=mock_workflow_runs,
@@ -181,7 +222,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
         page=2,
         page_size=5,
         search_key="abc",
-        run_type=[RunType.workflow_run, RunType.task_v1],
+        run_type=list(run_types),
         failure_category=None,
     )
 
@@ -191,11 +232,93 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
         page_size=5,
         status=None,
         search_key="abc",
-        run_type=["workflow_run", "task_v1"],
+        run_type=[run_type.value for run_type in run_types],
         workflow_permanent_ids=None,
         run_tags=None,
         failure_category=None,
     )
+    assert orjson.loads(response.body) == [
+        {
+            **row,
+            "created_by": None,
+            "attempt": 1,
+            "retry_pending": False,
+            "next_attempt_at": None,
+        }
+        for row in rows
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("finished_seconds_ago", "decision", "prepared", "pending"),
+    [
+        (30, None, False, True),
+        (600, None, False, True),
+        (601, None, False, False),
+        (601, "retry", False, True),
+        (30, "retry", True, False),
+        (30, "revoked", False, False),
+    ],
+)
+async def test_get_runs_v2_applies_retry_decision_grace_window(
+    monkeypatch: pytest.MonkeyPatch,
+    finished_seconds_ago: int,
+    decision: str | None,
+    prepared: bool,
+    pending: bool,
+) -> None:
+    now = datetime(2026, 4, 1, tzinfo=UTC).replace(tzinfo=None)
+    next_attempt_at = now + timedelta(minutes=5) if decision else None
+    monkeypatch.setattr(retry_policy, "naive_utc_now", lambda: now)
+    mock_workflow_runs = SimpleNamespace(
+        get_all_runs_v2=AsyncMock(
+            return_value=[
+                {
+                    "task_run_id": "tr_123",
+                    "run_id": "wr_123",
+                    "task_run_type": "workflow_run",
+                    "status": "completed",
+                    "title": "Workflow run",
+                    "started_at": None,
+                    # The task_runs mirror can lag the canonical workflow_runs row. Retry grace
+                    # must use the latter so list and detail agree during that window.
+                    "finished_at": None,
+                    "workflow_run_finished_at": now - timedelta(seconds=finished_seconds_ago),
+                    "created_at": "2026-04-01T00:00:00Z",
+                    "workflow_permanent_id": "wpid_123",
+                    "workflow_deleted": False,
+                    "script_run": False,
+                    "trigger_type": "mcp",
+                    "searchable_text": "Workflow run",
+                }
+            ]
+        )
+    )
+    summary = WorkflowRunAttemptSummary(
+        workflow_run_id="wr_123",
+        attempt_number=2,
+        retry_decision=decision,
+        next_attempt_prepared_at=now if prepared else None,
+        next_attempt_at=next_attempt_at,
+    )
+    attempts = make_workflow_run_attempts_fake()
+    attempts.get_latest_attempt_summaries_for_runs.return_value = {"wr_123": summary}
+    mock_database = SimpleNamespace(
+        workflow_runs=mock_workflow_runs,
+        workflow_run_attempts=attempts,
+    )
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    response = await agent_protocol.get_runs_v2(
+        current_org=SimpleNamespace(organization_id="org_123"),
+        page=1,
+        page_size=5,
+        search_key=None,
+        run_type=[RunType.workflow_run],
+        failure_category=None,
+    )
+
     assert orjson.loads(response.body) == [
         {
             "task_run_id": "tr_123",
@@ -211,63 +334,11 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
             "script_run": False,
             "trigger_type": "mcp",
             "created_by": None,
-            "attempt": 1,
-            "retry_pending": False,
-            "next_attempt_at": None,
+            "attempt": 2,
+            "retry_pending": pending,
+            "next_attempt_at": next_attempt_at.isoformat() if pending and next_attempt_at else None,
         }
     ]
-
-
-@pytest.mark.asyncio
-async def test_get_runs_v2_applies_retry_decision_grace_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    mock_workflow_runs = SimpleNamespace(
-        get_all_runs_v2=AsyncMock(
-            return_value=[
-                {
-                    "task_run_id": "tr_123",
-                    "run_id": "wr_123",
-                    "task_run_type": "workflow_run",
-                    "status": "completed",
-                    "title": "Workflow run",
-                    "started_at": None,
-                    # The task_runs mirror can lag the canonical workflow_runs row. Retry grace
-                    # must use the latter so list and detail agree during that window.
-                    "finished_at": None,
-                    "workflow_run_finished_at": datetime.now(UTC) - timedelta(seconds=30),
-                    "created_at": "2026-04-01T00:00:00Z",
-                    "workflow_permanent_id": "wpid_123",
-                    "workflow_deleted": False,
-                    "script_run": False,
-                    "trigger_type": "mcp",
-                    "searchable_text": "Workflow run",
-                }
-            ]
-        )
-    )
-    mock_attempt = SimpleNamespace(
-        attempt_number=1,
-        retry_decision=None,
-        next_attempt_prepared_at=None,
-        next_attempt_at=None,
-    )
-    mock_database = SimpleNamespace(
-        workflow_runs=mock_workflow_runs,
-        workflow_run_attempts=SimpleNamespace(
-            get_latest_attempts_for_runs=AsyncMock(return_value={"wr_123": mock_attempt})
-        ),
-    )
-    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
-
-    response = await agent_protocol.get_runs_v2(
-        current_org=SimpleNamespace(organization_id="org_123"),
-        page=1,
-        page_size=5,
-        search_key=None,
-        run_type=[RunType.workflow_run],
-        failure_category=None,
-    )
-
-    assert orjson.loads(response.body)[0]["retry_pending"] is True
 
 
 @pytest.mark.asyncio
@@ -483,6 +554,7 @@ async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
         created_at_start=None,
         created_at_end=None,
         run_tags=None,
+        project_status_for_reads=True,
     )
 
 
@@ -647,6 +719,7 @@ async def test_get_workflow_runs_bounds_free_text_search_without_a_start_to_a_de
         error_code="LOGIN_FAILED",
         created_at_start=expected_start,
         created_at_end=expected_end,
+        project_status_for_reads=True,
     )
 
 
@@ -745,21 +818,80 @@ async def test_workflow_service_forwards_created_at_bounds_to_the_repository(mon
 
 
 @pytest.mark.parametrize(
-    ("original_trigger_type", "x_user_agent", "expected_trigger"),
+    (
+        "original_trigger_type",
+        "x_user_agent",
+        "expected_trigger",
+        "guarded_retry",
+        "strict_execution_available",
+        "clear_browser_resources",
+        "expected_error",
+    ),
     [
-        (WorkflowRunTriggerType.seo_recipe_submit, None, WorkflowRunTriggerType.seo_recipe_submit),
-        (WorkflowRunTriggerType.api, None, WorkflowRunTriggerType.api),
-        (WorkflowRunTriggerType.api, SKYVERN_UI_USER_AGENT, WorkflowRunTriggerType.manual),
-        (WorkflowRunTriggerType.api, SKYVERN_MCP_USER_AGENT, WorkflowRunTriggerType.mcp),
+        (
+            WorkflowRunTriggerType.seo_recipe_submit,
+            None,
+            WorkflowRunTriggerType.seo_recipe_submit,
+            False,
+            False,
+            False,
+            None,
+        ),
+        (WorkflowRunTriggerType.api, None, WorkflowRunTriggerType.api, False, False, False, None),
+        (
+            WorkflowRunTriggerType.api,
+            SKYVERN_UI_USER_AGENT,
+            WorkflowRunTriggerType.manual,
+            False,
+            False,
+            False,
+            None,
+        ),
+        (
+            WorkflowRunTriggerType.api,
+            SKYVERN_MCP_USER_AGENT,
+            WorkflowRunTriggerType.mcp,
+            False,
+            False,
+            False,
+            None,
+        ),
         (
             WorkflowRunTriggerType.job_recipe_apply,
             None,
             WorkflowRunTriggerType.job_recipe_apply,
+            False,
+            False,
+            False,
+            None,
         ),
         (
             WorkflowRunTriggerType.job_recipe_extract,
             None,
             WorkflowRunTriggerType.job_recipe_extract,
+            False,
+            False,
+            False,
+            None,
+        ),
+        (
+            WorkflowRunTriggerType.api,
+            None,
+            WorkflowRunTriggerType.api,
+            True,
+            True,
+            False,
+            (400, "fresh local"),
+        ),
+        (WorkflowRunTriggerType.api, None, WorkflowRunTriggerType.api, True, True, True, None),
+        (
+            WorkflowRunTriggerType.api,
+            None,
+            WorkflowRunTriggerType.api,
+            True,
+            False,
+            True,
+            (501, "not supported"),
         ),
     ],
 )
@@ -769,8 +901,15 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
     original_trigger_type: WorkflowRunTriggerType,
     x_user_agent: str | None,
     expected_trigger: WorkflowRunTriggerType,
+    guarded_retry: bool,
+    strict_execution_available: bool,
+    clear_browser_resources: bool,
+    expected_error: tuple[int, str] | None,
 ) -> None:
     created_at = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    browser_session_id = None if clear_browser_resources else "pbs_123"
+    browser_profile_id = None if clear_browser_resources else "bprof_123"
+    browser_address = None if clear_browser_resources else "http://127.0.0.1:9222"
     original_run = SimpleNamespace(
         workflow_run_id="wr_original",
         workflow_id="wf_original",
@@ -780,8 +919,8 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
         webhook_callback_url="https://example.com/webhook",
         totp_verification_url="https://example.com/totp",
         totp_identifier="account@example.com",
-        browser_session_id="pbs_123",
-        browser_profile_id="bprof_123",
+        browser_session_id=browser_session_id,
+        browser_profile_id=browser_profile_id,
         browser_seed_source=None,
         start_fresh_browser=None,
         reuse_browser_session=None,
@@ -789,18 +928,26 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
         max_elapsed_time_minutes=None,
         extra_http_headers={"X-Test": "1"},
         cdp_connect_headers={"X-CDP-Auth": "secret"},
-        browser_address="http://127.0.0.1:9222",
+        browser_address=browser_address,
         run_with="code",
         ai_fallback=True,
         debug_session_id=None,
         code_gen=None,
         ignore_inherited_workflow_system_prompt=True,
         trigger_type=original_trigger_type,
+        otp_request_id=None,
     )
+    # A guarded retry creates a marked run, stored as running before it starts.
+    retried_status = WorkflowRunStatus.running if guarded_retry else WorkflowRunStatus.created
     retried_run = SimpleNamespace(
         workflow_run_id="wr_retry",
         workflow_id="wf_original",
-        status=WorkflowRunStatus.created,
+        status=retried_status,
+        status_for_reads=workflow_run_status_for_reads(
+            status=retried_status,
+            otp_request_id="otpr_retry" if guarded_retry else None,
+            started_at=None,
+        ),
         failure_reason=None,
         created_at=created_at,
         modified_at=created_at,
@@ -840,8 +987,11 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
     mock_agent_function = SimpleNamespace(
         get_workflow_run_retry_refusal=AsyncMock(return_value=None),
         is_block_scoped_workflow_run=AsyncMock(return_value=False),
-        browser_session_ids_authorized_for_connect=AsyncMock(return_value={"pbs_123"}),
+        browser_session_ids_authorized_for_connect=AsyncMock(
+            return_value={browser_session_id} if browser_session_id is not None else set()
+        ),
         should_redact_unresolved_browser_session_address=AsyncMock(return_value=False),
+        strict_otp_execution_available=lambda: strict_execution_available,
         on_run_created=AsyncMock(),
     )
     monkeypatch.setattr(app_instance, "AGENT_FUNCTION", mock_agent_function, raising=False)
@@ -854,13 +1004,37 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
     )
 
     run_workflow_mock = AsyncMock(return_value=retried_run)
+    if expected_error is not None and expected_error[0] == 501:
+        run_workflow_mock.side_effect = AssertionError("unsupported strict retry reached run_workflow")
     monkeypatch.setattr(agent_protocol.workflow_service, "run_workflow", run_workflow_mock)
 
     caller = _caller()
+    request = (
+        matched_route_request("/v1/otp-bound/workflows/runs/{workflow_run_id}/retry", otp_bound=True)
+        if guarded_retry
+        else SimpleNamespace()
+    )
+    if expected_error is not None:
+        expected_status, expected_detail = expected_error
+        with pytest.raises(HTTPException, match=expected_detail) as exc_info:
+            await agent_protocol.retry_workflow_run(
+                request=request,
+                background_tasks=BackgroundTasks(),
+                workflow_run_id="wr_original",
+                otp_request_id="otpr_retry",
+                caller=caller,
+                x_api_key="api-key",
+                x_max_steps_override=10,
+                x_user_agent=x_user_agent,
+            )
+        assert exc_info.value.status_code == expected_status
+        return
+
     response = await agent_protocol.retry_workflow_run(
-        request=SimpleNamespace(),
+        request=request,
         background_tasks=BackgroundTasks(),
         workflow_run_id="wr_original",
+        otp_request_id="otpr_retry" if guarded_retry else None,
         caller=caller,
         x_api_key="api-key",
         x_max_steps_override=10,
@@ -876,7 +1050,10 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
         workflow_run_id="wr_original",
     )
     mock_agent_function.is_block_scoped_workflow_run.assert_awaited_once_with(original_run)
-    mock_permission_checker.check.assert_awaited_once_with(caller.organization, browser_session_id="pbs_123")
+    mock_permission_checker.check.assert_awaited_once_with(
+        caller.organization,
+        browser_session_id=browser_session_id,
+    )
     mock_rate_limiter.rate_limit_submit_run.assert_awaited_once_with("org_123")
     mock_workflow_service.get_workflow.assert_awaited_once_with(
         workflow_id="wf_original",
@@ -908,17 +1085,18 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
     assert call_kwargs["workflow_request"].webhook_callback_url == "https://example.com/webhook"
     assert call_kwargs["workflow_request"].totp_verification_url == "https://example.com/totp"
     assert call_kwargs["workflow_request"].totp_identifier == "account@example.com"
-    assert call_kwargs["workflow_request"].browser_session_id == "pbs_123"
-    assert call_kwargs["workflow_request"].browser_profile_id == "bprof_123"
+    assert call_kwargs["workflow_request"].browser_session_id == browser_session_id
+    assert call_kwargs["workflow_request"].browser_profile_id == browser_profile_id
     assert call_kwargs["workflow_request"].max_screenshot_scrolls == 3
     assert call_kwargs["workflow_request"].extra_http_headers == {"X-Test": "1"}
     assert call_kwargs["workflow_request"].cdp_connect_headers == {"X-CDP-Auth": "secret"}
-    assert call_kwargs["workflow_request"].browser_address == "http://127.0.0.1:9222"
+    assert call_kwargs["workflow_request"].browser_address == browser_address
     assert call_kwargs["workflow_request"].run_with == "code"
     assert call_kwargs["workflow_request"].ai_fallback is True
     assert call_kwargs["workflow_request"].run_metadata == {"env": "prod"}
 
     assert response.run_id == "wr_retry"
+    assert response.status == ("queued" if guarded_retry else "created")
     assert response.run_id != original_run.workflow_run_id
     assert response.run_request is not None
     assert response.run_request.workflow_id == "wpid_123"
@@ -927,15 +1105,48 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
 
 
 @pytest.mark.asyncio
-async def test_retry_workflow_run_rejects_block_scoped_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    mock_debug = SimpleNamespace(has_block_run_for_workflow_run=AsyncMock(return_value=True))
+@pytest.mark.parametrize(
+    ("legacy_strict_root", "has_block_run"),
+    [(False, True), (True, False)],
+    ids=["database-block", "legacy-process-strict-root"],
+)
+async def test_retry_workflow_run_rejects_block_scoped_run(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_strict_root: bool,
+    has_block_run: bool,
+) -> None:
+    debug_reads = 0
+    dispatches = 0
+
+    async def has_block_run_for_workflow_run(**_: object) -> bool:
+        nonlocal debug_reads
+        debug_reads += 1
+        return has_block_run
+
+    async def get_workflow_run_retry_refusal(_: object) -> None:
+        return None
+
+    async def is_block_scoped_workflow_run(workflow_run: SimpleNamespace) -> bool:
+        if not legacy_strict_root:
+            return False
+        # This is the base-version CloudAgentFunction check. That process cannot
+        # see otp_request_id, but it can see the persisted tri-state code_gen field.
+        return workflow_run.debug_session_id is not None or workflow_run.code_gen is not None
+
+    async def run_workflow(**_: object) -> None:
+        nonlocal dispatches
+        dispatches += 1
+        pytest.fail("a mixed-version retry must not create or dispatch an unmarked run")
+
+    mock_debug = SimpleNamespace(has_block_run_for_workflow_run=has_block_run_for_workflow_run)
     mock_workflow_runs = SimpleNamespace(
         get_workflow_run=AsyncMock(
             return_value=SimpleNamespace(
                 workflow_run_id="wr_block",
+                otp_request_id=None,
                 status=WorkflowRunStatus.failed,
                 debug_session_id=None,
-                code_gen=None,
+                code_gen=False if legacy_strict_root else None,
             )
         )
     )
@@ -949,12 +1160,13 @@ async def test_retry_workflow_run_rejects_block_scoped_run(monkeypatch: pytest.M
         app_instance,
         "AGENT_FUNCTION",
         SimpleNamespace(
-            get_workflow_run_retry_refusal=AsyncMock(return_value=None),
-            is_block_scoped_workflow_run=AsyncMock(return_value=False),
+            get_workflow_run_retry_refusal=get_workflow_run_retry_refusal,
+            is_block_scoped_workflow_run=is_block_scoped_workflow_run,
         ),
         raising=False,
     )
     monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent_protocol.workflow_service, "run_workflow", run_workflow)
 
     with pytest.raises(HTTPException) as exc_info:
         await agent_protocol.retry_workflow_run(
@@ -969,10 +1181,8 @@ async def test_retry_workflow_run_rejects_block_scoped_run(monkeypatch: pytest.M
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "Block-scoped workflow runs cannot be retried with this endpoint"
-    mock_debug.has_block_run_for_workflow_run.assert_awaited_once_with(
-        organization_id="org_123",
-        workflow_run_id="wr_block",
-    )
+    assert debug_reads == (0 if legacy_strict_root else 1)
+    assert dispatches == 0
 
 
 @pytest.mark.asyncio
@@ -980,6 +1190,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
     now = datetime(2026, 4, 1, tzinfo=timezone.utc)
     original_run = SimpleNamespace(
         workflow_run_id="wr_template",
+        otp_request_id=None,
         workflow_id="wf_template",
         workflow_permanent_id="wpid_template",
         status=WorkflowRunStatus.completed,
@@ -1007,6 +1218,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         workflow_run_id="wr_template_retry",
         workflow_id="wf_template",
         status=WorkflowRunStatus.created,
+        status_for_reads=WorkflowRunStatus.created,
         failure_reason=None,
         created_at=now,
         modified_at=now,
@@ -1087,6 +1299,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
 async def test_retry_workflow_run_rejects_missing_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
     original_run = SimpleNamespace(
         workflow_run_id="wr_missing_workflow",
+        otp_request_id=None,
         workflow_id="wf_missing",
         workflow_permanent_id="wpid_missing",
         status=WorkflowRunStatus.failed,
@@ -1141,10 +1354,42 @@ async def test_retry_workflow_run_rejects_missing_workflow(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_retry_workflow_run_rejects_active_run(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("status", "otp_request_id", "route", "retry_otp_request_id", "expected_detail"),
+    [
+        (WorkflowRunStatus.running, None, None, None, "Only terminal workflow runs can be retried"),
+        (WorkflowRunStatus.failed, "otpr_test", None, None, "otp-bound retry endpoint"),
+        (
+            WorkflowRunStatus.failed,
+            None,
+            ("/v1/renamed/workflows/runs/{workflow_run_id}/retry", True),
+            None,
+            "otp_request_id is required on the otp-bound retry endpoint",
+        ),
+        (
+            WorkflowRunStatus.failed,
+            None,
+            ("/v1/otp-bound/workflows/runs/{workflow_run_id}/retry", False),
+            "otpr_new",
+            "otp_request_id is accepted only on the otp-bound retry endpoint",
+        ),
+    ],
+)
+async def test_retry_workflow_run_rejects_active_run(
+    monkeypatch: pytest.MonkeyPatch,
+    status: WorkflowRunStatus,
+    otp_request_id: str | None,
+    route: tuple[str, bool] | None,
+    retry_otp_request_id: str | None,
+    expected_detail: str,
+) -> None:
     mock_workflow_runs = SimpleNamespace(
         get_workflow_run=AsyncMock(
-            return_value=SimpleNamespace(workflow_run_id="wr_running", status=WorkflowRunStatus.running)
+            return_value=SimpleNamespace(
+                workflow_run_id="wr_running",
+                status=status,
+                otp_request_id=otp_request_id,
+            )
         )
     )
     monkeypatch.setattr(agent_protocol.app, "DATABASE", SimpleNamespace(workflow_runs=mock_workflow_runs))
@@ -1152,9 +1397,10 @@ async def test_retry_workflow_run_rejects_active_run(monkeypatch: pytest.MonkeyP
 
     with pytest.raises(HTTPException) as exc_info:
         await agent_protocol.retry_workflow_run(
-            request=SimpleNamespace(),
+            request=SimpleNamespace() if route is None else matched_route_request(route[0], otp_bound=route[1]),
             background_tasks=BackgroundTasks(),
             workflow_run_id="wr_running",
+            otp_request_id=retry_otp_request_id,
             caller=_caller(),
             x_api_key=None,
             x_max_steps_override=None,
@@ -1162,10 +1408,14 @@ async def test_retry_workflow_run_rejects_active_run(monkeypatch: pytest.MonkeyP
         )
 
     assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == "Only terminal workflow runs can be retried"
+    assert expected_detail in exc_info.value.detail
 
 
-def _install_task_route_doubles(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+def _install_task_route_doubles(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    strict_otp_execution_available: bool = True,
+) -> AsyncMock:
     on_run_created = AsyncMock()
     app_instance = object.__getattribute__(agent_protocol.app, "_inst")
     monkeypatch.setattr(
@@ -1192,6 +1442,7 @@ def _install_task_route_doubles(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
         SimpleNamespace(
             on_run_created=on_run_created,
             browser_session_ids_authorized_for_connect=AsyncMock(return_value=set()),
+            strict_otp_execution_available=lambda: strict_otp_execution_available,
         ),
         raising=False,
     )
@@ -1218,11 +1469,13 @@ def _install_task_route_doubles(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     return on_run_created
 
 
-def _task_run_request(engine: RunEngine) -> TaskRunRequest:
+def _task_run_request(engine: RunEngine, *, otp_request_id: str | None = None, **kwargs: object) -> TaskRunRequest:
     return TaskRunRequest(
         prompt="Do the task",
         url="https://example.com",
         engine=engine,
+        otp_request_id=otp_request_id,
+        **kwargs,
     )
 
 
@@ -1230,17 +1483,19 @@ def _task_run_request(engine: RunEngine) -> TaskRunRequest:
 async def test_run_task_v1_uses_resolved_caller_type_with_ui_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     on_run_created = _install_task_route_doubles(monkeypatch)
     created_task = MagicMock(task_id="tsk_v1")
-    monkeypatch.setattr(
-        agent_protocol.task_v1_service,
-        "run_task",
-        AsyncMock(return_value=(created_task, RunEngine.skyvern_v1)),
-    )
+    received_tasks: list[object] = []
+
+    async def run_task_v1(*, task: object, **_: object) -> tuple[MagicMock, RunEngine]:
+        received_tasks.append(task)
+        return created_task, RunEngine.skyvern_v1
+
+    monkeypatch.setattr(agent_protocol.task_v1_service, "run_task", run_task_v1)
     background_tasks = BackgroundTasks()
 
-    await agent_protocol.run_task(
-        request=SimpleNamespace(),
+    response = await agent_protocol.run_task(
+        request=matched_route_request("/v1/otp-bound/run/tasks", otp_bound=True),
         background_tasks=background_tasks,
-        run_request=_task_run_request(RunEngine.skyvern_v1),
+        run_request=_task_run_request(RunEngine.skyvern_v1, otp_request_id="otpr_test"),
         caller=SimpleNamespace(
             organization=SimpleNamespace(organization_id="org_123", max_steps_per_run=None),
             caller_type=CallerType.API_KEY,
@@ -1250,6 +1505,9 @@ async def test_run_task_v1_uses_resolved_caller_type_with_ui_user_agent(monkeypa
     )
 
     assert len(background_tasks.tasks) == 1
+    assert len(received_tasks) == 1
+    assert getattr(received_tasks[0], "otp_request_id", None) == "otpr_test"
+    assert response.run_request.otp_request_id == "otpr_test"
     await background_tasks()
     on_run_created.assert_awaited_once_with(
         organization_id="org_123",
@@ -1263,17 +1521,19 @@ async def test_run_task_v1_uses_resolved_caller_type_with_ui_user_agent(monkeypa
 async def test_run_task_v2_schedules_run_created_hook(monkeypatch: pytest.MonkeyPatch) -> None:
     on_run_created = _install_task_route_doubles(monkeypatch)
     task_v2 = MagicMock(observer_cruise_id="tsk_v2", workflow_run_id=None)
-    monkeypatch.setattr(
-        agent_protocol.task_v2_service,
-        "initialize_task_v2",
-        AsyncMock(return_value=task_v2),
-    )
+    received_markers: list[str | None] = []
+
+    async def initialize_task_v2(*, otp_request_id: str | None = None, **_: object) -> MagicMock:
+        received_markers.append(otp_request_id)
+        return task_v2
+
+    monkeypatch.setattr(agent_protocol.task_v2_service, "initialize_task_v2", initialize_task_v2)
     background_tasks = BackgroundTasks()
 
-    await agent_protocol.run_task(
-        request=SimpleNamespace(),
+    response = await agent_protocol.run_task(
+        request=matched_route_request("/v1/otp-bound/run/tasks", otp_bound=True),
         background_tasks=background_tasks,
-        run_request=_task_run_request(RunEngine.skyvern_v2),
+        run_request=_task_run_request(RunEngine.skyvern_v2, otp_request_id="otpr_test"),
         caller=SimpleNamespace(
             organization=SimpleNamespace(organization_id="org_123", max_steps_per_run=None),
             caller_type=CallerType.API_KEY,
@@ -1282,6 +1542,8 @@ async def test_run_task_v2_schedules_run_created_hook(monkeypatch: pytest.Monkey
     )
 
     assert len(background_tasks.tasks) == 1
+    assert received_markers == ["otpr_test"]
+    assert response.run_request.otp_request_id == "otpr_test"
     await background_tasks()
     on_run_created.assert_awaited_once_with(
         organization_id="org_123",
@@ -1292,25 +1554,39 @@ async def test_run_task_v2_schedules_run_created_hook(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("engine", [RunEngine.skyvern_v1, RunEngine.skyvern_v2])
+@pytest.mark.parametrize(
+    ("engine", "creation_error", "expected_status"),
+    [
+        (RunEngine.skyvern_v1, RuntimeError("creation failed"), None),
+        (RunEngine.skyvern_v2, RuntimeError("creation failed"), None),
+        (
+            RunEngine.skyvern_v2,
+            OTPRequestAlreadyBoundError(owner_type="workflow_run", owner_id="wr_owner"),
+            409,
+        ),
+    ],
+)
 async def test_run_task_does_not_schedule_run_created_hook_when_creation_fails(
     monkeypatch: pytest.MonkeyPatch,
     engine: RunEngine,
+    creation_error: Exception,
+    expected_status: int | None,
 ) -> None:
     on_run_created = _install_task_route_doubles(monkeypatch)
     monkeypatch.setattr(
         agent_protocol.task_v1_service,
         "run_task",
-        AsyncMock(side_effect=RuntimeError("creation failed")),
+        AsyncMock(side_effect=creation_error),
     )
     monkeypatch.setattr(
         agent_protocol.task_v2_service,
         "initialize_task_v2",
-        AsyncMock(side_effect=RuntimeError("creation failed")),
+        AsyncMock(side_effect=creation_error),
     )
     background_tasks = BackgroundTasks()
 
-    with pytest.raises(RuntimeError, match="creation failed"):
+    expected_error = HTTPException if expected_status is not None else RuntimeError
+    with pytest.raises(expected_error, match="already bound|creation failed") as exc_info:
         await agent_protocol.run_task(
             request=SimpleNamespace(),
             background_tasks=background_tasks,
@@ -1322,13 +1598,123 @@ async def test_run_task_does_not_schedule_run_created_hook_when_creation_fails(
             x_api_key="api-key",
         )
 
+    if expected_status is not None:
+        assert isinstance(exc_info.value, HTTPException)
+        assert exc_info.value.status_code == expected_status
+
     assert background_tasks.tasks == []
     on_run_created.assert_not_awaited()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "run_kind",
+        "path",
+        "otp_bound",
+        "otp_request_id",
+        "resource_kwargs",
+        "strict_otp_execution_available",
+        "expected_status",
+        "expected_detail",
+    ),
+    [
+        ("task_v1", "/v1/run/tasks", False, "otpr_test", {}, True, 400, "otp_request_id"),
+        ("task_v1", "/v1/otp-bound/run/tasks", True, None, {}, True, 400, "otp_request_id"),
+        (
+            "task_v1",
+            "/v1/otp-bound/run/tasks",
+            True,
+            "otpr_test",
+            {"browser_session_id": "pbs_existing"},
+            True,
+            400,
+            "fresh local",
+        ),
+        (
+            "task_v1",
+            "/v1/otp-bound/run/tasks",
+            True,
+            "otpr_test",
+            {"browser_profile_id": "bp_existing"},
+            True,
+            400,
+            "fresh local",
+        ),
+        (
+            "task_v1",
+            "/v1/otp-bound/run/tasks",
+            True,
+            "otpr_test",
+            {"browser_address": "wss://browser.example.test/devtools/browser/id"},
+            True,
+            400,
+            "fresh local",
+        ),
+        ("task_v1", "/v1/otp-bound/run/tasks", True, "otpr_test", {}, False, 501, "not supported"),
+        ("task_v2", "/v1/otp-bound/run/tasks", True, "otpr_test", {}, False, 501, "not supported"),
+        ("workflow", "/v1/otp-bound/run/agents", True, "otpr_test", {}, False, 501, "not supported"),
+        ("task_v1", "/v1/renamed/run/tasks", True, None, {}, True, 400, "otp_request_id is required"),
+        ("task_v1", "/v1/otp-bound/run/tasks", False, "otpr_test", {}, True, 400, "accepted only"),
+    ],
+)
+async def test_run_task_refuses_ambiguous_strict_admission_before_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    run_kind: str,
+    path: str,
+    otp_bound: bool,
+    otp_request_id: str | None,
+    resource_kwargs: dict[str, object],
+    strict_otp_execution_available: bool,
+    expected_status: int,
+    expected_detail: str,
+) -> None:
+    _install_task_route_doubles(
+        monkeypatch,
+        strict_otp_execution_available=strict_otp_execution_available,
+    )
+    run_task = AsyncMock()
+    run_workflow = AsyncMock()
+    monkeypatch.setattr(agent_protocol.task_v1_service, "run_task", run_task)
+    monkeypatch.setattr(agent_protocol.workflow_service, "run_workflow", run_workflow)
+    run_request = _task_run_request(
+        RunEngine.skyvern_v2 if run_kind == "task_v2" else RunEngine.skyvern_v1,
+        otp_request_id=otp_request_id,
+        **resource_kwargs,
+    )
+
+    assert getattr(run_request, "otp_request_id", None) == otp_request_id
+    with pytest.raises(HTTPException, match=expected_detail) as exc_info:
+        if run_kind == "workflow":
+            await agent_protocol.run_workflow(
+                request=matched_route_request(path, otp_bound=otp_bound),
+                background_tasks=BackgroundTasks(),
+                workflow_run_request=SimpleNamespace(otp_request_id=otp_request_id, **resource_kwargs),
+                caller=SimpleNamespace(
+                    organization=SimpleNamespace(organization_id="org_123", max_steps_per_run=None),
+                    caller_type=CallerType.API_KEY,
+                ),
+            )
+        else:
+            await agent_protocol.run_task(
+                request=matched_route_request(path, otp_bound=otp_bound),
+                background_tasks=BackgroundTasks(),
+                run_request=run_request,
+                caller=SimpleNamespace(
+                    organization=SimpleNamespace(organization_id="org_123", max_steps_per_run=None),
+                    caller_type=CallerType.API_KEY,
+                ),
+                x_api_key="api-key",
+            )
+
+    assert exc_info.value.status_code == expected_status
+    run_task.assert_not_awaited()
+    run_workflow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_legacy_task_routes_schedule_run_created_hook(monkeypatch: pytest.MonkeyPatch) -> None:
-    on_run_created = _install_task_route_doubles(monkeypatch)
+    on_run_created = _install_task_route_doubles(monkeypatch, strict_otp_execution_available=False)
     created_task_v1 = SimpleNamespace(task_id="tsk_legacy_v1")
     created_task_v2 = MagicMock(observer_cruise_id="tsk_legacy_v2")
     created_task_v2.model_dump.return_value = {"task_id": "tsk_legacy_v2"}
@@ -1345,27 +1731,43 @@ async def test_legacy_task_routes_schedule_run_created_hook(monkeypatch: pytest.
     background_tasks = BackgroundTasks()
     organization = SimpleNamespace(organization_id="org_123")
     caller = SimpleNamespace(organization=organization, caller_type=CallerType.API_KEY)
+    pathless_request = Request({"type": "http", "method": "POST", "headers": []})
 
     await agent_protocol.run_task_v1(
-        request=SimpleNamespace(),
+        request=pathless_request,
         background_tasks=background_tasks,
-        task=MagicMock(url="https://example.com", browser_session_id=None, model=None),
+        task=MagicMock(url="https://example.com", browser_session_id=None, model=None, otp_request_id=None),
         caller=caller,
         x_api_key="api-key",
         x_max_steps_override=None,
         x_user_agent=None,
     )
     await agent_protocol.run_task_v2(
-        request=SimpleNamespace(),
+        request=pathless_request,
         background_tasks=background_tasks,
         caller=caller,
-        data=MagicMock(browser_session_id=None),
+        data=MagicMock(browser_session_id=None, otp_request_id=None),
         x_max_iterations_override=None,
         x_max_steps_override=None,
         x_user_agent=None,
         x_api_key="api-key",
     )
+    agent_protocol.task_v2_service.initialize_task_v2.side_effect = OTPRequestAlreadyBoundError(
+        owner_type="workflow_run", owner_id="wr_owner"
+    )
+    with pytest.raises(HTTPException, match="already bound") as conflict:
+        await agent_protocol.run_task_v2(
+            request=pathless_request,
+            background_tasks=background_tasks,
+            caller=caller,
+            data=MagicMock(browser_session_id=None, otp_request_id=None),
+            x_max_iterations_override=None,
+            x_max_steps_override=None,
+            x_user_agent=None,
+            x_api_key="api-key",
+        )
 
+    assert conflict.value.status_code == 409
     assert len(background_tasks.tasks) == 2
     await background_tasks()
     assert on_run_created.await_args_list == [

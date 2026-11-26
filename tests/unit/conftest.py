@@ -52,16 +52,16 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
-from skyvern.forge.sdk.copilot.context import (
-    CopilotContext,
-    model_written_context_fields,
-    tool_recorded_context_fields,
-)
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
 from skyvern.forge.sdk.db.utils import _custom_json_serializer
+from skyvern.forge.sdk.ember.context import (
+    EmberContext,
+    model_written_context_fields,
+    tool_recorded_context_fields,
+)
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.bootstrap import register_aes_encryptor
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
@@ -87,6 +87,7 @@ from skyvern.schemas.proxy_pinning import render_proxy_observability_value
 from skyvern.services import workflow_run_group_service as group_service
 from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.utils import page as page_module
+from skyvern.webeye.utils.challenge_signature import SolverExtensionCheck
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
 from tests.unit.chromium_probe import chromium_available, full_chromium_available
@@ -332,10 +333,10 @@ def reset_collapse_xp_assignment_memo():
 
 
 @pytest.fixture(autouse=True)
-def reset_copilot_driver_ledgers() -> Iterator[None]:
+def reset_ember_driver_ledgers() -> Iterator[None]:
     # A holder count leaked by one test makes a later test's turn-exit release silently skip its evict.
     def _clear() -> None:
-        runtime = sys.modules.get("skyvern.forge.sdk.copilot.runtime")
+        runtime = sys.modules.get("skyvern.forge.sdk.ember.runtime")
         if runtime is not None:
             runtime._ATTACHED_TURNS_PER_SESSION.clear()
             runtime._DRIVER_RELEASES_IN_FLIGHT.clear()
@@ -348,11 +349,11 @@ def reset_copilot_driver_ledgers() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def reset_copilot_tool_window_summarized() -> Iterator[None]:
+def reset_ember_tool_window_summarized() -> Iterator[None]:
     # A sync test that runs the model input filter sets this in the main thread's context, which every later test and
     # its event loop inherit.
     def _clear() -> None:
-        enforcement = sys.modules.get("skyvern.forge.sdk.copilot.enforcement")
+        enforcement = sys.modules.get("skyvern.forge.sdk.ember.enforcement")
         if enforcement is not None:
             enforcement.TOOL_WINDOW_SUMMARIZED.set(False)
 
@@ -419,8 +420,8 @@ _AGENT_TEMPLATE_DEFAULTS = dict(
 
 
 def render_agent_prompt(**overrides: str) -> str:
-    """Render the workflow-copilot-agent template with test defaults; overrides replace named params."""
-    return prompt_engine.load_prompt("workflow-copilot-agent", **{**_AGENT_TEMPLATE_DEFAULTS, **overrides})
+    """Render the ember-agent template with test defaults; overrides replace named params."""
+    return prompt_engine.load_prompt("ember-agent", **{**_AGENT_TEMPLATE_DEFAULTS, **overrides})
 
 
 def use_templating_strictness(monkeypatch: pytest.MonkeyPatch, strictness: str) -> None:
@@ -443,10 +444,10 @@ def make_block_output_parameter(key: str = "block_output", workflow_id: str = "w
     )
 
 
-def make_copilot_context(
+def make_ember_context(
     workflow_yaml: str = "", *, organization_id: str = "o", workflow_permanent_id: str = "wp"
-) -> CopilotContext:
-    return CopilotContext(
+) -> EmberContext:
+    return EmberContext(
         organization_id=organization_id,
         workflow_id="w",
         workflow_permanent_id=workflow_permanent_id,
@@ -456,7 +457,7 @@ def make_copilot_context(
     )
 
 
-async def invoke_copilot_tool(tool: FunctionTool, ctx: CopilotContext, arguments: dict[str, Any]) -> dict[str, Any]:
+async def invoke_ember_tool(tool: FunctionTool, ctx: EmberContext, arguments: dict[str, Any]) -> dict[str, Any]:
     raw_arguments = json.dumps(arguments)
     tool_context = ToolContext(
         context=ctx, tool_name=tool.name, tool_call_id=f"call_{tool.name}", tool_arguments=raw_arguments
@@ -1144,10 +1145,13 @@ class ScopeRecordingAgentFunction(AgentFunction):
             self.events.append("confirm")
         return default_result if self._confirm is None else self._confirm
 
-    async def auto_solve_captchas(self, page: object) -> bool:
+    async def solver_extension_check(self, page: object) -> SolverExtensionCheck | None:
         if self._record_arms:
             self.events.append("solve")
-        return self._auto_solve
+        return SolverExtensionCheck(found=True, solved=True) if self._auto_solve else None
+
+    async def auto_solve_captchas(self, page: object) -> bool:
+        return await self.solver_extension_check(page) is not None
 
     async def solve_recaptcha_token(self, page: object, **kwargs: object) -> bool:
         if self._record_arms:
@@ -1403,7 +1407,7 @@ async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEng
     monkeypatch.setattr(
         app.AGENT_FUNCTION, "get_organization_usage_quota", AgentFunction().get_organization_usage_quota
     )
-    monkeypatch.setattr(app.AGENT_FUNCTION, "copilot_run_stop_rule", AgentFunction().copilot_run_stop_rule)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "ember_run_stop_rule", AgentFunction().ember_run_stop_rule)
     monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
     monkeypatch.setattr(group_service, "_spawn", spawned.append)
     monkeypatch.setattr(service, "_schedule_workflow_run_terminal_hooks", lambda **_: None)
@@ -1614,3 +1618,12 @@ def skycdp_engine_selection() -> BrowserEngineSelection:
 async def screenshot_stalls_until_its_own_timeout(*, timeout: float, **_kwargs: object) -> bytes:
     await asyncio.sleep(timeout / 1000)
     raise PlaywrightTimeoutError("waiting for fonts to load")
+
+
+@pytest.fixture
+def isolated_user_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the per-user config root (XDG_CONFIG_HOME) at a temp dir so CLI writes stay out of the real home."""
+    root = tmp_path / "user-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(root))
+    monkeypatch.delenv("APPDATA", raising=False)
+    return root

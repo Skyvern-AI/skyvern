@@ -11,10 +11,10 @@ import structlog
 # datetime class, so real datetimes stop serializing for the rest of the process.
 from pydantic.deprecated.json import pydantic_encoder
 from sqlalchemy import Column, ColumnElement, Table, func, inspect, or_
+from sqlalchemy.engine import Row
 
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import (
@@ -23,6 +23,7 @@ from skyvern.forge.sdk.db.models import (
     AWSSecretParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
+    EmberChatMessageModel,
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
@@ -32,7 +33,6 @@ from skyvern.forge.sdk.db.models import (
     StepModel,
     TaskModel,
     TaskV2Model,
-    WorkflowCopilotChatMessageModel,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunBlockModel,
@@ -41,10 +41,14 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunParameterModel,
     WorkflowScheduleModel,
 )
+from skyvern.forge.sdk.ember.context import TurnNarrativePayload
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod, TokenDecryptionError
 from skyvern.forge.sdk.models import Step, StepStatus
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
+from skyvern.forge.sdk.schemas.ember import EmberAttachedFile
+from skyvern.forge.sdk.schemas.ember import EmberChatMessage as EmberChatMessageSchema
+from skyvern.forge.sdk.schemas.ember import EmberMessageFeedback
+from skyvern.forge.sdk.schemas.ember_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.har_evidence import without_final_har_user_match
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
@@ -58,9 +62,6 @@ from skyvern.forge.sdk.schemas.organizations import (
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotMessageFeedback
 from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
 from skyvern.forge.sdk.workflow import response_value_caps
@@ -93,36 +94,8 @@ from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, S
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.actions import (
+    ACTION_TYPE_TO_CLASS,
     Action,
-    ActionType,
-    CheckboxAction,
-    ClickAction,
-    ClosePageAction,
-    CompleteAction,
-    DownloadFileAction,
-    DragAction,
-    ExecuteJsAction,
-    ExtractAction,
-    GoBackAction,
-    GoForwardAction,
-    GotoUrlAction,
-    HoverAction,
-    InputTextAction,
-    KeypressAction,
-    LeftMouseAction,
-    MoveAction,
-    NewTabAction,
-    NullAction,
-    PasteTextAction,
-    ReloadPageAction,
-    ScrollAction,
-    SelectOptionAction,
-    SolveCaptchaAction,
-    SwitchTabAction,
-    TerminateAction,
-    UploadFileAction,
-    VerificationCodeAction,
-    WaitAction,
 )
 
 LOG = structlog.get_logger()
@@ -131,7 +104,7 @@ _MODEL_TIMESTAMP_FIELDS = frozenset({"started_at", "finished_at", "created_at", 
 _NARRATIVE_PAYLOAD_ADAPTER: pydantic.TypeAdapter[TurnNarrativePayload] = pydantic.TypeAdapter(TurnNarrativePayload)
 
 
-def summarize_copilot_chat_title(content: str, max_length: int = 120) -> str:
+def summarize_ember_chat_title(content: str, max_length: int = 120) -> str:
     # Collapse the opening message to one line so multi-line prompts read cleanly in the history dropdown.
     collapsed = " ".join(content.split())
     if len(collapsed) <= max_length:
@@ -265,39 +238,6 @@ def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
         serialized_value=redact_proxy_location(result),
     )
     return result
-
-
-# Mapping of action types to their corresponding action classes
-ACTION_TYPE_TO_CLASS = {
-    ActionType.CLICK: ClickAction,
-    ActionType.INPUT_TEXT: InputTextAction,
-    ActionType.PASTE_TEXT: PasteTextAction,
-    ActionType.UPLOAD_FILE: UploadFileAction,
-    ActionType.DOWNLOAD_FILE: DownloadFileAction,
-    ActionType.NULL_ACTION: NullAction,
-    ActionType.TERMINATE: TerminateAction,
-    ActionType.COMPLETE: CompleteAction,
-    ActionType.SELECT_OPTION: SelectOptionAction,
-    ActionType.CHECKBOX: CheckboxAction,
-    ActionType.WAIT: WaitAction,
-    ActionType.HOVER: HoverAction,
-    ActionType.SOLVE_CAPTCHA: SolveCaptchaAction,
-    ActionType.RELOAD_PAGE: ReloadPageAction,
-    ActionType.CLOSE_PAGE: ClosePageAction,
-    ActionType.NEW_TAB: NewTabAction,
-    ActionType.SWITCH_TAB: SwitchTabAction,
-    ActionType.EXTRACT: ExtractAction,
-    ActionType.SCROLL: ScrollAction,
-    ActionType.KEYPRESS: KeypressAction,
-    ActionType.MOVE: MoveAction,
-    ActionType.DRAG: DragAction,
-    ActionType.VERIFICATION_CODE: VerificationCodeAction,
-    ActionType.LEFT_MOUSE: LeftMouseAction,
-    ActionType.GOTO_URL: GotoUrlAction,
-    ActionType.GO_BACK: GoBackAction,
-    ActionType.GO_FORWARD: GoForwardAction,
-    ActionType.EXECUTE_JS: ExecuteJsAction,
-}
 
 
 def _scrub_nul_chars(obj: typing.Any) -> typing.Any:
@@ -445,10 +385,14 @@ def prefer_capped_columns(table: Table, *, raw: str, capped: str) -> list[Column
     ]
 
 
-def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_permanent_id: str | None = None) -> Task:
+def convert_to_task(
+    task_obj: TaskModel | Row[tuple[Any, ...]], debug_enabled: bool = False, workflow_permanent_id: str | None = None
+) -> Task:
     if debug_enabled:
         LOG.debug("Converting TaskModel to Task", task_id=task_obj.task_id)
-    extracted_information = task_obj.extracted_information
+    extracted_information = (
+        task_obj._mapping.get("extracted_information") if isinstance(task_obj, Row) else task_obj.extracted_information
+    )
     if extracted_information is not None and not isinstance(extracted_information, (dict, list, str)):
         # LLM extraction can store a bare JSON scalar (bool/int/float); coerce to its JSON
         # string form so one such row can't fail Task validation and break a whole listing.
@@ -469,6 +413,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         webhook_failure_reason=task_obj.webhook_failure_reason,
         totp_verification_url=task_obj.totp_verification_url,
         totp_identifier=task_obj.totp_identifier,
+        otp_request_id=task_obj.otp_request_id,
         navigation_goal=task_obj.navigation_goal,
         data_extraction_goal=task_obj.data_extraction_goal,
         navigation_payload=task_obj.navigation_payload,
@@ -513,13 +458,13 @@ def convert_to_task_v2(task_v2_model: TaskV2Model, debug_enabled: bool = False) 
     return TaskV2.model_validate(task_v2_data)
 
 
-def convert_to_workflow_copilot_chat_message(
-    message_model: WorkflowCopilotChatMessageModel, debug_enabled: bool = False
-) -> WorkflowCopilotChatMessageSchema:
+def convert_to_ember_chat_message(
+    message_model: EmberChatMessageModel, debug_enabled: bool = False
+) -> EmberChatMessageSchema:
     if debug_enabled:
         LOG.debug(
-            "Converting WorkflowCopilotChatMessage to WorkflowCopilotChatMessageSchema",
-            workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+            "Converting EmberChatMessage to EmberChatMessageSchema",
+            workflow_copilot_chat_message_id=message_model.ember_chat_message_id,
         )
     raw_outcome = message_model.turn_outcome
     parsed_outcome: TurnOutcome | None = None
@@ -529,7 +474,7 @@ def convert_to_workflow_copilot_chat_message(
         except Exception as exc:
             LOG.warning(
                 "Failed to parse TurnOutcome from chat row, treating as None",
-                workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+                workflow_copilot_chat_message_id=message_model.ember_chat_message_id,
                 error=_safe_error(exc),
             )
             parsed_outcome = None
@@ -543,26 +488,26 @@ def convert_to_workflow_copilot_chat_message(
             # while every chat still holds rows written under the previous shape.
             LOG.warning(
                 "Failed to parse the narrative payload from a chat row, treating as None",
-                workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+                workflow_copilot_chat_message_id=message_model.ember_chat_message_id,
                 error=_safe_error(exc),
             )
             raw_narrative = None
             narrative_payload_unreadable = True
     raw_attachments = message_model.attached_files
-    attached_files: list[CopilotAttachedFile] = []
+    attached_files: list[EmberAttachedFile] = []
     if isinstance(raw_attachments, list):
         for entry in raw_attachments:
             try:
-                attached_files.append(CopilotAttachedFile.model_validate(entry))
+                attached_files.append(EmberAttachedFile.model_validate(entry))
             except Exception as exc:
                 LOG.warning(
                     "Failed to parse an attached file from a chat row, dropping it",
-                    workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+                    workflow_copilot_chat_message_id=message_model.ember_chat_message_id,
                     error=_safe_error(exc),
                 )
-    message = WorkflowCopilotChatMessageSchema(
-        workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
-        workflow_copilot_chat_id=message_model.workflow_copilot_chat_id,
+    message = EmberChatMessageSchema(
+        workflow_copilot_chat_message_id=message_model.ember_chat_message_id,
+        workflow_copilot_chat_id=message_model.ember_chat_id,
         sender=message_model.sender,
         content=message_model.content,
         audio_artifact_id=message_model.audio_artifact_id,
@@ -579,10 +524,10 @@ def convert_to_workflow_copilot_chat_message(
     return message
 
 
-def _message_feedback_from_row(message_model: WorkflowCopilotChatMessageModel) -> WorkflowCopilotMessageFeedback | None:
+def _message_feedback_from_row(message_model: EmberChatMessageModel) -> EmberMessageFeedback | None:
     if message_model.feedback_rating not in ("up", "down") or message_model.feedback_at is None:
         return None
-    return WorkflowCopilotMessageFeedback(
+    return EmberMessageFeedback(
         rating=message_model.feedback_rating,
         reason=message_model.feedback_reason,
         rated_at=message_model.feedback_at,
@@ -845,6 +790,7 @@ def convert_to_workflow_run(
         webhook_failure_reason=workflow_run_model.webhook_failure_reason,
         totp_verification_url=workflow_run_model.totp_verification_url,
         totp_identifier=workflow_run_model.totp_identifier,
+        otp_request_id=workflow_run_model.otp_request_id,
         queued_at=workflow_run_model.queued_at,
         started_at=workflow_run_model.started_at,
         finished_at=workflow_run_model.finished_at,
@@ -874,7 +820,7 @@ def convert_to_workflow_run(
         browser_settings=workflow_run_model.browser_settings,
         browser_settings_receipt=workflow_run_model.browser_settings_receipt,
         ignore_inherited_workflow_system_prompt=workflow_run_model.ignore_inherited_workflow_system_prompt,
-        copilot_session_id=workflow_run_model.copilot_session_id,
+        copilot_session_id=workflow_run_model.ember_session_id,
         requested_by=workflow_run_model.requested_by,
         created_by=workflow_run_model.created_by,
         credits_used=workflow_run_model.credits_used or 0,

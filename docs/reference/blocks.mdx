@@ -63,7 +63,6 @@ Browser-based blocks (Browser Task, Browser Action, Extraction, Login, File Down
 | **URL** | All except Extraction | Starting URL. Leave blank to continue from the previous block's page. |
 | **Engine** | All five | AI engine for this block. On Skyvern Cloud, **Default** runs on Skyvern 3.0 in agents created since October 1, 2026. The selector labels Skyvern 3.0 **Recommended** and Skyvern 1.0 and 2.0 **Legacy**. See [Choose an engine per block](/cloud/studio#choose-an-engine-per-block). |
 | **Max Steps Override** | All except Browser Action | Cap the number of AI reasoning steps |
-| **Disable Cache** | All five | Skip cached script execution |
 | **2FA Identifier** | All except Extraction | ID that links 2FA codes to this block. When empty, the block uses the selected credential's identifier, if it has one. |
 | **2FA Verification URL** | All except Extraction | Endpoint this block polls when it needs a 2FA code |
 | **Error Messages** | All except Extraction | Map error conditions to custom error codes (JSON) |
@@ -96,7 +95,6 @@ The block shows the same fields for every engine except Skyvern 2.0. Skyvern 2.0
 | **URL** | text | Starting URL (optional) |
 | **Prompt** | text | Natural language instructions for the AI |
 | **Max Steps** | number | Maximum AI steps |
-| **Disable Cache** | boolean | Skip cached script execution |
 
 Additional fields in **Advanced Settings** (not on Skyvern 2.0 blocks):
 
@@ -143,6 +141,14 @@ Extract structured data from the current page using AI.
 |-------|------|-------------|
 | **Data Extraction Goal** | text | What data to extract |
 | **Data Schema** | JSON | [JSON Schema](https://json-schema.org/) defining the output format. Enable the checkbox to reveal the editor. Click **Generate with AI** to auto-suggest a schema from your extraction goal. |
+
+Turn on **Export as Parquet** in the **Export** section to also write the extracted data to a downloadable Parquet file, without a separate Data Export block. It adds these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Data Schema** | JSON | Schema of the exported records. Starts from the extraction's Data Schema when it can be derived. |
+| **Filename (optional)** | text | Name of the Parquet file. Leave it empty to use the block's label. Inside a loop, each iteration's file ends in its number, such as `-0001`. |
+| **Records (optional)** | text | What to export. Defaults to this block's extracted data; use `{{ parameter_name }}` to export something else. |
 
 *Plus [common browser fields](#common-fields).*
 
@@ -285,15 +291,25 @@ Send text to the LLM for processing without browser interaction. Useful for summ
 
 Parse PDFs, CSVs, Excel files, images, DOCX files, and ZIP archives.
 
-ZIP inputs are unzipped, and the block outputs the extracted file list as `file_name`, `file_path`, and `file_size`. Data Schema is ignored for ZIP inputs; loop over the file list and pass each `file_path` to another File Parser block to parse individual files.
+ZIP inputs are unzipped, and the block outputs the extracted file list as `file_name`, `file_path`, `file_size`, and `run_file`. Each extracted file becomes one of the run's downloaded files, named `run_file`. Data Schema is ignored for ZIP inputs; loop over the file list and pass each `file_path` to another File Parser block to parse individual files.
+
+For a CSV, Skyvern picks the delimiter from comma, tab, semicolon, pipe and colon. When none of them fits, it uses comma, or tab for a `.tsv` file. A one-column file stays one column, and a space-separated file parses as one column. The exception is a file whose lines, up to the first five, all hold the same number of colons, at least one, such as a list of URLs or times with no header row. Skyvern splits that file at the colons. A header row with no colon in it keeps the file in one column. A UTF-8 byte order mark is dropped, so the first column's name is the header the file shows.
 
 Very large files can exceed the parser's time budget and fail the block. When a File Parser sits inside a loop, set **On block failure** (Advanced Settings) to *Skip to next iteration* so files that cannot be parsed are skipped and the rest of the list still runs.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | **File URL** | text | URL or parameter reference to the file |
+| **File Type** | select | **Auto detect**, **CSV**, **Excel**, **PDF**, **Image**, **DOCX** or **ZIP**. Auto detect reads the type from the URL's extension when it can. |
+| **Worksheet** | text | Excel only: the exact name of the worksheet to read. Leave it empty to read the first worksheet. The run fails if the workbook has no worksheet with that name. |
 | **Data Schema** | JSON | Schema for the extracted output. Enable the checkbox to reveal the editor. |
 | **Model** | selector | Which LLM model to use |
+
+Additional fields in **Advanced Settings:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Force OCR** | switch | PDF only: ignore the PDF's text layer and read the pages with vision OCR. Skyvern already does this when the text layer is empty or scrambled; turn it on when the text layer is unreadable in another way. OCR is slower, costs more, and reads at most the first 50 pages. |
 
 <Frame>
 <img width="400" src="/images/cloud/file_parse_block.png" alt="File Parser block configuration with File URL, Data Schema, and Model fields" />
@@ -426,12 +442,19 @@ Additional fields in **Advanced Settings:**
 
 ### Code
 
-Execute custom Python code. Input parameters are available as global variables. Top-level variables in your code become the block's output.
+Execute custom Python code. The block's inputs are available as global variables. Top-level variables in your code become the block's output.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **Code** | code editor | Python code to execute |
-| **Input Parameters** | select | Parameters available as globals in the code |
+| **View** | toggle | **Plain** shows the Goal, the returned data schema and the steps. **Code** shows the steps, Inputs and the code. A new block opens in **Plain**. |
+| **Goal** | text | In **Plain**. What the block does, in plain language. **Generate** (**Regenerate** once the block has code) has Copilot write the code and steps from the Goal, and opens the Copilot pane. |
+| **Returned data schema** | read-only | In **Plain**, when the block has one. The fields of the block's output, shown as a list or as JSON. |
+| **Steps** | list | A plain-language outline of the code, rebuilt from the code on save. In **Code**, click a step to highlight its lines. |
+| **Inputs** | select | In **Code**. Inputs available as globals in the code |
+| **Code Input** | code editor | In **Code**. Python code to execute |
+| **Error Messages** | JSON | Error codes the code may raise, each with the condition it reports. Raise one with `raise ErrorCode("code", "reason")`. A code that isn't listed fails the block like any other exception. |
+
+After you edit the Goal, the block shows **Goal changed — not applied yet** in place of **Generate**. **Apply new Goal** has Copilot rebuild the code to match, and **Undo** restores the old Goal. When you edit the code of a block that has a Goal, it shows **Code changed — Goal may be out of date**, with **Update Goal** and **Keep Goal**.
 
 Code can import `asyncio`, `datetime`, `html`, `json` and `re`. Each one binds the
 sandbox's own version of the module, which carries part of the standard library and
@@ -473,10 +496,6 @@ secrets of at least five characters are also masked inside larger strings. Deriv
 or transformed values may no longer match. Do not expose credentials through output
 or errors.
 
-<Frame>
-<img width="400" src="/images/cloud/code_block.png" alt="Code block configuration with Python code editor and Input Parameters field" />
-</Frame>
-
 ### Agent
 
 The Agent block lets a model choose which tools to call until it can return the fields in its Data Schema.
@@ -493,13 +512,13 @@ The Agent block is available to selected organizations. Contact support to enabl
 | **Max Turns** | number | Turns the model may take, from 1 to 200. Defaults to 25. When the turns run out, the model gets one more turn in which it can only return its answer; the block fails if that turn does not produce a valid answer |
 | **Tools** | multi-select | The tools the model may call |
 
-The model can always read this run's data (`read_run_data`) and return its answer (`finish`). Without a Tools list it has no other tools. A new Agent block starts with these checked: **Browser Task**, **Download**, **File Download**, **Web Search**, **Go to URL**, **Click**, **Input Text** and **Extract Data**. The Tools checklist in the editor lists every optional tool, and checking one offers it to the model, except Login, which also needs a credential in Inputs.
+The model can always read this run's data (`read_run_data`) and return its answer (`finish`). Without a Tools list it has no other tools. A new Agent block starts with these checked: **Browser Task**, **Code**, **Download**, **File Download**, **Login**, **Web Search**, **Go to URL**, **Click**, **Input Text** and **Extract Data**. The Tools checklist in the editor lists every optional tool, and checking one offers it to the model, except Login, which also needs a credential in Inputs.
 
 A tool named after a block, such as **Browser Task** or **HTTP Request**, runs that block as an ordinary block and is billed as usual. **Go to URL**, **Click**, **Input Text** and **Extract Data** act on the run's current page. **Browser Task**, **File Download** and **Login** each start a separate browser agent that uses your organization's default step limit.
 
 App actions are tools too: Gmail **Read inbox** and **Send email**, Outlook **Read inbox**, Google Sheets **Read rows** and **Write rows**, and Google Drive **Upload files**. In the API and YAML `tools` list, each is named `<integration id>__<action id>`, such as `gmail__read_inbox` or `google_sheets__write_rows`, and Skyvern maps the retired `google_sheets_read` and `google_sheets_write` names to `google_sheets__read_rows` and `google_sheets__write_rows`. When the model calls an app action, it picks one of the run owner's accounts connected on [Integrations](/cloud/integrations), leaving out accounts known to lack the permission the action needs. An action that no connected account can run is not offered in that run. Power BI **Run DAX query** is not an Agent block tool, so run it as its own block before or after the Agent block.
 
-To sign in, check **Login** in Tools and add a credential to Inputs. Login is not checked by default. Skyvern masks the run's registered secrets in the tool results the model reads and in the recorded tool calls. The answer is saved as the model returns it, so do not ask the model to return a secret.
+To sign in, check **Login** in Tools and add a credential to Inputs. Login is checked by default; it is offered to the model only when Inputs has a credential. Skyvern masks the run's registered secrets in the tool results the model reads and in the recorded tool calls. The answer is saved as the model returns it, so do not ask the model to return a secret.
 
 [Copilot](/cloud/studio#build-with-copilot) can add an Agent block to your agent and choose its Tools.
 
@@ -560,18 +579,24 @@ error_code: PRECHECK_UNREACHABLE
 
 ### File Download
 
-Navigate the browser to download a file.
+Navigate the browser to download a file. The block can keep the file in Skyvern or send it to cloud storage, and it can read the file from an SFTP server instead of a website.
+
+When **URL** points straight at a file, the browser starts a download instead of loading a page. Skyvern fetches the file once, waits for it to finish saving, and completes the block. A download the browser cannot save fails the block.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **URL** | text | Starting URL (optional) |
-| **Download Goal** | text | Instructions for finding and downloading the file |
-| **Download Timeout (sec)** | number | Seconds to wait for the download to complete |
+| **URL** | text | Starting URL (optional). Not needed when the block reads from SFTP. |
+| **Download Goal** | text | Instructions for finding and downloading the file. Hidden when the block reads from SFTP. |
+| **Download Timeout (sec)** | number | Seconds to wait for the download to complete. Defaults to 120 when empty. Hidden when the block reads from SFTP. |
+| **Download Target** | select | **Website** keeps the downloaded files in Skyvern. **AWS S3**, **Azure Blob Storage**, **Google Drive** and **SFTP** send them to that storage, with the same fields as the [Cloud Storage](#cloud-storage) block. |
+| **Files to Send (Optional)** | text | Shown when the target is not **Website**. Describes which downloaded files to send, such as only the PDF files whose names contain "invoice". Leave it empty to send all of them. |
+| **Google Drive Source Account (Optional)** | selector | Shown when the URL is a Google Drive link and the target is AWS S3, Azure Blob Storage or SFTP. For a private Drive link, the file is fetched through this connected account instead of the browser. |
 
 Additional fields in **Advanced Settings:**
 
 | Field | Type | Description |
 |-------|------|-------------|
+| **SFTP Source Path** | text | Under **Read from SFTP (Optional)**: the path of a file to read from an SFTP server instead of browsing for it. It replaces the URL, Download Goal and Download Timeout, and shows the SFTP connection fields, where **Host Key** is then required. When the target is also SFTP, one connection serves both. |
 | **File Name** | text | Custom filename for the download. Replaces the site's filename, keeping the extension. Reference `{{ original_filename }}` to keep the site's name instead — `{{ fund }}_{{ original_filename }}` prefixes it, which separates documents that several pages name identically. |
 
 *Plus [common browser fields](#common-fields).*
@@ -708,15 +733,15 @@ Fields in **Advanced Settings** (SMTP only):
 
 ### HTTP Request
 
-Make an API call to an external service. Click **Import cURL** in the block header to populate fields from a cURL command.
+Make an API call to an external service. Click **Import cURL**, above the **Method** field, to populate fields from a cURL command.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | **Method** | select | GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS |
 | **URL** | text | Request URL. Supports parameter references. |
 | **Headers** | JSON | HTTP headers. Use **Quick Headers** to add common headers. |
-| **Body** | JSON | Request body (POST/PUT/PATCH only) |
-| **Files** | JSON | File uploads (POST/PUT/PATCH only) |
+| **Body** | JSON | Request body. Hidden for GET, HEAD and DELETE. |
+| **Files** | JSON | File uploads. Hidden for GET, HEAD and DELETE. |
 
 Additional fields in **Advanced Settings:**
 
@@ -727,6 +752,7 @@ Additional fields in **Advanced Settings:**
 | **Continue on Failure** | boolean | Continue agent if the request fails |
 | **Save Response as File** | boolean | Save the response body as a downloadable file |
 | **Download Filename** | text | Filename for the saved response (shown when Save Response as File is enabled) |
+| **Secret Response Paths** | text | One dot-path per line into the JSON response body, such as `data.ssn`. Matching values are stored as secrets: hidden from outputs, logs and the AI, and usable in later blocks like credentials. A path that does not resolve to a non-empty string fails the block, and the response body is left out of its output. You cannot combine it with **Save Response as File**: the editor lets you turn on both, but saving the agent fails. |
 
 <Frame>
 <img width="400" src="/images/cloud/http_block.png" alt="HTTP Request block configuration with Method, URL, Headers, and Body fields" />

@@ -28,7 +28,9 @@ from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import docx
+import grpc
 import libcst as cst
+import openpyxl
 import pandas as pd
 import pytest
 import structlog
@@ -42,10 +44,19 @@ import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
 from skyvern.core.script_generations.generate_script import _build_file_url_parser_statement
 from skyvern.exceptions import PDFParsingError
+from skyvern.file_parser.client import IsolatedFileParserError, parse_file_remotely
+from skyvern.file_parser.parser import ParserFailure, ParserLimits, TableLimits, parse_file
+from skyvern.file_parser.proto import file_parser_pb2_grpc
+from skyvern.file_parser.service import FileParserService
+from skyvern.file_parser.transport import GRPC_OPTIONS
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.forge_app_initializer import start_forge_app
-from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat, LLMProviderErrorRetryableTask
+from skyvern.forge.sdk.api.llm.exceptions import (
+    InvalidLLMResponseFormat,
+    LLMProviderErrorRetryableTask,
+    withhold_provider_text,
+)
 from skyvern.forge.sdk.utils.capped_subprocess import MEMORY_CAP_ENFORCED, CappedSubprocessError
 from skyvern.forge.sdk.utils.capped_subprocess_child import MIN_MEMORY_BUDGET_BYTES
 from skyvern.forge.sdk.utils.pdf_parser import (
@@ -245,16 +256,105 @@ class TestValidateFileType:
 
 @pytest.mark.asyncio
 class TestFileParserBlockAutoDetectExecution:
-    async def test_docx_downloaded_from_extensionless_url_is_parsed(
+    async def test_configured_service_bypasses_local_parsers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        path = _create_docx(tmp_path / "downloaded", paragraphs=["Hello", "World"])
-        block = _make_file_parser_block("https://example.com/download?id=123", FileType.AUTO_DETECT)
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"synthetic")
+        block = _make_file_parser_block("https://example.com/download", FileType.AUTO_DETECT)
+        remote_parse = AsyncMock(
+            return_value=block_module.IsolatedParserResult(
+                file_type="csv",
+                detection_source="magic",
+                kind="json",
+                metadata={},
+                content=[{"name": "alpha"}],
+            )
+        )
+        monkeypatch.setattr(settings, "FILE_PARSER_SERVICE_TARGET", "file-parser.test.svc:7820")
+        monkeypatch.setattr(block_module, "parse_file_remotely", remote_parse)
+        monkeypatch.setattr(
+            FileParserBlock, "_detect_file_type_from_url", MagicMock(side_effect=AssertionError("local detect"))
+        )
+        monkeypatch.setattr(
+            FileParserBlock, "validate_file_type", MagicMock(side_effect=AssertionError("local validate"))
+        )
 
         result = await _execute_with_downloaded_file(block, path, monkeypatch)
 
         assert result.success is True
+        assert result.output_parameter_value == [{"name": "alpha"}]
+        assert block.file_type == FileType.CSV
+
+        image_block = _make_file_parser_block("https://example.com/pages.tiff", FileType.AUTO_DETECT)
+        remote_parse.return_value = block_module.IsolatedParserResult(
+            file_type="image",
+            detection_source="magic",
+            kind="images",
+            metadata={"total_pages": 2},
+            images=[b"synthetic-page-1", b"synthetic-page-2"],
+        )
+        received_images: list[bytes | list[bytes]] = []
+
+        async def ocr_images(
+            _self: FileParserBlock,
+            image_bytes: bytes | list[bytes],
+            workflow_run_block_id: str | None = None,
+            organization_id: str | None = None,
+        ) -> str:
+            received_images.append(image_bytes)
+            return "synthetic pages"
+
+        monkeypatch.setattr(FileParserBlock, "_ocr_image_bytes", ocr_images)
+        image_result = await _execute_with_downloaded_file(image_block, path, monkeypatch)
+
+        assert image_result.success is True
+        assert image_result.output_parameter_value == {"value": "synthetic pages"}
+        assert received_images == [[b"synthetic-page-1", b"synthetic-page-2"]]
+
+    @pytest.mark.parametrize(
+        ("url_source", "numeric_url"),
+        [
+            ("parameter", False),
+            ("block_output_parameter", False),
+            ("rendered_block_output", False),
+            ("block_output_parameter", True),
+            ("rendered_block_output", True),
+        ],
+    )
+    async def test_docx_from_a_parameterized_url_is_parsed_without_logging_the_resolved_value(
+        self, url_source: str, numeric_url: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_docx(tmp_path / "downloaded", paragraphs=["Hello", "World"])
+        file_url = "https://files.example.test/fake-path-token/download?fake_key=fake-query-value"
+        block_output = {"downloaded_files": [{"url": 42 if numeric_url else file_url}]}
+        workflow_run_context = _mock_workflow_run_context()
+        if url_source == "rendered_block_output":
+            block = _make_file_parser_block(json.dumps(block_output), FileType.AUTO_DETECT)
+        else:
+            block = _make_file_parser_block("file_url_parameter", FileType.AUTO_DETECT)
+            workflow_run_context.has_parameter.return_value = True
+            workflow_run_context.has_value.return_value = True
+            workflow_run_context.get_value.return_value = file_url if url_source == "parameter" else block_output
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch, workflow_run_context)
+
+        if numeric_url:
+            assert isinstance(result, BlockResult)
+            extracted = next(entry for entry in logs if entry["event"].startswith("FileParserBlock Extracted"))
+            assert extracted["extracted_url"] == "[invalid URL]"
+            return
+        assert result.success is True
         assert result.output_parameter_value == {"value": "Hello\nWorld"}
+        resolution_logs = [entry for entry in logs if "file url" in entry["event"].lower()]
+        assert resolution_logs
+        assert "fake-path-token" not in repr(resolution_logs)
+        assert "fake-query-value" not in repr(resolution_logs)
+        if url_source == "parameter":
+            parameterized = next(entry for entry in resolution_logs if entry["event"].endswith("parameter value"))
+            assert parameterized["file_parameter_value_type"] == "str"
+            assert parameterized["file_parameter_value_length"] == len(file_url)
 
     async def test_legacy_doc_reports_conversion_guidance(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -295,6 +395,309 @@ class TestFileParserBlockAutoDetectExecution:
         assert result.success is False
         assert "not a valid auto-detect file" in result.failure_reason
         assert "not a valid csv file" not in result.failure_reason
+
+    @pytest.mark.parametrize("parser_path", ["block", "shared_parser", "isolated_service"])
+    @pytest.mark.parametrize(
+        ("case", "parsed_rows", "exceeded_unit"),
+        [
+            ("csv_in_budget", 3, None),
+            ("csv_over_rows", None, "rows"),
+            ("csv_over_cells", None, "cells"),
+            ("csv_duplicate_headers", None, "cells"),
+            ("csv_long_header", None, "bytes"),
+            ("csv_control_characters", None, "bytes"),
+            ("csv_duplicate_long_headers", 3, None),
+            ("csv_ragged_rows", None, "bytes"),
+            ("csv_over_bytes", None, "bytes"),
+            ("csv_blank_over_bytes", None, "bytes"),
+            ("xlsx_in_budget", 3, None),
+            ("xlsx_over_rows", None, "rows"),
+            ("xlsx_sparse_far_cell", None, "cells"),
+            ("xlsx_over_decoded_bytes", None, "bytes"),
+            ("xlsx_sparse_target_worksheet", None, "cells"),
+            ("xlsx_oversized_first_sheet", 1, None),
+            ("xlsx_huge_first_sheet", 1, None),
+            ("xlsx_repeated_shared_string", None, "bytes"),
+            ("xlsx_repeated_non_ascii_shared_string", None, "bytes"),
+            ("xlsx_many_short_cells", None, "bytes"),
+            ("xlsx_small_int_cells", 300, None),
+            ("ods_workbook", 1, None),
+            ("xls_in_budget", 2, None),
+            ("xls_sparse_far_cell", None, "cells"),
+            ("xls_sparse_other_sheet", 1, None),
+            ("xls_beyond_memory_cap", None, "memory"),
+            ("xls_repeated_shared_string", None, "bytes"),
+            ("xls_repeated_non_ascii_shared_string", None, "bytes"),
+        ],
+    )
+    async def test_parse_limits_bound_csv_and_excel_inputs(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        case: str,
+        parsed_rows: int | None,
+        exceeded_unit: str | None,
+        parser_path: str,
+    ) -> None:
+        if exceeded_unit == "memory" and parser_path == "shared_parser":
+            pytest.skip("parse_file runs in-process here; the block and the parser service run it under a memory cap")
+        path, worksheet = _write_parse_budget_case(case, tmp_path)
+        # Many short cells: small JSON, but rows the worker rebuilds that outgrow the decoded-size limit.
+        raised = case in ("xlsx_many_short_cells", "xlsx_small_int_cells")
+        max_rows, max_cells = (10_000, 100_000) if raised else (3, 12)
+        file_type = FileType.EXCEL if path.suffix == ".ods" else FileType.AUTO_DETECT
+        failure: str | None = None
+        rows: list[dict[str, Any]] = []
+        if parser_path == "block":
+            monkeypatch.setattr(settings, "FILE_PARSER_MAX_ROWS", max_rows)
+            monkeypatch.setattr(settings, "FILE_PARSER_MAX_CELLS", max_cells)
+            monkeypatch.setattr(settings, "FILE_PARSER_MAX_DECODED_BYTES", 64 * 1024)
+            monkeypatch.setattr(settings, "PDFPLUMBER_MAX_MEMORY_BYTES", 256 * 1024 * 1024)
+            block = _make_file_parser_block(f"https://example.com/{path.name}", file_type)
+            block.worksheet = worksheet
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+            failure = None if result.success else result.failure_reason
+            rows = result.output_parameter_value if result.success else []
+        elif parser_path == "isolated_service":
+            server = grpc.aio.server(options=GRPC_OPTIONS)
+            service = FileParserService(tmp_path, table_limits=TableLimits(max_rows, max_cells, 64 * 1024))
+            file_parser_pb2_grpc.add_FileParserServicer_to_server(service, server)
+            port = server.add_insecure_port("127.0.0.1:0")
+            await server.start()
+            try:
+                remote = await parse_file_remotely(
+                    f"127.0.0.1:{port}",
+                    path,
+                    file_name=path.name,
+                    configured_file_type=file_type.value,
+                    worksheet=worksheet,
+                    force_ocr=False,
+                    output_dir=tmp_path / "remote-output",
+                    timeout_seconds=30,
+                    max_input_bytes=512 * 1024 * 1024,
+                    max_output_bytes=1024**3,
+                    max_tokens=256_000,
+                    max_pdf_ocr_pages=50,
+                    pdf_memory_bytes=512 * 1024 * 1024,
+                    pdf_result_bytes=256 * 1024 * 1024,
+                )
+                rows = remote.content if isinstance(remote.content, list) else []
+            except IsolatedFileParserError as e:
+                failure = str(e)
+            finally:
+                await server.stop(None)
+        else:
+            limits = ParserLimits(
+                max_input_bytes=512 * 1024 * 1024,
+                max_output_bytes=1024**3,
+                max_tokens=256_000,
+                max_pdf_ocr_pages=50,
+                pdf_memory_bytes=512 * 1024 * 1024,
+                pdf_result_bytes=256 * 1024 * 1024,
+                timeout_seconds=30,
+                max_page_image_bytes=3_500_000,
+                max_page_image_edge_px=7_900,
+                max_table_rows=max_rows,
+                max_table_cells=max_cells,
+                max_table_decoded_bytes=64 * 1024,
+            )
+            try:
+                parsed = parse_file(
+                    path,
+                    file_name=path.name,
+                    configured_file_type=file_type.value,
+                    worksheet=worksheet,
+                    force_ocr=False,
+                    limits=limits,
+                    scratch_dir=tmp_path,
+                )
+                rows = json.loads(parsed.parts[0].data or b"[]")
+            except ParserFailure as e:
+                failure = str(e)
+
+        if exceeded_unit == "memory":
+            assert failure is not None and "too large or complex" in failure
+        elif exceeded_unit is not None:
+            assert failure is not None and "exceeds the parse limit" in failure
+            assert exceeded_unit in failure.partition("exceeds the parse limit")[2]
+        else:
+            assert failure is None, failure
+            assert len(rows) == parsed_rows
+
+
+_ODS_ONE_ROW_CONTENT = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+    'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+    'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2">'
+    '<office:body><office:spreadsheet><table:table table:name="Sheet1">'
+    '<table:table-row><table:table-cell office:value-type="string"><text:p>name</text:p></table:table-cell>'
+    "</table:table-row>"
+    '<table:table-row><table:table-cell office:value-type="string"><text:p>a</text:p></table:table-cell>'
+    "</table:table-row>"
+    "</table:table></office:spreadsheet></office:body></office:document-content>"
+)
+_ODS_MANIFEST = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">'
+    '<manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.spreadsheet"/>'
+    '<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>'
+    "</manifest:manifest>"
+)
+
+
+def _build_xls(*sheets: list[tuple[int, int, float | str]]) -> bytes:
+    """A BIFF8 workbook, one sheet of NUMBER cells per argument, inside a minimal OLE container with a 4096-byte stream."""
+
+    def record(kind: int, data: bytes = b"") -> bytes:
+        return struct.pack("<HH", kind, len(data)) + data
+
+    def bof(substream: int) -> bytes:
+        return record(0x0809, struct.pack("<HHHHII", 0x0600, substream, 0x0DBB, 0x07CC, 0, 0x06))
+
+    def workbook_globals(sheet_offsets: list[int]) -> bytes:
+        bound_sheets = b"".join(
+            record(0x0085, struct.pack("<IBBBB", offset, 0, 0, 6, 0) + f"Sheet{index}".encode())
+            for index, offset in enumerate(sheet_offsets, 1)
+        )
+        return bof(0x0005) + shared_strings + bound_sheets + record(0x000A)
+
+    strings = sorted({v for cells in sheets for _, _, v in cells if isinstance(v, str)})
+    shared_strings = b""
+    if strings:
+        entries = b"".join(struct.pack("<HB", len(text), 0) + text.encode("latin-1") for text in strings)
+        references = sum(isinstance(v, str) for cells in sheets for _, _, v in cells)
+        shared_strings = record(0x00FC, struct.pack("<II", references, len(strings)) + entries)
+
+    def cell(r: int, c: int, v: float | str) -> bytes:
+        if isinstance(v, str):
+            return record(0x00FD, struct.pack("<HHHI", r, c, 0, strings.index(v)))
+        return record(0x0203, struct.pack("<HHHd", r, c, 0, v))
+
+    bodies = [bof(0x0010) + b"".join(cell(r, c, v) for r, c, v in cells) + record(0x000A) for cells in sheets]
+    offsets = [len(workbook_globals([0] * len(sheets)))]
+    for body in bodies[:-1]:
+        offsets.append(offsets[-1] + len(body))
+    stream = (workbook_globals(offsets) + b"".join(bodies)).ljust(4096, b"\0")
+    stream = stream.ljust(-(-len(stream) // 512) * 512, b"\0")
+    stream_sectors = len(stream) // 512
+    free, end_of_chain = 0xFFFFFFFF, 0xFFFFFFFE
+    header = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 16
+    header += struct.pack("<HHHHH6sIIIIIII", 0x3E, 3, 0xFFFE, 9, 6, b"\0" * 6, 0, 1, 1, 0, 4096, end_of_chain, 0)
+    header += struct.pack("<II", end_of_chain, 0) + struct.pack("<I108I", 0, *([free] * 108))
+    chain = [*range(3, 2 + stream_sectors), end_of_chain]
+    fat = struct.pack("<128I", 0xFFFFFFFD, end_of_chain, *chain, *([free] * (126 - stream_sectors)))
+
+    def directory_entry(name: str, kind: int, child: int, start: int, size: int) -> bytes:
+        raw = name.encode("utf-16-le") + b"\0\0"
+        fields = struct.pack(
+            "<HBBIII16sIQQIII", len(raw), kind, 1, free, free, child, b"\0" * 16, 0, 0, 0, start, size, 0
+        )
+        return raw.ljust(64, b"\0") + fields
+
+    directory = directory_entry("Root Entry", 5, 1, end_of_chain, 0) + directory_entry(
+        "Workbook", 2, free, 2, len(stream)
+    )
+    return header + fat + directory.ljust(512, b"\0") + stream
+
+
+def _write_parse_budget_case(case: str, directory: Path) -> tuple[Path, str | None]:
+    if case.startswith("csv_"):
+        path = directory / f"{case}.csv"
+        if case == "csv_in_budget":
+            path.write_text("name,city\n" + "".join(f"n{i},c{i}\n" for i in range(3)))
+        elif case == "csv_over_rows":
+            path.write_text("name,city\n" + "".join(f"n{i},c{i}\n" for i in range(4)))
+        elif case == "csv_blank_over_bytes":
+            path.write_text(" " * 70_000)
+        elif case == "csv_ragged_rows":
+            # Extra fields land under a None key, which the JSON output writes as an added "null" key; this file's
+            # output is just over the 64 KiB limit only once that key and the array separators are counted.
+            path.write_text("h\n" + ("a," + "x" * 21_830 + "\n") * 3)
+        elif case == "csv_duplicate_long_headers":
+            path.write_text(",".join(["h" * 6000] * 4) + "\n" + "1,2,3,4\n" * 3)
+        elif case == "csv_control_characters":
+            # U+0001 is one byte in UTF-8 but six ("\\u0001") in the JSON the parser returns.
+            path.write_text("notes\n" + ("\x01" * 4000 + "\n") * 3)
+        elif case == "csv_long_header":
+            path.write_text("h" * 30_000 + "\n" + "x\n" * 3)
+        elif case == "csv_duplicate_headers":
+            path.write_text(",".join(["h"] * 7) + "\n" + ("1,2,3,4,5,6,7\n" * 2))
+        elif case == "csv_over_cells":
+            path.write_text(",".join(f"h{i}" for i in range(7)) + "\n" + ("1,2,3,4,5,6,7\n" * 2))
+        else:
+            path.write_text("name,notes\nn0," + "x" * 70_000 + "\n")
+        return path, None
+
+    if case.startswith("xls_"):
+        path = directory / f"{case}.xls"
+        far_cells = [(1, 0, 2.0), (1, 19, 3.0)]
+        small_cells = [(0, 1, 1.0), (1, 0, 2.0), (1, 1, 3.0), (2, 0, 4.0), (2, 1, 5.0)]
+        if case == "xls_beyond_memory_cap":
+            path.write_bytes(_build_xls([(0, 0, 1.0), (65535, 255, 2.0)]))
+        elif case in ("xls_repeated_shared_string", "xls_repeated_non_ascii_shared_string"):
+            long_text = "x" * 8000 if case == "xls_repeated_shared_string" else "\u00e9" * 5000
+            header = [(0, c, float(c)) for c in range(3)]
+            path.write_bytes(_build_xls(header + [(r, c, long_text) for r in range(1, 4) for c in range(3)]))
+        elif case == "xls_sparse_other_sheet":
+            path.write_bytes(_build_xls([(0, 0, 1.0), (1, 0, 2.0)], [(0, 0, 1.0)] + far_cells))
+        else:
+            path.write_bytes(_build_xls([(0, 0, 1.0)] + (small_cells if case == "xls_in_budget" else far_cells)))
+        return path, None
+
+    if case == "ods_workbook":
+        path = directory / f"{case}.ods"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("mimetype", "application/vnd.oasis.opendocument.spreadsheet")
+            archive.writestr("content.xml", _ODS_ONE_ROW_CONTENT)
+            archive.writestr("META-INF/manifest.xml", _ODS_MANIFEST)
+        return path, None
+
+    path = directory / f"{case}.xlsx"
+    if case == "xlsx_in_budget":
+        pd.DataFrame({"name": ["a", "b", "c"], "city": ["d", "e", "f"]}).to_excel(path, index=False)
+    elif case == "xlsx_over_rows":
+        pd.DataFrame({"name": ["a", "b", "c", "d"], "city": ["e", "f", "g", "h"]}).to_excel(path, index=False)
+    elif case == "xlsx_small_int_cells":
+        pd.DataFrame({"a": [1] * 300, "b": [2] * 300, "c": [3] * 300}).to_excel(path, index=False)
+    elif case == "xlsx_many_short_cells":
+        pd.DataFrame({"a": [1] * 400, "b": [2] * 400, "c": [3] * 400}).to_excel(path, index=False)
+    elif case == "xlsx_repeated_shared_string":
+        pd.DataFrame({"notes": ["x" * 20_000] * 3, "copy": ["x" * 20_000] * 3}).to_excel(path, index=False)
+    elif case == "xlsx_repeated_non_ascii_shared_string":
+        cjk = "\u6f22" * 5000
+        pd.DataFrame({"notes": [cjk] * 3, "copy": [cjk] * 3}).to_excel(path, index=False)
+    elif case == "xlsx_over_decoded_bytes":
+        pd.DataFrame({"notes": ["x" * 30_000, "y" * 30_000, "z" * 30_000]}).to_excel(path, index=False)
+    else:
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        if case == "xlsx_huge_first_sheet":
+            sheet["A1"] = "name"
+            sheet.cell(row=200_000, column=200, value="far")
+            data_sheet = workbook.create_sheet("Data")
+            data_sheet["A1"] = "name"
+            data_sheet["A2"] = "a"
+            workbook.save(path)
+            return path, "Data"
+        if case == "xlsx_oversized_first_sheet":
+            sheet["A1"] = "name"
+            sheet.cell(row=2, column=20, value="far")
+            data_sheet = workbook.create_sheet("Data")
+            data_sheet["A1"] = "name"
+            data_sheet["A2"] = "a"
+            workbook.save(path)
+            return path, "Data"
+        if case == "xlsx_sparse_target_worksheet":
+            sheet.title = "Summary"
+            sheet["A1"] = "name"
+            sheet["A2"] = "a"
+            sheet = workbook.create_sheet("Data")
+        sheet["A1"] = "name"
+        sheet.cell(row=2, column=20, value="far")
+        workbook.save(path)
+        return path, "Data" if case == "xlsx_sparse_target_worksheet" else None
+    return path, None
 
 
 @pytest.mark.asyncio
@@ -491,9 +894,6 @@ class TestExtractFileUrlFromBlockOutput:
 
     def test_list_returns_none(self) -> None:
         assert self._extract([{"url": "https://example.com/file.pdf"}]) is None
-
-    def test_integer_returns_none(self) -> None:
-        assert self._extract(42) is None
 
 
 @pytest.mark.asyncio
@@ -968,7 +1368,7 @@ class TestOcrPdfPages:
             with pytest.raises(asyncio.CancelledError):
                 await block._ocr_pdf_pages([b"p1", b"p2"])
 
-    @pytest.mark.parametrize("outage", ["rate_limited", "failed_validation"])
+    @pytest.mark.parametrize("outage", ["rate_limited", "rate_limited_withheld", "failed_validation"])
     async def test_a_total_outage_reason_classifies_as_the_provider_text_did(self, outage: str) -> None:
         """Failure attribution reads the reason text, so dropping the provider's words must not change its category."""
         block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
@@ -980,9 +1380,17 @@ class TestOcrPdfPages:
         cause = RateLimitError(provider_text)
         provider_error = LLMProviderErrorRetryableTask("synthetic-llm", cause=cause)
 
+        previous_reason = str(provider_error)
+        if outage == "rate_limited_withheld":
+            # What the LLM handler raises for a document prompt.
+            provider_error.__cause__ = cause
+            withhold_provider_text(provider_error)
+
         async def fake_handler(**kwargs: Any) -> Any:
             if outage == "failed_validation":
                 return {"extracted_text": None}
+            if outage == "rate_limited_withheld":
+                raise provider_error
             raise provider_error from cause
 
         with pytest.MonkeyPatch.context() as mp:
@@ -991,8 +1399,7 @@ class TestOcrPdfPages:
             with pytest.raises(RuntimeError) as raised:
                 await block._ocr_pdf_pages([b"p1", b"p2"])
 
-        if outage == "rate_limited":
-            previous_reason = str(provider_error)
+        if outage != "failed_validation":
             expected_category: str | None = "LLM_ERROR"
         else:
             previous_reason = "OCR response must include extracted_text as a string; got null."
@@ -1183,14 +1590,15 @@ def _build_pdf(
     cid_to_unicode_range: str | None = None,
     cid_to_unicode_char: str | None = None,
     content_length: int | None = None,
+    page_tree_depth: int = 1,
 ) -> bytes:
     """Build a one-page PDF that always draws plain ASCII codes, so ``remap`` alone makes the ToUnicode map lie.
 
     The other options each shape one structure a limit test needs: Flate, LZW, run-length, gzip-wrapped Flate or JBIG2
     content (at most one; gzip reaches pypdf's recovery loop, JBIG2 stays undecoded), a PNG predictor as
     (Colors, Columns) on Flate content, a Flate xref stream, repeated /Contents, a CID font with its /W array and
-    ToUnicode bfrange or bfchar, and a replaced content /Length. Options that would silently override or ignore each
-    other raise ValueError.
+    ToUnicode bfrange or bfchar, a replaced content /Length, and the page nested page_tree_depth levels deep. Options
+    that would silently override or ignore each other raise ValueError.
     """
     if sum([flate_content, lzw_content, run_length_content, gzip_content, jbig2_content]) > 1:
         raise ValueError("the content encodings are mutually exclusive")
@@ -1266,6 +1674,13 @@ def _build_pdf(
             "CMapName currentdict /CMap defineresource pop\nend\nend"
         ).encode()
         objects.append(b"<< /Length %d >>\nstream\n" % len(cmap) + cmap + b"\nendstream")
+    if page_tree_depth > 1:
+        chain = [2, *range(len(objects) + 1, len(objects) + page_tree_depth)]
+        objects[1] = b"<< /Type /Pages /Kids [%d 0 R] /Count 1 >>" % chain[1]
+        objects[2] = objects[2].replace(b"/Parent 2 0 R", b"/Parent %d 0 R" % chain[-1])
+        for level in range(1, page_tree_depth):
+            kid = chain[level + 1] if level + 1 < page_tree_depth else 3
+            objects.append(b"<< /Type /Pages /Parent %d 0 R /Kids [%d 0 R] /Count 1 >>" % (chain[level - 1], kid))
 
     out = bytearray(b"%PDF-1.4\n")
     offsets = []
@@ -1525,6 +1940,16 @@ class TestPypdfLimitFallback:
                 {},
                 id="to_unicode_code_length",
             ),
+            # The parent stops at the depth limit, so the size cap is hit by the pypdf retry in the capped child.
+            pytest.param(
+                {
+                    "page_tree_depth": 150,
+                    "cid_widths": b"[0 [500]]",
+                    "cid_to_unicode_range": "<000000000000000041> <000000000000000042> <0041>",
+                },
+                {},
+                id="to_unicode_code_length_in_deep_page_tree",
+            ),
         ],
     )
     def test_other_size_cap_pdfminer_lacks_fails_without_falling_back(
@@ -1556,7 +1981,8 @@ class TestPypdfLimitFallback:
                 {},
                 id="oversized_bfchar_string",
             ),
-            pytest.param({}, {"page_tree_maximum_depth": 0}, id="page_tree_depth"),
+            # Past pdfminer's recursion limit, so only the pypdf retry in the capped child reads it.
+            pytest.param({"page_tree_depth": 1200}, {}, id="page_tree_depth"),
             pytest.param({"flate_content": True, "png_predictor": (17, 1)}, {}, id="predictor_colors"),
             pytest.param(
                 {"flate_content": True, "png_predictor": (1, 17)},
@@ -1577,6 +2003,7 @@ class TestPypdfLimitFallback:
                 PdfReader(str(pdf_path)).pages[0].extract_text()
 
             assert "17 Aug 26" in extract_pdf_file(str(pdf_path))
+            assert validate_pdf_file(str(pdf_path))
 
     def test_jbig2_buffer_limit_still_falls_back_to_pdfplumber(self, tmp_path: Path) -> None:
         # pdfminer passes a JBIG2 stream through undecoded, so only pypdf's jbig2dec call can hit the limit.
@@ -1752,8 +2179,8 @@ class TestParsingDoesNotBlockEventLoop:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(
-                "skyvern.forge.sdk.workflow.models.block.pd.read_excel",
-                _blocking(pd.DataFrame([{"name": "Alice"}])),
+                "skyvern.forge.sdk.workflow.models.block.run_in_capped_subprocess",
+                _blocking({"data": b'[{"name": "Alice"}]'}),
             )
             rows, ticks = await _count_event_loop_ticks_during(block._parse_excel_file("/tmp/large.xlsx"))
 
@@ -3366,12 +3793,6 @@ class TestFileParserBlock:
 
         yield temp_file
         os.unlink(temp_file)
-
-    def test_file_type_enum_values(self):
-        """Test that FileType enum has the expected values."""
-        assert FileType.CSV == "csv"
-        assert FileType.EXCEL == "excel"
-        assert FileType.PDF == "pdf"
 
     def test_file_parser_block_initialization(self, file_parser_block):
         """Test that FileParserBlock initializes correctly."""

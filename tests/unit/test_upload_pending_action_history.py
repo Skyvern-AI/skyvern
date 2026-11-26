@@ -1,19 +1,20 @@
+import json
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.services.action_service import get_action_history
 from skyvern.webeye.actions.actions import ClickAction
 from skyvern.webeye.actions.handler import DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE, UPLOAD_PENDING_FOLLOWUP_MESSAGE
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
+from tests.unit.conftest import chromium_context, requires_chromium
 
 
 class TestUploadFollowupActionHistory:
-    def test_followup_message_field_exists(self):
-        r = ActionResult(success=True)
-        assert r.followup_message is None
-
     def test_followup_message_set_on_deferred_upload(self):
         r = ActionSuccess()
         r.upload_file_triggered = False
@@ -128,3 +129,64 @@ class TestDownloadFollowupActionHistory:
         assert entry["result"]["download_triggered"] is True
         assert "needs_followup" not in entry["result"]
         assert "followup_message" not in entry["result"]
+
+
+_TYPED_SECRET = "Typed-Secret-4417"
+
+
+async def _fill_a_disabled_field(page: Any) -> None:
+    await page.set_content('<input id="pw" type="password" disabled>')
+    await page.locator("#pw").fill(_TYPED_SECRET, timeout=300)
+
+
+async def _type_into_a_detached_field(page: Any) -> None:
+    await page.set_content('<div id="box"><input id="pw" type="password"></div>')
+    handle = await page.query_selector("#pw")
+    await page.evaluate("document.getElementById('box').innerHTML = ''")
+    await handle.type(_TYPED_SECRET, timeout=300)
+
+
+async def _click_that_landed_before_the_timeout(_page: Any) -> None:
+    # The driver's markup lines echo a field's current value; a click that landed logs that it was done.
+    raise PlaywrightTimeoutError(
+        'Locator.click: Timeout 300ms exceeded.\nCall log:\n  - waiting for locator("#go")\n'
+        f'    - locator resolved to <input id="go" value="{_TYPED_SECRET}"/>\n  - attempting click action\n'
+        "    - element is visible, enabled and stable\n    - performing click action\n    - click action done\n"
+    )
+
+
+@requires_chromium
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("write", "first_line", "reason"),
+    [
+        (_fill_a_disabled_field, "Locator.fill: Timeout 300ms exceeded.", "element is not enabled"),
+        (_type_into_a_detached_field, "ElementHandle.type: Element is not attached to the DOM", None),
+        (
+            _click_that_landed_before_the_timeout,
+            "Locator.click: Timeout 300ms exceeded.",
+            "the action was performed, and the timeout came after it",
+        ),
+    ],
+    ids=["fill", "type", "click-done"],
+)
+async def test_a_failed_write_keeps_the_typed_value_out_of_the_step_output_and_the_next_prompt(
+    write: Callable[[Any], Awaitable[None]], first_line: str, reason: str | None
+) -> None:
+    # The driver's call log quotes the value it was asked to write; the stored step output and the action history
+    # sent to the model keep only the error's first line and the driver's last reason.
+    async with chromium_context() as context:
+        page = await context.new_page()
+        with pytest.raises(Exception) as raised:
+            await write(page)
+    assert _TYPED_SECRET in str(raised.value)
+    result = ActionFailure(raised.value)
+
+    entry = await _download_action_history(result)
+
+    for stored in (result.model_dump_json(), json.dumps(entry)):
+        assert _TYPED_SECRET not in stored
+        assert first_line in stored
+    expected = f"{first_line} The driver last reported: {reason}." if reason else first_line
+    assert result.exception_message == expected
+    assert entry["result"]["exception_message"] == expected

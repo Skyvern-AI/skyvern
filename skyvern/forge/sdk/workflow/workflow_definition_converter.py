@@ -614,6 +614,7 @@ def block_yaml_to_block(
             azure_blob_container_name=block_yaml.azure_blob_container_name,
             google_credential_id=block_yaml.google_credential_id,
             google_drive_folder_id=block_yaml.google_drive_folder_id,
+            google_drive_save_as_sheet=block_yaml.google_drive_save_as_sheet,
             sftp_host=block_yaml.sftp_host,
             sftp_port=block_yaml.sftp_port,
             sftp_username=block_yaml.sftp_username,
@@ -1072,6 +1073,8 @@ def block_yaml_to_block(
             max_results=block_yaml.max_results,
             include_body=block_yaml.include_body,
             download_attachments=block_yaml.download_attachments,
+            organize_action=block_yaml.organize_action,
+            organize_label=block_yaml.organize_label,
             parameters=email_inbox_parameters,
         )
     elif block_yaml.block_type == BlockType.GOOGLE_SHEETS_WRITE:

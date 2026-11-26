@@ -9,6 +9,7 @@ keywords:
   - timeline
   - outputs
   - run history
+  - run group
   - artifacts
   - recording
   - download
@@ -42,8 +43,6 @@ The defaults work for most runs. The settings you are most likely to change:
 |---|---|
 | **Webhook Callback URL** | Skyvern posts the run's result to this URL when it finishes. **Test Webhook** sends a sample. |
 | **Proxy Location** | The country the browser's traffic comes from. Defaults to a US residential proxy. |
-| **Run With** | **Skyvern Agent** runs every step with AI. **Code** runs the agent's generated code (once it has been generated). |
-| **AI Fallback (cached scripts)** | When a code run fails, AI tries to fix the step and regenerate the code. On by default. |
 
 **Advanced Settings** holds browser options: **Browser Type**, **Browser Session ID** (run in an open session), **Reuse browser session**, **Browser Profile** (start with saved cookies and logins), **Browser Address** (connect to your own browser over CDP), **Extra HTTP Headers**, **CDP Connect Headers** and **Max Screenshot Scrolls**. [Browsers](/browsers) explains sessions and profiles.
 
@@ -73,14 +72,13 @@ Click **Stop** in the top bar, then **Stop run** to confirm. The run ends with s
 
 ## Read a run
 
-The **Run** pane has three views, plus more under **⋯**:
+The **Run** pane has three views:
 
 | View | What it shows |
 |---|---|
 | **Timeline** | Each block in order with its status, and the actions inside it. Click a block to see its details. |
-| **Inputs** | The input values and settings this run used, such as browser session, profile and **Run with** |
+| **Inputs** | The input values and settings this run used, such as the webhook URL, proxy, browser session and browser profile |
 | **Outputs** | **Extracted information**, **Run outputs**, **Errors**, **Webhook failure reason** and **Downloaded files** |
-| **⋯** → **Code** | The code generated for this run |
 
 <img src="/images/cloud/cloud-run-timeline.png" alt="A completed run with the Browser pane on Screenshots and the Run pane Timeline showing the block and its action" />
 
@@ -116,7 +114,6 @@ A block that never ran because an earlier branch or condition skipped it shows `
 | Screenshots | **Browser** pane → **Screenshots** |
 | Extracted data (JSON) | **Run** pane → **Outputs** → **Extracted information** or **Run outputs** |
 | Files the agent downloaded | **Run** pane → **Outputs** → **Downloaded files**. Click a file to download it. |
-| Generated code | **Run** pane → **⋯** → **Code** |
 
 To pull artifacts from code, call `GET /v1/runs/{run_id}/artifacts`. Each artifact comes with a `signed_url` you can download from. Filter with `artifact_type`, for example `recording` or `screenshot_final`:
 
@@ -135,10 +132,26 @@ Click **Runs** in the sidebar to open **Run History**, every run in your organiz
 
 - **Search** by run ID, input value or credential ("Search by run ID, input, credential...").
 - **Filter** by agent, by run type (**Task**, **Workflow**, **Agent (CUA)**) and by status.
-- Columns are **Run ID**, **Detail**, **Status**, **Created At** and **Duration** (some organizations also see **Created By**). Runs started by a schedule carry a badge next to the ID, and runs that used generated code show a lightning icon.
+- Columns are **Run ID**, **Detail**, **Status**, **Created At** and **Duration** (some organizations also see **Created By**). Runs started by a schedule carry a badge next to the ID.
 - Click a run to open it in Studio.
 
 To see only one agent's runs while you work on it, open the **Past Runs** list from the Studio top bar.
+
+## Read a group of runs
+
+Ask Copilot to run a saved agent once per row of inputs, or once for each of several saved credentials, and it shows a card listing what it will run. You can remove rows there; nothing runs until you approve. Each row then becomes its own run, in its own fresh browser, with its own run ID. A group holds up to 25 runs by default.
+
+Once you approve, the card in the chat links **Open results**, which opens the **Run group** page at `/run-groups/<group id>`. Its header shows the group ID, whether the group is `running`, `stopping` or `finished`, how many runs it holds, and a count for each outcome. One table row per run:
+
+| Column | What it shows |
+|---|---|
+| **Row** | The run's position in the group |
+| **Inputs** | The input values that run used |
+| **Outcome** | **Waiting**, **Running**, **Completed**, **Failed before acting**, **Unknown, may have acted** or **Canceled** |
+| **Run** | A link to the run, or **Not started** |
+| **Final output** | The output of the run's last block |
+
+The table pages 25 rows at a time. **Download CSV** exports every row in the group, not just the page you are on. While runs are still going, **Stop** cancels the ones that haven't finished; confirm with **Stop runs**. Runs that already finished keep their results. The chat's own **Stop** button does not stop these runs, so use **Stop** here or ask Copilot to cancel the group.
 
 ## Schedule an agent
 

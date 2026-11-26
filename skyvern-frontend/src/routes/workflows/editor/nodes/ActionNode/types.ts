@@ -4,6 +4,8 @@ import { RunEngine } from "@/api/types";
 import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 
 export type ActionNodeData = NodeBaseData & {
+  selector?: string | null;
+  aiFallback?: "fallback" | "proactive";
   url: string;
   navigationGoal: string;
   errorCodeMapping: string;

@@ -18,7 +18,7 @@ afterEach(() => {
   save.mockClear();
 });
 
-it("guards trigger-dialog saves using the current Copilot action store", async () => {
+it("guards trigger-dialog saves using the current Ember action store", async () => {
   useEmberActionStore
     .getState()
     .setPendingGoalChanges([

@@ -34,6 +34,7 @@ import { WorkflowCreatorLabel } from "../WorkflowCreatorLabel";
 import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import { useWorkflowsListContext } from "./WorkflowsListContext";
 import { useNavigate } from "react-router-dom";
+import { usePageSlots } from "@/store/PageSlots";
 
 // Pixels of left padding added per level of folder nesting. Level 0 (flat search
 // results and ungrouped agents) uses the cell's default padding. depth 1 lands
@@ -56,6 +57,7 @@ type WorkflowRowProps = {
 };
 
 function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
+  const { agentStartsBadge: AgentStartsBadge } = usePageSlots();
   const {
     showCheckbox,
     columnCount,
@@ -225,6 +227,11 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                     title={workflow.title}
                     surface="list"
                   />
+                  {AgentStartsBadge ? (
+                    <AgentStartsBadge
+                      workflowPermanentId={workflow.workflow_permanent_id}
+                    />
+                  ) : null}
                 </div>
                 {taggingEnabled && workflowTags && workflowTags.length > 0 ? (
                   <TagChipList

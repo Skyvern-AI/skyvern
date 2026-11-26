@@ -6,7 +6,7 @@ import copy
 import hashlib
 import os
 import time
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Collection, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -35,27 +35,31 @@ from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.agents.skills import AvailableSkill
+from skyvern.forge.sdk.agents.skills import AvailableSkill, SkillWriteReason
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
-from skyvern.forge.sdk.copilot.browser_ablation import CopilotBrowserCodeMode
-from skyvern.forge.sdk.copilot.browser_code_contract import (
+from skyvern.forge.sdk.core import aiohttp_helper, skyvern_context
+from skyvern.forge.sdk.core.http_request_authorization import GuardedHTTPHopResponse, GuardedHTTPHopStream
+from skyvern.forge.sdk.credential_site_policy import LoginSite
+from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.ember.browser_ablation import EmberBrowserCodeMode
+from skyvern.forge.sdk.ember.browser_code_contract import (
     BrowserCodeSession,
     BrowserCodeSessionUnavailableError,
 )
-from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
-from skyvern.forge.sdk.copilot.config import (
-    CopilotConfig,
+from skyvern.forge.sdk.ember.code_block_preflight import CodeBlockScanFinding
+from skyvern.forge.sdk.ember.config import (
+    EmberConfig,
     authoring_capability_for_request,
 )
-from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.credential_site_policy import LoginSite
-from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
+from skyvern.forge.sdk.experimentation.drive_shared_drive_search import drive_shared_drive_search_enabled
+from skyvern.forge.sdk.integrations.catalog import integration_is_live
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
@@ -91,16 +95,22 @@ from skyvern.forge.sdk.services.request_principal import (
     human_user_id,
     scoped_api_key_id_from_actor,
 )
+from skyvern.forge.sdk.services.request_reads import RequestReads
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar, CodeFailure
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
-from skyvern.schemas.emails import GmailSendErrorCode, GmailSendOutcome
+from skyvern.schemas.emails import EmailOrganizeAction, GmailSendErrorCode, GmailSendOutcome
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflow_run_groups import DEFAULT_RUN_GROUP_LIMITS, RunGroupLimits
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
 from skyvern.services.email.gmail import GmailSendResult
 from skyvern.services.email.gmail_client import GmailAPIError
-from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
+from skyvern.services.otp_email import (
+    EmailOTPSearchError,
+    EmailOTPSource,
+    EmailOTPVerificationContext,
+    build_email_otp_sources,
+)
 from skyvern.services.webhook_delivery import WebhookDeliveryAttempts, bound_webhook_request
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
 from skyvern.settings_manager import SettingsManager
@@ -115,7 +125,7 @@ from skyvern.webeye.scraper.scraped_page import (
     ScrapedPage,
     json_to_html,
 )
-from skyvern.webeye.utils.challenge_signature import ChallengeVendor
+from skyvern.webeye.utils.challenge_signature import ChallengeVendor, SolverExtensionCheck
 from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveRecord
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
@@ -126,10 +136,15 @@ if TYPE_CHECKING:
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.db.models import FolderModel
-    from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry, IntegrationTrigger
+    from skyvern.forge.sdk.integrations.catalog import (
+        AccountsById,
+        IntegrationEntry,
+        IntegrationTrigger,
+        IntegrationUnavailableReason,
+    )
     from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection
+    from skyvern.forge.sdk.schemas.ember import EmberTurnControl
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
-    from skyvern.forge.sdk.schemas.workflow_copilot import CopilotTurnControl
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.code_block_authorized_files import (
         AuthorizedFileMaterialization,
@@ -150,6 +165,13 @@ if TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
+OUTBOUND_RESPONSE_LIMIT_BYTES = 25 * 1024 * 1024
+
+
+def _bounded_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    request_headers = {name: value for name, value in headers.items() if name.lower() != "accept-encoding"}
+    request_headers["Accept-Encoding"] = "gzip, deflate"
+    return request_headers
 
 
 async def record_request_audit_event(
@@ -173,6 +195,18 @@ async def record_request_audit_event(
             related_resource_ids,
             metadata=metadata or {},
         ),
+    )
+
+
+async def record_request_audit_event_strict(
+    organization_id: str,
+    action: str,
+    resource_type: str,
+    resource_id: str | None,
+) -> None:
+    await app.AGENT_FUNCTION.record_audit_event_strict(
+        get_request_principal(),
+        AuditEvent(organization_id, action, resource_type, resource_id),
     )
 
 
@@ -201,7 +235,7 @@ def running_in_packaged_deployment() -> bool:
     return any(os.path.exists(path) for path in _PACKAGED_DEPLOYMENT_MARKER_FILES)
 
 
-def developer_checkout_opted_into_inline_copilot_code() -> bool:
+def developer_checkout_opted_into_inline_ember_code() -> bool:
     # ENV alone cannot carry this: self-hosted Docker and Kubernetes are documented with
     # ENV=local, so a packaged deployment would look identical to a laptop.
     if settings.is_cloud_environment() or running_in_packaged_deployment():
@@ -276,9 +310,12 @@ class ScriptExecutionPolicyDecision:
     # (ADR-0012 mint-time validation); a rollout verdict sets this False so the run reaches the
     # agent instead. Defaults closed so a new denial reason has to opt into degrading.
     fail_closed: bool = True
+    # A fail-open denial the policy issues on every run logs at debug; any other logs at warning so the
+    # fail-open denial monitor sees it at production LOG_LEVEL=INFO.
+    steady_state: bool = False
 
 
-class CopilotCandidateNetworkHop(TypedDict):
+class EmberCandidateNetworkHop(TypedDict):
     url: str
     resource_type: str
     resolved_public_ips: list[str]
@@ -287,7 +324,7 @@ class CopilotCandidateNetworkHop(TypedDict):
 
 
 @dataclass(frozen=True)
-class CopilotOrganizationUsage:
+class EmberOrganizationUsage:
     """A null field is one the deployment or account does not record; ``credits_note`` says why
     when nothing is recorded at all."""
 
@@ -303,19 +340,24 @@ class CopilotOrganizationUsage:
     billing_page_path: str | None = None
 
 
-COPILOT_TRIGGERS_UNAVAILABLE = "Triggers are not available in this deployment."
+EMBER_TRIGGERS_UNAVAILABLE = "Triggers are not available in this deployment."
+
+# Each workflow input key maps to a JSON Pointer into the event, or to {"value": <JSON>} for a fixed value.
+TriggerMapping = dict[str, str | dict[str, JsonValue]]
 
 
 @dataclass(frozen=True)
-class CopilotTriggerSummary:
+class EmberTriggerSummary:
     event_trigger_id: str
     workflow_permanent_id: str
     source_kind: str
-    mapping: dict[str, str]
+    mapping: TriggerMapping
     settings: dict[str, JsonValue]
     enabled: bool
     created_at: str
     note: str | None = None
+    # Whether anyone has seen its signing secret; None for sources that never hand one out.
+    secret_shown: bool | None = None
     # Whether its source starts runs by itself once on (a poller), so switching it on is the only step left.
     fires_on_its_own: bool = False
     # The connected account the source reads through, when it has one, so the card can name it.
@@ -325,11 +367,11 @@ class CopilotTriggerSummary:
 
 
 @dataclass(frozen=True)
-class CopilotTriggerSource:
+class EmberTriggerSource:
     source_kind: str
     description: str
     # Adapter-managed sources are set up outside Copilot; `set_up_in` names where.
-    creatable_in_copilot: bool
+    creatable_in_ember: bool
     settings_schema: dict[str, JsonValue]
     example_event: dict[str, JsonValue]
     fires_on_its_own: bool
@@ -347,12 +389,28 @@ TriggerMappingReasonCode = Literal[
 
 
 @dataclass(frozen=True)
-class CopilotTriggerResult:
+class EmberTriggerResult:
     error: str | None = None
-    triggers: list[CopilotTriggerSummary] = field(default_factory=list)
+    triggers: list[EmberTriggerSummary] = field(default_factory=list)
     resolved_parameters: dict[str, JsonValue] | None = None
     reason_code: TriggerMappingReasonCode | None = None
     after_create: str | None = None
+
+
+EMBER_SKILLS_UNAVAILABLE = "Nothing was changed: skills cannot be saved in this deployment."
+# Asked once every check has passed and right before the write, with the live version the write replaces or removes
+# (None for a new skill) and whether the save keeps source run ids; False writes nothing.
+SkillWriteConfirm = Callable[[int | None, bool], Awaitable[bool]]
+
+
+@dataclass(frozen=True)
+class EmberSkillWriteResult:
+    error: str | None = None
+    reason: SkillWriteReason | None = None
+    version: int | None = None
+    # The version that was live before this save; None when the skill was new or deleted.
+    previous_version: int | None = None
+    skill_md: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1093,10 +1151,97 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
+    def strict_otp_execution_available(self) -> bool:
+        return False
+
     async def nango_gmail_catalog_available(self, organization_id: str) -> bool:
         return False
 
+    async def nango_google_drive_catalog_available(self, organization_id: str) -> bool:
+        return False
+
+    async def prepare_google_drive_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
+        return None
+
+    async def list_nango_google_drive_files(
+        self,
+        *,
+        principal: RequestPrincipal,
+        connection_id: str,
+        folders: bool,
+        query: str | None,
+        page_token: str | None,
+        page_size: int,
+        search_all_drives: bool,
+        downloadable_only: bool,
+    ) -> google_drive_service.DriveFilesPage:
+        raise google_drive_service.GoogleDriveAPIError(
+            status=404, code="integration_unavailable", message="Google Drive integration unavailable"
+        )
+
+    async def get_nango_google_drive_item(
+        self, *, principal: RequestPrincipal, connection_id: str, item: str
+    ) -> dict[str, Any]:
+        raise google_drive_service.GoogleDriveAPIError(
+            status=404, code="integration_unavailable", message="Google Drive integration unavailable"
+        )
+
+    async def get_google_drive_item_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        item: str,
+        selection_grant: str | None = None,
+    ) -> dict[str, Any]:
+        raise google_drive_service.GoogleDriveAPIError(
+            status=404, code="integration_unavailable", message="Google Drive integration unavailable"
+        )
+
+    async def list_google_drive_folder_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        folder: str,
+        max_results: int,
+        page_token: str | None = None,
+        include_page_token: bool = False,
+        selection_grant: str | None = None,
+        resource_key: str | None = None,
+    ) -> dict[str, Any]:
+        raise google_drive_service.GoogleDriveAPIError(
+            status=404, code="integration_unavailable", message="Google Drive integration unavailable"
+        )
+
+    async def download_google_drive_file_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        file_id: str,
+        resource_key: str | None,
+        output_dir: str,
+        max_bytes: int,
+        selection_grant: str | None = None,
+    ) -> str:
+        raise google_drive_service.GoogleDriveAPIError(
+            status=404, code="integration_unavailable", message="Google Drive integration unavailable"
+        )
+
     async def own_connected_gmail_connections(self, organization_id: str, user_id: str) -> list[OrgConnection]:
+        return []
+
+    async def own_connected_google_drive_connections(self, organization_id: str, user_id: str) -> list[OrgConnection]:
         return []
 
     async def prepare_gmail_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
@@ -1141,6 +1286,23 @@ class AgentFunction:
         """Stream one attachment of a connected account into destination and return the bytes written."""
         raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
 
+    async def organize_gmail_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        action: EmailOrganizeAction,
+        label: str | None,
+        folder: str,
+        message_ids: list[str],
+        grants: list[str],
+    ) -> None:
+        """Apply the block's saved organize action to emails its own connected-account listing returned."""
+        raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
+
     async def send_gmail_for_run(
         self,
         *,
@@ -1157,9 +1319,17 @@ class AgentFunction:
     async def nango_powerbi_catalog_available(self, organization_id: str) -> bool:
         return False
 
+    async def nango_connection_ids(self, organization_id: str, connection_ids: Collection[str]) -> set[str]:
+        """The ids among ``connection_ids`` that name a Nango connection of the organization."""
+        return set()
+
     async def hidden_integration_ids(self, organization_id: str) -> frozenset[str]:
         """Catalog entries this organization must not see at all, not even as coming soon."""
         return frozenset()
+
+    async def integration_unavailable_reasons(self, organization_id: str) -> dict[str, IntegrationUnavailableReason]:
+        """Entries the Integrations page shows disabled with a reason, even when they are otherwise hidden."""
+        return {}
 
     async def powerbi_plan_allows(self, organization_id: str) -> bool | None:
         """None when the plan could not be read."""
@@ -1274,6 +1444,20 @@ class AgentFunction:
     ) -> bool:
         return True
 
+    async def readable_run_artifact_ids(
+        self,
+        organization_id: str,
+        workflow_run_id: str | None,
+        artifacts: Sequence[Artifact],
+        *,
+        task_id: str | None = None,
+    ) -> set[str]:
+        """Ids of the artifacts the run's own subject may read; OSS has no folder or session ACLs.
+
+        ``task_id`` names a task that runs outside a workflow run, when there is no ``workflow_run_id``.
+        """
+        return {artifact.artifact_id for artifact in artifacts}
+
     async def role_allows(self, principal: RequestPrincipal | None, action: str) -> bool:
         """Whether an enforced role grant allows ``action``; deployments without roles allow everything."""
         return True
@@ -1338,6 +1522,25 @@ class AgentFunction:
     ) -> None:
         """Cloud raises 403 when a folder denies the action on any of the runs, checked in one pass; OSS allows."""
         return None
+
+    async def browser_profile_source_rules_apply(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> bool:
+        """Whether any rule could hide a saved profile's source from this caller; OSS has no folder ACLs."""
+        return False
+
+    async def hidden_browser_profile_ids(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_profile_ids: set[str]
+    ) -> set[str]:
+        """Profiles whose source session or run the caller cannot access; OSS has no folder ACLs."""
+        return set()
+
+    async def workflow_run_can_use_browser_profile(
+        self, organization_id: str, workflow_run_id: str | None, browser_profile_id: str
+    ) -> bool:
+        """Cloud checks the run's principal (the requester before a run exists) against the folder of the profile's
+        workflow; OSS has no folder ACLs."""
+        return True
 
     async def enforce_credential_folder_access_for_ids(
         self,
@@ -1435,6 +1638,15 @@ class AgentFunction:
     ) -> None:
         """Cloud checks a standalone task's TOTP identifier against linked credentials."""
 
+    async def enforce_request_credential_use(
+        self, principal: RequestPrincipal | None, organization_id: str, credential_id: str
+    ) -> None:
+        """Cloud checks the caller's role and the credential's folder before a request binds the credential."""
+
+    def confine_task_credentials_to_saved_sites(self, task: Task) -> bool:
+        """Whether a block task may type its credentials only on their saved websites."""
+        return False
+
     async def enforce_task_credential_use(self, task: Task, browser_session_id: str | None) -> None:
         """Cloud revalidates a standalone task's recorded requester before browser access."""
 
@@ -1465,6 +1677,22 @@ class AgentFunction:
 
     async def record_audit_event(self, principal: RequestPrincipal | None, event: AuditEvent) -> None:
         """OSS has no customer audit store; cloud overrides this best-effort hook."""
+        return None
+
+    async def record_audit_event_strict(self, principal: RequestPrincipal | None, event: AuditEvent) -> None:
+        """OSS has no customer audit store; cloud overrides this strict hook."""
+        return None
+
+    async def record_request_reads(
+        self,
+        principal: RequestPrincipal | None,
+        *,
+        method: str,
+        action: str | None,
+        resource: Mapping[str, object],
+        reads: RequestReads,
+    ) -> None:
+        """Called after a request's handler returns; OSS has no customer audit store, so it records nothing."""
         return None
 
     async def authorize_request(
@@ -1510,6 +1738,12 @@ class AgentFunction:
     ) -> bool:
         """Cloud enforces connect permission and origin-folder access; OSS preserves existing stream behavior."""
         return True
+
+    async def browser_session_console_enabled(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str | None = None
+    ) -> bool:
+        """Whether this principal may run JavaScript in the session's page from the live view."""
+        return False
 
     async def browser_session_stream_reauthorization_required(
         self, principal: RequestPrincipal | None, organization_id: str
@@ -1722,6 +1956,10 @@ class AgentFunction:
     def get_cloud_integration_entries(self) -> list[IntegrationEntry]:
         return []
 
+    async def more_integration_entries(self, known: list[IntegrationEntry]) -> list[IntegrationEntry]:
+        """Request-only apps the Integrations page lists after the catalog; Ember and pickers never see them."""
+        return []
+
     def get_cloud_integration_triggers(self) -> dict[str, list[IntegrationTrigger]]:
         """Triggers cloud adds to entries it does not define, keyed by entry id."""
         return {}
@@ -1867,6 +2105,9 @@ class AgentFunction:
         Cloud gates this on viewer presence so unwatched runs skip uploads entirely.
         OSS default keeps the historical always-publish behavior."""
         return True
+
+    async def html_content_bounded_transport_enabled(self) -> bool:
+        return False
 
     async def resolve_recording_video_size(
         self,
@@ -2035,7 +2276,7 @@ class AgentFunction:
         """
         return None
 
-    async def should_dispatch_copilot_block_run_to_worker(
+    async def should_dispatch_ember_block_run_to_worker(
         self,
         *,
         organization_id: str,
@@ -2044,14 +2285,14 @@ class AgentFunction:
         """Base no-op; callers fail closed when worker dispatch is unavailable."""
         return False
 
-    async def copilot_browser_code_mode(
+    async def ember_browser_code_mode(
         self, *, organization_id: str, workflow_permanent_id: str
-    ) -> CopilotBrowserCodeMode:
+    ) -> EmberBrowserCodeMode:
         """Whether run_browser_code joins the copilot surface, and whether it replaces the browser tools;
         OSS has no isolated interpreter to host it."""
-        return CopilotBrowserCodeMode.OFF
+        return EmberBrowserCodeMode.OFF
 
-    def copilot_browser_pattern_accepting_calls(self) -> tuple[str, ...]:
+    def ember_browser_pattern_accepting_calls(self) -> tuple[str, ...]:
         return ()
 
     async def agent_skills(
@@ -2059,7 +2300,34 @@ class AgentFunction:
     ) -> list[AvailableSkill]:
         return []
 
-    async def open_copilot_browser_code_session(
+    async def agent_skills_enabled(self, *, organization_id: str) -> bool:
+        return False
+
+    async def save_ember_skill(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str | None,
+        name: str,
+        skill_md: str,
+        ember_chat_id: str | None,
+        confirm: SkillWriteConfirm | None,
+    ) -> EmberSkillWriteResult:
+        """Saves SKILL.md as the skill's next version for the signed-in requester; never raises."""
+        return EmberSkillWriteResult(error=EMBER_SKILLS_UNAVAILABLE)
+
+    async def delete_ember_skill(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str | None,
+        name: str,
+        ember_chat_id: str | None,
+        confirm: SkillWriteConfirm | None,
+    ) -> EmberSkillWriteResult:
+        return EmberSkillWriteResult(error=EMBER_SKILLS_UNAVAILABLE)
+
+    async def open_ember_browser_code_session(
         self,
         *,
         page: Page,
@@ -2077,48 +2345,48 @@ class AgentFunction:
         self,
         *,
         organization_id: str,
-    ) -> CopilotOrganizationUsage:
+    ) -> EmberOrganizationUsage:
         """OSS keeps no billing records; cloud overrides this with the authenticated read."""
         del organization_id
-        return CopilotOrganizationUsage(credits_note="This deployment does not track billing.")
+        return EmberOrganizationUsage(credits_note="This deployment does not track billing.")
 
-    async def copilot_run_stop_rule(self, *, organization_id: str) -> str | None:
+    async def ember_run_stop_rule(self, *, organization_id: str) -> str | None:
         """The billing check that stops this organization's runs, in one sentence; None when it cannot be stated."""
         del organization_id
         return None
 
-    def copilot_trigger_sources(self) -> list[CopilotTriggerSource]:
+    def ember_trigger_sources(self) -> list[EmberTriggerSource]:
         return []
 
-    async def create_copilot_trigger(
+    async def create_ember_trigger(
         self,
         *,
         organization_id: str,
         workflow_permanent_id: str,
         source_kind: str,
         settings: dict[str, JsonValue],
-        mapping: dict[str, str],
+        mapping: TriggerMapping,
         enabled: bool,
-    ) -> CopilotTriggerResult:
-        return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
+    ) -> EmberTriggerResult:
+        return EmberTriggerResult(error=EMBER_TRIGGERS_UNAVAILABLE)
 
-    async def dry_run_copilot_trigger_mapping(
+    async def dry_run_ember_trigger_mapping(
         self,
         *,
         organization_id: str,
         workflow_permanent_id: str,
         source_kind: str,
-        mapping: dict[str, str],
+        mapping: TriggerMapping,
         payload: dict[str, JsonValue] | None,
-    ) -> CopilotTriggerResult:
-        return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
+    ) -> EmberTriggerResult:
+        return EmberTriggerResult(error=EMBER_TRIGGERS_UNAVAILABLE)
 
-    async def list_copilot_workflow_triggers(
+    async def list_ember_workflow_triggers(
         self, *, organization_id: str, workflow_permanent_id: str
-    ) -> CopilotTriggerResult:
-        return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
+    ) -> EmberTriggerResult:
+        return EmberTriggerResult(error=EMBER_TRIGGERS_UNAVAILABLE)
 
-    def resolve_copilot_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
+    def resolve_ember_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
         """Base no-op (no dispatch routing hint); overridden per deployment."""
         return None
 
@@ -2138,7 +2406,7 @@ class AgentFunction:
         """
         return []
 
-    def allow_copilot_inline_code_execution(self) -> bool:
+    def allow_ember_inline_code_execution(self) -> bool:
         """Whether a copilot block test run may execute in the API process when sandbox dispatch is
         unavailable. Open source has no sandbox and already runs every workflow in the API process."""
         return True
@@ -2174,7 +2442,7 @@ class AgentFunction:
         """Fetch per-run analytics metadata. OSS builds have no sidecar table."""
         return None
 
-    def capture_copilot_message_feedback(
+    def capture_ember_message_feedback(
         self,
         *,
         organization_id: str,
@@ -2241,6 +2509,19 @@ class AgentFunction:
         """Whole-dir write the run's credential living-profile at healthy (completed) run end, only
         when the run was seeded from that profile (seed==sink). No-op in OSS; cloud overrides."""
         return None
+
+    async def capture_external_browser_state(self, workflow_run: WorkflowRun) -> None:
+        """Record an external browser's storage state before cleanup releases it. No-op in OSS."""
+        return None
+
+    async def persist_external_browser_profile(
+        self,
+        workflow_run: WorkflowRun,
+        browser_state: BrowserState | None,
+        workflow_run_status: WorkflowRunStatus,
+    ) -> bool:
+        """Save an external browser's state to the run's sink; True skips the directory write-back. OSS no-op."""
+        return False
 
     async def should_apply_banked_cookies(self, organization_id: str | None) -> bool:
         """Whether a profile's banked-cookie sidecar should be injected at boot. Default True (OSS
@@ -2330,6 +2611,10 @@ class AgentFunction:
     ) -> tuple[str, str] | None:
         return None
 
+    async def ensure_api_key_issuance_allowed(self, organization_id: str) -> None:
+        """Raise HTTPException when the organization may not be handed an API key."""
+        return None
+
     async def resolve_member_api_key_user_id(self, organization_id: str, token_id: str) -> str | None:
         return None
 
@@ -2340,21 +2625,30 @@ class AgentFunction:
         """Return an org-scoped API key; returns None in the base implementation."""
         return None
 
-    async def resolve_copilot_loopback_api_key(
+    async def resolve_ember_loopback_api_key(
         self, principal: RequestPrincipal | None, organization_id: str, request_key: str | None
     ) -> str | None:
         """The key Copilot's tools send to the API on behalf of the chat user; raises HTTPException to refuse."""
         return request_key
 
-    async def copilot_turn_control_allowed(
+    async def ember_turn_control_allowed(
         self,
         principal: RequestPrincipal | None,
         organization_id: str,
         starter_user_id: str | None,
-        control: CopilotTurnControl,
+        control: EmberTurnControl,
     ) -> bool:
         """Whether the caller may steer, answer or cancel a running Copilot turn."""
         return True
+
+    async def authorize_skill_card_approval(
+        self,
+        principal: RequestPrincipal | None,
+        organization_id: str,
+        action: Literal["save", "delete"],
+        from_runs: bool,
+    ) -> None:
+        """Cloud raises 403 unless the approving caller may make the card's organization skill change now."""
 
     async def browser_context_route_handlers_allowed(self, **_: Any) -> bool:
         return True
@@ -2458,6 +2752,14 @@ class AgentFunction:
     ) -> None:
         return
 
+    async def before_run_target_dispatch(self, *, organization_id: str, run_id: str, run_kind: str) -> None:
+        """Cloud may reserve a desktop target; OSS keeps the existing browser path."""
+        return
+
+    async def on_run_target_terminal(self, *, organization_id: str, run_id: str, run_kind: str) -> None:
+        """Cloud may request desktop input stop after a run becomes terminal."""
+        return
+
     async def should_defer_workflow_browser_creation(self, workflow_run: WorkflowRun) -> bool:
         return False
 
@@ -2499,10 +2801,16 @@ class AgentFunction:
         return
 
     def browser_session_create_admission(
-        self, organization_id: str, *, copilot: bool = False
+        self, organization_id: str, *, ember: bool = False
     ) -> AbstractAsyncContextManager[None]:
         """Held around a browser-session create; a deployment refuses it by raising TooManyStartingBrowserSessions."""
         return nullcontext()
+
+    def browser_session_creation_disallows_fallback(self, error: Exception) -> bool:
+        return False
+
+    def is_fixed_ip_browser_session_incompatibility(self, error: Exception) -> bool:
+        return False
 
     async def parse_enterprise_totp_secret(
         self,
@@ -2821,6 +3129,11 @@ class AgentFunction:
         Cloud override provides actual solving; OSS base is a no-op."""
         return False
 
+    async def solver_extension_check(self, page: Page) -> SolverExtensionCheck | None:
+        """What the solver extension found and did on this page, or None when the deployment has none. Exceptions
+        reach the caller."""
+        return None
+
     async def solve_recaptcha_token(
         self,
         page: Page,
@@ -2828,9 +3141,9 @@ class AgentFunction:
         organization_id: str | None = None,
         workflow_run_id: str | None = None,
         browser_session_id: str | None = None,
-    ) -> bool:
-        """Solve and apply a reCAPTCHA token. OSS has no solver client."""
-        return False
+    ) -> bool | None:
+        """Solve and apply a reCAPTCHA token; None when no token was requested. OSS has no solver client."""
+        return None
 
     async def detect_vendor_challenge(self, page: Page | RecordingPage) -> ChallengeVendor | None:
         """The vendor whose challenge page this is, detect-only; raises when the page cannot be read, so an
@@ -2915,6 +3228,19 @@ class AgentFunction:
                 exc_info=True,
             )
             return credential_id
+
+    async def get_or_mint_google_access_token(
+        self,
+        organization_id: str,
+        credential_id: str,
+        mint: Callable[[], Awaitable[str]],
+        *,
+        lock_wait_seconds: int = google_oauth_service.GOOGLE_ACCESS_TOKEN_CACHE_LOCK_BLOCKING_TIMEOUT_SECONDS,
+        rejected_token: str | None = None,
+    ) -> str:
+        """Read-through access-token cache keyed on a stored credential id; ``mint`` errors propagate.
+        A cached ``rejected_token`` is a miss, and a miss waits at most ``lock_wait_seconds`` for another minter."""
+        return await mint()
 
     async def get_google_sheets_credentials(
         self,
@@ -3027,7 +3353,7 @@ class AgentFunction:
         workflow_run_block_id: str,
         connection_id: str,
         hop_token: str | None = None,
-        credential_source: Literal["nango"] = "nango",
+        credential_source: Literal["nango", "native"] = "nango",
         dataset_id: str,
         query: str,
         max_rows: int = 1_000,
@@ -3035,7 +3361,9 @@ class AgentFunction:
         """Power BI reads require Cloud's persisted-run identity and audited execution facade."""
         raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
 
-    async def ensure_powerbi_queries_available(self, organization_id: str) -> None:
+    async def ensure_powerbi_queries_available(
+        self, organization_id: str, *, credential_sources: frozenset[str] = frozenset({"nango"})
+    ) -> None:
         raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
 
     async def get_google_workspace_credentials(
@@ -3086,6 +3414,10 @@ class AgentFunction:
             )
             return None
 
+    def get_extra_email_otp_sources(self) -> list[EmailOTPSource]:
+        """Email code sources a deployment adds after the built-in inbox sources."""
+        return []
+
     async def get_otp_value_from_email(
         self,
         *,
@@ -3128,7 +3460,9 @@ class AgentFunction:
                     # completed one; CancelledError bypasses the handler below.
                     source_context.credential_list_refresh_failed = True
                     try:
-                        source_context.credential_ids = await source.list_credential_ids(organization_id)
+                        source_context.credential_ids = await source.list_credential_ids(
+                            organization_id, source_context
+                        )
                         source_context.credential_ids_loaded_at = now
                         source_context.credential_list_refresh_failed = False
                         source_context.failed_credential_ids &= set(source_context.credential_ids)
@@ -3524,12 +3858,48 @@ class AgentFunction:
         closing the DNS-rebinding window between validation and connect.
         """
         async with bound_webhook_request(attempts, timeout_seconds), pinned_ip_client(resolved_ips) as client:
-            return await client.post(
+            async with client.stream(
+                "POST",
                 url,
                 content=payload,
-                headers=headers,
+                headers=_bounded_response_headers(headers),
                 timeout=httpx.Timeout(timeout_seconds),
-            )
+            ) as response:
+                body, _ = await aiohttp_helper.read_httpx_response_body_limited(response, OUTBOUND_RESPONSE_LIMIT_BYTES)
+                return aiohttp_helper.buffered_httpx_response(response, body)
+
+    async def relay_http_request_hop(
+        self,
+        *,
+        organization_id: str | None = None,
+        method: str,
+        target_url: str,
+        headers: dict[str, str] | None = None,
+        data: Any | None = None,
+        json_data: dict[str, Any] | None = None,
+        files: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        timeout_seconds: float,
+        response_limit_bytes: int,
+        resolved_ips: Callable[[], tuple[str, ...]],
+    ) -> GuardedHTTPHopResponse | None:
+        """Relay one validated HTTP hop in Cloud; OSS keeps its guarded direct transport."""
+        return None
+
+    @asynccontextmanager
+    async def relay_http_download_hop(
+        self,
+        *,
+        organization_id: str | None = None,
+        target_url: str,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        timeout_seconds: float,
+        response_limit_bytes: int,
+        resolved_ips: Callable[[], tuple[str, ...]],
+    ) -> AsyncIterator[GuardedHTTPHopStream | None]:
+        """Stream one validated download hop in Cloud; OSS keeps its guarded direct transport."""
+        yield None
 
     async def post_totp_verification_request(
         self,
@@ -3545,13 +3915,17 @@ class AgentFunction:
         # operation, so a slow-drip endpoint needs the outer cap to stay within the budget.
         try:
             async with asyncio.timeout(timeout_seconds), pinned_ip_client(resolved_ips) as client:
-                response = await client.request(
+                async with client.stream(
                     method,
                     url,
                     content=payload or None,
-                    headers=headers,
+                    headers=_bounded_response_headers(headers),
                     timeout=httpx.Timeout(timeout_seconds),
-                )
+                ) as upstream:
+                    body, _ = await aiohttp_helper.read_httpx_response_body_limited(
+                        upstream, OUTBOUND_RESPONSE_LIMIT_BYTES
+                    )
+                    response = aiohttp_helper.buffered_httpx_response(upstream, body)
         except TimeoutError as e:
             raise httpx.ReadTimeout(f"TOTP verification request exceeded {timeout_seconds}s") from e
         return TOTPVerificationResponse(
@@ -3609,11 +3983,18 @@ class AgentFunction:
         if destination.storage_type == FileStorageType.GOOGLE_DRIVE:
             if not destination.google_access_token:
                 raise ValueError("Google Drive destination is missing required fields")
-            uploaded_file = await google_drive_service.upload_file(
-                access_token=destination.google_access_token,
-                file_path=file_path,
-                folder_id=destination.google_drive_folder_id,
-            )
+            try:
+                uploaded_file = await google_drive_service.upload_file(
+                    access_token=destination.google_access_token,
+                    file_path=file_path,
+                    folder_id=destination.google_drive_folder_id,
+                    save_as_sheet=destination.google_drive_save_as_sheet,
+                )
+            except google_drive_service.GoogleDriveAPIError as exc:
+                explained = google_drive_service.explain_access_error(exc, operation="upload")
+                if explained and await drive_shared_drive_search_enabled(organization_id):
+                    raise explained from None
+                raise
             return uploaded_file.web_view_link or f"https://drive.google.com/file/d/{uploaded_file.id}/view"
 
         if destination.storage_type == FileStorageType.SFTP:
@@ -3651,31 +4032,31 @@ class AgentFunction:
         if size > CUSTOMER_STORAGE_UPLOAD_MAX_BYTES:
             raise UploadFileMaxSizeExceeded(file_size_bytes=size, max_size_bytes=CUSTOMER_STORAGE_UPLOAD_MAX_BYTES)
 
-    def copilot_candidate_network_guard(
+    def ember_candidate_network_guard(
         self,
         browser_context: BrowserContext,
         *,
         expected_origin: str,
-    ) -> AbstractAsyncContextManager[list[CopilotCandidateNetworkHop]]:
-        return self._unavailable_copilot_candidate_network_guard(browser_context, expected_origin=expected_origin)
+    ) -> AbstractAsyncContextManager[list[EmberCandidateNetworkHop]]:
+        return self._unavailable_ember_candidate_network_guard(browser_context, expected_origin=expected_origin)
 
     @asynccontextmanager
-    async def _unavailable_copilot_candidate_network_guard(
+    async def _unavailable_ember_candidate_network_guard(
         self,
         browser_context: BrowserContext,
         *,
         expected_origin: str,
-    ) -> AsyncIterator[list[CopilotCandidateNetworkHop]]:
+    ) -> AsyncIterator[list[EmberCandidateNetworkHop]]:
         del browser_context, expected_origin
         raise RuntimeError("Copilot candidate pre-connect enforcement is unavailable")
         yield []  # pragma: no cover
 
-    def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
+    def get_ember_config(self, code_block_mode: bool | None = None) -> EmberConfig | None:
         """Return an optional workflow copilot config override."""
         del code_block_mode
-        return CopilotConfig()
+        return EmberConfig()
 
-    async def _copilot_default_code_block_mode(self, organization_id: str | None) -> bool | None:
+    async def ember_default_code_block_mode(self, organization_id: str | None) -> bool | None:
         """The mode for a turn whose request states none: False is agent blocks only, None lets the model
         choose per step, True is code blocks only."""
         del organization_id
@@ -3690,7 +4071,7 @@ class AgentFunction:
         del organization_id, user_id
         return False
 
-    async def _resolve_copilot_requested_code_block_mode(
+    async def _resolve_ember_requested_code_block_mode(
         self,
         organization_id: str | None,
         code_block_mode: bool | None,
@@ -3700,17 +4081,17 @@ class AgentFunction:
         # the field get plain Build instead of inheriting deployment state.
         return code_block_mode is True
 
-    async def get_copilot_config_for_request(
+    async def get_ember_config_for_request(
         self,
         organization_id: str | None = None,
         code_block_mode: bool | None = None,
-    ) -> CopilotConfig | None:
+    ) -> EmberConfig | None:
         """Return a request-scoped workflow copilot config override."""
         # The composer sends no mode, so the org's dial decides it; off is the rollback lever ADR-0011
         # names, taking every such turn to agent blocks only without a deploy.
         if code_block_mode is None:
-            code_block_mode = await self._copilot_default_code_block_mode(organization_id)
-        requested_code_block_mode = await self._resolve_copilot_requested_code_block_mode(
+            code_block_mode = await self.ember_default_code_block_mode(organization_id)
+        requested_code_block_mode = await self._resolve_ember_requested_code_block_mode(
             organization_id,
             code_block_mode,
         )
@@ -3718,20 +4099,20 @@ class AgentFunction:
             has_code_block_access = await self.has_code_block_access(organization_id)
         except Exception:
             LOG.warning(
-                "Failed to resolve Copilot code-block access; using non-code authoring",
+                "Failed to resolve Ember code-block access; using non-code authoring",
                 organization_id=organization_id,
                 exc_info=True,
             )
             has_code_block_access = False
         effective_code_block_mode = requested_code_block_mode and has_code_block_access
-        config = self.get_copilot_config(effective_code_block_mode)
+        config = self.get_ember_config(effective_code_block_mode)
         if config is None:
             return None
         try:
             agent_step_enabled = await self.agent_step_enabled(organization_id)
         except Exception:
             LOG.warning(
-                "Failed to resolve Copilot agent_step access; leaving it unavailable",
+                "Failed to resolve Ember agent_step access; leaving it unavailable",
                 organization_id=organization_id,
                 exc_info=True,
             )
@@ -3780,6 +4161,17 @@ class AgentFunction:
         a markerless (generated) script or a failed import.
         """
         return None
+
+    async def static_script_module_for_run(self, workflow: Any, workflow_run: Any) -> str | None:
+        """The platform module ensure_static_script would pin for this run; the loader trusts no other header."""
+        return None
+
+    def static_script_run_signatures(self, workflow: Any, loaded_module: Any) -> dict[str, str]:
+        """Run signature per workflow block label for a module returned by try_import_static_script.
+
+        The loader runs these in place of a static pin's stored signatures; a block missing here runs via the agent.
+        """
+        return {}
 
     async def ensure_static_script(
         self,
@@ -4070,3 +4462,7 @@ class AgentFunction:
             api_key=settings.MCP_POSTHOG_PROJECT_API_KEY,
             host=settings.MCP_POSTHOG_PROJECT_HOST,
         )
+
+    async def powerbi_native_connections_available(self, organization_id: str) -> bool:
+        """Whether this org may connect and query Power BI through its own Microsoft OAuth connection."""
+        return integration_is_live("powerbi")

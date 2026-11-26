@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import json
 import uuid
 import zipfile
 from datetime import UTC, datetime
@@ -13,7 +14,6 @@ from unittest.mock import AsyncMock, MagicMock
 import boto3
 import pytest
 import zstandard as zstd
-from aiobotocore.response import StreamingBody
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -21,11 +21,13 @@ from skyvern.config import settings
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.signing import parse_keyring, sign_artifact_url
 from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
 from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.routes.agent_protocol import _parse_range_header
+from tests.unit.forge.sdk.artifact.storage.test_s3_storage import audit_storage_bodies  # noqa: F401
 from tests.unit.forge.sdk.artifact.storage.test_s3_storage_moto import moto_server  # noqa: F401
 from tests.unit.shared_route_app import shared_route_app
 
@@ -65,14 +67,9 @@ def _build_client(monkeypatch: pytest.MonkeyPatch, *, content: bytes = CONTENT) 
 
 
 class TestParseRangeHeader:
-    def test_none_header_returns_none(self) -> None:
-        assert _parse_range_header(None, 1000) is None
-
-    def test_empty_header_returns_none(self) -> None:
-        assert _parse_range_header("", 1000) is None
-
-    def test_non_bytes_unit_returns_none(self) -> None:
-        assert _parse_range_header("items=0-99", 1000) is None
+    @pytest.mark.parametrize("header", [None, "", "items=0-99"], ids=["absent", "empty", "other-unit"])
+    def test_absent_or_non_bytes_header_returns_none(self, header: str | None) -> None:
+        assert _parse_range_header(header, 1000) is None
 
     def test_full_range(self) -> None:
         assert _parse_range_header("bytes=0-99", 1000) == (0, 99)
@@ -92,11 +89,9 @@ class TestParseRangeHeader:
     def test_end_beyond_content_is_clamped(self) -> None:
         assert _parse_range_header("bytes=900-9999", 1000) == (900, 999)
 
-    def test_unsatisfiable_start_returns_sentinel(self) -> None:
-        assert _parse_range_header("bytes=2000-3000", 1000) == (-1, -1)
-
-    def test_inverted_range_returns_sentinel(self) -> None:
-        assert _parse_range_header("bytes=500-100", 1000) == (-1, -1)
+    @pytest.mark.parametrize("header", ["bytes=2000-3000", "bytes=500-100"], ids=["past-eof", "inverted"])
+    def test_unsatisfiable_range_returns_sentinel(self, header: str) -> None:
+        assert _parse_range_header(header, 1000) == (-1, -1)
 
     def test_multipart_range_returns_none(self) -> None:
         # Multipart ranges (RFC 7233 §4.1) are valid but we don't implement them.
@@ -237,26 +232,6 @@ def s3_backed_storage(
     return storage
 
 
-@pytest.fixture
-def storage_bodies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    """Every read of an S3 response body as (requested amount, bytes returned), and how many bodies were closed."""
-    observed = SimpleNamespace(reads=[], closes=0)
-    real_read = StreamingBody.read
-
-    async def read(self: StreamingBody, amt: int | None = None) -> bytes:
-        chunk = await real_read(self, amt)
-        observed.reads.append((amt, len(chunk)))
-        return chunk
-
-    def close(self: StreamingBody) -> None:
-        observed.closes += 1
-        self.__wrapped__.close()
-
-    monkeypatch.setattr(StreamingBody, "read", read)
-    monkeypatch.setattr(StreamingBody, "close", close, raising=False)
-    return observed
-
-
 def _store_artifact(
     s3: Any,
     data: bytes,
@@ -285,6 +260,7 @@ def _artifact_route_app(monkeypatch: pytest.MonkeyPatch, artifact: Artifact) -> 
 
     artifacts_db = MagicMock()
     artifacts_db.get_artifact_by_id = AsyncMock(return_value=artifact)
+    artifacts_db.get_artifact_by_id_no_org = AsyncMock(return_value=artifact)
     monkeypatch.setattr(forge_app.DATABASE, "artifacts", artifacts_db)
     monkeypatch.setattr(agent_protocol.org_auth_service, "get_current_org", _fake_org)
     return shared_route_app(monkeypatch)
@@ -347,14 +323,27 @@ class TestArtifactContentFromS3:
         assert all(amount is not None for amount, _ in storage_bodies.reads)
         assert sum(size for _, size in storage_bodies.reads) == len(body)
 
-    @pytest.mark.parametrize(("kind", "range_header"), [("bundle-member", None), ("compressed-har", "bytes=5-14")])
-    def test_decoded_artifacts_keep_their_whole_object_semantics(
+    @pytest.mark.parametrize(
+        ("kind", "range_header", "auth", "status"),
+        [
+            pytest.param("bundle-member", None, "org", 200, id="bundle-full"),
+            pytest.param("bundle-member", "bytes=5-14", "org", 206, id="bundle-member-range"),
+            pytest.param("bundle-member", "bytes=5000-", "org", 416, id="bundle-member-unsatisfiable"),
+            pytest.param("bundle-member", "bytes=5-14", "signature", 206, id="bundle-valid-signature"),
+            pytest.param("bundle-member", None, "invalid-signature", 403, id="bundle-invalid-signature"),
+            pytest.param("compressed-har", "bytes=5-14", "org", 206, id="legacy-har-member-coordinates"),
+        ],
+    )
+    def test_decoded_artifacts_keep_member_coordinate_ranges_and_auth(
         self,
         monkeypatch: pytest.MonkeyPatch,
         s3_backed_storage: S3Storage,
         stream_bucket: Any,
+        storage_bodies: SimpleNamespace,
         kind: str,
         range_header: str | None,
+        auth: str,
+        status: int,
     ) -> None:
         if kind == "bundle-member":
             served = b"<html><body>bundled member page</body></html>"
@@ -378,18 +367,28 @@ class TestArtifactContentFromS3:
                 filename="network.har.zst",
             )
 
-        with TestClient(_artifact_route_app(monkeypatch, artifact)) as client:
-            response = client.get(
-                "/v1/artifacts/a_stored/content", headers={"Range": range_header} if range_header else {}
-            )
+        url = "/v1/artifacts/a_stored/content"
+        if auth != "org":
+            keyring = json.dumps({"current_kid": "test", "keys": {"test": {"secret": "fixture-only" * 4}}})
+            monkeypatch.setattr(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", keyring)
+            url = sign_artifact_url("", artifact.artifact_id, parse_keyring(keyring))
+            if auth == "invalid-signature":
+                url += "x"
 
-        if range_header is None:
-            assert response.status_code == 200
+        with TestClient(_artifact_route_app(monkeypatch, artifact)) as client:
+            response = client.get(url, headers={"Range": range_header} if range_header else {})
+
+        assert response.status_code == status
+        if status == 200:
             assert response.content == served
-        else:
-            assert response.status_code == 206
+        elif status == 206:
             assert response.content == served[5:15]
             assert response.headers["content-range"] == f"bytes 5-14/{len(served)}"
+        elif status == 416:
+            assert response.content == b""
+            assert response.headers["content-range"] == f"bytes */{len(served)}"
+        else:
+            assert not storage_bodies.reads and storage_bodies.closes == 0
 
     def test_range_read_of_an_object_replaced_after_sizing_serves_one_version(
         self,

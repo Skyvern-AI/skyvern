@@ -16,8 +16,7 @@ type WorkflowPanelState = {
     | "nodeLibrary"
     | "history"
     | "comparison"
-    | "schedules"
-    | "triggers";
+    | "schedules";
   data?: {
     previous?: string | null;
     next?: string | null;
@@ -29,9 +28,6 @@ type WorkflowPanelState = {
     version1?: WorkflowVersion;
     version2?: WorkflowVersion;
     showComparison?: boolean;
-    // For triggers panel
-    focusTriggerId?: string;
-    focusRequest?: number;
     mode?: "history" | "ember";
     onEmberReviewClose?: (status: EmberReviewStatus) => void | Promise<void>;
   };

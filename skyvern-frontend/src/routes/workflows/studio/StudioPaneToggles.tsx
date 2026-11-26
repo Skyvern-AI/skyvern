@@ -30,13 +30,9 @@ import { PastRunsList } from "./PastRunsList";
 import { StudioPaneAttentionDot } from "./StudioPaneAttentionDot";
 import { studioPanelId, studioTabId } from "./constants";
 import { STUDIO_PANE_META, railLabel } from "./paneMeta";
-import {
-  STUDIO_PANE_IDS,
-  WORKFLOW_AUTHORING_PANES,
-  type StudioPaneId,
-} from "./panes";
+import { WORKFLOW_AUTHORING_PANES, type StudioPaneId } from "./panes";
 import { useStudioNarrow } from "./useStudioNarrow";
-import { useStudioPanes } from "./useStudioPanes";
+import { useStudioPaneIds, useStudioPanes } from "./useStudioPanes";
 import { useStudioRunSignals } from "./useStudioRunSignals";
 import {
   useStudioShellContext,
@@ -109,9 +105,10 @@ export function StudioPaneToggles() {
   // At phone width the pane switch under the stage picks panes; only the run
   // control (it holds Past Runs) stays up here.
   const narrow = useStudioNarrow();
+  const availablePaneIds = useStudioPaneIds();
   const paneIds = narrow
-    ? STUDIO_PANE_IDS.filter((id) => id === "overview")
-    : STUDIO_PANE_IDS;
+    ? availablePaneIds.filter((id) => id === "overview")
+    : availablePaneIds;
   const [runsSelectorOpen, setRunsSelectorOpen] = useState(false);
 
   // Picking a run in the selector opens/retargets the run pane. The row's own
@@ -202,7 +199,7 @@ export function StudioPaneToggles() {
         const ariaLabel = showActivityDot
           ? "Browser, new activity"
           : awaiting
-            ? `Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`
+            ? `Ember, ${EMBER_ATTENTION_LABEL[awaiting]}`
             : isRunControl && runStatus
               ? `${label}, ${runStatusLabel(runStatus)}`
               : label;
@@ -218,7 +215,7 @@ export function StudioPaneToggles() {
             ) : awaiting ? (
               <StudioPaneAttentionDot
                 tone="waiting"
-                title={`Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`}
+                title={`Ember, ${EMBER_ATTENTION_LABEL[awaiting]}`}
               />
             ) : showRunStatusDot && runStatus ? (
               <span

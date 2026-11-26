@@ -7,6 +7,7 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { DriveFileInput } from "@/routes/workflows/components/DriveFileCombobox";
 import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
 import {
   Accordion,
@@ -25,7 +26,7 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
-import { GOOGLE_DRIVE_REQUIRED_SCOPES } from "@/util/googleScopes";
+import { GOOGLE_DRIVE_STEP_SCOPES } from "@/util/googleScopes";
 import { cn } from "@/util/utils";
 
 import { ErrorCodeMappingEditor } from "../../ErrorCodeMappingEditor";
@@ -37,6 +38,7 @@ import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { SftpPrivateKeyField } from "../components/SftpPrivateKeyField";
 import { type FileDownloadNode, type FileDownloadNodeData } from "./types";
+import { useGoogleDriveFolderHelp } from "../useGoogleDriveFolderHelp";
 import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
 import {
   blockUrlErrorId,
@@ -96,6 +98,7 @@ function FileDownloadEditorBody({
   blockId: string;
   data: FileDownloadNodeData;
 }) {
+  const driveFolderHelp = useGoogleDriveFolderHelp();
   const {
     editable,
     label,
@@ -304,19 +307,34 @@ function FileDownloadEditorBody({
               }
             />
           </div>
-          <WorkflowBlockInputTextarea
-            name="url"
-            nodeId={blockId}
-            onChange={(next) => update({ url: next })}
-            value={url}
-            placeholder={urlPlaceholder}
-            aria-invalid={urlError !== null}
-            aria-describedby={urlError ? blockUrlErrorId(blockId) : undefined}
-            className={cn(
-              "nopan text-xs",
-              urlError !== null && "border-destructive",
-            )}
-          />
+          {showGoogleDriveSourceAccount && googleCredentialId ? (
+            <DriveFileInput
+              name="url"
+              nodeId={blockId}
+              credentialId={googleCredentialId}
+              kind="file"
+              onChange={(next) => update({ url: next })}
+              value={url}
+              placeholder={urlPlaceholder}
+              aria-invalid={urlError !== null}
+              aria-describedby={urlError ? blockUrlErrorId(blockId) : undefined}
+              className={cn(urlError !== null && "border-destructive")}
+            />
+          ) : (
+            <WorkflowBlockInputTextarea
+              name="url"
+              nodeId={blockId}
+              onChange={(next) => update({ url: next })}
+              value={url}
+              placeholder={urlPlaceholder}
+              aria-invalid={urlError !== null}
+              aria-describedby={urlError ? blockUrlErrorId(blockId) : undefined}
+              className={cn(
+                "nopan text-xs",
+                urlError !== null && "border-destructive",
+              )}
+            />
+          )}
           {urlError ? (
             <p
               id={blockUrlErrorId(blockId)}
@@ -569,19 +587,20 @@ function FileDownloadEditorBody({
                 nodeId={blockId}
                 value={googleCredentialId ?? ""}
                 onChange={(value) => update({ googleCredentialId: value })}
-                requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
+                requiredScopes={GOOGLE_DRIVE_STEP_SCOPES}
               />
             </DestinationField>
             <DestinationField
               label="Google Drive Folder ID (Optional)"
-              help="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root."
+              help={driveFolderHelp}
             >
-              <WorkflowBlockInputTextarea
+              <DriveFileInput
                 name="googleDriveFolderId"
                 nodeId={blockId}
+                credentialId={googleCredentialId ?? ""}
+                kind="folder"
                 onChange={(value) => update({ googleDriveFolderId: value })}
                 value={googleDriveFolderId ?? ""}
-                className="nopan text-xs"
               />
             </DestinationField>
           </>
@@ -598,7 +617,7 @@ function FileDownloadEditorBody({
               nodeId={blockId}
               value={googleCredentialId ?? ""}
               onChange={(value) => update({ googleCredentialId: value })}
-              requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
+              requiredScopes={GOOGLE_DRIVE_STEP_SCOPES}
               optional
             />
           </DestinationField>

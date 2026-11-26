@@ -28,9 +28,9 @@ const TOUR_STEPS: { name: string; step: DriveStep }[] = [
     step: {
       element: `#${studioPanelId("ember")}`,
       popover: {
-        title: "Meet Copilot",
+        title: "Meet Ember",
         description:
-          "Tell Copilot what to automate or what to change. It builds and tests the steps for you.",
+          "Tell Ember what to automate or what to change. It builds and tests the steps for you.",
         side: "right",
         align: "center",
       },

@@ -36,7 +36,13 @@ import {
 import { summarizeWorkflowChanges, snapshotOf } from "./workflowChangesSummary";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProxySelector } from "@/components/ProxySelector";
-import { TitleSection } from "../studio/StudioTopBar";
+import {
+  SaveButton as StudioSaveButton,
+  TitleSection,
+} from "../studio/StudioTopBar";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_DOC_EDITOR_FLAG } from "@/util/featureFlags";
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import type { EmberChatHistoryResponse } from "../ember/emberTypes";
@@ -545,7 +551,7 @@ describe("WorkflowEditor deleted-agent run fallback", () => {
       screen.getAllByText("Source agent deleted — this run is view-only."),
     ).toHaveLength(2);
     expect(
-      (screen.getByRole("button", { name: "Copilot" }) as HTMLButtonElement)
+      (screen.getByRole("button", { name: "Ember" }) as HTMLButtonElement)
         .disabled,
     ).toBe(true);
     expect(
@@ -611,7 +617,7 @@ describe("WorkflowEditor deleted-agent run fallback", () => {
     expect(screen.getByLabelText("Save workflow")).toBeTruthy();
     expect(screen.getByRole("button", { name: /^Run$/ })).toBeTruthy();
     expect(
-      (screen.getByRole("button", { name: "Copilot" }) as HTMLButtonElement)
+      (screen.getByRole("button", { name: "Ember" }) as HTMLButtonElement)
         .disabled,
     ).toBe(false);
   });
@@ -1193,7 +1199,7 @@ describe("save failures stop navigation and block runs", () => {
       ]);
       expect(toast).toHaveBeenCalledWith(
         expect.objectContaining({
-          title: "Wait for the Copilot change to finish",
+          title: "Wait for the Ember change to finish",
         }),
       );
       act(() => canvas.harness.targetBlock());
@@ -1230,7 +1236,7 @@ describe("save failures stop navigation and block runs", () => {
       ]);
       expect(toast).toHaveBeenCalledWith(
         expect.objectContaining({
-          title: "Wait for the Copilot change to finish",
+          title: "Wait for the Ember change to finish",
         }),
       );
       expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("ember");
@@ -1460,7 +1466,7 @@ describe("save failures stop navigation and block runs", () => {
       expect(canvas.harness.graph.nodes).toHaveLength(3);
       expect(toast).toHaveBeenCalledWith(
         expect.objectContaining({
-          title: "Wait for the Copilot change to finish",
+          title: "Wait for the Ember change to finish",
         }),
       );
     } finally {
@@ -2232,7 +2238,7 @@ describe("save failures stop navigation and block runs", () => {
       });
       expect(screen.getByTestId("comparison")).toBeTruthy();
       // The chat's hold reaches the open comparison as it changes, not as it stood at Review.
-      const hold = "Copilot is saving your accepted changes.";
+      const hold = "Ember is saving your accepted changes.";
       act(() =>
         useWorkflowHasChangesStore.getState().setSaveBlockedReason(hold),
       );
@@ -3008,7 +3014,7 @@ describe("save failures stop navigation and block runs", () => {
     },
   );
 
-  const SAVE_HOLD = "Copilot is saving your accepted changes.";
+  const SAVE_HOLD = "Ember is saving your accepted changes.";
   const setSaveHold = (reason: string | null) =>
     act(() =>
       useWorkflowHasChangesStore.getState().setSaveBlockedReason(reason),
@@ -3241,7 +3247,7 @@ describe("save failures stop navigation and block runs", () => {
     }
   });
 
-  const PROPOSAL_HOLD = "Resolve the Copilot proposal before saving.";
+  const PROPOSAL_HOLD = "Resolve the Ember proposal before saving.";
   test("a pending Ember proposal disables Save as Template and hides version history, so Accept stays the only way to save it", async () => {
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
@@ -4439,10 +4445,10 @@ describe("A49 metadata authorship through editor actions", () => {
     },
   );
 
-  test.each(["clean", "Copilot startup", "storage unavailable"])(
+  test.each(["clean", "Ember startup", "storage unavailable"])(
     "A54 %s load hydrates exactly once and keeps local edits on refetch",
     async (mode) => {
-      integration.chat = mode === "Copilot startup";
+      integration.chat = mode === "Ember startup";
       history.proposed_workflow = null;
       history.proposed_workflow_metadata = null;
       let finishHistory!: (response: {
@@ -5917,3 +5923,144 @@ test("the canvas publishes whether it has a block for the studio Run control", (
   }
   expect(useWorkflowHasChangesStore.getState().editorHasBlocks).toBeNull();
 });
+
+test.each([false, true])(
+  "restoring an older version from a clean Studio editor lets Save write it (Doc: %s)",
+  async (doc) => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    localStorage.clear();
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    useWorkflowSnapshotStore.setState(
+      useWorkflowSnapshotStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState(
+      useWorkflowParametersStore.getInitialState(),
+    );
+    useWorkflowTitleStore.setState(useWorkflowTitleStore.getInitialState());
+    useWorkflowPresentationStore.setState(
+      useWorkflowPresentationStore.getInitialState(),
+    );
+    const hiddenParameter = {
+      parameter_type: "aws_secret" as const,
+      key: "api_key",
+      description: "Restored reference",
+      aws_key: "restored_key",
+    };
+    const current = {
+      ...(liveWorkflow as WorkflowApiResponse),
+      workflow_id: "wf_current",
+      version: 2,
+      workflow_definition: { version: 2, blocks: [], parameters: [] },
+    } as WorkflowApiResponse;
+    const older = {
+      ...current,
+      workflow_id: "wf_older",
+      version: 1,
+      workflow_definition: {
+        version: 2,
+        blocks: [{ block_type: "wait", label: "restored", wait_sec: 5 }],
+        parameters: [
+          {
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+            key: "input",
+            description: null,
+            default_value: "Restored value",
+          },
+          hiddenParameter,
+        ],
+      },
+    } as WorkflowApiResponse;
+    workflowQueryMock.mockReturnValue({ data: current, isLoading: false });
+    const { nodes, edges } = getElements(
+      current.workflow_definition.blocks,
+      apiWorkflowToSettings(current),
+      true,
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <FeatureFlagContext.Provider
+          value={(flag) => doc && flag === WORKFLOW_DOC_EDITOR_FLAG}
+        >
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/agents/wpid_live/studio"]}>
+              <WorkflowPermanentIdContext.Provider value="wpid_live">
+                <ReactFlowProvider>
+                  <DebugStoreContext.Provider
+                    value={{ isDebugMode: false, blockRunsEnabled: false }}
+                  >
+                    <StudioSaveButton />
+                    <Workspace
+                      initialNodes={nodes}
+                      initialEdges={edges}
+                      initialTitle={current.title}
+                      workflow={current}
+                      embedded
+                    />
+                  </DebugStoreContext.Provider>
+                </ReactFlowProvider>
+              </WorkflowPermanentIdContext.Provider>
+            </MemoryRouter>
+          </TooltipProvider>
+        </FeatureFlagContext.Provider>
+      </QueryClientProvider>,
+    );
+    try {
+      await waitFor(() =>
+        expect(useWorkflowPresentationStore.getState().docMounted).toBe(doc),
+      );
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+      act(() =>
+        useWorkflowPanelStore.getState().setWorkflowPanelState({
+          active: false,
+          content: "history",
+          data: {
+            showComparison: true,
+            version1: older,
+            version2: current,
+            mode: "history",
+          },
+        }),
+      );
+      fireEvent.click(
+        screen.getAllByRole("button", { name: "Select this variant" })[0]!,
+      );
+      await waitFor(() => {
+        const saveData = useWorkflowHasChangesStore.getState().getSaveData()!;
+        expect(saveData.blocks).toMatchObject([{ label: "restored" }]);
+        expect(saveData.parameters.map(({ key }) => key).sort()).toEqual([
+          "api_key",
+          "input",
+        ]);
+        expect(saveData.parameters).toContainEqual(hiddenParameter);
+      });
+      fireEvent.click(screen.getByRole("button", { name: /^Save workflow/ }));
+      expect(
+        await screen.findByRole("dialog", { name: "Saving Changes" }),
+      ).toBeTruthy();
+    } finally {
+      view.unmount();
+      client.clear();
+      vi.unstubAllGlobals();
+      useWorkflowPanelStore.setState(useWorkflowPanelStore.getInitialState());
+      useWorkflowPresentationStore.setState(
+        useWorkflowPresentationStore.getInitialState(),
+      );
+    }
+  },
+);

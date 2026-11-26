@@ -9,12 +9,13 @@ import { useDebouncedSidebarSave } from "../useDebouncedSidebarSave";
 
 function IntegrationActionBlockForm({ blockId }: { blockId: string }) {
   const node = useNodesData<IntegrationActionNode>(blockId);
+  const actionId = node?.data.actionId;
   const connectionId = node?.data.connectionId;
   const inputs = node?.data.inputs;
   const parameterKeys = node?.data.parameterKeys;
   const value = useMemo(
-    () => ({ connectionId, inputs, parameterKeys }),
-    [connectionId, inputs, parameterKeys],
+    () => ({ actionId, connectionId, inputs, parameterKeys }),
+    [actionId, connectionId, inputs, parameterKeys],
   );
   const { commit } = useDebouncedSidebarSave<typeof value>({
     blockId,

@@ -1,7 +1,7 @@
 import os
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import BinaryIO, Protocol, cast
@@ -398,6 +398,14 @@ class StreamingArtifactStorage(ABC):
         ``etag``, raises ``StoredObjectChangedError`` once the stored object is no longer that version."""
 
 
+@dataclass(frozen=True)
+class BrowserProfileSnapshot:
+    directory: str
+    encrypted: bool = False
+    legacy_local_copy: bool = False
+    version: str | None = None
+
+
 class BaseStorage(ABC):
     # False when a URL from presign_managed_file keeps working for as long as the file exists.
     presigned_urls_expire = True
@@ -512,28 +520,44 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
+    async def store_browser_session(
+        self, organization_id: str, workflow_permanent_id: str, directory: str, *, require_encryption: bool = False
+    ) -> None:
         pass
 
     @abstractmethod
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
         pass
 
+    async def retrieve_browser_session_snapshot(
+        self, organization_id: str, workflow_permanent_id: str
+    ) -> BrowserProfileSnapshot | None:
+        directory = await self.retrieve_browser_session(organization_id, workflow_permanent_id)
+        return BrowserProfileSnapshot(directory) if directory is not None else None
+
     @abstractmethod
     async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
         pass
 
     @abstractmethod
-    async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
+    async def store_browser_profile(
+        self, organization_id: str, profile_id: str, directory: str, *, require_encryption: bool = False
+    ) -> None:
         """Store a browser profile from a directory."""
 
     @abstractmethod
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve a browser profile to a temporary directory."""
 
+    async def retrieve_browser_profile_snapshot(
+        self, organization_id: str, profile_id: str, *, copy: bool = False
+    ) -> BrowserProfileSnapshot | None:
+        retrieve = self.retrieve_browser_profile_copy if copy else self.retrieve_browser_profile
+        directory = await retrieve(organization_id, profile_id)
+        return BrowserProfileSnapshot(directory) if directory is not None else None
+
     async def retrieve_browser_profile_copy(self, organization_id: str, profile_id: str) -> str | None:
-        """A working copy that a browser can change without touching the stored profile. Object stores already
-        extract to a temp directory; local storage, whose retrieve returns the stored directory, overrides this."""
+        """A working copy that a browser can change without touching the stored profile."""
         return await self.retrieve_browser_profile(organization_id, profile_id)
 
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
@@ -544,11 +568,14 @@ class BaseStorage(ABC):
         workflows reach it, and correctness (never deleting real state) beats saving one download."""
         return bool(await self.retrieve_browser_profile(organization_id, profile_id))
 
-    async def get_browser_profile_etag(self, organization_id: str, profile_id: str) -> str | None:
-        """A cheap fingerprint of the stored profile archive that changes iff its bytes change, used by
-        the freshness guard to detect a concurrent write between a run's seed and its write-back. None
-        means "can't tell" — the caller then falls back to a full write. Object backends override with a
-        head request; backends without one (local) leave it None (no concurrent-writer race there)."""
+    async def get_browser_profile_etag(
+        self, organization_id: str, profile_id: str, *, encrypted: bool | None = None
+    ) -> str | None:
+        """Return the current winning archive's version for comparison at write-back.
+
+        An explicit `encrypted` value describes the seed whose version is known. Compare
+        against the current object regardless of representation, since it may have migrated.
+        """
         return None
 
     @abstractmethod
@@ -587,10 +614,12 @@ class BaseStorage(ABC):
         run_id: str | None,
         *,
         attempt_number: int | None = None,
+        files: Mapping[str, str] | None = None,
     ) -> None:
         """Raises DownloadSaveIncompleteError after the loop when any file could not be fully
         saved and registered; every other file already is when it raises, so the save is
-        retryable-incomplete."""
+        retryable-incomplete. ``files`` (run-file name to local path) saves those files instead of
+        the top of the download directory (``downloads_to_save``)."""
 
     def get_downloaded_file_signature_aliases(self, file_info: FileInfo) -> list[DownloadedFileSignature]:
         return []

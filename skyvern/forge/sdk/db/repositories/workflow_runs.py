@@ -69,7 +69,7 @@ from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import DispatchFinalizationStatus, WorkflowRunTriggerType
-from skyvern.forge.sdk.db.exceptions import NotFoundError, RunsListSearchCanceled
+from skyvern.forge.sdk.db.exceptions import NotFoundError, OTPRequestAlreadyBoundError, RunsListSearchCanceled
 from skyvern.forge.sdk.db.id import (
     BROWSER_PROFILE_PREFIX,
     CREDENTIAL_PREFIX,
@@ -87,6 +87,7 @@ from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     CredentialParameterModel,
+    OTPRequestBindingModel,
     PersistentBrowserSessionModel,
     StepModel,
     TaskModel,
@@ -120,7 +121,13 @@ from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs, workflow_log
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.audit_events import record_run_cancel_audit
-from skyvern.forge.sdk.services.request_principal import RequestPrincipal, api_key_actor_id, get_request_principal
+from skyvern.forge.sdk.services.request_principal import (
+    AuthKind,
+    RequestPrincipal,
+    api_key_actor_id,
+    get_request_principal,
+    key_requester_id,
+)
 from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES
 from skyvern.forge.sdk.workflow.credential_selection import clear_credential_selections_for_retry
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
@@ -143,9 +150,75 @@ from skyvern.forge.sdk.workflow.status_mapping import (
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TERMINAL_STATUSES, ProxyLocationInput, RunType
-from skyvern.schemas.workflows import BlockStatus
+from skyvern.schemas.workflows import BlockStatus, BlockType
 
 LOG = structlog.get_logger()
+_OTP_REQUEST_BINDING_PK = "otp_request_bindings_pkey"
+
+
+def strict_otp_unstarted_reservation_clause() -> ColumnElement[bool]:
+    """The durable running-state fence used before a marked workflow run actually starts."""
+    return and_(
+        WorkflowRunModel.status == WorkflowRunStatus.running.value,
+        WorkflowRunModel.otp_request_id.is_not(None),
+        WorkflowRunModel.started_at.is_(None),
+    )
+
+
+def workflow_run_status_for_reads_expr() -> ColumnElement[str]:
+    """SQL projection matching ``WorkflowRun.status_for_reads``."""
+    return case(
+        (strict_otp_unstarted_reservation_clause(), WorkflowRunStatus.queued.value),
+        else_=WorkflowRunModel.status,
+    )
+
+
+def workflow_run_status_for_reads_filter(
+    statuses: Collection[str | WorkflowRunStatus],
+) -> ColumnElement[bool]:
+    """Index-friendly raw predicates for filtering by the projected workflow-run status."""
+    values = {status.value if isinstance(status, WorkflowRunStatus) else status for status in statuses}
+    reservation = strict_otp_unstarted_reservation_clause()
+    clauses: list[ColumnElement[bool]] = []
+    if WorkflowRunStatus.queued.value in values:
+        clauses.append(
+            or_(
+                WorkflowRunModel.status == WorkflowRunStatus.queued.value,
+                reservation,
+            )
+        )
+        values.remove(WorkflowRunStatus.queued.value)
+    if WorkflowRunStatus.running.value in values:
+        clauses.append(
+            and_(
+                WorkflowRunModel.status == WorkflowRunStatus.running.value,
+                ~reservation,
+            )
+        )
+        values.remove(WorkflowRunStatus.running.value)
+    if values:
+        clauses.append(WorkflowRunModel.status.in_(values))
+    return or_(*clauses) if clauses else false()
+
+
+def _is_duplicate_otp_request_binding(error: IntegrityError) -> bool:
+    constraint_name = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
+    if constraint_name == _OTP_REQUEST_BINDING_PK:
+        return True
+    error_text = str(error.orig).lower()
+    return (
+        _OTP_REQUEST_BINDING_PK in error_text
+        or "unique constraint failed: otp_request_bindings.organization_id, otp_request_bindings.otp_request_id"
+        in error_text
+    )
+
+
+def _bound_otp_request_error(binding: OTPRequestBindingModel) -> OTPRequestAlreadyBoundError:
+    owner_id = binding.owner_task_id if binding.owner_type == "task" else binding.owner_workflow_run_id
+    if owner_id is None:
+        raise RuntimeError("OTP request binding has no owner")
+    return OTPRequestAlreadyBoundError(owner_type=binding.owner_type, owner_id=owner_id)
+
 
 # Well under the connection's own DATABASE_STATEMENT_TIMEOUT_MS, so an unanswerable free-text search
 # hands the connection back rather than holding it until that expires. Budget for the whole read, not
@@ -560,6 +633,11 @@ def _final_webhook_claim_is_free(stale_before: datetime) -> ColumnElement[bool]:
             WorkflowRunModel.webhook_delivery_finalized_at < stale_before,
         ),
     )
+
+
+class FinalWebhookDeliveryState(NamedTuple):
+    status: str | None
+    finalized_at: datetime | None
 
 
 class WorkflowRunsRepository(BaseRepository):
@@ -1071,7 +1149,7 @@ class WorkflowRunsRepository(BaseRepository):
 
             return (active_count, stale_count)
 
-    @db_operation("create_workflow_run")
+    @db_operation("create_workflow_run", expected_errors=(OTPRequestAlreadyBoundError,))
     async def create_workflow_run(
         self,
         workflow_permanent_id: str,
@@ -1085,6 +1163,7 @@ class WorkflowRunsRepository(BaseRepository):
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
+        otp_request_id: str | None = None,
         parent_workflow_run_id: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
         max_elapsed_time_minutes: int | None = None,
@@ -1113,6 +1192,28 @@ class WorkflowRunsRepository(BaseRepository):
     ) -> WorkflowRun:
         async with self.Session() as session:
             kwargs: dict[str, Any] = {}
+            if parent_workflow_run_id is not None:
+                owner = (
+                    await session.execute(
+                        select(WorkflowRunModel.organization_id, WorkflowRunModel.otp_request_id).where(
+                            WorkflowRunModel.workflow_run_id == parent_workflow_run_id
+                        )
+                    )
+                ).one_or_none()
+                owner_organization_id = owner.organization_id if owner is not None else None
+                owner_marker = owner.otp_request_id if owner is not None else None
+                if owner_organization_id != organization_id and (
+                    owner_marker is not None or otp_request_id is not None
+                ):
+                    raise ValueError("Strict workflow run organization does not match its parent owner")
+                if owner_organization_id == organization_id and otp_request_id is None:
+                    otp_request_id = owner_marker
+                elif otp_request_id is not None and otp_request_id != owner_marker:
+                    raise ValueError("Workflow run OTP request marker does not match its parent owner")
+            if otp_request_id is not None and parent_workflow_run_id is None:
+                existing_binding = await session.get(OTPRequestBindingModel, (organization_id, otp_request_id))
+                if existing_binding is not None:
+                    raise _bound_otp_request_error(existing_binding)
             if workflow_run_id is not None:
                 kwargs["workflow_run_id"] = workflow_run_id
             if retried_from_workflow_run_id is not None and created_by is None and requested_by is None:
@@ -1131,8 +1232,17 @@ class WorkflowRunsRepository(BaseRepository):
                 kwargs["browser_settings"] = browser_settings.model_dump(mode="json")
             principal = get_request_principal()
             api_key_actor = api_key_actor_id(organization_id)
-            if principal is not None and principal.api_key_access_mode == "scoped":
-                requested_by = api_key_actor
+            if principal is not None and (
+                principal.auth_kind == AuthKind.member_api_key or principal.api_key_access_mode == "scoped"
+            ):
+                requested_by = key_requester_id(principal, organization_id)
+                if principal.auth_kind == AuthKind.member_api_key:
+                    created_by = principal.user_id
+            # Every marked workflow row is reserved as soon as its binding is inherited or inserted. Persisting it as
+            # timestamp-free `running` keeps base-version repair workers (which scan only created/queued rows) from
+            # reconstructing either a root or a TriggerWorkflowBlock child without its marker. The actual execution
+            # transition still stamps started_at; an async child first records its Temporal routing and queued_at.
+            initial_status = WorkflowRunStatus.running if otp_request_id is not None else WorkflowRunStatus.created
             workflow_run = WorkflowRunModel(
                 workflow_permanent_id=workflow_permanent_id,
                 workflow_id=workflow_id,
@@ -1144,11 +1254,12 @@ class WorkflowRunsRepository(BaseRepository):
                 reuse_bound_key=reuse_bound_key,
                 workflow_definition_sha256=workflow_definition_sha256,
                 proxy_location=serialize_proxy_location(proxy_location),
-                status="created",
+                status=initial_status.value,
                 setup_completed=trigger_type != WorkflowRunTriggerType.event,
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
+                otp_request_id=otp_request_id,
                 parent_workflow_run_id=parent_workflow_run_id,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 max_elapsed_time_minutes=max_elapsed_time_minutes,
@@ -1167,7 +1278,7 @@ class WorkflowRunsRepository(BaseRepository):
                 retried_from_workflow_run_id=retried_from_workflow_run_id,
                 fallback_attempt=fallback_attempt,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
-                copilot_session_id=copilot_session_id,
+                ember_session_id=copilot_session_id,
                 created_by=created_by,
                 # created_by names who to show; run start judges the actor that authorized the request instead.
                 requested_by=requested_by or api_key_actor,
@@ -1177,6 +1288,26 @@ class WorkflowRunsRepository(BaseRepository):
             # The flush already holds what a post-commit refresh would reread: Python defaults are set at flush and
             # any server default returns through the INSERT. Only a trigger could differ; add a refresh if one lands.
             await session.flush()
+            if otp_request_id is not None and parent_workflow_run_id is None:
+                try:
+                    session.add(
+                        OTPRequestBindingModel(
+                            organization_id=organization_id,
+                            otp_request_id=otp_request_id,
+                            owner_type="workflow_run",
+                            owner_workflow_run_id=workflow_run.workflow_run_id,
+                            owner_store="workflow_runs",
+                        )
+                    )
+                    await session.flush()
+                except IntegrityError as exc:
+                    if not _is_duplicate_otp_request_binding(exc):
+                        raise
+                    await session.rollback()
+                    existing_binding = await session.get(OTPRequestBindingModel, (organization_id, otp_request_id))
+                    if existing_binding is None:
+                        raise
+                    raise _bound_otp_request_error(existing_binding) from exc
             created = convert_to_workflow_run(workflow_run)
             await session.commit()
             return created
@@ -1261,6 +1392,22 @@ class WorkflowRunsRepository(BaseRepository):
                 )
             )
         return free_run_id is not None
+
+    @db_operation("get_final_webhook_delivery_state")
+    async def get_final_webhook_delivery_state(self, workflow_run_id: str) -> FinalWebhookDeliveryState | None:
+        async with self.Session() as session:
+            row = (
+                await session.execute(
+                    select(
+                        WorkflowRunModel.webhook_delivery_status, WorkflowRunModel.webhook_delivery_finalized_at
+                    ).where(WorkflowRunModel.workflow_run_id == workflow_run_id)
+                )
+            ).first()
+        if row is None:
+            return None
+        return FinalWebhookDeliveryState(
+            status=row.webhook_delivery_status, finalized_at=row.webhook_delivery_finalized_at
+        )
 
     @db_operation("release_final_webhook_delivery_claim")
     async def release_final_webhook_delivery_claim(self, workflow_run_id: str, *, claimed_at: datetime) -> None:
@@ -1734,10 +1881,19 @@ class WorkflowRunsRepository(BaseRepository):
         audit_actor: RequestPrincipal | None = None,
         on_transition: Callable[[], Awaitable[None]] | None = None,
         on_committed: Callable[[], None] | None = None,
+        on_confirmed_precommit_failure: Callable[[], None] | None = None,
+        reserve_for_dispatch: bool = False,
+        require_job_id_unset: bool = False,
     ) -> WorkflowRun | None:
         """One conditional UPDATE to ``status`` from a non-terminal state (``only_from`` narrows it), so a late
         cancel cannot clobber a finalization; None when the row was terminal or missing. Timestamps follow
-        :meth:`update_workflow_run`. ``on_committed`` runs synchronously once this write has won and committed."""
+        :meth:`update_workflow_run`. ``reserve_for_dispatch`` keeps a running row's ``started_at`` empty while
+        recording its first queue timestamp; the activity worker stamps the actual start later. ``on_committed``
+        runs synchronously once this write has won and committed. ``on_confirmed_precommit_failure`` runs only when
+        the reservation work fails before commit is attempted; commit failures remain deliberately ambiguous.
+        ``require_job_id_unset`` makes the routing write an exclusive dispatch claim."""
+        if reserve_for_dispatch and status != WorkflowRunStatus.running:
+            raise ValueError("A workflow dispatch reservation must use running status")
         non_terminal = [
             s.value for s in WorkflowRunStatus if not s.is_final() and (only_from is None or s in only_from)
         ]
@@ -1745,7 +1901,7 @@ class WorkflowRunsRepository(BaseRepository):
         values: dict[str, Any] = {"status": status}
         if status.is_final():
             values["finished_at"] = now
-        if status == WorkflowRunStatus.running:
+        if status == WorkflowRunStatus.running and not reserve_for_dispatch:
             values["started_at"] = func.coalesce(WorkflowRunModel.started_at, now)
         if failure_reason is not None:
             values["failure_reason"] = failure_reason
@@ -1784,38 +1940,45 @@ class WorkflowRunsRepository(BaseRepository):
             )
 
         async with self.Session() as session:
-            if status == WorkflowRunStatus.queued:
-                workflow_run = (
-                    await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
-                ).first()
-                if workflow_run is not None and workflow_run.queued_at is None:
-                    values["queued_at"] = func.coalesce(
-                        WorkflowRunModel.queued_at, await _first_queued_at(session, workflow_run)
+            try:
+                if status == WorkflowRunStatus.queued or reserve_for_dispatch:
+                    workflow_run = (
+                        await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
+                    ).first()
+                    if workflow_run is not None and workflow_run.queued_at is None:
+                        values["queued_at"] = func.coalesce(
+                            WorkflowRunModel.queued_at, await _first_queued_at(session, workflow_run)
+                        )
+                statement = update(WorkflowRunModel)
+                if require_job_id_unset:
+                    statement = statement.where(WorkflowRunModel.job_id.is_(None))
+                if require_latest_attempt_number is not None:
+                    statement = statement.where(
+                        ~exists().where(
+                            WorkflowRunAttemptModel.workflow_run_id == WorkflowRunModel.workflow_run_id,
+                            WorkflowRunAttemptModel.attempt_number > require_latest_attempt_number,
+                        )
                     )
-            statement = update(WorkflowRunModel)
-            if require_latest_attempt_number is not None:
-                statement = statement.where(
-                    ~exists().where(
-                        WorkflowRunAttemptModel.workflow_run_id == WorkflowRunModel.workflow_run_id,
-                        WorkflowRunAttemptModel.attempt_number > require_latest_attempt_number,
+                result = await session.execute(
+                    statement.where(
+                        WorkflowRunModel.workflow_run_id == workflow_run_id,
+                        WorkflowRunModel.status.in_(non_terminal),
                     )
+                    .values(**values)
+                    .returning(WorkflowRunModel)
+                    # The queued path (or a caller's ambient session) already holds this row in the identity map. The
+                    # UPDATE autoflushes pending changes first, so only changes left unflushed (no_autoflush) are overwritten.
+                    .execution_options(populate_existing=True)
                 )
-            result = await session.execute(
-                statement.where(
-                    WorkflowRunModel.workflow_run_id == workflow_run_id,
-                    WorkflowRunModel.status.in_(non_terminal),
-                )
-                .values(**values)
-                .returning(WorkflowRunModel)
-                # The queued path (or a caller's ambient session) already holds this row in the identity map. The UPDATE
-                # autoflushes pending changes first, so only changes left unflushed (no_autoflush) are overwritten.
-                .execution_options(populate_existing=True)
-            )
-            updated = result.scalar_one_or_none()
-            # Converted before the commits (this one and the one in save_workflow_run_logs) expire the row, so the
-            # result is the UPDATE-time snapshot. A later concurrent write such as a cancel is not in it;
-            # _execute_single_block reloads the run before each block.
-            workflow_run_result = convert_to_workflow_run(updated) if updated is not None else None
+                updated = result.scalar_one_or_none()
+                # Converted before the commits (this one and the one in save_workflow_run_logs) expire the row, so the
+                # result is the UPDATE-time snapshot. A later concurrent write such as a cancel is not in it;
+                # _execute_single_block reloads the run before each block.
+                workflow_run_result = convert_to_workflow_run(updated) if updated is not None else None
+            except BaseException:
+                if on_confirmed_precommit_failure is not None:
+                    on_confirmed_precommit_failure()
+                raise
             await session.commit()
             if workflow_run_result is None:
                 return None
@@ -1943,6 +2106,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: WorkflowRunStatus | None = None,
         failure_reason: str | None = None,
         only_if_status_in: list[WorkflowRunStatus] | None = None,
+        include_strict_otp_reservations_as_queued: bool = False,
     ) -> list[str]:
         """Bulk update workflow runs by their IDs.
 
@@ -1951,12 +2115,18 @@ class WorkflowRunsRepository(BaseRepository):
             status: Optional status to set for all workflow runs
             failure_reason: Optional failure reason to set for all workflow runs
             only_if_status_in: Optional status whitelist used as a compare-and-set guard
+            include_strict_otp_reservations_as_queued: Also match marked, unstarted running reservations when queued
+                is in the whitelist. Their persisted status remains the legacy-repair fence until this update wins.
 
         Returns:
             IDs of rows that matched the update.
         """
         if not workflow_run_ids:
             return []
+        if include_strict_otp_reservations_as_queued and (
+            only_if_status_in is None or WorkflowRunStatus.queued not in only_if_status_in
+        ):
+            raise ValueError("strict OTP reservations can only be included in a queued status guard")
 
         async with self.Session() as session:
             update_values: dict[str, Any] = {}
@@ -1994,9 +2164,12 @@ class WorkflowRunsRepository(BaseRepository):
 
             update_stmt = update(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
             if only_if_status_in is not None:
-                update_stmt = update_stmt.where(
-                    WorkflowRunModel.status.in_([eligible_status.value for eligible_status in only_if_status_in])
+                status_guard = WorkflowRunModel.status.in_(
+                    [eligible_status.value for eligible_status in only_if_status_in]
                 )
+                if include_strict_otp_reservations_as_queued:
+                    status_guard = or_(status_guard, strict_otp_unstarted_reservation_clause())
+                update_stmt = update_stmt.where(status_guard)
             result = await session.execute(
                 update_stmt.values(**update_values).returning(WorkflowRunModel.workflow_run_id)
             )
@@ -2044,6 +2217,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: list[WorkflowRunStatus] | None = None,
         include_debugger_runs: bool = False,
         search_key: str | None = None,
+        project_status_for_reads: bool = False,
     ) -> list[WorkflowRun | Task]:
         await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
@@ -2058,7 +2232,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
-                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .filter(WorkflowRunModel.ember_session_id.is_(None))
             )
             folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
             if folder_access_filter is not None:
@@ -2084,7 +2258,11 @@ class WorkflowRunsRepository(BaseRepository):
                 )
 
             if status:
-                workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
+                workflow_run_query = workflow_run_query.filter(
+                    workflow_run_status_for_reads_filter(status)
+                    if project_status_for_reads
+                    else WorkflowRunModel.status.in_(status)
+                )
             workflow_run_query = workflow_run_query.order_by(WorkflowRunModel.created_at.desc()).limit(limit)
             workflow_run_query_result = (await session.execute(workflow_run_query)).all()
             workflow_runs = [
@@ -2163,7 +2341,8 @@ class WorkflowRunsRepository(BaseRepository):
                 budget_expires_at = time.monotonic() + RUNS_LIST_STATEMENT_TIMEOUT_SECONDS
                 await apply_statement_timeout(session, RUNS_LIST_STATEMENT_TIMEOUT_SECONDS)
             run_tag_subqueries = run_tag_run_id_subqueries(run_tags, organization_id)
-            effective_status = func.coalesce(WorkflowRunModel.status, TaskRunModel.status)
+            projected_workflow_status = workflow_run_status_for_reads_expr()
+            effective_status = func.coalesce(projected_workflow_status, TaskRunModel.status)
             # Matches workflow_runs.failure_category[0].category only (the classifier's top
             # category); task_run_type != workflow_run rows join WorkflowRunModel as NULL, so
             # they're excluded here for free. A failure classification is never assigned to a
@@ -2217,7 +2396,6 @@ class WorkflowRunsRepository(BaseRepository):
                     TaskRunModel.script_run.label("script_run"),
                     WorkflowRunModel.trigger_type.label("trigger_type"),
                     created_by_expr.label("created_by"),
-                    TaskRunModel.searchable_text.label("searchable_text"),
                     workflow_deleted_expr,
                 )
                 .select_from(TaskRunModel)
@@ -2234,7 +2412,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(effective_status.isnot(None))
                 .filter(TaskRunModel.parent_workflow_run_id.is_(None))
                 .filter(TaskRunModel.debug_session_id.is_(None))
-                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .filter(WorkflowRunModel.ember_session_id.is_(None))
             )
             # A task v2 row records no workflow, and the join above skips its run, so it follows its own workflow run.
             task_v2_wpid = (
@@ -2252,7 +2430,18 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter(folder_access_filter)
 
             if status:
-                query = query.filter(effective_status.in_(status))
+                query = query.filter(
+                    or_(
+                        and_(
+                            WorkflowRunModel.workflow_run_id.is_not(None),
+                            workflow_run_status_for_reads_filter(status),
+                        ),
+                        and_(
+                            WorkflowRunModel.workflow_run_id.is_(None),
+                            TaskRunModel.status.in_(status),
+                        ),
+                    )
+                )
 
             if category_match_clause is not None:
                 query = query.filter(category_match_clause).filter(effective_status.in_(failure_statuses))
@@ -2296,9 +2485,9 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.offset(offset)
 
             result = await execute_list_query(query)
-            rows = [dict(row) for row in result.mappings().all()]
 
             if use_fallback_merge:
+                rows: list[RowMapping] = list(result.mappings().all())
                 # The fallback only yields workflow_run rows, so skip it when the run_type filter excludes them.
                 if not run_type or RunType.workflow_run in run_type:
                     task_run_exists = (
@@ -2314,7 +2503,7 @@ class WorkflowRunsRepository(BaseRepository):
                             WorkflowRunModel.workflow_run_id.label("task_run_id"),
                             WorkflowRunModel.workflow_run_id.label("run_id"),
                             literal(RunType.workflow_run.value).label("task_run_type"),
-                            WorkflowRunModel.status.label("status"),
+                            workflow_run_status_for_reads_expr().label("status"),
                             WorkflowModel.title.label("title"),
                             WorkflowRunModel.started_at.label("started_at"),
                             WorkflowRunModel.finished_at.label("finished_at"),
@@ -2324,7 +2513,6 @@ class WorkflowRunsRepository(BaseRepository):
                             WorkflowRunModel.script_run.label("script_run"),
                             WorkflowRunModel.trigger_type.label("trigger_type"),
                             WorkflowRunModel.created_by.label("created_by"),
-                            WorkflowModel.title.label("searchable_text"),
                             self._workflow_deleted_expr(
                                 WorkflowRunModel.workflow_permanent_id,
                                 WorkflowRunModel.organization_id,
@@ -2335,7 +2523,7 @@ class WorkflowRunsRepository(BaseRepository):
                         .filter(WorkflowRunModel.organization_id == organization_id)
                         .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                         .filter(WorkflowRunModel.debug_session_id.is_(None))
-                        .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                        .filter(WorkflowRunModel.ember_session_id.is_(None))
                         .filter(~task_run_exists)
                     )
                     if folder_access_filter is not None:
@@ -2345,7 +2533,7 @@ class WorkflowRunsRepository(BaseRepository):
                     if search_key:
                         fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
                     if status:
-                        fallback_query = fallback_query.filter(WorkflowRunModel.status.in_(status))
+                        fallback_query = fallback_query.filter(workflow_run_status_for_reads_filter(status))
                     if category_match_clause is not None:
                         fallback_query = fallback_query.filter(category_match_clause).filter(
                             WorkflowRunModel.status.in_(failure_statuses)
@@ -2365,11 +2553,11 @@ class WorkflowRunsRepository(BaseRepository):
                             session, max(remaining_budget_seconds, _RUNS_LIST_EXHAUSTED_BUDGET_SECONDS)
                         )
                     fallback_result = await execute_list_query(fallback_query)
-                    rows.extend(dict(row) for row in fallback_result.mappings().all())
+                    rows.extend(fallback_result.mappings().all())
                 rows.sort(key=lambda row: row["created_at"], reverse=True)
-                rows = rows[offset : offset + page_size]
+                return [dict(row) for row in rows[offset : offset + page_size]]
 
-            return rows
+            return [dict(row) for row in result.mappings().all()]
 
     @read_retry()
     @db_operation("get_workflow_run", log_errors=False)
@@ -2577,7 +2765,7 @@ class WorkflowRunsRepository(BaseRepository):
             query = select(WorkflowRunModel).filter_by(workflow_permanent_id=workflow_permanent_id)
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
-            query = query.filter_by(status=WorkflowRunStatus.queued)
+            query = query.filter(workflow_run_status_for_reads_filter([WorkflowRunStatus.queued]))
             if sequential_key:
                 query = query.filter_by(sequential_key=sequential_key)
             query = query.order_by(WorkflowRunModel.modified_at.desc()).limit(1)
@@ -3598,6 +3786,7 @@ class WorkflowRunsRepository(BaseRepository):
         error_code: str | None = None,
         created_at_start: datetime | None = None,
         created_at_end: datetime | None = None,
+        project_status_for_reads: bool = False,
     ) -> list[WorkflowRun]:
         await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
@@ -3614,7 +3803,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
-                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .filter(WorkflowRunModel.ember_session_id.is_(None))
             )
             folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
             if folder_access_filter is not None:
@@ -3624,7 +3813,11 @@ class WorkflowRunsRepository(BaseRepository):
             query = self._apply_error_code_filter(query, error_code, organization_id)
 
             if status:
-                query = query.filter(WorkflowRunModel.status.in_(status))
+                query = query.filter(
+                    workflow_run_status_for_reads_filter(status)
+                    if project_status_for_reads
+                    else WorkflowRunModel.status.in_(status)
+                )
             # created_at is naive UTC; an aware bound compared as-is would shift by its offset.
             if created_at_start is not None:
                 query = query.filter(WorkflowRunModel.created_at >= to_naive_utc(created_at_start))
@@ -3685,6 +3878,7 @@ class WorkflowRunsRepository(BaseRepository):
         self,
         organization_id: str,
         status: list[WorkflowRunStatus] | None = None,
+        project_status_for_reads: bool = False,
     ) -> int:
         await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
@@ -3697,7 +3891,11 @@ class WorkflowRunsRepository(BaseRepository):
             if folder_access_filter is not None:
                 count_query = count_query.where(folder_access_filter)
             if status:
-                count_query = count_query.filter(WorkflowRunModel.status.in_(status))
+                count_query = count_query.filter(
+                    workflow_run_status_for_reads_filter(status)
+                    if project_status_for_reads
+                    else WorkflowRunModel.status.in_(status)
+                )
             return (await session.execute(count_query)).scalar_one()
 
     @db_operation("get_workflow_runs_for_organization_by_status")
@@ -3757,6 +3955,7 @@ class WorkflowRunsRepository(BaseRepository):
         created_at_start: datetime | None = None,
         created_at_end: datetime | None = None,
         run_tags: Sequence[tuple[str | None, str | None]] | None = None,
+        project_status_for_reads: bool = False,
     ) -> list[WorkflowRun]:
         """
         Get runs for a workflow, optionally searching its title, run ID, inputs, webhook URL,
@@ -3776,7 +3975,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
-                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .filter(WorkflowRunModel.ember_session_id.is_(None))
             )
             folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
             if folder_access_filter is not None:
@@ -3786,7 +3985,11 @@ class WorkflowRunsRepository(BaseRepository):
             query = self._apply_workflow_run_search_key_filter(query, search_key)
             query = self._apply_error_code_filter(query, error_code, organization_id)
             if status:
-                query = query.filter(WorkflowRunModel.status.in_(status))
+                query = query.filter(
+                    workflow_run_status_for_reads_filter(status)
+                    if project_status_for_reads
+                    else WorkflowRunModel.status.in_(status)
+                )
             if created_at_start is not None:
                 query = query.filter(WorkflowRunModel.created_at >= created_at_start)
             if created_at_end is not None:
@@ -3829,7 +4032,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.browser_session_id == browser_session_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
-                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .filter(WorkflowRunModel.ember_session_id.is_(None))
             )
             folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
             if folder_access_filter is not None:
@@ -3931,7 +4134,7 @@ class WorkflowRunsRepository(BaseRepository):
                     WorkflowRunModel.organization_id,
                     WorkflowRunModel.browser_session_id,
                     WorkflowRunModel.workflow_permanent_id,
-                    WorkflowRunModel.copilot_session_id,
+                    WorkflowRunModel.ember_session_id.label("copilot_session_id"),
                     WorkflowRunModel.status,
                     WorkflowRunModel.created_at,
                     WorkflowRunModel.finished_at,
@@ -4321,14 +4524,26 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str,
         organization_id: str | None = None,
         attempt_number: int | None = None,
+        *,
+        only_error_output: bool = False,
     ) -> list[WorkflowRunBlockErrorRow]:
         """Return block provenance and error details for errored blocks in stable creation order."""
+        output = (
+            case(
+                (
+                    WorkflowRunBlockModel.block_type.in_((BlockType.CODE.value, BlockType.WEB_SEARCH.value)),
+                    WorkflowRunBlockModel.output,
+                ),
+            ).label("output")
+            if only_error_output
+            else WorkflowRunBlockModel.output
+        )
         async with self.Session() as session:
             query = select(
                 WorkflowRunBlockModel.workflow_run_block_id,
                 WorkflowRunBlockModel.error_codes,
                 WorkflowRunBlockModel.failure_reason,
-                WorkflowRunBlockModel.output,
+                output,
                 WorkflowRunBlockModel.block_type,
                 WorkflowRunBlockModel.label,
                 WorkflowRunBlockModel.current_index,

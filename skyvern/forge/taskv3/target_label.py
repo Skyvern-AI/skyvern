@@ -149,6 +149,7 @@ def name_looks_like_a_label(raw: str) -> bool:
 # here: press_key is about the key, navigate about the URL, and neither reads as a target.
 TARGET_VERBS = {
     "click": "Clicked",
+    "download": "Asked for a file from",
     "hover": "Hovered over",
     "drag": "Dragged",
     "type": "Typed into",
@@ -211,6 +212,7 @@ _DEFAULT_KIND_BY_TOOL = {
 
 _FAILED_TARGET_VERBS = {
     "click": "Tried to click",
+    "download": "Tried to download from",
     "hover": "Tried to hover over",
     "drag": "Tried to drag",
     "type": "Tried to type into",

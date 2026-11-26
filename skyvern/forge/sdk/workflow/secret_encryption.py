@@ -5,12 +5,14 @@ import re
 from copy import deepcopy
 from typing import Any, NoReturn
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException
+from skyvern.forge.sdk.encrypt.bootstrap import validate_aes_v2_material
 from skyvern.schemas.workflows import BlockType, _has_jinja_syntax
 
 SENSITIVE_DESTINATION_FIELDS: frozenset[str] = frozenset(
@@ -25,8 +27,9 @@ SENSITIVE_DESTINATION_FIELDS: frozenset[str] = frozenset(
 SENSITIVE_SEND_EMAIL_FIELDS: frozenset[str] = frozenset({"custom_smtp_password"})
 WORKFLOW_SECRET_MASK = "[REDACTED]"
 ENCRYPTED_SECRET_PREFIX = "skyvern_enc:"
-_METHOD = "aesgcm-v1"
-_SENTINEL_PREFIX = f"{ENCRYPTED_SECRET_PREFIX}{_METHOD}:"
+_WRITE_METHOD = "aesgcm-v1"
+_METHODS = frozenset({_WRITE_METHOD, "aesgcm-v2"})
+_SENTINEL_PREFIX = f"{ENCRYPTED_SECRET_PREFIX}{_WRITE_METHOD}:"
 _NONCE_LEN = 12
 _SENSITIVE_BLOCK_FIELDS = {
     BlockType.FILE_UPLOAD: SENSITIVE_DESTINATION_FIELDS,
@@ -330,20 +333,38 @@ def encryption_available() -> bool:
     )
 
 
-def _derive_key() -> bytes:
-    salt = settings.ENCRYPTOR_AES_SALT.encode() if settings.ENCRYPTOR_AES_SALT else None
+def _derive_key(method: str, *, v1_secret_key: str | None = None) -> bytes:
+    if method == "aesgcm-v1":
+        secret_key = v1_secret_key if v1_secret_key is not None else settings.ENCRYPTOR_AES_SECRET_KEY
+        salt_value = settings.ENCRYPTOR_AES_SALT
+    elif method == "aesgcm-v2":
+        v2_material = validate_aes_v2_material(
+            secret_key=settings.ENCRYPTOR_AES_SECRET_KEY,
+            salt=settings.ENCRYPTOR_AES_SALT,
+            v2_secret_key=settings.ENCRYPTOR_AES_SECRET_KEY_V2,
+            v2_salt=settings.ENCRYPTOR_AES_SALT_V2,
+        )
+        if v2_material is None:
+            raise ValueError
+        secret_key, salt_value = v2_material
+    else:
+        raise ValueError
+    salt = salt_value.encode() if salt_value else None
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
-        info=b"skyvern-file-destination-secret-aesgcm-v1",
+        info=f"skyvern-file-destination-secret-{method}".encode(),
     )
-    return hkdf.derive(settings.ENCRYPTOR_AES_SECRET_KEY.encode())
+    return hkdf.derive(secret_key.encode())
 
 
 # AAD binds each ciphertext to its org + field so a value moved to another field or org fails to authenticate.
-def _binding_aad(organization_id: str | None, field_name: str) -> bytes:
-    return b"\x00".join((b"skyvern-file-destination-secret-v1", (organization_id or "").encode(), field_name.encode()))
+def _binding_aad(method: str, organization_id: str | None, field_name: str) -> bytes:
+    version = method.removeprefix("aesgcm-")
+    return b"\x00".join(
+        (f"skyvern-file-destination-secret-{version}".encode(), (organization_id or "").encode(), field_name.encode())
+    )
 
 
 async def encrypt_secret_field_value(
@@ -361,7 +382,16 @@ async def encrypt_secret_field_value(
     if template_skips_encryption:
         return value
     nonce = os.urandom(_NONCE_LEN)
-    ciphertext = AESGCM(_derive_key()).encrypt(nonce, value.encode(), _binding_aad(organization_id, field_name))
+    scoped_key = settings.ENCRYPTOR_AES_SCOPED_SECRET_KEY if settings.ENCRYPTOR_AES_WRITE_SCOPED else None
+    if settings.ENCRYPTOR_AES_WRITE_SCOPED and (
+        not scoped_key or scoped_key in {"fillmein", settings.ENCRYPTOR_AES_SECRET_KEY}
+    ):
+        raise RuntimeError("ENCRYPTOR_AES_WRITE_SCOPED requires a distinct ENCRYPTOR_AES_SCOPED_SECRET_KEY")
+    ciphertext = AESGCM(_derive_key(_WRITE_METHOD, v1_secret_key=scoped_key)).encrypt(
+        nonce,
+        value.encode(),
+        _binding_aad(_WRITE_METHOD, organization_id, field_name),
+    )
     return _SENTINEL_PREFIX + base64.b64encode(nonce + ciphertext).decode()
 
 
@@ -373,11 +403,21 @@ async def decrypt_secret_field_value(value: str, *, organization_id: str | None,
     if not is_encrypted_secret(value):
         raise ValueError(_DECRYPT_FAILED)
     try:
-        raw = base64.b64decode(value[len(_SENTINEL_PREFIX) :], validate=True)
+        method, separator, encoded = value[len(ENCRYPTED_SECRET_PREFIX) :].partition(":")
+        if not separator or method not in _METHODS:
+            raise ValueError
+        raw = base64.b64decode(encoded, validate=True)
         nonce, ciphertext = raw[:_NONCE_LEN], raw[_NONCE_LEN:]
         if len(nonce) != _NONCE_LEN or not ciphertext:
             raise ValueError
-        plaintext = AESGCM(_derive_key()).decrypt(nonce, ciphertext, _binding_aad(organization_id, field_name))
+        aad = _binding_aad(method, organization_id, field_name)
+        try:
+            plaintext = AESGCM(_derive_key(method)).decrypt(nonce, ciphertext, aad)
+        except InvalidTag:
+            scoped_key = settings.ENCRYPTOR_AES_SCOPED_SECRET_KEY
+            if method != "aesgcm-v1" or not scoped_key or scoped_key == "fillmein":
+                raise
+            plaintext = AESGCM(_derive_key(method, v1_secret_key=scoped_key)).decrypt(nonce, ciphertext, aad)
     except Exception:
         # Generic on purpose: never reveal the ciphertext/plaintext or which check failed.
         raise ValueError(_DECRYPT_FAILED) from None

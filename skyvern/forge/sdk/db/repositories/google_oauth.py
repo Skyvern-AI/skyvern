@@ -293,7 +293,7 @@ class GoogleOAuthRepository(BaseRepository):
         organization_id: str,
         new_client_id: str | None,
         now: datetime.datetime,
-    ) -> int:
+    ) -> list[str]:
         async with self.Session() as session:
             filters = [
                 GoogleOAuthCredentialModel.organization_id == organization_id,
@@ -309,10 +309,11 @@ class GoogleOAuthRepository(BaseRepository):
                     state=STATE_ERROR,
                     modified_at=now,
                 )
+                .returning(GoogleOAuthCredentialModel.id)
             )
-            result = await session.execute(stmt)
+            flipped = list((await session.execute(stmt)).scalars().all())
             await session.commit()
-            return result.rowcount or 0
+            return flipped
 
     @db_operation("promote_pending_to_active")
     async def promote_pending_to_active(
@@ -323,6 +324,7 @@ class GoogleOAuthRepository(BaseRepository):
         encrypted_method: EncryptMethod,
         scopes_granted: list[str],
         now: datetime.datetime,
+        initiating_user_id: str | None = None,
         google_subject: str | None = None,
         email_address: str | None = None,
     ) -> GoogleOAuthCredentialBase:
@@ -346,6 +348,9 @@ class GoogleOAuthRepository(BaseRepository):
                     scopes_granted=scopes_granted,
                     email_address=func.coalesce(email_address, GoogleOAuthCredentialModel.email_address),
                     google_subject=func.coalesce(google_subject, GoogleOAuthCredentialModel.google_subject),
+                    # Unlike microsoft_oauth_credentials, which keeps the first initiator, this is overwritten on
+                    # every consent: a reconnect by someone else, or by no person, never keeps the old connector.
+                    initiating_user_id=initiating_user_id,
                     consent_nonce=None,
                     consent_redirect_uri=None,
                     consent_expires_at=None,

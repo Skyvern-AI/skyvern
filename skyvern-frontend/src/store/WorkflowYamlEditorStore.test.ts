@@ -73,7 +73,7 @@ describe("Ember turn reservations", () => {
       draft: "title: Edited\nblocks: []",
     });
     expect(toast).toHaveBeenCalledExactlyOnceWith({
-      title: "Wait for the Copilot change to finish",
+      title: "Wait for the Ember change to finish",
       variant: "destructive",
     });
     expect(commit).not.toHaveBeenCalled();
@@ -179,7 +179,7 @@ describe("Ember turn reservations", () => {
     expect(toast).not.toHaveBeenCalled();
     expect(filterWorkflowChanges([...passive, ...mutations])).toEqual(passive);
     expect(toast).toHaveBeenCalledExactlyOnceWith({
-      title: "Wait for the Copilot change to finish",
+      title: "Wait for the Ember change to finish",
       variant: "destructive",
     });
     withEmberAcceptance(token, () => {
@@ -211,7 +211,7 @@ describe("Ember turn reservations", () => {
   test.each([
     ["yaml", "A YAML commit is in progress"],
     ["save", "A save is in progress"],
-    ["ember", "Wait for the Copilot change to finish"],
+    ["ember", "Wait for the Ember change to finish"],
   ] as const)("reports the %s lock kind", (lockKind, message) => {
     useWorkflowYamlEditorStore.setState({
       lockKind,
