@@ -252,6 +252,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     redacted_exception_origin,
     settle_browser_downloads_for_context,
 )
+from skyvern.webeye.computer_surface import ComputerSurface
 from skyvern.webeye.dom_inspection import (
     is_static_listbox_option_snapshot,
     read_static_listbox_option_snapshot,
@@ -5151,6 +5152,7 @@ class ActionHandler:
         *,
         file_download_false_click_eligible: bool = False,
         allow_stale_refresh: bool = False,
+        computer_surface: ComputerSurface | None = None,
     ) -> list[ActionResult]:
         context = skyvern_context.current()
         prior_reservations: tuple[tuple[Page, ...], tuple[Page, ...]] = ((), ())
@@ -5173,6 +5175,7 @@ class ActionHandler:
                 action,
                 file_download_false_click_eligible=file_download_false_click_eligible,
                 allow_stale_refresh=allow_stale_refresh,
+                computer_surface=computer_surface,
             )
             if _browser_dispatch_committed.get():
                 app.AGENT_FUNCTION.note_page_action(page, action)
@@ -5210,6 +5213,7 @@ class ActionHandler:
         *,
         file_download_false_click_eligible: bool = False,
         allow_stale_refresh: bool = False,
+        computer_surface: ComputerSurface | None = None,
     ) -> list[ActionResult]:
         # task_id, step_id auto-attached by @traced from SkyvernContext
         _action_span = otel_trace.get_current_span()
@@ -5296,6 +5300,7 @@ class ActionHandler:
                             page=page,
                             action=action,
                             allow_stale_refresh=allow_stale_refresh,
+                            computer_surface=computer_surface,
                         )
                 finally:
                     if false_click_eligible_token is not None:
@@ -5502,6 +5507,7 @@ class ActionHandler:
                                     page=page,
                                     action=action,
                                     allow_stale_refresh=allow_stale_refresh,
+                                    computer_surface=computer_surface,
                                 )
                             except asyncio.CancelledError:
                                 raise
@@ -5823,6 +5829,7 @@ class ActionHandler:
                     page=page,
                     action=action,
                     allow_stale_refresh=allow_stale_refresh,
+                    computer_surface=computer_surface,
                 )
             # The execution window ends when the inner action completes: the download wait
             # below (up to BROWSER_DOWNLOAD_TIMEOUT) is settle observation, excluded to match
@@ -6462,6 +6469,7 @@ class ActionHandler:
         page: Page,
         action: Action,
         allow_stale_refresh: bool = False,
+        computer_surface: ComputerSurface | None = None,
     ) -> list[ActionResult]:
         action.tel_input_outcome = None
         await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
@@ -6548,7 +6556,21 @@ class ActionHandler:
                     # do the handler
                     handler = ActionHandler._handled_action_types[action.action_type]
                     action_phase.mark_action_phase(ActionPhase.HANDLER)
-                    results = await handler(action, page, scraped_page, task, step)
+                    if computer_surface is not None and action.action_type in (
+                        ActionType.CLICK,
+                        ActionType.INPUT_TEXT,
+                        ActionType.WAIT,
+                        ActionType.SCROLL,
+                        ActionType.KEYPRESS,
+                        ActionType.MOVE,
+                        ActionType.DRAG,
+                        ActionType.LEFT_MOUSE,
+                    ):
+                        results = await cast(Callable[..., Awaitable[list[ActionResult]]], handler)(
+                            action, page, scraped_page, task, step, computer_surface=computer_surface
+                        )
+                    else:
+                        results = await handler(action, page, scraped_page, task, step)
                     actions_result.extend(results)
                     await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
                     # do the teardown
@@ -7836,6 +7858,8 @@ async def handle_click_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     # Get wait config once for this handler
     wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
@@ -7843,6 +7867,9 @@ async def handle_click_action(
     dom = DomUtil(scraped_page=scraped_page, page=page)
     original_url = page.url
     if action.x is not None and action.y is not None:
+        if computer_surface is not None:
+            await computer_surface.click(action.x, action.y, action.button, action.repeat)
+            return [ActionSuccess()]
         # Find the element at the clicked location using JavaScript evaluation
         element_id: str | None = await page.evaluate(
             """data => {
@@ -9543,6 +9570,8 @@ async def handle_input_text_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     action.tel_input_outcome = None
     return await _handle_input_text_action(
@@ -9551,6 +9580,7 @@ async def handle_input_text_action(
         scraped_page=scraped_page,
         task=task,
         step=step,
+        computer_surface=computer_surface,
     )
 
 
@@ -9576,6 +9606,8 @@ async def _handle_input_text_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     initial_action_target_id = action.element_id
     context = skyvern_context.current()
@@ -9665,7 +9697,10 @@ async def _handle_input_text_action(
             task.workflow_run_id,
             is_card_secret=_is_card_secret_parameter(task, action.text, resolved_to_a_secret=cua_text != action.text),
         )
-        await EventStrategyFactory.type_text(page, None, cua_text)
+        if computer_surface is not None:
+            await computer_surface.type_text(cua_text)
+        else:
+            await EventStrategyFactory.type_text(page, None, cua_text)
         return [ActionSuccess()]
 
     totp_secret: str | None = None
@@ -11675,8 +11710,13 @@ async def handle_wait_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
-    await asyncio.sleep(action.seconds)
+    if computer_surface is not None:
+        await computer_surface.wait(action.seconds)
+    else:
+        await asyncio.sleep(action.seconds)
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
 
 
@@ -11895,6 +11935,8 @@ async def handle_scroll_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     if action.scroll_x is None or action.scroll_y is None:
         return [ActionFailure(Exception("ScrollAction is missing scroll_x/scroll_y coordinates"))]
@@ -12067,10 +12109,16 @@ async def handle_scroll_action(
             await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     elif action.x and action.y:
         # Coordinate-based scrolling from CUA/UI-TARS agents
-        await EventStrategyFactory.move_cursor(page, action.x, action.y)
-        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
+        if computer_surface is not None:
+            await computer_surface.scroll(action.x, action.y, action.scroll_x, action.scroll_y)
+        else:
+            await EventStrategyFactory.move_cursor(page, action.x, action.y)
+            await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     else:
-        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
+        if computer_surface is not None:
+            await computer_surface.scroll(None, None, action.scroll_x, action.scroll_y)
+        else:
+            await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     return [ActionSuccess()]
 
 
@@ -12081,9 +12129,16 @@ async def handle_keypress_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     otp_dispatch_effect.set("unknown")
-    await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
+    if computer_surface is not None:
+        await computer_surface.key(action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
+    else:
+        await handler_utils.keypress(
+            page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat
+        )
     otp_dispatch_effect.set("dispatched")
     return [ActionSuccess()]
 
@@ -12271,10 +12326,15 @@ async def handle_move_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
     if action.x is None or action.y is None:
         return [ActionFailure(Exception("MoveAction is missing x/y coordinates"))]
-    await EventStrategyFactory.move_cursor(page, action.x, action.y)
+    if computer_surface is not None:
+        await computer_surface.move(action.x, action.y)
+    else:
+        await EventStrategyFactory.move_cursor(page, action.x, action.y)
     return [ActionSuccess()]
 
 
@@ -12285,8 +12345,13 @@ async def handle_drag_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
-    await handler_utils.drag(page, action.start_x, action.start_y, action.path)
+    if computer_surface is not None:
+        await computer_surface.drag(action.start_x, action.start_y, action.path)
+    else:
+        await handler_utils.drag(page, action.start_x, action.start_y, action.path)
     return [ActionSuccess()]
 
 
@@ -12314,8 +12379,13 @@ async def handle_left_mouse_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    *,
+    computer_surface: ComputerSurface | None = None,
 ) -> list[ActionResult]:
-    await handler_utils.left_mouse(page, action.x, action.y, action.direction)
+    if computer_surface is not None:
+        await computer_surface.left_mouse(action.x, action.y, action.direction)
+    else:
+        await handler_utils.left_mouse(page, action.x, action.y, action.direction)
     return [ActionSuccess()]
 
 

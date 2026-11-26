@@ -8661,6 +8661,9 @@ class WorkflowService:
                 attempt_number=attempt_number,
                 dispatch_claim_started_at=dispatch_claim_started_at,
             )
+            await app.AGENT_FUNCTION.before_run_target_dispatch(
+                organization_id=organization_id, run_id=workflow_run_id, run_kind="workflow_run"
+            )
         except WorkflowAttemptDispatchSuperseded:
             raise
         except Exception as error:
@@ -16721,9 +16724,15 @@ class WorkflowService:
             )
         finally:
             # Finalized protection belongs to the execution that finalizes the run, not to an external canceler.
-            await self._after_workflow_run_status_write(
-                updated, WorkflowRunStatus.canceled, mark_finalized=not requested_externally
-            )
+            try:
+                await self._after_workflow_run_status_write(
+                    updated, WorkflowRunStatus.canceled, mark_finalized=not requested_externally
+                )
+            finally:
+                # External cancellation can finalize without entering execution cleanup.
+                await app.AGENT_FUNCTION.on_run_target_terminal(
+                    organization_id=updated.organization_id, run_id=workflow_run_id, run_kind="workflow_run"
+                )
         return updated
 
     async def mark_workflow_run_as_timed_out(
