@@ -409,10 +409,9 @@ function EmailInboxEditorBody({
         </div>
         {isNango ? (
           <p className="text-xs text-muted-foreground">
-            This Gmail account reads only in runs that belong to its owner.
-            API-key, webhook, job recipe and directory submission runs are
-            unsupported. Folder, sender, and subject must be literal. Reads
-            return at most 100 messages.
+            This Gmail account reads only in runs that belong to its owner. Runs
+            started by an API key or a webhook are unsupported. Folder, sender,
+            and subject must be literal. Reads return at most 100 messages.
           </p>
         ) : null}
       </div>
