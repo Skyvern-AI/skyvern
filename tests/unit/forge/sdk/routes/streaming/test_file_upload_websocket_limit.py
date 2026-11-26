@@ -9,9 +9,10 @@ from starlette.applications import Starlette
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
 from skyvern.config import settings
-from skyvern.forge.payload_limits import max_file_upload_ws_message_size
+from skyvern.forge.payload_limits import MIN_SHARED_WS_CONTENT_BYTES, max_file_upload_ws_message_size
 from skyvern.forge.sdk.routes.streaming.cdp_input import _dispatch_file_upload_event
 
 
@@ -22,7 +23,8 @@ async def _receive_message_size(websocket: WebSocket) -> None:
 
 
 @pytest.mark.asyncio
-async def test_uvicorn_sansio_accepts_25mb_file_upload_frame() -> None:
+@pytest.mark.parametrize("case", ["file_upload", "content_floor", "over_limit"])
+async def test_uvicorn_sansio_enforces_the_shared_websocket_limit(case: str) -> None:
     app = Starlette(routes=[WebSocketRoute("/", _receive_message_size)])
     server_socket = socket.socket()
     server_socket.bind(("127.0.0.1", 0))
@@ -47,20 +49,31 @@ async def test_uvicorn_sansio_accepts_25mb_file_upload_frame() -> None:
             while not server.started:
                 await asyncio.sleep(0.01)
 
-            file_content = base64.b64encode(bytes(25 * 1024 * 1024)).decode("ascii")
-            message = json.dumps(
-                {
-                    "kind": "fileUpload",
-                    "fileName": "upload.bin",
-                    "mimeType": "application/octet-stream",
-                    "content": file_content,
-                },
-                separators=(",", ":"),
-            )
+            limit = max_file_upload_ws_message_size(settings.MAX_UPLOAD_FILE_SIZE)
+            if case == "over_limit":
+                message = "x" * (limit + 1)
+            else:
+                size = 25 * 1024 * 1024 if case == "file_upload" else MIN_SHARED_WS_CONTENT_BYTES
+                content = base64.b64encode(bytes(size)).decode("ascii")
+                message = json.dumps(
+                    {
+                        "kind": "fileUpload",
+                        "fileName": "upload.bin",
+                        "mimeType": "application/octet-stream",
+                        "content": content,
+                    },
+                    separators=(",", ":"),
+                )
 
-            async with connect(f"ws://127.0.0.1:{port}/") as websocket:
-                await websocket.send(message)
-                assert await websocket.recv() == str(len(message.encode("utf-8")))
+            async with connect(f"ws://127.0.0.1:{port}/", max_size=None, compression=None) as websocket:
+                if case == "over_limit":
+                    # The server refuses with 1009, but a TCP reset can beat the close frame to the client.
+                    with pytest.raises(ConnectionClosed):
+                        await websocket.send(message)
+                        await websocket.recv()
+                else:
+                    await websocket.send(message)
+                    assert await websocket.recv() == str(len(message.encode("utf-8")))
     finally:
         server.should_exit = True
         try:
