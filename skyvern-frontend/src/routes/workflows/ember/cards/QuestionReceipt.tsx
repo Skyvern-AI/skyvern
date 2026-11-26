@@ -83,7 +83,7 @@ export function QuestionReceipt({
               className="size-3.5 shrink-0"
             />
           }
-          title={`Copilot asked ${count === 1 ? "a question" : `${count} questions`}`}
+          title={`Ember asked ${count === 1 ? "a question" : `${count} questions`}`}
         />
       </div>
     );

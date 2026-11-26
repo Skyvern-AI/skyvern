@@ -611,7 +611,7 @@ describe("EmberChat — credential receipt placement", () => {
     // The server sends no frame on timeout, so the deadline alone has to release the dock.
     await act(async () => vi.advanceTimersByTimeAsync(300_001));
     expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
-    expect(screen.queryByText("Copilot needs to sign in")).toBeNull();
+    expect(screen.queryByText("Ember needs to sign in")).toBeNull();
     expect(screen.getAllByText("Timed out").length).toBeGreaterThan(0);
     expect(useEmberHeaderStore.getState().attention).toBeNull();
   });
@@ -629,7 +629,7 @@ describe("EmberChat — credential receipt placement", () => {
     const precedes = (a: Node, b: Node) =>
       Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
     const tray = await screen.findByRole("group", { name: "Sign-in request" });
-    const marker = screen.getByText("Copilot needs to sign in");
+    const marker = screen.getByText("Ember needs to sign in");
     expect(
       precedes(
         document.querySelector('[data-activity-row-id="tc-1"]')!,
@@ -640,7 +640,7 @@ describe("EmberChat — credential receipt placement", () => {
     expect(
       precedes(
         tray,
-        screen.getByRole("group", { name: "Copilot message composer" }),
+        screen.getByRole("group", { name: "Ember message composer" }),
       ),
     ).toBe(true);
     expect(screen.getAllByRole("button", { name: "Skip for now" })).toEqual([
@@ -671,7 +671,7 @@ describe("EmberChat — credential receipt placement", () => {
     });
     expect(await screen.findByText("Credential 'HN Login' added")).toBeTruthy();
     expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
-    expect(screen.queryByText("Copilot needs to sign in")).toBeNull();
+    expect(screen.queryByText("Ember needs to sign in")).toBeNull();
     expect(useEmberHeaderStore.getState().attention).toBeNull();
   });
 
@@ -1717,7 +1717,7 @@ describe("EmberChat — credential card wiring", () => {
     });
     expect(
       screen.getByText(
-        "Copilot needs to sign in to https://news.ycombinator.com",
+        "Ember needs to sign in to https://news.ycombinator.com",
       ),
     ).toBeTruthy();
     expect(
@@ -2781,7 +2781,7 @@ describe("EmberChat — credential card wiring", () => {
       streamCalls[0]!.onMessage(terminalDeclinedResponse("turn-7"));
       streamCalls[0]!.resolve();
     });
-    expect(screen.queryByText(/Copilot needs to sign in to/)).toBeNull();
+    expect(screen.queryByText(/Ember needs to sign in to/)).toBeNull();
     expect(
       screen.queryByRole("button", { name: "Connect credential" }),
     ).toBeNull();
@@ -2796,9 +2796,7 @@ describe("EmberChat — credential card wiring", () => {
       streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
       streamCalls[0]!.resolve();
     });
-    expect(
-      screen.getByText(/Copilot needs to sign in to the site/),
-    ).toBeTruthy();
+    expect(screen.getByText(/Ember needs to sign in to the site/)).toBeTruthy();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
     });
@@ -3658,7 +3656,7 @@ describe("EmberChat — reload during a running turn", () => {
     });
     await advance(2_000);
     expect(
-      screen.getByText(/Copilot is still working on this turn/),
+      screen.getByText(/Ember is still working on this turn/),
     ).toBeTruthy();
     historyResponse.data = {
       ...historyResponse.data,
@@ -3666,7 +3664,7 @@ describe("EmberChat — reload during a running turn", () => {
     };
     await advance(5_000);
     expect(
-      screen.getByText(/canvas shows Copilot's latest draft and is read-only/),
+      screen.getByText(/canvas shows Ember's latest draft and is read-only/),
     ).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Reject" }));
     await advance(0);
@@ -3752,7 +3750,7 @@ describe("EmberChat — reload during a running turn", () => {
       cancelToken: stream.body.cancel_token!,
     };
   };
-  const followingCopy = /canvas shows Copilot's latest draft and is read-only/;
+  const followingCopy = /canvas shows Ember's latest draft and is read-only/;
 
   it.each([
     { staged: "no proposal", proposal: {} },

@@ -128,12 +128,12 @@ describe("TemplateInputsCard", () => {
   it.each([
     {
       hold: "a save hold",
-      reason: "Copilot is saving your accepted changes.",
+      reason: "Ember is saving your accepted changes.",
       set: (on: boolean) =>
         useWorkflowHasChangesStore
           .getState()
           .setSaveBlockedReason(
-            on ? "Copilot is saving your accepted changes." : null,
+            on ? "Ember is saving your accepted changes." : null,
           ),
     },
     {

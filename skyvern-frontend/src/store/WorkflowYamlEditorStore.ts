@@ -486,7 +486,7 @@ export function canInitializeWorkflow(workflowPermanentId: string): boolean {
 
 // Shown to the user and matched by AutoAcceptChip, so every thrower and the matcher share it.
 export const EMBER_CHANGE_PENDING_MESSAGE =
-  "Wait for the Copilot change to finish";
+  "Wait for the Ember change to finish";
 
 type StoredAccept = Pick<EmberAcceptSnapshot, "chatId" | "acceptAttempt"> & {
   alwaysAccept: boolean;

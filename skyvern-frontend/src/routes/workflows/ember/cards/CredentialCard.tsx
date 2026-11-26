@@ -183,7 +183,7 @@ export interface ManualSignInOffer {
 }
 
 const URL_MATCHED_UPDATE_WHY_LINE =
-  "Copilot chose this saved login because its saved URL matches this page. Updating it changes it everywhere it is used.";
+  "Ember chose this saved login because its saved URL matches this page. Updating it changes it everywhere it is used.";
 const SIGN_IN_WHY_LINE =
   "So it can sign in on your behalf when this workflow runs — stored encrypted, never shown in chat.";
 
@@ -709,7 +709,7 @@ function AskChrome({
           title={title}
           wrapTitle
           meta={countdown}
-          collapsedTitle="Copilot needs to sign in"
+          collapsedTitle="Ember needs to sign in"
           collapsedMeta={countdown}
           collapsed={tray.collapsed}
           onCollapsedChange={tray.onCollapsedChange}
@@ -761,7 +761,7 @@ export function CredentialAskMarker({ message }: { message?: string }) {
       <AskMessage message={message} />
       <AttentionMarker
         icon={<LockClosedIcon aria-hidden className="size-3.5 shrink-0" />}
-        title="Copilot needs to sign in"
+        title="Ember needs to sign in"
       />
     </div>
   );
@@ -817,7 +817,7 @@ function resolvedSiteCopy(outcome: CredentialPauseHistorical): {
       tone: "warn",
       title: `Saved ${siteB} on ${name}, not connected`,
       detail:
-        "The request ended before this login was connected. Ask Copilot again to use it.",
+        "The request ended before this login was connected. Ask Ember again to use it.",
     };
   }
   if (outcome.siteAnswer === "no") {
@@ -831,8 +831,7 @@ function resolvedSiteCopy(outcome: CredentialPauseHistorical): {
     return {
       tone: "warn",
       title: `Couldn't confirm ${siteB} was saved on ${name}`,
-      detail:
-        "Check the login on the Credentials page, then ask Copilot again.",
+      detail: "Check the login on the Credentials page, then ask Ember again.",
     };
   }
   return {
@@ -1484,7 +1483,7 @@ function CredentialAskCard({
       title={
         registration
           ? `Create a login for ${site}`
-          : `Copilot needs to sign in to ${site}`
+          : `Ember needs to sign in to ${site}`
       }
       countdown={
         countdownActive ? (
@@ -1505,7 +1504,7 @@ function CredentialAskCard({
                 key="named"
                 className="break-words text-[11px] font-medium leading-relaxed"
               >
-                You named this login ({namedCredential.credentialId}). Copilot
+                You named this login ({namedCredential.credentialId}). Ember
                 wants to use it on {site}. Check that is the right site before
                 you confirm.
               </span>,

@@ -28,10 +28,10 @@ export const EMBER_ATTENTION_LABEL: Record<EmberAttention, string> = {
 };
 
 export const EMBER_ATTENTION_DOT: Record<EmberAttention, string> = {
-  question: "Copilot needs your answer",
-  credential: "Copilot needs to sign in",
-  account: "Copilot needs an account",
-  demonstration: "Copilot is watching your demonstration",
+  question: "Ember needs your answer",
+  credential: "Ember needs to sign in",
+  account: "Ember needs an account",
+  demonstration: "Ember is watching your demonstration",
 };
 
 /**

@@ -73,7 +73,7 @@ beforeEach(() => {
 describe("StudioStageLauncher", () => {
   test("offers every pane as a labeled button", () => {
     renderAt();
-    for (const label of ["Copilot", "Editor", "Browser", "Past Runs"]) {
+    for (const label of ["Ember", "Editor", "Browser", "Past Runs"]) {
       expect(
         screen.getByRole("button", { name: new RegExp(`^${label}`) }),
       ).toBeTruthy();

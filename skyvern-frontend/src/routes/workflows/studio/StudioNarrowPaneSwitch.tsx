@@ -42,7 +42,7 @@ export function StudioNarrowPaneSwitch({
               activity
                 ? "Browser, new activity"
                 : awaiting
-                  ? `Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`
+                  ? `Ember, ${EMBER_ATTENTION_LABEL[awaiting]}`
                   : undefined
             }
             onClick={() => onShow(id)}
@@ -64,7 +64,7 @@ export function StudioNarrowPaneSwitch({
               ) : awaiting ? (
                 <StudioPaneAttentionDot
                   tone="waiting"
-                  title={`Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`}
+                  title={`Ember, ${EMBER_ATTENTION_LABEL[awaiting]}`}
                 />
               ) : null}
             </span>

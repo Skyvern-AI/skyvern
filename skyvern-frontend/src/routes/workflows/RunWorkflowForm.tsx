@@ -854,7 +854,7 @@ function RunWorkflowForm({
               >
                 Add a block
               </Link>{" "}
-              or ask Copilot to build the agent, then run it.
+              or ask Ember to build the agent, then run it.
             </AlertDescription>
           </Alert>
         )}

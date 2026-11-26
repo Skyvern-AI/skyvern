@@ -34,7 +34,7 @@ type StartFromCardsProps = {
 };
 
 const UPLOAD_SOP_HINT =
-  "Attach a procedure (PDF or Word .docx) for Copilot to build from";
+  "Attach a procedure (PDF or Word .docx) for Ember to build from";
 const RECORD_TASK_HINT =
   "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps";
 
@@ -108,7 +108,7 @@ function StartFromCards({
                   Demonstrate task
                 </span>
                 <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
-                  Show Copilot how in the browser
+                  Show Ember how in the browser
                 </span>
               </span>
             </button>

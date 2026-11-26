@@ -175,17 +175,17 @@ const GATE_STATUS: Record<
     variant: "warning",
     line: "Nothing was saved because this proposal changed. Review it before accepting.",
     lineWithoutProposal:
-      "This workflow changed, so your Accept didn't go through and the proposal is gone. Send Copilot a new message to propose it again.",
+      "This workflow changed, so your Accept didn't go through and the proposal is gone. Send Ember a new message to propose it again.",
   },
   recover: {
     label: "Confirming…",
     variant: "warning",
-    line: "This may have saved. Don't save the workflow until Copilot confirms.",
+    line: "This may have saved. Don't save the workflow until Ember confirms.",
   },
   saved: {
     label: "Saved, not shown",
     variant: "warning",
-    line: "Copilot saved this change, but the editor couldn't load it. Try again — this replaces what's on the canvas — or reload the page, which discards unsaved canvas edits.",
+    line: "Ember saved this change, but the editor couldn't load it. Try again — this replaces what's on the canvas — or reload the page, which discards unsaved canvas edits.",
   },
   reload: {
     label: "Couldn't reload",
@@ -718,7 +718,7 @@ export function ReviewGateCard({
           >
             Always accept
             <span className="text-[11px] leading-snug text-muted-foreground">
-              Apply Copilot&apos;s future changes in this chat without asking.
+              Apply Ember&apos;s future changes in this chat without asking.
             </span>
           </DropdownMenuItem>
         </DropdownMenuContent>

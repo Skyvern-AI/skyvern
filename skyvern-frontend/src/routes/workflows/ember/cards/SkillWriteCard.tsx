@@ -15,7 +15,7 @@ function effectText(review: SkillWriteReview): string {
     review.live_version === null
       ? "This is a new skill."
       : `It replaces version ${review.live_version}; earlier versions stay in its history.`;
-  return `Every later Copilot chat and agent step in this organization can use it. ${replaces}`;
+  return `Ember in every later chat, and every agent step in this organization, can use it. ${replaces}`;
 }
 
 export function SkillWriteReviewCard({
@@ -44,7 +44,7 @@ export function SkillWriteReviewCard({
       title={`${verb} the organization skill ${review.name}?`}
       titleId={titleId}
       wrapTitle
-      collapsedTitle={`Copilot is waiting on your answer about the skill ${review.name}`}
+      collapsedTitle={`Ember is waiting on your answer about the skill ${review.name}`}
       collapsed={collapsed}
       onCollapsedChange={onCollapsedChange}
       minimizeLabel="Minimize skill review"
@@ -108,7 +108,7 @@ export function SkillWriteReceipt({
               className="size-3.5 shrink-0"
             />
           }
-          title={`Copilot asked to ${saving ? "save" : "delete"} the organization skill ${review.name}`}
+          title={`Ember asked to ${saving ? "save" : "delete"} the organization skill ${review.name}`}
         />
       </div>
     );

@@ -99,7 +99,7 @@ interface WorkflowSaveOpts {
   status?: string;
 }
 
-const PROPOSAL_SAVE_MESSAGE = "Resolve the Copilot proposal before saving.";
+const PROPOSAL_SAVE_MESSAGE = "Resolve the Ember proposal before saving.";
 
 function assertWorkflowSaveAllowed(
   yamlCommit?: YamlCommitContext,

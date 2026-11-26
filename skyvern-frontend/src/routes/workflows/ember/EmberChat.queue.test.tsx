@@ -303,7 +303,7 @@ async function attachSpreadsheet(
 
 async function dropAttachments(...files: File[]) {
   const composer = screen.getByRole("group", {
-    name: "Copilot message composer",
+    name: "Ember message composer",
   });
   const dataTransfer = {
     files,
@@ -390,7 +390,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
   it("shows a stable file-drop affordance across nested drag events", async () => {
     await renderChat();
     const composer = screen.getByRole("group", {
-      name: "Copilot message composer",
+      name: "Ember message composer",
     });
     const dataTransfer = {
       files: [new File(["row_id,url\n"], "rows.csv")],
@@ -505,7 +505,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
   it("ignores dragged prose and other non-file payloads", async () => {
     await renderChat();
     const composer = screen.getByRole("group", {
-      name: "Copilot message composer",
+      name: "Ember message composer",
     });
     const dataTransfer = {
       files: [],
@@ -2133,7 +2133,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     await act(async () => {
       call.onMessage({
         type: "error",
-        error: "Copilot is not configured.",
+        error: "Ember is not configured.",
         turn_id: null,
       });
       call.resolve();
@@ -3170,7 +3170,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
     expect(
-      screen.getByText(/Copilot is checking whether this turn finished/),
+      screen.getByText(/Ember is checking whether this turn finished/),
     ).toBeTruthy();
   });
 
@@ -3198,7 +3198,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
           terminal: "error",
           terminalMessage:
             "Copilot hit an internal error before it could finish this turn.",
-          narrativeSummary: "Copilot hit an internal error.",
+          narrativeSummary: "Ember hit an internal error.",
           priorBlockCount: null,
           designActivity: [],
           startedAt: null,
@@ -3209,7 +3209,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     });
 
     expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
-    expect(screen.getByText("Copilot hit an internal error.")).toBeTruthy();
+    expect(screen.getByText("Ember hit an internal error.")).toBeTruthy();
     expect(screen.queryByText("Completed the run")).toBeNull();
   });
 
@@ -3678,7 +3678,7 @@ describe("EmberChat — a repeat of the turn's own message is not re-run", () =>
     if (!call) throw new Error("no pending stream to complete");
     await act(async () => {
       call.onMessage({
-        ...terminalResponse("Copilot hit an internal error."),
+        ...terminalResponse("Ember hit an internal error."),
         narrative_payload: {
           turnId: "turn-1",
           turnIndex: 0,
@@ -3688,8 +3688,8 @@ describe("EmberChat — a repeat of the turn's own message is not re-run", () =>
           draft: null,
           blocks: [],
           terminal: "error",
-          terminalMessage: "Copilot hit an internal error.",
-          narrativeSummary: "Copilot hit an internal error.",
+          terminalMessage: "Ember hit an internal error.",
+          narrativeSummary: "Ember hit an internal error.",
           priorBlockCount: null,
           designActivity: [],
           startedAt: null,
@@ -4309,7 +4309,7 @@ describe("EmberChat — send now delivers a queued message into the running turn
         ],
       });
     });
-    expect(screen.getByText("Sent while Copilot was working")).toBeTruthy();
+    expect(screen.getByText("Sent while Ember was working")).toBeTruthy();
 
     await completeOldestStream("Built it with the title.");
     await act(async () => {});

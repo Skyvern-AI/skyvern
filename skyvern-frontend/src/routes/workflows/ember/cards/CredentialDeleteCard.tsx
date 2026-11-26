@@ -36,7 +36,7 @@ function scopeText(review: CredentialDeleteReview): string {
   if (listed >= total) {
     return `This card lists all ${plural(total, "saved credential")} in your organization.`;
   }
-  return `This card lists ${listed} of your ${plural(total, "saved credential")}. The other ${total - listed} are not on it and stay saved. Ask Copilot for another card to delete the rest.`;
+  return `This card lists ${listed} of your ${plural(total, "saved credential")}. The other ${total - listed} are not on it and stay saved. Ask Ember for another card to delete the rest.`;
 }
 
 export function CredentialDeleteReviewCard({
@@ -92,7 +92,7 @@ export function CredentialDeleteReviewCard({
         deleting
           ? `Deleting ${plural(review.approved_credential_ids?.length ?? selected.length, "credential")}…`
           : canDelete
-            ? `Copilot is waiting on your answer about deleting ${plural(review.rows.length, "credential")}`
+            ? `Ember is waiting on your answer about deleting ${plural(review.rows.length, "credential")}`
             : askAdmin
       }
       collapsed={collapsed}
@@ -209,7 +209,7 @@ export function CredentialDeleteReceipt({
           title={
             review.claimed_at
               ? `Deleting ${plural(review.approved_credential_ids?.length ?? count, "credential")}…`
-              : `Copilot asked to delete ${plural(count, "saved credential")}`
+              : `Ember asked to delete ${plural(count, "saved credential")}`
           }
         />
       </div>

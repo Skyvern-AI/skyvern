@@ -333,7 +333,7 @@ describe("StudioShell with a pane folded for the Doc", () => {
     docFold.folded = ["ember"];
     renderDoc("editor,ember");
     expect(emberOnScreen()).toBe("false");
-    fireEvent.click(screen.getByRole("button", { name: /^Show Copilot pane/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Show Ember pane/ }));
     expect(emberOnScreen()).toBe("true");
   });
 
@@ -424,12 +424,12 @@ describe("StudioShell at phone width", () => {
 
   test("shows one pane at a time and the pane switch moves between them", () => {
     renderPhone();
-    expect(shown()).toEqual(["Copilot"]);
+    expect(shown()).toEqual(["Ember"]);
     expect(
       within(paneSwitch())
         .getAllByRole("button")
         .map((button) => button.textContent),
-    ).toEqual(["Copilot", "Editor", "Browser"]);
+    ).toEqual(["Ember", "Editor", "Browser"]);
 
     fireEvent.click(
       within(paneSwitch()).getByRole("button", { name: "Editor" }),
@@ -481,7 +481,7 @@ describe("StudioShell at phone width", () => {
       ).toBeTruthy();
       // Ember is the shown pane, so it carries no dot yet.
       expect(
-        within(paneSwitch()).getByRole("button", { name: "Copilot" }),
+        within(paneSwitch()).getByRole("button", { name: "Ember" }),
       ).toBeTruthy();
 
       fireEvent.click(
@@ -489,7 +489,7 @@ describe("StudioShell at phone width", () => {
       );
       expect(
         within(paneSwitch()).getByRole("button", {
-          name: "Copilot, waiting for your answer",
+          name: "Ember, waiting for your answer",
         }),
       ).toBeTruthy();
     } finally {
@@ -500,7 +500,7 @@ describe("StudioShell at phone width", () => {
 
   test("signing in yourself shows a Browser open behind another pane", () => {
     renderPhone("/workflows/wpid_synthetic/studio?panes=ember,browser");
-    expect(shown()).toEqual(["Copilot"]);
+    expect(shown()).toEqual(["Ember"]);
     try {
       act(() => {
         useManualSignInStore.setState({ browserSessionId: "pbs_synthetic" });
@@ -645,7 +645,7 @@ describe("StudioPane header", () => {
     const onToggleExpanded = vi.fn();
     const { pane } = renderPane({ onToggleExpanded });
     const expand = screen.getByRole("button", {
-      name: "Expand Copilot pane",
+      name: "Expand Ember pane",
     });
 
     expect(expand.getAttribute("aria-pressed")).toBe("false");
@@ -659,7 +659,7 @@ describe("StudioPane header", () => {
     const onToggleExpanded = vi.fn();
     const { pane } = renderPane({ expanded: true, onToggleExpanded });
     const restore = screen.getByRole("button", {
-      name: "Restore Copilot pane",
+      name: "Restore Ember pane",
     });
 
     expect(restore.getAttribute("aria-pressed")).toBe("true");
@@ -674,7 +674,7 @@ describe("StudioPane header", () => {
     const onToggleExpanded = vi.fn();
     renderPane({ expansionTransitioning: true, onToggleExpanded });
     const expand = screen.getByRole("button", {
-      name: "Expand Copilot pane",
+      name: "Expand Ember pane",
     });
 
     expect(expand.getAttribute("aria-disabled")).toBe("true");
@@ -789,7 +789,7 @@ describe("StudioPane header", () => {
     const { reorder, header } = renderPane();
 
     fireEvent.pointerDown(
-      screen.getByRole("button", { name: "Close Copilot pane" }),
+      screen.getByRole("button", { name: "Close Ember pane" }),
     );
     const notPrevented = fireEvent.dragStart(header, {
       dataTransfer: dataTransfer(),

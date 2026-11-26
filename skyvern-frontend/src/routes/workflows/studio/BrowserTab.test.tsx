@@ -628,7 +628,7 @@ describe("BrowserTab view machine", () => {
     expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
     expect(
       screen
-        .getByRole("button", { name: "Copilot browser" })
+        .getByRole("button", { name: "Ember browser" })
         .getAttribute("aria-pressed"),
     ).toBe("true");
   });

@@ -36,7 +36,7 @@ const asked: QuestionInteraction = {
 
 it("marks where a pending question was asked without repeating the tray's call to action", () => {
   render(<QuestionReceipt interaction={asked} />);
-  expect(screen.getByText("Copilot asked 2 questions")).toBeTruthy();
+  expect(screen.getByText("Ember asked 2 questions")).toBeTruthy();
   expect(screen.queryByText(/answer below/)).toBeNull();
   expect(screen.queryByRole("button")).toBeNull();
   expect(screen.queryByText("Which format?")).toBeNull();

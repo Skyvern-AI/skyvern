@@ -498,7 +498,7 @@ describe("EmberChat connected account choices", () => {
     expect(
       Boolean(
         screen
-          .getByText("Copilot needs an account")
+          .getByText("Ember needs an account")
           .compareDocumentPosition(tray) & Node.DOCUMENT_POSITION_FOLLOWING,
       ),
     ).toBe(true);

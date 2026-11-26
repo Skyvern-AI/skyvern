@@ -70,35 +70,35 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     kind: "user-code",
     title: "The block's code raised an error",
     guidance:
-      "The block's code stopped on an error it raised, so rerunning it unchanged fails the same way. Fix with Copilot reads this run and repairs the block.",
+      "The block's code stopped on an error it raised, so rerunning it unchanged fails the same way. Fix with Ember reads this run and repairs the block.",
     recovery: "fix",
   },
   insecure_code_detected: {
     kind: "user-code",
     title: "The code used a blocked operation",
     guidance:
-      "Code blocks run in a locked-down sandbox, and this operation is not allowed there. Fix with Copilot can replace the step with a supported Skyvern helper.",
+      "Code blocks run in a locked-down sandbox, and this operation is not allowed there. Fix with Ember can replace the step with a supported Skyvern helper.",
     recovery: "fix",
   },
   unsupported_page_operation: {
     kind: "user-code",
     title: "The code called an unsupported browser operation",
     guidance:
-      "Only the page operations Skyvern proxies into the sandbox are available. Fix with Copilot can switch the step to a supported page method or a browser block.",
+      "Only the page operations Skyvern proxies into the sandbox are available. Fix with Ember can switch the step to a supported page method or a browser block.",
     recovery: "fix",
   },
   unsupported_skyvern_helper: {
     kind: "user-code",
     title: "The code called an unsupported Skyvern helper",
     guidance:
-      "Only the helpers Skyvern proxies into the sandbox are available, and this one is not among them. Fix with Copilot can switch it to a supported helper.",
+      "Only the helpers Skyvern proxies into the sandbox are available, and this one is not among them. Fix with Ember can switch it to a supported helper.",
     recovery: "fix",
   },
   browser_operation_failed: {
     kind: "browser",
     title: "A browser operation failed",
     guidance:
-      "The page did not respond as the code expected — the site may be blocking the browser, or the element may not have loaded. Check this block's screenshot, then retry, or use Fix with Copilot if the page has changed.",
+      "The page did not respond as the code expected — the site may be blocking the browser, or the element may not have loaded. Check this block's screenshot, then retry, or use Fix with Ember if the page has changed.",
     recovery: "either",
   },
   browser_disconnected: {
@@ -112,28 +112,28 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     kind: "limit",
     title: "The code block ran out of time",
     guidance:
-      "It hit the code block time limit. Retry if the site was slow; Fix with Copilot can narrow what the block waits on or split the work across blocks.",
+      "It hit the code block time limit. Retry if the site was slow; Fix with Ember can narrow what the block waits on or split the work across blocks.",
     recovery: "either",
   },
   output_limit_exceeded: {
     kind: "limit",
     title: "The block returned too much data",
     guidance:
-      "The block returned more data than can be passed on. Fix with Copilot can trim it to the fields the next block needs.",
+      "The block returned more data than can be passed on. Fix with Ember can trim it to the fields the next block needs.",
     recovery: "fix",
   },
   result_limit_exceeded: {
     kind: "limit",
     title: "The block returned too much data",
     guidance:
-      "The block returned more data than can be passed on. Fix with Copilot can trim it to the fields the next block needs.",
+      "The block returned more data than can be passed on. Fix with Ember can trim it to the fields the next block needs.",
     recovery: "fix",
   },
   memory_limit_exceeded: {
     kind: "limit",
     title: "The block ran out of memory",
     guidance:
-      "The block's data did not fit in the sandbox's memory. Fix with Copilot can process it in smaller batches or return fewer fields.",
+      "The block's data did not fit in the sandbox's memory. Fix with Ember can process it in smaller batches or return fewer fields.",
     recovery: "fix",
   },
   parameter_reassembly_memory_limit_exceeded: {
@@ -174,14 +174,14 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     kind: "limit",
     title: "The block's inputs are too large to transfer",
     guidance:
-      "The block's inputs exceeded the maximum size that can be transferred to the sandbox. Fix with Copilot can have an earlier block pass in less data.",
+      "The block's inputs exceeded the maximum size that can be transferred to the sandbox. Fix with Ember can have an earlier block pass in less data.",
     recovery: "fix",
   },
   unspecified: {
     kind: "user-code",
     title: "The code block failed",
     guidance:
-      "The block's code stopped without a recognized cause. Retry it, or use Fix with Copilot to diagnose the run.",
+      "The block's code stopped without a recognized cause. Retry it, or use Fix with Ember to diagnose the run.",
     recovery: "either",
   },
 };
@@ -232,7 +232,7 @@ const REASON_ONLY_FAILURES: Array<{
       kind: "user-code",
       title: "The block raised an undeclared error code",
       guidance:
-        "ErrorCode() was raised with a code that is not in the workflow's error code mapping, so it could not be reported as a workflow error. Fix with Copilot can declare the code or raise one that is already declared.",
+        "ErrorCode() was raised with a code that is not in the workflow's error code mapping, so it could not be reported as a workflow error. Fix with Ember can declare the code or raise one that is already declared.",
       recovery: "fix",
     },
   },
@@ -336,21 +336,21 @@ const DENIAL_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     kind: "limit",
     title: "The block used too many browser operations",
     guidance:
-      "This block issued more browser operations in a single run than the per-run limit allows. Fix with Copilot can split the work across several runs or narrow what each run processes.",
+      "This block issued more browser operations in a single run than the per-run limit allows. Fix with Ember can split the work across several runs or narrow what each run processes.",
     recovery: "fix",
   },
   "codeblock.page_operation_broker.HandleLimitExceeded": {
     kind: "limit",
     title: "The block held too many browser objects",
     guidance:
-      "This block used more live browser objects in a single run than the per-run limit allows. Every query_selector or element_handle result, .all() on a filtered, get_by_* or frame-rooted locator, and each locator passed as an argument holds one object until it is released or the run ends. Fix with Copilot can move the block to locator chains that hold none, release each object as it goes, or split the work across several runs.",
+      "This block used more live browser objects in a single run than the per-run limit allows. Every query_selector or element_handle result, .all() on a filtered, get_by_* or frame-rooted locator, and each locator passed as an argument holds one object until it is released or the run ends. Fix with Ember can move the block to locator chains that hold none, release each object as it goes, or split the work across several runs.",
     recovery: "fix",
   },
   "codeblock.page_operation_broker.BlockedEgressError": {
     kind: "browser",
     title: "The block navigated to a blocked destination",
     guidance:
-      "Navigation is limited to reachable external web addresses; internal, unroutable, and non-web destinations are refused. Fix with Copilot can correct the URL this block navigates to.",
+      "Navigation is limited to reachable external web addresses; internal, unroutable, and non-web destinations are refused. Fix with Ember can correct the URL this block navigates to.",
     recovery: "fix",
   },
 };

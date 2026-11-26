@@ -1749,7 +1749,7 @@ describe("workflow save reservation", () => {
     const { result } = renderHook(() => useWorkflowSave(), { wrapper });
     await expect(
       act(async () => result.current.mutateAsync(undefined)),
-    ).rejects.toThrow("Wait for the Copilot change to finish");
+    ).rejects.toThrow("Wait for the Ember change to finish");
     expect(mocks.getClient).not.toHaveBeenCalled();
     expect(mocks.put).not.toHaveBeenCalled();
     expect(useWorkflowHasChangesStore.getState()).toMatchObject({
@@ -1929,7 +1929,7 @@ describe("workflow save reservation", () => {
         mocks.getClient.mockImplementationOnce(async () => {
           expect(beginEmberAcceptance()).toBeNull();
           // Revalidate even if a writer bypasses the transaction entry point.
-          reservation = Symbol("competing Copilot reservation");
+          reservation = Symbol("competing Ember reservation");
           useWorkflowYamlEditorStore.setState({
             emberAcceptance: reservation,
             lockKind: "ember",
@@ -1941,7 +1941,7 @@ describe("workflow save reservation", () => {
 
       await expect(
         act(async () => result.current.mutateAsync(undefined)),
-      ).rejects.toThrow("Wait for the Copilot change to finish");
+      ).rejects.toThrow("Wait for the Ember change to finish");
       expect(mocks.getClient).toHaveBeenCalledTimes(
         timing === "before save" ? 0 : 1,
       );
@@ -2245,7 +2245,7 @@ describe("blocked saves", () => {
     try {
       await act(async () => {
         await expect(result.current.mutateAsync(undefined)).rejects.toThrow(
-          "Resolve the Copilot proposal before saving.",
+          "Resolve the Ember proposal before saving.",
         );
       });
       expect(mocks.put).not.toHaveBeenCalled();

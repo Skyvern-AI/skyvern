@@ -24,7 +24,7 @@ describe("NarrativeView — transcript working line", () => {
     expect(screen.getAllByText("Working…")).toHaveLength(1);
     expect(screen.queryByText("· building your workflow")).toBeNull();
     expect(screen.getByRole("status").textContent).toContain(
-      "Copilot is working on your request…",
+      "Ember is working on your request…",
     );
   });
 });

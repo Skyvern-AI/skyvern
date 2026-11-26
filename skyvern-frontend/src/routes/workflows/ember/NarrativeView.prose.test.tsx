@@ -13,7 +13,7 @@ function terminalTurn(
   overrides: Partial<TurnNarrativeState> = {},
 ): TurnNarrativeState {
   const terminalMessage =
-    overrides.terminalMessage ?? "Copilot's terminal message.";
+    overrides.terminalMessage ?? "Ember's terminal message.";
   return {
     ...EMPTY_NARRATIVE,
     turnId: "turn-prose",

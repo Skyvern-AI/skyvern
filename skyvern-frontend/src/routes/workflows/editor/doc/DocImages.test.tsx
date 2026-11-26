@@ -894,7 +894,7 @@ describe("Doc screenshots", () => {
       await finish("file_copilot");
       expect(notify).not.toHaveBeenCalledWith(
         expect.objectContaining({
-          title: "Wait for the Copilot change to finish",
+          title: "Wait for the Ember change to finish",
         }),
       );
       act(() => useWorkflowYamlEditorStore.setState({ emberAcceptance: null }));
@@ -1458,8 +1458,8 @@ describe("Doc screenshots", () => {
   });
 
   test.each([
-    ["a Copilot acceptance"],
-    ["a pending Copilot proposal"],
+    ["an Ember acceptance"],
+    ["a pending Ember proposal"],
     ["a demonstration"],
   ])(
     "an upload that finishes while %s locks the Doc still lands, with no toast",

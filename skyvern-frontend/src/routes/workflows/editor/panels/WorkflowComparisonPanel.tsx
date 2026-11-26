@@ -446,11 +446,11 @@ function EmberReview({
       <div className="flex flex-shrink-0 flex-wrap items-center gap-x-6 gap-y-3 p-4">
         <div className="min-w-0">
           <div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
-            Copilot review
+            Ember review
           </div>
           <h2 className="truncate text-lg font-semibold">{version.title}</h2>
         </div>
-        <ReviewSummary diff={diff} lead="Copilot's changes" />
+        <ReviewSummary diff={diff} lead="Ember's changes" />
         <div className="ml-auto flex flex-wrap items-center gap-3">
           {targets.length > 0 && !diff.isNewWorkflow ? (
             <div className="flex items-center gap-1">

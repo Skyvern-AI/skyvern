@@ -54,7 +54,7 @@ vi.mock("./runview/RunView", () => ({
       ) : null}
       {props.onFix ? (
         <button type="button" onClick={() => props.onFix?.("checkout")}>
-          Fix with Copilot
+          Fix with Ember
         </button>
       ) : null}
     </div>
@@ -188,7 +188,7 @@ describe("RunTab Fix navigation", () => {
     render(<RouterProvider router={router} />);
     writes.length = 0;
     try {
-      fireEvent.click(screen.getByRole("button", { name: "Fix with Copilot" }));
+      fireEvent.click(screen.getByRole("button", { name: "Fix with Ember" }));
 
       expect(writes).toHaveLength(1);
       expect(writes[0]?.search).toBe("?wr=run_1&selected-block=checkout");

@@ -383,9 +383,9 @@ describe("EmberChat — a plan renders in the turn that wrote it", () => {
     const planRow = document.querySelector('[data-activity-row-id="p2"]')!;
     expect(precedes(planRow, revision)).toBe(true);
     expect(precedes(revision, summary)).toBe(true);
-    expect(
-      screen.getAllByRole("group", { name: "Copilot's plan" }),
-    ).toHaveLength(2);
+    expect(screen.getAllByRole("group", { name: "Ember's plan" })).toHaveLength(
+      2,
+    );
     // The first plan folded when the user answered it; its step shows only as the revision's removal.
     expect(screen.getAllByText("reach the payment step")).toHaveLength(1);
     expect(screen.getByText("Plan updated")).toBeTruthy();
@@ -433,7 +433,7 @@ describe("EmberChat — a plan renders in the turn that wrote it", () => {
     const row = (id: string) =>
       document.querySelector(`[data-activity-row-id="${id}"]`)!;
     const livePlan = await screen.findByRole("group", {
-      name: "Copilot's plan",
+      name: "Ember's plan",
     });
     expect(precedes(row("p1"), livePlan)).toBe(true);
     expect(precedes(livePlan, row("w1"))).toBe(true);
@@ -469,7 +469,7 @@ describe("EmberChat — a plan renders in the turn that wrote it", () => {
     });
     const summary = await screen.findByText("Saved a draft.");
     const [finalPlan, ...extra] = screen.getAllByRole("group", {
-      name: "Copilot's plan",
+      name: "Ember's plan",
     });
     expect(extra).toHaveLength(0);
     expect(precedes(finalPlan!, summary)).toBe(true);

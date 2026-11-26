@@ -109,7 +109,7 @@ describe("credential deletion card", () => {
       screen.getByText(/lists 2 of your 5 saved credentials/),
     ).toBeTruthy();
     expect(
-      screen.getByText(/Ask Copilot for another card to delete the rest/),
+      screen.getByText(/Ask Ember for another card to delete the rest/),
     ).toBeTruthy();
     expect(screen.getByText(/cannot be undone/)).toBeTruthy();
     fireEvent.click(screen.getByLabelText(/Billing/));

@@ -442,7 +442,7 @@ async function requestWithin<T>(
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
           controller.abort();
-          reject(new Error("Copilot request timed out"));
+          reject(new Error("Ember request timed out"));
         }, ACCEPT_SETTLE_CEILING_MS);
       }),
     ]);
@@ -512,7 +512,7 @@ const RECOVERY_POLL_SUPERSEDE_READS = 4;
 // Says only what is true: the composer stays enabled while this is showing, so
 // it must not claim a retry is being held back.
 const RECOVERY_IN_PROGRESS_MESSAGE =
-  "The connection dropped, so Copilot is checking whether this turn finished.";
+  "The connection dropped, so Ember is checking whether this turn finished.";
 const TEST_END_TO_END_PROMPT = "Test this workflow end to end.";
 const DEMONSTRATION_START_MESSAGE = "Showing you in the browser now.";
 const DEMONSTRATION_DONE_MESSAGE =
@@ -993,24 +993,24 @@ const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
   return null;
 };
 
-const ACCEPT_IN_FLIGHT_SAVE_REASON = "Copilot is saving your accepted changes.";
+const ACCEPT_IN_FLIGHT_SAVE_REASON = "Ember is saving your accepted changes.";
 
 const DETACHED_GATE_RECEIPT = "detached";
 
 const ACCEPT_SAVED_NOT_SHOWN_SAVE_REASON =
-  "Copilot saved this change but the editor couldn't load it, so saving now would write an older workflow over it.";
+  "Ember saved this change but the editor couldn't load it, so saving now would write an older workflow over it.";
 
 const ACCEPT_UNCONFIRMED_SAVE_REASON =
-  "Copilot couldn't confirm whether an Accept already saved. Use Try again on the review gate first.";
+  "Ember couldn't confirm whether an Accept already saved. Use Try again on the review gate first.";
 
 const WORKFLOW_CLAIMED_SAVE_REASON =
   "Another change to this workflow is being saved right now. Reload the page before saving, so you don't overwrite it \u2014 reloading discards unsaved canvas edits.";
 
 const PROPOSAL_CHANGED_SAVE_REASON =
-  "This workflow changed after Copilot staged its proposal, so this canvas may be out of date. Reload the page before saving, so you don't overwrite that change \u2014 reloading discards unsaved canvas edits.";
+  "This workflow changed after Ember staged its proposal, so this canvas may be out of date. Reload the page before saving, so you don't overwrite that change \u2014 reloading discards unsaved canvas edits.";
 
 const ACCEPT_STALE_CANVAS_SAVE_REASON =
-  "Copilot couldn't confirm an earlier Accept, so this canvas may be out of date. Saving it could overwrite newer changes \u2014 reload the page first, which discards unsaved canvas edits.";
+  "Ember couldn't confirm an earlier Accept, so this canvas may be out of date. Saving it could overwrite newer changes \u2014 reload the page first, which discards unsaved canvas edits.";
 const getLatestDiffCardTurnIdFromHistory = (
   messages: EmberChatHistoryMessage[],
 ): string | null => {
@@ -1667,7 +1667,7 @@ function DemonstrationOfferCard({
           />
         }
         wrapTitle
-        title="Show Copilot how in the browser"
+        title="Show Ember how in the browser"
       />
       <CardFooter className="flex items-center">
         <TooltipProvider>
@@ -1840,7 +1840,7 @@ export function EmberChat({
     row: EmberChatHistoryResponse;
   } | null>(null);
   const acceptHoldReason = startupPending
-    ? "Checking saved Copilot changes. Retry if the check fails."
+    ? "Checking saved Ember changes. Retry if the check fails."
     : isAccepting
       ? ACCEPT_IN_FLIGHT_SAVE_REASON
       : outstandingAccept
@@ -3987,7 +3987,7 @@ export function EmberChat({
         finish();
         logEmberRequestFailure(
           "recovery_poll_gave_up",
-          new Error("Copilot recovery polling gave up"),
+          new Error("Ember recovery polling gave up"),
           chatId,
         );
         setMessages((prev) =>
@@ -4097,7 +4097,7 @@ export function EmberChat({
               (requestId !== turnId ? requestId : undefined);
             if (!cancelToken) {
               toast({
-                title: "Could not cancel the Copilot turn",
+                title: "Could not cancel the Ember turn",
                 description:
                   "The saved turn has no cancellation token. Retry to check its status.",
                 variant: "destructive",
@@ -4130,8 +4130,8 @@ export function EmberChat({
                 });
                 logEmberRequestFailure("cancel", error, chatId);
                 toast({
-                  title: "Could not cancel the Copilot turn",
-                  description: "Copilot will keep checking for saved changes.",
+                  title: "Could not cancel the Ember turn",
+                  description: "Ember will keep checking for saved changes.",
                   variant: "destructive",
                 });
               } finally {
@@ -4921,7 +4921,7 @@ export function EmberChat({
         if (unanswered?.turn_id && !data.proposed_workflow) {
           pending = { turn_id: unanswered.turn_id };
           toast({
-            title: "Could not recover the Copilot turn controls",
+            title: "Could not recover the Ember turn controls",
             description:
               "The saved turn has no cancellation token. Retry to check its status.",
             variant: "destructive",
@@ -5776,7 +5776,7 @@ export function EmberChat({
             toast({
               title: "The draft could not be restored",
               description:
-                "The Copilot change was saved on the server. The saved workflow was loaded.",
+                "The Ember change was saved on the server. The saved workflow was loaded.",
               variant: "destructive",
             });
         }
@@ -5807,7 +5807,7 @@ export function EmberChat({
           pendingCanonicalRecovery.current === pending
         ) {
           toast({
-            title: "Could not check the saved Copilot change",
+            title: "Could not check the saved Ember change",
             description:
               "Your draft is retained. Reload to check the saved workflow before saving.",
             variant: "destructive",
@@ -5974,7 +5974,7 @@ export function EmberChat({
         toast({
           title: "Accept failed",
           description:
-            "Copilot could not verify the current proposal. Please try again.",
+            "Ember could not verify the current proposal. Please try again.",
           variant: "destructive",
         });
         return;
@@ -6778,10 +6778,10 @@ export function EmberChat({
       console.error("Failed to clear proposed workflow:", error);
       logEmberRequestFailure("proposal_sync", error, chatId);
       toast({
-        title: "Copilot update failed",
+        title: "Ember update failed",
         description: autoAcceptValue
           ? "Agent was applied, but auto-accept did not update."
-          : "Failed to clear copilot proposal. Please try again.",
+          : "Failed to clear the Ember proposal. Please try again.",
         variant: "destructive",
       });
       return false;
@@ -6847,7 +6847,7 @@ export function EmberChat({
         toast({
           title: "Review dismissed",
           description:
-            "Copilot is still working on this proposal. Its status is shown in the chat.",
+            "Ember is still working on this proposal. Its status is shown in the chat.",
         });
         return true;
       }
@@ -7294,7 +7294,7 @@ export function EmberChat({
         toast({
           variant: "destructive",
           title: "Couldn't send now",
-          description: "Your message is queued for when Copilot finishes.",
+          description: "Your message is queued for when Ember finishes.",
         });
       }
     }
@@ -7985,7 +7985,7 @@ export function EmberChat({
   if (trayCredentialKey) {
     attentionQueue.push({
       kind: "credential",
-      upNext: "Copilot needs to sign in",
+      upNext: "Ember needs to sign in",
     });
   }
   if (trayAccountChoice) {
@@ -8006,7 +8006,7 @@ export function EmberChat({
   if (isDemonstrating) {
     attentionQueue.push({
       kind: "demonstration",
-      upNext: "Show Copilot the task",
+      upNext: "Show Ember the task",
     });
   }
   const activeAttention = attentionQueue[0]?.kind ?? null;
@@ -8310,7 +8310,7 @@ export function EmberChat({
         ) {
           toast({
             title: "Add a message",
-            description: "Tell Copilot what to do with the attached file.",
+            description: "Tell Ember what to do with the attached file.",
           });
         }
         return false;
@@ -9727,7 +9727,7 @@ export function EmberChat({
         return;
       }
       if (hasPendingQuestion) {
-        toast({ title: "Answer Copilot's question first" });
+        toast({ title: "Answer Ember's question first" });
         noteDemonstrationStartFailed();
         return;
       }
@@ -10175,13 +10175,13 @@ export function EmberChat({
       toast({
         title: "Could not auto-send message",
         description: initialAction
-          ? "The copilot was not ready in time — click Fix with Copilot again."
-          : "The copilot was not ready in time — please retype your prompt.",
+          ? "Ember was not ready in time — click Fix with Ember again."
+          : "Ember was not ready in time — please retype your prompt.",
         variant: "destructive",
       });
       logEmberRequestFailure(
         "auto_send",
-        new Error("Copilot auto-send timed out"),
+        new Error("Ember auto-send timed out"),
       );
     }, AUTO_SEND_TIMEOUT_MS);
     return () => {
@@ -10612,14 +10612,14 @@ export function EmberChat({
         {recoveryControls.conflict
           ? "The saved workflow changed while you had local edits. Choose which changes to keep."
           : recoveryControls.cancelling
-            ? "Cancelling the Copilot turn. Checking for saved changes before restoring your draft."
+            ? "Cancelling the Ember turn. Checking for saved changes before restoring your draft."
             : recoveryControls.reload
-              ? "Could not confirm whether Copilot saved changes. Save is blocked. Retry or reload the saved workflow to check again."
+              ? "Could not confirm whether Ember saved changes. Save is blocked. Retry or reload the saved workflow to check again."
               : recoveryControls.followingDraft
                 ? recoveryControls.draftApplied
-                  ? "The canvas shows Copilot's latest draft and is read-only while the turn runs. Reject cancels the turn and restores your workflow."
-                  : "Copilot is still working on this turn. The canvas is read-only and updates when Copilot saves a draft. Reject cancels the turn and restores your workflow."
-                : "Copilot is checking for saved changes. Your draft is retained. Reject requests cancellation; changes already saved will be kept."}
+                  ? "The canvas shows Ember's latest draft and is read-only while the turn runs. Reject cancels the turn and restores your workflow."
+                  : "Ember is still working on this turn. The canvas is read-only and updates when Ember saves a draft. Reject cancels the turn and restores your workflow."
+                : "Ember is checking for saved changes. Your draft is retained. Reject requests cancellation; changes already saved will be kept."}
       </p>
       <div className="flex gap-2">
         {recoveryControls.conflict ? (
@@ -10666,7 +10666,7 @@ export function EmberChat({
                   content={
                     deletingCredentials
                       ? DELETION_STOP_BLOCKED_REASON
-                      : "Cancel the Copilot turn"
+                      : "Cancel the Ember turn"
                   }
                   blocked={deletingCredentials}
                 >
@@ -11066,9 +11066,9 @@ export function EmberChat({
     : isDemonstrating
       ? "A demonstration is already open"
       : hasPendingQuestion
-        ? "Answer Copilot's question first"
+        ? "Answer Ember's question first"
         : isLoading
-          ? "Wait for Copilot to finish"
+          ? "Wait for Ember to finish"
           : null;
   const content = (
     <div
@@ -11105,7 +11105,7 @@ export function EmberChat({
           {chromeless ? null : (
             <div className="flex items-center gap-2">
               <h3 className="text-sm font-semibold text-foreground">
-                {docked ? "Copilot" : "Agent Copilot (Beta)"}
+                {docked ? "Ember" : "Ember (Beta)"}
               </h3>
               {docked ? (
                 <span className="rounded bg-slate-elevation3 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -11494,7 +11494,7 @@ export function EmberChat({
                             This agent is no longer available
                           </div>
                           <div className="mt-1 text-xs text-muted-foreground">
-                            Copilot can&apos;t save or test changes to it. Open
+                            Ember can&apos;t save or test changes to it. Open
                             another agent or create a new one to continue.
                           </div>
                           <Button
@@ -11781,8 +11781,8 @@ export function EmberChat({
                 className="space-y-2 rounded-md border p-3 text-sm"
               >
                 <p>
-                  Could not check saved Copilot changes. Save and chat actions
-                  are paused.
+                  Could not check saved Ember changes. Save and chat actions are
+                  paused.
                 </p>
                 <Button
                   variant="outline"
@@ -12260,7 +12260,7 @@ export function EmberChat({
         ) : null}
         <div
           role="group"
-          aria-label="Copilot message composer"
+          aria-label="Ember message composer"
           onDragEnter={handleComposerDragEnter}
           onDragOver={handleComposerDragOver}
           onDragLeave={handleComposerDragLeave}
@@ -12500,7 +12500,7 @@ export function EmberChat({
                       <span className="block">Attach a file</span>
                       <span className="block text-xs text-muted-foreground">
                         {attachDisabledReason ??
-                          "A document, spreadsheet, or SOP for Copilot"}
+                          "A document, spreadsheet, or SOP for Ember"}
                       </span>
                     </span>
                   </DropdownMenuItem>
@@ -12516,7 +12516,7 @@ export function EmberChat({
                       <span className="block">Demonstrate task</span>
                       <span className="block text-xs text-muted-foreground">
                         {composerDemonstrateDisabledReason ??
-                          "Show Copilot how in the browser"}
+                          "Show Ember how in the browser"}
                       </span>
                     </span>
                   </DropdownMenuItem>

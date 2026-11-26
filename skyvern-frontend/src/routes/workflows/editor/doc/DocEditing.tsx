@@ -120,7 +120,7 @@ export function DocStepPicker({
   // cmdk highlights the first visible item, so a typed query lists this after the steps.
   // One or two letters would match only its keywords, so it waits for three.
   const demonstrate = onDemonstrate && (!query || query.length >= 3) && (
-    <CommandGroup heading="Copilot">
+    <CommandGroup heading="Ember">
       <CommandItem
         value="Demonstrate task"
         keywords={["demonstrate", "record", "teach"]}
@@ -133,7 +133,7 @@ export function DocStepPicker({
         <span className="min-w-0">
           <span className="block text-sm leading-tight">Demonstrate task</span>
           <span className="block text-xs leading-tight text-muted-foreground">
-            Show Copilot how in the browser
+            Show Ember how in the browser
           </span>
         </span>
       </CommandItem>

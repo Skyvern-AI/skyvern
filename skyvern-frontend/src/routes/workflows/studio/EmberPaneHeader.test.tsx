@@ -24,7 +24,7 @@ function registerControls(navigationLockedReason: string | null) {
 
 describe("EmberPaneControls", () => {
   it("names a locked control by its action and gives its reason as a description a keyboard reaches", async () => {
-    const reason = "Copilot couldn't confirm whether an Accept already saved.";
+    const reason = "Ember couldn't confirm whether an Accept already saved.";
     registerControls(reason);
     render(
       <TooltipProvider>
@@ -57,8 +57,8 @@ describe("Ember pane waiting signal", () => {
     useEmberHeaderStore.setState({ attention: "question" });
     render(<EmberActiveDot />);
 
-    const dot = screen.getByRole("img", { name: "Copilot needs your answer" });
-    expect(dot.getAttribute("title")).toBe("Copilot needs your answer");
+    const dot = screen.getByRole("img", { name: "Ember needs your answer" });
+    expect(dot.getAttribute("title")).toBe("Ember needs your answer");
     expect(dot.className).toContain("bg-amber-500");
     expect(
       screen.queryByText(/needs your answer/i, {
@@ -68,7 +68,7 @@ describe("Ember pane waiting signal", () => {
 
     act(() => useEmberHeaderStore.setState({ attention: null }));
     expect(
-      screen.getByRole("img", { name: "Copilot session active" }).className,
+      screen.getByRole("img", { name: "Ember session active" }).className,
     ).toContain("bg-success");
   });
 });

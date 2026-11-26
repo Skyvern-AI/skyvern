@@ -73,7 +73,7 @@ export function EditorOverflowMenu({
   const proposalPending = useEmberProposalStore((s) => s.proposal !== null);
   // Saving here would make a staged Ember proposal durable without Accept.
   const templateSaveReason = proposalPending
-    ? "Resolve the Copilot proposal before saving."
+    ? "Resolve the Ember proposal before saving."
     : (saveBlockedReason ?? saveLockReason);
   const templateReasonId = useId();
   const requestTour = useProductTourStore((s) => s.requestTour);

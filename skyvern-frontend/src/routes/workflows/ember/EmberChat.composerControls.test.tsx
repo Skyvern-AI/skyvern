@@ -428,7 +428,7 @@ describe("EmberChat — unflagged S4 composer", () => {
     ).toBe(true);
     expect(
       screen.queryByText(
-        "Copilot is working. Your next send will wait for the next turn.",
+        "Ember is working. Your next send will wait for the next turn.",
       ),
     ).toBeNull();
   });
@@ -544,7 +544,7 @@ describe("EmberChat — unflagged S4 composer", () => {
     const ta = textarea();
 
     expect(ta.getAttribute("placeholder")).toBe(
-      "Ask Copilot to build or change your workflow…",
+      "Ask Ember to build or change your workflow…",
     );
     // Border + focus ring moved off the textarea onto the wrapping container.
     expect(ta.className).not.toContain("border-input");

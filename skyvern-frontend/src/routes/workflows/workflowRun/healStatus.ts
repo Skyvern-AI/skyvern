@@ -54,7 +54,7 @@ const healSkipReasonLabels: Record<string, string> = {
   unclassifiable: "Unclassified",
   user_defined_error: "Error raised by the block",
   proxy_transport: "Proxy connection failed",
-  authoring_run: "Off in Copilot and editor test runs",
+  authoring_run: "Off in Ember and editor test runs",
 };
 
 function healSkipReasonLabel(reason: string | null): string {

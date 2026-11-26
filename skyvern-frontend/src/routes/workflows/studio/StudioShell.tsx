@@ -487,7 +487,7 @@ function CollapsedPaneStrip({
             ) : awaiting ? (
               <StudioPaneAttentionDot
                 tone="waiting"
-                title={`Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`}
+                title={`Ember, ${EMBER_ATTENTION_LABEL[awaiting]}`}
               />
             ) : null}
           </span>
