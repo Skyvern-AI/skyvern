@@ -123,6 +123,7 @@ from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
     profile_writer_options,
 )
 from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import (
     ResponseComparison,
@@ -6176,7 +6177,7 @@ class WorkflowService:
         snapshot = None
         try:
             storage = app.STORAGE
-            if isinstance(storage, S3Storage):
+            if isinstance(storage, (S3Storage, AzureStorage, GcsStorage, LocalStorage)):
                 # The seed is published to a new managed profile, never to the legacy source key.
                 snapshot = await storage.retrieve_browser_session_snapshot(
                     organization_id, storage_key, allow_sealed_fallback=True
@@ -6230,7 +6231,9 @@ class WorkflowService:
             return False
         finally:
             if snapshot is not None and (
-                snapshot.encrypted or snapshot.legacy_local_copy or settings.SKYVERN_ENCRYPT_BROWSER_PROFILES
+                snapshot.encrypted
+                or snapshot.legacy_local_copy
+                or (not isinstance(storage, LocalStorage) and settings.SKYVERN_ENCRYPT_BROWSER_PROFILES)
             ):
                 discard_temp_working_dir(snapshot.directory)
         LOG.info(

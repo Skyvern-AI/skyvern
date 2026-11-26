@@ -353,7 +353,7 @@ class LocalStorage(BaseStorage):
         return snapshot.directory if snapshot is not None else None
 
     async def retrieve_browser_session_snapshot(
-        self, organization_id: str, workflow_permanent_id: str
+        self, organization_id: str, workflow_permanent_id: str, *, allow_sealed_fallback: bool = False
     ) -> BrowserProfileSnapshot | None:
         stored = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
         if stored is None:
@@ -366,6 +366,7 @@ class LocalStorage(BaseStorage):
             workflow_permanent_id,
             copy=False,
             purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+            allow_sealed_fallback=allow_sealed_fallback,
         )
 
     async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
@@ -549,15 +550,55 @@ class LocalStorage(BaseStorage):
         )
 
     async def _retrieve_local_archive(
-        self, stored: Path, sealed: Path, organization_id: str, profile_id: str, *, copy: bool, purpose: str
+        self,
+        stored: Path,
+        sealed: Path,
+        organization_id: str,
+        profile_id: str,
+        *,
+        copy: bool,
+        purpose: str,
+        allow_sealed_fallback: bool = False,
     ) -> BrowserProfileSnapshot | None:
-        if (sealed_stat := self._profile_stat(sealed)) is None:
+        async def restore_seal(sealed_stat: os.stat_result) -> BrowserProfileSnapshot:
+            if not stat.S_ISREG(sealed_stat.st_mode):
+                raise OSError("Invalid encrypted browser profile file")
+            version = self._sealed_stat_etag(sealed_stat)
+            snapshot = await restore_profile_archive(
+                sealed, organization_id, profile_id, encrypted=True, purpose=purpose
+            )
+            try:
+                return replace(snapshot, version=version) if self._sealed_profile_etag(sealed) == version else snapshot
+            except BaseException:
+                shutil.rmtree(snapshot.directory, ignore_errors=True)
+                raise
+
+        sealed_error_type: str | None = None
+
+        async def observe_seal() -> os.stat_result | BrowserProfileSnapshot | None:
+            # Strict readers select by stat. A seeder must validate the seal while plaintext is still available.
+            if not allow_sealed_fallback:
+                return self._profile_stat(sealed)
+            nonlocal sealed_error_type
+            try:
+                sealed_stat = self._profile_stat(sealed)
+                return await restore_seal(sealed_stat) if sealed_stat is not None else None
+            except Exception as exc:
+                sealed_error_type = type(exc).__name__
+                return None
+
+        def use_plaintext(snapshot: BrowserProfileSnapshot | None) -> BrowserProfileSnapshot | None:
+            if sealed_error_type is not None:
+                LOG.warning("Falling back to legacy workflow profile directory", error_type=sealed_error_type)
+            return snapshot
+
+        if (seal := await observe_seal()) is None:
             legacy_stat = self._profile_stat(stored)
-            if (sealed_stat := self._profile_stat(sealed)) is None and legacy_stat is not None:
+            if (seal := await observe_seal()) is None and legacy_stat is not None:
                 if not stat.S_ISDIR(legacy_stat.st_mode):
                     raise NotADirectoryError(stored)
                 if not copy and not settings.SKYVERN_ENCRYPT_BROWSER_PROFILES:
-                    return BrowserProfileSnapshot(str(stored))
+                    return use_plaintext(BrowserProfileSnapshot(str(stored)))
                 with ExitStack() as abandoned:
                     working_copy = make_run_temp_directory(prefix="skyvern_browser_profile_")
                     abandoned.callback(shutil.rmtree, working_copy, ignore_errors=True)
@@ -566,23 +607,15 @@ class LocalStorage(BaseStorage):
                             self._copy_directory_best_effort, stored, Path(working_copy), private_copy=True
                         )
                     except FileNotFoundError:
-                        if (sealed_stat := self._profile_stat(sealed)) is None:
+                        if (seal := await observe_seal()) is None:
                             raise
                     else:
-                        if (sealed_stat := self._profile_stat(sealed)) is None:
+                        if (seal := await observe_seal()) is None:
                             abandoned.pop_all()
-                            return BrowserProfileSnapshot(working_copy, legacy_local_copy=True)
-        if sealed_stat is None:
-            return None
-        if not stat.S_ISREG(sealed_stat.st_mode):
-            raise OSError("Invalid encrypted browser profile file")
-        version = self._sealed_stat_etag(sealed_stat)
-        snapshot = await restore_profile_archive(sealed, organization_id, profile_id, encrypted=True, purpose=purpose)
-        try:
-            return replace(snapshot, version=version) if self._sealed_profile_etag(sealed) == version else snapshot
-        except BaseException:
-            shutil.rmtree(snapshot.directory, ignore_errors=True)
-            raise
+                            return use_plaintext(BrowserProfileSnapshot(working_copy, legacy_local_copy=True))
+        if isinstance(seal, os.stat_result):
+            return await restore_seal(seal)
+        return seal if seal is not None else use_plaintext(None)
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         snapshot = await self.retrieve_browser_profile_snapshot(organization_id, profile_id)
