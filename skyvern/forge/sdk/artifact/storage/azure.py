@@ -39,6 +39,7 @@ from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
     WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
     find_profile_object,
     profile_archive_uris,
+    profile_writer_options,
     retrieve_remote_profile,
     store_remote_profile,
     workflow_session_archive_uris,
@@ -268,6 +269,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
         *,
         require_encryption: bool = False,
         strict_traversal: bool = False,
+        source_browser_type: str | None = None,
     ) -> None:
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
@@ -282,6 +284,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
             require_encryption=require_encryption,
             strict_traversal=strict_traversal,
             purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+            **profile_writer_options(source_browser_type),
         )
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
@@ -318,6 +321,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
         require_encryption: bool = False,
         confirm_creation: bool = False,
         strict_traversal: bool = False,
+        source_browser_type: str | None = None,
     ) -> None:
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
@@ -332,6 +336,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
             delete=self.async_client.delete_file,
             require_encryption=require_encryption,
             strict_traversal=strict_traversal,
+            **profile_writer_options(source_browser_type),
             confirm_creation=confirm_creation,
         )
 

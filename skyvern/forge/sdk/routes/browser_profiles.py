@@ -3,7 +3,7 @@ import secrets
 import shutil
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path as FilePath
@@ -22,7 +22,12 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import discard_temp_working_dir, make_temp_directory
-from skyvern.forge.sdk.artifact.storage.browser_profile_archive import ProfilePublicationConflict, settle_profile_io
+from skyvern.forge.sdk.artifact.storage.base import BaseStorage
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
+    ProfilePublicationConflict,
+    profile_writer_options,
+    settle_profile_io,
+)
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.credential_site_policy import same_release_scope
 from skyvern.forge.sdk.routes.code_samples import (
@@ -1326,6 +1331,56 @@ async def _create_profile_from_session_locked(
     return profile
 
 
+async def _recover_failed_workflow_profile_store(
+    *,
+    organization_id: str,
+    profile_id: str,
+    workflow_run_id: str,
+    browser_session_id: str | None,
+    failure: BaseException,
+) -> None:
+    disposition = "publication_conflict"
+    try:
+        if not isinstance(failure, ProfilePublicationConflict) and not isinstance(
+            failure.__cause__, ProfilePublicationConflict
+        ):
+            disposition = "archive_status_unknown"
+            storage = app.STORAGE
+            # The base fallback retrieves content and cannot confirm that the destination is absent.
+            if type(storage).browser_profile_exists is not BaseStorage.browser_profile_exists:
+                exists = await storage.browser_profile_exists(organization_id=organization_id, profile_id=profile_id)
+                if exists is False:
+                    # Absence holds at the time of the probe. Recovery never deletes storage keys.
+                    disposition = "metadata_cleanup_unconfirmed"
+                    removed = await app.DATABASE.browser_sessions.delete_unwritten_workflow_browser_profile(
+                        profile_id=profile_id,
+                        organization_id=organization_id,
+                        source_workflow_run_id=workflow_run_id,
+                        source_browser_session_id=browser_session_id,
+                    )
+                    disposition = "removed_empty_row" if removed else "row_changed_or_deleted"
+                elif exists is True:
+                    disposition = "archive_present"
+    except (Exception, asyncio.CancelledError):
+        LOG.warning(
+            "Could not recover after workflow profile storage failure",
+            organization_id=organization_id,
+            browser_profile_id=profile_id,
+            workflow_run_id=workflow_run_id,
+            cleanup=disposition,
+            exc_info=True,
+        )
+    else:
+        LOG.warning(
+            "Workflow profile storage failed",
+            organization_id=organization_id,
+            browser_profile_id=profile_id,
+            workflow_run_id=workflow_run_id,
+            cleanup=disposition,
+            failure_type=type(failure).__name__,
+        )
+
+
 async def _create_profile_from_workflow_run(
     *,
     organization_id: str,
@@ -1411,9 +1466,12 @@ async def _create_profile_from_workflow_run(
             detail="Workflow run does not have a persisted session",
         )
 
+    writer = profile_writer_options(snapshot.source_browser_type)
     try:
+        browser_sessions = app.DATABASE.browser_sessions
+        # Commit the source-linked NULL row and release the connection before storing the archive.
         try:
-            profile = await app.DATABASE.browser_sessions.create_browser_profile(
+            profile = await browser_sessions.create_browser_profile(
                 organization_id=organization_id,
                 name=name,
                 description=description,
@@ -1426,34 +1484,78 @@ async def _create_profile_from_workflow_run(
         except IntegrityError as exc:
             _handle_duplicate_profile_name(organization_id=organization_id, name=name, exc=exc)
 
-        try:
-            await app.STORAGE.store_browser_profile(
-                organization_id=organization_id,
-                profile_id=profile.browser_profile_id,
-                directory=snapshot.directory,
-                require_encryption=snapshot.encrypted,
-            )
-            LOG.info(
-                "Created browser profile from workflow run",
-                organization_id=organization_id,
-                browser_profile_id=profile.browser_profile_id,
-                workflow_run_id=workflow_run_id,
-            )
-        except (Exception, asyncio.CancelledError) as exc:
-            rolled_back = await settle_profile_io(
-                _hard_delete_created_profile_after_store_failure(
-                    organization_id=organization_id, browser_profile_id=profile.browser_profile_id, failure=exc
+        if writer:
+            try:
+                await app.STORAGE.store_browser_profile(
+                    organization_id=organization_id,
+                    profile_id=profile.browser_profile_id,
+                    directory=snapshot.directory,
+                    require_encryption=snapshot.encrypted,
+                    confirm_creation=True,
+                    **writer,
                 )
-            )
-            LOG.error(
-                "Failed to store browser profile artifacts",
-                organization_id=organization_id,
-                browser_profile_id=profile.browser_profile_id,
-                workflow_run_id=workflow_run_id,
-                rolled_back=rolled_back,
-                exc_info=True,
-            )
-            raise
+            except (Exception, asyncio.CancelledError) as exc:
+                # Concrete storage adapters settle owned archive I/O before returning or raising.
+                with suppress(asyncio.CancelledError):
+                    await settle_profile_io(
+                        _recover_failed_workflow_profile_store(
+                            organization_id=organization_id,
+                            profile_id=profile.browser_profile_id,
+                            workflow_run_id=workflow_run_id,
+                            browser_session_id=run_session_id,
+                            failure=exc,
+                        )
+                    )
+                raise
+
+            try:
+                profile = await settle_profile_io(
+                    browser_sessions.commit_created_browser_profile_writer(
+                        profile_id=profile.browser_profile_id,
+                        organization_id=organization_id,
+                        source_browser_type=writer["source_browser_type"],
+                        source_workflow_run_id=workflow_run_id,
+                        source_browser_session_id=run_session_id,
+                    )
+                )
+            except (Exception, asyncio.CancelledError):
+                LOG.warning(
+                    "Could not confirm workflow profile writer update",
+                    organization_id=organization_id,
+                    browser_profile_id=profile.browser_profile_id,
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+                raise
+        else:
+            try:
+                await app.STORAGE.store_browser_profile(
+                    organization_id=organization_id,
+                    profile_id=profile.browser_profile_id,
+                    directory=snapshot.directory,
+                    require_encryption=snapshot.encrypted,
+                )
+            except (Exception, asyncio.CancelledError) as exc:
+                rolled_back = await settle_profile_io(
+                    _hard_delete_created_profile_after_store_failure(
+                        organization_id=organization_id, browser_profile_id=profile.browser_profile_id, failure=exc
+                    )
+                )
+                LOG.error(
+                    "Failed to store browser profile artifacts",
+                    organization_id=organization_id,
+                    browser_profile_id=profile.browser_profile_id,
+                    workflow_run_id=workflow_run_id,
+                    rolled_back=rolled_back,
+                    exc_info=True,
+                )
+                raise
+        LOG.info(
+            "Created browser profile from workflow run",
+            organization_id=organization_id,
+            browser_profile_id=profile.browser_profile_id,
+            workflow_run_id=workflow_run_id,
+        )
     finally:
         discard_temp_working_dir(snapshot.directory)
 

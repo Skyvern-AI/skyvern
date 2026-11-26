@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import io
 import os
 import shutil
@@ -12,7 +13,7 @@ import zipfile
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol, TypedDict, TypeVar
 
 import structlog
 from aiohttp import ClientConnectionError, ClientSSLError
@@ -40,6 +41,21 @@ TRANSIENT_PROFILE_FILES = {"RunningChromeVersion", "SingletonLock", "SingletonSo
 _T = TypeVar("_T")
 _LEGACY_ZIP_HEADERS = (b"PK\x03\x04", b"PK\x05\x06")
 _SEAL_STATUS_TIMEOUT_SECONDS = 5
+_WRITER_COMMENTS = {
+    writer: f"skyvern:browser-profile-writer:v1:{writer}".encode("ascii")
+    for writer in ("chrome", "msedge", "stealth-chromium")
+}
+_COMMENT_WRITERS = {comment: writer for writer, comment in _WRITER_COMMENTS.items()}
+
+
+class ProfileWriterOptions(TypedDict, total=False):
+    source_browser_type: str
+
+
+def profile_writer_options(source_browser_type: str | None) -> ProfileWriterOptions:
+    if isinstance(source_browser_type, str) and source_browser_type in _WRITER_COMMENTS:
+        return {"source_browser_type": source_browser_type}
+    return {}
 
 
 class ProfilePublicationConflict(RuntimeError):
@@ -113,18 +129,29 @@ def _tree_size(directory: str) -> tuple[int, int]:
 
 
 def write_profile_archive(
-    directory: str, zip_file_path: str, *, strict_traversal: bool | None = False, **log_context: Any
+    directory: str,
+    zip_file_path: str,
+    *,
+    strict_traversal: bool | None = False,
+    source_browser_type: str | None = None,
+    **log_context: Any,
 ) -> int:
     if not Path(directory).is_dir():
         raise NotADirectoryError(directory)
 
-    def raise_traversal_error(error: OSError) -> None:
-        raise error
+    writer_comment = _WRITER_COMMENTS.get(source_browser_type or "")
+    complete = True
+
+    def traversal_error(error: OSError) -> None:
+        nonlocal complete
+        if strict_traversal is not False:
+            raise error
+        complete = False
 
     archived_files = archived_bytes = excluded_files = excluded_bytes = 0
     with zipfile.ZipFile(zip_file_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for dirpath, dirnames, filenames in os.walk(
-            directory, onerror=raise_traversal_error if strict_traversal is not False else None
+            directory, onerror=traversal_error if strict_traversal is not False or writer_comment else None
         ):
             relative_dir = os.path.relpath(dirpath, directory)
             kept_dirnames = []
@@ -142,19 +169,31 @@ def write_profile_archive(
                 if strict_traversal is None and name in TRANSIENT_PROFILE_FILES:
                     continue
                 path = os.path.join(dirpath, name)
-                if strict_traversal is not False:
+                if strict_traversal is not False or writer_comment:
                     try:
-                        is_regular_file = stat.S_ISREG(os.stat(path, follow_symlinks=False).st_mode)
+                        mode = os.stat(path, follow_symlinks=False).st_mode
                     except OSError as exc:
-                        if strict_traversal is None and isinstance(exc, FileNotFoundError):
+                        if strict_traversal is False or (
+                            strict_traversal is None and isinstance(exc, FileNotFoundError)
+                        ):
+                            complete = False
                             continue
                         raise
+                    if stat.S_ISDIR(mode):
+                        # os.walk treats an is_dir() error as a file entry.
+                        if strict_traversal is True:
+                            raise IsADirectoryError(errno.EISDIR, "Browser profile directory was not traversed", path)
+                        complete = False
+                        continue
+                    is_regular_file = stat.S_ISREG(mode)
                 else:
                     is_regular_file = os.path.isfile(path) and not os.path.islink(path)
                 if is_regular_file:
                     archive.write(path, os.path.normpath(os.path.join(relative_dir, name)))
                     archived_files += 1
                     archived_bytes += archive.filelist[-1].file_size
+        if writer_comment and complete and archived_files:
+            archive.comment = writer_comment
     LOG.info(
         "Archived browser profile",
         archived_files=archived_files,
@@ -178,6 +217,7 @@ def stage_profile_archive(
     strict_traversal: bool | None = None,
     confirm_creation: bool = False,
     purpose: str = PROFILE_ENCRYPTION_PURPOSE,
+    source_browser_type: str | None = None,
 ) -> Path:
     zip_path = staging_dir / "profile.zip"
     if encrypted and strict_traversal is False:
@@ -188,6 +228,7 @@ def stage_profile_archive(
         strict_traversal=True if confirm_creation else strict_traversal,
         organization_id=organization_id,
         profile_id=profile_id,
+        **profile_writer_options(source_browser_type),
     )
     if confirm_creation and not archived_files:
         raise ValueError("Cannot create a credential profile from an empty capture")
@@ -209,10 +250,11 @@ def extract_profile_zip(archive: zipfile.ZipFile, destination: str) -> None:
     archive.extractall(destination, [info for info in members if not is_regenerated_profile_path(info.filename)])
 
 
-def _extract_zip(source: bytes | Path, destination: str, **log_context: Any) -> None:
+def _extract_zip(source: bytes | Path, destination: str, **log_context: Any) -> str | None:
     with zipfile.ZipFile(io.BytesIO(source) if isinstance(source, bytes) else source) as archive:
         extract_profile_zip(archive, destination)
         files = [info for info in archive.infolist() if not info.is_dir()]
+        source_browser_type = _COMMENT_WRITERS.get(archive.comment)
     skipped = [info for info in files if is_regenerated_profile_path(info.filename)]
     skipped_bytes = sum(info.file_size for info in skipped)
     LOG.info(
@@ -224,16 +266,16 @@ def _extract_zip(source: bytes | Path, destination: str, **log_context: Any) -> 
         skipped_bytes=skipped_bytes,
         **log_context,
     )
+    return source_browser_type if len(files) > len(skipped) else None
 
 
 def _extract_profile(
     source: bytes | Path, destination: str, organization_id: str, profile_id: str, *, encrypted: bool, purpose: str
-) -> None:
+) -> str | None:
     if not encrypted:
         if isinstance(source, bytes) and not source.startswith(_LEGACY_ZIP_HEADERS):
             raise zipfile.BadZipFile("Invalid browser profile archive header")
-        _extract_zip(source, destination, organization_id=organization_id, profile_id=profile_id)
-        return
+        return _extract_zip(source, destination, organization_id=organization_id, profile_id=profile_id)
 
     with profile_archive_staging_dir() as temp_dir:
         if isinstance(source, bytes):
@@ -248,7 +290,7 @@ def _extract_profile(
             purpose=purpose,
             object_id=profile_id,
         )
-        _extract_zip(zip_path, destination, organization_id=organization_id, profile_id=profile_id)
+        return _extract_zip(zip_path, destination, organization_id=organization_id, profile_id=profile_id)
 
 
 async def restore_profile_archive(
@@ -268,13 +310,13 @@ async def restore_profile_archive(
         else tempfile.mkdtemp(prefix=prefix, dir=parent_dir)
     )
     try:
-        await run_profile_io(
+        source_browser_type = await run_profile_io(
             _extract_profile, source, destination, organization_id, profile_id, encrypted=encrypted, purpose=purpose
         )
     except BaseException:
         shutil.rmtree(destination, ignore_errors=True)
         raise
-    return BrowserProfileSnapshot(destination, encrypted, version=version)
+    return BrowserProfileSnapshot(destination, encrypted, version=version, source_browser_type=source_browser_type)
 
 
 async def find_profile_object(
@@ -420,6 +462,7 @@ async def store_remote_profile(
     confirm_creation: bool = False,
     strict_traversal: bool = False,
     purpose: str = PROFILE_ENCRYPTION_PURPOSE,
+    source_browser_type: str | None = None,
 ) -> None:
     uri, sealed_uri = uris
     encrypted = should_encrypt_profile(protected_input=require_encryption) or should_encrypt_profile(
@@ -436,6 +479,7 @@ async def store_remote_profile(
             confirm_creation=confirm_creation,
             strict_traversal=strict_traversal,
             purpose=purpose,
+            **profile_writer_options(source_browser_type),
         )
 
         async def publish() -> None:

@@ -44,6 +44,7 @@ from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
     WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
     ProfilePublicationConflict,
     profile_archive_staging_dir,
+    profile_writer_options,
     restore_profile_archive,
     run_profile_io,
     should_encrypt_profile,
@@ -304,7 +305,13 @@ class LocalStorage(BaseStorage):
                         raise
 
     async def store_browser_session(
-        self, organization_id: str, workflow_permanent_id: str, directory: str, *, require_encryption: bool = False
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        directory: str,
+        *,
+        require_encryption: bool = False,
+        source_browser_type: str | None = None,
     ) -> None:
         stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
         if stored_folder_path is None:
@@ -325,6 +332,7 @@ class LocalStorage(BaseStorage):
                 organization_id,
                 workflow_permanent_id,
                 purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+                **profile_writer_options(source_browser_type),
             )
             return
         if source_directory == stored_folder_path:
@@ -410,6 +418,8 @@ class LocalStorage(BaseStorage):
         require_encryption: bool = False,
         write_back: bool = False,
         seed_etag: str | None = None,
+        confirm_creation: bool = False,
+        source_browser_type: str | None = None,
     ) -> None:
         stored_folder_path, sealed = self._profile_paths(organization_id, profile_id)
         source_directory = Path(directory).resolve()
@@ -425,8 +435,12 @@ class LocalStorage(BaseStorage):
                 profile_id,
                 write_back=write_back,
                 seed_etag=seed_etag,
+                confirm_creation=confirm_creation,
+                **profile_writer_options(source_browser_type),
             )
             return
+        if confirm_creation:
+            raise ValueError("Confirmed local profile creation requires a sealed archive")
         if write_back and not self._profile_seed_matches(stored_folder_path, sealed, seed_etag):
             return
         if source_directory == stored_folder_path:
@@ -458,6 +472,8 @@ class LocalStorage(BaseStorage):
         purpose: str = PROFILE_ENCRYPTION_PURPOSE,
         write_back: bool = False,
         seed_etag: str | None = None,
+        confirm_creation: bool = False,
+        source_browser_type: str | None = None,
     ) -> None:
         if not source_directory.is_dir():
             raise NotADirectoryError(source_directory)
@@ -475,6 +491,8 @@ class LocalStorage(BaseStorage):
                 encrypted=True,
                 sealed_dir=Path(staging_dir),
                 purpose=purpose,
+                confirm_creation=confirm_creation,
+                **profile_writer_options(source_browser_type),
             )
             if write_back and not self._profile_seed_matches(stored_folder_path, sealed, seed_etag):
                 return

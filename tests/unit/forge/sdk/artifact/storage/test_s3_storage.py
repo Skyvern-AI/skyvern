@@ -12,12 +12,12 @@ import subprocess
 import threading
 import time
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1992,6 +1992,29 @@ def _profile_archive_cases() -> list:
         for confirm in (False, True)
         if backend == "s3" or case.id == "listing"
     ]
+    cases.extend(
+        pytest.param(False, *case.values, backend, "writer", id=f"writer-{case.id}-{backend}")
+        for backend in ("s3", "azure", "gcs")
+        for case in capture_cases
+        if case.id == "readable" or (backend == "s3" and case.id in {"listing", "stat-io", "missing-cookies"})
+    )
+    for confirm, scenario, label in (
+        (False, "writer", "plaintext"),
+        (False, "writer-encrypted", "encrypted"),
+        (True, "writer", "strict"),
+    ):
+        cases.append(
+            pytest.param(
+                confirm,
+                _COOKIES_MEMBER,
+                False,
+                "directory-classification",
+                errno.EISDIR if confirm else None,
+                "s3",
+                scenario,
+                id=f"writer-directory-classification-{label}",
+            )
+        )
     common = (
         "legacy",
         "legacy-read-migrates",
@@ -2094,6 +2117,31 @@ async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_t
             return scandir(path)
 
         monkeypatch.setattr(os, "scandir", scan_directory)
+    elif fault == "directory-classification":
+        scandir = os.scandir
+
+        def fail_is_dir() -> bool:
+            raise OSError(errno.EIO, "synthetic directory classification failure", str(network))
+
+        class UnreadableEntryScan(Iterator[os.DirEntry[str] | SimpleNamespace]):
+            def __init__(self, path: str) -> None:
+                self.entries = scandir(path)
+
+            def __enter__(self) -> Self:
+                return self
+
+            def __exit__(self, *_exc: object) -> None:
+                self.entries.close()
+
+            def __next__(self) -> os.DirEntry[str] | SimpleNamespace:
+                item = next(self.entries)
+                if item.name == network.name:
+                    return SimpleNamespace(name=item.name, is_dir=fail_is_dir)
+                return item
+
+        monkeypatch.setattr(
+            os, "scandir", lambda path: UnreadableEntryScan(path) if path == str(network.parent) else scandir(path)
+        )
     elif isinstance(fault, int):
         real_stat = os.stat
 
@@ -2127,6 +2175,17 @@ async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_t
     else:
         monkeypatch.setattr(storage, "async_client", fake)
 
+    if scenario == "writer-encrypted":
+        await storage.store_browser_profile(
+            "o", "bp", str(profile), require_encryption=True, source_browser_type="msedge"
+        )
+        reopened = await storage.retrieve_browser_profile_snapshot("o", "bp")
+        assert reopened is not None and reopened.encrypted
+        assert (Path(reopened.directory) / "Local State").read_bytes() == b"state"
+        assert not (Path(reopened.directory) / _COOKIES_MEMBER).exists()
+        assert reopened.source_browser_type is None
+        return
+
     upload = storage.async_client.upload_file_from_path
     uploads: list[str] = []
     archived: dict[str, bytes] = {}
@@ -2141,18 +2200,20 @@ async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_t
 
     monkeypatch.setattr(storage.async_client, "upload_file_from_path", capture_upload)
 
+    options: dict[str, bool | str] = {"confirm_creation": True} if confirm_creation else {}
+    if scenario == "writer":
+        options["source_browser_type"] = "msedge"
     if confirm_creation and strict_error is not None:
         with pytest.raises(OSError) as error:
-            await storage.store_browser_profile("o", "bp", str(profile), confirm_creation=True)
+            await storage.store_browser_profile("o", "bp", str(profile), **options)
         assert error.value.errno == strict_error
         assert not uploads
+        assert not fake.objects
         assert not list((tmp_path / "temp").glob("*.zip"))
         return
 
     with capture_logs() as events:
-        await storage.store_browser_profile(
-            "o", "bp", str(profile), **({"confirm_creation": True} if confirm_creation else {})
-        )
+        await storage.store_browser_profile("o", "bp", str(profile), **options)
 
     assert "Local State" in archived
     assert (member in archived) is (not dangling and fault is None)
@@ -2169,6 +2230,29 @@ async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_t
         return
 
     monkeypatch.setattr(storage.async_client, "upload_file_from_path", upload)
+    if scenario == "writer":
+        reopened = await storage.retrieve_browser_profile_snapshot("o", "bp")
+        assert reopened is not None and reopened.source_browser_type == ("msedge" if fault is None else None)
+        assert (Path(reopened.directory) / "Local State").read_bytes() == b"state"
+        if fault is None and backend == "s3":
+            uri, body = next(iter(fake.objects.items()))
+            malformed = io.BytesIO(body)
+            with zipfile.ZipFile(malformed, "a") as archive:
+                archive.comment += b".unknown"
+            fake.objects[uri] = malformed.getvalue()
+            reopened = await storage.retrieve_browser_profile_snapshot("o", "bp")
+            assert reopened is not None and reopened.source_browser_type is None
+
+            empty = tmp_path / "empty"
+            empty.mkdir()
+            await storage.store_browser_profile("o", "bp_empty", str(empty), source_browser_type="chrome")
+            reopened = await storage.retrieve_browser_profile_snapshot("o", "bp_empty")
+            assert reopened is not None and reopened.source_browser_type is None
+            with pytest.raises(ValueError):
+                await storage.store_browser_profile(
+                    "o", "bp_strict_empty", str(empty), source_browser_type="chrome", confirm_creation=True
+                )
+        return
     legacy_uri, legacy = next(iter(fake.objects.items()))
     assert legacy_uri.endswith("/o/profiles/bp.zip")
     assert await storage.browser_profile_exists("o", "bp")
@@ -2206,6 +2290,11 @@ async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_t
         assert archive not in fake.objects and fake.objects[archive + ".enc"].startswith(FILE_MAGIC)
         snapshot = await storage.retrieve_browser_session_snapshot("o", "wpid_test")
         assert snapshot and snapshot.encrypted
+        assert (Path(snapshot.directory) / _COOKIES_MEMBER).read_bytes() == b"cookies"
+        assert snapshot.source_browser_type is None
+        await storage.store_browser_session("o", "wpid_test", snapshot.directory, source_browser_type="chrome")
+        snapshot = await storage.retrieve_browser_session_snapshot("o", "wpid_test")
+        assert snapshot and snapshot.encrypted and snapshot.source_browser_type == "chrome"
         assert (Path(snapshot.directory) / _COOKIES_MEMBER).read_bytes() == b"cookies"
         await storage.delete_browser_session("o", "wpid_test")
         assert fake.objects.keys() == {legacy_uri}

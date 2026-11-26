@@ -738,6 +738,7 @@ async def test_lane_run_does_not_overwrite_a_write_interleaved_after_the_previou
         "encrypted-seed-legacy-seal-failure",
         "encrypted-seed-new-target",
         "encrypted-seed-new-seal-failure",
+        "typed-destination",
     ],
 )
 async def test_delta_merge_unions_only_changed_cookies_into_current(
@@ -794,6 +795,11 @@ async def test_delta_merge_unions_only_changed_cookies_into_current(
         durable.mkdir()
         (durable / "target-state").write_text("existing target")
         (durable / BANKED_COOKIES_FILENAME).write_text(json.dumps([existing]))
+        if mode == "typed-destination":
+            bs.browser_artifacts._credential_profile_writer = "chrome"
+            await storage.store_browser_profile(
+                "o_test", "bp_target", str(durable), require_encryption=True, source_browser_type="msedge"
+            )
 
     wr = _make_workflow_run(
         WorkflowRunStatus.completed, browser_profile_id="bp_seed", browser_sink_profile_id="bp_target"
@@ -838,6 +844,7 @@ async def test_delta_merge_unions_only_changed_cookies_into_current(
     assert not durable.exists()
     restored = await storage.retrieve_browser_profile_snapshot("o_test", "bp_target")
     assert restored is not None and restored.encrypted
+    assert restored.source_browser_type == ("msedge" if mode == "typed-destination" else None)
     if new_target:
         assert {"a": "1", "b": "2"} == {
             cookie["name"]: cookie["value"] for cookie in read_persisted_session_cookies(restored.directory)

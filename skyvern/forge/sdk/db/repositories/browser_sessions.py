@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import structlog
-from sqlalchemy import Select, and_, case, desc, exists, func, or_, select, union, update
+from sqlalchemy import Select, and_, case, delete, desc, exists, func, or_, select, union, update
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
@@ -274,6 +274,61 @@ class BrowserSessionsRepository(BaseRepository):
                 await connection.flush()
             await connection.refresh(browser_profile)
             return BrowserProfile.model_validate(browser_profile)
+
+    @db_operation("commit_created_browser_profile_writer")
+    async def commit_created_browser_profile_writer(
+        self,
+        *,
+        profile_id: str,
+        organization_id: str,
+        source_browser_type: str,
+        source_workflow_run_id: str,
+        source_browser_session_id: str | None,
+    ) -> BrowserProfile:
+        async with self.Session() as session:
+            row = await session.scalar(
+                update(BrowserProfileModel)
+                .filter_by(
+                    browser_profile_id=profile_id,
+                    organization_id=organization_id,
+                    source_workflow_run_id=source_workflow_run_id,
+                    source_browser_session_id=source_browser_session_id,
+                    source_browser_type=None,
+                    deleted_at=None,
+                )
+                .values(source_browser_type=source_browser_type)
+                .returning(BrowserProfileModel)
+            )
+            if row is None:
+                raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+            profile = BrowserProfile.model_validate(row)
+            await session.commit()
+            return profile
+
+    @db_operation("delete_unwritten_workflow_browser_profile")
+    async def delete_unwritten_workflow_browser_profile(
+        self,
+        *,
+        profile_id: str,
+        organization_id: str,
+        source_workflow_run_id: str,
+        source_browser_session_id: str | None,
+    ) -> bool:
+        async with self.Session() as session:
+            removed = await session.scalar(
+                delete(BrowserProfileModel)
+                .filter_by(
+                    browser_profile_id=profile_id,
+                    organization_id=organization_id,
+                    source_workflow_run_id=source_workflow_run_id,
+                    source_browser_session_id=source_browser_session_id,
+                    source_browser_type=None,
+                    deleted_at=None,
+                )
+                .returning(BrowserProfileModel.browser_profile_id)
+            )
+            await session.commit()
+            return removed is not None
 
     @db_operation("get_browser_session_workflow_permanent_ids")
     async def get_browser_session_workflow_permanent_ids(
