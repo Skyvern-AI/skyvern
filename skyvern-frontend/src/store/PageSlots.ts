@@ -126,6 +126,9 @@ export type PageSlots = {
   connectedGmailFlow?: React.ComponentType<
     Readonly<{ children: (flow: ConnectedGmailFlow) => React.ReactNode }>
   >;
+  connectedGoogleDriveFlow?: React.ComponentType<
+    Readonly<{ children: (flow: ConnectedGmailFlow) => React.ReactNode }>
+  >;
   workflowFindingsScope?: React.ComponentType<
     Readonly<{
       workflowPermanentIds: readonly string[];

@@ -30,7 +30,7 @@ import {
 import { helpTooltips } from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { EmailBodyFormatSelect } from "../components/EmailBodyFormatSelect";
-import { type SendEmailNode } from "./types";
+import { type SendEmailNode, type SendEmailNodeData } from "./types";
 import { useUpdate } from "../../useUpdate";
 
 function SendEmailEditor({ blockId }: { blockId: string }) {
@@ -41,6 +41,20 @@ function SendEmailEditor({ blockId }: { blockId: string }) {
     return null;
   }
   return <SendEmailEditorBody blockId={blockId} data={nodeSlice.data} />;
+}
+
+function SendEmailEditorBody({
+  blockId,
+  data,
+}: {
+  blockId: string;
+  data: SendEmailNodeData;
+}) {
+  const update = useUpdate<SendEmailNodeData>({
+    id: blockId,
+    editable: data.editable,
+  });
+  return <SendEmailFields blockId={blockId} data={data} update={update} />;
 }
 
 // Saving a workflow that sends only through Gmail removes these parameters, and
@@ -55,13 +69,21 @@ const PLATFORM_SMTP_SECRET_FIELDS = [
   ["smtpPasswordSecretParameterKey", "smtp_password"],
 ] as const;
 
-function SendEmailEditorBody({
+type SendEmailFieldsProps = {
+  blockId: string;
+  data: SendEmailNodeData;
+  update: (updates: Partial<SendEmailNodeData>) => unknown;
+  showTransport?: boolean;
+  showAccount?: boolean;
+};
+
+function SendEmailFields({
   blockId,
   data,
-}: {
-  blockId: string;
-  data: SendEmailNode["data"];
-}) {
+  update,
+  showTransport = true,
+  showAccount = true,
+}: SendEmailFieldsProps) {
   const {
     editable,
     recipients,
@@ -77,7 +99,6 @@ function SendEmailEditorBody({
     cc,
     bcc,
   } = data;
-  const update = useUpdate<SendEmailNode["data"]>({ id: blockId, editable });
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id: blockId });
   const isGmail = transport === "gmail";
   const isReply = isGmail && Boolean(replyToMessageId?.trim());
@@ -111,27 +132,29 @@ function SendEmailEditorBody({
 
   return (
     <div data-testid="send-email-block-form" className="space-y-4 px-4 py-4">
-      <div className="space-y-2">
-        <Label className="text-xs text-tertiary-foreground">Send with</Label>
-        <Select
-          value={transport}
-          onValueChange={(next) => changeTransport(next as EmailTransport)}
-          disabled={!editable}
-        >
-          <SelectTrigger
-            aria-label="Send with"
-            className="nopan text-xs"
-            data-testid="send-email-transport"
+      {showTransport ? (
+        <div className="space-y-2">
+          <Label className="text-xs text-tertiary-foreground">Send with</Label>
+          <Select
+            value={transport}
+            onValueChange={(next) => changeTransport(next as EmailTransport)}
+            disabled={!editable}
           >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="smtp">SMTP</SelectItem>
-            <SelectItem value="gmail">Connected Gmail account</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
-      {isGmail ? (
+            <SelectTrigger
+              aria-label="Send with"
+              className="nopan text-xs"
+              data-testid="send-email-transport"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="smtp">SMTP</SelectItem>
+              <SelectItem value="gmail">Connected Gmail account</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      ) : null}
+      {showAccount && isGmail ? (
         <div className="space-y-2">
           <div className="flex gap-2">
             <Label className="text-xs text-tertiary-foreground">
@@ -466,4 +489,4 @@ function SmtpAdvancedSettings({
   );
 }
 
-export { SendEmailEditor };
+export { SendEmailEditor, SendEmailFields };

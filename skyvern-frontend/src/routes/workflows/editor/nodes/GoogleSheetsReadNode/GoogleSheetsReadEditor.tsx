@@ -61,8 +61,30 @@ function GoogleSheetsReadEditorBody({
   blockId: string;
   data: GoogleSheetsReadNodeData;
 }) {
-  const { editable } = data;
+  const update = useUpdate<GoogleSheetsReadNodeData>({
+    id: blockId,
+    editable: data.editable,
+  });
+  return (
+    <GoogleSheetsReadFields blockId={blockId} data={data} update={update} />
+  );
+}
 
+type GoogleSheetsReadFieldsProps = {
+  blockId: string;
+  data: GoogleSheetsReadNodeData;
+  update: (updates: Partial<GoogleSheetsReadNodeData>) => unknown;
+  showAccount?: boolean;
+  showParameters?: boolean;
+};
+
+function GoogleSheetsReadFields({
+  blockId,
+  data,
+  update,
+  showAccount = true,
+  showParameters = true,
+}: GoogleSheetsReadFieldsProps) {
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const availableOutputParameterKeys = getAvailableOutputParameterKeys(
@@ -70,8 +92,6 @@ function GoogleSheetsReadEditorBody({
     edges,
     blockId,
   );
-
-  const update = useUpdate<GoogleSheetsReadNodeData>({ id: blockId, editable });
 
   const [spreadsheetDisplayName, setSpreadsheetDisplayName] = useState<
     string | null
@@ -116,29 +136,33 @@ function GoogleSheetsReadEditorBody({
   return (
     <div data-testid="google-sheets-read-block-form" className="space-y-4">
       <div className="space-y-3">
-        <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-          Connection
-        </div>
+        {showAccount ? (
+          <>
+            <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              Connection
+            </div>
 
-        <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-tertiary-foreground">
-              Google Account
-            </Label>
-            <HelpTooltip
-              content={
-                helpTooltips["google_sheets_read"]?.["credentialId"] ??
-                "The Google account used to authenticate with the spreadsheet"
-              }
-            />
-          </div>
-          <GoogleOAuthCredentialSelector
-            nodeId={blockId}
-            value={data.credentialId}
-            onChange={(next) => update({ credentialId: next })}
-            requiredScopes={GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES}
-          />
-        </div>
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Label className="text-xs text-tertiary-foreground">
+                  Google Account
+                </Label>
+                <HelpTooltip
+                  content={
+                    helpTooltips["google_sheets_read"]?.["credentialId"] ??
+                    "The Google account used to authenticate with the spreadsheet"
+                  }
+                />
+              </div>
+              <GoogleOAuthCredentialSelector
+                nodeId={blockId}
+                value={data.credentialId}
+                onChange={(next) => update({ credentialId: next })}
+                requiredScopes={GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES}
+              />
+            </div>
+          </>
+        ) : null}
 
         <div className="space-y-2">
           <div className="flex items-center justify-between gap-2">
@@ -279,25 +303,27 @@ function GoogleSheetsReadEditorBody({
           </AccordionContent>
         </AccordionItem>
 
-        <AccordionItem value="advanced" className="border-b-0">
-          <AccordionTrigger className="py-2">
-            Advanced Settings
-          </AccordionTrigger>
-          <AccordionContent className="pl-6 pr-1 pt-4">
-            <div className="space-y-3">
-              <ParametersMultiSelect
-                availableOutputParameters={availableOutputParameterKeys}
-                parameters={data.parameterKeys}
-                onParametersChange={(parameterKeys) => {
-                  update({ parameterKeys });
-                }}
-              />
-            </div>
-          </AccordionContent>
-        </AccordionItem>
+        {showParameters ? (
+          <AccordionItem value="advanced" className="border-b-0">
+            <AccordionTrigger className="py-2">
+              Advanced Settings
+            </AccordionTrigger>
+            <AccordionContent className="pl-6 pr-1 pt-4">
+              <div className="space-y-3">
+                <ParametersMultiSelect
+                  availableOutputParameters={availableOutputParameterKeys}
+                  parameters={data.parameterKeys}
+                  onParametersChange={(parameterKeys) => {
+                    update({ parameterKeys });
+                  }}
+                />
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+        ) : null}
       </Accordion>
     </div>
   );
 }
 
-export { GoogleSheetsReadEditor };
+export { GoogleSheetsReadEditor, GoogleSheetsReadFields };

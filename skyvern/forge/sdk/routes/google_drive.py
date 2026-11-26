@@ -2,12 +2,14 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
+from sqlalchemy.exc import SQLAlchemyError
 
+from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event_strict
 from skyvern.forge.sdk.experimentation.drive_shared_drive_search import drive_shared_drive_search_enabled
 from skyvern.forge.sdk.integrations.google import tokens as google_tokens
 from skyvern.forge.sdk.routes.google_sheets import _mint_access_token
-from skyvern.forge.sdk.schemas.google_drive import GoogleDriveFile, ListGoogleDriveFilesResponse
+from skyvern.forge.sdk.schemas.google_drive import GoogleDriveFile, GoogleDriveItem, ListGoogleDriveFilesResponse
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import google_drive_service, org_auth_service
 from skyvern.forge.sdk.services.request_principal import (
@@ -86,18 +88,35 @@ async def list_files(
     page_token: Annotated[str | None, Query(description="Drive v3 pagination token")] = None,
     page_size: Annotated[int, Query(ge=1, le=100)] = 25,
 ) -> ListGoogleDriveFilesResponse:
-    access_token = await _mint_access_token(current_org.organization_id, credential_id)
     search_all_drives = await drive_shared_drive_search_enabled(current_org.organization_id)
     try:
-        page = await google_drive_service.list_files(
-            access_token=access_token,
-            folders=folders,
-            query=q,
-            page_token=page_token,
-            page_size=page_size,
-            search_all_drives=search_all_drives,
-            downloadable_only=not folders,
-        )
+        if credential_id in await app.AGENT_FUNCTION.nango_connection_ids(current_org.organization_id, {credential_id}):
+            principal = get_request_principal()
+            if principal is None or principal.organization_id != current_org.organization_id:
+                raise HTTPException(status_code=403, detail="Organization access required")
+            page = await app.AGENT_FUNCTION.list_nango_google_drive_files(
+                principal=principal,
+                connection_id=credential_id,
+                folders=folders,
+                query=q,
+                page_token=page_token,
+                page_size=page_size,
+                search_all_drives=search_all_drives,
+                downloadable_only=not folders,
+            )
+        else:
+            access_token = await _mint_access_token(current_org.organization_id, credential_id)
+            page = await google_drive_service.list_files(
+                access_token=access_token,
+                folders=folders,
+                query=q,
+                page_token=page_token,
+                page_size=page_size,
+                search_all_drives=search_all_drives,
+                downloadable_only=not folders,
+            )
+    except SQLAlchemyError as exc:
+        raise _picker_error(503, "Database unavailable") from exc
     except google_drive_service.GoogleDriveAPIError as exc:
         raise _http_error(exc)
     response = ListGoogleDriveFilesResponse(
@@ -107,6 +126,32 @@ async def list_files(
     if search_all_drives:
         response.incomplete_search = page.incomplete_search
     return response
+
+
+@google_drive_router.get("/files/{item_id:path}")
+async def get_item(
+    item_id: str,
+    credential_id: Annotated[str, Query(description="Stored Google OAuth credential id")],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+) -> GoogleDriveItem:
+    try:
+        if credential_id in await app.AGENT_FUNCTION.nango_connection_ids(current_org.organization_id, {credential_id}):
+            principal = get_request_principal()
+            if principal is None or principal.organization_id != current_org.organization_id:
+                raise HTTPException(status_code=403, detail="Organization access required")
+            item = await app.AGENT_FUNCTION.get_nango_google_drive_item(
+                principal=principal, connection_id=credential_id, item=item_id
+            )
+        else:
+            access_token = await _mint_access_token(current_org.organization_id, credential_id)
+            item = await google_drive_service.get_item(access_token=access_token, item=item_id)
+    except SQLAlchemyError as exc:
+        raise _picker_error(503, "Database unavailable") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except google_drive_service.GoogleDriveAPIError as exc:
+        raise _http_error(exc)
+    return GoogleDriveItem.model_validate(google_drive_service.summarize_item(item, item_id))
 
 
 @google_drive_router.post(

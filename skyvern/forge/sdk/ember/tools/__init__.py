@@ -1370,9 +1370,10 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
 
     When the current request identifies one active, scope-compatible row, bind its
     exact `connection_id` as the native block's `credential_id` and continue.
-    A `provider` `nango` row is a Connected Gmail account: it reports no scopes, and
-    its `connection_id` goes in the Gmail block's `connection_id` with
-    `credential_source: nango`, never in `credential_id`.
+    A `provider` `nango` row is a broker account and reports no scopes. Under Gmail it
+    is a Connected Gmail account. Under Google Drive it is a Connected Google Drive
+    account, and currently only the `list_folder` and `download_from_drive` actions
+    support it. Use the row's `connection_id`, never its `credential_id`.
     Never require an opaque ID already present in this tool result to be repeated.
     If the requested account remains ambiguous or no compatible active row exists,
     use a grounded ordinary-language clarification instead.
@@ -1386,13 +1387,15 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     one action: `integration_id` is the entry's `id`, `action_id` the action's `id`,
     `inputs` holds values for the names in the action's `inputs` schema, and
     `connection_id` is the account field. `needs` lists the scopes the account must
-    have granted, and `acts` is true when the action sends, writes or uploads. An
+    have granted, `credential_backends` lists whether native or broker accounts can
+    run the action, and `acts` is true when the action sends, writes or uploads. An
     action runs as the block type its `runs_via` names (`block:<type>`); that block
     type can also be written directly instead of an `integration_action`. An
     `integration_action` does not run for an entry whose `credential_backend` is
-    `nango` and that has no `oauth_provider`, or with an account whose `provider` is
-    `nango` (a Connected Gmail account); the block type written directly takes those
-    accounts. A trigger's `source_kind` is the `source_kind` that
+    `nango` and that has no `oauth_provider`. Bind a broker row only when the chosen
+    action's `credential_backends` includes `nango`; a Gmail action whose input pins
+    `credential_source: nango` runs through the block type written directly. A
+    trigger's `source_kind` is the `source_kind` that
     `create_webhook_trigger` takes.
     """
     ember_ctx = ctx.context

@@ -13,6 +13,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.elements import BindParameter
 
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
@@ -2030,11 +2031,15 @@ def test_google_drive_resumable_session_uri_rejects_ssrf_variants(session_uri: s
 
 
 @pytest.mark.asyncio
-async def test_google_drive_list_folder_lists_at_most_the_cap_in_one_call(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_google_drive_list_folder_lists_at_most_the_cap_in_one_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     cap = google_drive_service.DRIVE_LIST_FOLDER_MAX_RESULTS
     page_sizes: list[int] = []
+    resource_key_headers: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        resource_key_headers.append(request.headers.get("X-Goog-Drive-Resource-Keys"))
         if request.url.path == "/drive/v3/files/folder_1":
             return httpx.Response(
                 200, json={"id": "folder_1", "mimeType": google_drive_service.GOOGLE_FOLDER_MIME_TYPE}
@@ -2043,7 +2048,10 @@ async def test_google_drive_list_folder_lists_at_most_the_cap_in_one_call(monkey
         page_size = int(request.url.params["pageSize"])
         page_sizes.append(page_size)
         # Like Drive, return at most 1,000 items a page, from a folder that always has more.
-        files = [{"id": f"f{len(page_sizes)}_{i}", "name": "item"} for i in range(min(page_size, 1000))]
+        files = [
+            {"id": f"f{len(page_sizes)}_{i}", "name": "item", "resourceKey": "child_key"}
+            for i in range(min(page_size, 1000))
+        ]
         return httpx.Response(200, json={"files": files, "nextPageToken": f"page_{len(page_sizes)}"})
 
     _install_google_drive_transport(monkeypatch, handler)
@@ -2052,6 +2060,275 @@ async def test_google_drive_list_folder_lists_at_most_the_cap_in_one_call(monkey
 
     assert max(page_sizes) <= cap
     assert (listed["count"], len(listed["files"]), listed["has_more"]) == (cap, cap, True)
+    assert set(resource_key_headers) == {None} and "resource_key" not in listed["files"][0]
+    resource_key_headers.clear()
+    keyed = await google_drive_service.list_folder(
+        access_token="token", folder="folder_1", max_results=1, resource_key="folder_key", include_resource_keys=True
+    )
+    assert set(resource_key_headers) == {"folder_1/folder_key"} and len(resource_key_headers) == 2
+    assert keyed["files"][0]["resource_key"] == "child_key"
+    folder_link = "https://drive.google.com/drive/folders/folder_1?resourcekey=link_key"
+    for explicit_key, expected_header in ((None, "folder_1/link_key"), ("folder_key", "folder_1/folder_key")):
+        resource_key_headers.clear()
+        await google_drive_service.list_folder(
+            access_token="token", folder=folder_link, max_results=1, resource_key=explicit_key
+        )
+        assert resource_key_headers == [expected_header, expected_header]
+    with pytest.raises(ValueError, match="resource key"):
+        await google_drive_service.list_folder(access_token="token", folder="folder_1", resource_key="bad!")
+    assert (
+        await google_drive_service.get_item(
+            access_token="token", item="https://drive.google.com/drive/folders/folder_1"
+        )
+    )["id"] == "folder_1"
+
+    from skyvern.forge.sdk.routes import google_drive as drive_routes
+
+    async def mint(*args: Any, **kwargs: Any) -> str:
+        return "token"
+
+    monkeypatch.setattr(drive_routes, "_mint_access_token", mint)
+    item_response = await drive_routes.get_item(
+        item_id="folder_1", credential_id="account", current_org=SimpleNamespace(organization_id="org")
+    )
+    assert item_response.model_dump() == {
+        "id": "folder_1",
+        "name": "folder_1",
+        "is_folder": True,
+        "web_view_link": None,
+    }
+
+    async def nango_ids(_organization_id: str, connection_ids: set[str]) -> set[str]:
+        return {connection_id for connection_id in connection_ids if connection_id == "connected-drive"}
+
+    async def nango_item(**kwargs: Any) -> dict[str, Any]:
+        return {"id": kwargs["item"], "name": "from-nango", "mimeType": "application/pdf"}
+
+    async def nango_files(**_kwargs: Any) -> google_drive_service.DriveFilesPage:
+        return google_drive_service.DriveFilesPage(
+            files=[{"id": "nango-file", "name": "from-nango", "is_folder": False}],
+            next_page_token="nango-next",
+        )
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "nango_connection_ids", nango_ids)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_nango_google_drive_item", nango_item)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "list_nango_google_drive_files", nango_files)
+    monkeypatch.setattr(
+        drive_routes,
+        "get_request_principal",
+        lambda: SimpleNamespace(organization_id="org"),
+    )
+    monkeypatch.setattr(drive_routes, "drive_shared_drive_search_enabled", AsyncMock(return_value=False))
+    nango_item_response = await drive_routes.get_item(
+        item_id="nango-file", credential_id="connected-drive", current_org=SimpleNamespace(organization_id="org")
+    )
+    nango_list_response = await drive_routes.list_files(
+        credential_id="connected-drive", current_org=SimpleNamespace(organization_id="org")
+    )
+    assert nango_item_response.model_dump() == {
+        "id": "nango-file",
+        "name": "from-nango",
+        "is_folder": False,
+        "web_view_link": None,
+    }
+    assert nango_list_response.model_dump(exclude_unset=True) == {
+        "files": [{"id": "nango-file", "name": "from-nango"}],
+        "next_page_token": "nango-next",
+    }
+
+    async def database_unavailable(*_args: Any, **_kwargs: Any) -> set[str]:
+        raise SQLAlchemyError("database unavailable")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "nango_connection_ids", database_unavailable)
+    for route_call in (
+        drive_routes.get_item(
+            item_id="folder_1", credential_id="account", current_org=SimpleNamespace(organization_id="org")
+        ),
+        drive_routes.list_files(credential_id="account", current_org=SimpleNamespace(organization_id="org")),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await route_call
+        assert (exc_info.value.status_code, exc_info.value.detail, exc_info.value.headers) == (
+            503,
+            "Database unavailable",
+            {"Cache-Control": "no-store"},
+        )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "nango_connection_ids", nango_ids)
+
+    # A folder download must follow pages, skip subfolders unless requested, deduplicate, and report failures.
+    from skyvern.forge.sdk.integrations import action_runners
+    from skyvern.forge.sdk.integrations.google import drive_download
+
+    native_references: list[str] = []
+
+    async def token(organization_id: str, connection_id: str, required_scopes: list[str], *, api: str) -> str:
+        native_references.append(connection_id)
+        return "token"
+
+    async def credentials(*args: Any, **kwargs: Any) -> list[Any]:
+        return [
+            SimpleNamespace(
+                id="account",
+                credential_name="Work Drive",
+                email_address="ops@example.com",
+                state=google_oauth_service.STATE_ACTIVE,
+                scopes_granted=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+            )
+        ]
+
+    async def item(*, access_token: str, item: str) -> dict[str, Any]:
+        if item == "bad":
+            raise google_drive_service.GoogleDriveAPIError(status=403, code="forbidden", message="private")
+        return {
+            "id": item,
+            "mimeType": google_drive_service.GOOGLE_FOLDER_MIME_TYPE if item in ("root", "sub") else "application/pdf",
+        }
+
+    def listed(
+        item_id: str, *, is_folder: bool = False, grant: str | None = None, resource_key: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "id": item_id,
+            "name": item_id if is_folder else f"{item_id}.pdf",
+            "mime_type": google_drive_service.GOOGLE_FOLDER_MIME_TYPE if is_folder else "application/pdf",
+            "size": None if is_folder else 4,
+            "is_folder": is_folder,
+            **({"selection_grant": grant} if grant else {}),
+            **({"resource_key": resource_key} if resource_key else {}),
+        }
+
+    async def folder(
+        *, access_token: str, folder: str, max_results: int, page_token: str | None = None, **kwargs: Any
+    ) -> dict[str, Any]:
+        if folder == "root" and page_token is None:
+            return {"files": [listed("a"), listed("sub", is_folder=True)], "next_page_token": "next"}
+        if folder == "root":
+            return {"files": [listed("bad"), listed("a")]}
+        return {"files": [listed("c")]}
+
+    async def download(*, file_id: str, output_dir: str, **kwargs: Any) -> str:
+        if file_id == "bad":
+            raise google_drive_service.GoogleDriveAPIError(status=403, code="forbidden", message="private")
+        path = Path(output_dir) / file_id
+        path.write_text("data")
+        return str(path)
+
+    monkeypatch.setattr(action_runners, "resolve_account_token", token)
+    monkeypatch.setattr(drive_download, "resolve_account_token", token)
+    monkeypatch.setattr(google_oauth_service, "get_visible_credentials_for_org", credentials)
+    monkeypatch.setattr(google_drive_service, "get_item", item)
+    monkeypatch.setattr(google_drive_service, "list_folder", folder)
+    monkeypatch.setattr(google_drive_service, "download_file", download)
+    native_folder = await action_runners.run_google_drive_folder_action(
+        "org",
+        "ops@example.com",
+        "list_folder",
+        {"google_drive_folder_id": "root", "_nango_drive": False},
+    )
+    native_download = await drive_download.download_selected_items(
+        organization_id="org",
+        connection_id="Work Drive",
+        references=["a"],
+        recursive=False,
+        output_dir=str(tmp_path),
+    )
+    native_folder_download = await drive_download.download_selected_items(
+        organization_id="org",
+        connection_id="Work Drive",
+        references=["root"],
+        recursive=False,
+        output_dir=str(tmp_path),
+    )
+    assert native_folder["files"][0]["id"] == "a"
+    assert {file["id"] for file in native_download["files"]} == {"a"}
+    assert {file["id"] for file in native_folder_download["files"]} == {"a"}
+    assert native_folder_download["errors"] == [{"item": "bad", "error": "forbidden"}]
+    assert native_references == ["ops@example.com", "Work Drive", "Work Drive"]
+
+    async def nango_download(**kwargs: Any) -> str:
+        return await download(file_id=kwargs["file_id"], output_dir=kwargs["output_dir"])
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_google_drive_item_for_run", nango_item)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "download_google_drive_file_for_run", nango_download)
+    nango_downloaded = await drive_download.download_selected_items(
+        organization_id="org",
+        connection_id="connected-drive",
+        references=["nango-file"],
+        recursive=False,
+        output_dir=str(tmp_path),
+        workflow_run_id="wr",
+        workflow_run_block_id="wrb",
+        hop_token="hop",
+        nango_drive=True,
+    )
+    assert {file["id"] for file in nango_downloaded["files"]} == {"nango-file"}
+    assert native_references == ["ops@example.com", "Work Drive", "Work Drive"]
+
+    async def nango_recursive_item(**kwargs: Any) -> dict[str, Any]:
+        item_id = google_drive_service.extract_item_reference(kwargs["item"]).file_id
+        if item_id == "child":
+            raise AssertionError("listed children must not be fetched again")
+        return {
+            "id": item_id,
+            "mimeType": google_drive_service.GOOGLE_FOLDER_MIME_TYPE if item_id == "nango-root" else "application/pdf",
+        }
+
+    async def nango_recursive_list(**kwargs: Any) -> dict[str, Any]:
+        if (kwargs["folder"], kwargs["selection_grant"], kwargs["resource_key"]) != ("nango-root", None, "root-key"):
+            raise google_drive_service.GoogleDriveAPIError(status=404, code="not_found", message="not found")
+        return {"files": [listed("child", grant="child-grant", resource_key="child-key")]}
+
+    async def nango_recursive_download(**kwargs: Any) -> str:
+        if (kwargs["file_id"], kwargs["selection_grant"], kwargs["resource_key"]) != (
+            "child",
+            "child-grant",
+            "child-key",
+        ):
+            raise google_drive_service.GoogleDriveAPIError(status=404, code="not_found", message="not found")
+        return await download(file_id=kwargs["file_id"], output_dir=kwargs["output_dir"])
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_google_drive_item_for_run", nango_recursive_item)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "list_google_drive_folder_for_run", nango_recursive_list)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "download_google_drive_file_for_run", nango_recursive_download)
+    nango_recursive = await drive_download.download_selected_items(
+        organization_id="org",
+        connection_id="connected-drive",
+        references=["https://drive.google.com/drive/folders/nango-root?resourcekey=root-key"],
+        recursive=True,
+        output_dir=str(tmp_path),
+        workflow_run_id="wr",
+        workflow_run_block_id="wrb",
+        hop_token="hop",
+        nango_drive=True,
+    )
+    assert {file["id"] for file in nango_recursive["files"]} == {"child"}
+    assert nango_recursive["errors"] == []
+
+    for recursive, expected in ((False, {"a"}), (True, {"a", "c"})):
+        result = await drive_download.download_selected_items(
+            organization_id="org",
+            connection_id="account",
+            references=["root"],
+            recursive=recursive,
+            output_dir=str(tmp_path),
+        )
+        assert {file["id"] for file in result["files"]} == expected
+        assert result["errors"] == [{"item": "bad", "error": "forbidden"}]
+
+    async def narrow_credentials(*args: Any, **kwargs: Any) -> list[Any]:
+        return [
+            SimpleNamespace(
+                id="account",
+                state=google_oauth_service.STATE_ACTIVE,
+                scopes_granted=[google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE],
+            )
+        ]
+
+    monkeypatch.setattr(google_oauth_service, "get_visible_credentials_for_org", narrow_credentials)
+    result = await drive_download.download_selected_items(
+        organization_id="org", connection_id="account", references=["root"], recursive=True, output_dir=str(tmp_path)
+    )
+    assert result == {"files": [], "errors": [{"item": "root", "error": "folder_requires_full_drive_scope"}]}
 
 
 def test_google_drive_maps_insufficient_scope_to_reconnect() -> None:

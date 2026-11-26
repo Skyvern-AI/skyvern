@@ -81,6 +81,11 @@ _SENSITIVE_ENDPOINTS = {
     "POST /api/v1/stripe_webhook",
     # Identity-provider session events embed the full user record (email, name, linked Google account).
     "POST /api/v1/clerk-webhook",
+    "POST /api/v1/internal/gmail/capability",
+    "POST /api/v1/internal/gmail/trigger-capability",
+    "POST /api/v1/internal/drive/get",
+    "POST /api/v1/internal/drive/list",
+    "POST /api/v1/internal/drive/download",
 }
 _SIGNED_TRIGGER_RECEIVER_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/triggers/[^/]+/events$")
 _AD_ATTRIBUTION_WITHDRAWAL_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/ad-attribution/withdraw$")
@@ -166,6 +171,7 @@ _STREAMING_REQUEST_ENDPOINT_PATTERNS = (
 )
 # Binary bodies streamed on purpose; buffering them for the log would hold a whole file in memory.
 _STREAMING_RESPONSE_ENDPOINTS = frozenset({"POST /api/v1/internal/gmail/attachment"})
+_STREAMING_RESPONSE_ENDPOINTS = _STREAMING_RESPONSE_ENDPOINTS.union({"POST /api/v1/internal/drive/download"})
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # 404/405 are dominated by internet scanners and MCP clients probing GET for an SSE stream;

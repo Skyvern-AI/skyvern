@@ -5473,6 +5473,7 @@ async def _run_blocks_with_minted_browser_claim(
         await _send_run_started_update(ctx, workflow_run.workflow_run_id)
         # Only a test copy the user's Test click approved gets a Gmail capability; other blocks record why not.
         await app.AGENT_FUNCTION.prepare_gmail_hop_tokens(workflow_run=workflow_run, workflow=snapshot.workflow)
+        await app.AGENT_FUNCTION.prepare_google_drive_hop_tokens(workflow_run=workflow_run, workflow=snapshot.workflow)
 
         if dispatch_to_worker:
             # Submit through the cloud executor (Temporal). The run was created against the

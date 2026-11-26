@@ -8,6 +8,7 @@ import pytest
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.integrations.action_runners import ACTION_RUNNERS, ActionRunContext, ActionRunFailed
 from skyvern.forge.sdk.integrations.connected_accounts import connected_account_fields
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import Block, FileUploadBlock, SendEmailBlock
@@ -60,6 +61,7 @@ def _run_context(monkeypatch: pytest.MonkeyPatch) -> None:
         return BlockResult(
             success=kwargs["success"],
             failure_reason=kwargs.get("failure_reason"),
+            error_codes=kwargs.get("error_codes") or [],
             output_parameter=self.output_parameter,
             output_parameter_value=kwargs.get("output_parameter_value"),
             status=kwargs["status"],
@@ -70,7 +72,18 @@ def _run_context(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("integration_id", "action_id", "inputs", "inner_class", "pinned", "acts", "read_rows", "described", "nango"),
+    (
+        "integration_id",
+        "action_id",
+        "inputs",
+        "inner_class",
+        "pinned",
+        "acts",
+        "read_rows",
+        "described",
+        "nango",
+        "runtime_blocked",
+    ),
     [
         (
             "google_sheets",
@@ -81,6 +94,7 @@ def _run_context(monkeypatch: pytest.MonkeyPatch) -> None:
             False,
             True,
             True,
+            False,
             False,
         ),
         (
@@ -93,6 +107,7 @@ def _run_context(monkeypatch: pytest.MonkeyPatch) -> None:
             False,
             True,
             False,
+            False,
         ),
         (
             "gmail",
@@ -101,6 +116,7 @@ def _run_context(monkeypatch: pytest.MonkeyPatch) -> None:
             SendEmailBlock,
             "transport",
             True,
+            False,
             False,
             False,
             False,
@@ -115,18 +131,32 @@ def _run_context(monkeypatch: pytest.MonkeyPatch) -> None:
             False,
             True,
             False,
+            False,
         ),
-        ("outlook", "read_inbox", {}, EmailInboxBlock, "email_client", False, False, True, False),
+        (
+            "google_drive",
+            "upload_files",
+            {"google_drive_folder_id": "folder"},
+            FileUploadBlock,
+            "storage_type",
+            True,
+            False,
+            True,
+            True,
+            True,
+        ),
+        ("outlook", "read_inbox", {}, EmailInboxBlock, "email_client", False, False, True, False, False),
         # The account is among the org's Nango connections: it runs as Nango.
-        ("gmail", "read_inbox", {}, EmailInboxBlock, "email_client", False, False, True, True),
+        ("gmail", "read_inbox", {}, EmailInboxBlock, "email_client", False, False, True, True, False),
         # The lookup failed: an account of unknown kind runs as neither.
-        ("gmail", "read_inbox", {}, EmailInboxBlock, "email_client", False, False, True, None),
+        ("gmail", "read_inbox", {}, EmailInboxBlock, "email_client", False, False, True, None, False),
     ],
     ids=[
         "sheets-read",
         "sheets-write",
         "gmail-send",
         "drive-upload",
+        "drive-upload-nango-blocked",
         "outlook-read",
         "gmail-read-nango",
         "gmail-read-lookup-failed",
@@ -143,6 +173,7 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
     read_rows: bool,
     described: bool,
     nango: bool | None,
+    runtime_blocked: bool,
 ) -> None:
     context = FakeWorkflowRunContext(values={"account": "goac_acct"})
 
@@ -179,6 +210,71 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
     result = await block.execute("wr_test", "wrb_test", organization_id="o_test")
     if nango is None:
         assert not ran and result.failure_reason == "Skyvern could not check this block's account. Run it again."
+        return
+    if runtime_blocked:
+        assert (
+            not ran
+            and result.failure_reason == "Google Drive: this connected account is not available for this action yet."
+        )
+        original_runner = ACTION_RUNNERS["google_drive_folder"]
+        seen_runner: dict[str, Any] = {}
+
+        async def capture_runner(
+            organization_id: str,
+            connection_id: str,
+            action_id: str,
+            action_inputs: dict[str, Any],
+            run_context: ActionRunContext,
+        ) -> dict[str, Any]:
+            seen_runner.update(inputs=dict(action_inputs), context=run_context)
+            return await original_runner(organization_id, connection_id, action_id, action_inputs, run_context)
+
+        monkeypatch.setitem(ACTION_RUNNERS, "google_drive_folder", capture_runner)
+
+        async def nango_list(**_kwargs: Any) -> dict[str, Any]:
+            return {"folder_id": "root", "files": [], "count": 0, "has_more": False}
+
+        async def record_output(**_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(app.AGENT_FUNCTION, "list_google_drive_folder_for_run", nango_list)
+        context.register_output_parameter_value_post_execution = record_output  # type: ignore[attr-defined]
+        read_block = _saved_block(
+            integration_id="google_drive",
+            action_id="list_folder",
+            connection_id="{{ account }}",
+            inputs={"google_drive_folder_id": "root"},
+        )
+        context._powerbi_hop_refusals[read_block.label] = "copilot_test_run"
+        refused = await read_block.execute("wr_test", "wrb_test", organization_id="o_test")
+        assert refused.error_codes == ["copilot_test_run_unsupported"]
+        assert "save the workflow and run it" in (refused.failure_reason or "")
+        context._powerbi_hop_refusals.clear()
+        context._powerbi_hop_refusals[read_block.label] = "unsafe_selection_input_source"
+        unsafe_selection = await read_block.execute("wr_test", "wrb_test", organization_id="o_test")
+        assert not unsafe_selection.success
+        assert "without templates" in (unsafe_selection.failure_reason or "")
+        context._powerbi_hop_refusals.clear()
+        context._powerbi_hop_tokens[read_block.label] = "synthetic-hop"
+        read_result = await read_block.execute("wr_test", "wrb_test", organization_id="o_test")
+        assert read_result.success and read_result.output_parameter_value == {
+            "folder_id": "root",
+            "files": [],
+            "count": 0,
+            "has_more": False,
+        }
+        assert seen_runner == {
+            "inputs": {"google_drive_folder_id": "root"},
+            "context": ActionRunContext("wr_test", "wrb_test", "synthetic-hop", True),
+        }
+        with pytest.raises(ActionRunFailed, match="not available for this action yet"):
+            await original_runner(
+                "o_test",
+                "goac_acct",
+                "create_folder",
+                {"parent_folder_id": "root", "folder_name": "Reports"},
+                ActionRunContext("wr_test", "wrb_test", "synthetic-hop", True),
+            )
         return
     await block._generate_workflow_run_block_description("wrb_test", "o_test")
 
@@ -234,6 +330,10 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
             "Input 'destination_folder_id' is required.",
         ),
         (
+            {"integration_id": "google_drive", "action_id": "download_from_drive", "inputs": {"items": []}},
+            "Input 'items' does not fit this action",
+        ),
+        (
             {
                 "integration_id": "google_drive",
                 "action_id": "move_file",
@@ -241,14 +341,6 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
                 "inputs": {"file_id": "private-value", "destination_folder_id": "private-value"},
             },
             "Google Drive: Move file needs a connected account.",
-        ),
-        (
-            {
-                "integration_id": "google_drive",
-                "action_id": "move_file",
-                "inputs": {"file_id": "private-value", "destination_folder_id": "private-value"},
-            },
-            "Google Drive folder actions are not available for this organization.",
         ),
     ],
     ids=[
@@ -261,8 +353,8 @@ async def test_an_action_runs_the_block_it_wraps_as_the_connected_account(
         "templated-pin",
         "literal-pin",
         "drive-move-missing-destination",
+        "drive-download-empty-items",
         "drive-move-no-account",
-        "drive-move-flag-off",
     ],
 )
 async def test_a_bad_action_or_input_fails_the_block_naming_it(values: dict[str, Any], reason: str) -> None:

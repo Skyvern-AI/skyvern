@@ -134,19 +134,31 @@ type ConnectionCardProps = {
 };
 
 export function ConnectionCard(props: ConnectionCardProps) {
-  const { connectedGmailFlow: GmailFlow } = usePageSlots();
+  const { connectedGmailFlow: GmailFlow, connectedGoogleDriveFlow: DriveFlow } =
+    usePageSlots();
   // A reconnect keeps its native credential; only a new Gmail connection follows the Connected Gmail default.
+  // Cards saved before credentialBackends existed keep their prior Drive choices.
+  const offersDriveBroker =
+    props.card.credentialBackends?.includes("nango") ?? true;
   if (
-    !GmailFlow ||
-    props.card.integrationId !== "gmail" ||
-    props.card.reconnectConnectionId
+    props.card.integrationId === "google_drive" &&
+    offersDriveBroker &&
+    DriveFlow
   ) {
-    return <ConnectionCardBody {...props} />;
+    return (
+      <DriveFlow>
+        {(flow) => <ConnectionCardBody {...props} connectedDrive={flow} />}
+      </DriveFlow>
+    );
   }
-  return (
+  return GmailFlow &&
+    props.card.integrationId === "gmail" &&
+    !props.card.reconnectConnectionId ? (
     <GmailFlow>
       {(flow) => <ConnectionCardBody {...props} connectedGmail={flow} />}
     </GmailFlow>
+  ) : (
+    <ConnectionCardBody {...props} />
   );
 }
 
@@ -159,7 +171,11 @@ function ConnectionCardBody({
   onSelect,
   onSelectionShown,
   connectedGmail,
-}: ConnectionCardProps & { connectedGmail?: ConnectedGmailFlow }) {
+  connectedDrive,
+}: ConnectionCardProps & {
+  connectedGmail?: ConnectedGmailFlow;
+  connectedDrive?: ConnectedGmailFlow;
+}) {
   // Once the server answers native sign-in with 409, Connected Gmail is the card's flow while it can connect, so its
   // failure and retry show; a flow that can no longer connect falls back to native sign-in like any non-live flow.
   const [switchedToConnectedGmail, setSwitchedToConnectedGmail] =
@@ -255,6 +271,11 @@ function ConnectionCardBody({
     // Out of the effect, since the send flushes editor state synchronously.
     queueMicrotask(() => pickRef.current(completedGmailId));
   }, [completedGmailId]);
+  const completedDriveId = connectedDrive?.completedConnectionId ?? null;
+  useEffect(() => {
+    if (completedDriveId)
+      queueMicrotask(() => pickRef.current(completedDriveId));
+  }, [completedDriveId]);
   const newIds = new Set([
     ...(isGoogle ? google.credentials : microsoft.credentials)
       .filter(
@@ -334,6 +355,12 @@ function ConnectionCardBody({
   const choices: ConnectedAccountChoice[] = [
     ...(card.connectedGmailOnly ? [] : nativeChoices),
     ...(connectedGmail?.connections ?? []).map((connection) => ({
+      connection_id: connection.connection_id,
+      name: connection.name,
+      state: "active" as const,
+      email_address: connection.email_address ?? null,
+    })),
+    ...(connectedDrive?.connections ?? []).map((connection) => ({
       connection_id: connection.connection_id,
       name: connection.name,
       state: "active" as const,
@@ -462,6 +489,7 @@ function ConnectionCardBody({
   // Google shows an administrator block on its own page and never returns to the callback, so a popup closed
   // with nothing changed carries no cause and the card does not guess one.
   const failure =
+    connectedDrive?.failure ||
     gmailFlow?.failure ||
     (attempt === "partial"
       ? `${targetCredential?.credential_name ?? "The account"} was connected without the ${card.integrationName} permission. Reconnect it and leave every permission checked.`
@@ -584,6 +612,7 @@ function ConnectionCardBody({
             disabled={
               isStarting ||
               Boolean(connectedGmail?.busy) ||
+              Boolean(connectedDrive?.busy) ||
               gmailFlowLoading ||
               !canAuthorize ||
               (Boolean(targetConnectionId) && google.isLoading)
@@ -622,6 +651,21 @@ function ConnectionCardBody({
             page
           </a>
         )}
+        {isGoogle && connectedDrive?.canConnect ? (
+          <button
+            type="button"
+            className="ml-2 mt-3 rounded border border-input px-3 py-1.5 text-xs font-medium disabled:opacity-60"
+            disabled={isStarting || connectedDrive.busy || disabled}
+            onClick={() => {
+              captureConnectStarted();
+              connectedDrive.start();
+            }}
+          >
+            {connectedDrive.busy
+              ? "Waiting for sign-in…"
+              : "Connect with Nango"}
+          </button>
+        ) : null}
       </div>
       <ConfirmDialog
         open={confirmSetAccount}

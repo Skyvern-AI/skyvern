@@ -229,9 +229,10 @@ describe("connection card hydration", () => {
       scopeProfile: "outlook_mail",
       requiredScopes: ["Mail.Read"],
       reconnectConnectionId: null,
+      credentialBackends: ["native", "nango"],
     };
     const raw = [
-      outlook,
+      { ...outlook, credentialBackends: ["native", "nango", "invalid"] },
       { ...outlook, integrationName: "duplicate" },
       { ...outlook, provider: "dropbox" },
       { integrationId: "gmail" },

@@ -300,7 +300,15 @@ async def google_oauth_callback(
                 credential_id=context.credential_id,
                 rejection=exc.rejection.value,
             )
-            raise HTTPException(status_code=409, detail=str(exc))
+            detail = str(exc)
+            if exc.missing_scopes and exc.missing_scopes <= google_oauth_service.GOOGLE_DRIVE_CONSENT_SCOPES:
+                detail = (
+                    "Not every requested Google Drive permission was granted. The previous connection is unchanged."
+                    if is_reconnect
+                    else "Google didn't grant full Google Drive access, so the account wasn't connected. "
+                    "Connect again and allow Google Drive access."
+                )
+            raise HTTPException(status_code=409, detail=detail)
     if identity is None:
         identity = await google_oauth_service.verify_google_identity(
             token_data.get("id_token"),

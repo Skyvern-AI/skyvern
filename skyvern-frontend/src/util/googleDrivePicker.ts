@@ -1,3 +1,4 @@
+import { fetchDrivePickerToken } from "@/api/drivePickerToken";
 import { isTemplateExpression } from "@/util/googleSheetsUrl";
 
 function readEnv(value: string | undefined): string {
@@ -17,20 +18,9 @@ const drivePickerConfigured = Boolean(
   drivePickerConfig.appId,
 );
 
-// The picker needs a short-lived, credential-scoped access token in the browser, which is an
-// open security decision. Until fetchDrivePickerToken mints one, the picker stays unavailable.
-const drivePickerTokenFlowExists = false;
-
-const drivePickerUnavailableReason: string | null = !drivePickerConfigured
-  ? "Not set up yet: this environment has no Google picker key."
-  : drivePickerTokenFlowExists
-    ? null
-    : "Not available yet: opening Drive from Skyvern is still being set up.";
-
-async function fetchDrivePickerToken(credentialId: string): Promise<string> {
-  void credentialId;
-  throw new Error("Choosing files in Drive is not available yet.");
-}
+const drivePickerUnavailableReason: string | null = drivePickerConfigured
+  ? null
+  : "Not set up yet: this environment has no Google picker key.";
 
 // Publish-to-web Doc links (/document/d/e/<public-id>) are not Drive file ids.
 const DRIVE_ID_IN_URL =
@@ -45,16 +35,10 @@ function driveIdFromValue(value: string): string | null {
   return match?.[1] ?? match?.[2] ?? null;
 }
 
-function driveItemUrl(kind: "file" | "folder", id: string): string {
-  return kind === "folder"
-    ? `https://drive.google.com/drive/folders/${id}`
-    : `https://drive.google.com/file/d/${id}/view`;
-}
-
 export {
   drivePickerConfig,
+  drivePickerConfigured,
   drivePickerUnavailableReason,
   fetchDrivePickerToken,
   driveIdFromValue,
-  driveItemUrl,
 };

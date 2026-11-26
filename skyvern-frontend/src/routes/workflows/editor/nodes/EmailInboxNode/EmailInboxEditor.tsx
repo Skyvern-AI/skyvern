@@ -74,6 +74,198 @@ function FieldLabel({
   );
 }
 
+type EmailInboxFieldsProps = {
+  blockId: string;
+  data: EmailInboxNodeData;
+  update: (updates: Partial<EmailInboxNodeData>) => unknown;
+};
+
+function EmailInboxDataFields({
+  blockId,
+  data,
+  update,
+  showMessageId = true,
+}: EmailInboxFieldsProps & { showMessageId?: boolean }) {
+  const isNango = data.credentialSource === "nango";
+  return (
+    <div className="space-y-3">
+      {showMessageId && data.emailClient === "gmail" && !isNango ? (
+        <div className="space-y-2">
+          <Label
+            htmlFor={`${blockId}-message-id`}
+            className="text-xs text-tertiary-foreground"
+          >
+            Message ID (optional)
+          </Label>
+          <WorkflowBlockInput
+            id={`${blockId}-message-id`}
+            name="messageId"
+            nodeId={blockId}
+            value={data.messageId}
+            onChange={(value) => update({ messageId: value })}
+            disabled={!data.editable}
+            className="nopan text-xs"
+          />
+          <p className="text-xs text-muted-foreground">
+            {
+              "Fetches only this email instead of searching. In an agent started by a Gmail trigger, use {{ email.id }}."
+            }
+          </p>
+        </div>
+      ) : null}
+      <div className="space-y-2">
+        <FieldLabel
+          field="folder"
+          label="Folder"
+          fallback="Gmail label e.g. INBOX / Outlook folder e.g. inbox."
+        />
+        <WorkflowBlockInputTextarea
+          name="folder"
+          nodeId={blockId}
+          onChange={(next) => update({ folder: next })}
+          value={data.folder}
+          placeholder="INBOX"
+          className="nopan text-xs"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <FieldLabel
+          field="prompt"
+          label="Match prompt"
+          fallback="Describe which emails to keep. Leave blank to keep all."
+        />
+        <WorkflowBlockInputTextarea
+          name="prompt"
+          nodeId={blockId}
+          onChange={(next) => update({ prompt: next })}
+          value={data.prompt}
+          placeholder="Describe which emails to keep. Leave blank to keep all."
+          className="nopan text-xs"
+        />
+      </div>
+    </div>
+  );
+}
+
+function EmailInboxFilterFields({
+  blockId,
+  data,
+  update,
+  showReadOptions = true,
+}: EmailInboxFieldsProps & { showReadOptions?: boolean }) {
+  return (
+    <div className="space-y-3">
+      <div className="space-y-2">
+        <FieldLabel
+          field="sender"
+          label="Sender"
+          fallback="Only include emails from this sender."
+        />
+        <WorkflowBlockInputTextarea
+          name="sender"
+          nodeId={blockId}
+          onChange={(next) => update({ sender: next })}
+          value={data.sender}
+          placeholder="sender@example.com"
+          className="nopan text-xs"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <FieldLabel
+          field="subject"
+          label="Subject"
+          fallback="Only include emails matching this subject."
+        />
+        <WorkflowBlockInputTextarea
+          name="subject"
+          nodeId={blockId}
+          onChange={(next) => update({ subject: next })}
+          value={data.subject}
+          placeholder="Subject contains..."
+          className="nopan text-xs"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <FieldLabel
+          field="newerThanDays"
+          label="Newer Than Days"
+          fallback="Only include emails newer than this many days."
+        />
+        <Input
+          type="number"
+          min={1}
+          value={data.newerThanDays ?? ""}
+          onChange={(event) =>
+            update({
+              newerThanDays: parseNullablePositiveInteger(
+                event.currentTarget.value,
+              ),
+            })
+          }
+          placeholder="Any age"
+          className="nopan text-xs"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <FieldLabel
+          field="maxResults"
+          label="Max Results"
+          fallback="Maximum number of emails to return."
+        />
+        <Input
+          type="number"
+          min={1}
+          value={data.maxResults}
+          onChange={(event) =>
+            update({
+              maxResults: parsePositiveInteger(
+                event.currentTarget.value,
+                data.maxResults,
+              ),
+            })
+          }
+          className="nopan text-xs"
+        />
+      </div>
+
+      {showReadOptions ? (
+        <>
+          <div className="flex items-center justify-between">
+            <FieldLabel
+              field="includeBody"
+              label="Include Body"
+              fallback="Include email body text in matching results."
+            />
+            <Switch
+              checked={data.includeBody}
+              onCheckedChange={(checked) => update({ includeBody: checked })}
+            />
+          </div>
+
+          <div className="flex items-center justify-between">
+            <FieldLabel
+              field="downloadAttachments"
+              label="Download Attachments"
+              fallback="Download non-inline attachments from matched emails for downstream blocks."
+            />
+            <Switch
+              aria-label="Download Attachments"
+              checked={data.downloadAttachments}
+              onCheckedChange={(checked) =>
+                update({ downloadAttachments: checked })
+              }
+            />
+          </div>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
 function EmailInboxEditor({ blockId }: { blockId: string }) {
   const nodeSlice = useNodesData<EmailInboxNode>(blockId);
   if (!nodeSlice || nodeSlice.type !== "emailInbox") {
@@ -230,175 +422,22 @@ function EmailInboxEditorBody({
         <AccordionItem value="data" className="border-b-0">
           <AccordionTrigger className="py-2">Data</AccordionTrigger>
           <AccordionContent className="pl-6 pr-1 pt-4">
-            <div className="space-y-3">
-              {data.emailClient === "gmail" && !isNango ? (
-                <div className="space-y-2">
-                  <Label
-                    htmlFor={`${blockId}-message-id`}
-                    className="text-xs text-tertiary-foreground"
-                  >
-                    Message ID (optional)
-                  </Label>
-                  <WorkflowBlockInput
-                    id={`${blockId}-message-id`}
-                    name="messageId"
-                    nodeId={blockId}
-                    value={data.messageId}
-                    onChange={(value) => update({ messageId: value })}
-                    disabled={!editable}
-                    className="nopan text-xs"
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    {
-                      "Fetches only this email instead of searching. In an agent started by a Gmail trigger, use {{ email.id }}."
-                    }
-                  </p>
-                </div>
-              ) : null}
-              <div className="space-y-2">
-                <FieldLabel
-                  field="folder"
-                  label="Folder"
-                  fallback="Gmail label e.g. INBOX / Outlook folder e.g. inbox."
-                />
-                <WorkflowBlockInputTextarea
-                  name="folder"
-                  nodeId={blockId}
-                  onChange={(next) => update({ folder: next })}
-                  value={data.folder}
-                  placeholder="INBOX"
-                  className="nopan text-xs"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <FieldLabel
-                  field="prompt"
-                  label="Match prompt"
-                  fallback="Describe which emails to keep. Leave blank to keep all."
-                />
-                <WorkflowBlockInputTextarea
-                  name="prompt"
-                  nodeId={blockId}
-                  onChange={(next) => update({ prompt: next })}
-                  value={data.prompt}
-                  placeholder="Describe which emails to keep. Leave blank to keep all."
-                  className="nopan text-xs"
-                />
-              </div>
-            </div>
+            <EmailInboxDataFields
+              blockId={blockId}
+              data={data}
+              update={update}
+            />
           </AccordionContent>
         </AccordionItem>
 
         <AccordionItem value="filters" className="border-b-0">
           <AccordionTrigger className="py-2">Optional Filters</AccordionTrigger>
           <AccordionContent className="pl-6 pr-1 pt-4">
-            <div className="space-y-3">
-              <div className="space-y-2">
-                <FieldLabel
-                  field="sender"
-                  label="Sender"
-                  fallback="Only include emails from this sender."
-                />
-                <WorkflowBlockInputTextarea
-                  name="sender"
-                  nodeId={blockId}
-                  onChange={(next) => update({ sender: next })}
-                  value={data.sender}
-                  placeholder="sender@example.com"
-                  className="nopan text-xs"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <FieldLabel
-                  field="subject"
-                  label="Subject"
-                  fallback="Only include emails matching this subject."
-                />
-                <WorkflowBlockInputTextarea
-                  name="subject"
-                  nodeId={blockId}
-                  onChange={(next) => update({ subject: next })}
-                  value={data.subject}
-                  placeholder="Subject contains..."
-                  className="nopan text-xs"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <FieldLabel
-                  field="newerThanDays"
-                  label="Newer Than Days"
-                  fallback="Only include emails newer than this many days."
-                />
-                <Input
-                  type="number"
-                  min={1}
-                  value={data.newerThanDays ?? ""}
-                  onChange={(event) =>
-                    update({
-                      newerThanDays: parseNullablePositiveInteger(
-                        event.currentTarget.value,
-                      ),
-                    })
-                  }
-                  placeholder="Any age"
-                  className="nopan text-xs"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <FieldLabel
-                  field="maxResults"
-                  label="Max Results"
-                  fallback="Maximum number of emails to return."
-                />
-                <Input
-                  type="number"
-                  min={1}
-                  value={data.maxResults}
-                  onChange={(event) =>
-                    update({
-                      maxResults: parsePositiveInteger(
-                        event.currentTarget.value,
-                        data.maxResults,
-                      ),
-                    })
-                  }
-                  className="nopan text-xs"
-                />
-              </div>
-
-              <div className="flex items-center justify-between">
-                <FieldLabel
-                  field="includeBody"
-                  label="Include Body"
-                  fallback="Include email body text in matching results."
-                />
-                <Switch
-                  checked={data.includeBody}
-                  onCheckedChange={(checked) =>
-                    update({ includeBody: checked })
-                  }
-                />
-              </div>
-
-              <div className="flex items-center justify-between">
-                <FieldLabel
-                  field="downloadAttachments"
-                  label="Download Attachments"
-                  fallback="Download non-inline attachments from matched emails for downstream blocks."
-                />
-                <Switch
-                  aria-label="Download Attachments"
-                  checked={data.downloadAttachments}
-                  onCheckedChange={(checked) =>
-                    update({ downloadAttachments: checked })
-                  }
-                />
-              </div>
-            </div>
+            <EmailInboxFilterFields
+              blockId={blockId}
+              data={data}
+              update={update}
+            />
           </AccordionContent>
         </AccordionItem>
 
@@ -419,4 +458,4 @@ function EmailInboxEditorBody({
   );
 }
 
-export { EmailInboxEditor };
+export { EmailInboxDataFields, EmailInboxEditor, EmailInboxFilterFields };

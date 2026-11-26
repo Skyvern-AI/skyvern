@@ -81,6 +81,7 @@ GOOGLE_DRIVE_SCOPES: tuple[str, ...] = ("https://www.googleapis.com/auth/drive",
 # Only the files a person chooses in the picker or the app creates.
 GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 GOOGLE_DRIVE_FILE_SCOPES: tuple[str, ...] = (GOOGLE_DRIVE_FILE_SCOPE,)
+GOOGLE_DRIVE_CONSENT_SCOPES: frozenset[str] = frozenset((*GOOGLE_DRIVE_SCOPES, GOOGLE_DRIVE_FILE_SCOPE))
 # What a Drive step requires; _REQUIRED_SCOPE_RULES says which grants meet it.
 GOOGLE_DRIVE_STEP_SCOPES: tuple[str, ...] = (GOOGLE_DRIVE_FILE_SCOPE,)
 # openid and email make Google return an ID token, which is the only server-verified account identity.
@@ -257,10 +258,17 @@ GOOGLE_RECONNECT_CONSENT_REJECTION_MESSAGES: dict[GmailSendConsentRejection, str
 
 
 class GmailSendConsentRejectedError(ValueError):
-    def __init__(self, rejection: GmailSendConsentRejection, *, gmail_send: bool = True) -> None:
+    def __init__(
+        self,
+        rejection: GmailSendConsentRejection,
+        *,
+        gmail_send: bool = True,
+        missing_scopes: frozenset[str] = frozenset(),
+    ) -> None:
         messages = GMAIL_SEND_CONSENT_REJECTION_MESSAGES if gmail_send else GOOGLE_RECONNECT_CONSENT_REJECTION_MESSAGES
         super().__init__(messages[rejection])
         self.rejection = rejection
+        self.missing_scopes = missing_scopes
 
 
 @dataclass(frozen=True)
@@ -958,8 +966,13 @@ async def verify_gmail_send_consent(
             raise GmailSendConsentRejectedError(GmailSendConsentRejection.IDENTITY_UNVERIFIED)
     else:
         identity = None
-    if not _required_consent_scopes(context, scopes_granted) <= _normalized_scopes(scopes_granted):
-        raise GmailSendConsentRejectedError(GmailSendConsentRejection.SCOPES_NOT_GRANTED, gmail_send=gmail_send)
+    missing_scopes = frozenset(_required_consent_scopes(context, scopes_granted) - _normalized_scopes(scopes_granted))
+    if missing_scopes:
+        raise GmailSendConsentRejectedError(
+            GmailSendConsentRejection.SCOPES_NOT_GRANTED,
+            gmail_send=gmail_send,
+            missing_scopes=missing_scopes,
+        )
     identity_required = gmail_send or bool(context.google_subject or context.email_address)
     if not identity_required:
         return None

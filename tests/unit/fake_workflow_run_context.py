@@ -51,6 +51,12 @@ class FakeWorkflowRunContext:
     def get_powerbi_hop_refusal(self, block_label: str) -> str | None:
         return self._powerbi_hop_refusals.get(block_label)
 
+    def get_google_drive_hop_token(self, block_label: str) -> str | None:
+        return self.get_powerbi_hop_token(block_label)
+
+    def get_google_drive_hop_refusal(self, block_label: str) -> str | None:
+        return self.get_powerbi_hop_refusal(block_label)
+
     def get_block_metadata(self, label: str | None) -> dict[str, Any]:
         if not label:
             return {}
