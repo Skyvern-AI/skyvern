@@ -201,8 +201,9 @@ async def _request_connection(
 
 
 def _offered_accounts(entry: IntegrationEntry, backends: frozenset[str]) -> list[dict[str, Any]] | None:
-    if entry.accounts is None:
-        return None
+    # Only an entry that runs on more than one backend narrows its accounts to the ones the action can use.
+    if entry.accounts is None or len(entry_credential_backends(entry)) < 2:
+        return ember_payload(entry)["accounts"]
     return [
         account.model_dump(exclude_none=True)
         for account in entry.accounts
