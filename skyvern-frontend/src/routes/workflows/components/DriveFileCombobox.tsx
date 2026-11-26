@@ -1,4 +1,9 @@
-import { ExternalLinkIcon, ReloadIcon } from "@radix-ui/react-icons";
+import {
+  Cross2Icon,
+  ExternalLinkIcon,
+  FileIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDebounce } from "use-debounce";
@@ -6,7 +11,10 @@ import {
   DrivePicker,
   DrivePickerDocsView,
 } from "@googleworkspace/drive-picker-react";
+import { isAxiosError } from "axios";
+import { FolderIcon } from "@/components/icons/FolderIcon";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   Popover,
   PopoverAnchor,
@@ -14,7 +22,10 @@ import {
 } from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { useGoogleDriveFiles } from "@/hooks/useGoogleDriveFiles";
+import {
+  useGoogleDriveFiles,
+  useGoogleDriveItem,
+} from "@/hooks/useGoogleDriveFiles";
 import {
   getGoogleOAuthCredentialScopesGranted,
   hasGoogleOAuthCredentialScopes,
@@ -28,8 +39,8 @@ import { isReconnectRequired } from "@/util/googleSheetsErrors";
 import { isTemplateExpression } from "@/util/googleSheetsUrl";
 import {
   driveIdFromValue,
-  driveItemUrl,
   drivePickerConfig,
+  drivePickerConfigured,
   drivePickerUnavailableReason,
   fetchDrivePickerToken,
 } from "@/util/googleDrivePicker";
@@ -38,7 +49,7 @@ import { TemplateExpressionRow } from "./TemplateExpressionRow";
 
 const FOLDER_MIME = "application/vnd.google-apps.folder";
 
-type Kind = "file" | "folder";
+type Kind = "file" | "folder" | "any";
 
 type PickedEvent = { detail: { docs?: Array<{ id?: string }> } };
 
@@ -51,8 +62,14 @@ type Props = {
   onChange: (value: string) => void;
   placeholder?: string;
   className?: string;
+  disabled?: boolean;
   "aria-invalid"?: boolean;
   "aria-describedby"?: string;
+};
+
+type ListProps = Omit<Props, "kind" | "value" | "onChange"> & {
+  value: string[];
+  onChange: (value: string[]) => void;
 };
 
 function DriveFileCombobox({
@@ -64,6 +81,7 @@ function DriveFileCombobox({
   onChange,
   placeholder,
   className,
+  disabled,
   ...ariaProps
 }: Props) {
   const [isOpen, setIsOpen] = useState(false);
@@ -85,7 +103,7 @@ function DriveFileCombobox({
     templateMode ||
     isTemplateExpression(value) ||
     isTemplateExpression(credentialId);
-  const canPick = Boolean(credentialId) && !effectiveTemplateMode;
+  const canPick = Boolean(credentialId) && !disabled && !effectiveTemplateMode;
   const pastedId = effectiveTemplateMode ? null : driveIdFromValue(value);
 
   const [debouncedQuery] = useDebounce(pastedId ? "" : value.trim(), 300);
@@ -143,6 +161,7 @@ function DriveFileCombobox({
     !pastedIdGranted;
 
   const openPicker = (fileId?: string) => {
+    if (disabled) return;
     setIsOpen(false);
     setPickerError(null);
     fetchDrivePickerToken(credentialId)
@@ -158,7 +177,7 @@ function DriveFileCombobox({
     const id = event.detail.docs?.[0]?.id;
     setPicker(null);
     if (!id) return;
-    onChange(driveItemUrl(kind, id));
+    onChange(id);
     void queryClient.invalidateQueries({ queryKey: ["googleDrive", "files"] });
   };
 
@@ -204,7 +223,7 @@ function DriveFileCombobox({
             kind={kind}
             query={searchQuery}
             onPick={(id) => {
-              onChange(driveItemUrl(kind, id));
+              onChange(id);
               setIsOpen(false);
             }}
           />
@@ -297,7 +316,7 @@ function DriveFileCombobox({
           <DrivePickerDocsView
             enable-drives={picker.fileIds ? undefined : "true"}
             include-folders="true"
-            select-folder-enabled={kind === "folder" ? "true" : "false"}
+            select-folder-enabled={kind === "file" ? "false" : "true"}
             mime-types={kind === "folder" ? FOLDER_MIME : undefined}
             file-ids={picker.fileIds}
           />
@@ -463,24 +482,394 @@ function DriveListPanel({ credentialId, kind, query, onPick }: ListPanelProps) {
 function DriveFileInput(props: Props) {
   const { credentials } = useGoogleOAuthCredentials();
   const account = credentials.find((c) => c.id === props.credentialId);
-  if (
+  const narrowAccount = Boolean(
     account &&
-    isNarrowDriveGrant(getGoogleOAuthCredentialScopesGranted(account))
-  ) {
-    return <DriveFileCombobox {...props} />;
+    isNarrowDriveGrant(getGoogleOAuthCredentialScopesGranted(account)),
+  );
+  const [textMode, setTextMode] = useState(false);
+  const [picker, setPicker] = useState<{
+    credentialId: string;
+    token: string;
+  } | null>(null);
+  const [pickerError, setPickerError] = useState<{
+    credentialId: string;
+    message: string;
+  } | null>(null);
+  const queryClient = useQueryClient();
+  const itemId = driveIdFromValue(props.value);
+  const item = useGoogleDriveItem(
+    props.credentialId || undefined,
+    drivePickerConfigured && narrowAccount && !isTemplateExpression(props.value)
+      ? itemId
+      : null,
+  );
+  const refusalMessage =
+    pickerError?.credentialId === props.credentialId
+      ? pickerError.message
+      : null;
+  const textInput =
+    narrowAccount && props.kind !== "any" ? (
+      <DriveFileCombobox {...props} />
+    ) : (
+      <WorkflowBlockInputTextarea
+        name={props.name}
+        nodeId={props.nodeId}
+        value={props.value}
+        onChange={props.onChange}
+        placeholder={props.placeholder}
+        disabled={props.disabled}
+        aria-invalid={props["aria-invalid"]}
+        aria-describedby={props["aria-describedby"]}
+        className={cn("nopan text-xs", props.className)}
+      />
+    );
+
+  const openPicker = () => {
+    if (props.disabled) return;
+    const credentialId = props.credentialId;
+    setPickerError(null);
+    fetchDrivePickerToken(credentialId)
+      .then((token) => setPicker({ credentialId, token }))
+      .catch((error: unknown) => {
+        if (error instanceof Error && !isAxiosError(error)) {
+          setPickerError({ credentialId, message: error.message });
+        }
+      });
+  };
+
+  const handlePicked = (event: PickedEvent) => {
+    const id = event.detail.docs?.[0]?.id;
+    setPicker(null);
+    if (!id) return;
+    props.onChange(id);
+    void queryClient.invalidateQueries({
+      queryKey: ["googleDrive", "item", props.credentialId, id],
+    });
+  };
+
+  if (!drivePickerConfigured || !narrowAccount) {
+    return textInput;
   }
+  if (!props.credentialId || isTemplateExpression(props.value)) {
+    return textInput;
+  }
+  if (refusalMessage) {
+    return (
+      <div className="space-y-1">
+        {textInput}
+        <div className="flex items-center gap-2 text-xs text-muted-foreground dark:text-slate-400">
+          <span>{refusalMessage}</span>
+          <button
+            type="button"
+            disabled={props.disabled}
+            onClick={openPicker}
+            className="shrink-0 font-medium underline disabled:cursor-not-allowed disabled:no-underline disabled:opacity-60"
+          >
+            Try again
+          </button>
+        </div>
+      </div>
+    );
+  }
+  if (textMode || (props.value !== "" && itemId === null)) {
+    return textInput;
+  }
+
+  const pickerElement =
+    picker?.credentialId === props.credentialId ? (
+      <DrivePicker
+        client-id={drivePickerConfig.clientId}
+        app-id={drivePickerConfig.appId}
+        developer-key={drivePickerConfig.apiKey}
+        oauth-token={picker.token}
+        onPicked={(event) => handlePicked(event as unknown as PickedEvent)}
+        onCanceled={() => setPicker(null)}
+      >
+        <DrivePickerDocsView
+          enable-drives="true"
+          include-folders="true"
+          select-folder-enabled={props.kind === "file" ? "false" : "true"}
+          mime-types={props.kind === "folder" ? FOLDER_MIME : undefined}
+        />
+      </DrivePicker>
+    ) : null;
+
+  if (!itemId) {
+    return (
+      <div className="space-y-1">
+        <Button
+          type="button"
+          variant="outline"
+          disabled={props.disabled}
+          onClick={openPicker}
+          className={cn("w-full", props.className)}
+        >
+          Choose from Google Drive
+        </Button>
+        <button
+          type="button"
+          disabled={props.disabled}
+          onClick={() => setTextMode(true)}
+          className="text-xs text-muted-foreground underline disabled:cursor-not-allowed disabled:no-underline disabled:opacity-60 dark:text-slate-400"
+        >
+          Paste a link or use an input instead
+        </button>
+        {pickerElement}
+      </div>
+    );
+  }
+
+  const isFolder = item.data?.is_folder ?? props.kind === "folder";
+  const notFound =
+    item.isError &&
+    isAxiosError(item.error) &&
+    item.error.response?.status === 404;
   return (
+    <div className="space-y-1">
+      <div
+        aria-invalid={props["aria-invalid"]}
+        aria-describedby={props["aria-describedby"]}
+        className={cn(
+          "flex min-h-9 items-center gap-2 rounded-md border border-input bg-transparent px-3 py-1 text-xs",
+          props["aria-invalid"] && "border-destructive",
+          props.className,
+        )}
+      >
+        {isFolder ? (
+          <FolderIcon className="size-4 shrink-0" />
+        ) : (
+          <FileIcon className="size-4 shrink-0" />
+        )}
+        <span className="min-w-0 flex-1 truncate" title={props.value}>
+          {item.data?.name ?? props.value}
+        </span>
+        <button
+          type="button"
+          disabled={props.disabled}
+          onClick={openPicker}
+          className="font-medium underline disabled:cursor-not-allowed disabled:no-underline disabled:opacity-60"
+        >
+          Change
+        </button>
+      </div>
+      <button
+        type="button"
+        disabled={props.disabled}
+        onClick={() => setTextMode(true)}
+        className="text-xs text-muted-foreground underline disabled:cursor-not-allowed disabled:no-underline disabled:opacity-60 dark:text-slate-400"
+      >
+        Edit as text
+      </button>
+      {notFound ? (
+        <p className="text-xs text-muted-foreground dark:text-slate-400">
+          Not found in this account
+        </p>
+      ) : null}
+      {pickerElement}
+    </div>
+  );
+}
+
+function DriveFileListItem({
+  credentialId,
+  value,
+  disabled,
+  onRemove,
+}: {
+  credentialId: string;
+  value: string;
+  disabled?: boolean;
+  onRemove: () => void;
+}) {
+  const itemId = driveIdFromValue(value);
+  const item = useGoogleDriveItem(
+    credentialId || undefined,
+    drivePickerConfigured && !isTemplateExpression(value) ? itemId : null,
+  );
+  const label = item.data?.name ?? value;
+  const isFolder = item.data?.is_folder ?? value.includes("/folders/");
+  const notFound =
+    item.isError &&
+    isAxiosError(item.error) &&
+    item.error.response?.status === 404;
+
+  return (
+    <div className="rounded-md border border-input bg-transparent px-2 py-1.5 text-xs">
+      <div className="flex min-w-0 items-center gap-2">
+        {isFolder ? (
+          <FolderIcon className="size-4 shrink-0" />
+        ) : (
+          <FileIcon className="size-4 shrink-0" />
+        )}
+        <span className="min-w-0 flex-1 truncate" title={value}>
+          {label}
+        </span>
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={onRemove}
+          aria-label={`Remove ${label}`}
+          className="shrink-0 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          <Cross2Icon className="size-3.5" />
+        </button>
+      </div>
+      {notFound ? (
+        <p className="mt-1 text-muted-foreground dark:text-slate-400">
+          Not found in this account
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function DriveFileListInput(props: ListProps) {
+  const { credentials } = useGoogleOAuthCredentials();
+  const account = credentials.find((c) => c.id === props.credentialId);
+  const narrowAccount = Boolean(
+    account &&
+    isNarrowDriveGrant(getGoogleOAuthCredentialScopesGranted(account)),
+  );
+  const [textMode, setTextMode] = useState(false);
+  const [picker, setPicker] = useState<{
+    credentialId: string;
+    token: string;
+  } | null>(null);
+  const [pickerError, setPickerError] = useState<{
+    credentialId: string;
+    message: string;
+  } | null>(null);
+  const queryClient = useQueryClient();
+  const refusalMessage =
+    pickerError?.credentialId === props.credentialId
+      ? pickerError.message
+      : null;
+  const textInput = (
     <WorkflowBlockInputTextarea
       name={props.name}
       nodeId={props.nodeId}
-      value={props.value}
-      onChange={props.onChange}
+      value={props.value.join("\n")}
+      onChange={(text) =>
+        props.onChange(
+          text
+            .split(/\r?\n/)
+            .map((value) => value.trim())
+            .filter(Boolean),
+        )
+      }
       placeholder={props.placeholder}
+      disabled={props.disabled}
       aria-invalid={props["aria-invalid"]}
       aria-describedby={props["aria-describedby"]}
       className={cn("nopan text-xs", props.className)}
     />
   );
+
+  const openPicker = () => {
+    if (props.disabled) return;
+    const credentialId = props.credentialId;
+    setPickerError(null);
+    fetchDrivePickerToken(credentialId)
+      .then((token) => setPicker({ credentialId, token }))
+      .catch((error: unknown) => {
+        if (error instanceof Error && !isAxiosError(error)) {
+          setPickerError({ credentialId, message: error.message });
+        }
+      });
+  };
+
+  const handlePicked = (event: PickedEvent) => {
+    const ids = event.detail.docs?.flatMap(({ id }) => (id ? [id] : [])) ?? [];
+    setPicker(null);
+    if (ids.length === 0) return;
+    props.onChange(Array.from(new Set([...props.value, ...ids])));
+    void queryClient.invalidateQueries({
+      queryKey: ["googleDrive", "item", props.credentialId],
+    });
+  };
+
+  if (!drivePickerConfigured || !narrowAccount) {
+    return textInput;
+  }
+  if (refusalMessage) {
+    return (
+      <div className="space-y-1">
+        {textInput}
+        <div className="flex items-center gap-2 text-xs text-muted-foreground dark:text-slate-400">
+          <span>{refusalMessage}</span>
+          <button
+            type="button"
+            disabled={props.disabled}
+            onClick={openPicker}
+            className="shrink-0 font-medium underline disabled:cursor-not-allowed disabled:no-underline disabled:opacity-60"
+          >
+            Try again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const pickerElement =
+    picker?.credentialId === props.credentialId ? (
+      <DrivePicker
+        client-id={drivePickerConfig.clientId}
+        app-id={drivePickerConfig.appId}
+        developer-key={drivePickerConfig.apiKey}
+        oauth-token={picker.token}
+        multiselect
+        onPicked={(event) => handlePicked(event as unknown as PickedEvent)}
+        onCanceled={() => setPicker(null)}
+      >
+        <DrivePickerDocsView
+          enable-drives="true"
+          include-folders="true"
+          select-folder-enabled="true"
+        />
+      </DrivePicker>
+    ) : null;
+
+  return (
+    <div className="space-y-2">
+      {textMode ? (
+        textInput
+      ) : (
+        <div className="space-y-1">
+          {props.value.map((value, index) => (
+            <DriveFileListItem
+              key={`${value}:${index}`}
+              credentialId={props.credentialId}
+              value={value}
+              disabled={props.disabled}
+              onRemove={() =>
+                props.onChange(props.value.filter((_, item) => item !== index))
+              }
+            />
+          ))}
+        </div>
+      )}
+      <Button
+        type="button"
+        variant="outline"
+        disabled={props.disabled}
+        onClick={openPicker}
+        className={cn("w-full", props.className)}
+      >
+        Choose from Google Drive
+      </Button>
+      {!textMode ? (
+        <button
+          type="button"
+          disabled={props.disabled}
+          onClick={() => setTextMode(true)}
+          className="text-xs text-muted-foreground underline disabled:cursor-not-allowed disabled:no-underline disabled:opacity-60 dark:text-slate-400"
+        >
+          Paste a link or use an input instead
+        </button>
+      ) : null}
+      {pickerElement}
+    </div>
+  );
 }
 
-export { DriveFileCombobox, DriveFileInput };
+export { DriveFileCombobox, DriveFileInput, DriveFileListInput };

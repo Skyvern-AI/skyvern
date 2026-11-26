@@ -28,9 +28,10 @@ export function validateIntegrationActionNode(
   catalog: readonly IntegrationCatalogEntryWithActions[] | undefined,
 ): Array<string> {
   const { label, integrationId, actionId, connectionId, inputs } = node.data;
-  if (!integrationId.trim() || !actionId.trim()) {
+  if (!integrationId.trim()) {
     return [`${label}: Pick an app action.`];
   }
+  if (!actionId.trim()) return [`${label}: Action is required.`];
   const found = findIntegrationAction(catalog, integrationId, actionId);
   // An action missing from this org's catalog only warns on the node; the server rejects it at run time.
   if (!found) return [];
@@ -42,7 +43,13 @@ export function validateIntegrationActionNode(
   const required = new Set(found.action.inputs.required ?? []);
   for (const [key, schema] of fields) {
     // The server checks inputs as saved and fills in no defaults, so a required field needs a value.
-    if (required.has(key) && isBlank(inputs[key])) {
+    const replySubject =
+      integrationId === "gmail" &&
+      actionId === "send_email" &&
+      key === "subject" &&
+      typeof inputs.reply_to_message_id === "string" &&
+      Boolean(inputs.reply_to_message_id.trim());
+    if (required.has(key) && isBlank(inputs[key]) && !replySubject) {
       errors.push(`${label}: ${fieldLabel(key, schema)} is required.`);
     }
   }

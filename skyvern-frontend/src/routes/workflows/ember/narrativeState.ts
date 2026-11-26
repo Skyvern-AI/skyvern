@@ -546,6 +546,7 @@ export interface ConnectionCard {
   scopeProfile: string | null;
   requiredScopes: string[];
   reconnectConnectionId: string | null;
+  credentialBackends?: ("native" | "nango")[];
   // The step runs only on a Connected Gmail account, so a Google sign-in account is neither offered nor connected.
   connectedGmailOnly?: boolean;
 }
@@ -885,6 +886,14 @@ export function parseConnectionCards(value: unknown): ConnectionCard[] {
         row.reconnectConnectionId.length > 0
           ? row.reconnectConnectionId
           : null,
+      ...(Array.isArray(row.credentialBackends)
+        ? {
+            credentialBackends: row.credentialBackends.filter(
+              (backend): backend is "native" | "nango" =>
+                backend === "native" || backend === "nango",
+            ),
+          }
+        : {}),
       ...(row.connectedGmailOnly === true ? { connectedGmailOnly: true } : {}),
     };
     const key = connectionCardKey(card);

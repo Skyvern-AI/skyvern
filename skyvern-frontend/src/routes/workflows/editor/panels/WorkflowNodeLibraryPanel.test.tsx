@@ -116,7 +116,7 @@ describe("WorkflowNodeLibraryPanel apps", () => {
     ];
   });
 
-  test("lists connected apps first and adds an action node from an expanded app", () => {
+  test("lists connected apps first and adds one actionless block per app", () => {
     const added: Array<Record<string, unknown>> = [];
     render(
       <WorkflowNodeLibraryPanel onNodeClick={(props) => added.push(props)} />,
@@ -129,16 +129,17 @@ describe("WorkflowNodeLibraryPanel apps", () => {
     expect(apps[0]?.textContent).toContain("Connected");
 
     fireEvent.click(screen.getByTestId("block-library-app-gmail"));
-    fireEvent.click(
-      screen.getByTestId("block-library-app-action-gmail-send_email"),
-    );
     expect(added).toMatchObject([
       {
         nodeType: "integrationAction",
-        integrationAction: { integrationId: "gmail", actionId: "send_email" },
+        label: "gmail",
+        integrationAction: { integrationId: "gmail", actionId: "" },
       },
     ]);
 
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show Gmail triggers" }),
+    );
     fireEvent.click(
       screen.getByTestId("block-library-app-trigger-gmail-new_email"),
     );

@@ -17,6 +17,7 @@ import {
   isMicrosoftOAuthCredentialActive,
   useMicrosoftOAuthCredentials,
 } from "@/hooks/useMicrosoftOAuthCredentials";
+import { type ConnectedGmailFlow, usePageSlots } from "@/store/PageSlots";
 import {
   type AccountFit,
   type IntegrationCatalogEntryWithActions,
@@ -27,6 +28,7 @@ export type PickerAccount = {
   label: string;
   active: boolean;
   fit: AccountFit;
+  providerHint?: string;
 };
 
 const CONNECT_OPTION = "__connect__";
@@ -69,7 +71,8 @@ function accountHint(account: PickerAccount): string | null {
   if (!account.active) return "Needs reconnect";
   if (account.fit === "no")
     return "Missing permission for this action. Reconnect it on Integrations.";
-  if (account.fit === "unknown") return "Permissions unknown";
+  if (account.fit === "unknown" && !account.providerHint)
+    return "Permissions unknown";
   return null;
 }
 
@@ -107,30 +110,38 @@ function ConnectionIdField({
   );
 }
 
-// Native accounts only: the integration action block cannot run on a Nango connection id yet.
 function OAuthAccountPicker({
   entry,
   actionKey,
   value,
   onChange,
   disabled,
-}: Props) {
-  const { accounts, isLoading, isError } = useOAuthAccounts(
-    entry.oauthProvider,
-    actionKey,
-  );
-  if (isLoading) return <Skeleton className="h-9 w-full" />;
+  additionalAccounts = [],
+  additionalLoading = false,
+  additionalError = false,
+  missingSavedHint,
+}: Props & {
+  additionalAccounts?: PickerAccount[];
+  additionalLoading?: boolean;
+  additionalError?: boolean;
+  missingSavedHint?: string;
+}) {
+  const oauth = useOAuthAccounts(entry.oauthProvider, actionKey);
+  const accounts = [...oauth.accounts, ...additionalAccounts];
+  if (oauth.isLoading || additionalLoading)
+    return <Skeleton className="h-9 w-full" />;
   const saved = accounts.find((account) => account.id === value);
   const savedHint = saved ? accountHint(saved) : null;
   return (
     <div className="space-y-2">
-      {isError ? (
+      {oauth.isError || additionalError ? (
         <p className="text-xs text-amber-600 dark:text-amber-300">
           Could not load {entry.name} accounts.
         </p>
       ) : value && !saved ? (
         <p className="text-xs text-amber-600 dark:text-amber-300">
-          Saved account is no longer connected. Pick another below.
+          {missingSavedHint ??
+            "Saved account is no longer connected. Pick another below."}
         </p>
       ) : savedHint ? (
         <p className="text-xs text-amber-600 dark:text-amber-300">
@@ -157,6 +168,7 @@ function OAuthAccountPicker({
         <SelectContent>
           {accounts.map((account) => {
             const hint = accountHint(account);
+            const detail = hint ?? account.providerHint;
             return (
               <CustomSelectItem
                 key={account.id}
@@ -167,8 +179,8 @@ function OAuthAccountPicker({
                   <p className="text-sm font-medium">
                     <SelectItemText>{account.label}</SelectItemText>
                   </p>
-                  {hint ? (
-                    <p className="text-xs text-muted-foreground">{hint}</p>
+                  {detail ? (
+                    <p className="text-xs text-muted-foreground">{detail}</p>
                   ) : null}
                 </div>
               </CustomSelectItem>
@@ -183,9 +195,66 @@ function OAuthAccountPicker({
   );
 }
 
-// Nango-backed apps have no account list in the editor yet, so they take a raw connection id.
+function connectedDriveAction(
+  entry: IntegrationCatalogEntryWithActions,
+  actionKey: string,
+) {
+  if (entry.id !== "google_drive") return;
+  const prefix = `${entry.id}.`;
+  if (!actionKey.startsWith(prefix)) return;
+  return entry.actions?.find(
+    (item) => item.id === actionKey.slice(prefix.length),
+  );
+}
+
+function connectedDriveAccounts(flow: ConnectedGmailFlow): PickerAccount[] {
+  return flow.connections.map((connection) => ({
+    id: connection.connection_id,
+    label: connection.email_address
+      ? `${connection.name} (${connection.email_address})`
+      : connection.name,
+    active: true,
+    fit: "unknown",
+    providerHint: "Connected account",
+  }));
+}
+
 function IntegrationAccountPicker(props: Props) {
-  if (props.entry.oauthProvider) return <OAuthAccountPicker {...props} />;
+  const { connectedGoogleDriveFlow: ConnectedDriveFlow } = usePageSlots();
+  if (props.entry.oauthProvider) {
+    const driveAction = connectedDriveAction(props.entry, props.actionKey);
+    if (ConnectedDriveFlow && driveAction) {
+      return (
+        <ConnectedDriveFlow>
+          {(flow) => {
+            const supportsConnected =
+              driveAction.credentialBackends?.includes("nango") === true;
+            const savedIsConnected = flow.connections.some(
+              (connection) => connection.connection_id === props.value,
+            );
+            return (
+              <OAuthAccountPicker
+                {...props}
+                additionalAccounts={
+                  supportsConnected ? connectedDriveAccounts(flow) : []
+                }
+                additionalLoading={
+                  supportsConnected && flow.status === "loading"
+                }
+                additionalError={supportsConnected && Boolean(flow.failure)}
+                missingSavedHint={
+                  !supportsConnected && savedIsConnected
+                    ? `Connected Drive accounts do not support ${driveAction.name}. Pick a native account below.`
+                    : undefined
+                }
+              />
+            );
+          }}
+        </ConnectedDriveFlow>
+      );
+    }
+    return <OAuthAccountPicker {...props} />;
+  }
   return <ConnectionIdField {...props} />;
 }
 

@@ -748,7 +748,7 @@ function layout(
 }
 
 // A comma inside {{ }} or {% %} belongs to the template, as in {{ addresses | join(",") }}.
-function splitEmailList(value: string): Array<string> {
+export function splitEmailList(value: string): Array<string> {
   return (value.match(/(?:\{\{.*?\}\}|\{%.*?%\}|[^,])+/gs) ?? [])
     .map((entry) => entry.trim())
     .filter(Boolean);

@@ -182,6 +182,7 @@ import {
   createNode,
   defaultEdge,
   generateNodeLabel,
+  getUniqueLabelForExistingNode,
   layout,
   startNode,
   getWorkflowBlocks,
@@ -1662,15 +1663,12 @@ function Workspace({
     const id = nanoid();
     // Use global label tracking instead of just current nodes
     const existingLabels = Array.from(usedLabelsRef.current);
-    const newLabel =
-      label && !existingLabels.includes(label)
-        ? label
-        : generateNodeLabel(
-            existingLabels,
-            useWorkflowParametersStore
-              .getState()
-              .parameters.map((parameter) => parameter.key),
-          );
+    const parameterKeys = useWorkflowParametersStore
+      .getState()
+      .parameters.map((parameter) => parameter.key);
+    const newLabel = label
+      ? getUniqueLabelForExistingNode(label, existingLabels, parameterKeys)
+      : generateNodeLabel(existingLabels, parameterKeys);
     const computedParentId = parent ?? branch?.conditionalNodeId;
     const node = createNode(
       { id, parentId: computedParentId },

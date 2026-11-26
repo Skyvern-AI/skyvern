@@ -14,6 +14,7 @@ export type JsonSchema = {
   $ref?: string;
   $defs?: Record<string, JsonSchema>;
   properties?: Record<string, JsonSchema>;
+  items?: JsonSchema;
   required?: string[];
 };
 
@@ -24,10 +25,19 @@ export type IntegrationActionSpec = {
   inputs: JsonSchema;
   needs?: string[];
   acts?: boolean;
+  credentialBackends?: ("native" | "nango")[];
+  runsVia?: string;
 };
+
+export function isGenericActionAvailable(
+  action: IntegrationActionSpec,
+): boolean {
+  return action.inputs.properties?.credential_source?.const !== "nango";
+}
 
 export type IntegrationCatalogEntryWithActions = IntegrationCatalogEntry & {
   name: string;
+  logo?: string;
   description?: string;
   oauthProvider?: "google" | "microsoft";
   requiredScopes?: string[];
@@ -112,6 +122,7 @@ export function fieldSchema(
     title: base.title,
     description: base.description ?? inner.description,
     default: base.default ?? inner.default,
+    format: base.format ?? inner.format,
   };
 }
 

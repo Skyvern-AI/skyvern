@@ -513,6 +513,60 @@ describe("ConnectionCard", () => {
     expect(startAuthorize).not.toHaveBeenCalled();
     unmount();
 
+    const driveFlow = {
+      ...flow,
+      connections: [{ connection_id: "ngc_drive", name: "Broker Drive" }],
+    };
+    const driveSlots = {
+      connectedGoogleDriveFlow: ({
+        children,
+      }: {
+        children: (value: ConnectedGmailFlow) => React.ReactNode;
+      }) => <>{children(driveFlow)}</>,
+    };
+    const drive = render(
+      <PageSlotsProvider value={driveSlots}>
+        <ConnectionCard
+          card={{
+            integrationId: "google_drive",
+            integrationName: "Google Drive",
+            provider: "google",
+            scopeProfile: "google_drive",
+            requiredScopes: ["https://www.googleapis.com/auth/drive"],
+            reconnectConnectionId: null,
+            credentialBackends: ["native", "nango"],
+          }}
+        />
+      </PageSlotsProvider>,
+    );
+    expect(
+      screen.getByRole("button", { name: "Connect with Nango" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
+    expect(screen.getByText("Broker Drive")).toBeTruthy();
+    drive.unmount();
+
+    render(
+      <PageSlotsProvider value={driveSlots}>
+        <ConnectionCard
+          card={{
+            integrationId: "google_drive",
+            integrationName: "Google Drive",
+            provider: "google",
+            scopeProfile: "google_drive",
+            requiredScopes: ["https://www.googleapis.com/auth/drive"],
+            reconnectConnectionId: null,
+            credentialBackends: ["native"],
+          }}
+        />
+      </PageSlotsProvider>,
+    );
+    expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Connect with Nango" }),
+    ).toBeNull();
+    expect(screen.queryByText("Broker Drive")).toBeNull();
+
     googleCredentials.current = [row("goac_gmail", [GMAIL], "error")];
     render(
       <PageSlotsProvider value={slots}>
