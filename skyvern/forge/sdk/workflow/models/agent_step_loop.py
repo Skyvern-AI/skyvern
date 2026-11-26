@@ -5,6 +5,7 @@ import inspect
 import json
 import re
 import uuid
+from collections import Counter, defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
@@ -76,6 +77,7 @@ from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models.agent_step_tools import (
     CATALOG_ACTION_TOOLS,
     DEDICATED_BLOCK_TOOLS,
+    FAIL_DESCRIPTION,
     FILES_DESCRIPTION,
     FINISH_DESCRIPTION,
     READ_SKILL_RESOURCE_DESCRIPTION,
@@ -145,10 +147,18 @@ _OPAQUE_TOKEN = re.compile(rf"{_TOKEN_PREFIX}[0-9a-f]{{8}}")
 
 _INSTRUCTIONS = (
     "You are one step of an unattended workflow run; nobody can answer questions. "
-    "Each tool other than finish runs a workflow block, reads this run's data or acts on this run's browser page, "
+    "Each tool other than finish and fail runs a workflow block, reads this run's data "
+    "or acts on this run's browser page, "
     "and returns its status, output and error. When you have the answer, call finish with it."
 )
-_FINISH_ONLY = "Only finish can run now. Call finish with the best answer the tool results support."
+_ENDING_ONLY = "Only finish and fail can run now."
+_ENDING_TOOLS = frozenset({"finish", "fail"})
+_FAIL_SCHEMA = {
+    "type": "object",
+    "properties": {"reason": {"type": "string", "minLength": 1}},
+    "required": ["reason"],
+    "additionalProperties": False,
+}
 _SKILL_LIST_HEADER = "load_skill(name) returns a skill's instructions and file list."
 _HIDDEN_SKILL_ARGUMENTS = json.dumps({"name": EVERYONE_SKILL_LABEL})
 
@@ -187,6 +197,7 @@ class _RunState:
     # The report each child block or page command returned, by name, so read_run_data can page what the model saw.
     results: dict[str, dict[str, Any]] = field(default_factory=dict)
     answer: dict[str, Any] | None = None
+    fail_reason: str | None = None
     drained: bool = False
     # The SDK starts one response's tool calls as concurrent tasks even with parallel_tool_calls=False, and providers
     # still return several calls. They share the page, so each waits for its turn in the order the model wrote them.
@@ -204,6 +215,14 @@ class _RunState:
     skills: SkillSession | None = None
     # The exact text appended to the instructions, so stored model requests can swap it for the public list.
     skill_list: str | None = None
+
+    @property
+    def ending(self) -> Literal["finish", "fail"] | None:
+        if self.answer is not None:
+            return "finish"
+        if self.fail_reason is not None:
+            return "fail"
+        return None
 
 
 def _capped(text: str) -> str:
@@ -311,13 +330,14 @@ def _in_turn(
                         workflow_run_block_id=state.workflow_run_block_id,
                         exc_info=True,
                     )
-                if state.answer is not None:
+                if state.ending:
                     status = BlockStatus.skipped
-                    return "finish already returned this step's answer, so this call did not run."
-                # The drain keeps every tool listed because Anthropic rejects replayed thinking once the tool list changes.
-                if state.drained and ctx.tool_name != "finish":
+                    return "This step already ended, so this call did not run."
+                # The drain keeps every tool listed because Anthropic rejects replayed thinking once the tool list
+                # changes.
+                if state.drained and ctx.tool_name not in _ENDING_TOOLS:
                     status = BlockStatus.skipped
-                    return _FINISH_ONLY
+                    return _ENDING_ONLY
                 return await invoke(arguments)
             except (asyncio.CancelledError, _RunEnded):
                 status = BlockStatus.canceled
@@ -326,7 +346,8 @@ def _in_turn(
                 status = BlockStatus.failed
                 raise
             finally:
-                # A call no tool recorded (bad arguments, refused, or cut off by an exception) is shown but never billed.
+                # A call no tool recorded (bad arguments, refused, or cut off by an exception) is shown but never
+                # billed.
                 if started:
                     with contained_effect(
                         "agent step tool call entry", workflow_run_block_id=state.workflow_run_block_id
@@ -523,7 +544,7 @@ def resolve_agent_model(llm_key: str) -> tuple[str | Model, RunConfig]:
     )
 
 
-def _finish_argument_facts(answer: JsonValue, schema: dict[str, Any]) -> list[str]:
+def _argument_facts(tool: str, answer: JsonValue, schema: dict[str, Any]) -> list[str]:
     properties = schema.get("properties")
     if not isinstance(answer, dict) or not isinstance(properties, dict):
         return []
@@ -534,28 +555,43 @@ def _finish_argument_facts(answer: JsonValue, schema: dict[str, Any]) -> list[st
         if inside:
             tags = " and ".join(f'<parameter name="{name}">' for name in inside)
             facts.append(f"The value of {key} contains {tags}, and the arguments have no {' or '.join(inside)} key.")
-    facts += [f"{key} is not one of finish's fields." for key in answer if key not in properties]
+    facts += [f"{key} is not one of {tool}'s fields." for key in answer if key not in properties]
     return facts
 
 
-def _finish_tool(schema: dict[str, Any], state: _RunState) -> FunctionTool:
+def _record_answer(state: _RunState, answer: dict[str, Any]) -> str:
+    state.answer = answer
+    return "Answer recorded."
+
+
+def _record_failure(state: _RunState, arguments: dict[str, Any]) -> str:
+    state.fail_reason = _scrubbed(state, arguments["reason"])
+    return "Failure recorded."
+
+
+def _ending_tool(
+    name: str,
+    description: str,
+    schema: dict[str, Any],
+    state: _RunState,
+    on_valid: Callable[[_RunState, dict[str, Any]], str],
+) -> FunctionTool:
     async def invoke(arguments: str) -> str:
         try:
-            answer = json.loads(arguments or "{}")
+            parsed = json.loads(arguments or "{}")
         except json.JSONDecodeError as e:
-            _record_call(state, arguments, tool="finish", status="invalid_arguments")
-            return f"finish arguments are not valid JSON ({e}). Call finish again."
-        error = _validate_response_against_json_schema(answer, schema, "finish")
-        _record_call(state, answer, tool="finish", status="invalid_arguments" if error else "completed")
+            _record_call(state, arguments, tool=name, status="invalid_arguments")
+            return f"{name} arguments are not valid JSON ({e}). Call {name} again."
+        error = _validate_response_against_json_schema(parsed, schema, name)
+        _record_call(state, parsed, tool=name, status="invalid_arguments" if error else "completed")
         if error:
-            facts = "".join(f" {fact}" for fact in _finish_argument_facts(answer, schema))
-            return f"{error.rstrip('.')}.{facts} Call finish again with arguments that match its schema."
-        state.answer = answer
-        return "Answer recorded."
+            facts = "".join(f" {fact}" for fact in _argument_facts(name, parsed, schema))
+            return f"{error.rstrip('.')}.{facts} Call {name} again with arguments that match its schema."
+        return on_valid(state, parsed)
 
     return FunctionTool(
-        name="finish",
-        description=FINISH_DESCRIPTION,
+        name=name,
+        description=description,
         params_json_schema=schema,
         on_invoke_tool=_in_turn(state, invoke),
         # Strict mode would make every optional property required.
@@ -1644,8 +1680,9 @@ async def run_agent_step(
     state.skills = await _skill_session(state)
     if state.skills:
         state.skill_list = f"{_SKILL_LIST_HEADER}\n{render_skills_catalog(state.skills)}"
-    finish = _finish_tool(block.data_schema, state)
-    tools = [*_tools(state), *(_skill_tools(state, state.skills) if state.skills else []), finish]
+    finish = _ending_tool("finish", FINISH_DESCRIPTION, block.data_schema, state, _record_answer)
+    fail = _ending_tool("fail", FAIL_DESCRIPTION, _FAIL_SCHEMA, state, _record_failure)
+    tools = [*_tools(state), *(_skill_tools(state, state.skills) if state.skills else []), finish, fail]
     run_config = replace(
         run_config,
         tool_not_found_behavior="return_error_to_model",
@@ -1670,7 +1707,7 @@ async def run_agent_step(
         # model_construct because Claude keys can pin "max", which openai's Reasoning type does not list.
         model_settings=ModelSettings(parallel_tool_calls=False, reasoning=Reasoning.model_construct(effort=effort)),
         tool_use_behavior=lambda _ctx, _results: ToolsToFinalOutputResult(
-            is_final_output=state.answer is not None, final_output=state.answer
+            is_final_output=state.ending is not None, final_output=state.answer
         ),
     )
     hooks = _LoopHooks(state, block_row)
@@ -1685,7 +1722,7 @@ async def run_agent_step(
         with suppress(MaxTurnsExceeded):
             await Runner.run(
                 agent,
-                [*history, {"role": "user", "content": _FINISH_ONLY}],
+                [*history, {"role": "user", "content": _ENDING_ONLY}],
                 max_turns=1,
                 run_config=run_config,
                 hooks=hooks,
@@ -1708,7 +1745,24 @@ async def run_agent_step(
             "model": {"llm_key": llm_key, "reasoning_effort": effort},
         }
 
-    async def save(value: dict[str, Any]) -> None:
+    def log_exit(value: dict[str, Any], block_status: BlockStatus | None) -> None:
+        counts: defaultdict[str, Counter[str]] = defaultdict(Counter)
+        for entry in state.trail:
+            tool = entry.block_type.value if entry.tool == "run_block" and entry.block_type else entry.tool
+            counts[tool][str(entry.status or "unknown")] += 1
+        LOG.info(
+            "Agent step finished",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            ending_call=state.ending or "none",
+            stop_reason=value["stop_reason"],
+            block_status=block_status,
+            model_calls=value["usage"]["requests"],
+            llm_key=value["model"]["llm_key"],
+            tool_call_counts={tool: dict(by_status) for tool, by_status in counts.items()},
+        )
+
+    async def save(value: dict[str, Any], block_status: BlockStatus | None) -> None:
         try:
             if organization_id:
                 await app.DATABASE.observer.increment_workflow_run_block_llm_cost(
@@ -1730,14 +1784,21 @@ async def run_agent_step(
                     organization_id,
                     workflow_run_id,
                     workflow_run_block_id,
-                    decisions=sum(1 for call in state.calls if call["tool"] != "finish"),
+                    decisions=sum(1 for call in state.calls if call["tool"] not in _ENDING_TOOLS),
                 )
             finally:
                 # The display-only trail goes last, so cost, output and billing never wait on it.
                 with contained_effect("agent step final tool calls", workflow_run_block_id=workflow_run_block_id):
+                    # A canceled tool appends its trail entry while it still holds the turn lock.
+                    with suppress(TimeoutError):
+                        async with asyncio.timeout(2 * _TRAIL_WRITE_SECONDS):
+                            async with state.turn:
+                                pass
                     # One write may be in flight ahead of this final one.
                     async with asyncio.timeout(2 * _TRAIL_WRITE_SECONDS):
                         await asyncio.shield(_publish_trail(state))
+                with contained_effect("agent step exit line", workflow_run_block_id=workflow_run_block_id):
+                    log_exit(value, block_status)
 
     try:
         with model_usage_observer(lambda event: costs.append(event.cost or 0.0)), model_attempt_telemetry_scope():
@@ -1750,14 +1811,15 @@ async def run_agent_step(
                 error_handlers={"max_turns": lambda data: drain(data.run_data.history, "max_turns")},
             )
             # The SDK takes a plain-text reply as the run's final output, so the max_turns handler never sees it.
-            if state.answer is None and not state.drained:
+            if state.ending is None and not state.drained:
                 await drain(result.to_input_list(), "no_tool_calls")
     except asyncio.CancelledError:
         # The run's elapsed timeout cancels the block, and the run's cascade then sets the row, task and step statuses.
-        await asyncio.shield(save(output("run_ended")))
+        await asyncio.shield(save(output("run_ended"), None))
         raise
     except _Refused as e:
-        stop_reason, status, failure_reason = "refused", BlockStatus.failed, f"The model refused: {e}"
+        stop_reason, status = "refused", BlockStatus.failed
+        failure_reason = f"The model refused: {_scrubbed(state, str(e))}"
     except Exception as e:
         # A hook raises _RunEnded as is; the SDK re-raises it from a tool hook as UserError("Error running tool ...").
         ended = e if isinstance(e, _RunEnded) else e.__cause__
@@ -1765,9 +1827,12 @@ async def run_agent_step(
             stop_reason, status = "run_ended", ended.status
             failure_reason = f"The workflow run became {status} while the agent block ran."
         else:
-            stop_reason, status, failure_reason = "error", BlockStatus.failed, f"{type(e).__name__}: {e}"
+            stop_reason, status = "error", BlockStatus.failed
+            failure_reason = f"{type(e).__name__}: {_scrubbed(state, str(e))}"
     else:
-        if state.answer is None:
+        if state.fail_reason is not None:
+            status, failure_reason = BlockStatus.failed, f"The model called fail: {state.fail_reason}"
+        elif state.answer is None:
             status = BlockStatus.failed
             failure_reason = (
                 f"The agent block used its {block.max_turns} turns without a valid finish."
@@ -1777,7 +1842,7 @@ async def run_agent_step(
 
     value = output(stop_reason)
     try:
-        await save(value)
+        await save(value, status)
     finally:
         if state.task and state.step:
             await app.ARTIFACT_MANAGER.flush_step_archive(state.step.step_id)

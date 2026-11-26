@@ -292,9 +292,10 @@ FILES_DESCRIPTION = (
     "can upload them."
 )
 FINISH_DESCRIPTION = "Return this step's answer. The arguments are the answer."
+FAIL_DESCRIPTION = "End this step as failed. The block fails with reason as its failure reason."
 
 # Catalog action names are listed in CATALOG_TOOL_NAMES instead, a names-only copy checked here against the catalog.
-if {*DEDICATED_BLOCK_TOOLS, *RUN_BLOCK_TYPES, *RUN_TOOL_DESCRIPTIONS, "finish"} != AGENT_STEP_TOOL_NAMES:
+if {*DEDICATED_BLOCK_TOOLS, *RUN_BLOCK_TYPES, *RUN_TOOL_DESCRIPTIONS, "finish", "fail"} != AGENT_STEP_TOOL_NAMES:
     raise RuntimeError("AGENT_STEP_TOOL_NAMES must list exactly the agent step's tool table.")
 if (catalog_names := {*CATALOG_ACTION_TOOLS, *SAVED_BLOCK_ONLY_TOOLS}) != CATALOG_TOOL_NAMES or (
     CATALOG_TOOL_NAMES & AGENT_STEP_TOOL_NAMES
@@ -335,6 +336,7 @@ def tool_descriptions() -> dict[str, str]:
         **{name: action_description(entry, action) for name, (entry, action) in CATALOG_ACTION_TOOLS.items()},
         **RUN_TOOL_DESCRIPTIONS,
         "finish": FINISH_DESCRIPTION,
+        "fail": FAIL_DESCRIPTION,
     }
 
 
