@@ -12,10 +12,15 @@ import pytest
 from freezegun import freeze_time
 
 from skyvern.config import settings
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage import local as local_module
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
+    SEALED_PROFILE_SUFFIX,
+    WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+)
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
-from skyvern.forge.sdk.encrypt.files import ArtifactDecryptionError
+from skyvern.forge.sdk.encrypt.files import ArtifactDecryptionError, encrypt_file
 from skyvern.webeye.session_cookies import SESSION_COOKIES_FILENAME, read_persisted_session_cookies
 from tests.unit.forge.sdk.artifact.storage.test_helpers import (
     artifact_root,
@@ -135,6 +140,93 @@ async def test_delete_browser_profile_hard_delete_raises_on_failure(
         await local_storage.delete_browser_profile(TEST_ORGANIZATION_ID, "bp_1", hard_delete=False)
 
 
+async def _check_local_workflow_archive(
+    storage: LocalStorage, directory: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    workflow_id = "wpid_1"
+    stored = directory / TEST_ORGANIZATION_ID / workflow_id
+    sealed = stored.with_name(workflow_id + SEALED_PROFILE_SUFFIX)
+    stored.mkdir(parents=True)
+    legacy = stored / "Cookies"
+    legacy.write_bytes(b"legacy")
+    monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", (artifact_root(),))
+    monkeypatch.setattr(
+        settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", case in {"late", "rescued", "copy-error", "owned"}
+    )
+
+    pending = tmp_path / "pending.enc"
+    if case in {"valid", "late", "rescued", "version-change", "version-error"}:
+        archive = tmp_path / "fixture.zip"
+        archive.write_bytes(ArtifactManager._build_zip({"Cookies": b"sealed"}))
+        encrypt_file(
+            archive,
+            pending,
+            organization_id=TEST_ORGANIZATION_ID,
+            purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
+            object_id=workflow_id,
+        )
+
+    copy_error = FileNotFoundError("legacy copy lost a file")
+    if case in {"late", "rescued", "copy-error"}:
+        copy = storage._copy_directory_best_effort
+
+        def during_copy(source: Path, destination: Path, *, private_copy: bool) -> None:
+            if case == "copy-error":
+                sealed.write_bytes(b"invalid seal")
+                raise copy_error
+            pending.replace(sealed)
+            if case == "rescued":
+                raise copy_error
+            copy(source, destination, private_copy=private_copy)
+
+        monkeypatch.setattr(storage, "_copy_directory_best_effort", during_copy)
+    elif pending.exists():
+        pending.replace(sealed)
+    else:
+        sealed.write_bytes(b"invalid seal")
+
+    if case == "cancel":
+
+        async def cancelled(*_: object, **__: object) -> None:
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(local_module, "restore_profile_archive", cancelled)
+        with pytest.raises(asyncio.CancelledError):
+            await storage.retrieve_browser_session_snapshot(
+                TEST_ORGANIZATION_ID, workflow_id, allow_sealed_fallback=True
+            )
+        assert legacy.read_bytes() == b"legacy"
+        return
+    if case == "copy-error":
+        with pytest.raises(FileNotFoundError) as error:
+            await storage.retrieve_browser_session_snapshot(
+                TEST_ORGANIZATION_ID, workflow_id, allow_sealed_fallback=True
+            )
+        assert error.value is copy_error
+        assert legacy.read_bytes() == b"legacy"
+        return
+    if case == "version-change":
+        monkeypatch.setattr(storage, "_sealed_profile_etag", lambda _: "different seal")
+    elif case == "version-error":
+
+        def unreadable_version(_: Path) -> str:
+            raise PermissionError("seal changed permissions")
+
+        monkeypatch.setattr(storage, "_sealed_profile_etag", unreadable_version)
+
+    snapshot = await storage.retrieve_browser_session_snapshot(
+        TEST_ORGANIZATION_ID, workflow_id, allow_sealed_fallback=True
+    )
+    protected = case in {"valid", "late", "rescued", "version-change"}
+    assert snapshot is not None and snapshot.encrypted is protected
+    assert (Path(snapshot.directory) / "Cookies").read_bytes() == (b"sealed" if protected else b"legacy")
+    assert snapshot.legacy_local_copy is (case == "owned")
+    assert (Path(snapshot.directory) == stored) is (not protected and case != "owned")
+    expected_version = storage._sealed_stat_etag(sealed.stat()) if protected and case != "version-change" else None
+    assert snapshot.version == expected_version
+    assert legacy.read_bytes() == b"legacy"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("read_only", "encrypted", "scenario"),
@@ -151,6 +243,20 @@ async def test_delete_browser_profile_hard_delete_raises_on_failure(
         pytest.param(False, True, "corrupt", id="encrypted-corruption-refuses-legacy"),
         pytest.param(False, True, "replace-failure", id="encrypted-atomic-save"),
         pytest.param(False, True, "cancelled", id="encrypted-cancel-save"),
+        *[
+            pytest.param(False, False, f"workflow-{case}", id=f"workflow-{case}")
+            for case in (
+                "corrupt",
+                "owned",
+                "valid",
+                "late",
+                "rescued",
+                "copy-error",
+                "version-change",
+                "version-error",
+                "cancel",
+            )
+        ],
     ],
 )
 async def test_browser_profile_cookie_state_survives_storage(
@@ -165,6 +271,11 @@ async def test_browser_profile_cookie_state_survives_storage(
     monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(storage_root))
     monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
     monkeypatch.setattr(settings, "ENABLE_ENCRYPTION", True)
+    if scenario.startswith("workflow-"):
+        await _check_local_workflow_archive(
+            local_storage, storage_root, tmp_path, monkeypatch, scenario.removeprefix("workflow-")
+        )
+        return
     monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", encrypted)
     stored = storage_root / TEST_ORGANIZATION_ID / "profiles" / "bp_1"
     source = tmp_path / "profile" if encrypted else stored

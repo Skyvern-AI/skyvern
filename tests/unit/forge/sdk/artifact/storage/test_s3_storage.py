@@ -26,10 +26,11 @@ from aiobotocore.credentials import AioCredentialResolver
 from aiobotocore.response import StreamingBody
 from aiohttp import web
 from anyio import CancelScope, to_thread
+from azure.core.exceptions import ClientAuthenticationError, HttpResponseError
 from botocore import UNSIGNED
 from botocore.exceptions import ClientError, ConnectTimeoutError, EndpointConnectionError
 from freezegun import freeze_time
-from google.api_core.exceptions import Forbidden, RetryError
+from google.api_core.exceptions import Forbidden, InternalServerError, RetryError
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import ReadTimeout, SSLError
 from structlog.testing import capture_logs
@@ -63,6 +64,7 @@ from tests.unit.forge.sdk.artifact.storage.test_helpers import (
     create_fake_task_v2,
     create_fake_thought,
     create_fake_workflow_run_block,
+    install_cloud_profile_transport,
     install_s3_profile_transport,
 )
 from tests.unit.test_aws_client_ttl import _local_s3
@@ -1852,35 +1854,57 @@ async def test_browser_profile_exists_propagates_non_not_found_errors() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "case",
+    ("backend", "case"),
     [
-        "named",
-        "strict",
-        "403",
-        "404",
-        "5xx-probe",
-        "timeout",
-        "decrypt",
-        "extract",
-        "valid",
-        "recheck",
-        "legacy-missing",
-        "legacy-500",
-        "legacy-invalid",
-        "cancel",
+        *[
+            pytest.param("s3", case, id=case)
+            for case in (
+                "named",
+                "strict",
+                "403",
+                "404",
+                "5xx-probe",
+                "timeout",
+                "decrypt",
+                "extract",
+                "valid",
+                "recheck",
+                "legacy-missing",
+                "legacy-500",
+                "legacy-invalid",
+                "cancel",
+            )
+        ],
+        pytest.param("azure", "strict", id="azure-401-default"),
+        pytest.param("azure", "5xx-probe", id="azure-503-probe"),
+        pytest.param("azure", "recheck", id="azure-404-then-seal"),
+        pytest.param("azure", "extract", id="azure-sealed-invalid-zip"),
+        pytest.param("azure", "legacy-500", id="azure-legacy-500"),
+        pytest.param("azure", "cancel", id="azure-cancel"),
+        pytest.param("gcs", "strict", id="gcs-403-default"),
+        pytest.param("gcs", "generic", id="gcs-generic-failure"),
+        pytest.param("gcs", "legacy-missing", id="gcs-typed-404"),
+        pytest.param("gcs", "decrypt", id="gcs-invalid-seal"),
+        pytest.param("gcs", "valid", id="gcs-valid-seal"),
+        pytest.param("gcs", "legacy-500", id="gcs-legacy-500"),
+        pytest.param("gcs", "legacy-invalid", id="gcs-legacy-invalid-zip"),
     ],
 )
 async def test_retrieve_browser_profile_extracts_sub_buffer_size_archive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str, case: str
 ) -> None:
     # Regression: the archive used to be closed only AFTER unzipping, so anything smaller than the io
     # buffer (~8KB) — a cookie-only first bank — was still unflushed and ZipFile hit an empty file.
     zip_bytes = _build_zip({".skyvern_banked_cookies.json": b'[{"name":"session"}]'})
     assert len(zip_bytes) < 1024
 
-    storage, transport = S3Storage(), ProfileTransport()
+    storage = {
+        "s3": S3Storage,
+        "azure": lambda: AzureStorage(account_name="teststorage", account_key="test-only"),
+        "gcs": GcsStorage,
+    }[backend]()
+    transport = ProfileTransport()
     legacy, sealed = storage._profile_uris("o", "bp") if case == "named" else storage._workflow_session_uris("o", "wp")
-    install_s3_profile_transport(storage, transport, monkeypatch)
     temp = tmp_path / "runtime"
     monkeypatch.setattr(settings, "TEMP_PATH", str(temp))
     if case != "legacy-missing":
@@ -1899,39 +1923,71 @@ async def test_retrieve_browser_profile_extracts_sub_buffer_size_archive(
         if case != "recheck":
             transport.objects[sealed] = ciphertext.read_bytes()
 
-    async def download(uri: str, **kwargs: object) -> bytes | None:
+    azure_denial = ClientAuthenticationError("test authentication failure")
+    azure_denial.status_code = 401
+    azure_server_error = HttpResponseError("test download failure")
+    azure_server_error.status_code = 503 if case == "5xx-probe" else 500
+    denial = {
+        "azure": azure_denial,
+        "gcs": Forbidden("test access denied"),
+        "s3": ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject"),
+    }[backend]
+    server_error = {
+        "azure": azure_server_error,
+        "gcs": InternalServerError("test download failure"),
+        "s3": ClientError(
+            {"Error": {"Code": "InternalError"}, "ResponseMetadata": {"HTTPStatusCode": 503}}, "GetObject"
+        ),
+    }[backend]
+
+    def read_object(uri: str) -> bytes | None:
         if uri == legacy:
             if case == "legacy-500":
-                raise ClientError({"Error": {"Code": "InternalError"}}, "GetObject")
+                raise server_error
             if case == "recheck":
                 transport.objects[sealed] = ciphertext.read_bytes()
         else:
-            if case in {"403", "strict", "legacy-missing", "legacy-500", "legacy-invalid"} or (
-                case == "recheck" and sealed not in transport.objects
+            if (
+                case in {"403", "strict", "legacy-500", "legacy-invalid"}
+                or (case == "legacy-missing" and backend == "s3")
+                or (case == "recheck" and backend == "s3" and sealed not in transport.objects)
             ):
-                raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+                raise denial
             if case == "404":
                 raise ClientError({"Error": {"Code": "404"}}, "GetObject")
             if case == "5xx-probe":
-                raise ClientError(
-                    {"Error": {"Code": "InternalError"}, "ResponseMetadata": {"HTTPStatusCode": 503}}, "GetObject"
-                )
+                raise server_error
+            if case == "generic":
+                raise RuntimeError("test sealed download failure")
             if case == "timeout":
                 raise TimeoutError()
             if case == "cancel":
                 raise asyncio.CancelledError()
-        return await read(uri, **kwargs)
+        return transport.objects.get(uri)
 
-    async def fail_probe(_: str) -> None:
+    def fail_probe(_: str) -> bytes | None:
         raise OSError("metadata unavailable")
 
-    read = transport.download_file
-    monkeypatch.setattr(transport, "download_file", download)
-    if case == "5xx-probe":
-        monkeypatch.setattr(transport, "get_object_info", fail_probe)
+    if isinstance(storage, S3Storage):
+
+        async def read_s3(uri: str) -> bytes | None:
+            return read_object(uri)
+
+        async def fail_s3_probe(uri: str) -> bytes | None:
+            return fail_probe(uri)
+
+        monkeypatch.setattr(transport, "download_file", read_s3)
+        if case == "5xx-probe":
+            monkeypatch.setattr(transport, "get_object_info", fail_s3_probe)
+        install_s3_profile_transport(storage, transport, monkeypatch)
+    else:
+        install_cloud_profile_transport(
+            storage, transport, monkeypatch, read=read_object, probe=fail_probe if case == "5xx-probe" else None
+        )
     if case == "strict":
-        with pytest.raises(ClientError, match="AccessDenied"):
+        with pytest.raises(type(denial)) as error:
             await storage.retrieve_browser_session_snapshot("o", "wp")
+        assert error.value is denial
         assert not temp.exists()
         return
     if case in {"cancel", "legacy-invalid"}:
