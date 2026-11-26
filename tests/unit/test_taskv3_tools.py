@@ -2344,19 +2344,58 @@ async def test_navigate_runs_preflight_when_observation_enabled(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_type_resolves_secret_placeholder_at_fill_time() -> None:
+@pytest.mark.parametrize(
+    ("tool", "args", "call", "expected"),
+    [
+        (
+            "type",
+            {"selector": "#password", "text": "placeholder_abc"},
+            "fill",
+            {"selector": "#password", "text": "real-secret"},
+        ),
+        (
+            "select_option",
+            {"selector": "#country", "label": "placeholder_abc"},
+            "select_option",
+            {"selector": "#country", "value": None, "label": "real-secret"},
+        ),
+        (
+            "select_option",
+            {"selector": "#country", "value": "placeholder_abc"},
+            "select_option",
+            {"selector": "#country", "value": "real-secret", "label": None},
+        ),
+        (
+            "select_option",
+            {"selector": "#country", "values": ["placeholder_abc", "US"]},
+            "select_option",
+            {"selector": "#country", "value": ["real-secret", "US"], "label": None},
+        ),
+        (
+            "select_option",
+            {"selector": "#country", "labels": ["placeholder_abc"]},
+            "select_option",
+            {"selector": "#country", "value": None, "label": ["real-secret"]},
+        ),
+    ],
+    ids=["type", "native_select_label", "native_select_value", "native_select_values", "native_select_labels"],
+)
+async def test_type_resolves_secret_placeholder_at_fill_time(
+    tool: str, args: dict[str, Any], call: str, expected: dict[str, Any]
+) -> None:
     # Workflow credentials reach the model only as placeholders; the real value must be what
-    # lands in the page, while the tool result echoes neither.
+    # lands in the page. The fake page has no select readback, so only type's receipt is checked.
     page = _FakePage()
     tools = build_browser_tools(
         _fixed_page_provider(page),
         resolve_typed_text=lambda text: "real-secret" if text == "placeholder_abc" else text,
     )
-    result = await _tool(tools, "type").handler({"selector": "#password", "text": "placeholder_abc"})
+    result = await _tool(tools, tool).handler(args)
     kinds = {c[0]: c[1] for c in page.calls}
-    assert kinds["fill"] == {"selector": "#password", "text": "real-secret"}
-    assert "real-secret" not in result.content
-    assert "placeholder_abc" not in result.content
+    assert kinds[call] == expected
+    if tool == "type":
+        assert "real-secret" not in result.content
+        assert "placeholder_abc" not in result.content
 
 
 class _MaskRecordingPage(_FakePage):
@@ -2469,10 +2508,16 @@ _SECOND_PLACEHOLDER = "placeholder_Ot34_note"
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("password", "typed", "page_url", "confined", "filled"),
+    ("password", "typed", "page_url", "confined", "filled", "swapped"),
     [
         pytest.param(
-            "real-secret-value", _PASSWORD_PLACEHOLDER, "https://phisher-signin.net/login", False, None, id="off-site"
+            "real-secret-value",
+            _PASSWORD_PLACEHOLDER,
+            "https://phisher-signin.net/login",
+            False,
+            None,
+            False,
+            id="off-site",
         ),
         # A post-login redirect lands on another host of the same site, which the release scope admits.
         pytest.param(
@@ -2481,6 +2526,7 @@ _SECOND_PLACEHOLDER = "placeholder_Ot34_note"
             "https://accounts.portal-example.com/signin",
             False,
             "real-secret-value",
+            False,
             id="redirect-host-of-its-site",
         ),
         pytest.param(
@@ -2489,6 +2535,7 @@ _SECOND_PLACEHOLDER = "placeholder_Ot34_note"
             "https://phisher-signin.net/login",
             True,
             None,
+            False,
             id="short-password-inside-a-longer-value-off-site",
         ),
         pytest.param(
@@ -2497,19 +2544,23 @@ _SECOND_PLACEHOLDER = "placeholder_Ot34_note"
             "https://portal-example.com/login",
             True,
             "pin7-other",
+            False,
             id="short-password-inside-a-longer-value-on-its-site",
         ),
-        pytest.param("pin7", "pin7", "https://phisher-signin.net/login", True, None, id="confined-short-plain-text"),
+        pytest.param(
+            "pin7", "pin7", "https://phisher-signin.net/login", True, None, False, id="confined-short-plain-text"
+        ),
         pytest.param(
             "real-secret-value",
             "my real-secret-value",
             "https://phisher-signin.net/login",
             True,
             None,
+            False,
             id="confined-password-inside-plain-text",
         ),
         pytest.param(
-            "pin7", "pin7", "https://portal-example.com/login", True, "pin7", id="confined-plain-text-on-site"
+            "pin7", "pin7", "https://portal-example.com/login", True, "pin7", False, id="confined-plain-text-on-site"
         ),
         pytest.param(
             "pin7",
@@ -2517,10 +2568,17 @@ _SECOND_PLACEHOLDER = "placeholder_Ot34_note"
             "https://phisher-signin.net/login",
             True,
             None,
+            False,
             id="confined-short-password-inside-plain-text",
         ),
         pytest.param(
-            "pin7", "pin77", "https://portal-example.com/login", True, "pin77", id="confined-plain-text-with-it-on-site"
+            "pin7",
+            "pin77",
+            "https://portal-example.com/login",
+            True,
+            "pin77",
+            False,
+            id="confined-plain-text-with-it-on-site",
         ),
         pytest.param(
             "pin7",
@@ -2528,6 +2586,7 @@ _SECOND_PLACEHOLDER = "placeholder_Ot34_note"
             "https://phisher-signin.net/login",
             True,
             None,
+            False,
             id="confined-short-password-beside-resolved-values",
         ),
         pytest.param(
@@ -2536,10 +2595,35 @@ _SECOND_PLACEHOLDER = "placeholder_Ot34_note"
             "https://portal-example.com/login",
             True,
             "other-other pin7",
+            False,
             id="confined-beside-resolved-values-on-site",
         ),
-        pytest.param("pin7", "pi7", "https://phisher-signin.net/login", True, "pi7", id="confined-unrelated-text"),
-        pytest.param("pin7", "pin7", "https://phisher-signin.net/login", False, "pin7", id="unconfined-plain-text"),
+        pytest.param(
+            "pin7", "pi7", "https://phisher-signin.net/login", True, "pi7", False, id="confined-unrelated-text"
+        ),
+        pytest.param(
+            "pin7", "pin7", "https://phisher-signin.net/login", False, "pin7", False, id="unconfined-plain-text"
+        ),
+        # On a Mask-off run a swapped payload value's placeholder is judged as the literal it stands for, so only a
+        # confined run refuses it off-site. With Mask Secrets, the off-site row refuses it.
+        pytest.param(
+            "real-secret-value",
+            _PASSWORD_PLACEHOLDER,
+            "https://phisher-signin.net/login",
+            False,
+            "real-secret-value",
+            True,
+            id="mask-off-swapped-value-off-site",
+        ),
+        pytest.param(
+            "real-secret-value",
+            _PASSWORD_PLACEHOLDER,
+            "https://phisher-signin.net/login",
+            True,
+            None,
+            True,
+            id="mask-off-swapped-value-confined-off-site",
+        ),
     ],
 )
 async def test_a_credential_is_typed_only_on_its_saved_site_however_the_text_carries_it(
@@ -2549,6 +2633,7 @@ async def test_a_credential_is_typed_only_on_its_saved_site_however_the_text_car
     page_url: str,
     confined: bool,
     filled: str | None,
+    swapped: bool,
 ) -> None:
     # The password reaches the field through its placeholder, alone or inside a longer value, or, on a confined run,
     # as plain text the model read on a page or in a screenshot, at any length; text without it is never judged.
@@ -2571,6 +2656,7 @@ async def test_a_credential_is_typed_only_on_its_saved_site_however_the_text_car
         _fixed_page_provider(page),
         resolve_typed_text=lambda text: get_actual_value_of_parameter_if_secret_with_task(task, text),
         credential_release_guard=guard,
+        swapped_literal_tokens=frozenset({_PASSWORD_PLACEHOLDER}) if swapped else frozenset(),
     )
     with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_pw")):
         if filled is None:

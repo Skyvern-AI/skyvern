@@ -2497,9 +2497,10 @@ async def test_no_round_is_reserved_after_a_call_that_may_have_submitted_or_left
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entry", ["typed", "type_failed"])
-async def test_no_reserve_round_follows_a_typed_secret_even_on_a_not_done_verdict(entry: str) -> None:
+@pytest.mark.parametrize(("entry", "swapped"), [("typed", False), ("type_failed", False), ("typed", True)])
+async def test_no_reserve_round_follows_a_typed_secret_even_on_a_not_done_verdict(entry: str, swapped: bool) -> None:
     # A partial or full credential is on the page; a second round could submit it and spend a lockout attempt.
+    # A Mask-off run's swapped placeholder is a literal, so the judge decides the round as for any typed text.
     types: list[tuple[str, dict[str, Any]]] = []
     clicks: list[dict[str, Any]] = []
     secret = {"selector": "#password", "text": "placeholder_TlK9_password"}
@@ -2518,11 +2519,15 @@ async def test_no_reserve_round_follows_a_typed_secret_even_on_a_not_done_verdic
             block_completion_check=check,
             max_action_steps=1,
             target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+            swapped_literal_tokens=frozenset({secret["text"]}) if swapped else frozenset(),
         )
 
+    decision = next(log for log in logs if log["event"] == TARGET_ACTION_ROUND_EVENT)
+    if swapped:
+        assert len(asked) >= 1 and decision["reason"] != "may_have_landed"
+        return
     assert outcome.status == "budget_exhausted"
     assert clicks == [] and asked == []
-    [decision] = [log for log in logs if log["event"] == TARGET_ACTION_ROUND_EVENT]
     assert decision["reason"] == "may_have_landed"
 
 
@@ -15832,22 +15837,25 @@ async def test_an_entry_that_failed_does_not_arm_the_guard() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ordinary_text_is_resubmitted_freely() -> None:
+@pytest.mark.parametrize("text", ["Jane Doe", _PASSWORD], ids=["plain_text", "mask_off_swapped_placeholder"])
+async def test_ordinary_text_is_resubmitted_freely(text: str) -> None:
     # The guard's floor: it engages only on a credential placeholder. Widening what counts as one
-    # would refuse re-entry on every ordinary form the fleet fills.
+    # would refuse re-entry on every ordinary form the fleet fills. A Mask-off run's swapped placeholder is a literal.
     calls: list[tuple[str, dict[str, Any]]] = []
     tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
     script = [
-        [("type", {"selector": "ref=1", "text": "Jane Doe"})],
+        [("type", {"selector": "ref=1", "text": text})],
         [("click", {"selector": "ref=2"})],
-        [("type", {"selector": "ref=3", "text": "Jane Doe"})],
+        [("type", {"selector": "ref=3", "text": text})],
         [("click", {"selector": "ref=4"})],
+        [("type", {"selector": "ref=5", "text": text})],
+        [("click", {"selector": "ref=6"})],
         [("finish", {"status": "completed", "reason": "submitted"})],
     ]
     with capture_logs() as logs:
-        outcome, _ = await _run(script, tools)
+        outcome, _ = await _run(script, tools, swapped_literal_tokens=frozenset({_PASSWORD}))
 
-    assert [name for name, _ in calls] == ["type", "click", "type", "click"]
+    assert [name for name, _ in calls] == ["type", "click"] * 3
     assert [e for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == []
     assert outcome.status == "completed", outcome.reason
 

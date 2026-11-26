@@ -15057,6 +15057,7 @@ def build_browser_tools(
     organization_id: str | None = None,
     resolve_typed_text: Callable[[str], Any] | None = None,
     credential_release_guard: CredentialReleaseGuard | None = None,
+    swapped_literal_tokens: frozenset[str] = frozenset(),
     resolve_totp_placeholder: TotpPlaceholderResolver | None = None,
     opaque_refs: OpaqueUrlRefs | None = None,
     vision_enabled: bool = True,
@@ -15211,6 +15212,19 @@ def build_browser_tools(
         except CodeBlockCredentialReleaseError as refusal:
             _refuse_release(refusal)
 
+    def _as_typed_before_the_swap(text: str) -> str:
+        # On a Mask-off run the guard judges these placeholders as the literals they stand for. A value that does not
+        # resolve stays a placeholder and is judged as one.
+        for token in sorted(swapped_literal_tokens, key=len, reverse=True):
+            if token in text and resolve_typed_text is not None:
+                try:
+                    value = resolve_typed_text(token)
+                except Exception:
+                    continue
+                if isinstance(value, str):
+                    text = text.replace(token, value)
+        return text
+
     async def _resolve_text(
         text: str,
         *,
@@ -15266,7 +15280,12 @@ def build_browser_tools(
                 raise ToolRefusal(ONE_TIME_CODE_PLACEHOLDER_NOT_ALONE, error_class="unusable_one_time_code_value")
             raise ToolRefusal(NO_ONE_TIME_CODE_SOURCE, error_class="no_one_time_code_source")
         carries_held_secret = await _check_credential_release(
-            resolved, typed=text, operation=operation, page=page, selector=selector, url_is_target=url_is_target
+            resolved,
+            typed=_as_typed_before_the_swap(text),
+            operation=operation,
+            page=page,
+            selector=selector,
+            url_is_target=url_is_target,
         )
         if not url_is_target and selector:
             ctx = skyvern_context.current()
@@ -24390,26 +24409,39 @@ def build_browser_tools(
         # A <select multiple> discards its whole selection on every call, so a set must travel as one
         # call; the driver takes a list natively.
         is_multi = bool(isinstance(probe, dict) and probe.get("multiple"))
+
         # What the readback is checked against comes off the SAME chain that selects, in the same
         # order. Derived separately, `values` plus a scalar `label` selected by value and verified by
         # label, so a call that did exactly what was asked reported `asked for ['Gamma'], it now
         # holds ['Alpha']` and told the model to re-pass a set it had never asked for.
+        # A payload value can reach the model as a secret placeholder; the page gets the value it stands for, and the
+        # receipt quotes the page's readback.
+        async def _resolved(options: list[Any]) -> list[Any]:
+            return [
+                await _resolve_text(option, operation="select_option", page=page, selector=selector)
+                if isinstance(option, str)
+                else option
+                for option in options
+            ]
+
         if label_list is not None:
-            by_label, asked = True, label_list
-            await input_dispatch.select_option(
-                page, selector, label=label_list, timeout=_ACTION_TIMEOUT_MS, force=force
-            )
+            by_label, ask_text = True, label_list
+            asked = await _resolved(label_list)
+            await input_dispatch.select_option(page, selector, label=asked, timeout=_ACTION_TIMEOUT_MS, force=force)
         elif value_list is not None:
-            by_label, asked = False, value_list
-            await input_dispatch.select_option(
-                page, selector, value=value_list, timeout=_ACTION_TIMEOUT_MS, force=force
-            )
+            by_label, ask_text = False, value_list
+            asked = await _resolved(value_list)
+            await input_dispatch.select_option(page, selector, value=asked, timeout=_ACTION_TIMEOUT_MS, force=force)
         elif label is not None:
-            by_label, asked = True, [label]
-            await input_dispatch.select_option(page, selector, label=label, timeout=_ACTION_TIMEOUT_MS, force=force)
+            by_label, ask_text = True, [label]
+            asked = await _resolved(ask_text)
+            await input_dispatch.select_option(page, selector, label=asked[0], timeout=_ACTION_TIMEOUT_MS, force=force)
         else:
-            by_label, asked = False, ([str(value)] if value is not None else [])
-            await input_dispatch.select_option(page, selector, value=value, timeout=_ACTION_TIMEOUT_MS, force=force)
+            by_label, ask_text = False, ([str(value)] if value is not None else [])
+            asked = await _resolved(ask_text)
+            await input_dispatch.select_option(
+                page, selector, value=asked[0] if asked else value, timeout=_ACTION_TIMEOUT_MS, force=force
+            )
         # Every select is read back: a page handler can refuse or reset a choice, and a set-valued control's call
         # that discarded every prior selection otherwise reports the same bare success as one that added to them.
         record_entry_variant("select_native_multiple" if is_multi else "select_native")
@@ -24447,7 +24479,7 @@ def build_browser_tools(
             if is_multi:
                 return ToolResult.error(
                     f"select on {selector} did NOT commit the requested set: asked for "
-                    f"{_selection_report(expected)}, it now holds {_selection_report(held)} — one call "
+                    f"{_selection_report(ask_text)}, it now holds {_selection_report(held)} — one call "
                     "REPLACES the whole selection, so pass every option "
                     "you want held in a single call via `values` or `labels`",
                     error_class="did_not_commit",

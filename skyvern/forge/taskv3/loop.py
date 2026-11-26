@@ -4594,6 +4594,8 @@ async def run_agent_tool_loop(
     # Placeholder tokens minted for a login credential's username slot, held to
     # LOGIN_IDENTIFIER_SUBMIT_BUDGET instead of CREDENTIAL_SUBMIT_BUDGET. Read per refusal.
     login_identifier_tokens: Callable[[], Collection[str]] | None = None,
+    # On a Mask-off run, placeholders standing for payload literals; they are not counted as credentials.
+    swapped_literal_tokens: frozenset[str] = frozenset(),
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     # Request answers no result reported, appended to the batch's last result before the next turn.
     late_request_lines: Callable[[], str | None] | None = None,
@@ -6294,7 +6296,7 @@ async def run_agent_tool_loop(
             # so a type that pressed Enter submits the value it just entered.
             if spec is not None:
                 if tool_name in CREDENTIAL_ENTRY_TOOLS and result.status == "ok":
-                    st.credentials_entered |= _credential_placeholders(args)
+                    st.credentials_entered |= _credential_placeholders(args) - swapped_literal_tokens
                 if _may_submit(tool_name, args):
                     # Cleared, so a second click on an untouched form is not a second submission of
                     # a credential that was only ever entered once.
@@ -6564,7 +6566,7 @@ async def run_agent_tool_loop(
             # resolves placeholders in a URL too.
             call_entered_secret = (
                 (tool_name in CREDENTIAL_ENTRY_TOOLS or tool_name == "navigate")
-                and bool(_credential_placeholders(args))
+                and bool(_credential_placeholders(args) - swapped_literal_tokens)
             ) or (dispatch_ctx is not None and len(dispatch_ctx.runtime_secret_values) > runtime_secrets_before)
             if call_entered_secret and (result.touched_page or not result.refused):
                 # A second round after a secret, ok or failed, could submit it again and spend a lockout attempt.

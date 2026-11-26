@@ -4808,16 +4808,37 @@ async def test_execute_task_v3_threads_secret_resolver_for_block_and_recovery_ta
     assert recovery_resolve_typed_text("placeholder_x") == "real-value"
 
 
+_CREDENTIAL_TOKEN_IN_TASK_TEXT: dict[str, dict[str, Any]] = {
+    "goal": {"navigation_goal": "Log in with placeholder_u"},
+    "extraction_goal": {"data_extraction_goal": "Report the account placeholder_u signed in as"},
+    "schema": {"extracted_information_schema": {"type": "object", "description": "user placeholder_u"}},
+    "url": {"url": "https://example.com/login?user=placeholder_u"},
+    "complete_criterion": {"complete_criterion": "placeholder_u is shown as signed in"},
+    "terminate_criterion": {"terminate_criterion": "placeholder_u is locked"},
+}
+
+
 @pytest.mark.parametrize("encode", [lambda payload: payload, json.dumps], ids=["dict", "json_string"])
 @pytest.mark.parametrize(
-    ("arm", "mask_secrets", "expected_email"),
+    ("arm", "mask_secrets", "shown"),
     [
-        ("block", True, "placeholder_u"),
-        ("recovery", True, "placeholder_u"),
-        ("bare", True, "demo_business_user"),
-        ("block", False, "demo_business_user"),
+        ("block", True, None),
+        ("recovery", True, None),
+        ("bare", True, None),
+        ("block", False, None),
+        ("recovery", False, None),
+        ("block", False, "payload_text"),
+        *(("block", False, field) for field in _CREDENTIAL_TOKEN_IN_TASK_TEXT),
     ],
-    ids=["block", "recovery", "bare_with_workflow_run", "mask_off_block"],
+    ids=[
+        "block",
+        "recovery",
+        "bare_with_workflow_run",
+        "mask_off_block",
+        "mask_off_recovery",
+        "mask_off_placeholder_inside_payload_text",
+        *(f"mask_off_placeholder_in_{field}" for field in _CREDENTIAL_TOKEN_IN_TASK_TEXT),
+    ],
 )
 @pytest.mark.asyncio
 async def test_execute_task_v3_payload_value_equal_to_a_secret_reaches_the_loop_as_its_placeholder(
@@ -4825,16 +4846,19 @@ async def test_execute_task_v3_payload_value_equal_to_a_secret_reaches_the_loop_
     encode: Callable[[dict[str, str]], dict[str, str] | str],
     arm: str,
     mask_secrets: bool,
-    expected_email: str,
+    shown: str | None,
 ) -> None:
     run_context = _stub_recovery_run_context(monkeypatch, tested_url=None, mask_secrets=mask_secrets)
     run_context.secrets["placeholder_n"] = "1234"
     run_context.register_runtime_otp_value("837261")
+    tokens_before = set(run_context.secrets)
+    extra = {"note": "sign in as placeholder_u"} if shown == "payload_text" else {}
     payload = {
         "email": "demo_business_user",
         "pin": "1234",
         "code": "837261",
         "company": "Example Widgets",
+        **extra,
     }
 
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
@@ -4844,18 +4868,36 @@ async def test_execute_task_v3_payload_value_equal_to_a_secret_reaches_the_loop_
         workflow_owned_recovery=arm == "recovery",
         workflow_run_id="wr_test",
         navigation_payload=encode(payload),
-        data_extraction_goal=None,
-        extracted_information_schema=None,
+        **{
+            "data_extraction_goal": None,
+            "extracted_information_schema": None,
+            **_CREDENTIAL_TOKEN_IN_TASK_TEXT.get(shown or "", {}),
+        },
     )
 
-    assert loop_mock.await_args.kwargs["parameters"] == {
-        "email": expected_email,
+    loop_kwargs = loop_mock.await_args.kwargs
+    email = loop_kwargs["parameters"]["email"]
+    assert loop_kwargs["parameters"] == {
+        "email": email,
         "pin": "1234",
         "code": "837261",
         "company": "Example Widgets",
+        **extra,
     }
-    if expected_email == "placeholder_u":
-        assert loop_mock.await_args.kwargs["resolve_typed_text"]("placeholder_u") == "demo_business_user"
+    if arm == "bare":
+        assert email == "demo_business_user"
+        assert loop_kwargs["swapped_literal_tokens"] == frozenset()
+        return
+    assert loop_kwargs["resolve_typed_text"](email) == "demo_business_user"
+    if mask_secrets:
+        assert email == "placeholder_u"
+        assert loop_kwargs["swapped_literal_tokens"] == frozenset()
+        return
+    # Mask off: the literal is shown as a token of its own, judged as the literal; every token the run held before,
+    # wherever the task's text names it, keeps credential treatment.
+    assert email.startswith("placeholder_") and email not in tokens_before
+    assert loop_kwargs["swapped_literal_tokens"] == frozenset({email})
+    assert not loop_kwargs["swapped_literal_tokens"] & tokens_before
 
 
 @pytest.mark.asyncio
