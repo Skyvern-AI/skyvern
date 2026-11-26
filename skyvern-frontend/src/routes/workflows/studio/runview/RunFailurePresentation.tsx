@@ -26,7 +26,7 @@ export function FailureRecoveryActions({
       {onFix ? (
         <Button size="sm" onClick={onFix}>
           <MagicWandIcon className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
-          Fix with Copilot
+          Fix with Ember
         </Button>
       ) : null}
       {onRetry ? (

@@ -2066,11 +2066,11 @@ describe("metadata lifecycle", () => {
       titleHasBeenGenerated: false,
       description: "Reopened workflow",
     });
-    store.setTitleFromEmberIfDefault("Copilot title");
+    store.setTitleFromEmberIfDefault("Ember title");
     store.initializeTitle("New Agent", "wpid_next");
     store.syncTitleFromWorkflow("New Workflow");
     expect(useWorkflowTitleStore.getState()).toMatchObject({
-      title: "Copilot title",
+      title: "Ember title",
       titleHasBeenGenerated: true,
     });
     store.setTitleFromGeneration("Generated title");
@@ -2956,7 +2956,7 @@ describe("regular save transactions", () => {
   test.each([
     ["yaml", "A YAML commit is in progress"],
     ["save", "A save is in progress"],
-    ["copilot", "Wait for the Copilot change to finish"],
+    ["copilot", "Wait for the Ember change to finish"],
   ])("refuses a save during %s", async (lock, message) => {
     const { owner, view, client } = mountSave();
     if (lock === "yaml") beginYamlCommit(owner);

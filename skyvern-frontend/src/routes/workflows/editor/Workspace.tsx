@@ -391,7 +391,7 @@ export function useWorkspaceEmberUpdate({
         applyWorkflowUpdate(workflowData, { ...options, userDriven: true }) ===
         false
       )
-        throw new Error("The editor refused the Copilot update");
+        throw new Error("The editor refused the Ember update");
       const { fire, nextState } = shouldAutoOpenEditor(
         editorAutoOpenStateRef.current,
         {
@@ -1583,7 +1583,7 @@ function Workspace({
           variant: "destructive",
           title: "SOP not received",
           description:
-            "The SOP file did not reach the editor. Use Upload an SOP in the Copilot panel to try again.",
+            "The SOP file did not reach the editor. Use Upload an SOP in the Ember panel to try again.",
         });
       // After staging: opening the Ember pane navigates with the current URL, which would
       // put the marker back if it ran after this rewrite.
@@ -2344,7 +2344,7 @@ function Workspace({
     // A restore would replace the canvas a pending Ember proposal is staged on.
     if (useEmberProposalStore.getState().proposal) {
       toast({
-        title: "Resolve the Copilot proposal before restoring a version.",
+        title: "Resolve the Ember proposal before restoring a version.",
         variant: "destructive",
       });
       return;

@@ -925,7 +925,7 @@ export function InstantAckPlaceholder() {
       role="status"
       className="mt-2 text-[13px] leading-[1.55] text-muted-foreground"
     >
-      <span className="sr-only">Copilot is working on your request…</span>
+      <span className="sr-only">Ember is working on your request…</span>
       <span aria-hidden="true">Working…</span>
     </p>
   );
@@ -1193,7 +1193,7 @@ function testCardStatus(
       return {
         tone: "failed",
         word: failedWord(attempt),
-        note: turnEnded || !attempt.newest ? null : "Copilot is fixing it",
+        note: turnEnded || !attempt.newest ? null : "Ember is fixing it",
         glyph: <Cross2Icon aria-hidden="true" className={glyphClass} />,
       };
     case "stopped":
@@ -1862,7 +1862,7 @@ function FFittedSteps({ steps }: { steps: string[] }) {
 function TestInputSource({ input }: { input: EmberTestInput }) {
   switch (input.source) {
     case "copilot":
-      return <>set by Copilot</>;
+      return <>set by Ember</>;
     case "page":
       return <>from the page</>;
     case "earlier_run":
@@ -2889,7 +2889,7 @@ function FBudgetLimitNote({ budget }: { budget: BudgetExpiryState }) {
         className="mt-[3px] size-3 shrink-0 text-muted-foreground"
       />
       <span>
-        {`Reached this turn's ${limit} limit. Copilot stopped starting new work${
+        {`Reached this turn's ${limit} limit. Ember stopped starting new work${
           budget.reportProduced === true ? " and reported what it found" : ""
         }.`}
       </span>

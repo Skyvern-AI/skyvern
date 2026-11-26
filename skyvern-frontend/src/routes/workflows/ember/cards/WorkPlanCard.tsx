@@ -53,7 +53,7 @@ export function WorkPlanCard({
   ].filter(Boolean);
   return (
     <EmberCard>
-      <div role="group" aria-label={label ?? "Copilot's plan"}>
+      <div role="group" aria-label={label ?? "Ember's plan"}>
         <CardHeader
           icon={
             <ListBulletIcon className="h-3.5 w-3.5 text-muted-foreground" />

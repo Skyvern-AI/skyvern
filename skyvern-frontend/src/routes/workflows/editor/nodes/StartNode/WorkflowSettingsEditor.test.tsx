@@ -348,7 +348,7 @@ describe("WorkflowSettingsEditor mask secrets setting", () => {
 describe("WorkflowSettingsEditor code block AI fallback", () => {
   test("has no per-workflow switch on an Ember-authored workflow in Studio", () => {
     vi.mocked(useWorkflowQuery).mockReturnValue({
-      data: { title: "Copilot workflow", copilot_authored: true },
+      data: { title: "Ember workflow", copilot_authored: true },
     } as unknown as ReturnType<typeof useWorkflowQuery>);
     renderSettings();
 

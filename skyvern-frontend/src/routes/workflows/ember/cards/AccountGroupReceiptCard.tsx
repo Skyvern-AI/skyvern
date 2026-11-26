@@ -92,8 +92,8 @@ export function AccountGroupReceiptCard({
           }
           title={
             singleRun
-              ? "Copilot asked you to review a run"
-              : `Copilot asked you to review ${plural(review.rows.length, rowGroup ? "run" : "account")}`
+              ? "Ember asked you to review a run"
+              : `Ember asked you to review ${plural(review.rows.length, rowGroup ? "run" : "account")}`
           }
         />
       </div>
@@ -264,7 +264,7 @@ export function AccountGroupReceiptCard({
       {group && group.status !== "finished" ? (
         <p className="pl-4 text-muted-foreground">
           The chat's Stop button does not stop these runs. To stop them, ask
-          Copilot to cancel the group.
+          Ember to cancel the group.
         </p>
       ) : null}
       {query.isError ? (
@@ -276,7 +276,7 @@ export function AccountGroupReceiptCard({
         <p className="pl-4 text-muted-foreground">Starting the runs…</p>
       ) : (
         <p className="pl-4 text-muted-foreground">
-          No run group is linked to this approval. Copilot's reply says whether
+          No run group is linked to this approval. Ember's reply says whether
           the runs started.
         </p>
       )}
@@ -328,7 +328,7 @@ export function AccountGroupCancelReceipt({
               className="size-3.5 shrink-0"
             />
           }
-          title={`Copilot asked whether to stop ${plural(count, "run")}`}
+          title={`Ember asked whether to stop ${plural(count, "run")}`}
         />
       </div>
     );

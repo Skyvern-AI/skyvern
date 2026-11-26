@@ -69,7 +69,7 @@ function useDemoLoginGuide(loginUrl: string | undefined, active: boolean) {
       {
         element: "[data-tour='credential-save']",
         title: "Save it",
-        description: "Copilot signs in with it and keeps building.",
+        description: "Ember signs in with it and keeps building.",
         side: "right",
         done: () => false,
       },

@@ -551,7 +551,7 @@ describe("WorkflowEditor deleted-agent run fallback", () => {
       screen.getAllByText("Source agent deleted — this run is view-only."),
     ).toHaveLength(2);
     expect(
-      (screen.getByRole("button", { name: "Copilot" }) as HTMLButtonElement)
+      (screen.getByRole("button", { name: "Ember" }) as HTMLButtonElement)
         .disabled,
     ).toBe(true);
     expect(
@@ -617,7 +617,7 @@ describe("WorkflowEditor deleted-agent run fallback", () => {
     expect(screen.getByLabelText("Save workflow")).toBeTruthy();
     expect(screen.getByRole("button", { name: /^Run$/ })).toBeTruthy();
     expect(
-      (screen.getByRole("button", { name: "Copilot" }) as HTMLButtonElement)
+      (screen.getByRole("button", { name: "Ember" }) as HTMLButtonElement)
         .disabled,
     ).toBe(false);
   });
@@ -1199,7 +1199,7 @@ describe("save failures stop navigation and block runs", () => {
       ]);
       expect(toast).toHaveBeenCalledWith(
         expect.objectContaining({
-          title: "Wait for the Copilot change to finish",
+          title: "Wait for the Ember change to finish",
         }),
       );
       act(() => canvas.harness.targetBlock());
@@ -1236,7 +1236,7 @@ describe("save failures stop navigation and block runs", () => {
       ]);
       expect(toast).toHaveBeenCalledWith(
         expect.objectContaining({
-          title: "Wait for the Copilot change to finish",
+          title: "Wait for the Ember change to finish",
         }),
       );
       expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("ember");
@@ -1466,7 +1466,7 @@ describe("save failures stop navigation and block runs", () => {
       expect(canvas.harness.graph.nodes).toHaveLength(3);
       expect(toast).toHaveBeenCalledWith(
         expect.objectContaining({
-          title: "Wait for the Copilot change to finish",
+          title: "Wait for the Ember change to finish",
         }),
       );
     } finally {
@@ -2238,7 +2238,7 @@ describe("save failures stop navigation and block runs", () => {
       });
       expect(screen.getByTestId("comparison")).toBeTruthy();
       // The chat's hold reaches the open comparison as it changes, not as it stood at Review.
-      const hold = "Copilot is saving your accepted changes.";
+      const hold = "Ember is saving your accepted changes.";
       act(() =>
         useWorkflowHasChangesStore.getState().setSaveBlockedReason(hold),
       );
@@ -3014,7 +3014,7 @@ describe("save failures stop navigation and block runs", () => {
     },
   );
 
-  const SAVE_HOLD = "Copilot is saving your accepted changes.";
+  const SAVE_HOLD = "Ember is saving your accepted changes.";
   const setSaveHold = (reason: string | null) =>
     act(() =>
       useWorkflowHasChangesStore.getState().setSaveBlockedReason(reason),
@@ -3247,7 +3247,7 @@ describe("save failures stop navigation and block runs", () => {
     }
   });
 
-  const PROPOSAL_HOLD = "Resolve the Copilot proposal before saving.";
+  const PROPOSAL_HOLD = "Resolve the Ember proposal before saving.";
   test("a pending Ember proposal disables Save as Template and hides version history, so Accept stays the only way to save it", async () => {
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
@@ -4445,10 +4445,10 @@ describe("A49 metadata authorship through editor actions", () => {
     },
   );
 
-  test.each(["clean", "Copilot startup", "storage unavailable"])(
+  test.each(["clean", "Ember startup", "storage unavailable"])(
     "A54 %s load hydrates exactly once and keeps local edits on refetch",
     async (mode) => {
-      integration.chat = mode === "Copilot startup";
+      integration.chat = mode === "Ember startup";
       history.proposed_workflow = null;
       history.proposed_workflow_metadata = null;
       let finishHistory!: (response: {

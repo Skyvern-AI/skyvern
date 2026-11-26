@@ -138,7 +138,7 @@ describe("useStudioOnboardingTour", () => {
   });
 
   it.each<[string, string, string | null]>([
-    ["a Copilot handoff", "/agents/wpid_1/studio?via=discover", null],
+    ["an Ember handoff", "/agents/wpid_1/studio?via=discover", null],
     ["a generated agent", "/agents/wpid_1/studio", "wpid_1"],
   ])(
     "waits for the run's browser to go live after %s from Home",

@@ -1041,7 +1041,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     await closeStreamWithoutTerminal();
     expect(
       screen.getByText(
-        "The connection dropped, so Copilot is checking whether this turn finished.",
+        "The connection dropped, so Ember is checking whether this turn finished.",
       ),
     ).toBeTruthy();
     expect(
@@ -1055,7 +1055,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     expect(renderedText()).toContain(capturedAiText);
     expect(
       screen.queryByText(
-        "The connection dropped, so Copilot is checking whether this turn finished.",
+        "The connection dropped, so Ember is checking whether this turn finished.",
       ),
     ).toBeNull();
   });
@@ -1366,7 +1366,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     await startTurn();
     await closeStreamWithoutTerminal();
     expect(renderedText()).toContain(
-      "Copilot is checking whether this turn finished",
+      "Ember is checking whether this turn finished",
     );
 
     for (let i = 0; i < 3; i += 1) {
@@ -1386,7 +1386,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
       useWorkflowYamlEditorStore.getState().emberAcceptance,
     ).not.toBeNull();
     expect(renderedText()).toContain(
-      "Copilot is checking whether this turn finished",
+      "Ember is checking whether this turn finished",
     );
     historyQueue.shift();
     const inFlight = historySignals[historySignals.length - 1];
@@ -1398,7 +1398,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     expect(historyQueue.length).toBe(1);
     expect(historySignals[historySignals.length - 1]?.aborted).toBe(true);
     expect(renderedText()).toContain(
-      "Could not confirm whether Copilot saved changes",
+      "Could not confirm whether Ember saved changes",
     );
     expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
   });
@@ -1637,7 +1637,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     await startTurn();
     await closeStreamWithoutTerminal();
     expect(renderedText()).toContain(
-      "Copilot is checking whether this turn finished",
+      "Ember is checking whether this turn finished",
     );
 
     for (let i = 0; i < 64; i += 1) {
@@ -1650,10 +1650,10 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
 
     // Recovery has stopped, so a notice saying it is still refreshing is stale.
     expect(renderedText()).not.toContain(
-      "Copilot is checking whether this turn finished",
+      "Ember is checking whether this turn finished",
     );
     expect(renderedText()).toContain(
-      "Could not confirm whether Copilot saved changes",
+      "Could not confirm whether Ember saved changes",
     );
     expect(
       useWorkflowYamlEditorStore.getState().emberAcceptance,
@@ -1940,7 +1940,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
         },
         { timeout: 5_000 },
       );
-      expect(renderedText()).toContain("Cancelling the Copilot turn");
+      expect(renderedText()).toContain("Cancelling the Ember turn");
       expect(
         (screen.getByRole("button", { name: "Reject" }) as HTMLButtonElement)
           .disabled,
@@ -2075,7 +2075,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
       expect(useWorkflowYamlEditorStore.getState().emberAcceptance).toBe(
         reservation,
       );
-      expect(renderedText()).toContain("Cancelling the Copilot turn");
+      expect(renderedText()).toContain("Cancelling the Ember turn");
 
       await advance(2_000);
       await resolveNextHistory(otherTurnHistory());
@@ -2201,8 +2201,8 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
       );
       expect(toast).toHaveBeenCalledWith(
         expect.objectContaining({
-          title: "Could not cancel the Copilot turn",
-          description: "Copilot will keep checking for saved changes.",
+          title: "Could not cancel the Ember turn",
+          description: "Ember will keep checking for saved changes.",
         }),
       );
       expect(useWorkflowYamlEditorStore.getState().emberAcceptance).toBe(
@@ -2448,7 +2448,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
       reservation,
     );
     await advance(1_500_000);
-    expect(renderedText()).toContain("Cancelling the Copilot turn");
+    expect(renderedText()).toContain("Cancelling the Ember turn");
     expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
     expect(useWorkflowYamlEditorStore.getState().emberAcceptance).toBe(
       reservation,
@@ -2477,7 +2477,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     await startTurn();
     await closeStreamWithoutTerminal();
     expect(renderedText()).toContain(
-      "Copilot is checking whether this turn finished",
+      "Ember is checking whether this turn finished",
     );
 
     for (let i = 0; i < 3; i += 1) {
@@ -2494,7 +2494,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     await advance(120_000);
     expect(historyQueue.length).toBe(1);
     expect(renderedText()).toContain(
-      "Copilot is checking whether this turn finished",
+      "Ember is checking whether this turn finished",
     );
     await advance(1_500_000);
     expect(historySignals[historySignals.length - 1]?.aborted).toBe(true);
@@ -2666,7 +2666,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     await startTurn();
     await closeStreamWithoutTerminal();
     expect(renderedText()).toContain(
-      "Copilot is checking whether this turn finished",
+      "Ember is checking whether this turn finished",
     );
 
     for (let i = 0; i < 64; i += 1) {
@@ -2679,10 +2679,10 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
 
     // Recovery has stopped, so a notice saying it is still refreshing is stale.
     expect(renderedText()).not.toContain(
-      "Copilot is checking whether this turn finished",
+      "Ember is checking whether this turn finished",
     );
     expect(renderedText()).toContain(
-      "Could not confirm whether Copilot saved changes",
+      "Could not confirm whether Ember saved changes",
     );
   });
 
@@ -2747,7 +2747,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
 
     expect(renderedText()).toContain(interruptedText);
     expect(renderedText()).not.toContain(
-      "Could not confirm whether Copilot saved changes",
+      "Could not confirm whether Ember saved changes",
     );
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     expect(workflowGets.length).toBeGreaterThan(readsBeforeRow);
@@ -2881,7 +2881,7 @@ describe("EmberChat — question transport", () => {
     );
     const tray = await screen.findByRole("group", { name: "Question parts" });
     expect(tray.nextElementSibling).toBe(
-      screen.getByRole("group", { name: "Copilot message composer" }),
+      screen.getByRole("group", { name: "Ember message composer" }),
     );
     expect(useEmberHeaderStore.getState().attention).toBe("question");
 

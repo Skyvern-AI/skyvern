@@ -113,7 +113,7 @@ it("converts an unstaged reload baseline's parameter keys before classifying cha
       .parameter_keys,
   ).toEqual(["account_id"]);
   expect(
-    screen.getByRole("region", { name: "Copilot proposal" }).textContent,
+    screen.getByRole("region", { name: "Ember proposal" }).textContent,
   ).not.toContain("step changed");
 });
 
@@ -134,7 +134,7 @@ it("uses the converter's deployment default of 40, not a guessed max_steps value
       .max_steps,
   ).toBeNull();
   expect(
-    screen.getByRole("region", { name: "Copilot proposal" }).textContent,
+    screen.getByRole("region", { name: "Ember proposal" }).textContent,
   ).not.toContain("step changed");
 });
 

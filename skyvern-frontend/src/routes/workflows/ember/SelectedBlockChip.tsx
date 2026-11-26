@@ -16,7 +16,7 @@ export function SelectedBlockChip() {
   }
   return (
     <div
-      title="Copilot can see this canvas selection"
+      title="Ember can see this canvas selection"
       className="mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full bg-slate-400/[0.12] px-2.5 py-0.5 text-xs text-muted-foreground"
     >
       <Share1Icon className="h-3 w-3 shrink-0" aria-hidden />

@@ -1420,7 +1420,7 @@ describe("RunView failed blocks of a run that continued", () => {
 
     const scope = within(container);
     expect(scope.getByText("missing.")).not.toBeNull();
-    fireEvent.click(scope.getByRole("button", { name: "Fix with Copilot" }));
+    fireEvent.click(scope.getByRole("button", { name: "Fix with Ember" }));
     expect(onFix).toHaveBeenCalledWith("fill_policy_dates");
   });
 
@@ -1446,15 +1446,13 @@ describe("RunView failed blocks of a run that continued", () => {
     const scope = within(view.container);
 
     expect(scope.getByText("missing.")).not.toBeNull();
-    expect(
-      scope.queryByRole("button", { name: "Fix with Copilot" }),
-    ).toBeNull();
+    expect(scope.queryByRole("button", { name: "Fix with Ember" })).toBeNull();
 
     seedContinuedLoopFailure(Status.Completed);
     view.rerenderRunView();
 
     expect(
-      scope.getByRole("button", { name: "Fix with Copilot" }),
+      scope.getByRole("button", { name: "Fix with Ember" }),
     ).not.toBeNull();
   });
 
@@ -1469,7 +1467,7 @@ describe("RunView failed blocks of a run that continued", () => {
 
       expect(
         within(view.container).queryByRole("button", {
-          name: "Fix with Copilot",
+          name: "Fix with Ember",
         }),
       ).toBeNull();
       cleanup();
@@ -1528,7 +1526,7 @@ describe("RunView failure presentation", () => {
     expect(
       line.getByText("Login page rejected the credentials"),
     ).not.toBeNull();
-    fireEvent.click(line.getByRole("button", { name: "Fix with Copilot" }));
+    fireEvent.click(line.getByRole("button", { name: "Fix with Ember" }));
     expect(onFix).toHaveBeenCalledTimes(1);
     fireEvent.click(line.getByRole("button", { name: "Retry" }));
     expect(onRetry).toHaveBeenCalledTimes(1);
@@ -1547,7 +1545,7 @@ describe("RunView failure presentation", () => {
     );
     const line = within(getByTestId("run-failure-line"));
 
-    expect(line.queryByRole("button", { name: "Fix with Copilot" })).toBeNull();
+    expect(line.queryByRole("button", { name: "Fix with Ember" })).toBeNull();
     expect(line.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
@@ -1569,7 +1567,7 @@ describe("RunView failure presentation", () => {
     const { container } = renderRunView({ onFix, onRetry: vi.fn() });
 
     fireEvent.click(
-      within(container).getByRole("button", { name: "Fix with Copilot" }),
+      within(container).getByRole("button", { name: "Fix with Ember" }),
     );
 
     expect(onFix.mock.calls[0]?.[0]).toBe("checkout");
@@ -1585,7 +1583,7 @@ describe("RunView failure presentation", () => {
     const { container } = renderRunView({ onFix: vi.fn(), onRetry: vi.fn() });
 
     expect(
-      within(container).queryByRole("button", { name: "Fix with Copilot" }),
+      within(container).queryByRole("button", { name: "Fix with Ember" }),
     ).toBeNull();
   });
 
@@ -1688,7 +1686,7 @@ describe("RunView failure presentation", () => {
     expect(scope.getByText("user_code_error")).not.toBeNull();
     // The run-level line already offers Fix for this block, so the card does not repeat it.
     expect(
-      scope.getAllByRole("button", { name: "Fix with Copilot" }),
+      scope.getAllByRole("button", { name: "Fix with Ember" }),
     ).toHaveLength(1);
   });
 
@@ -1939,7 +1937,7 @@ describe("RunView failure presentation", () => {
     const line = within(getByTestId("run-failure-line"));
 
     expect(line.getByText("— The code sandbox was unreachable")).not.toBeNull();
-    expect(line.queryByRole("button", { name: "Fix with Copilot" })).toBeNull();
+    expect(line.queryByRole("button", { name: "Fix with Ember" })).toBeNull();
 
     const retry = line.getByRole("button", { name: "Retry" });
     expect(retry.className).toContain("bg-cta");
@@ -1955,7 +1953,7 @@ describe("RunView failure presentation", () => {
     const { getByTestId } = renderRunView({ onFix: vi.fn(), onRetry: vi.fn() });
     const line = within(getByTestId("run-failure-line"));
 
-    expect(line.queryByRole("button", { name: "Fix with Copilot" })).toBeNull();
+    expect(line.queryByRole("button", { name: "Fix with Ember" })).toBeNull();
     expect(line.getByRole("button", { name: "Retry" })).not.toBeNull();
   });
 
@@ -1967,9 +1965,7 @@ describe("RunView failure presentation", () => {
     const { getByTestId } = renderRunView({ onFix: vi.fn(), onRetry: vi.fn() });
     const line = within(getByTestId("run-failure-line"));
 
-    expect(
-      line.getByRole("button", { name: "Fix with Copilot" }),
-    ).not.toBeNull();
+    expect(line.getByRole("button", { name: "Fix with Ember" })).not.toBeNull();
   });
 
   test("a code block that continued on failure does not retitle the line", () => {
@@ -2037,9 +2033,7 @@ describe("RunView failure presentation", () => {
     const scope = within(container);
 
     expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_unlabeled");
-    expect(
-      line.getByRole("button", { name: "Fix with Copilot" }),
-    ).not.toBeNull();
+    expect(line.getByRole("button", { name: "Fix with Ember" })).not.toBeNull();
     expect(line.getByRole("button", { name: "Retry" })).not.toBeNull();
     // The pinned block's own reason is identical to the run's, so it's fully
     // stated on the strip already: the block detail must not repeat it.
@@ -2504,7 +2498,7 @@ describe("RunView output signals", () => {
 
   test("does not substitute persisted Ember prose for a genuinely omitted output", async () => {
     const corroboratingProse =
-      "Copilot found 22.9k stars, matching the value visible in the source.";
+      "Ember found 22.9k stars, matching the value visible in the source.";
     getSpy.mockImplementation((path: string) => {
       if (path === "/ember/chat-history") {
         return Promise.resolve({

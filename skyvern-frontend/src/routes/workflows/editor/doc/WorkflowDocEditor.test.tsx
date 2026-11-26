@@ -266,7 +266,7 @@ describe("WorkflowDocEditor navigation", () => {
 
     test("Try Ember opens the Ember pane and the suggestion does not come back", () => {
       renderDoc([], edits);
-      fireEvent.click(screen.getByRole("button", { name: "Try Copilot" }));
+      fireEvent.click(screen.getByRole("button", { name: "Try Ember" }));
       expect(openPane).toHaveBeenCalledWith("ember");
       expect(nudge()).toBeNull();
       cleanup();
@@ -364,7 +364,7 @@ describe("WorkflowDocEditor navigation", () => {
           offersTry ? DOC_EMBER_NUDGE.text : DOC_EMBER_NUDGE.textBeside,
         );
         expect(
-          screen.queryByRole("button", { name: "Try Copilot" }) !== null,
+          screen.queryByRole("button", { name: "Try Ember" }) !== null,
         ).toBe(offersTry);
       },
     );
@@ -3219,8 +3219,8 @@ describe("Demonstrate task in the step menu", () => {
     renderDoc(twoSteps, edits);
     fireEvent.click(screen.getByRole("button", { name: "+ Add step" }));
 
-    expect(screen.getByText("Copilot")).toBeTruthy();
-    expect(screen.getByText("Show Copilot how in the browser")).toBeTruthy();
+    expect(screen.getByText("Ember")).toBeTruthy();
+    expect(screen.getByText("Show Ember how in the browser")).toBeTruthy();
     fireEvent.change(screen.getByPlaceholderText("Add a step…"), {
       target: { value: "demo" },
     });
@@ -4085,7 +4085,7 @@ describe("naming a step from its title", () => {
         ),
     ],
     [
-      "a Copilot proposal",
+      "an Ember proposal",
       (_doc, on) =>
         act(() =>
           useEmberProposalStore
@@ -4121,7 +4121,7 @@ describe("naming a step from its title", () => {
       fireEvent.change(field()!, { target: { value: "Write the note" } });
       lock(doc, true);
       // A proposal shows Ember's steps instead; every other lock leaves the field on screen, read-only, with the caret.
-      if (name !== "a Copilot proposal") {
+      if (name !== "an Ember proposal") {
         expect(field()?.readOnly).toBe(true);
         expect(document.activeElement).toBe(field());
         fireEvent.keyDown(field()!, { key: "Enter" });

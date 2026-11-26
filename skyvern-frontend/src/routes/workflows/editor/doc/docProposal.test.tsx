@@ -236,13 +236,13 @@ async function renderProposal(
 describe("Ember proposal in the Doc view", () => {
   test("the banner says Tested when Ember ran the proposal and Untested when it did not", async () => {
     await renderDoc(true, true, true);
-    const banner = screen.getByRole("region", { name: "Copilot proposal" });
+    const banner = screen.getByRole("region", { name: "Ember proposal" });
     expect(banner.textContent).toContain("Tested");
     expect(banner.textContent).not.toContain("Untested");
     cleanup();
     await renderDoc(true, true, false);
     expect(
-      screen.getByRole("region", { name: "Copilot proposal" }).textContent,
+      screen.getByRole("region", { name: "Ember proposal" }).textContent,
     ).toContain("Untested");
   });
 
@@ -287,7 +287,7 @@ describe("Ember proposal in the Doc view", () => {
       <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
     );
 
-    const card = screen.getByRole("region", { name: "Copilot proposal" });
+    const card = screen.getByRole("region", { name: "Ember proposal" });
     expect(card.textContent).toContain("2 workflow settings changed");
     expect(card.textContent).toContain("workflow description removed");
     fireEvent.click(within(card).getByRole("button", { expanded: false }));
@@ -437,7 +437,7 @@ describe("Ember proposal in the Doc view", () => {
       <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
     );
 
-    const card = screen.getByRole("region", { name: "Copilot proposal" });
+    const card = screen.getByRole("region", { name: "Ember proposal" });
     expect(card.textContent).toContain("3 inputs changed");
     fireEvent.click(within(card).getByRole("button", { expanded: false }));
     const rows = [...card.querySelectorAll("li")];
@@ -485,7 +485,7 @@ describe("Ember proposal in the Doc view", () => {
       await renderInStudio(
         <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
       );
-      const card = screen.getByRole("region", { name: "Copilot proposal" });
+      const card = screen.getByRole("region", { name: "Ember proposal" });
       expect(card.textContent).toContain("1 step changed");
       expect(screen.getByText("Open the proposed page.")).not.toBeNull();
     } finally {
@@ -669,7 +669,7 @@ describe("Ember proposal in the Doc view", () => {
       )?.status,
     ).toBe("unchanged");
     await renderDoc();
-    const card = screen.getByRole("region", { name: "Copilot proposal" });
+    const card = screen.getByRole("region", { name: "Ember proposal" });
 
     expect(card.textContent).toContain("2 steps changed · 1 removed");
     expect(card.textContent).not.toContain("Kept your notes");
@@ -726,7 +726,7 @@ describe("Ember proposal in the Doc view", () => {
 
     fireEvent.click(details("Open page"));
     expect(screen.queryByText("The results show")).toBeNull();
-    const card = screen.getByRole("region", { name: "Copilot proposal" });
+    const card = screen.getByRole("region", { name: "Ember proposal" });
     fireEvent.click(within(card).getByRole("button", { expanded: false }));
     fireEvent.click(within(card).getByText("Open Page"));
     expect(details("Open page").getAttribute("aria-expanded")).toBe("true");
@@ -1144,7 +1144,7 @@ describe("Ember proposal in the Doc view", () => {
     await renderInStudio(
       <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
     );
-    const card = screen.getByRole("region", { name: "Copilot proposal" });
+    const card = screen.getByRole("region", { name: "Ember proposal" });
     fireEvent.click(within(card).getByRole("button", { expanded: false }));
     const renderedMarks = [...card.querySelectorAll("button")]
       .map((button) =>
@@ -1217,7 +1217,7 @@ describe("Ember proposal in the Doc view", () => {
     act(() => useWorkflowHasChangesStore.getState().setHasChanges(true));
     await renderDoc();
     expect(
-      screen.getByRole("region", { name: "Copilot proposal" }),
+      screen.getByRole("region", { name: "Ember proposal" }),
     ).not.toBeNull();
     expect(screen.queryByText("Unsaved changes")).toBe(null);
     expect(screen.queryByRole("button", { name: "Save" })).toBe(null);
@@ -1228,9 +1228,7 @@ describe("Ember proposal in the Doc view", () => {
     await renderDoc();
     act(() => useEmberProposalStore.getState().setProposal(null));
 
-    expect(screen.queryByRole("region", { name: "Copilot proposal" })).toBe(
-      null,
-    );
+    expect(screen.queryByRole("region", { name: "Ember proposal" })).toBe(null);
     expect(screen.getByText("Goal of old_step")).not.toBeNull();
   });
 });

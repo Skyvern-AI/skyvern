@@ -56,7 +56,7 @@ const MENU_ITEM_CLASS =
 const FINISHED_RUN_BROWSER_LABEL =
   "This run has finished — shows the agent's debug browser, not the run";
 const FINISHED_RUN_OWN_BROWSER_LABEL =
-  "This run has finished — shows its browser, still open while Copilot works in it";
+  "This run has finished — shows its browser, still open while Ember works in it";
 
 // Status, not a switch: with no run open there is nothing to toggle to, but
 // the user still needs to know whether the browser they see is up yet.
@@ -222,7 +222,7 @@ export function BrowserPaneViewPills() {
       : finishedRun
         ? "Debug browser"
         : emberBrowserFocused
-          ? "Copilot browser"
+          ? "Ember browser"
           : "Live";
   const showsDebugBrowserAfterRun = finishedRun && liveSurface === "debug";
 

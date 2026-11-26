@@ -22,11 +22,11 @@ export function DocStarterNote() {
 
 export const DOC_EMBER_NUDGE = {
   tip: "copilot",
-  text: "Starting a new agent? Copilot can build it from a description of the task. The Doc is best for reading and fixing an agent.",
+  text: "Starting a new agent? Ember can build it from a description of the task. The Doc is best for reading and fixing an agent.",
   // Ember is already on screen beside the Doc, so the note points at it instead of offering to open it.
   textBeside:
-    "Starting a new agent? Copilot, next to this page, can build it from a description of the task. The Doc is best for reading and fixing an agent.",
-  action: "Try Copilot",
+    "Starting a new agent? Ember, next to this page, can build it from a description of the task. The Doc is best for reading and fixing an agent.",
+  action: "Try Ember",
   dismiss: "Dismiss",
 } as const;
 

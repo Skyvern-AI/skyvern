@@ -167,7 +167,7 @@ export function SaveButton() {
   const proposalPending = useEmberProposalStore((s) => s.proposal !== null);
   const saveUnavailable = saveLockReason !== null || proposalPending;
   const saveUnavailableReason = proposalPending
-    ? "Resolve the Copilot proposal before saving."
+    ? "Resolve the Ember proposal before saving."
     : saveLockReason;
   const onSave = useSaveWorkflow();
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -430,7 +430,7 @@ function PhoneTopBarItems() {
 const NO_DOC_PROBLEMS: DocRunCheckProblem[] = [];
 
 const NO_BLOCKS_RUN_TOOLTIP =
-  "Add a block or ask Copilot to build the agent before running";
+  "Add a block or ask Ember to build the agent before running";
 
 // stopOnly: global (read-only) workflows can't start runs from the studio, but
 // runs started elsewhere (e.g. the recipe pages run templates in place) still

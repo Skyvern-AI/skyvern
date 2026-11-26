@@ -163,7 +163,7 @@ export function ConnectedAccountChoiceMarker() {
   return (
     <AttentionMarker
       icon={<Link2Icon aria-hidden className="size-3.5 shrink-0" />}
-      title="Copilot needs an account"
+      title="Ember needs an account"
     />
   );
 }

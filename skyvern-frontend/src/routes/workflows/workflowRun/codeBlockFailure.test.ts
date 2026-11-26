@@ -276,7 +276,7 @@ describe("describeCodeBlockFailure", () => {
     ];
     for (const failure of failures) {
       expect(failure?.recovery).not.toBe("retry");
-      expect(failure?.guidance).toContain("Fix with Copilot");
+      expect(failure?.guidance).toContain("Fix with Ember");
       expect(failure?.guidance).not.toMatch(
         /open the block|fix the line|your code|\b(edit|rewrite)\b/i,
       );

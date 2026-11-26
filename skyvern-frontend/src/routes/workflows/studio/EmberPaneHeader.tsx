@@ -62,7 +62,7 @@ export function EmberActiveDot() {
   const attention = useEmberHeaderStore((state) => state.attention);
   const label = attention
     ? EMBER_ATTENTION_DOT[attention]
-    : "Copilot session active";
+    : "Ember session active";
   return (
     <span
       role="img"

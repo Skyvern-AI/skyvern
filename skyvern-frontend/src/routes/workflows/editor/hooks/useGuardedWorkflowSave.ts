@@ -11,7 +11,7 @@ import {
 import { useSaveWorkflow } from "./useSaveWorkflow";
 
 export const PENDING_GOAL_SAVE_MESSAGE =
-  "Review the pending Copilot changes, then save from the editor.";
+  "Review the pending Ember changes, then save from the editor.";
 
 export function useGuardedWorkflowSave() {
   const isGlobalWorkflow = useIsGlobalWorkflow();

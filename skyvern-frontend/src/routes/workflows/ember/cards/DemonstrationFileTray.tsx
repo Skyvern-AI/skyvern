@@ -36,7 +36,7 @@ export function DemonstrationFileTray({
       embedded={tray.embedded}
     >
       <div className="px-3 pb-2.5 pt-1 text-[11px] leading-relaxed text-muted-foreground">
-        The page opened a file picker. Choose the file to attach here; Copilot
+        The page opened a file picker. Choose the file to attach here; Ember
         saves it as the default for the workflow&apos;s file input.
       </div>
       <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border px-3 py-1.5">

@@ -1172,7 +1172,7 @@ function NodeHeader({
     playInert || demonstrationPending || runBlock.isPending
       ? "Wait for the current run to finish"
       : !startDemonstration
-        ? "Copilot can't start a demonstration right now"
+        ? "Ember can't start a demonstration right now"
         : null;
   const canRunDemonstrationPrefix = Boolean(
     demonstrationTarget &&
@@ -1240,12 +1240,12 @@ function NodeHeader({
                       demonstrationTarget.prefixLabels.length === 1
                         ? "it finishes"
                         : "they finish"
-                    }, the browser is yours: show how to do ${blockLabel}, then press Done. Copilot rewrites this block from what you show.`
+                    }, the browser is yours: show how to do ${blockLabel}, then press Done. Ember rewrites this block from what you show.`
                   : `${
                       demonstrationTarget.runUnavailableReason
                         ? `${demonstrationTarget.runUnavailableReason} Get the browser to ${blockLabel} yourself, then`
                         : "In the browser,"
-                    } show how to do ${blockLabel} and press Done. Copilot rewrites this block from what you show.`}
+                    } show how to do ${blockLabel} and press Done. Ember rewrites this block from what you show.`}
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>

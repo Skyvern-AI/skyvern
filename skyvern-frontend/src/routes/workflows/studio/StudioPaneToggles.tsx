@@ -199,7 +199,7 @@ export function StudioPaneToggles() {
         const ariaLabel = showActivityDot
           ? "Browser, new activity"
           : awaiting
-            ? `Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`
+            ? `Ember, ${EMBER_ATTENTION_LABEL[awaiting]}`
             : isRunControl && runStatus
               ? `${label}, ${runStatusLabel(runStatus)}`
               : label;
@@ -215,7 +215,7 @@ export function StudioPaneToggles() {
             ) : awaiting ? (
               <StudioPaneAttentionDot
                 tone="waiting"
-                title={`Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`}
+                title={`Ember, ${EMBER_ATTENTION_LABEL[awaiting]}`}
               />
             ) : showRunStatusDot && runStatus ? (
               <span

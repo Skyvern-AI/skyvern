@@ -1003,7 +1003,7 @@ describe("applyNarrativeEvent — terminal", () => {
           terminal: "error",
           terminalMessage:
             "Copilot hit an internal error before it could finish this turn.",
-          narrativeSummary: "Copilot hit an internal error.",
+          narrativeSummary: "Ember hit an internal error.",
           priorBlockCount: null,
           designActivity: [],
           startedAt: "2026-05-25T00:00:00Z",
@@ -1013,7 +1013,7 @@ describe("applyNarrativeEvent — terminal", () => {
     );
 
     expect(s.terminal).toBe("error");
-    expect(s.narrativeSummary).toBe("Copilot hit an internal error.");
+    expect(s.narrativeSummary).toBe("Ember hit an internal error.");
     expect(s.blocks).toHaveLength(1);
     expect(s.blocks[0]?.state).toBe("failed");
   });
@@ -1640,7 +1640,7 @@ describe("test run inputs under the run row", () => {
     const html = openInputs(turnWith(blocks));
     for (const text of [
       "copilot-value",
-      "set by Copilot",
+      "set by Ember",
       "page-value",
       "from the page",
       "reused-token",

@@ -71,8 +71,8 @@ export class CredentialRecoveryHistoryError extends Error {
     const safeStatus = typeof status === "number" ? status : null;
     super(
       safeStatus === null
-        ? "Copilot history request failed"
-        : `Copilot history request failed (${safeStatus})`,
+        ? "Ember history request failed"
+        : `Ember history request failed (${safeStatus})`,
     );
     this.name = "CredentialRecoveryHistoryError";
     this.status = safeStatus;

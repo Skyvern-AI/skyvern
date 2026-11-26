@@ -10,7 +10,7 @@ function WorkflowCreatorLabel({ createdBy }: Props) {
   // Non-member values: null for API-key creates and pre-attribution rows, "{org_id}_user" for the shared UI key.
   const name =
     createdBy === "copilot"
-      ? "Copilot"
+      ? "Ember"
       : createdBy
         ? resolveMemberName(createdBy)
         : null;

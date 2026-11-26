@@ -275,7 +275,7 @@ export function DocProposalCard({
     proposal.comparisonPending || Boolean(proposal.comparisonError);
   return (
     <section
-      aria-label="Copilot proposal"
+      aria-label="Ember proposal"
       className="mb-[18px] rounded-lg bg-[#F3EEF8] shadow-[0_1px_3px_rgba(0,0,0,0.12)] dark:bg-[rgba(183,147,218,.15)]"
     >
       {/* One line unless the title cannot sit beside the buttons; then they wrap below it. */}
@@ -307,7 +307,7 @@ export function DocProposalCard({
               </span>
             </span>
             {!comparisonUnavailable && summaryParts.length > 0 && (
-              <span>{summaryParts.join(" · ")} by Copilot.</span>
+              <span>{summaryParts.join(" · ")} by Ember.</span>
             )}
           </span>
         </button>

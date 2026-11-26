@@ -438,7 +438,7 @@ describe("SaveButton confirmation gating", () => {
     },
     {
       lock: { emberAcceptance: Symbol("acceptance") },
-      reason: "Wait for the Copilot change to finish",
+      reason: "Wait for the Ember change to finish",
     },
   ])(
     "disables Save while the editor is locked: $reason",
@@ -474,7 +474,7 @@ describe("SaveButton confirmation gating", () => {
     renderSaveButton();
     const save = screen.getByRole("button", {
       name: "Save workflow",
-      description: "Resolve the Copilot proposal before saving.",
+      description: "Resolve the Ember proposal before saving.",
     });
     expect(save.matches(":disabled")).toBe(true);
 
@@ -599,7 +599,7 @@ describe("SaveButton confirmation gating", () => {
       getSaveData: () => clean,
       saveIsPending: false,
       saveBlockedReason:
-        "This workflow changed after Copilot staged its proposal.",
+        "This workflow changed after Ember staged its proposal.",
     });
     useWorkflowSnapshotStore.setState({
       snapshot: snapshotOf(clean),
@@ -610,7 +610,7 @@ describe("SaveButton confirmation gating", () => {
     renderSaveButton();
     const save = screen.getByRole("button", {
       name: "Save workflow (paused)",
-      description: "This workflow changed after Copilot staged its proposal.",
+      description: "This workflow changed after Ember staged its proposal.",
     });
     expect(save.matches(":disabled")).toBe(false);
     fireEvent.click(save);
@@ -618,7 +618,7 @@ describe("SaveButton confirmation gating", () => {
     expect(
       screen.getByRole("dialog", {
         name: "Save is paused",
-        description: "This workflow changed after Copilot staged its proposal.",
+        description: "This workflow changed after Ember staged its proposal.",
       }),
     ).toBeTruthy();
     expect(
