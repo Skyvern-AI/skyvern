@@ -69,7 +69,9 @@ import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { BuildModeOnly } from "../BuildModeOnly";
 import { NodeHeader } from "../components/NodeHeader";
 import { IntegrationAccountPicker } from "./IntegrationAccountPicker";
+import { knownAccountBackends } from "./knownAccounts";
 import {
+  actionAcceptsAccount,
   editableInputs,
   fieldLabel,
   isGenericActionAvailable,
@@ -729,15 +731,23 @@ function IntegrationActionEditor({ blockId }: { blockId: string }) {
           value={action?.id}
           disabled={!data.editable}
           onValueChange={(actionId) => {
-            const properties =
-              entry.actions?.find((item) => item.id === actionId)?.inputs
-                .properties ?? {};
+            const next = entry.actions?.find((item) => item.id === actionId);
+            const properties = next?.inputs.properties ?? {};
             const inputs = Object.fromEntries(
               Object.entries(data.inputs).filter(([key]) =>
                 Object.prototype.hasOwnProperty.call(properties, key),
               ),
             );
-            update({ actionId, inputs });
+            update({
+              actionId,
+              inputs,
+              ...(actionAcceptsAccount(
+                next,
+                knownAccountBackends().get(data.connectionId),
+              )
+                ? {}
+                : { connectionId: "" }),
+            });
           }}
         >
           <SelectTrigger className="nopan text-xs" aria-label="Action">

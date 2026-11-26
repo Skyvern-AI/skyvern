@@ -824,7 +824,7 @@ function DriveFileListInput(props: ListProps) {
         <DrivePickerDocsView
           enable-drives="true"
           include-folders="true"
-          select-folder-enabled="true"
+          select-folder-enabled="false"
         />
       </DrivePicker>
     ) : null;

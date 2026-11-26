@@ -1,9 +1,11 @@
 import {
+  actionAcceptsAccount,
   editableInputs,
   fieldLabel,
   findIntegrationAction,
   isTemplate,
   schemaType,
+  type CredentialBackend,
   type IntegrationActionNode,
   type JsonSchema,
   type IntegrationCatalogEntryWithActions,
@@ -22,10 +24,12 @@ export function entryNeedsAccount(entry: IntegrationCatalogEntryWithActions) {
   return Boolean(entry.oauthProvider || entry.credentialBackend);
 }
 
-// Without a loaded catalog only the ids are checked; the server checks inputs on save.
+// Without a loaded catalog only the ids are checked; the server checks inputs on save. accounts holds the
+// backend of each account the editor has loaded; an account missing from it is left to the server.
 export function validateIntegrationActionNode(
   node: IntegrationActionNode,
   catalog: readonly IntegrationCatalogEntryWithActions[] | undefined,
+  accounts: ReadonlyMap<string, CredentialBackend> = new Map(),
 ): Array<string> {
   const { label, integrationId, actionId, connectionId, inputs } = node.data;
   if (!integrationId.trim()) {
@@ -38,6 +42,15 @@ export function validateIntegrationActionNode(
   const errors: Array<string> = [];
   if (entryNeedsAccount(found.entry) && !connectionId.trim()) {
     errors.push(`${label}: ${found.entry.name} account is required.`);
+  } else {
+    const backend = accounts.get(connectionId);
+    if (!actionAcceptsAccount(found.action, backend)) {
+      const [saved, other] =
+        backend === "nango" ? ["Connected", "native"] : ["Native", "connected"];
+      errors.push(
+        `${label}: ${saved} ${found.entry.name} accounts do not support ${found.action.name}. Choose a ${other} ${found.entry.name} account for this action.`,
+      );
+    }
   }
   const fields = editableInputs(found.action.inputs);
   const required = new Set(found.action.inputs.required ?? []);

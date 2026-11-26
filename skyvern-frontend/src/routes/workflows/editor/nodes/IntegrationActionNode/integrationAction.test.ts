@@ -149,6 +149,48 @@ describe("integration action library and validation", () => {
       "send: Priority must be a whole number.",
       "send: Headers must be a JSON object.",
     ]);
+
+    const driveAction = (
+      id: string,
+      name: string,
+      credentialBackends: ("native" | "nango")[],
+    ) => ({ id, name, description: "", inputs: {}, credentialBackends });
+    const drive: IntegrationCatalogEntryWithActions[] = [
+      {
+        id: "google_drive",
+        name: "Google Drive",
+        status: "live",
+        oauthProvider: "google",
+        actions: [
+          driveAction("list_folder", "List folder", ["native", "nango"]),
+          driveAction("create_folder", "Create subfolder", ["native"]),
+        ],
+      },
+    ];
+    // Backends come from the loaded accounts; an id the editor has not loaded is never inferred.
+    const accounts = new Map([
+      ["acct_broker", "nango" as const],
+      ["acct_native", "native" as const],
+    ]);
+    const driveErrors = (actionId: string, connectionId: string) =>
+      validateIntegrationActionNode(
+        actionNode({ integrationId: "google_drive", actionId, connectionId }),
+        drive,
+        accounts,
+      );
+    expect(driveErrors("create_folder", "acct_broker")).toEqual([
+      "send: Connected Google Drive accounts do not support Create subfolder. Choose a native Google Drive account for this action.",
+    ]);
+    expect(driveErrors("list_folder", "acct_broker")).toEqual([]);
+    expect(driveErrors("create_folder", "acct_native")).toEqual([]);
+    expect(driveErrors("create_folder", "ngc_unknown")).toEqual([]);
+    expect(
+      validateIntegrationActionNode(
+        actionNode({ ...ok.data, connectionId: "acct_broker" }),
+        catalog,
+        accounts,
+      ),
+    ).toEqual([]);
   });
 
   test("flattens pydantic optional and $ref fields to their real type", () => {

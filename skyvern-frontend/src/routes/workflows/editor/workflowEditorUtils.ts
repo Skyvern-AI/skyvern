@@ -220,6 +220,7 @@ import {
   isIntegrationActionNode,
   type IntegrationCatalogEntryWithActions,
 } from "./nodes/IntegrationActionNode/types";
+import { knownAccountBackends } from "./nodes/IntegrationActionNode/knownAccounts";
 import { validateIntegrationActionNode } from "./nodes/IntegrationActionNode/validate";
 import {
   POWERBI_QUERY_DEFAULT_MAX_ROWS,
@@ -6797,7 +6798,13 @@ function getWorkflowErrors(
   nodes
     .filter(isIntegrationActionNode)
     .forEach((node) =>
-      errors.push(...validateIntegrationActionNode(node, integrationCatalog)),
+      errors.push(
+        ...validateIntegrationActionNode(
+          node,
+          integrationCatalog,
+          knownAccountBackends(),
+        ),
+      ),
     );
 
   nodes

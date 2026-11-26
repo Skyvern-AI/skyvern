@@ -18,6 +18,8 @@ import {
   useMicrosoftOAuthCredentials,
 } from "@/hooks/useMicrosoftOAuthCredentials";
 import { type ConnectedGmailFlow, usePageSlots } from "@/store/PageSlots";
+import { useEffect } from "react";
+import { rememberAccounts } from "./knownAccounts";
 import {
   type AccountFit,
   type IntegrationCatalogEntryWithActions,
@@ -119,15 +121,25 @@ function OAuthAccountPicker({
   additionalAccounts = [],
   additionalLoading = false,
   additionalError = false,
+  brokerAccountIds = [],
   missingSavedHint,
 }: Props & {
   additionalAccounts?: PickerAccount[];
   additionalLoading?: boolean;
   additionalError?: boolean;
+  // Every loaded broker account, including ones this action cannot use and so does not list.
+  brokerAccountIds?: readonly string[];
   missingSavedHint?: string;
 }) {
   const oauth = useOAuthAccounts(entry.oauthProvider, actionKey);
   const accounts = [...oauth.accounts, ...additionalAccounts];
+  useEffect(() => {
+    rememberAccounts(
+      oauth.accounts.map((account) => account.id),
+      "native",
+    );
+    rememberAccounts(brokerAccountIds, "nango");
+  });
   if (oauth.isLoading || additionalLoading)
     return <Skeleton className="h-9 w-full" />;
   const saved = accounts.find((account) => account.id === value);
@@ -229,8 +241,8 @@ function IntegrationAccountPicker(props: Props) {
           {(flow) => {
             const supportsConnected =
               driveAction.credentialBackends?.includes("nango") === true;
-            const savedIsConnected = flow.connections.some(
-              (connection) => connection.connection_id === props.value,
+            const brokerAccountIds = flow.connections.map(
+              (connection) => connection.connection_id,
             );
             return (
               <OAuthAccountPicker
@@ -242,8 +254,9 @@ function IntegrationAccountPicker(props: Props) {
                   supportsConnected && flow.status === "loading"
                 }
                 additionalError={supportsConnected && Boolean(flow.failure)}
+                brokerAccountIds={brokerAccountIds}
                 missingSavedHint={
-                  !supportsConnected && savedIsConnected
+                  !supportsConnected && brokerAccountIds.includes(props.value)
                     ? `Connected Drive accounts do not support ${driveAction.name}. Pick a native account below.`
                     : undefined
                 }
