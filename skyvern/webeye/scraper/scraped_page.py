@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Awaitable, Callable, Self
+from typing import Any, Awaitable, Callable, ClassVar, Self
 
 import structlog
 from playwright.async_api import Frame, Page
@@ -247,6 +247,9 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     _support_empty_page: bool = PrivateAttr(default=False)
     _document_loader_id: str | None = PrivateAttr(default=None)
     _origin: "_ScrapeOrigin | None" = PrivateAttr(default=None)
+    # False for a page that is only a screenshot (no DOM, URL or browser): text-keyed caches and page-reading
+    # checks cannot use it.
+    browser_backed: ClassVar[bool] = True
 
     def __init__(self, **data: Any) -> None:
         missing_attrs = [attr for attr in ["_browser_state", "_clean_up_func"] if attr not in data]

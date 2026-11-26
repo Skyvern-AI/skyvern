@@ -163,6 +163,7 @@ if TYPE_CHECKING:
     from skyvern.services.otp_service import OTPValue
     from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
     from skyvern.webeye.browser_state import BrowserState
+    from skyvern.webeye.computer_surface import ComputerSurface
 
 LOG = structlog.get_logger()
 OUTBOUND_RESPONSE_LIMIT_BYTES = 25 * 1024 * 1024
@@ -2664,6 +2665,9 @@ class AgentFunction:
         return False
 
     def note_page_action(self, page: Page, action: Action) -> None:
+        return None
+
+    async def get_computer_surface(self, task: Task) -> ComputerSurface | None:
         return None
 
     async def on_browser_context_acquired(

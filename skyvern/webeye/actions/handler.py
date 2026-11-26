@@ -252,7 +252,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     redacted_exception_origin,
     settle_browser_downloads_for_context,
 )
-from skyvern.webeye.computer_surface import ComputerSurface
+from skyvern.webeye.computer_surface import BrowserComputerSurface, ComputerSurface
 from skyvern.webeye.dom_inspection import (
     is_static_listbox_option_snapshot,
     read_static_listbox_option_snapshot,
@@ -685,6 +685,48 @@ async def _apply_active_element_secret_visual_mask_if_needed(
         return
     if isinstance(secret_values, set) and text in secret_values:
         await apply_secret_visual_mask_to_active_element(page)
+
+
+# The input a non-browser computer surface performs itself.
+_NON_BROWSER_SURFACE_INPUT_TYPES = frozenset(
+    {
+        ActionType.CLICK,
+        ActionType.INPUT_TEXT,
+        ActionType.WAIT,
+        ActionType.SCROLL,
+        ActionType.KEYPRESS,
+        ActionType.MOVE,
+        ActionType.DRAG,
+        ActionType.LEFT_MOUSE,
+    }
+)
+# What a non-browser computer surface can do: its own input, plus actions that only end or report the step.
+_NON_BROWSER_SURFACE_ACTION_TYPES = _NON_BROWSER_SURFACE_INPUT_TYPES | {
+    ActionType.NULL_ACTION,
+    ActionType.COMPLETE,
+    ActionType.TERMINATE,
+    ActionType.EXTRACT,
+}
+
+
+def _secret_derived_input(workflow_run_id: str | None, parameter: str, value: str) -> bool:
+    """Whether typed text came from a run secret: a resolved placeholder, alone or embedded, or a secret or fetched
+    code the model typed literally. Uses the unfloored registries, not the redaction set. Fails closed."""
+    if value != parameter:
+        return True
+    try:
+        manager = app.WORKFLOW_CONTEXT_MANAGER
+        if manager.is_secret_text(workflow_run_id, parameter):
+            return True
+        literals = set(manager.secret_values_for_drop_check(workflow_run_id))
+        if (context := skyvern_context.current()) is not None:
+            literals |= context.runtime_secret_values
+        if workflow_run_id is not None and (run_context := manager.workflow_run_contexts.get(workflow_run_id)):
+            literals |= run_context.runtime_otp_values
+    except Exception:
+        LOG.warning("Failed to resolve secret provenance for unmaskable input", exc_info=True)
+        return True
+    return any(literal and literal in value for literal in literals)
 
 
 def _normalize_select_shadow_text(text: Any | None) -> str:
@@ -5154,6 +5196,15 @@ class ActionHandler:
         allow_stale_refresh: bool = False,
         computer_surface: ComputerSurface | None = None,
     ) -> list[ActionResult]:
+        if (
+            computer_surface is not None
+            and not isinstance(computer_surface, BrowserComputerSurface)
+            and action.action_type not in _NON_BROWSER_SURFACE_ACTION_TYPES
+        ):
+            # Any other action would act on the hosted page instead of the surface's screen.
+            refused = ActionFailure(SkyvernException(f"This surface cannot perform a {action.action_type} action."))
+            refused.skip_remaining_actions = True
+            return [refused]
         context = skyvern_context.current()
         prior_reservations: tuple[tuple[Page, ...], tuple[Page, ...]] = ((), ())
         if context is not None:
@@ -6541,8 +6592,15 @@ class ActionHandler:
                     # Only a normal, explicitly effect-free setup exit clears this commitment.
                     _browser_dispatch_committed.set(True)
                     app.AGENT_FUNCTION.note_page_action(page, action)
+                    # Hooks on input actions drive the hosted page, so a non-browser surface skips them; hooks on
+                    # actions that end the step are checks and still run, failing closed if they need a browser.
+                    browser_hooks = (
+                        computer_surface is None
+                        or isinstance(computer_surface, BrowserComputerSurface)
+                        or action.action_type not in _NON_BROWSER_SURFACE_INPUT_TYPES
+                    )
                     # do setup before action handler
-                    if setup := ActionHandler._setup_action_types.get(action.action_type):
+                    if browser_hooks and (setup := ActionHandler._setup_action_types.get(action.action_type)):
                         action_phase.mark_action_phase(ActionPhase.SETUP)
                         results = await setup(action, page, scraped_page, task, step)
                         actions_result.extend(results)
@@ -6575,7 +6633,7 @@ class ActionHandler:
                     await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
                     # do the teardown
                     teardown = ActionHandler._teardown_action_types.get(action.action_type)
-                    if teardown:
+                    if browser_hooks and teardown:
                         action_phase.mark_action_phase(ActionPhase.TEARDOWN)
                         results = await teardown(action, page, scraped_page, task, step)
                         actions_result.extend(results)
@@ -7864,12 +7922,13 @@ async def handle_click_action(
     # Get wait config once for this handler
     wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
 
+    # Before any page or DOM access: a desktop surface's frame has neither.
+    if computer_surface is not None and action.x is not None and action.y is not None:
+        await computer_surface.click(action.x, action.y, action.button, action.repeat)
+        return [ActionSuccess()]
     dom = DomUtil(scraped_page=scraped_page, page=page)
     original_url = page.url
     if action.x is not None and action.y is not None:
-        if computer_surface is not None:
-            await computer_surface.click(action.x, action.y, action.button, action.repeat)
-            return [ActionSuccess()]
         # Find the element at the clicked location using JavaScript evaluation
         element_id: str | None = await page.evaluate(
             """data => {
@@ -9691,6 +9750,19 @@ async def _handle_input_text_action(
             _register_runtime_otp_value_best_effort(task.workflow_run_id, cua_text)
         elif is_unresolved_totp_value(cua_text):
             return [ActionFailure(NoTOTPSecretFound())]
+        # Only a browser page can mask its focused field; elsewhere the next frame would show the value.
+        if (
+            computer_surface is not None
+            and not isinstance(computer_surface, BrowserComputerSurface)
+            and _secret_derived_input(task.workflow_run_id, action.text, cua_text)
+        ):
+            refused = ActionFailure(
+                SkyvernException("This surface cannot mask a secret value, so it was not typed."),
+                stop_execution_on_failure=True,
+            )
+            # Later actions in the batch, such as a submit click, must not act on the field left empty.
+            refused.skip_remaining_actions = True
+            return [refused]
         await _apply_active_element_secret_visual_mask_if_needed(
             page,
             cua_text,
@@ -12107,18 +12179,18 @@ async def handle_scroll_action(
             # so an unrelated container under it can absorb the scroll and the window offset
             # alone cannot tell a real move from a no-op.
             await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
+    elif computer_surface is not None:
+        # Coordinate-based scrolling from CUA/UI-TARS agents. Zero is a real coordinate; only a missing pair means
+        # the current cursor (the browser surface keeps its own handling of zero).
+        has_point = action.x is not None and action.y is not None
+        await computer_surface.scroll(
+            action.x if has_point else None, action.y if has_point else None, action.scroll_x, action.scroll_y
+        )
     elif action.x and action.y:
-        # Coordinate-based scrolling from CUA/UI-TARS agents
-        if computer_surface is not None:
-            await computer_surface.scroll(action.x, action.y, action.scroll_x, action.scroll_y)
-        else:
-            await EventStrategyFactory.move_cursor(page, action.x, action.y)
-            await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
+        await EventStrategyFactory.move_cursor(page, action.x, action.y)
+        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     else:
-        if computer_surface is not None:
-            await computer_surface.scroll(None, None, action.scroll_x, action.scroll_y)
-        else:
-            await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
+        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     return [ActionSuccess()]
 
 
@@ -17216,6 +17288,8 @@ async def extract_information_for_navigation_goal(
         )
         # Preserve cache_key so the downstream store() can still warm the cache
         # for subsequent identical calls even when lookup() fails transiently.
+    if not scraped_page_refreshed.browser_backed:
+        cache_key, lookup_result = None, None
 
     if lookup_result is not None and lookup_result.hit and isinstance(lookup_result.value, (dict, list, str)):
         LOG.info(
