@@ -1476,6 +1476,28 @@ def _live_codes_now(totp: pyotp.TOTP) -> list[str]:
     return live_totp_codes(totp, now=time.time())
 
 
+def _represent_literals_as_new_placeholders(
+    workflow_run_context: WorkflowRunContext, payload: Any
+) -> tuple[Any, frozenset[str]]:
+    """``payload`` with each value equal to a secret replaced by a newly registered placeholder, and those tokens."""
+    minted: dict[str, str] = {}
+
+    def swap(value: Any) -> Any:
+        if isinstance(value, str):
+            if workflow_run_context.find_secret_placeholder_for_value(value) is None:
+                return value
+            if value not in minted:
+                minted[value] = workflow_run_context.register_secret_value(value)
+            return minted[value]
+        if isinstance(value, dict):
+            return {key: swap(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [swap(item) for item in value]
+        return value
+
+    return swap(payload), frozenset(minted.values())
+
+
 def hold_run_secrets_back(workflow_run_id: str | None, release_guard: CredentialReleaseGuard | None) -> None:
     """Scrub every run credential's password from the model's view of tool output, and have the guard judge it and
     each live code of the credential's seed in every written value, as text read off a page and typed back would be."""
@@ -3357,12 +3379,17 @@ class ForgeAgent:
             else None
         )
         parameters = coerce_v3_parameters(task.navigation_payload)
-        if (
-            (task_block is not None or workflow_owned_recovery)
-            and workflow_run_context is not None
-            and app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run(task.workflow_run_id)
-        ):
-            parameters = workflow_run_context.represent_plaintext_secrets_as_placeholders(parameters)
+        swapped_literal_tokens: frozenset[str] = frozenset()
+        # The model always sees a placeholder for a payload value equal to a secret, as with the step engine. With Mask
+        # Secrets off it is a newly registered token judged as a literal; any token already in the task's text stays a
+        # credential token. Only for tasks that get resolve_typed_text, which turns the placeholder back into the value.
+        if (task_block is not None or workflow_owned_recovery) and workflow_run_context is not None:
+            if app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run(task.workflow_run_id):
+                parameters = workflow_run_context.represent_plaintext_secrets_as_placeholders(parameters)
+            else:
+                parameters, swapped_literal_tokens = _represent_literals_as_new_placeholders(
+                    workflow_run_context, parameters
+                )
         context = skyvern_context.current()
         turn_dom_arm: RunArm = "unrandomized"
         if context:
@@ -4582,6 +4609,7 @@ class ForgeAgent:
                 task_target_urls=task_target_urls,
                 label_secret_values=_label_secret_values,
                 login_identifier_tokens=_login_identifier_tokens,
+                swapped_literal_tokens=swapped_literal_tokens,
                 single_action_block=single_action_block,
                 target_action_reserve=target_action_reserve,
                 block_completion_judge=block_completion_judge,
