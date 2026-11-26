@@ -17,6 +17,7 @@ export const agentStepToolTitles: Record<string, string> = {
   load_skill: "Load skill",
   read_skill_resource: "Read skill file",
   finish: "Finish",
+  fail: "Fail",
 };
 
 export type AgentStepNodeData = NodeBaseData & {

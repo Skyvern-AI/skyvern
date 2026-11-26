@@ -1,6 +1,7 @@
 import {
   CheckCircledIcon,
   CursorTextIcon,
+  ExitIcon,
   ExternalLinkIcon,
   FileTextIcon,
   GearIcon,
@@ -20,6 +21,7 @@ const TOOL_ICONS: Record<string, ComponentType<{ className?: string }>> = {
   page_extract: ExtractIcon,
   read_run_data: FileTextIcon,
   finish: CheckCircledIcon,
+  fail: ExitIcon,
 };
 
 function ToolCallIcon({
