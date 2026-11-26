@@ -1268,6 +1268,13 @@ async def _finish_consent(
         ),
         pytest.param(
             RequestPrincipal("o_test", AuthKind.bearer, "user_1"),
+            "revoked-state",
+            403,
+            "picker_owner_only",
+            id="owner-revoked-state",
+        ),
+        pytest.param(
+            RequestPrincipal("o_test", AuthKind.bearer, "user_1"),
             "missing-secrets",
             409,
             "reconnect_required",
@@ -1319,6 +1326,8 @@ async def test_drive_picker_token_route_enforces_security_boundaries(
     values: dict[str, object] = {"initiating_user_id": "user_1"}
     if scenario == "error-state":
         values["state"] = STATE_ERROR
+    elif scenario == "revoked-state":
+        values["state"] = STATE_REVOKED
     elif scenario == "missing-secrets":
         values["encrypted_refresh_token"] = None
     async with engine.begin() as conn:
@@ -1757,6 +1766,13 @@ async def test_google_drive_reconnect_keeps_id_and_unions_existing_sheets_grants
     ("failure", "existing_grants", "scope_profile", "missing_scope"),
     [
         pytest.param(
+            "new-connection-partial-grant",
+            None,
+            "google_drive",
+            google_oauth_service.GOOGLE_DRIVE_SCOPES[0],
+            id="new-drive-partial-grant",
+        ),
+        pytest.param(
             "wrong-account",
             list(google_oauth_service.GOOGLE_SHEETS_SCOPES),
             "google_drive",
@@ -1785,38 +1801,40 @@ async def test_google_drive_reconnect_keeps_id_and_unions_existing_sheets_grants
             id="plain-reconnect-missing-existing-drive-grant",
         ),
         pytest.param(
-            "partial-grant",
+            "send-declined",
             [
                 *google_oauth_service.GOOGLE_SHEETS_SCOPES,
                 *google_oauth_service.GOOGLE_DRIVE_SCOPES,
                 google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
             ],
-            None,
-            google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE,
-            id="plain-reconnect-missing-existing-picker-grant",
+            "gmail_send",
+            GMAIL_SEND_SCOPE,
+            id="send-upgrade-on-drive-connection-declines-only-send",
         ),
     ],
 )
-async def test_google_drive_reconnect_rejection_leaves_existing_connection_unchanged(
+async def test_google_drive_consent_rejection_leaves_connection_unchanged_or_uncreated(
     gmail_send_oauth: SimpleNamespace,
     repo: GoogleOAuthRepository,
     engine: AsyncEngine,
     failure: str,
-    existing_grants: list[str],
+    existing_grants: list[str] | None,
     scope_profile: str | None,
     missing_scope: str | None,
 ) -> None:
     sheets_scopes = list(google_oauth_service.GOOGLE_SHEETS_SCOPES)
     drive_scope = google_oauth_service.GOOGLE_DRIVE_SCOPES[0]
     drive_file_scope = google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE
-    await _seed_gmail_connection(repo, engine, existing_grants, subject="subject-1")
-    before = await _stored_connection(engine)
+    before = None
+    if existing_grants is not None:
+        await _seed_gmail_connection(repo, engine, existing_grants, subject="subject-1")
+        before = await _stored_connection(engine)
     state, _ = await _start_consent(
-        credential_id="goac_gmail",
+        credential_id="goac_gmail" if before is not None else None,
         scope_profile=scope_profile,
         set_account=failure == "wrong-account-with-set-account",
     )
-    grants = [*sheets_scopes, drive_scope, drive_file_scope, *IDENTITY_GRANT]
+    grants = [*sheets_scopes, drive_scope, drive_file_scope, *SEND_GRANT]
     if failure.startswith("wrong-account"):
         gmail_send_oauth.claims["sub"] = "subject-2"
     else:
@@ -1826,8 +1844,18 @@ async def test_google_drive_reconnect_rejection_leaves_existing_connection_uncha
     with pytest.raises(HTTPException) as rejected:
         await _finish_consent(gmail_send_oauth, state, grants)
 
-    after = await _stored_connection(engine)
     assert rejected.value.status_code == 409
+    if before is None:
+        assert "Google Drive access" in rejected.value.detail
+        assert "sending" not in rejected.value.detail
+        assert "previous connection" not in rejected.value.detail
+        assert await repo.list_visible_for_org("o_test") == []
+        return
+    if failure == "send-declined":
+        assert "sending was not enabled" in rejected.value.detail
+        assert "Google Drive" not in rejected.value.detail
+
+    after = await _stored_connection(engine)
     assert (
         after.encrypted_refresh_token,
         after.state,

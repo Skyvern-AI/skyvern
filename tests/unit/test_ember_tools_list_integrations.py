@@ -228,6 +228,10 @@ async def test_lists_every_entry_with_gmail_and_bitwarden_accounts_and_no_secret
     assert entries["google_sheets"]["accounts"] == []
     assert entries["azure_key_vault"]["accounts"] == []
     assert entries["powerbi"]["status"] == "comingSoon"
+    drive_actions = {action["id"]: action for action in entries["google_drive"]["actions"]}
+    assert drive_actions["list_folder"]["credential_backends"] == ["native", "nango"]
+    assert drive_actions["list_folder"]["drive_hop_operations"] == ["list"]
+    assert drive_actions["upload_files"]["credential_backends"] == ["native"]
     assert entries["mcp"]["accounts"] is None
     for serialized in (json.dumps(result), json.dumps(page)):
         for sentinel in SENTINELS:
@@ -421,6 +425,9 @@ def test_tool_description_states_facts_without_prescribing_dialogue() -> None:
 
     assert "state` is `active`" in description
     assert "state` is `error`" in description
+    assert "Connected Google Drive" in description
+    assert "`list_folder` and `download_from_drive`" in description
+    assert "action's `credential_backends` includes `nango`" in description
     assert "ask the user" not in description.lower()
     assert "reconnect" not in description.lower()
 
@@ -787,12 +794,16 @@ async def test_request_connection_builds_one_card_from_the_list_entry_without_to
     action_id: str | None,
 ) -> None:
     monkeypatch.setattr(app.AGENT_FUNCTION, "nango_gmail_catalog_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "nango_google_drive_catalog_available", AsyncMock(return_value=True))
     monkeypatch.setattr(
         app.AGENT_FUNCTION,
         "get_cloud_integration_accounts",
         AsyncMock(
             return_value={
-                "gmail": [catalog.IntegrationAccount(connection_id="ngc_connected", provider="nango", state="active")]
+                "gmail": [catalog.IntegrationAccount(connection_id="ngc_connected", provider="nango", state="active")],
+                "google_drive": [
+                    catalog.IntegrationAccount(connection_id="ngc_drive", provider="nango", state="active")
+                ],
             }
         ),
     )
@@ -809,6 +820,7 @@ async def test_request_connection_builds_one_card_from_the_list_entry_without_to
             scopes_requested=[GMAIL_READ_SCOPE],
             scopes_granted=[GMAIL_READ_SCOPE],
         ),
+        _google(id="goac_drive", scopes_requested=[DRIVE_SCOPE], scopes_granted=[DRIVE_SCOPE]),
     ]
     org.microsoft = [
         _microsoft(scopes_requested=["Mail.Read"], scopes_granted=["Mail.Read"]),
@@ -830,6 +842,7 @@ async def test_request_connection_builds_one_card_from_the_list_entry_without_to
             "scopeProfile": entry.oauth_scope_profile,
             "requiredScopes": list(entry.capability_scopes or entry.required_scopes or []),
             "reconnectConnectionId": reconnect_id,
+            "credentialBackends": (["nango"] if action_id else sorted(catalog.entry_credential_backends(entry))),
             **({"connectedGmailOnly": True} if action_id else {}),
         }
     ]
@@ -852,6 +865,24 @@ async def test_request_connection_builds_one_card_from_the_list_entry_without_to
         assert refused["data"]["status"] == "not_offered"
         assert refused["data"]["earlier_card_withdrawn"] is True
         assert ctx.connection_cards == []
+        drive_read = await _request_connection(
+            "google_drive", None, make_ember_ctx(organization_id=ORGANIZATION_ID), "list_folder"
+        )
+        drive_write = await _request_connection(
+            "google_drive", None, make_ember_ctx(organization_id=ORGANIZATION_ID), "upload_files"
+        )
+        assert {(account["connection_id"], account["provider"]) for account in drive_read["data"]["accounts"]} == {
+            ("goac_drive", "google"),
+            ("ngc_drive", "nango"),
+        }
+        assert [(account["connection_id"], account["provider"]) for account in drive_write["data"]["accounts"]] == [
+            ("goac_drive", "google")
+        ]
+        org.google = [account for account in org.google if account.id != "goac_drive"]
+        broker_only_drive = await _request_connection(
+            "google_drive", None, make_ember_ctx(organization_id=ORGANIZATION_ID), "list_folder"
+        )
+        assert "connected_gmail_limit" not in broker_only_drive["data"]
 
 
 @pytest.mark.asyncio

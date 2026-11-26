@@ -26,7 +26,7 @@ from tests.unit.ember_test_helpers import FakeEmberStream, handback_ctx, termina
     ("terminal", "block_type", "error_codes", "failure_code"),
     [
         ("completed", BlockType.CODE, [], None),
-        # Only a Gmail block (a saved Gmail app action runs as integration_action) carries the refusal to the card.
+        # A saved connected-account app action carries the refusal to the card as an integration action.
         ("failed", BlockType.INTEGRATION_ACTION, [EMBER_TEST_RUN_UNSUPPORTED_CODE], EMBER_TEST_RUN_UNSUPPORTED_CODE),
         ("failed", BlockType.TASK, [EMBER_TEST_RUN_UNSUPPORTED_CODE], None),
         ("failed", BlockType.INTEGRATION_ACTION, [], None),

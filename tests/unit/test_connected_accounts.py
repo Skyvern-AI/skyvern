@@ -55,9 +55,9 @@ async def test_a_sheets_credential_reaches_only_a_backend_that_can_call_google(r
 
 
 @pytest.mark.asyncio
-async def test_an_unpinned_caller_resolves_only_a_known_account_id() -> None:
-    assert await connected_accounts.resolve_account_access("o_1", "msac_1") == "microsoft:msac_1"
-    assert await connected_accounts.resolve_account_access("o_1", "Work") is None
+async def test_a_pinned_caller_uses_the_requested_api() -> None:
+    assert await connected_accounts.resolve_account_access("o_1", "msac_1", api="microsoft") == "microsoft:msac_1"
+    assert await connected_accounts.resolve_account_access("o_1", "Work", api="microsoft") == "microsoft:Work"
 
 
 @pytest.mark.asyncio
