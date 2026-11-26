@@ -1253,7 +1253,7 @@ class TestMiddlewareLogVolume:
             now = datetime.now(UTC)
             apply_request_org_context(
                 Organization(
-                    organization_id="o_385835488455492960",
+                    organization_id="o_000000000000000000",
                     organization_name="Acme Corp",
                     created_at=now,
                     modified_at=now,
@@ -1265,7 +1265,7 @@ class TestMiddlewareLogVolume:
 
         assert response.status_code == 200
         logged = log_mock.info.call_args.kwargs
-        assert logged["organization_id"] == "o_385835488455492960"
+        assert logged["organization_id"] == "o_000000000000000000"
         assert logged["organization_name"] == "Acme Corp"
         assert type(logged["org_age"]) is int and logged["org_age"] == 0
 
@@ -1277,13 +1277,13 @@ class TestMiddlewareLogVolume:
 
         @app.post("/_test_request_logging_authed_boom")
         async def boom() -> None:
-            set_request_organization("o_385835488455492960", "Acme Corp")
+            set_request_organization("o_000000000000000000", "Acme Corp")
             raise ValueError("kaboom")
 
         response = TestClient(app, raise_server_exceptions=False).post("/_test_request_logging_authed_boom")
 
         assert response.status_code == 500
-        assert log_mock.error.call_args.kwargs["organization_id"] == "o_385835488455492960"
+        assert log_mock.error.call_args.kwargs["organization_id"] == "o_000000000000000000"
 
     @pytest.mark.parametrize("allow_bodies", [False, True])
     @pytest.mark.parametrize("error", [False, True])
@@ -1384,7 +1384,7 @@ class TestMiddlewareLogVolume:
 
         @app.post("/_test_request_logging_authed_then_anonymous")
         async def authed() -> dict:
-            set_request_organization("o_385835488455492960", "Acme Corp")
+            set_request_organization("o_000000000000000000", "Acme Corp")
             return {"ok": True}
 
         @app.post("/_test_request_logging_anonymous")
@@ -1591,7 +1591,7 @@ class TestMiddlewareLogVolume:
 _LOG_DRIVER_LINE_LIMIT_BYTES = 16 * 1024
 # Deep enough that the traceback alone passes the limit, as production pool-timeout errors do.
 _ROUTE_CALL_DEPTH = 25
-_TEST_ORGANIZATION_ID = "o_385835488455492960"
+_TEST_ORGANIZATION_ID = "o_000000000000000000"
 
 
 def _raise_from_depth(depth: int) -> None:
