@@ -441,6 +441,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     settle_browser_downloads_for_context,
     unsaved_downloads_since,
 )
+from skyvern.webeye.computer_surface import BrowserComputerSurface
 from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.native_downloads import NativeDownloadAttempt, NativeDownloads
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage, json_to_html
@@ -7001,6 +7002,9 @@ class ForgeAgent:
                         # Only actions after the first can be stale: an earlier action in this same batch
                         # may have remounted/reflowed this one's target away from the shared pre-batch scrape.
                         allow_stale_refresh=action_idx > 0,
+                        computer_surface=(
+                            BrowserComputerSurface(current_page, dispatch_page) if engine in CUA_ENGINES else None
+                        ),
                     )
                 otp_results = results
             finally:
@@ -8794,7 +8798,7 @@ class ForgeAgent:
             max_screenshot_number = 1
             scroll = False
 
-        scraped_page = await browser_state.scrape_website(
+        scrape = browser_state.scrape_website(
             url=task.url,
             cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
                 task=task,
@@ -8810,6 +8814,9 @@ class ForgeAgent:
             allow_transient_ui_suppression=True,
             support_empty_page=support_empty_page,
             navigation_deadline=navigation_deadline,
+        )
+        scraped_page = (
+            await BrowserComputerSurface(capture=lambda: scrape).get_frame() if engine in CUA_ENGINES else await scrape
         )
         scraped_page._support_empty_page = support_empty_page
         return scraped_page
@@ -11754,6 +11761,10 @@ class ForgeAgent:
         # stamp started_at between the two, and the stale read would bill that
         # compute as never_started.
         if updated_task.workflow_run_id is None:
+            if updated_task.status.is_final():
+                await app.AGENT_FUNCTION.on_run_target_terminal(
+                    organization_id=updated_task.organization_id, run_id=updated_task.task_id, run_kind="task"
+                )
             if finish_claimed:
                 if updated_task.started_at and updated_task.finished_at:
                     await app.AGENT_FUNCTION.record_run_duration(

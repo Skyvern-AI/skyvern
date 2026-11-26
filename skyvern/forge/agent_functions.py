@@ -2668,6 +2668,14 @@ class AgentFunction:
     ) -> None:
         return
 
+    async def before_run_target_dispatch(self, *, organization_id: str, run_id: str, run_kind: str) -> None:
+        """Cloud may reserve a desktop target; OSS keeps the existing browser path."""
+        return
+
+    async def on_run_target_terminal(self, *, organization_id: str, run_id: str, run_kind: str) -> None:
+        """Cloud may request desktop input stop after a run becomes terminal."""
+        return
+
     async def should_defer_workflow_browser_creation(self, workflow_run: WorkflowRun) -> bool:
         return False
 
