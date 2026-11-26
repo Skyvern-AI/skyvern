@@ -279,16 +279,28 @@ async def test_engine_wires_budget_and_retry_defaults(monkeypatch: pytest.Monkey
     from skyvern.forge.taskv3.loop import LoopOutcome
 
     captured: dict[str, object] = {}
+    tool_kwargs: dict[str, object] = {}
+    real_build = engine_mod.build_browser_tools
+
+    def capturing_build(*args: Any, **kwargs: Any) -> Any:
+        tool_kwargs.update(kwargs)
+        return real_build(*args, **kwargs)
 
     async def _capture(**kwargs: object) -> LoopOutcome:
         captured.update(kwargs)
         return LoopOutcome(status="completed", reason="ok")
 
+    monkeypatch.setattr(engine_mod, "build_browser_tools", capturing_build)
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
     await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x"
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        swapped_literal_tokens=frozenset({"placeholder_u"}),
     )
 
+    # Both the re-submit and secret-entered checks (loop) and the release guard (tools) read the swapped set.
+    assert captured["swapped_literal_tokens"] == tool_kwargs["swapped_literal_tokens"] == frozenset({"placeholder_u"})
     assert captured["max_tokens"] == engine_mod.DEFAULT_MAX_TOKENS
     assert captured["deadline_seconds"] == engine_mod.DEFAULT_DEADLINE_SECONDS
     assert captured["max_call_retries"] == engine_mod.DEFAULT_MAX_CALL_RETRIES
