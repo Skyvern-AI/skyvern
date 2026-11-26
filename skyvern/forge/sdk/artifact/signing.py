@@ -25,14 +25,20 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import re
 import time
 from functools import lru_cache
 from typing import NamedTuple
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from pydantic import BaseModel, model_validator
 
+from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
 from skyvern.forge.sdk.artifact.models import ArtifactType
 
 ARTIFACT_URL_EXPIRY_SECONDS = 12 * 60 * 60  # 12 hours — global default when no per-org override.
@@ -76,6 +82,9 @@ ARTIFACT_URL_EXPIRY_SECONDS_MAX = 7 * 24 * 60 * 60  # 7 days
 
 _ARTIFACT_CONTENT_PATH_TEMPLATE = "/v1/artifacts/{artifact_id}/content"
 _ARTIFACT_CONTENT_PATH_RE = re.compile(r"^/v1/artifacts/(?P<artifact_id>[^/]+)/content$")
+S3_DOWNLOAD_FALLBACK_PREFIX = "s3-download-"
+_S3_DOWNLOAD_FALLBACK_KEY_INFO = b"skyvern.artifact-content.s3-download-fallback.v1"
+_S3_DOWNLOAD_FALLBACK_NONCE_BYTES = 12
 
 
 class ParsedArtifactContentUrl(NamedTuple):
@@ -83,6 +92,79 @@ class ParsedArtifactContentUrl(NamedTuple):
     expiry: str | None
     kid: str | None
     sig: str | None
+
+
+class S3DownloadFallback(NamedTuple):
+    key: str
+    organization_id: str
+    filename: str
+
+
+def _s3_download_fallback_cipher(secret: bytes) -> AESGCM:
+    key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=_S3_DOWNLOAD_FALLBACK_KEY_INFO,
+    ).derive(secret)
+    return AESGCM(key)
+
+
+def sign_s3_download_fallback_url(
+    base_url: str,
+    *,
+    bucket: str,
+    key: str,
+    filename: str,
+    keyring: "ArtifactHmacKeyring",
+    expiry_seconds: int,
+) -> str:
+    kid = keyring.current_kid
+    secret = keyring.get_secret_bytes(kid)
+    if secret is None:
+        raise ValueError("No current key for standalone download fallback")
+    payload = json.dumps([bucket, key, filename], separators=(",", ":"), ensure_ascii=False).encode()
+    nonce = os.urandom(_S3_DOWNLOAD_FALLBACK_NONCE_BYTES)
+    ciphertext = _s3_download_fallback_cipher(secret).encrypt(nonce, payload, kid.encode())
+    artifact_id = S3_DOWNLOAD_FALLBACK_PREFIX + base64.urlsafe_b64encode(nonce + ciphertext).rstrip(b"=").decode()
+    return sign_artifact_url(
+        base_url,
+        artifact_id,
+        keyring,
+        expiry_seconds=min(expiry_seconds, ARTIFACT_URL_EXPIRY_SECONDS_MAX),
+    )
+
+
+def decode_s3_download_fallback(
+    artifact_id: str, *, bucket: str, environment: str, kid: str, keyring: "ArtifactHmacKeyring"
+) -> S3DownloadFallback | None:
+    if not artifact_id.startswith(S3_DOWNLOAD_FALLBACK_PREFIX):
+        return None
+    secret = keyring.get_secret_bytes(kid)
+    if secret is None:
+        return None
+    encoded = artifact_id.removeprefix(S3_DOWNLOAD_FALLBACK_PREFIX)
+    try:
+        sealed = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
+        nonce = sealed[:_S3_DOWNLOAD_FALLBACK_NONCE_BYTES]
+        ciphertext = sealed[_S3_DOWNLOAD_FALLBACK_NONCE_BYTES:]
+        payload = json.loads(_s3_download_fallback_cipher(secret).decrypt(nonce, ciphertext, kid.encode()))
+    except (InvalidTag, ValueError):
+        return None
+    if not isinstance(payload, list) or len(payload) != 3 or not all(isinstance(item, str) for item in payload):
+        return None
+    download_bucket, key, filename = payload
+    if download_bucket != bucket or not key.startswith(f"{DOWNLOAD_FILE_PREFIX}/{environment}/"):
+        return None
+    parts = key.split("/")
+    if (
+        len(parts) < 5
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(ord(char) < 32 for char in key)
+        or key.endswith(BROWSER_DOWNLOADING_SUFFIX)
+    ):
+        return None
+    return S3DownloadFallback(key=key, organization_id=parts[2], filename=filename)
 
 
 def parse_artifact_content_url(url: str, base_url: str) -> ParsedArtifactContentUrl | None:

@@ -65,6 +65,8 @@ from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS_MAX,
     ARTIFACT_URL_EXPIRY_SECONDS_MIN,
     ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
+    S3_DOWNLOAD_FALLBACK_PREFIX,
+    decode_s3_download_fallback,
     parse_keyring,
     verify_artifact_signature,
 )
@@ -3860,6 +3862,8 @@ async def get_artifact_content(
     authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> Response:
     artifact = None
+    download_fallback = None
+    is_fallback = artifact_id.startswith(S3_DOWNLOAD_FALLBACK_PREFIX)
 
     if sig is not None and expiry is not None and kid is not None:
         # HMAC-signed URL path — no org-level API key required.
@@ -3880,7 +3884,7 @@ async def get_artifact_content(
             # one: sign_artifact_url always emits exactly 43 base64url characters.
             LOG.warning(
                 "Rejected artifact content request with an unverifiable signature",
-                artifact_id=artifact_id,
+                artifact_id=None if is_fallback else artifact_id,
                 kid=kid,
                 expiry=expiry,
                 signature_length=len(sig),
@@ -3889,7 +3893,24 @@ async def get_artifact_content(
                 status_code=http_status.HTTP_403_FORBIDDEN,
                 detail="Invalid or expired artifact URL",
             )
-        artifact = await app.DATABASE.artifacts.get_artifact_by_id_no_org(artifact_id=artifact_id)
+        if is_fallback:
+            download_fallback = decode_s3_download_fallback(
+                artifact_id, bucket=settings.AWS_S3_BUCKET_UPLOADS, environment=settings.ENV, kid=kid, keyring=keyring
+            )
+            if download_fallback is not None:
+                now = datetime.now(UTC)
+                artifact = Artifact(
+                    artifact_id=artifact_id,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                    uri=f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{download_fallback.key}",
+                    organization_id=download_fallback.organization_id,
+                    created_at=now,
+                    modified_at=now,
+                )
+        else:
+            artifact = await app.DATABASE.artifacts.get_artifact_by_id_no_org(artifact_id=artifact_id)
+    elif is_fallback:
+        raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="Invalid or expired artifact URL")
     else:
         # Standard org-auth path (existing behaviour).
         current_org = await org_auth_service.get_current_org(
@@ -3904,12 +3925,14 @@ async def get_artifact_content(
     if not artifact:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
-            detail=f"Artifact not found {artifact_id}",
+            detail="Artifact content not available" if is_fallback else f"Artifact not found {artifact_id}",
         )
     is_signed = sig is not None and expiry is not None and kid is not None
     if not is_signed:
         await _authorize_artifact_read(artifact)
     media_type, content_disposition = _artifact_response_config(artifact)
+    if download_fallback is not None:
+        content_disposition = build_attachment_disposition(download_fallback.filename)
     signed_expiry_unix: int | None = None
     if is_signed and expiry is not None:
         try:
@@ -3925,11 +3948,15 @@ async def get_artifact_content(
     if artifact.artifact_type in _HTML_ARTIFACT_TYPES:
         headers["Content-Security-Policy"] = _HTML_ARTIFACT_CSP
     storage = app.STORAGE
-    if isinstance(storage, StreamingArtifactStorage) and storage.can_stream_artifact(artifact):
+    if isinstance(storage, StreamingArtifactStorage) and (
+        download_fallback is not None or storage.can_stream_artifact(artifact)
+    ):
         response = await _stream_artifact_content(storage, artifact, request.headers.get("range"), media_type, headers)
         if not is_signed and response.status_code in (http_status.HTTP_200_OK, http_status.HTTP_206_PARTIAL_CONTENT):
             note_artifact_reads((artifact,))
         return response
+    if download_fallback is not None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Artifact content not available")
     content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
     if content is None:
         raise HTTPException(
