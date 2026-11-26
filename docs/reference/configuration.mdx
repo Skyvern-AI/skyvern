@@ -727,6 +727,15 @@ With `ENABLE_ENCRYPTION=true`, Skyvern encrypts stored secrets such as organizat
 Never change `ENCRYPTOR_AES_SECRET_KEY`, `ENCRYPTOR_AES_SALT` or `ENCRYPTOR_AES_IV` after secrets are stored. Skyvern can't decrypt anything stored under the old values.
 </Warning>
 
+Saved browser profiles and saved browser-session state are files, not stored secrets, so `ENABLE_ENCRYPTION` doesn't cover them. They have their own setting and their own keys.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SKYVERN_ENCRYPT_BROWSER_PROFILES` | `false` | Encrypts saved browser profiles and saved browser-session state with AES-GCM before writing them, on every [storage](#storage) backend. The server refuses to start with this on and no valid key. |
+| `SKYVERN_ARTIFACT_ENCRYPTION_KEYS` | empty | JSON list of base64-encoded 32-byte keys, such as `SKYVERN_ARTIFACT_ENCRYPTION_KEYS=["<base64 key>"]`. Generate one with `openssl rand -base64 32`. The first key encrypts; reading an encrypted file needs the key it was written with, so keep every key still in use. These keys are separate from `ENCRYPTOR_AES_SECRET_KEY`. |
+
+Deploy the keys to every server before you turn encryption on. A profile that is already encrypted stays encrypted when you turn `SKYVERN_ENCRYPT_BROWSER_PROFILES` back off, so a server without the keys can't read it.
+
 ## Other server settings
 
 | Variable | Default | What it does |

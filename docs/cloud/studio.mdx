@@ -53,7 +53,7 @@ Type what you want in the Copilot message box ("Ask Copilot to build or change y
 
 Every change Copilot makes arrives as a **Proposed changes** card:
 
-- The card lists each block **Added**, **Changed** or **Removed**, and shows **Tested**, **Untested** or **Test failed**.
+- The card lists each block **Added**, **Changed** or **Removed**, and shows **Tested**, **Untested**, **Test failed** or **Couldn't test**. **Couldn't test** means the test wasn't allowed to use a connected account, so it says nothing about the blocks; the card offers to run it once with your account.
 - **Accept** applies the changes and saves them to the agent.
 - **Review** compares the proposed agent with the previous version before you decide.
 - **Reject** discards them and puts the agent back to the previous version.
@@ -63,6 +63,8 @@ Every change Copilot makes arrives as a **Proposed changes** card:
 <Warning>
 **Test end-to-end** performs real actions. It can submit forms, place orders or send messages.
 </Warning>
+
+When a block uses a [Connected Gmail account](/cloud/integrations#google-and-microsoft-accounts), the **Test end-to-end** confirmation says so: that one run is allowed to use the account. Tests Copilot starts on its own, and tests started through the API or an MCP client, are not; save the agent and run it to use the account.
 
 Other things you can do in the Copilot pane:
 
