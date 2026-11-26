@@ -13,7 +13,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
+from azure.core.exceptions import ClientAuthenticationError
 from botocore.exceptions import ClientError
+from google.api_core.exceptions import Forbidden
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -27,11 +29,14 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
 from skyvern.forge.sdk.artifact.storage.base import BrowserProfileSnapshot
 from skyvern.forge.sdk.artifact.storage.browser_profile_archive import (
+    SEALED_PROFILE_SUFFIX,
     ProfilePublicationConflict,
     ProfilePublicationUnconfirmed,
 )
+from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.core import skyvern_context
@@ -82,6 +87,7 @@ from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 from tests.unit.forge.sdk.artifact.storage.test_helpers import (
     ProfileTransport,
     artifact_root,
+    install_cloud_profile_transport,
     install_s3_profile_transport,
 )
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -353,36 +359,88 @@ async def test_ensure_managed_browser_profile_skips_non_persist_workflow(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["sealed-denied-missing", "sealed-denied-plaintext"])
+@pytest.mark.parametrize(
+    ("backend", "has_plaintext"),
+    [
+        pytest.param("s3", False, id="sealed-denied-missing"),
+        pytest.param("s3", True, id="sealed-denied-plaintext"),
+        pytest.param("azure", True, id="azure-401-copy"),
+        pytest.param("azure", False, id="azure-401-missing"),
+        pytest.param("gcs", True, id="gcs-403-copy"),
+        pytest.param("gcs", False, id="gcs-403-missing"),
+        pytest.param("local", True, id="local-probe-copy"),
+        pytest.param("local", False, id="local-probe-missing"),
+    ],
+)
 async def test_ensure_managed_browser_profile_seeds_new_profile_from_legacy_archive(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, backend: str, has_plaintext: bool
 ) -> None:
     profile = SimpleNamespace(browser_profile_id="bp_managed", proxy_session_id=None, is_managed=True)
     get_or_create = AsyncMock(return_value=(profile, True))
     monkeypatch.setattr(app.DATABASE.browser_sessions, "get_or_create_managed_browser_profile", get_or_create)
-    storage, transport = S3Storage(), ProfileTransport()
-    legacy, sealed = storage._workflow_session_uris("o_test", "wpid_test")
-    destination, _ = storage._profile_uris("o_test", profile.browser_profile_id)
     monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
     monkeypatch.setattr(settings, "SKYVERN_ENCRYPT_BROWSER_PROFILES", False)
-    monkeypatch.setattr(app, "STORAGE", storage)
     monkeypatch.setattr(app.DATABASE.browser_sessions, "hard_delete_browser_profile", AsyncMock())
-    if source == "sealed-denied-plaintext":
-        transport.objects[legacy] = ArtifactManager._build_zip({"Default/Cookies": b"legacy login"})
-        transport.objects[sealed] = b"unreadable seal"
-    original = transport.objects.copy()
-    read = transport.download_file
+    cookie = b"legacy login"
+    if backend == "local":
+        local = LocalStorage()
+        root = tmp_path / "archives"
+        monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(root))
+        source_dir = root / "o_test" / "wpid_test"
+        source_seal = source_dir.with_name(source_dir.name + SEALED_PROFILE_SUFFIX)
+        source_seal.parent.mkdir(parents=True)
+        source_seal.write_bytes(b"unreadable seal")
+        if has_plaintext:
+            (source_dir / "Default").mkdir(parents=True)
+            (source_dir / "Default" / "Cookies").write_bytes(cookie)
+        local_stat = local._profile_stat
 
-    async def refuse_seal(uri: str) -> bytes | None:
-        if uri == sealed:
+        def local_probe(path: Path) -> object:
+            if path == source_seal:
+                raise PermissionError("sealed test archive is inaccessible")
+            return local_stat(path)
+
+        monkeypatch.setattr(local, "_profile_stat", local_probe)
+        storage = local
+    else:
+        remote = {
+            "s3": S3Storage,
+            "azure": lambda: AzureStorage(account_name="teststorage", account_key="test-only"),
+            "gcs": GcsStorage,
+        }[backend]()
+        transport = ProfileTransport()
+        legacy, sealed = remote._workflow_session_uris("o_test", "wpid_test")
+        destination, _ = remote._profile_uris("o_test", profile.browser_profile_id)
+        if has_plaintext:
+            transport.objects[legacy] = ArtifactManager._build_zip({"Default/Cookies": cookie})
+            transport.objects[sealed] = b"unreadable seal"
+        original = transport.objects.copy()
+
+        def read_object(uri: str) -> bytes | None:
+            if uri != sealed:
+                return transport.objects.get(uri)
+            if backend == "azure":
+                denial = ClientAuthenticationError("test authentication failure")
+                denial.status_code = 401
+                raise denial
+            if backend == "gcs":
+                raise Forbidden("test authorization failure")
             raise ClientError(
                 {"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}}, "GetObject"
             )
-        return await read(uri)
 
-    monkeypatch.setattr(transport, "download_file", refuse_seal)
-    install_s3_profile_transport(storage, transport, monkeypatch)
+        if isinstance(remote, S3Storage):
 
+            async def read_s3(uri: str) -> bytes | None:
+                return read_object(uri)
+
+            monkeypatch.setattr(transport, "download_file", read_s3)
+            install_s3_profile_transport(remote, transport, monkeypatch)
+        else:
+            install_cloud_profile_transport(remote, transport, monkeypatch, read=read_object)
+        storage = remote
+
+    monkeypatch.setattr(app, "STORAGE", storage)
     result = await WorkflowService()._ensure_managed_browser_profile(
         workflow=_workflow(),
         workflow_run=_workflow_run(),
@@ -390,10 +448,18 @@ async def test_ensure_managed_browser_profile_seeds_new_profile_from_legacy_arch
     )
 
     assert result == profile.browser_profile_id
-    if source == "sealed-denied-plaintext":
-        with zipfile.ZipFile(io.BytesIO(transport.objects.pop(destination))) as bundle:
-            assert bundle.read("Default/Cookies") == b"legacy login"
-    assert transport.objects == original
+    if backend == "local":
+        saved = {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+        expected = {"o_test/wpid_test.zip.enc": b"unreadable seal"}
+        if has_plaintext:
+            expected["o_test/wpid_test/Default/Cookies"] = cookie
+            expected["o_test/profiles/bp_managed/Default/Cookies"] = cookie
+        assert saved == expected
+    else:
+        if has_plaintext:
+            with zipfile.ZipFile(io.BytesIO(transport.objects.pop(destination))) as bundle:
+                assert bundle.read("Default/Cookies") == cookie
+        assert transport.objects == original
 
 
 @pytest.mark.asyncio
@@ -404,6 +470,7 @@ async def test_ensure_managed_browser_profile_seeds_new_profile_from_legacy_arch
         "bad-tag",
         "missing-root",
         "protected-read",
+        "plaintext-read",
         "conflict",
         "causal-conflict",
         "legacy-unconfirmed",
@@ -447,6 +514,7 @@ async def test_ensure_managed_browser_profile_rolls_back_on_seed_failure(
     monkeypatch.setattr(app, "STORAGE", storage)
     store = storage.store_browser_profile
     original_error = PermissionError("protected workflow archive read denied")
+    plaintext_error = PermissionError("plaintext workflow archive read denied")
     conflict = ProfilePublicationConflict("competing sealed profile")
     error: Exception = conflict if failure == "conflict" else OSError("legacy upload had a competing seal")
     if failure.endswith("-unconfirmed"):
@@ -459,12 +527,14 @@ async def test_ensure_managed_browser_profile_rolls_back_on_seed_failure(
         archive.write_bytes(encrypted[:-1] + bytes([encrypted[-1] ^ 1]))
     elif failure == "missing-root":
         monkeypatch.setattr(settings, "SKYVERN_ARTIFACT_ENCRYPTION_KEYS", ())
-    elif failure == "protected-read":
+    elif failure in {"protected-read", "plaintext-read"}:
         stat = storage._profile_stat
 
         def refuse_protected_read(path: Path) -> object:
             if path == archive:
                 raise original_error
+            if failure == "plaintext-read" and path == archive.with_name(workflow_id):
+                raise plaintext_error
             return stat(path)
 
         monkeypatch.setattr(storage, "_profile_stat", refuse_protected_read)
@@ -496,12 +566,18 @@ async def test_ensure_managed_browser_profile_rolls_back_on_seed_failure(
         assert await resolve() == profile_id
     elif failure in {"bad-tag", "missing-root", "protected-read"}:
         exception = PermissionError if failure == "protected-read" else ArtifactDecryptionError
-        # A retry must still consult the saved archive and surface the same failure.
+        with pytest.raises(exception) as caught:
+            await storage.retrieve_browser_session_snapshot(organization_id, workflow_id)
+        if failure == "protected-read":
+            assert caught.value is original_error
+        assert await resolve() == profile_id and rows == {profile_id}
+        assert not await storage.browser_profile_exists(organization_id, profile_id)
+        assert await resolve() == profile_id
+    elif failure == "plaintext-read":
         for _ in range(2):
-            with pytest.raises(exception) as caught:
+            with pytest.raises(PermissionError) as caught:
                 await resolve()
-            if failure == "protected-read":
-                assert caught.value is original_error
+            assert caught.value is plaintext_error
             assert not rows and not await storage.browser_profile_exists(organization_id, profile_id)
     else:
         with pytest.raises(type(error)) as caught:

@@ -10,9 +10,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+from azure.core.exceptions import ResourceNotFoundError
 from botocore.exceptions import ClientError
+from google.api_core.exceptions import NotFound
 from pydantic import SecretStr
 
+from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -22,6 +25,7 @@ from skyvern.schemas.workflows import BlockType
 if TYPE_CHECKING:
     import pytest
 
+    from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
     from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 
 
@@ -170,3 +174,77 @@ def install_s3_profile_transport(storage: S3Storage, fake: ProfileTransport, mon
         yield _S3Vendor()
 
     monkeypatch.setattr(storage.async_client, "_s3_client", client)
+
+
+def install_cloud_profile_transport(
+    storage: AzureStorage | GcsStorage,
+    fake: ProfileTransport,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    read: Callable[[str], bytes | None],
+    probe: Callable[[str], bytes | None] | None = None,
+) -> None:
+    probe = fake.objects.get if probe is None else probe
+    if isinstance(storage, AzureStorage):
+
+        def azure_blob(uri: str) -> SimpleNamespace:
+            async def download_blob() -> SimpleNamespace:
+                data = read(uri)
+                if data is None:
+                    raise ResourceNotFoundError("missing test blob")
+
+                async def readall() -> bytes:
+                    return data
+
+                return SimpleNamespace(readall=readall, properties=SimpleNamespace(etag=str(fake._version(data))))
+
+            async def get_blob_properties() -> SimpleNamespace:
+                data = probe(uri)
+                if data is None:
+                    raise ResourceNotFoundError("missing test blob")
+                return SimpleNamespace(
+                    etag=str(fake._version(data)),
+                    size=len(data),
+                    metadata={},
+                    last_modified=None,
+                    content_settings=None,
+                )
+
+            return SimpleNamespace(download_blob=download_blob, get_blob_properties=get_blob_properties)
+
+        service = SimpleNamespace(
+            get_container_client=lambda name: SimpleNamespace(
+                get_blob_client=lambda path: azure_blob(f"azure://{name}/{path}")
+            )
+        )
+        monkeypatch.setattr(storage.async_client, "_get_blob_service_client", lambda: service)
+    else:
+
+        def gcs_blob(uri: str) -> SimpleNamespace:
+            blob = SimpleNamespace(generation=None)
+
+            def download_as_bytes() -> bytes:
+                data = read(uri)
+                if data is None:
+                    raise NotFound("missing test object")
+                blob.generation = fake._version(data)
+                return data
+
+            blob.download_as_bytes = download_as_bytes
+            return blob
+
+        def gcs_stat(uri: str) -> SimpleNamespace | None:
+            data = probe(uri)
+            if data is None:
+                return None
+            return SimpleNamespace(generation=fake._version(data), size=len(data), metadata={}, updated=None)
+
+        client = SimpleNamespace(
+            bucket=lambda name: SimpleNamespace(
+                blob=lambda path: gcs_blob(f"gs://{name}/{path}"),
+                get_blob=lambda path: gcs_stat(f"gs://{name}/{path}"),
+            )
+        )
+        monkeypatch.setattr(storage.async_client, "_get_client", lambda: client)
+    monkeypatch.setattr(storage.async_client, "upload_file_from_path", fake.upload_file_from_path)
+    monkeypatch.setattr(storage.async_client, "delete_file", fake.delete_file)
