@@ -7031,7 +7031,10 @@ class ForgeAgent:
                         # may have remounted/reflowed this one's target away from the shared pre-batch scrape.
                         allow_stale_refresh=action_idx > 0,
                         computer_surface=(
-                            BrowserComputerSurface(current_page, dispatch_page) if engine in CUA_ENGINES else None
+                            await app.AGENT_FUNCTION.get_computer_surface(task)
+                            or BrowserComputerSurface(current_page, dispatch_page)
+                            if engine in CUA_ENGINES
+                            else None
                         ),
                     )
                 otp_results = results
@@ -7131,6 +7134,9 @@ class ForgeAgent:
                     action=action,
                     action_result=results,
                 )
+                # A refused completion that asked to stop the batch must not let a later action in it run.
+                if results[-1].skip_remaining_actions:
+                    break
             elif results and not results[-1].success and not results[-1].stop_execution_on_failure:
                 LOG.warning(
                     "Action failed, but not stopping execution",
@@ -8802,6 +8808,11 @@ class ForgeAgent:
         navigation_deadline: float | None = None,
         support_empty_page: bool = False,
     ) -> ScrapedPage:
+        if engine in CUA_ENGINES and (surface := await app.AGENT_FUNCTION.get_computer_surface(task)) is not None:
+            scraped_page = await surface.get_frame()
+            scraped_page._support_empty_page = support_empty_page
+            return scraped_page
+
         if scrape_type == ScrapeType.NORMAL:
             pass
 
