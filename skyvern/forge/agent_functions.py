@@ -1157,7 +1157,91 @@ class AgentFunction:
     async def nango_gmail_catalog_available(self, organization_id: str) -> bool:
         return False
 
+    async def nango_google_drive_catalog_available(self, organization_id: str) -> bool:
+        return False
+
+    async def prepare_google_drive_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
+        return None
+
+    async def list_nango_google_drive_files(
+        self,
+        *,
+        principal: RequestPrincipal,
+        connection_id: str,
+        folders: bool,
+        query: str | None,
+        page_token: str | None,
+        page_size: int,
+        search_all_drives: bool,
+        downloadable_only: bool,
+    ) -> google_drive_service.DriveFilesPage:
+        raise google_drive_service.GoogleDriveAPIError(
+            status=404, code="integration_unavailable", message="Google Drive integration unavailable"
+        )
+
+    async def get_nango_google_drive_item(
+        self, *, principal: RequestPrincipal, connection_id: str, item: str
+    ) -> dict[str, Any]:
+        raise google_drive_service.GoogleDriveAPIError(
+            status=404, code="integration_unavailable", message="Google Drive integration unavailable"
+        )
+
+    async def get_google_drive_item_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        item: str,
+        selection_grant: str | None = None,
+    ) -> dict[str, Any]:
+        raise google_drive_service.GoogleDriveAPIError(
+            status=404, code="integration_unavailable", message="Google Drive integration unavailable"
+        )
+
+    async def list_google_drive_folder_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        folder: str,
+        max_results: int,
+        page_token: str | None = None,
+        include_page_token: bool = False,
+        selection_grant: str | None = None,
+        resource_key: str | None = None,
+    ) -> dict[str, Any]:
+        raise google_drive_service.GoogleDriveAPIError(
+            status=404, code="integration_unavailable", message="Google Drive integration unavailable"
+        )
+
+    async def download_google_drive_file_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        file_id: str,
+        resource_key: str | None,
+        output_dir: str,
+        max_bytes: int,
+        selection_grant: str | None = None,
+    ) -> str:
+        raise google_drive_service.GoogleDriveAPIError(
+            status=404, code="integration_unavailable", message="Google Drive integration unavailable"
+        )
+
     async def own_connected_gmail_connections(self, organization_id: str, user_id: str) -> list[OrgConnection]:
+        return []
+
+    async def own_connected_google_drive_connections(self, organization_id: str, user_id: str) -> list[OrgConnection]:
         return []
 
     async def prepare_gmail_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:

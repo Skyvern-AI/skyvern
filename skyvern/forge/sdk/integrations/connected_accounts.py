@@ -186,6 +186,14 @@ async def _no_connections() -> list[OrgConnection]:
     return []
 
 
+async def _own_nango_connections(organization_id: str, user_id: str) -> list[OrgConnection]:
+    gmail, drive = await asyncio.gather(
+        app.AGENT_FUNCTION.own_connected_gmail_connections(organization_id, user_id),
+        app.AGENT_FUNCTION.own_connected_google_drive_connections(organization_id, user_id),
+    )
+    return [*gmail, *drive]
+
+
 class IncompleteConnectionRead(Exception):
     """A provider's rows could not be read. `connections` holds the providers that did load; only an id lookup may
     use them, because a name that looks unique among them can still match a row in the provider that failed."""
@@ -200,7 +208,7 @@ async def org_connections(organization_id: str, user_id: str | None = None) -> l
     """Every connection `user_id` may see in the org, as one flat list. Nango connections are the user's own."""
     # Not integrations_for_org: it files accounts under catalog entries by scope, and this list must not.
     own_nango: Awaitable[list[OrgConnection]] = (
-        app.AGENT_FUNCTION.own_connected_gmail_connections(organization_id, user_id) if user_id else _no_connections()
+        _own_nango_connections(organization_id, user_id) if user_id else _no_connections()
     )
     reads: list[Sequence[Any] | BaseException] = list(
         await asyncio.gather(
@@ -338,7 +346,7 @@ ACCOUNT_BACKENDS: dict[str, AccountBackend] = {
 }
 
 
-async def _known_account(organization_id: str, account_ref: str, api: AccountApi | None) -> OrgConnection | None:
+async def _known_account(organization_id: str, account_ref: str, api: AccountApi) -> OrgConnection | None:
     ref = account_ref.strip()
     return next(
         (
@@ -346,7 +354,7 @@ async def _known_account(organization_id: str, account_ref: str, api: AccountApi
             for connection in await org_connections_by_id(organization_id)
             if connection.id == ref
             and connection.provider in ACCOUNT_BACKENDS
-            and (api is None or api in ACCOUNT_BACKENDS[connection.provider].apis)
+            and api in ACCOUNT_BACKENDS[connection.provider].apis
         ),
         None,
     )
@@ -357,28 +365,23 @@ async def resolve_account_access(
     account_ref: str,
     required_scopes: list[str] | None = None,
     *,
-    api: AccountApi | None = None,
+    api: AccountApi,
 ) -> AccountAccess:
     """What a block needs to use the connected account `account_ref`, from the backend its provider names.
     A block that calls one provider's API passes `api`, so only an account whose token can call it resolves."""
-    if api is not None and [name for name, backend in ACCOUNT_BACKENDS.items() if api in backend.apis] == [api]:
+    if [name for name, backend in ACCOUNT_BACKENDS.items() if api in backend.apis] == [api]:
         # Only the API's own backend can serve it, so reading the org's accounts could not change the answer.
         return await ACCOUNT_BACKENDS[api].access(organization_id, account_ref, required_scopes)
     try:
         account = await _known_account(organization_id, account_ref, api)
     except Exception:
-        if api is None:
-            raise
         LOG.warning("connected_account_lookup_failed", organization_id=organization_id, exc_info=True)
         account = None
     if account is not None:
         return await ACCOUNT_BACKENDS[account.provider].access(organization_id, account.id, required_scopes)
-    if api is not None:
-        # Not a known id (a hand-written name or email, or an unreadable account list): the API's own backend
-        # resolves the reference itself.
-        return await ACCOUNT_BACKENDS[api].access(organization_id, account_ref, required_scopes)
-    LOG.info("connected_account_not_resolved", organization_id=organization_id)
-    return None
+    # Not a known id (a hand-written name or email, or an unreadable account list): the API's own backend
+    # resolves the reference itself.
+    return await ACCOUNT_BACKENDS[api].access(organization_id, account_ref, required_scopes)
 
 
 async def resolve_account_token(

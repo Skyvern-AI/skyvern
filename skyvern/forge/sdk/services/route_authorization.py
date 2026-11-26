@@ -199,6 +199,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.feedback.get_run_feedback": "feedback.read",
     "skyvern.forge.sdk.routes.feedback.submit_agent_feedback": "feedback.create",
     "skyvern.forge.sdk.routes.feedback.submit_run_feedback": "feedback.create",
+    "skyvern.forge.sdk.routes.google_drive.get_item": "google_drive.list",
     "skyvern.forge.sdk.routes.google_drive.list_files": "google_drive.list",
     "skyvern.forge.sdk.routes.google_drive.mint_drive_picker_token": "google_oauth.picker_token",
     "skyvern.forge.sdk.routes.google_oauth.delete_google_oauth_client_config": "google_oauth.delete",

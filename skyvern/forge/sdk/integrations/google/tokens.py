@@ -5,7 +5,7 @@ from enum import StrEnum
 from sqlalchemy.exc import SQLAlchemyError
 
 from skyvern.forge import app
-from skyvern.forge.sdk.db.repositories.google_oauth import STATE_ACTIVE
+from skyvern.forge.sdk.db.repositories.google_oauth import STATE_ACTIVE, STATE_ERROR
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service
 
@@ -52,8 +52,10 @@ async def resolve_drive_picker_token(
         return DrivePickerToken(status)
     if credential is None:
         return DrivePickerToken(DrivePickerTokenStatus.OWNER_ONLY)
-    if credential.state != STATE_ACTIVE:
+    if credential.state == STATE_ERROR:
         return DrivePickerToken(DrivePickerTokenStatus.RECONNECT_REQUIRED)
+    if credential.state != STATE_ACTIVE:
+        return DrivePickerToken(DrivePickerTokenStatus.OWNER_ONLY)
     if google_oauth_service.GOOGLE_DRIVE_FILE_SCOPE not in credential.scopes_granted:
         return DrivePickerToken(DrivePickerTokenStatus.PICKER_RECONNECT_REQUIRED)
 
@@ -102,8 +104,10 @@ async def resolve_drive_picker_token(
         return DrivePickerToken(status)
     if current_credential is None:
         return DrivePickerToken(DrivePickerTokenStatus.OWNER_ONLY)
-    if current_credential.state != STATE_ACTIVE:
+    if current_credential.state == STATE_ERROR:
         return DrivePickerToken(DrivePickerTokenStatus.RECONNECT_REQUIRED)
+    if current_credential.state != STATE_ACTIVE:
+        return DrivePickerToken(DrivePickerTokenStatus.OWNER_ONLY)
     if current_credential.modified_at != refreshed.credential_version:
         return DrivePickerToken(DrivePickerTokenStatus.RETRY_REQUIRED)
     return DrivePickerToken(

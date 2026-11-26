@@ -4,17 +4,25 @@ integration_action block calls a runner; no workflow definition can name one."""
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
 
-from skyvern.forge.sdk.experimentation.drive_folder_actions import drive_folder_actions_enabled
-from skyvern.forge.sdk.integrations.connected_accounts import resolve_account_token
+from skyvern.constants import EMBER_TEST_RUN_UNSUPPORTED_CODE
+from skyvern.forge import app
+from skyvern.forge.sdk.integrations.catalog import action_credential_backends, runner_action
+from skyvern.forge.sdk.integrations.connected_accounts import UseHop, resolve_account_token
+from skyvern.forge.sdk.integrations.google.drive_download import run_drive_download
+from skyvern.forge.sdk.schemas.google_drive import (
+    GOOGLE_DRIVE_EMBER_TEST_RUN_REASON,
+    GOOGLE_DRIVE_LITERAL_SELECTION_REASON,
+    GoogleDriveHopRefusal,
+)
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
 
 LOG = structlog.get_logger()
 
-DRIVE_FOLDER_ACTIONS_UNAVAILABLE = "Google Drive folder actions are not available for this organization."
 _DRIVE_REQUIRED_INPUTS: dict[str, tuple[str, ...]] = {
     "list_folder": ("google_drive_folder_id",),
     "create_folder": ("parent_folder_id", "folder_name"),
@@ -25,13 +33,23 @@ _DRIVE_REQUIRED_INPUTS: dict[str, tuple[str, ...]] = {
 class ActionRunFailed(Exception):
     """A refusal or failure whose message is already written for the person running the block."""
 
-    def __init__(self, reason: str, output: dict[str, Any] | None = None) -> None:
+    def __init__(self, reason: str, output: dict[str, Any] | None = None, error_code: str | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
         self.output = output
+        self.error_code = error_code
 
 
-ActionRunner = Callable[[str, str, str, Mapping[str, Any]], Awaitable[dict[str, Any]]]
+@dataclass(frozen=True)
+class ActionRunContext:
+    workflow_run_id: str
+    workflow_run_block_id: str
+    hop_token: str | None
+    broker_connection: bool
+    hop_refusal: str | None = None
+
+
+ActionRunner = Callable[[str, str, str, Mapping[str, Any], ActionRunContext], Awaitable[dict[str, Any]]]
 
 
 def _text(inputs: Mapping[str, Any], name: str) -> str:
@@ -39,28 +57,67 @@ def _text(inputs: Mapping[str, Any], name: str) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def google_drive_hop_refusal(context: ActionRunContext) -> ActionRunFailed | None:
+    if context.broker_connection and not context.hop_token:
+        if context.hop_refusal == GoogleDriveHopRefusal.ember_test_run:
+            return ActionRunFailed(
+                GOOGLE_DRIVE_EMBER_TEST_RUN_REASON,
+                error_code=EMBER_TEST_RUN_UNSUPPORTED_CODE,
+            )
+        if context.hop_refusal == GoogleDriveHopRefusal.unsafe_selection_input_source:
+            return ActionRunFailed(GOOGLE_DRIVE_LITERAL_SELECTION_REASON)
+    return None
+
+
 async def run_google_drive_folder_action(
-    organization_id: str, connection_id: str, action_id: str, inputs: Mapping[str, Any]
+    organization_id: str,
+    connection_id: str,
+    action_id: str,
+    inputs: Mapping[str, Any],
+    context: ActionRunContext | None = None,
 ) -> dict[str, Any]:
     """List a folder, create a subfolder or move an item through one connected Google account of the organization."""
-    if not await drive_folder_actions_enabled(organization_id):
-        raise ActionRunFailed(DRIVE_FOLDER_ACTIONS_UNAVAILABLE)
     if missing := [name for name in _DRIVE_REQUIRED_INPUTS[action_id] if not _text(inputs, name)]:
         raise ActionRunFailed(f"Google Drive: {missing[0]!r} is required.")
     # Minted for this organization's own connection, so both ends of a move go through one account of the
     # organization running the block.
-    access_token = await resolve_account_token(
-        organization_id, connection_id, list(google_oauth_service.GOOGLE_DRIVE_STEP_SCOPES), api="google"
+    context = context or ActionRunContext("", "", None, False)
+    if refusal := google_drive_hop_refusal(context):
+        raise refusal
+    found = runner_action("google_drive", action_id)
+    if context.broker_connection and (found is None or "nango" not in action_credential_backends(*found)):
+        raise ActionRunFailed("Google Drive: this connected account is not available for this action yet.")
+    access = (
+        UseHop()
+        if context.broker_connection
+        else await resolve_account_token(
+            organization_id,
+            connection_id,
+            list(google_oauth_service.GOOGLE_DRIVE_STEP_SCOPES),
+            api="google",
+        )
     )
-    if not access_token:
+    if not access:
         raise ActionRunFailed(await google_oauth_service.describe_credential_failure(organization_id, connection_id))
+    access_token = access if isinstance(access, str) else ""
     try:
         if action_id == "list_folder":
-            output = await google_drive_service.list_folder(
-                access_token=access_token,
-                folder=_text(inputs, "google_drive_folder_id"),
-                max_results=int(inputs.get("max_results") or 100),
-            )
+            if isinstance(access, UseHop):
+                output = await app.AGENT_FUNCTION.list_google_drive_folder_for_run(
+                    organization_id=organization_id,
+                    workflow_run_id=context.workflow_run_id,
+                    workflow_run_block_id=context.workflow_run_block_id,
+                    connection_id=connection_id,
+                    hop_token=context.hop_token,
+                    folder=_text(inputs, "google_drive_folder_id"),
+                    max_results=int(inputs.get("max_results") or 100),
+                )
+            else:
+                output = await google_drive_service.list_folder(
+                    access_token=access,
+                    folder=_text(inputs, "google_drive_folder_id"),
+                    max_results=int(inputs.get("max_results") or 100),
+                )
         elif action_id == "create_folder":
             output = await google_drive_service.create_folder(
                 access_token=access_token,
@@ -94,4 +151,7 @@ async def run_google_drive_folder_action(
     return output
 
 
-ACTION_RUNNERS: dict[str, ActionRunner] = {"google_drive_folder": run_google_drive_folder_action}
+ACTION_RUNNERS: dict[str, ActionRunner] = {
+    "google_drive_folder": run_google_drive_folder_action,
+    "google_drive_download": run_drive_download,
+}

@@ -8,12 +8,19 @@ from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from skyvern.forge import app
-from skyvern.forge.sdk.integrations.action_runners import ACTION_RUNNERS, ActionRunFailed, ActionRunner
+from skyvern.forge.sdk.integrations.action_runners import (
+    ACTION_RUNNERS,
+    ActionRunContext,
+    ActionRunFailed,
+    ActionRunner,
+)
 from skyvern.forge.sdk.integrations.catalog import (
     IntegrationAction,
     IntegrationEntry,
+    action_credential_backends,
     all_integration_entries,
     entry_action,
+    entry_credential_backends,
 )
 from skyvern.forge.sdk.integrations.connected_accounts import connected_account_fields
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
@@ -63,12 +70,16 @@ def validate_action_inputs(action: IntegrationAction, inputs: dict[str, Any]) ->
 
 
 def _takes_nango(entry: IntegrationEntry) -> bool:
-    return "nango" in {entry.credential_backend, *(entry.additional_credential_backends or [])}
+    return "nango" in entry_credential_backends(entry)
 
 
-def _uses_nango(entry: IntegrationEntry, nango: bool) -> bool:
+def _uses_nango(entry: IntegrationEntry, action: IntegrationAction, nango: bool) -> bool:
     # An entry that takes both kinds of account cannot tell them apart from the id; the caller looked it up.
-    return _takes_nango(entry) and (entry.oauth_provider is None or nango)
+    return "nango" in action_credential_backends(entry, action) and (entry.oauth_provider is None or nango)
+
+
+def _unsupported_account_reason(entry: IntegrationEntry) -> str:
+    return f"{entry.name}: this connected account is not available for this action yet."
 
 
 def runnable_blocks(blocks: Sequence[Block], nango_connection_ids: Collection[str] = frozenset()) -> list[Block]:
@@ -158,6 +169,15 @@ class IntegrationActionBlock(Block):
             return await self._failure(
                 f"{entry.name}: {action.name} needs a connected account.", workflow_run_block_id, organization_id
             )
+        broker_connection = _takes_nango(entry) and bool(
+            await app.AGENT_FUNCTION.nango_connection_ids(organization_id, {connection_id})
+        )
+        if broker_connection and "nango" not in action_credential_backends(entry, action):
+            return await self._failure(
+                _unsupported_account_reason(entry),
+                workflow_run_block_id,
+                organization_id,
+            )
         inputs = dict(self.inputs)
         # Values an agent wrote are text, never templates.
         if "inputs" not in self._prerendered_fields:
@@ -165,6 +185,13 @@ class IntegrationActionBlock(Block):
                 inputs = {
                     name: self.format_block_parameter_template_from_workflow_run_context(value, workflow_run_context)
                     if _templated(value)
+                    else [
+                        self.format_block_parameter_template_from_workflow_run_context(item, workflow_run_context)
+                        if _templated(item)
+                        else item
+                        for item in value
+                    ]
+                    if action.runs_via == "runner:google_drive_download" and name == "items" and isinstance(value, list)
                     else value
                     for name, value in inputs.items()
                 }
@@ -180,7 +207,22 @@ class IntegrationActionBlock(Block):
                     organization_id,
                 )
         try:
-            output = await runner(organization_id, connection_id, action.id, inputs)
+            run_context = ActionRunContext(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                hop_token=(
+                    workflow_run_context.get_google_drive_hop_token(self.label)
+                    if broker_connection and action.drive_hop_operations
+                    else None
+                ),
+                broker_connection=broker_connection,
+                hop_refusal=(
+                    workflow_run_context.get_google_drive_hop_refusal(self.label)
+                    if broker_connection and action.drive_hop_operations
+                    else None
+                ),
+            )
+            output = await runner(organization_id, connection_id, action.id, inputs, run_context)
         except ActionRunFailed as e:
             if e.output is not None:
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, e.output)
@@ -191,6 +233,7 @@ class IntegrationActionBlock(Block):
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                error_codes=[e.error_code] if e.error_code else None,
             )
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
         return await self.build_block_result(
@@ -209,7 +252,7 @@ class IntegrationActionBlock(Block):
     def inner_block(self, nango: bool = False) -> Block:
         """The existing block this action runs as, under this block's label and output."""
         # Late import: the converter imports every block model, this one included.
-        from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block  # noqa: PLC0415
+        from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
 
         found = entry_action(all_integration_entries(), self.integration_id, self.action_id)
         if found is None:
@@ -229,7 +272,7 @@ class IntegrationActionBlock(Block):
         yaml_class = BLOCK_TYPE_MAP[block_type]
         account_fields = connected_account_fields({"block_type": block_type, **fields})
         if self.connection_id:
-            if _uses_nango(entry, nango):
+            if _uses_nango(entry, action, nango):
                 if "credential_source" in yaml_class.model_fields:
                     fields["credential_source"] = "nango"
                 account_fields = ("connection_id",)
@@ -320,6 +363,13 @@ class IntegrationActionBlock(Block):
                     workflow_run_block_id,
                     effective_org_id,
                 )
+        found = entry_action(all_integration_entries(), rendered.integration_id, rendered.action_id)
+        if nango and found is not None and "nango" not in action_credential_backends(*found):
+            return await self._failure(
+                _unsupported_account_reason(found[0]),
+                workflow_run_block_id,
+                effective_org_id,
+            )
         try:
             inner = rendered.inner_block(nango=nango)
         except IntegrationActionError as e:

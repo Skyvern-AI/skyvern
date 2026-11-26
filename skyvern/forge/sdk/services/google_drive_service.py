@@ -29,6 +29,8 @@ from skyvern.forge.sdk.services.file_download_utils import publish_unique_downlo
 
 DRIVE_UPLOAD_API_BASE = "https://www.googleapis.com/upload/drive/v3"
 DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
+DRIVE_STREAM_CHUNK_BYTES = 256 * 1024
+DRIVE_STREAM_METADATA_BYTES = 4 * 1024
 DRIVE_MULTIPART_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
 # Reserve headroom for JSON metadata and MIME boundaries below the 5 MiB multipart request cap.
 DRIVE_MULTIPART_FILE_MAX_BYTES = DRIVE_MULTIPART_UPLOAD_MAX_BYTES - 10 * 1024
@@ -45,7 +47,8 @@ SHEET_CONVERTIBLE_MEDIA_TYPES = {
     ".xls": "application/vnd.ms-excel",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
-_DRIVE_FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+DRIVE_FILE_ID_PATTERN = r"^[A-Za-z0-9_-]+$"
+_DRIVE_FILE_ID_PATTERN = re.compile(DRIVE_FILE_ID_PATTERN)
 
 _DEFAULT_BACKOFF_SECONDS = 1.0
 _FILE_PERMISSION_403_REASONS = frozenset({"insufficientFilePermissions", "teamDriveMembershipRequired"})
@@ -86,6 +89,12 @@ class DownloadableDriveFile:
     name: str
     mime_type: str | None
     size: int | None
+
+
+@dataclass(frozen=True)
+class PreparedDriveDownload:
+    file: DownloadableDriveFile
+    export_mime_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -612,41 +621,73 @@ async def _upload_file_resumable(
         )
 
 
-def extract_file_reference(value: str) -> GoogleDriveFileReference:
+def is_valid_drive_id(value: str) -> bool:
+    return _DRIVE_FILE_ID_PATTERN.fullmatch(value) is not None
+
+
+def _extract_drive_reference(
+    value: str, *, file_links_only: bool, include_resource_key: bool = True
+) -> GoogleDriveFileReference:
     candidate = value.strip()
-    if _DRIVE_FILE_ID_PATTERN.fullmatch(candidate):
+    if is_valid_drive_id(candidate):
         return GoogleDriveFileReference(file_id=candidate)
 
     parsed = urlparse(candidate)
     if parsed.scheme.lower() != "https" or parsed.hostname not in ("drive.google.com", "docs.google.com"):
-        raise ValueError("Google Drive file URL must use https://drive.google.com or https://docs.google.com")
+        if file_links_only:
+            raise ValueError("Google Drive file URL must use https://drive.google.com or https://docs.google.com")
+        raise ValueError("A Google Drive link must use https://drive.google.com or https://docs.google.com")
 
-    expected_prefix = ["file", "d"] if parsed.hostname == "drive.google.com" else ["document", "d"]
     segments = [segment for segment in parsed.path.split("/") if segment]
-    if len(segments) >= 3 and segments[1] == "u" and segments[2].isdigit():
-        # Signed into several accounts, Google inserts /u/<account-index>/ after the first segment.
-        del segments[1:3]
-    if len(segments) < 3 or segments[:2] != expected_prefix or not _DRIVE_FILE_ID_PATTERN.fullmatch(segments[2]):
-        raise ValueError("Unsupported Google Drive file URL")
-    if parsed.hostname == "docs.google.com" and segments[2] == "e":
-        # Publish-to-web links (/document/d/e/<public-id>/pub) carry an ID Drive cannot resolve.
-        raise ValueError("Published Google Docs links are not Drive file URLs")
+    if file_links_only:
+        expected_prefix = ["file", "d"] if parsed.hostname == "drive.google.com" else ["document", "d"]
+        if len(segments) >= 3 and segments[1] == "u" and segments[2].isdigit():
+            # Signed into several accounts, Google inserts /u/<account-index>/ after the first segment.
+            del segments[1:3]
+        if len(segments) < 3 or segments[:2] != expected_prefix or not is_valid_drive_id(segments[2]):
+            raise ValueError("Unsupported Google Drive file URL")
+        if parsed.hostname == "docs.google.com" and segments[2] == "e":
+            # Publish-to-web links (/document/d/e/<public-id>/pub) carry an ID Drive cannot resolve.
+            raise ValueError("Published Google Docs links are not Drive file URLs")
+        item_id = segments[2]
+    else:
+        item_id = ""
+        for marker in ("folders", "d"):
+            if marker in segments:
+                index = segments.index(marker)
+                item_id = segments[index + 1] if index + 1 < len(segments) else ""
+                if is_valid_drive_id(item_id) and item_id != "e":
+                    break
+        else:
+            query_ids = parse_qs(parsed.query).get("id", [])
+            item_id = query_ids[0] if len(query_ids) == 1 and is_valid_drive_id(query_ids[0]) else ""
+        if not item_id or item_id == "e":
+            raise ValueError("Unsupported Google Drive link")
+
+    if not include_resource_key:
+        return GoogleDriveFileReference(file_id=item_id)
 
     query = parse_qs(parsed.query, keep_blank_values=True)
     resource_keys = query.get("resourcekey", []) + query.get("resourceKey", [])
     if len(resource_keys) > 1:
-        raise ValueError("Google Drive file URL contains multiple resource keys")
-    resource_key = resource_keys[0] if resource_keys else None
-    if resource_key is not None and not _DRIVE_FILE_ID_PATTERN.fullmatch(resource_key):
+        if file_links_only:
+            raise ValueError("Google Drive file URL contains multiple resource keys")
         raise ValueError("Google Drive resource key is invalid")
-    return GoogleDriveFileReference(file_id=segments[2], resource_key=resource_key)
+    resource_key = resource_keys[0] if resource_keys else None
+    if resource_key is not None and not is_valid_drive_id(resource_key):
+        raise ValueError("Google Drive resource key is invalid")
+    return GoogleDriveFileReference(file_id=item_id, resource_key=resource_key)
+
+
+def extract_file_reference(value: str) -> GoogleDriveFileReference:
+    return _extract_drive_reference(value, file_links_only=True)
 
 
 def extract_file_id(value: str) -> str:
     return extract_file_reference(value).file_id
 
 
-def _downloadable_file_from_payload(payload: Mapping[str, Any], file_id: str) -> DownloadableDriveFile:
+def downloadable_file_from_payload(payload: Mapping[str, Any], file_id: str) -> DownloadableDriveFile:
     raw_name = payload.get("name")
     name = Path(str(raw_name)).name if raw_name else file_id
     safe_name = (
@@ -666,6 +707,22 @@ def _downloadable_file_from_payload(payload: Mapping[str, Any], file_id: str) ->
         mime_type=mime_type,
         size=size,
     )
+
+
+def prepare_drive_download(payload: Mapping[str, Any], file_id: str) -> PreparedDriveDownload:
+    metadata = downloadable_file_from_payload(payload, file_id)
+    if metadata.mime_type == GOOGLE_DOC_MIME_TYPE:
+        return PreparedDriveDownload(
+            file=DownloadableDriveFile(
+                name=f"{metadata.name}.md",
+                mime_type="text/markdown",
+                size=metadata.size,
+            ),
+            export_mime_type="text/markdown",
+        )
+    if metadata.mime_type and metadata.mime_type.startswith(GOOGLE_WORKSPACE_MIME_PREFIX):
+        raise GoogleDriveNativeDocumentError()
+    return PreparedDriveDownload(file=metadata)
 
 
 async def _get_download_metadata_with_retry(
@@ -705,7 +762,7 @@ async def download_file(
 ) -> str:
     validated_file_id = extract_file_id(file_id)
     max_size_bytes = max_size_mb * 1024 * 1024
-    if resource_key is not None and not _DRIVE_FILE_ID_PATTERN.fullmatch(resource_key):
+    if resource_key is not None and not is_valid_drive_id(resource_key):
         raise ValueError("Google Drive resource key is invalid")
     headers = {"Authorization": f"Bearer {access_token}"}
     if resource_key is not None:
@@ -726,18 +783,16 @@ async def download_file(
             },
         )
         _raise_for_error(metadata_response)
-        metadata = _downloadable_file_from_payload(metadata_response.json() or {}, validated_file_id)
+        prepared = prepare_drive_download(metadata_response.json() or {}, validated_file_id)
+        metadata = prepared.file
 
         media_url = file_url
         media_params = {"alt": "media", "supportsAllDrives": "true"}
         output_name = metadata.name
-        if metadata.mime_type == GOOGLE_DOC_MIME_TYPE:
+        if prepared.export_mime_type is not None:
             # Drive caps exports at 10 MB and answers larger Docs with a non-retryable 403 exportSizeLimitExceeded.
             media_url = f"{file_url}/export"
-            media_params = {"mimeType": "text/markdown"}
-            output_name = f"{metadata.name}.md"
-        elif metadata.mime_type and metadata.mime_type.startswith(GOOGLE_WORKSPACE_MIME_PREFIX):
-            raise GoogleDriveNativeDocumentError()
+            media_params = {"mimeType": prepared.export_mime_type}
         if metadata.size is not None and metadata.size > max_size_bytes:
             raise DownloadFileMaxSizeExceeded(max_size_mb)
 
@@ -844,8 +899,9 @@ async def upload_file(
 
 GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 DRIVE_LIST_FOLDER_MAX_RESULTS = 1000
-_DRIVE_ITEM_FIELDS = "id,name,mimeType,parents,driveId,webViewLink,trashed"
-_DRIVE_LIST_FIELDS = "nextPageToken,files(id,name,mimeType,modifiedTime,size,webViewLink)"
+DRIVE_ITEM_FIELDS = "id,name,mimeType,parents,driveId,webViewLink,trashed"
+DRIVE_LIST_FIELDS = "nextPageToken,files(id,name,mimeType,modifiedTime,size,webViewLink)"
+DRIVE_LIST_FIELDS_WITH_RESOURCE_KEYS = "nextPageToken,files(id,name,mimeType,modifiedTime,size,webViewLink,resourceKey)"
 DriveFolderOperation = Literal["list_folder", "create_folder", "move_file"]
 
 # Reasons Drive gives for a refused move or create, each with what the person can do about it.
@@ -883,33 +939,16 @@ _FOLDER_ACTION_PERMISSION_HINTS: dict[DriveFolderOperation, str] = {
 
 def extract_item_id(value: str | None) -> str:
     """The ID of a Drive file or folder given as an ID or a drive.google.com or docs.google.com link."""
-    candidate = (value or "").strip()
-    if not candidate:
+    if not (value or "").strip():
         raise ValueError("A Google Drive file or folder ID or link is required")
-    if _DRIVE_FILE_ID_PATTERN.fullmatch(candidate):
-        return candidate
-    parsed = urlparse(candidate)
-    if parsed.scheme.lower() != "https" or parsed.hostname not in ("drive.google.com", "docs.google.com"):
-        raise ValueError("A Google Drive link must use https://drive.google.com or https://docs.google.com")
-    segments = [segment for segment in parsed.path.split("/") if segment]
-    for marker in ("folders", "d"):
-        if marker in segments:
-            index = segments.index(marker)
-            item_id = segments[index + 1] if index + 1 < len(segments) else ""
-            # Publish-to-web links (/d/e/<public-id>/pub) carry an ID Drive cannot resolve.
-            if _DRIVE_FILE_ID_PATTERN.fullmatch(item_id) and item_id != "e":
-                return item_id
-    query_ids = parse_qs(parsed.query).get("id", [])
-    if len(query_ids) == 1 and _DRIVE_FILE_ID_PATTERN.fullmatch(query_ids[0]):
-        return query_ids[0]
-    raise ValueError("Unsupported Google Drive link")
+    return _extract_drive_reference(value or "", file_links_only=False, include_resource_key=False).file_id
 
 
 class _FolderActionInputError(GoogleDriveAPIError):
     """A refusal this module makes itself, whose message is already written for the person running the block."""
 
 
-def _folder_action_error(exc: GoogleDriveAPIError, operation: DriveFolderOperation) -> GoogleDriveAPIError:
+def folder_action_error(exc: GoogleDriveAPIError, operation: DriveFolderOperation) -> GoogleDriveAPIError:
     # Google's own message is never passed on: for notFound it echoes the file or folder ID.
     if exc.code == "upstream_unavailable":
         return exc
@@ -976,7 +1015,7 @@ async def _get_item(client: httpx.AsyncClient, headers: Mapping[str, str], item_
         "GET",
         _item_url(item_id),
         headers=headers,
-        params={"fields": _DRIVE_ITEM_FIELDS, "supportsAllDrives": "true"},
+        params={"fields": DRIVE_ITEM_FIELDS, "supportsAllDrives": "true"},
     )
 
 
@@ -984,16 +1023,20 @@ async def _get_folder(
     client: httpx.AsyncClient, headers: Mapping[str, str], folder_id: str, role: str
 ) -> dict[str, Any]:
     folder = await _get_item(client, headers, folder_id)
+    return _folder_from_payload(folder, role)
+
+
+def _folder_from_payload(folder: Mapping[str, Any], role: str) -> dict[str, Any]:
     if folder.get("mimeType") != GOOGLE_FOLDER_MIME_TYPE:
         raise _FolderActionInputError(
             status=400, code="notAFolder", message=f"The {role} is not a Google Drive folder."
         )
     if folder.get("trashed"):
         raise _FolderActionInputError(status=400, code="folderTrashed", message=f"The {role} is in the Drive trash.")
-    return folder
+    return dict(folder)
 
 
-def _listed_item(payload: Mapping[str, Any]) -> dict[str, Any]:
+def listed_item(payload: Mapping[str, Any]) -> dict[str, Any]:
     mime_type = payload.get("mimeType")
     raw_size = payload.get("size")
     return {
@@ -1005,6 +1048,10 @@ def _listed_item(payload: Mapping[str, Any]) -> dict[str, Any]:
         "size": int(raw_size) if isinstance(raw_size, str) and raw_size.isdigit() else None,
         "web_view_link": payload.get("webViewLink"),
     }
+
+
+def summarize_item(item: Mapping[str, Any], fallback_id: str) -> dict[str, Any]:
+    return {**listed_item(item), "name": item.get("name") or item.get("id") or fallback_id}
 
 
 async def _run_folder_action(
@@ -1019,7 +1066,7 @@ async def _run_folder_action(
     except _FolderActionInputError:
         raise
     except GoogleDriveAPIError as exc:
-        raise _folder_action_error(exc, operation) from None
+        raise folder_action_error(exc, operation) from None
 
 
 def _folder_id(value: str | None) -> str:
@@ -1027,51 +1074,134 @@ def _folder_id(value: str | None) -> str:
     return "root" if candidate.lower() == "root" else extract_item_id(candidate)
 
 
-async def list_folder(*, access_token: str, folder: str, max_results: int = 100) -> dict[str, Any]:
-    """The items directly inside a folder, in My Drive or a shared drive, folders first."""
-    folder_id = _folder_id(folder)
-    limit = max(1, min(max_results, DRIVE_LIST_FOLDER_MAX_RESULTS))
+async def get_item(*, access_token: str, item: str) -> dict[str, Any]:
+    """Read the metadata needed to distinguish a selected file from a folder."""
+    reference = extract_item_reference(item)
+    headers = {"Authorization": f"Bearer {access_token}"}
+    if reference.resource_key:
+        headers["X-Goog-Drive-Resource-Keys"] = f"{reference.file_id}/{reference.resource_key}"
+    async with httpx.AsyncClient(timeout=settings.GOOGLE_DRIVE_API_TIMEOUT_SECONDS) as client:
+        return await _get_item(client, headers, reference.file_id)
 
-    async def action(client: httpx.AsyncClient, headers: Mapping[str, str]) -> dict[str, Any]:
-        meta = await _get_folder(client, headers, folder_id, "folder to list")
-        drive_id = meta.get("driveId")
-        # A shared drive's own corpus is listed completely; the "user" corpus covers My Drive and shared-with-me.
-        params = {
-            # The ID is checked against Drive's ID alphabet above, so it cannot close the quoted string.
-            "q": f"'{folder_id}' in parents and trashed = false",
-            "fields": _DRIVE_LIST_FIELDS,
-            "orderBy": "folder,name_natural",
-            "supportsAllDrives": "true",
-            "includeItemsFromAllDrives": "true",
-            **({"corpora": "drive", "driveId": str(drive_id)} if drive_id else {"corpora": "user"}),
-        }
-        items: list[dict[str, Any]] = []
-        page_token: str | None = None
-        while True:
-            page = await _drive_request(
+
+def extract_item_reference(value: str) -> GoogleDriveFileReference:
+    if not value.strip():
+        raise ValueError("A Google Drive file or folder ID or link is required")
+    return _extract_drive_reference(value, file_links_only=False)
+
+
+def folder_reference(folder: str | None, resource_key: str | None) -> GoogleDriveFileReference:
+    """An explicit resource key wins; otherwise a folder link's own key is kept."""
+    if resource_key is not None and not is_valid_drive_id(resource_key):
+        raise ValueError("Google Drive resource key is invalid")
+    folder_id = _folder_id(folder)
+    if resource_key is None and folder_id != "root" and not is_valid_drive_id((folder or "").strip()):
+        resource_key = extract_item_reference(folder or "").resource_key
+    return GoogleDriveFileReference(file_id=folder_id, resource_key=resource_key)
+
+
+def _resource_key_headers(reference: GoogleDriveFileReference) -> dict[str, str]:
+    if reference.resource_key is None:
+        return {}
+    return {"X-Goog-Drive-Resource-Keys": f"{reference.file_id}/{reference.resource_key}"}
+
+
+async def list_folder(
+    *,
+    access_token: str,
+    folder: str,
+    max_results: int = 100,
+    page_token: str | None = None,
+    include_page_token: bool = False,
+    resource_key: str | None = None,
+    include_resource_keys: bool = False,
+) -> dict[str, Any]:
+    """The items directly inside a folder, in My Drive or a shared drive, folders first."""
+    reference = folder_reference(folder, resource_key)
+
+    async def action(client: httpx.AsyncClient, auth_headers: Mapping[str, str]) -> dict[str, Any]:
+        headers = {**auth_headers, **_resource_key_headers(reference)}
+
+        async def get_folder(folder_id: str) -> Mapping[str, Any]:
+            return await _get_item(client, headers, folder_id)
+
+        async def list_page(params: Mapping[str, str]) -> Mapping[str, Any]:
+            return await _drive_request(
                 client,
                 "GET",
                 f"{DRIVE_API_BASE}/files",
                 headers=headers,
-                params={
-                    **params,
-                    "pageSize": str(limit - len(items)),
-                    **({"pageToken": page_token} if page_token else {}),
-                },
+                params=params,
             )
-            items.extend(_listed_item(item) for item in page.get("files") or [] if isinstance(item, dict))
-            page_token = page.get("nextPageToken")
-            if not page_token or len(items) >= limit:
-                break
-        return {
-            "folder_id": meta.get("id") or folder_id,
-            "shared_drive_id": drive_id,
-            "files": items[:limit],
-            "count": len(items[:limit]),
-            "has_more": bool(page_token) or len(items) > limit,
-        }
+
+        return await list_folder_with_transport(
+            folder=reference.file_id,
+            max_results=max_results,
+            page_token=page_token,
+            include_page_token=include_page_token,
+            get_folder=get_folder,
+            list_page=list_page,
+            include_resource_keys=include_resource_keys,
+        )
 
     return await _run_folder_action("list_folder", access_token, action)
+
+
+def _listed_item_with_resource_key(payload: Mapping[str, Any]) -> dict[str, Any]:
+    resource_key = payload.get("resourceKey")
+    valid = isinstance(resource_key, str) and is_valid_drive_id(resource_key)
+    return {**listed_item(payload), **({"resource_key": resource_key} if valid else {})}
+
+
+async def list_folder_with_transport(
+    *,
+    folder: str,
+    max_results: int,
+    page_token: str | None,
+    include_page_token: bool,
+    get_folder: Callable[[str], Awaitable[Mapping[str, Any]]],
+    list_page: Callable[[Mapping[str, str]], Awaitable[Mapping[str, Any]]],
+    include_resource_keys: bool = False,
+) -> dict[str, Any]:
+    folder_id = _folder_id(folder)
+    limit = max(1, min(max_results, DRIVE_LIST_FOLDER_MAX_RESULTS))
+    meta = _folder_from_payload(await get_folder(folder_id), "folder to list")
+    drive_id = meta.get("driveId")
+    # A shared drive's own corpus is listed completely; the "user" corpus covers My Drive and shared-with-me.
+    params = {
+        # The ID is checked against Drive's ID alphabet above, so it cannot close the quoted string.
+        "q": f"'{folder_id}' in parents and trashed = false",
+        "fields": DRIVE_LIST_FIELDS_WITH_RESOURCE_KEYS if include_resource_keys else DRIVE_LIST_FIELDS,
+        "orderBy": "folder,name_natural",
+        "supportsAllDrives": "true",
+        "includeItemsFromAllDrives": "true",
+        **({"corpora": "drive", "driveId": str(drive_id)} if drive_id else {"corpora": "user"}),
+    }
+    items: list[dict[str, Any]] = []
+    next_page_token = page_token
+    while True:
+        page = await list_page(
+            {
+                **params,
+                "pageSize": str(limit - len(items)),
+                **({"pageToken": next_page_token} if next_page_token else {}),
+            }
+        )
+        to_item = _listed_item_with_resource_key if include_resource_keys else listed_item
+        items.extend(to_item(item) for item in page.get("files") or [] if isinstance(item, dict))
+        raw_token = page.get("nextPageToken")
+        next_page_token = raw_token if isinstance(raw_token, str) and raw_token else None
+        if not next_page_token or len(items) >= limit:
+            break
+    listed = items[:limit]
+    return {
+        "folder_id": meta.get("id") or folder_id,
+        "shared_drive_id": drive_id,
+        "files": listed,
+        "count": len(listed),
+        "has_more": bool(next_page_token) or len(items) > limit,
+        **({"next_page_token": next_page_token} if include_page_token and next_page_token else {}),
+    }
 
 
 async def create_folder(*, access_token: str, parent_folder: str, name: str) -> dict[str, Any]:
@@ -1088,7 +1218,7 @@ async def create_folder(*, access_token: str, parent_folder: str, name: str) -> 
             "POST",
             f"{DRIVE_API_BASE}/files",
             headers=headers,
-            params={"fields": _DRIVE_ITEM_FIELDS, "supportsAllDrives": "true"},
+            params={"fields": DRIVE_ITEM_FIELDS, "supportsAllDrives": "true"},
             json_body={"name": folder_name, "mimeType": GOOGLE_FOLDER_MIME_TYPE, "parents": [parent.get("id")]},
         )
         return {
@@ -1132,7 +1262,7 @@ async def move_file(*, access_token: str, item: str, destination_folder: str) ->
             params={
                 "addParents": target_id,
                 "removeParents": ",".join(parents),
-                "fields": _DRIVE_ITEM_FIELDS,
+                "fields": DRIVE_ITEM_FIELDS,
                 "supportsAllDrives": "true",
             },
             json_body={},
@@ -1163,6 +1293,34 @@ async def list_files(
     search_all_drives: bool = False,
     downloadable_only: bool = False,
 ) -> DriveFilesPage:
+    params = list_files_params(
+        folders=folders,
+        query=query,
+        page_token=page_token,
+        page_size=page_size,
+        search_all_drives=search_all_drives,
+        downloadable_only=downloadable_only,
+    )
+    async with httpx.AsyncClient(timeout=settings.GOOGLE_DRIVE_API_TIMEOUT_SECONDS) as client:
+        payload = await _drive_request(
+            client,
+            "GET",
+            f"{DRIVE_API_BASE}/files",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+        )
+    return files_page_from_payload(payload, search_all_drives=search_all_drives)
+
+
+def list_files_params(
+    *,
+    folders: bool,
+    query: str | None,
+    page_token: str | None,
+    page_size: int,
+    search_all_drives: bool,
+    downloadable_only: bool,
+) -> dict[str, str]:
     terms = [f"mimeType {'=' if folders else '!='} '{GOOGLE_FOLDER_MIME_TYPE}'", "trashed = false"]
     if downloadable_only:
         # download_file exports only Google Docs; every other Workspace type raises GoogleDriveNativeDocumentError.
@@ -1172,7 +1330,7 @@ async def list_files(
     params = {
         "q": " and ".join(terms),
         "pageSize": str(max(1, min(100, page_size))),
-        "fields": f"incompleteSearch,{_DRIVE_LIST_FIELDS}" if search_all_drives else _DRIVE_LIST_FIELDS,
+        "fields": f"incompleteSearch,{DRIVE_LIST_FIELDS}" if search_all_drives else DRIVE_LIST_FIELDS,
         "orderBy": "modifiedTime desc",
         "spaces": "drive",
         "supportsAllDrives": "true",
@@ -1181,17 +1339,13 @@ async def list_files(
         **({"corpora": "allDrives"} if search_all_drives else {}),
         **({"pageToken": page_token} if page_token else {}),
     }
-    async with httpx.AsyncClient(timeout=settings.GOOGLE_DRIVE_API_TIMEOUT_SECONDS) as client:
-        payload = await _drive_request(
-            client,
-            "GET",
-            f"{DRIVE_API_BASE}/files",
-            headers={"Authorization": f"Bearer {access_token}"},
-            params=params,
-        )
+    return params
+
+
+def files_page_from_payload(payload: Mapping[str, Any], *, search_all_drives: bool) -> DriveFilesPage:
     return DriveFilesPage(
         files=[
-            {**_listed_item(item), "name": item.get("name") or item["id"]}
+            {**listed_item(item), "name": item.get("name") or item["id"]}
             for item in payload.get("files") or []
             if isinstance(item, dict) and item.get("id")
         ],

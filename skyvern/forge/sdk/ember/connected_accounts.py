@@ -107,5 +107,6 @@ class ConnectionCardPayload(TypedDict):
     scopeProfile: str | None
     requiredScopes: list[str]
     reconnectConnectionId: str | None
+    credentialBackends: list[Literal["native", "nango"]]
     # Set when the step runs only on a Connected Gmail account, which a Google sign-in account cannot stand in for.
     connectedGmailOnly: NotRequired[bool]

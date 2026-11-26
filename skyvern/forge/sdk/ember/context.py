@@ -202,8 +202,8 @@ class NarrativeBlockAttempt(TypedDict):
 ACCESS_REFUSAL_ERROR_CODES = frozenset({EMBER_TEST_RUN_UNSUPPORTED_CODE})
 
 
-# Only the platform's Gmail blocks write the refusal code (a saved Gmail app action runs as integration_action); an
-# author can declare any code on other blocks.
+# Only the platform's connected-account blocks write the refusal code (saved app actions run as integration_action);
+# an author can declare any code on other blocks.
 _ACCESS_REFUSAL_BLOCK_TYPES = frozenset({"send_email", "email_inbox", "integration_action"})
 
 

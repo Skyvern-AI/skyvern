@@ -1050,6 +1050,12 @@ class WorkflowRunContext:
     def get_gmail_hop_token(self, block_label: str) -> str | None:
         return self.get_powerbi_hop_token(block_label)
 
+    def get_google_drive_hop_token(self, block_label: str) -> str | None:
+        return self.get_powerbi_hop_token(block_label)
+
+    def get_google_drive_hop_refusal(self, block_label: str) -> str | None:
+        return self.get_powerbi_hop_refusal(block_label)
+
     def get_powerbi_hop_refusal(self, block_label: str) -> str | None:
         """Return why the run was issued no capability for this block; the block owns the known reason codes."""
         refusal = self._powerbi_hop_refusals.get(block_label)
@@ -3294,19 +3300,31 @@ class WorkflowContextManager:
         powerbi_hop_tokens: Mapping[str, str] = {}
         powerbi_hop_refusals: Mapping[str, str] = {}
         if workflow is not None:
+            from skyvern.forge.sdk.integrations.catalog import DRIVE_READ_ACTION_IDS
             from skyvern.forge.sdk.workflow.models.block import get_all_blocks
-            from skyvern.forge.sdk.workflow.models.integration_action_block import nango_account_ids, runnable_blocks
+            from skyvern.forge.sdk.workflow.models.integration_action_block import (
+                IntegrationActionBlock,
+                nango_account_ids,
+                runnable_blocks,
+            )
 
             saved_blocks = get_all_blocks(workflow.workflow_definition.blocks)
-            all_blocks = runnable_blocks(
-                saved_blocks, await nango_account_ids(saved_blocks, organization.organization_id)
-            )
+            nango_ids = await nango_account_ids(saved_blocks, organization.organization_id)
+            all_blocks = runnable_blocks(saved_blocks, nango_ids)
             powerbi_query_labels = [block.label for block in all_blocks if block.block_type == BlockType.POWERBI_QUERY]
             powerbi_block_labels = powerbi_query_labels + [
                 block.label
                 for block in all_blocks
                 if block.block_type in (BlockType.EMAIL_INBOX, BlockType.SEND_EMAIL)
                 and block.credential_source == "nango"
+            ]
+            powerbi_block_labels += [
+                block.label
+                for block in saved_blocks
+                if isinstance(block, IntegrationActionBlock)
+                and block.integration_id == "google_drive"
+                and block.action_id in DRIVE_READ_ACTION_IDS
+                and block.connection_id in nango_ids
             ]
             if powerbi_block_labels:
                 # A run nothing issued capabilities for at its start — scheduled, event, or a Trigger block's child —
