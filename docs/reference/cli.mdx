@@ -294,6 +294,8 @@ skyvern doctor                   # Check the installation (--fix tries to repair
 skyvern doctor streaming         # Check that local browser streaming works (--base-url, --browser-session-id, --timeout)
 ```
 
+`skyvern login` opens the Skyvern CLI sign-in page in your browser. After you sign in, the page names your organization and the local address the key goes to (`http://127.0.0.1:<port>/callback`), and sends the API key to the CLI only when you click **Authorize**. **Cancel** sends nothing. The command stops waiting after `--timeout` seconds (300 by default).
+
 For a local server, `skyvern init` uses PostgreSQL if it is already running, or offers to start a container in Docker (`--no-postgres` skips the offer, and `--database-string` points it at your own database). It then runs the database migrations. Start Skyvern afterwards with `skyvern run server`.
 
 ## CLI vs MCP: when to use which
