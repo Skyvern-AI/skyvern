@@ -598,7 +598,7 @@ const result = await page.agent.downloadFiles(
 |-----------|------|----------|-------------|
 | `prompt` | `str` | Yes | What to download |
 | `url` | `str` | No | Page to start from. Defaults to the current page URL |
-| `download_suffix` | `str` | No | Filename for the saved file. A name without an extension (e.g., `"invoice"`) gets the downloaded file's extension (`invoice.pdf`); a full name like `"invoice.pdf"` is used as is. Don't pass only an extension such as `".pdf"`: it becomes the whole name (`.pdf.pdf`). `{{ original_filename }}` inserts the site's own file name (`"archive_{{ original_filename }}"` → `archive_Q4 Report.pdf`). |
+| `download_suffix` | `str` | No | Filename for the saved file. A name without an extension (e.g., `"invoice"`) gets the downloaded file's extension (`invoice.pdf`); a full name like `"invoice.pdf"` is used as is. Don't pass only an extension such as `".pdf"`: Skyvern treats it as the name and saves `pdf.pdf`. `{{ original_filename }}` inserts the site's own file name (`"archive_{{ original_filename }}"` → `archive_Q4 Report.pdf`). |
 | `download_timeout` | `float` | No | Soft hint (seconds) for how long to wait for a download. The overall `timeout` is what actually fails the run. |
 | `max_steps_per_run` | `int` | No | Cap AI steps |
 | `webhook_url` | `str` | No | Callback URL for the run result. See [Webhooks](/developers/production#webhooks). |
