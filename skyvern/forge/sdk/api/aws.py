@@ -1799,6 +1799,39 @@ async def s3_object_info_if_exists(client: AsyncAWSClient, uri: str) -> dict | N
         raise
 
 
+async def s3_key_missing_after_denied(
+    client: AsyncAWSClient, uri: str, error: ClientError, *, allow_truncated: bool = False
+) -> bool:
+    """Check exact-key absence after a 403 in a general-purpose bucket."""
+    code = error.response.get("Error", {}).get("Code")
+    status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    if code not in {"403", "AccessDenied"} and status != 403:
+        return False
+    key_uri = S3Uri(uri)
+    async with client._s3_client() as s3:
+        listing: object = await s3.list_objects_v2(Bucket=key_uri.bucket, Prefix=key_uri.key, MaxKeys=1)
+    if not isinstance(listing, dict):
+        return False
+    items = listing.get("Contents", [])
+    count = listing.get("KeyCount")
+    truncated = listing.get("IsTruncated")
+    if (
+        not isinstance(items, list)
+        or len(items) > 1
+        or type(count) is not int
+        or count != len(items)
+        or not isinstance(truncated, bool)
+        or (truncated and not allow_truncated)
+    ):
+        return False
+    if not items:
+        return not truncated
+    item = items[0]
+    key = item.get("Key") if isinstance(item, dict) else None
+    # The exact key sorts before any longer key sharing its prefix.
+    return isinstance(key, str) and key.startswith(key_uri.key) and key != key_uri.key
+
+
 class S3Uri:
     # From: https://stackoverflow.com/questions/42641315/s3-urls-get-bucket-name-and-path
     """
