@@ -49,7 +49,7 @@ The defaults work for most runs. The settings you are most likely to change:
 **Copy API Command** copies the same run as a cURL or PowerShell command, with your inputs and settings filled in. Use it to trigger the agent from a script. The [code quickstart](/developers/getting-started/quickstart) covers the SDKs.
 
 <Note>
-**Run** is disabled while the agent has no blocks. Add one, or ask Copilot to build the agent first.
+**Run** is disabled while the agent has no blocks. Add one, or ask Ember to build the agent first.
 </Note>
 
 ## Watch a run live
@@ -84,7 +84,7 @@ The **Run** pane has three views:
 
 **API & Webhooks** in the Run pane header copies this run as a cURL or PowerShell command and offers **Test Webhook**.
 
-When a run fails, the top of the Run pane names the failing block, the run's error codes and the reason. Each code is listed once; hover a code to read its message. Past three codes the line ends with **+N more**, and **Outputs** → **Errors** lists every code. **Fix with Copilot** sends the failure to Copilot, which proposes a fix in the Copilot pane. **Retry** opens the run form to run it again.
+When a run fails, the top of the Run pane names the failing block, the run's error codes and the reason. Each code is listed once; hover a code to read its message. Past three codes the line ends with **+N more**, and **Outputs** → **Errors** lists every code. **Fix with Ember** sends the failure to Ember, which proposes a fix in the Ember pane. **Retry** opens the run form to run it again.
 
 ### Re-run
 
@@ -139,7 +139,7 @@ To see only one agent's runs while you work on it, open the **Past Runs** list f
 
 ## Read a group of runs
 
-Ask Copilot to run a saved agent once per row of inputs, or once for each of several saved credentials, and it shows a card listing what it will run. You can remove rows there; nothing runs until you approve. Each row then becomes its own run, in its own fresh browser, with its own run ID. A group holds up to 25 runs by default.
+Ask Ember to run a saved agent once per row of inputs, or once for each of several saved credentials, and it shows a card listing what it will run. You can remove rows there; nothing runs until you approve. Each row then becomes its own run, in its own fresh browser, with its own run ID. A group holds up to 25 runs by default.
 
 Once you approve, the card in the chat links **Open results**, which opens the **Run group** page at `/run-groups/<group id>`. Its header shows the group ID, whether the group is `running`, `stopping` or `finished`, how many runs it holds, and a count for each outcome. One table row per run:
 
@@ -151,7 +151,7 @@ Once you approve, the card in the chat links **Open results**, which opens the *
 | **Run** | A link to the run, or **Not started** |
 | **Final output** | The output of the run's last block |
 
-The table pages 25 rows at a time. **Download CSV** exports every row in the group, not just the page you are on. While runs are still going, **Stop** cancels the ones that haven't finished; confirm with **Stop runs**. Runs that already finished keep their results. The chat's own **Stop** button does not stop these runs, so use **Stop** here or ask Copilot to cancel the group.
+The table pages 25 rows at a time. **Download CSV** exports every row in the group, not just the page you are on. While runs are still going, **Stop** cancels the ones that haven't finished; confirm with **Stop runs**. Runs that already finished keep their results. The chat's own **Stop** button does not stop these runs, so use **Stop** here or ask Ember to cancel the group.
 
 ## Schedule an agent
 

@@ -447,14 +447,14 @@ Execute custom Python code. The block's inputs are available as global variables
 | Field | Type | Description |
 |-------|------|-------------|
 | **View** | toggle | **Plain** shows the Goal, the returned data schema and the steps. **Code** shows the steps, Inputs and the code. A new block opens in **Plain**. |
-| **Goal** | text | In **Plain**. What the block does, in plain language. **Generate** (**Regenerate** once the block has code) has Copilot write the code and steps from the Goal, and opens the Copilot pane. |
+| **Goal** | text | In **Plain**. What the block does, in plain language. **Generate** (**Regenerate** once the block has code) has Ember write the code and steps from the Goal, and opens the Ember pane. |
 | **Returned data schema** | read-only | In **Plain**, when the block has one. The fields of the block's output, shown as a list or as JSON. |
 | **Steps** | list | A plain-language outline of the code, rebuilt from the code on save. In **Code**, click a step to highlight its lines. |
 | **Inputs** | select | In **Code**. Inputs available as globals in the code |
 | **Code Input** | code editor | In **Code**. Python code to execute |
 | **Error Messages** | JSON | Error codes the code may raise, each with the condition it reports. Raise one with `raise ErrorCode("code", "reason")`. A code that isn't listed fails the block like any other exception. |
 
-After you edit the Goal, the block shows **Goal changed — not applied yet** in place of **Generate**. **Apply new Goal** has Copilot rebuild the code to match, and **Undo** restores the old Goal. When you edit the code of a block that has a Goal, it shows **Code changed — Goal may be out of date**, with **Update Goal** and **Keep Goal**.
+After you edit the Goal, the block shows **Goal changed — not applied yet** in place of **Generate**. **Apply new Goal** has Ember rebuild the code to match, and **Undo** restores the old Goal. When you edit the code of a block that has a Goal, it shows **Code changed — Goal may be out of date**, with **Update Goal** and **Keep Goal**.
 
 Code can import `asyncio`, `datetime`, `html`, `json` and `re`. Each one binds the
 sandbox's own version of the module, which carries part of the standard library and
@@ -518,7 +518,7 @@ A tool named after a block, such as **Browser Task** or **HTTP Request**, runs t
 
 To sign in, check **Login** in Tools and add a credential to Inputs. Login is checked by default; it is offered to the model only when Inputs has a credential. Skyvern masks the run's registered secrets in the tool results the model reads and in the recorded tool calls. The answer is saved as the model returns it, so do not ask the model to return a secret.
 
-[Copilot](/cloud/studio#build-with-copilot) can add an Agent block to your agent and choose its Tools.
+[Ember](/cloud/studio#build-with-ember) can add an Agent block to your agent and choose its Tools.
 
 <Frame>
 <img width="400" src="/images/cloud/agent_block.png" alt="Agent block configuration with Prompt, Data Schema, Inputs, Max Turns and Tools fields" />
