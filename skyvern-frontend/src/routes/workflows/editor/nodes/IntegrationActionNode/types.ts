@@ -42,6 +42,7 @@ const BUILT_IN_BLOCKS = {
   file_upload: "fileUpload",
   google_sheets_read: "googleSheetsRead",
   google_sheets_write: "googleSheetsWrite",
+  powerbi_query: "powerBIQuery",
 } as const;
 
 // An action that one of our blocks runs is added as that block, preset with the

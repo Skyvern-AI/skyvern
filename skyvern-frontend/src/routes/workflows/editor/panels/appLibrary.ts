@@ -6,14 +6,17 @@ import {
 
 export type AppRow = {
   entry: IntegrationCatalogEntryWithActions;
-  connected: boolean;
+  // Undefined until the account list has loaded: an empty list while loading or after an error proves nothing.
+  connected: boolean | undefined;
 };
 
 export type AppActionMatch = AppRow & { action: IntegrationActionSpec };
 
 export function appRows(
   catalog: readonly IntegrationCatalogEntryWithActions[] | undefined,
-  isConnected: (entry: IntegrationCatalogEntryWithActions) => boolean,
+  isConnected: (
+    entry: IntegrationCatalogEntryWithActions,
+  ) => boolean | undefined,
 ): AppRow[] {
   const rows = (catalog ?? [])
     // Actions pinned to a Nango account are not offered by this generic block.
@@ -33,11 +36,19 @@ export function appRows(
   ];
 }
 
-export function appRowMeta({ entry, connected }: AppRow): string {
+export function appAccountStatus({ entry, connected }: AppRow): string | null {
+  if (connected) return "Account connected";
+  return entry.oauthProvider && connected === false
+    ? "No account connected"
+    : null;
+}
+
+export function appRowMeta(row: AppRow): string {
+  const { entry } = row;
   const count = (n: number, word: string) =>
     n ? `${n} ${word}${n === 1 ? "" : "s"}` : null;
   return [
-    connected ? "Connected" : null,
+    appAccountStatus(row),
     count(entry.actions?.length ?? 0, "action"),
     count(entry.triggers?.length ?? 0, "trigger"),
   ]

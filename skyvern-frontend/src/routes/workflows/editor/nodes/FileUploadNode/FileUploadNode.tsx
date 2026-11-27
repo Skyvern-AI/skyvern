@@ -51,7 +51,15 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
       >
         <NodeHeader
           blockLabel={label}
+          blockTitle={
+            data.storageType === "google_drive"
+              ? "Cloud Storage · Google Drive"
+              : undefined
+          }
           editable={editable}
+          integrationLogo={
+            data.storageType === "google_drive" ? "google_drive" : undefined
+          }
           nodeId={id}
           totpIdentifier={null}
           totpUrl={null}

@@ -51,7 +51,15 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
       >
         <NodeHeader
           blockLabel={label}
+          blockTitle={
+            data.downloadTarget === "google_drive"
+              ? "File Download · Google Drive"
+              : undefined
+          }
           editable={editable}
+          integrationLogo={
+            data.downloadTarget === "google_drive" ? "google_drive" : undefined
+          }
           nodeId={id}
           totpIdentifier={data.totpIdentifier}
           totpUrl={data.totpVerificationUrl}

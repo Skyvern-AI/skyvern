@@ -24,6 +24,7 @@ vi.mock("@/store/PageSlots", async (importOriginal) => ({
 vi.mock("@/hooks/useGoogleOAuthCredentials", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   useGoogleOAuthCredentials: () => ({
+    isSuccess: true,
     credentials: [
       { id: "goc_1", state: "active", scopes_granted: ["gmail.readonly"] },
     ],
@@ -31,7 +32,7 @@ vi.mock("@/hooks/useGoogleOAuthCredentials", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useMicrosoftOAuthCredentials", async (importOriginal) => ({
   ...(await importOriginal<object>()),
-  useMicrosoftOAuthCredentials: () => ({ credentials: [] }),
+  useMicrosoftOAuthCredentials: () => ({ isSuccess: true, credentials: [] }),
 }));
 
 import {
@@ -133,7 +134,8 @@ describe("WorkflowNodeLibraryPanel apps", () => {
       "block-library-app-gmail",
       "block-library-app-outlook",
     ]);
-    expect(apps[0]?.textContent).toContain("Connected");
+    expect(apps[0]?.textContent).toContain("Account connected");
+    expect(apps[1]?.textContent).toContain("No account connected");
 
     fireEvent.click(screen.getByTestId("block-library-app-gmail"));
     expect(added).toEqual([]);

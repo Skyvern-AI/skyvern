@@ -6,6 +6,7 @@ import {
   PlusIcon,
 } from "@radix-ui/react-icons";
 
+import { integrationLogo } from "@/components/icons/integrationLogos";
 import {
   hasGoogleOAuthCredentialScopes,
   isGoogleOAuthCredentialActive,
@@ -23,16 +24,22 @@ import {
   type IntegrationCatalogEntryWithActions,
 } from "../nodes/IntegrationActionNode/types";
 import { workflowBlockTitle } from "../nodes/types";
-import { appRowMeta, appRows, matchingAppActions } from "./appLibrary";
+import {
+  appAccountStatus,
+  appRowMeta,
+  appRows,
+  matchingAppActions,
+} from "./appLibrary";
 import { useStudioPaneIds, useStudioPanes } from "../../studio/useStudioPanes";
 
-function AppBadge({ name }: { name: string }) {
+function AppBadge({ entry }: { entry: IntegrationCatalogEntryWithActions }) {
+  const Logo = integrationLogo(entry.logo);
   return (
     <div
       aria-hidden
       className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-border text-sm font-semibold dark:border-slate-600"
     >
-      {name.charAt(0).toUpperCase()}
+      {Logo ? <Logo className="size-6" /> : entry.name.charAt(0).toUpperCase()}
     </div>
   );
 }
@@ -64,6 +71,7 @@ function LibraryApps({ catalog, search, onAdd }: Props) {
   const apps = appRows(catalog, (entry) => {
     const scopes = entry.capabilityScopes ?? entry.requiredScopes ?? [];
     if (entry.oauthProvider === "google") {
+      if (!google.isSuccess) return undefined;
       return google.credentials.some(
         (credential) =>
           isGoogleOAuthCredentialActive(credential) &&
@@ -71,6 +79,7 @@ function LibraryApps({ catalog, search, onAdd }: Props) {
       );
     }
     if (entry.oauthProvider === "microsoft") {
+      if (!microsoft.isSuccess) return undefined;
       return microsoft.credentials.some(
         (credential) =>
           isMicrosoftOAuthCredentialActive(credential) &&
@@ -84,37 +93,43 @@ function LibraryApps({ catalog, search, onAdd }: Props) {
     return (
       <>
         {matchingAppActions(apps, search).map(
-          ({ entry, action, connected }) => (
-            <button
-              type="button"
-              key={`${entry.id}:${action.id}`}
-              data-testid={`block-library-app-action-${entry.id}-${action.id}`}
-              className="flex w-full min-w-0 items-center justify-between gap-2 rounded-sm bg-slate-elevation4 p-4 text-left hover:bg-slate-elevation5"
-              onClick={() =>
-                onAdd({
-                  integrationId: entry.id,
-                  actionId: action.id,
-                })
-              }
-            >
-              <div className="flex min-w-0 gap-2">
-                <AppBadge name={entry.name} />
-                <div className="flex min-w-0 flex-col gap-1">
-                  <span className="min-w-0 truncate text-base">
-                    {integrationActionTitle(entry, action)}
-                  </span>
-                  <span className="min-w-0 truncate text-xs text-slate-600 dark:text-slate-400">
-                    {connected
-                      ? "Connected"
-                      : entry.oauthProvider
-                        ? "Connect when you add it"
-                        : null}
-                  </span>
+          ({ entry, action, connected }) => {
+            const builtIn = builtInBlockFor(action);
+            return (
+              <button
+                type="button"
+                key={`${entry.id}:${action.id}`}
+                data-testid={`block-library-app-action-${entry.id}-${action.id}`}
+                className="flex w-full min-w-0 items-center justify-between gap-2 rounded-sm bg-slate-elevation4 p-4 text-left hover:bg-slate-elevation5"
+                onClick={() =>
+                  onAdd({
+                    integrationId: entry.id,
+                    actionId: action.id,
+                  })
+                }
+              >
+                <div className="flex min-w-0 gap-2">
+                  <AppBadge entry={entry} />
+                  <div className="flex min-w-0 flex-col gap-1">
+                    <span className="min-w-0 truncate text-base">
+                      {integrationActionTitle(entry, action)}
+                    </span>
+                    <span className="min-w-0 text-xs text-slate-600 dark:text-slate-400">
+                      {[
+                        builtIn
+                          ? `${workflowBlockTitle[builtIn.blockType]} block`
+                          : null,
+                        appAccountStatus({ entry, connected }),
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </span>
+                  </div>
                 </div>
-              </div>
-              <PlusIcon className="size-6 shrink-0" />
-            </button>
-          ),
+                <PlusIcon className="size-6 shrink-0" />
+              </button>
+            );
+          },
         )}
       </>
     );
@@ -143,7 +158,7 @@ function LibraryApps({ catalog, search, onAdd }: Props) {
               className="flex w-full min-w-0 items-center gap-2 p-4 text-left enabled:hover:bg-slate-elevation5 disabled:cursor-default"
               onClick={() => setExpandedApp(expanded ? null : entry.id)}
             >
-              <AppBadge name={entry.name} />
+              <AppBadge entry={entry} />
               <div className="flex min-w-0 flex-1 flex-col gap-1">
                 <span className="min-w-0 truncate text-base">{entry.name}</span>
                 <span className="min-w-0 truncate text-xs text-slate-600 dark:text-slate-400">
