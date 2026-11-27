@@ -34,10 +34,8 @@ from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.private_settings import (
     PRIVATE_WORKFLOW_SETTINGS_FIELDS,
+    merge_extra_http_headers,
     resolve_cdp_connect_headers,
-)
-from skyvern.forge.sdk.workflow.private_settings import resolve_extra_http_headers as _resolve_extra_http_headers
-from skyvern.forge.sdk.workflow.private_settings import (
     resolve_proxy_location,
     resolve_totp_identifier,
     resolve_totp_verification_url,
@@ -150,9 +148,7 @@ def with_private_workflow_settings(
     private_settings = merge_private_workflow_settings(private_settings)
     root_settings = {key: value for key, value in private_settings.items() if key not in request.model_fields_set}
     if "extra_http_headers" in private_settings:
-        root_settings["extra_http_headers"] = resolve_extra_http_headers(
-            request, private_settings["extra_http_headers"], ember=True
-        )
+        root_settings["extra_http_headers"] = merge_extra_http_headers(request, private_settings["extra_http_headers"])
     if "cdp_connect_headers" in private_settings:
         root_settings["cdp_connect_headers"] = resolve_cdp_connect_headers(
             request, private_settings["cdp_connect_headers"]
@@ -176,17 +172,6 @@ def with_private_workflow_settings(
     return request.model_copy(
         update={key: getattr(validated, key) for key in root_settings if key in validated.model_fields_set}
     )
-
-
-def resolve_extra_http_headers(
-    request: WorkflowCreateYAMLRequest, inherited_headers: dict[str, str] | None, *, ember: bool = False
-) -> dict[str, str] | None:
-    headers = _resolve_extra_http_headers(request, inherited_headers)
-    if ember and "extra_http_headers" in request.model_fields_set:
-        if headers and SECRET_HEADER_MASK in headers.values():
-            LOG.debug("Merging masked ember headers", field_name="extra_http_headers")
-        return merge_masked_headers(headers, inherited_headers)
-    return headers
 
 
 def runner_code_block_associations(
@@ -903,8 +888,8 @@ async def _process_workflow_yaml(
             inherited_settings=inherited_header_settings(settings_source) if settings_source is not None else None,
         )
         workflow_yaml_request = with_private_workflow_settings(workflow_yaml_request, private_settings)
-    extra_http_headers = resolve_extra_http_headers(
-        workflow_yaml_request, settings_source.extra_http_headers if settings_source is not None else None, ember=True
+    extra_http_headers = merge_extra_http_headers(
+        workflow_yaml_request, settings_source.extra_http_headers if settings_source is not None else None
     )
     cdp_connect_headers = resolve_cdp_connect_headers(
         workflow_yaml_request, settings_source.cdp_connect_headers if settings_source is not None else None

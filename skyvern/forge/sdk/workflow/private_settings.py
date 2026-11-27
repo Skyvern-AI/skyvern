@@ -1,13 +1,20 @@
 from collections.abc import Mapping
-from typing import Any
+from http import HTTPStatus
+from typing import Any, Literal
 
 import structlog
 from pydantic import ValidationError
 
+from skyvern.exceptions import SkyvernHTTPException
 from skyvern.schemas.proxy_location import GeoTarget
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
-from skyvern.utils.secret_headers import SECRET_HEADER_MASK, merge_masked_headers
+from skyvern.utils.secret_headers import (
+    SECRET_HEADER_MASK,
+    UnresolvedMaskedHeader,
+    merge_masked_headers,
+    resolve_masked_headers,
+)
 
 LOG = structlog.get_logger()
 
@@ -25,19 +32,41 @@ def resolve_extra_http_headers(
     request: WorkflowCreateYAMLRequest, inherited_headers: dict[str, str] | None
 ) -> dict[str, str] | None:
     if "extra_http_headers" in request.model_fields_set:
-        return request.extra_http_headers or {}
+        try:
+            return resolve_masked_headers(
+                request.extra_http_headers or {}, inherited_headers, field_name="extra_http_headers"
+            )
+        except UnresolvedMaskedHeader as exc:
+            raise SkyvernHTTPException(str(exc), HTTPStatus.UNPROCESSABLE_ENTITY) from exc
     return inherited_headers
+
+
+def _merge_header_field(
+    request: WorkflowCreateYAMLRequest,
+    field_name: Literal["extra_http_headers", "cdp_connect_headers"],
+    inherited_headers: dict[str, str] | None,
+) -> dict[str, str] | None:
+    if field_name in request.model_fields_set:
+        headers = (
+            request.extra_http_headers if field_name == "extra_http_headers" else request.cdp_connect_headers
+        ) or {}
+        if SECRET_HEADER_MASK in headers.values():
+            LOG.debug("Merging masked headers", field_name=field_name)
+        return merge_masked_headers(headers, inherited_headers)
+    return inherited_headers
+
+
+def merge_extra_http_headers(
+    request: WorkflowCreateYAMLRequest, inherited_headers: dict[str, str] | None
+) -> dict[str, str] | None:
+    """Ember's variant of ``resolve_extra_http_headers``: an unresolvable masked key is dropped, not rejected."""
+    return _merge_header_field(request, "extra_http_headers", inherited_headers)
 
 
 def resolve_cdp_connect_headers(
     request: WorkflowCreateYAMLRequest, inherited_headers: dict[str, str] | None
 ) -> dict[str, str] | None:
-    if "cdp_connect_headers" in request.model_fields_set:
-        headers = request.cdp_connect_headers or {}
-        if SECRET_HEADER_MASK in headers.values():
-            LOG.debug("Merging masked headers", field_name="cdp_connect_headers")
-        return merge_masked_headers(headers, inherited_headers)
-    return inherited_headers
+    return _merge_header_field(request, "cdp_connect_headers", inherited_headers)
 
 
 def resolve_proxy_location(request: WorkflowCreateYAMLRequest, inherited: ProxyLocationInput) -> ProxyLocationInput:

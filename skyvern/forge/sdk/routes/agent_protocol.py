@@ -477,6 +477,7 @@ async def run_task(
 ) -> TaskRunResponse:
     _require_unambiguous_otp_admission(request, run_request.otp_request_id)
     _require_strict_local_browser_inputs(run_request, run_request.otp_request_id)
+    task_v1_service.reject_masked_extra_http_headers(run_request.extra_http_headers)
     current_org = caller.organization
     if run_request.webhook_url:
         run_request.webhook_url = validate_webhook_url(run_request.webhook_url)
@@ -7468,6 +7469,7 @@ async def run_task_v2(
 ) -> dict[str, Any]:
     _require_unambiguous_otp_admission(request, data.otp_request_id)
     _require_strict_local_browser_inputs(data, data.otp_request_id)
+    task_v1_service.reject_masked_extra_http_headers(data.extra_http_headers)
     organization = caller.organization
     if x_max_iterations_override or x_max_steps_override:
         LOG.info(

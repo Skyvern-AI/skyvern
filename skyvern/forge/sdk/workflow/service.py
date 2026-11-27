@@ -516,7 +516,12 @@ from skyvern.utils.action_redaction import (
 )
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
-from skyvern.utils.secret_headers import merge_masked_headers
+from skyvern.utils.secret_headers import (
+    SECRET_HEADER_MASK,
+    UnresolvedMaskedHeader,
+    merge_masked_headers,
+    resolve_masked_headers,
+)
 from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_bytes, redact_secrets_from_text
 from skyvern.utils.strings import is_uuid
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
@@ -4723,8 +4728,17 @@ class WorkflowService:
                 workflow_request.proxy_location = workflow.proxy_location
             if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
                 workflow_request.webhook_callback_url = workflow.webhook_callback_url
-            if workflow_request.extra_http_headers is None and workflow.extra_http_headers is not None:
+            if workflow_request.extra_http_headers is None:
                 workflow_request.extra_http_headers = workflow.extra_http_headers
+            else:
+                try:
+                    workflow_request.extra_http_headers = resolve_masked_headers(
+                        workflow_request.extra_http_headers,
+                        workflow.extra_http_headers,
+                        field_name="extra_http_headers",
+                    )
+                except UnresolvedMaskedHeader as exc:
+                    raise SkyvernHTTPException(str(exc), HTTPStatus.UNPROCESSABLE_ENTITY) from exc
             # Capture the caller-supplied browser_profile_id BEFORE the legacy-pin copy below, so the
             # seed resolver can distinguish an explicit per-run override from a workflow's legacy pin.
             explicit_request_browser_profile_id = workflow_request.browser_profile_id
@@ -13237,6 +13251,10 @@ class WorkflowService:
                 organization_id=organization.organization_id,
             )
 
+        if extra_http_headers and SECRET_HEADER_MASK in extra_http_headers.values():
+            LOG.info(
+                "Dropping masked extra HTTP headers on workflow create", organization_id=organization.organization_id
+            )
         new_workflow = await self.create_workflow(
             title=title,
             workflow_definition=WorkflowDefinition(parameters=[], blocks=blocks),
@@ -13246,7 +13264,7 @@ class WorkflowService:
             totp_verification_url=totp_verification_url,
             totp_identifier=totp_identifier,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
-            extra_http_headers=extra_http_headers,
+            extra_http_headers=merge_masked_headers(extra_http_headers, None),
             cdp_connect_headers=cdp_connect_headers,
             status=status,
             run_with=run_with,
@@ -19674,7 +19692,8 @@ class WorkflowService:
 
         dispatch_definition = runtime_workflow.workflow_definition.model_copy(deep=True)
         cdp_connect_headers = runtime_workflow.cdp_connect_headers
-        if cdp_connect_headers:
+        extra_http_headers = runtime_workflow.extra_http_headers
+        if cdp_connect_headers or extra_http_headers:
             source = await app.DATABASE.workflows.get_workflow(
                 workflow_id=runtime_workflow.workflow_id,
                 organization_id=organization_id,
@@ -19682,8 +19701,15 @@ class WorkflowService:
             if source is None:
                 # Do not persist unverified raw header values when their source version is unavailable.
                 cdp_connect_headers = None
+                if extra_http_headers and SECRET_HEADER_MASK in extra_http_headers.values():
+                    LOG.warning(
+                        "Dropping masked extra HTTP headers; their source workflow version is unavailable",
+                        workflow_id=runtime_workflow.workflow_id,
+                    )
+                extra_http_headers = merge_masked_headers(extra_http_headers, None)
             else:
                 cdp_connect_headers = merge_masked_headers(cdp_connect_headers, source.cdp_connect_headers)
+                extra_http_headers = merge_masked_headers(extra_http_headers, source.extra_http_headers)
 
         async def insert_placeholder(version: int) -> Workflow:
             return await self.create_workflow(
@@ -19711,7 +19737,7 @@ class WorkflowService:
                 model=runtime_workflow.model,
                 max_screenshot_scrolling_times=runtime_workflow.max_screenshot_scrolls,
                 max_elapsed_time_minutes=runtime_workflow.max_elapsed_time_minutes,
-                extra_http_headers=runtime_workflow.extra_http_headers,
+                extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 run_with=runtime_workflow.run_with,
                 browser_type=read_browser_type(runtime_workflow),
@@ -19803,6 +19829,8 @@ class WorkflowService:
         workflow_id: str | None = None,
         encrypt_secrets: bool = True,
     ) -> Workflow:
+        if request.extra_http_headers and SECRET_HEADER_MASK in request.extra_http_headers.values():
+            LOG.info("Dropping masked extra HTTP headers on workflow create", organization_id=organization_id)
         return await self.create_workflow(
             title=title,
             workflow_definition=workflow_definition,
@@ -19821,7 +19849,7 @@ class WorkflowService:
             model=request.model,
             max_screenshot_scrolling_times=request.max_screenshot_scrolls,
             max_elapsed_time_minutes=request.max_elapsed_time_minutes,
-            extra_http_headers=request.extra_http_headers,
+            extra_http_headers=merge_masked_headers(request.extra_http_headers, None),
             cdp_connect_headers=cdp_connect_headers,
             workflow_permanent_id=workflow_permanent_id,
             version=1,
@@ -20204,7 +20232,7 @@ class WorkflowService:
 
         try:
             if existing_latest_workflow:
-                # Public CDP headers are masked during serialization; public extra HTTP headers are literal.
+                # A *** entry keeps the stored value for its key; an extra HTTP header *** with no stored value is 422.
                 effective_cdp_connect_headers = resolve_cdp_connect_headers(
                     request, existing_latest_workflow.cdp_connect_headers
                 )

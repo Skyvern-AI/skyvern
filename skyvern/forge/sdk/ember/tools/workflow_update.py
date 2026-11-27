@@ -107,12 +107,12 @@ from skyvern.forge.sdk.ember.workflow_yaml import (
     dump_workflow_yaml,
     inherited_header_settings,
     inherited_workflow_settings,
+    merge_extra_http_headers,
     merge_private_workflow_settings,
     private_workflow_settings_from_yaml,
     reconcile_workflow_completion_contract,
     redact_credentials_in_workflow_yaml,
     resolve_cdp_connect_headers,
-    resolve_extra_http_headers,
     resolve_proxy_location,
     resolve_totp_identifier,
     resolve_totp_verification_url,
@@ -4000,8 +4000,8 @@ async def _parse_stored_candidate(
             and saved is not None
         ):
             workflow.max_elapsed_time_minutes = saved.max_elapsed_time_minutes
-        workflow.extra_http_headers = resolve_extra_http_headers(
-            authored, saved.extra_http_headers if saved is not None else None, ember=True
+        workflow.extra_http_headers = merge_extra_http_headers(
+            authored, saved.extra_http_headers if saved is not None else None
         )
         workflow.cdp_connect_headers = resolve_cdp_connect_headers(
             authored, saved.cdp_connect_headers if saved is not None else None
