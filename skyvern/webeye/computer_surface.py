@@ -2,13 +2,15 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 import structlog
 from playwright.async_api import Page
 
+from skyvern.exceptions import SkyvernException
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.webeye.actions import handler_utils
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.dom import DomUtil
 
@@ -33,6 +35,47 @@ class ComputerSurface(Protocol):
     async def move(self, x: int, y: int) -> None: ...
 
     async def left_mouse(self, x: int | None, y: int | None, direction: Literal["down", "up"]) -> None: ...
+
+
+class ComputerSurfaceEngineRefused(SkyvernException):
+    def __init__(self, engine: str) -> None:
+        super().__init__(f"A run bound to a computer surface needs a computer-use engine, not {engine}.")
+
+
+class ComputerUseTargetRequired(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("A computer-use block runs only on a run targeted at an enrolled desktop machine.")
+
+
+class SurfaceHasNoBrowser(AttributeError):
+    """A step bound to a non-browser surface reached code that needs a hosted browser page."""
+
+
+class SurfaceBrowserState:
+    """The browser state of a step bound to a non-browser surface: it has no page, every screenshot is a fresh frame
+    from the surface, and any other browser member raises, so nothing on this path can open a hosted browser."""
+
+    browser_context = None
+    browser_context_route_policy_url = None
+    engine_selection = None
+    last_navigation_status = None
+    last_navigation_url = None
+
+    def __init__(self, surface: ComputerSurface) -> None:
+        self.surface = surface
+        self.browser_artifacts = BrowserArtifacts()
+
+    def __getattr__(self, name: str) -> Any:
+        raise SurfaceHasNoBrowser(name)
+
+    async def get_working_page(self, *, prune_excess_pages: bool = True) -> None:
+        return None
+
+    async def take_post_action_screenshot(self, scrolling_number: int, file_path: str | None = None) -> bytes:
+        return (await self.surface.get_frame()).screenshots[0]
+
+    async def take_fullpage_screenshot(self, file_path: str | None = None) -> bytes:
+        return (await self.surface.get_frame()).screenshots[0]
 
 
 class BrowserComputerSurface:

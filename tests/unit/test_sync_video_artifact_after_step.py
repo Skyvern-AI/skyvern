@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.forge.agent import ForgeAgent
+from skyvern.schemas.runs import RunEngine
 from skyvern.webeye.browser_artifacts import RecordingPrefixSnapshot
 
 
@@ -197,8 +198,11 @@ async def test_initialize_execution_state_skips_byte_read_when_all_recordings_re
         mock_app.BROWSER_MANAGER.get_video_artifacts = AsyncMock()
         mock_app.ARTIFACT_MANAGER.create_artifact = AsyncMock()
         mock_app.BROWSER_MANAGER.set_video_artifact_for_task = MagicMock()
+        mock_app.AGENT_FUNCTION.get_computer_surface = AsyncMock(return_value=None)
 
-        await agent.initialize_execution_state(task=task, step=step, pre_resolved_browser_state=browser_state)
+        await agent.initialize_execution_state(
+            task=task, step=step, pre_resolved_browser_state=browser_state, engine=RunEngine.skyvern_v1
+        )
 
     mock_app.BROWSER_MANAGER.get_video_artifacts.assert_not_called()
     mock_app.ARTIFACT_MANAGER.create_artifact.assert_not_called()
@@ -222,8 +226,11 @@ async def test_initialize_execution_state_registers_unregistered_recording() -> 
         mock_app.BROWSER_MANAGER.get_video_artifacts = AsyncMock(return_value=[unregistered])
         mock_app.ARTIFACT_MANAGER.create_artifact = AsyncMock(return_value="new-id-a")
         mock_app.BROWSER_MANAGER.set_video_artifact_for_task = MagicMock()
+        mock_app.AGENT_FUNCTION.get_computer_surface = AsyncMock(return_value=None)
 
-        await agent.initialize_execution_state(task=task, step=step, pre_resolved_browser_state=browser_state)
+        await agent.initialize_execution_state(
+            task=task, step=step, pre_resolved_browser_state=browser_state, engine=RunEngine.skyvern_v1
+        )
 
     mock_app.BROWSER_MANAGER.get_video_artifacts.assert_awaited_once_with(
         task_id=task.task_id, browser_state=browser_state, finalize=False
@@ -251,8 +258,11 @@ async def test_initialize_execution_state_registers_only_new_recording_when_mixe
         mock_app.BROWSER_MANAGER.get_video_artifacts = AsyncMock(return_value=[registered, new])
         mock_app.ARTIFACT_MANAGER.create_artifact = AsyncMock(return_value="new-id-b")
         mock_app.BROWSER_MANAGER.set_video_artifact_for_task = MagicMock()
+        mock_app.AGENT_FUNCTION.get_computer_surface = AsyncMock(return_value=None)
 
-        await agent.initialize_execution_state(task=task, step=step, pre_resolved_browser_state=browser_state)
+        await agent.initialize_execution_state(
+            task=task, step=step, pre_resolved_browser_state=browser_state, engine=RunEngine.skyvern_v1
+        )
 
     mock_app.BROWSER_MANAGER.get_video_artifacts.assert_awaited_once_with(
         task_id=task.task_id, browser_state=browser_state, finalize=False

@@ -4040,6 +4040,7 @@ def test_task_envelope_block_types_matches_explicit_envelope_block_set() -> None
         "GOTO_URL",
         "HUMAN_INTERACTION",
         "TASK_V2",
+        "COMPUTER_USE",
     }
     assert _TASK_ENVELOPE_BLOCK_TYPES == expected
 

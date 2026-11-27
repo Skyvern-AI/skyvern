@@ -2756,8 +2756,16 @@ class AgentFunction:
     ) -> None:
         return
 
-    async def before_run_target_dispatch(self, *, organization_id: str, run_id: str, run_kind: str) -> None:
-        """Cloud may reserve a desktop target; OSS keeps the existing browser path."""
+    async def before_run_target_dispatch(
+        self,
+        *,
+        organization_id: str,
+        run_id: str,
+        run_kind: str,
+        computer_use_engines: frozenset[RunEngine] | None = None,
+    ) -> None:
+        """Cloud may reserve a desktop target; OSS keeps the existing browser path. `computer_use_engines` is set only
+        for a workflow whose every block is a computer-use block, and holds their engines."""
         return
 
     async def on_run_target_terminal(self, *, organization_id: str, run_id: str, run_kind: str) -> None:

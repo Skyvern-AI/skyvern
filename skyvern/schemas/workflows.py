@@ -61,7 +61,7 @@ from skyvern.schemas.emails import (
     EmailOrganizeAction,
     EmailTransport,
 )
-from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
+from skyvern.schemas.runs import CUA_ENGINES, GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
 from skyvern.utils.templating import (
@@ -199,7 +199,7 @@ def _normalize_llm_selection(
         return block
 
     # Local on purpose: config_registry imports litellm, and the stdio MCP server must not load it at boot.
-    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry  # noqa: PLC0415
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 
     if raw_llm_key in LLMConfigRegistry.get_model_names():
         block.llm_key = raw_llm_key
@@ -587,6 +587,7 @@ class BlockType(StrEnum):
     TERMINATE = "terminate"
     AGENT_STEP = "agent_step"
     INTEGRATION_ACTION = "integration_action"
+    COMPUTER_USE = "computer_use"
 
 
 class AIFallbackMode(StrEnum):
@@ -1526,6 +1527,25 @@ class NavigationBlockYAML(BlockYAML):
     include_action_history_in_verification: bool = False
 
 
+class ComputerUseBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.COMPUTER_USE] = BlockType.COMPUTER_USE  # type: ignore
+
+    navigation_goal: str
+    engine: RunEngine = RunEngine.anthropic_cua
+    max_retries: int = 0
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
+    parameter_keys: list[str] | None = None
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+
+    @field_validator("engine")
+    @classmethod
+    def _computer_use_engine(cls, engine: RunEngine) -> RunEngine:
+        if engine not in CUA_ENGINES:
+            raise ValueError(f"A computer_use block needs a computer-use engine, not {engine}")
+        return engine
+
+
 class ExtractionBlockYAML(BlockYAML):
     block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION  # type: ignore
 
@@ -2109,6 +2129,7 @@ BLOCK_YAML_SUBCLASSES = (
     | GoogleSheetsWriteBlockYAML
     | PowerBIQueryBlockYAML
     | IntegrationActionBlockYAML
+    | ComputerUseBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {

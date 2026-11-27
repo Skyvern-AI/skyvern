@@ -441,7 +441,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     settle_browser_downloads_for_context,
     unsaved_downloads_since,
 )
-from skyvern.webeye.computer_surface import BrowserComputerSurface
+from skyvern.webeye.computer_surface import BrowserComputerSurface, ComputerSurfaceEngineRefused, SurfaceBrowserState
 from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.native_downloads import NativeDownloadAttempt, NativeDownloads
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage, json_to_html
@@ -5302,6 +5302,7 @@ class ForgeAgent:
                 workflow_run,
                 browser_session_id,
                 pre_resolved_browser_state=pre_resolved_browser_state,
+                engine=engine,
             )
             # Before the engine split, so both engines' reload signals belong to this task's page. Unbound, no
             # page-level request can ask for a reload, so a failure here costs only that.
@@ -6973,7 +6974,10 @@ class ForgeAgent:
 
             if engine != RunEngine.openai_cua:
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
-            current_page = await browser_state.must_get_working_page()
+            # A desktop surface has no page; its handlers act through the surface and refuse anything else.
+            current_page = (
+                None if isinstance(browser_state, SurfaceBrowserState) else await browser_state.must_get_working_page()
+            )
             if isinstance(action, CompleteAction) and not complete_verification:
                 # Do not verify the complete action when complete_verification is False
                 # set verified to True will skip the completion verification
@@ -8523,21 +8527,23 @@ class ForgeAgent:
         _span.set_attribute("step_order", step.order if step else -1)
 
         working_page = await browser_state.get_working_page()
-        if not working_page:
+        # A desktop surface has no page: its screenshot is a fresh frame, and it has no DOM to capture.
+        if not working_page and not isinstance(browser_state, SurfaceBrowserState):
             raise MissingBrowserStatePage(
                 diagnostic=get_browser_state_diagnostic(browser_state),
                 detected_at=datetime.now(UTC),
             )
 
         skyvern_frame: SkyvernFrame | None = None
-        try:
-            skyvern_frame = await SkyvernFrame.create_instance(
-                frame=working_page,
-                engine_selection=browser_state.engine_selection,
-            )
-            await skyvern_frame.safe_wait_for_animation_end(caller="post_action_artifact")
-        except Exception:
-            LOG.info("Failed to wait for animation end, ignore it", exc_info=True)
+        if working_page is not None:
+            try:
+                skyvern_frame = await SkyvernFrame.create_instance(
+                    frame=working_page,
+                    engine_selection=browser_state.engine_selection,
+                )
+                await skyvern_frame.safe_wait_for_animation_end(caller="post_action_artifact")
+            except Exception:
+                LOG.info("Failed to wait for animation end, ignore it", exc_info=True)
 
         context = skyvern_context.ensure_context()
         scrolling_number = context.max_screenshot_scrolls
@@ -8589,6 +8595,7 @@ class ForgeAgent:
             if skyvern_frame and x is not None and y is not None:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
                 LOG.debug("Scrolled back to the original x, y position of the page after taking screenshot", x=x, y=y)
+            if (skyvern_frame and x is not None and y is not None) or isinstance(browser_state, SurfaceBrowserState):
                 _ctx = skyvern_context.current()
                 # step=None and speculative steps use the non-archive path.
                 _bundled = bool(step and not step.is_speculative and _ctx)
@@ -8633,12 +8640,12 @@ class ForgeAgent:
 
         html: str | None = None
         try:
-            if skyvern_frame is None:
+            if skyvern_frame is None and working_page is not None:
                 skyvern_frame = await SkyvernFrame.create_instance(
                     frame=working_page,
                     engine_selection=browser_state.engine_selection,
                 )
-            html = await skyvern_frame.get_content()
+            html = await skyvern_frame.get_content() if skyvern_frame is not None else None
         except (SkyvernPageAnalysisTimeout, TimeoutError):
             # get_content bounds frame.content() with asyncio.timeout, which raises the builtin TimeoutError.
             LOG.warning("Timed out reading the post-action html, skipping it")
@@ -8725,7 +8732,25 @@ class ForgeAgent:
         workflow_run: WorkflowRun | None = None,
         browser_session_id: str | None = None,
         pre_resolved_browser_state: BrowserState | None = None,
+        *,
+        engine: RunEngine,
     ) -> tuple[Step, BrowserState, DetailedAgentStepOutput]:
+        detailed_output = DetailedAgentStepOutput(
+            scraped_page=None,
+            extract_action_prompt=None,
+            llm_response=None,
+            actions=None,
+            action_results=None,
+            actions_and_results=None,
+            step_exception=None,
+        )
+        # Asked before any browser exists, on every engine: a run bound to a desktop surface must never reach one,
+        # and one that is targeted but not bound in this process is refused here by the hook.
+        surface = await app.AGENT_FUNCTION.get_computer_surface(task)
+        if surface is not None:
+            if engine not in CUA_ENGINES:
+                raise ComputerSurfaceEngineRefused(engine)
+            return step, cast(BrowserState, SurfaceBrowserState(surface)), detailed_output
         if pre_resolved_browser_state is not None:
             browser_state = pre_resolved_browser_state
             # An inherited browser_state was NOT navigated to this task's url here, so its
@@ -8787,15 +8812,6 @@ class ForgeAgent:
                     video_artifacts[idx].video_artifact_id = video_artifact_id
                 app.BROWSER_MANAGER.set_video_artifact_for_task(task, video_artifacts)
 
-        detailed_output = DetailedAgentStepOutput(
-            scraped_page=None,
-            extract_action_prompt=None,
-            llm_response=None,
-            actions=None,
-            action_results=None,
-            actions_and_results=None,
-            step_exception=None,
-        )
         return step, browser_state, detailed_output
 
     async def _scrape_with_type(
@@ -10717,11 +10733,21 @@ class ForgeAgent:
             # since the browser is not initialized properly or the proxy is not working.
 
             browser_state = _get_browser_state_for_cleanup(task)
+            try:
+                surface = await app.AGENT_FUNCTION.get_computer_surface(task)
+            except Exception:
+                # A targeted run this process never bound has no frame, and it never registered a hosted browser.
+                surface = None
+            if surface is not None:
+                browser_state = cast(BrowserState, SurfaceBrowserState(surface))
             if browser_state is not None:
                 # get_working_page() is inside the try so a raise here cannot propagate and strand the
                 # task listener/claim state armed (terminal-expiry promise).
                 try:
-                    if await browser_state.get_working_page() is not None:
+                    if (
+                        isinstance(browser_state, SurfaceBrowserState)
+                        or await browser_state.get_working_page() is not None
+                    ):
                         try:
                             screenshot = await browser_state.take_fullpage_screenshot()
                         except TimeoutError as e:
@@ -12259,7 +12285,11 @@ class ForgeAgent:
         if complete_action is not None:
             self._schedule_discarded_plan_persist(next_step, speculative_task)
 
-            working_page = page or await browser_state.must_get_working_page()
+            working_page = (
+                page
+                if page is not None or isinstance(browser_state, SurfaceBrowserState)
+                else await browser_state.must_get_working_page()
+            )
 
             if step.output is None:
                 step.output = AgentStepOutput(action_results=[], actions_and_results=[], errors=[])
@@ -12277,13 +12307,31 @@ class ForgeAgent:
                 persisted_action.step_order = step.order
                 persisted_action.action_order = len(step.output.actions_and_results)
 
-            action_results = await ActionHandler.handle_action(scraped_page, task, step, working_page, persisted_action)
+            action_results = await ActionHandler.handle_action(
+                scraped_page,
+                task,
+                step,
+                working_page,  # type: ignore[arg-type]
+                persisted_action,
+            )
             await self.record_artifacts_after_action(task, step, browser_state, engine, persisted_action)
             step.output.action_results.extend(action_results)
             step.output.actions_and_results.append((persisted_action, action_results))
             if isinstance(persisted_action, DecisiveAction) and persisted_action.errors:
                 step.output.errors.extend(persisted_action.errors)
                 step.output.terminal_user_errors = True
+            # On a frame no hosted page backs, a refused completion check is the only proof there is, so it stands.
+            completion_refused = (
+                isinstance(persisted_action, CompleteAction)
+                and not scraped_page.browser_backed
+                and not all(result.success for result in action_results)
+            )
+            if completion_refused:
+                LOG.info(
+                    "Parallel verification: completion refused on a non-browser surface",
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                )
 
             if isinstance(persisted_action, TerminateAction):
                 LOG.warning(
@@ -12337,36 +12385,37 @@ class ForgeAgent:
                 )
                 return True, last_step, None
 
-            if isinstance(persisted_action, CompleteAction) and task.navigation_goal and task.data_extraction_goal:
-                task = await self._run_data_extraction_after_complete_action(
-                    task=task,
-                    step=step,
-                    scraped_page=scraped_page,
-                    working_page=working_page,
-                )
+            if not completion_refused:
+                if isinstance(persisted_action, CompleteAction) and task.navigation_goal and task.data_extraction_goal:
+                    task = await self._run_data_extraction_after_complete_action(
+                        task=task,
+                        step=step,
+                        scraped_page=scraped_page,
+                        working_page=working_page,
+                    )
 
-            LOG.info(
-                "Parallel verification: goal achieved, marking task as completed",
-                step_id=step.step_id,
-                task_id=task.task_id,
-            )
-            final_status = step.speculative_original_status or StepStatus.completed
-            step.speculative_original_status = None
-            step.status = final_status
-            last_step = await self.update_step(
-                step,
-                status=final_status,
-                output=step.output,
-                is_last=True,
-            )
-            extracted_information = await self.get_extracted_information_for_task(task)
-            await app.AGENT_FUNCTION.settle_page_reload_signal(task=task, raise_signal=False, accept=True)
-            await self.update_task(
-                task,
-                status=TaskStatus.completed,
-                extracted_information=extracted_information,
-            )
-            return True, last_step, None
+                LOG.info(
+                    "Parallel verification: goal achieved, marking task as completed",
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                )
+                final_status = step.speculative_original_status or StepStatus.completed
+                step.speculative_original_status = None
+                step.status = final_status
+                last_step = await self.update_step(
+                    step,
+                    status=final_status,
+                    output=step.output,
+                    is_last=True,
+                )
+                extracted_information = await self.get_extracted_information_for_task(task)
+                await app.AGENT_FUNCTION.settle_page_reload_signal(task=task, raise_signal=False, accept=True)
+                await self.update_task(
+                    task,
+                    status=TaskStatus.completed,
+                    extracted_information=extracted_information,
+                )
+                return True, last_step, None
 
         LOG.info(
             "Parallel verification: goal not achieved, awaiting speculative extract-actions",

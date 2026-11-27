@@ -501,6 +501,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     replay_candidate_holds,
     settle_browser_downloads_for_context,
 )
+from skyvern.webeye.computer_surface import ComputerUseTargetRequired
 from skyvern.webeye.navigation import (
     default_navigation_settle,
     driver_nav_error_code,
@@ -3223,7 +3224,22 @@ class BaseTaskBlock(Block):
             navigation: bool | StartUrlDownload = False
             close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
             holds_start_url = await self._holds_start_url(task)
-            if is_first_task:
+            working_page: Page | None = None
+            if self.block_type == BlockType.COMPUTER_USE:
+                # Acts only through the run's bound desktop surface, so it never acquires or navigates a browser.
+                try:
+                    if await app.AGENT_FUNCTION.get_computer_surface(task) is None:
+                        raise ComputerUseTargetRequired()
+                except Exception as e:
+                    await self._handle_task_failure_with_error_detection(
+                        task=task,
+                        step=step,
+                        browser_state=None,
+                        failure_reason=str(e),
+                        organization_id=workflow_run.organization_id,
+                    )
+                    raise
+            elif is_first_task:
                 # the first task block will create the browser state and do the navigation
                 try:
                     # SKY-8818: for file_download blocks, skip the browser factory's built-in
@@ -3427,7 +3443,7 @@ class BaseTaskBlock(Block):
                         )
                         raise e
 
-            if self._allow_blank_start:
+            if self._allow_blank_start and working_page is not None:
                 self._allow_blank_start = page_is_dead_blank(working_page)
 
             try:
@@ -17474,6 +17490,17 @@ class ActionBlock(BaseTaskBlock):
     ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
 
 
+class ComputerUseBlock(BaseTaskBlock):
+    """A computer-use task on the run's leased desktop machine; it never opens a hosted browser."""
+
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.COMPUTER_USE] = BlockType.COMPUTER_USE  # type: ignore
+
+    navigation_goal: str
+    engine: RunEngine = RunEngine.anthropic_cua  # type: ignore[assignment]
+
+
 class NavigationBlock(BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -22170,6 +22197,7 @@ BlockSubclasses = Union[
     DataExportBlock,
     TerminateBlock,
     AgentStepBlock,
+    ComputerUseBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

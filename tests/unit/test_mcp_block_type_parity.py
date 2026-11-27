@@ -95,6 +95,13 @@ class BlockDriftEntry:
 # Add the block to the client, then remove the entry here.
 _KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = (
     BlockDriftEntry(
+        block_type="computer_use",
+        ticket="SKY-21575",
+        owner="@AronPerez",
+        added_at=date(2026, 11, 26),
+        notes="Dark until a desktop client ships; runs only on a run targeted at an enrolled machine.",
+    ),
+    BlockDriftEntry(
         block_type="web_search",
         ticket="SKY-16450",
         owner="@suchintan",
