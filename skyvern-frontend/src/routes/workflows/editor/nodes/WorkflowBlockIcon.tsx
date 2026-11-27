@@ -1,10 +1,7 @@
 import { ClickIcon } from "@/components/icons/ClickIcon";
-import { GmailIcon } from "@/components/icons/GmailIcon";
-import { GoogleDriveIcon } from "@/components/icons/GoogleDriveIcon";
 import { GoogleSheetsIcon } from "@/components/icons/GoogleSheetsIcon";
-import { OutlookIcon } from "@/components/icons/OutlookIcon";
+import { integrationLogo } from "@/components/icons/integrationLogos";
 import { PowerBIIcon } from "@/components/icons/PowerBIIcon";
-import type { ComponentType } from "react";
 import { WorkflowBlockType } from "../../types/workflowTypes";
 import {
   CheckCircledIcon,
@@ -37,24 +34,12 @@ type Props = {
   integrationLogo?: string;
 };
 
-const integrationLogoIcons: Record<
-  string,
-  ComponentType<{ className?: string }>
-> = {
-  gmail: GmailIcon,
-  google_drive: GoogleDriveIcon,
-  google_sheets: GoogleSheetsIcon,
-  outlook: OutlookIcon,
-};
-
 function WorkflowBlockIcon({
   workflowBlockType,
   className,
-  integrationLogo,
+  integrationLogo: logoKey,
 }: Props) {
-  const IntegrationLogo = integrationLogo
-    ? integrationLogoIcons[integrationLogo]
-    : undefined;
+  const IntegrationLogo = integrationLogo(logoKey);
   if (IntegrationLogo) return <IntegrationLogo className={className} />;
   switch (workflowBlockType) {
     case "action": {

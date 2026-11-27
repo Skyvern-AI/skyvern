@@ -155,6 +155,7 @@ export function useMicrosoftOAuthCredentials({
     data: credentials,
     isLoading,
     isFetching,
+    isSuccess,
     error,
   } = useQuery<MicrosoftOAuthCredential[]>({
     queryKey: includeEmail
@@ -310,6 +311,7 @@ export function useMicrosoftOAuthCredentials({
     credentials: credentials ?? [],
     isLoading,
     isFetching,
+    isSuccess,
     error,
     startAuthorize: authorizeMutation.mutateAsync,
     isStartingAuthorize: authorizeMutation.isPending,

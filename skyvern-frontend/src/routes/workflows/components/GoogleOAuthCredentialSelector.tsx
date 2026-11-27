@@ -73,6 +73,7 @@ function GoogleOAuthCredentialSelector({
     credentials: allCredentials,
     isLoading,
     isFetching,
+    isSuccess,
   } = useGoogleOAuthCredentials({ includeEmail: showEmail });
   const canAuthorize = useHasCapability("google_oauth.authorize");
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -96,6 +97,12 @@ function GoogleOAuthCredentialSelector({
     (showAdvanced || isTemplateValue);
 
   const hasCredentials = credentials.length > 0;
+  // A failed lookup also leaves an empty list, so only a loaded list can show there is no account.
+  const noUsableAccount =
+    !value &&
+    isSuccess &&
+    !hasCredentials &&
+    !additionalAccounts?.options.length;
   const isKnownCredential = credentials.some((c) => c.id === value);
   // The saved id may point at a connection that still exists but is expired
   // ("needs reconnect"). Re-auth-in-place keeps the same id, so the block keeps
@@ -336,7 +343,7 @@ function GoogleOAuthCredentialSelector({
                       <SelectItemText>
                         {showEmail
                           ? oauthAccountLabel(cred)
-                          : cred.credential_name}
+                          : cred.credential_name || "Unnamed account"}
                       </SelectItemText>
                     </p>
                     <p className="text-xs text-muted-foreground">{cred.id}</p>
@@ -385,6 +392,25 @@ function GoogleOAuthCredentialSelector({
               ) : null}
             </SelectContent>
           </Select>
+          {noUsableAccount ? (
+            <p className="text-xs text-muted-foreground">
+              {allCredentials.some(isGoogleOAuthCredentialActive)
+                ? "None of your Google accounts has the access this block needs."
+                : "No Google account connected yet."}{" "}
+              {canAuthorize ? (
+                <a
+                  href="/integrations"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline"
+                >
+                  Connect an account
+                </a>
+              ) : (
+                "An admin can connect one."
+              )}
+            </p>
+          ) : null}
         </>
       )}
     </div>

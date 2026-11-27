@@ -88,14 +88,15 @@ export function credentialsWithActionFit(
   }));
 }
 
-// The Integrations page's account format: "Name (address)", or one of them when they match or one is missing.
+// The Integrations page's account format: "Name (address)", one of them when they match or one is missing,
+// else "Unnamed account".
 export function oauthAccountLabel(credential: {
   credential_name: string;
   email_address?: string | null;
 }): string {
   const { credential_name: name, email_address: email } = credential;
-  if (!email || email === name) return name;
-  return name ? `${name} (${email})` : email;
+  if (name && email && email !== name) return `${name} (${email})`;
+  return name || email || "Unnamed account";
 }
 
 export function isGoogleOAuthCredentialActive(
@@ -210,6 +211,7 @@ export function useGoogleOAuthCredentials({
     data: credentials,
     isLoading,
     isFetching,
+    isSuccess,
     error,
     refetch: refetchCredentials,
   } = useQuery<GoogleOAuthCredential[]>({
@@ -370,6 +372,7 @@ export function useGoogleOAuthCredentials({
     credentials: credentials ?? [],
     isLoading,
     isFetching,
+    isSuccess,
     error,
     refetchCredentials,
     startAuthorize: authorizeMutation.mutateAsync,

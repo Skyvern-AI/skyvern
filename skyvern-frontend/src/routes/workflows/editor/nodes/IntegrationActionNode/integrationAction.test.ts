@@ -4,6 +4,7 @@ import { appRows, matchingAppActions } from "../../panels/appLibrary";
 import { queryClient } from "@/api/QueryClient";
 import { createNode, getWorkflowErrors } from "../../workflowEditorUtils";
 import {
+  builtInBlockFor,
   fieldLabel,
   fieldSchema,
   type IntegrationActionNode,
@@ -83,7 +84,7 @@ function actionNode(
 describe("integration action library and validation", () => {
   afterEach(() => queryClient.clear());
 
-  test("lists live apps connected first and finds an action in every app", () => {
+  test("lists live apps, finds actions, and presets only fields each block has", () => {
     const rows = appRows(catalog, (entry) => entry.id === "gmail");
     expect(rows.map((row) => row.entry.id)).toEqual([
       "gmail",
@@ -105,6 +106,61 @@ describe("integration action library and validation", () => {
       "read_inbox",
     ]);
     expect(matchingAppActions(rows, "archive")).toEqual([]);
+
+    // Every catalog action that runs a block, with its pinned inputs (skyvern/forge/sdk/integrations/catalog.py).
+    const blockAction = (runsVia: string, pins: Record<string, string>) => ({
+      id: runsVia,
+      name: runsVia,
+      description: "",
+      runsVia,
+      inputs: {
+        properties: Object.fromEntries(
+          Object.entries(pins).map(([field, value]) => [
+            field,
+            { const: value },
+          ]),
+        ),
+      },
+    });
+    const catalogBlockActions = [
+      [
+        blockAction("block:email_inbox", { email_client: "gmail" }),
+        "emailInbox",
+      ],
+      [
+        blockAction("block:email_inbox", { email_client: "outlook" }),
+        "emailInbox",
+      ],
+      [
+        blockAction("block:email_inbox", {
+          email_client: "gmail",
+          credential_source: "nango",
+          organize_action: "archive",
+        }),
+        "emailInbox",
+      ],
+      [blockAction("block:send_email", { transport: "gmail" }), "sendEmail"],
+      [
+        blockAction("block:file_upload", { storage_type: "google_drive" }),
+        "fileUpload",
+      ],
+      [
+        blockAction("block:file_download", { download_target: "google_drive" }),
+        "fileDownload",
+      ],
+      [blockAction("block:google_sheets_read", {}), "googleSheetsRead"],
+      [blockAction("block:google_sheets_write", {}), "googleSheetsWrite"],
+      [blockAction("block:powerbi_query", {}), "powerBIQuery"],
+    ] as const;
+    for (const [action, nodeType] of catalogBlockActions) {
+      const builtIn = builtInBlockFor(action);
+      expect(builtIn?.nodeType ?? null).toBe(nodeType);
+      if (!builtIn) continue;
+      const node = createNode({ id: "n1" }, builtIn.nodeType, "block");
+      expect(Object.keys(node.data)).toEqual(
+        expect.arrayContaining(Object.keys(builtIn.data)),
+      );
+    }
   });
 
   test("flags a missing account, missing required inputs and bad typed text", () => {
