@@ -8,6 +8,7 @@ Covers:
 - ForgeApp restoration on bootstrap failure
 """
 
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -383,7 +384,7 @@ async def test_local_persistent_mode_accepts_settings_without_dotenv(
 @pytest.mark.asyncio
 async def test_persistent_embedded_mode_upgrades_an_existing_sqlite_schema(tmp_path: Path) -> None:
     """Persistent embedded mode never runs the server lifespan, so it must bootstrap the SQLite schema itself."""
-    from sqlalchemy import select
+    from sqlalchemy import inspect, select
 
     from skyvern.forge import app as forge_app
     from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -398,6 +399,10 @@ async def test_persistent_embedded_mode_upgrades_an_existing_sqlite_schema(tmp_p
         await conn.exec_driver_sql("ALTER TABLE tasks DROP COLUMN attempt_number")
         await conn.exec_driver_sql("ALTER TABLE workflow_run_blocks DROP COLUMN attempt_number")
         await conn.exec_driver_sql("ALTER TABLE artifacts DROP COLUMN download_filename")
+        await conn.exec_driver_sql("DROP INDEX uq_totp_codes_strict_code_digest")
+        await conn.exec_driver_sql("DROP INDEX uq_totp_codes_strict_webhook_code_digest")
+        await conn.exec_driver_sql("ALTER TABLE totp_codes DROP COLUMN code_digest")
+        await conn.exec_driver_sql("ALTER TABLE totp_codes DROP COLUMN fields_encrypted")
 
     organization = await db.organizations.create_organization(organization_name="Existing SQLite organization")
     artifact_id = "a_existing_screenshot"
@@ -407,6 +412,13 @@ async def test_persistent_embedded_mode_upgrades_an_existing_sqlite_schema(tmp_p
             "INSERT INTO artifacts (artifact_id, organization_id, artifact_type, uri, created_at, modified_at) "
             "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             (artifact_id, organization.organization_id, ArtifactType.SCREENSHOT_ACTION.value, artifact_uri),
+        )
+        now = datetime.now(UTC).replace(tzinfo=None).isoformat(sep=" ")
+        await conn.exec_driver_sql(
+            "INSERT INTO totp_codes (totp_code_id, totp_identifier, organization_id, content, code, source, "
+            "created_at, modified_at) VALUES ('totp_existing', 'existing@example.com', ?, 'Your code is 482910', "
+            "'482910', 'email', ?, ?)",
+            (organization.organization_id, now, now),
         )
 
     async def fake_app(scope, receive, send):  # type: ignore[no-untyped-def]
@@ -431,6 +443,14 @@ async def test_persistent_embedded_mode_upgrades_an_existing_sqlite_schema(tmp_p
         async with db.Session() as session:
             assert (await session.execute(select(TaskModel))).scalars().all() == []
             assert (await session.execute(select(WorkflowRunBlockModel))).scalars().all() == []
+
+        otp_codes = await db.otp.get_otp_codes(organization.organization_id, "existing@example.com")
+        assert [(otp.code, otp.content) for otp in otp_codes] == [("482910", "Your code is 482910")]
+        async with db.engine.connect() as conn:
+            index_names = await conn.run_sync(
+                lambda sync_conn: {index["name"] for index in inspect(sync_conn).get_indexes("totp_codes")}
+            )
+        assert {"uq_totp_codes_strict_code_digest", "uq_totp_codes_strict_webhook_code_digest"} <= index_names
 
         await ensure_sqlite_schema(db.engine)
         assert await db.artifacts.get_artifact_by_id(artifact_id, organization.organization_id) == artifact

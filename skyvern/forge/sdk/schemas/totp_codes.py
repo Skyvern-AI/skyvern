@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from skyvern.forge.sdk.db.models import TOTPCodeModel
+from skyvern.forge.sdk.encrypt.totp_fields import decrypt_totp_field
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 
 
@@ -115,6 +117,21 @@ class RawTOTPCode(BaseModel):
     source: str | None
     created_at: datetime
     expired_at: datetime | None
+
+
+async def totp_code_from_row(row: TOTPCodeModel) -> TOTPCode:
+    totp_code = TOTPCode.model_validate(row)
+    if row.fields_encrypted:
+        totp_code.code = await decrypt_totp_field(totp_code.code)
+        totp_code.content = await decrypt_totp_field(totp_code.content)
+    return totp_code
+
+
+async def raw_totp_code_from_row(row: TOTPCodeModel) -> RawTOTPCode:
+    raw_code = RawTOTPCode.model_validate(row)
+    if row.fields_encrypted:
+        raw_code.content = await decrypt_totp_field(raw_code.content)
+    return raw_code
 
 
 class RawTOTPCodeAccepted(TOTPCode):

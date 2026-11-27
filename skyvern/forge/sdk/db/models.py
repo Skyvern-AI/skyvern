@@ -1535,6 +1535,31 @@ class TOTPCodeModel(Base):
             ),
         ),
         Index(
+            "uq_totp_codes_strict_code_digest",
+            "organization_id",
+            "otp_request_id",
+            "totp_identifier",
+            "code_digest",
+            unique=True,
+            postgresql_where=text("otp_request_id IS NOT NULL AND code_digest IS NOT NULL"),
+            sqlite_where=text("otp_request_id IS NOT NULL AND code_digest IS NOT NULL"),
+        ),
+        Index(
+            "uq_totp_codes_strict_webhook_code_digest",
+            "organization_id",
+            "otp_request_id",
+            "code_digest",
+            unique=True,
+            postgresql_where=text(
+                "otp_request_id IS NOT NULL AND totp_identifier IS NULL "
+                "AND source = 'verification_url' AND code_digest IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "otp_request_id IS NOT NULL AND totp_identifier IS NULL "
+                "AND source = 'verification_url' AND code_digest IS NOT NULL"
+            ),
+        ),
+        Index(
             "uq_totp_codes_org_external_message_id",
             "organization_id",
             "external_message_id",
@@ -1560,6 +1585,9 @@ class TOTPCodeModel(Base):
     rejected_at = Column(DateTime, nullable=True)
     content = Column(String, nullable=False)
     code = Column(String)
+    code_digest = Column(String, nullable=True)
+    # Set only by our writer. Readers never infer ciphertext from a value's prefix, so caller text is never decrypted.
+    fields_encrypted = Column(Boolean, nullable=True)
     source = Column(String)
     external_message_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)

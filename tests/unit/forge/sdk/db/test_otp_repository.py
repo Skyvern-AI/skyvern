@@ -13,6 +13,8 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import TOTPCodeModel
 from skyvern.forge.sdk.db.repositories.otp import _strict_identifier
+from skyvern.forge.sdk.encrypt.base import TokenDecryptionError
+from skyvern.forge.sdk.encrypt.totp_fields import encrypt_totp_field, totp_code_digest
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
 from skyvern.services import otp_service
 from skyvern.services.otp_email import EmailOTPCandidate
@@ -57,22 +59,31 @@ async def _read_codes(
         ),
     ],
 )
+@pytest.mark.parametrize("row_format", ["plaintext", "encrypted", "unmarked-ciphertext"])
 @pytest.mark.asyncio
 async def test_otp_repository_readers_match_email_identifiers_case_insensitively(
     agent_db: AgentDB,
+    registered_encryption: None,
     reader_name: ReaderName,
     stored_identifier: str,
     lookup_identifier: str,
+    row_format: str,
 ) -> None:
     parse_status = "raw" if reader_name == "get_raw_otp_codes" else "parsed"
+    # Caller text that is someone else's ciphertext must come back as stored, never decrypted.
+    caller_ciphertext = await encrypt_totp_field("another store's secret")
+    plaintext_content = caller_ciphertext if row_format == "unmarked-ciphertext" else "Your code is 123456"
+    stored_content = await encrypt_totp_field(plaintext_content) if row_format == "encrypted" else plaintext_content
+    stored_code = await encrypt_totp_field("123456") if row_format == "encrypted" else "123456"
     async with agent_db.Session() as session:
         session.add(
             TOTPCodeModel(
                 totp_code_id="otp_legacy_case",
                 organization_id="o_test",
                 totp_identifier=stored_identifier,
-                content="123456",
-                code=None if parse_status == "raw" else "123456",
+                content=stored_content,
+                code=None if parse_status == "raw" else stored_code,
+                fields_encrypted=True if row_format == "encrypted" else None,
                 otp_type=None if parse_status == "raw" else "totp",
                 parse_status=parse_status,
             )
@@ -82,6 +93,9 @@ async def test_otp_repository_readers_match_email_identifiers_case_insensitively
     results = await _read_codes(agent_db, reader_name, lookup_identifier)
 
     assert [result.totp_code_id for result in results] == ["otp_legacy_case"]
+    assert [result.content for result in results] == [plaintext_content]
+    if parse_status == "parsed":
+        assert [result.code for result in results if isinstance(result, TOTPCode)] == ["123456"]
 
 
 @pytest.mark.parametrize("reader_name", ["get_otp_codes", "get_recent_otp_codes", "get_raw_otp_codes"])
@@ -183,6 +197,7 @@ async def test_otp_repository_readers_match_non_email_identifiers_exactly(
 @pytest.mark.asyncio
 async def test_promote_raw_otp_code_and_strict_claims_are_atomic(
     org_scoped_db: tuple[AgentDB, Any, str],
+    registered_encryption: None,
 ) -> None:
     agent_db, _, organization_id = org_scoped_db
     async with agent_db.Session() as session:
@@ -201,8 +216,9 @@ async def test_promote_raw_otp_code_and_strict_claims_are_atomic(
                     totp_code_id="otp_strict_promote",
                     organization_id=organization_id,
                     totp_identifier=_strict_identifier("strict@example.test", "otpr_raw"),
-                    content="your strict code is 654321",
+                    content=await encrypt_totp_field("your strict code is 654321"),
                     code=None,
+                    fields_encrypted=True,
                     otp_type=None,
                     parse_status="strict_raw",
                     otp_request_id="otpr_raw",
@@ -228,7 +244,11 @@ async def test_promote_raw_otp_code_and_strict_claims_are_atomic(
         otp_type=OTPType.TOTP,
     )
     assert strict_promoted is not None
+    assert (strict_promoted.code, strict_promoted.content) == ("654321", "your strict code is 654321")
     async with agent_db.Session() as session:
+        assert (
+            await session.scalar(select(TOTPCodeModel.code).where(TOTPCodeModel.totp_code_id == "otp_strict_promote"))
+        ) != "654321"
         assert (
             await session.scalar(select(TOTPCodeModel.parse_status).where(TOTPCodeModel.totp_code_id == "otp_promote"))
             == "parsed"
@@ -239,6 +259,17 @@ async def test_promote_raw_otp_code_and_strict_claims_are_atomic(
             )
             == "strict_parsed"
         )
+        promoted_digests = (
+            await session.execute(
+                select(TOTPCodeModel.totp_code_id, TOTPCodeModel.code_digest).where(
+                    TOTPCodeModel.totp_code_id.in_(("otp_promote", "otp_strict_promote"))
+                )
+            )
+        ).all()
+    assert dict(promoted_digests) == {
+        "otp_promote": totp_code_digest(organization_id, "123456"),
+        "otp_strict_promote": totp_code_digest(organization_id, "654321"),
+    }
 
     task_a = await agent_db.tasks.create_task(
         url="https://example.test/a",
@@ -463,6 +494,85 @@ async def test_promote_raw_otp_code_and_strict_claims_are_atomic(
     assert first_delivery is not None
     assert first_delivery.totp_identifier == "shared@example.test"
     assert duplicate_delivery is None
+    async with agent_db.Session() as session:
+        stored_digest = await session.scalar(
+            select(TOTPCodeModel.code_digest).where(TOTPCodeModel.totp_code_id == first_delivery.totp_code_id)
+        )
+    assert stored_digest == totp_code_digest(organization_id, "444444")
+
+    async with agent_db.Session() as session:
+        session.add(
+            TOTPCodeModel(
+                totp_code_id="otp_encrypted_delivery",
+                organization_id=organization_id,
+                totp_identifier=_strict_identifier("encrypted@example.test", "otpr_b"),
+                content=await encrypt_totp_field("Your code is 909090"),
+                code=await encrypt_totp_field("909090"),
+                code_digest=totp_code_digest(organization_id, "909090"),
+                fields_encrypted=True,
+                otp_type="totp",
+                parse_status="strict_parsed",
+                otp_request_id="otpr_b",
+                task_id=task_b.task_id,
+            )
+        )
+        await session.commit()
+    assert (
+        await agent_db.otp.create_otp_code_if_new(
+            organization_id=organization_id,
+            totp_identifier="encrypted@example.test",
+            content="Your code is 909090",
+            code="909090",
+            otp_type=OTPType.TOTP,
+            task_id=task_b.task_id,
+            otp_request_id="otpr_b",
+        )
+        is None
+    )
+    encrypted_claim = await agent_db.otp.claim_otp_code(
+        organization_id=organization_id,
+        totp_identifier="encrypted@example.test",
+        otp_request_id="otpr_b",
+        task_id=task_b.task_id,
+    )
+    assert encrypted_claim is not None
+    assert (encrypted_claim.totp_code_id, encrypted_claim.code, encrypted_claim.content) == (
+        "otp_encrypted_delivery",
+        "909090",
+        "Your code is 909090",
+    )
+
+    # A marked row that does not decrypt must fail the claim and leave the delivery unclaimed.
+    async with agent_db.Session() as session:
+        session.add(
+            TOTPCodeModel(
+                totp_code_id="otp_undecryptable_delivery",
+                organization_id=organization_id,
+                totp_identifier=_strict_identifier("broken@example.test", "otpr_b"),
+                content="skyvern_aes:aes_gcm:corrupted",
+                code="skyvern_aes:aes_gcm:corrupted",
+                code_digest=totp_code_digest(organization_id, "707070"),
+                fields_encrypted=True,
+                otp_type="totp",
+                parse_status="strict_parsed",
+                otp_request_id="otpr_b",
+                task_id=task_b.task_id,
+            )
+        )
+        await session.commit()
+    with pytest.raises(TokenDecryptionError):
+        await agent_db.otp.claim_otp_code(
+            organization_id=organization_id,
+            totp_identifier="broken@example.test",
+            otp_request_id="otpr_b",
+            task_id=task_b.task_id,
+        )
+    async with agent_db.Session() as session:
+        assert (
+            await session.scalar(
+                select(TOTPCodeModel.claimed_at).where(TOTPCodeModel.totp_code_id == "otp_undecryptable_delivery")
+            )
+        ) is None
 
     literal_codes = [
         r"\xGG",
@@ -644,6 +754,7 @@ async def test_promote_raw_otp_code_and_strict_claims_are_atomic(
             )
         ).all()
     assert {row.code for row in webhook_rows} == {"888111", "888222", *literal_codes}
+    assert all(row.code_digest == totp_code_digest(organization_id, row.code) for row in webhook_rows)
     assert all(row.totp_identifier is None for row in webhook_rows)
     assert all(row.claimed_by_task_id == webhook_task.task_id for row in webhook_rows)
     assert all(row.claimed_at is not None for row in webhook_rows)
