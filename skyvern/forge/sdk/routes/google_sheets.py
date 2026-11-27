@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.exc import SQLAlchemyError
 
 from skyvern.forge import app
-from skyvern.forge.sdk.experimentation.drive_shared_drive_search import drive_shared_drive_search_enabled
+from skyvern.forge.sdk.experimentation.drive_shared_drive_search import resolve_page_search_mode, tag_page_token
 from skyvern.forge.sdk.schemas.google_sheets import (
     CreateGoogleSheetTabRequest,
     CreateGoogleSheetTabResponse,
@@ -151,7 +151,7 @@ async def list_spreadsheets(
     page_token: Annotated[str | None, Query(description="Drive v3 pagination token")] = None,
     page_size: Annotated[int, Query(ge=1, le=100)] = 25,
 ) -> ListGoogleSpreadsheetsResponse:
-    search_all_drives = await drive_shared_drive_search_enabled(current_org.organization_id)
+    page_token, search_all_drives = await resolve_page_search_mode(current_org.organization_id, page_token)
     try:
         paged = await _with_access_token(
             current_org.organization_id,
@@ -176,7 +176,7 @@ async def list_spreadsheets(
             )
             for s in paged.spreadsheets
         ],
-        next_page_token=paged.next_page_token,
+        next_page_token=tag_page_token(paged.next_page_token, search_all_drives),
     )
     if search_all_drives:
         response.incomplete_search = paged.incomplete_search
