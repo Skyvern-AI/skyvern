@@ -31,6 +31,7 @@ from skyvern.schemas.workflows import (
     FileDownloadTarget,
     FileStorageType,
 )
+from skyvern.webeye.browser_artifacts import DownloadBinding
 from tests.unit.helpers import connected_accounts_are, make_pdf
 
 
@@ -100,9 +101,13 @@ async def _execute_file_download(
     unresolvable_endpoint_hosts: tuple[str, ...] = (),
     endpoint_host_ips: tuple[str, ...] = ("203.0.113.10",),
     accounts: tuple[OrgConnection, ...] = (),
+    producer_download_binding: DownloadBinding | None = None,
 ) -> SimpleNamespace:
     workflow_run_context = MagicMock()
     workflow_run_context.organization_id = "organization-id"
+    workflow_run_context.browser_session_download_binding = (
+        ("organization-id", "pbs_fixture", producer_download_binding) if producer_download_binding is not None else None
+    )
     workflow_run_context.values = {}
     workflow_run_context.secrets = {}
     workflow_run_context.include_secrets_in_templates = False
@@ -191,10 +196,16 @@ async def _execute_file_download(
         mock_app.STORAGE.save_downloaded_files = AsyncMock(side_effect=storage_save_side_effect)
         mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=downloaded_file_infos or [])
         mock_app.STORAGE.get_current_attempt_downloaded_files = mock_app.STORAGE.get_downloaded_files
+        if producer_download_binding is not None:
+            mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = None
+            mock_app.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(
+                side_effect=TimeoutError("fixture post-download session lookup timed out")
+            )
         result = await block.execute(
             workflow_run_id="workflow-run-id",
             workflow_run_block_id="workflow-run-block-id",
             organization_id="organization-id",
+            browser_session_id="pbs_fixture" if producer_download_binding is not None else None,
         )
 
     return SimpleNamespace(
@@ -1242,7 +1253,10 @@ async def test_dispatch_failure_returns_failed_result_and_clears_output(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_empty_scope_and_empty_download_dir_is_noop(tmp_path: Path) -> None:
+@pytest.mark.parametrize("producer_download_binding", [None, DownloadBinding.RUN_DIR])
+async def test_empty_scope_and_empty_download_dir_is_noop(
+    tmp_path: Path, producer_download_binding: DownloadBinding | None
+) -> None:
     download_dir = tmp_path / "downloads"
     _write_downloads(download_dir)
     block = _file_download_block(
@@ -1253,7 +1267,9 @@ async def test_empty_scope_and_empty_download_dir_is_noop(tmp_path: Path) -> Non
     )
     browser_result = _browser_result(block)
 
-    execution = await _execute_file_download(block, browser_result, download_dir)
+    execution = await _execute_file_download(
+        block, browser_result, download_dir, producer_download_binding=producer_download_binding
+    )
 
     assert execution.result is browser_result
     assert execution.result.success is True

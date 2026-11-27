@@ -39,8 +39,8 @@ from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.helpers import connected_accounts_are, make_organization, make_step, make_task
 
 
-@pytest_asyncio.fixture
-async def browser_manager() -> AsyncIterator[RealBrowserManager]:
+@asynccontextmanager
+async def managed_browser_manager() -> AsyncIterator[RealBrowserManager]:
     manager = RealBrowserManager()
     try:
         yield manager
@@ -52,6 +52,12 @@ async def browser_manager() -> AsyncIterator[RealBrowserManager]:
             renewer.cancel()
             with suppress(asyncio.CancelledError):
                 await renewer
+
+
+@pytest_asyncio.fixture
+async def browser_manager() -> AsyncIterator[RealBrowserManager]:
+    async with managed_browser_manager() as manager:
+        yield manager
 
 
 def _recording_browser() -> tuple[MagicMock, MagicMock]:
@@ -741,11 +747,18 @@ async def test_browser_manager_adoption_rebinds_to_run_dir(browser_manager: Real
 async def test_browser_manager_adoption_skips_rebind_when_session_dir_binding(
     browser_manager: RealBrowserManager,
 ) -> None:
+    await check_adoption_preserves_download_binding(browser_manager, DownloadBinding.SESSION_DIR)
+
+
+async def check_adoption_preserves_download_binding(
+    browser_manager: RealBrowserManager,
+    download_binding: DownloadBinding,
+) -> None:
     """A provider-owned remote binding preserves the provider-selected destination."""
     browser, cdp_session = _recording_browser()
     browser_state = MagicMock()
     browser_state.browser_context.browser = browser
-    browser_state.browser_artifacts.download_binding = DownloadBinding.SESSION_DIR
+    browser_state.browser_artifacts.download_binding = download_binding
     browser_state.get_working_page = AsyncMock(return_value=None)
     browser_state.get_or_create_page = AsyncMock()
     manager = browser_manager
@@ -825,14 +838,17 @@ async def test_block_non_adoption_cache_hit_rebinds_to_run_dir() -> None:
 
 @pytest.mark.asyncio
 async def test_block_non_adoption_skips_rebind_when_session_dir_binding() -> None:
-    """Defense-in-depth: an own-browser state carrying a SESSION_DIR binding must not be rebound off its
-    provider-selected destination even on the non-adoption path."""
+    await check_non_adoption_preserves_download_binding(DownloadBinding.SESSION_DIR)
+
+
+async def check_non_adoption_preserves_download_binding(download_binding: DownloadBinding) -> None:
+    """A provider-owned binding preserves its destination even on the non-adoption path."""
 
     browser, cdp_session = _recording_browser()
     browser_state = MagicMock()
     browser_state.browser_context.browser = browser
     browser_state.is_connected = MagicMock(return_value=True)
-    browser_state.browser_artifacts.download_binding = DownloadBinding.SESSION_DIR
+    browser_state.browser_artifacts.download_binding = download_binding
 
     with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
         mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=browser_state)

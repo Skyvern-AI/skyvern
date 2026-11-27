@@ -277,7 +277,8 @@ def keyring_configured():
 
 
 @pytest.mark.asyncio
-async def test_get_downloaded_files_uses_artifact_urls_when_rows_exist(keyring_configured):
+@pytest.mark.parametrize("download_filename", [None, "configured.pdf"])
+async def test_get_downloaded_files_uses_artifact_urls_when_rows_exist(keyring_configured, download_filename):
     """When DOWNLOAD artifact rows exist, retrieval skips S3 entirely:
     URL, checksum, filename, modified_at all come straight from the row."""
     storage = S3Storage()
@@ -286,12 +287,13 @@ async def test_get_downloaded_files_uses_artifact_urls_when_rows_exist(keyring_c
     storage.async_client.get_file_metadata = AsyncMock()  # must NOT be called
     storage.async_client.create_presigned_urls = AsyncMock()  # must NOT be called
 
+    uri = "s3://skyvern-uploads/downloads/local/o_1/wr_1/invoice.pdf"
     artifact = _make_artifact(
         "a_42",
-        "s3://skyvern-uploads/downloads/local/o_1/wr_1/invoice.pdf",
+        uri,
         checksum="sha-from-db",
         file_size=4096,
-    )
+    ).model_copy(update={"download_filename": download_filename})
     mock_list = AsyncMock(return_value=[artifact])
     resolve_url = AsyncMock(return_value="https://api.skyvern.com/v1/artifacts/a_42/content?expiry=x&kid=y&sig=z")
 
@@ -304,7 +306,8 @@ async def test_get_downloaded_files_uses_artifact_urls_when_rows_exist(keyring_c
 
     assert len(result) == 1
     assert result[0].url.startswith("https://api.skyvern.com/v1/artifacts/a_42/content")
-    assert result[0].filename == "invoice.pdf"
+    assert result[0].filename == (download_filename or "invoice.pdf")
+    assert artifact.uri == uri
     assert result[0].checksum == "sha-from-db"
     assert result[0].file_size == 4096
     assert result[0].modified_at is not None
@@ -442,16 +445,27 @@ async def test_get_downloaded_files_artifact_lookup_failure_falls_back_to_listin
 
 
 @pytest.mark.asyncio
-async def test_content_endpoint_download_returns_attachment_with_filename():
+@pytest.mark.parametrize(
+    ("download_filename", "expected_filename"),
+    [
+        (None, "invoice.pdf"),
+        ("configured invoice.pdf", "configured invoice.pdf"),
+        ('configured"\r\n.pdf', "configured.pdf"),
+    ],
+)
+async def test_content_endpoint_download_returns_attachment_with_filename(download_filename, expected_filename):
     """DOWNLOAD artifacts must serve with attachment disposition so browsers don't render
     PDFs inline (defeats the SKY-8862 XSS-via-PDF mitigation)."""
     from skyvern.forge.sdk.routes.agent_protocol import _artifact_response_config
 
-    artifact = _make_artifact("a_dl", "s3://skyvern-uploads/downloads/local/o_1/wr_1/invoice.pdf")
+    uri = "s3://skyvern-uploads/downloads/local/o_1/wr_1/invoice.pdf"
+    artifact = _make_artifact("a_dl", uri).model_copy(update={"download_filename": download_filename})
     media_type, disposition = _artifact_response_config(artifact)
     assert media_type == "application/octet-stream"
     assert disposition.startswith("attachment;")
-    assert 'filename="invoice.pdf"' in disposition
+    assert f'filename="{expected_filename}"' in disposition
+    assert "\r" not in disposition and "\n" not in disposition
+    assert artifact.uri == uri
     local_snapshot = _make_artifact(
         "a_local", "file:///tmp/artifacts/downloads/local/o_1/wr_1/attempts/2/report%20%231.pdf"
     )
@@ -499,6 +513,7 @@ def test_content_endpoint_session_replay_falls_back_to_mp4_for_unknown_extension
         artifact_id="a_replay",
         artifact_type=ArtifactType.SESSION_REPLAY,
         uri="s3://skyvern-artifacts/.../session_replay",
+        download_filename="ignored.webm",
         organization_id="o_1",
         created_at="2026-04-23T00:00:00Z",
         modified_at="2026-04-23T00:00:00Z",

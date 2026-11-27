@@ -386,8 +386,10 @@ async def test_persistent_embedded_mode_upgrades_an_existing_sqlite_schema(tmp_p
     from sqlalchemy import select
 
     from skyvern.forge import app as forge_app
+    from skyvern.forge.sdk.artifact.models import ArtifactType
     from skyvern.forge.sdk.db.agent_db import AgentDB
     from skyvern.forge.sdk.db.models import Base, TaskModel, WorkflowRunBlockModel
+    from skyvern.forge.sdk.db.sqlite_schema import ensure_sqlite_schema
     from skyvern.library.embedded_server_factory import create_embedded_server
 
     db = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'existing.db'}")
@@ -395,6 +397,17 @@ async def test_persistent_embedded_mode_upgrades_an_existing_sqlite_schema(tmp_p
         await conn.run_sync(Base.metadata.create_all)
         await conn.exec_driver_sql("ALTER TABLE tasks DROP COLUMN attempt_number")
         await conn.exec_driver_sql("ALTER TABLE workflow_run_blocks DROP COLUMN attempt_number")
+        await conn.exec_driver_sql("ALTER TABLE artifacts DROP COLUMN download_filename")
+
+    organization = await db.organizations.create_organization(organization_name="Existing SQLite organization")
+    artifact_id = "a_existing_screenshot"
+    artifact_uri = "file:///existing-screenshot.png"
+    async with db.engine.begin() as conn:
+        await conn.exec_driver_sql(
+            "INSERT INTO artifacts (artifact_id, organization_id, artifact_type, uri, created_at, modified_at) "
+            "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            (artifact_id, organization.organization_id, ArtifactType.SCREENSHOT_ACTION.value, artifact_uri),
+        )
 
     async def fake_app(scope, receive, send):  # type: ignore[no-untyped-def]
         await send({"type": "http.response.start", "status": 200, "headers": []})
@@ -407,10 +420,20 @@ async def test_persistent_embedded_mode_upgrades_an_existing_sqlite_schema(tmp_p
         with patch("skyvern.library.embedded_server_factory.create_api_app", return_value=fake_app):
             response = await client.get("/")
         assert response.status_code == 200
+        artifact = await db.artifacts.get_artifact_by_id(artifact_id, organization.organization_id)
+        assert artifact is not None
+        assert artifact.artifact_id == artifact_id
+        assert artifact.organization_id == organization.organization_id
+        assert artifact.artifact_type == ArtifactType.SCREENSHOT_ACTION
+        assert artifact.uri == artifact_uri
+        assert artifact.download_filename is None
         # The mapped models select every column; a missing one fails here with "no such column".
         async with db.Session() as session:
             assert (await session.execute(select(TaskModel))).scalars().all() == []
             assert (await session.execute(select(WorkflowRunBlockModel))).scalars().all() == []
+
+        await ensure_sqlite_schema(db.engine)
+        assert await db.artifacts.get_artifact_by_id(artifact_id, organization.organization_id) == artifact
     finally:
         await client.aclose()
         forge_app.DATABASE = original_db  # type: ignore[assignment]
