@@ -2359,6 +2359,30 @@ class TestCodeBlockOtpBudget:
         raw_context.store_queried = True
 
     @staticmethod
+    def _extra_source_is_the_only_inbox(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        email_context.for_source(GmailOTPSource.name).credential_ids = []
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        extra = email_context.for_source("extra_inbox")
+        extra.label = "Extra"
+        extra.credential_ids = ["cred_extra"]
+        extra.completed_credential_ids.add("cred_extra")
+        extra.remember_message("cred_extra", "msg_extra")
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _extra_source_has_no_inbox(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        email_context.for_source(GmailOTPSource.name).credential_ids = []
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        extra = email_context.for_source("extra_inbox")
+        extra.label = "Extra"
+        extra.credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
     def _store_queried_only(email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext) -> None:
         raw_context.store_queried = True
 
@@ -2453,6 +2477,18 @@ class TestCodeBlockOtpBudget:
             ),
             (
                 "otp@example.com",
+                _extra_source_is_the_only_inbox,
+                ["1 Extra inbox connected, 1 message checked"],
+                ["No Gmail or Outlook inbox is connected", "inbox list never loaded"],
+            ),
+            (
+                "otp@example.com",
+                _extra_source_has_no_inbox,
+                ["No Gmail, Outlook or Extra inbox is connected", "no code has been stored"],
+                ["No Gmail or Outlook inbox is connected"],
+            ),
+            (
+                "otp@example.com",
                 _nothing_consulted,
                 ["No delivery source was checked before the wait ended."],
                 ["No Gmail or Outlook inbox is connected", "no code has been stored"],
@@ -2480,6 +2516,8 @@ class TestCodeBlockOtpBudget:
             "evicted-then-disconnected",
             "searched-then-failed",
             "one-message-singular",
+            "extra-source-only-inbox",
+            "extra-source-no-inbox",
             "nothing-queried",
             "sms-identifier",
         ],
