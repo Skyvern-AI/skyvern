@@ -1,9 +1,9 @@
 ---
 title: Build in Studio
-description: Build and edit Skyvern agents in Studio, with Copilot or by hand. Add and configure blocks, define inputs, pick an engine, save versions, and organize agents in folders and templates.
+description: Build and edit Skyvern agents in Studio, with Ember or by hand. Add and configure blocks, define inputs, pick an engine, save versions, and organize agents in folders and templates.
 keywords:
   - Studio
-  - Copilot
+  - Ember
   - editor
   - blocks
   - inputs
@@ -17,11 +17,11 @@ keywords:
   - export
 ---
 
-Studio is where you open an agent to build it, change it, run it and watch it. You can let Copilot do the building, edit blocks yourself, or mix the two on the same agent.
+Studio is where you open an agent to build it, change it, run it and watch it. You can let Ember do the building, edit blocks yourself, or mix the two on the same agent.
 
 To open Studio, click an agent on **Agents** → **All Agents**, or create one with **New Agent** in the sidebar. The address is `/agents/<agent id>/studio`.
 
-<img src="/images/cloud/cloud-studio-overview.png" alt="Studio with the Copilot, Browser and Editor panes side by side, the pane toggles in the top bar, and Inputs and Run on the right" />
+<img src="/images/cloud/cloud-studio-overview.png" alt="Studio with the Ember, Browser and Editor panes side by side, the pane toggles in the top bar, and Inputs and Run on the right" />
 
 ## The layout
 
@@ -29,17 +29,17 @@ Studio has five panes. Toggle each one from the top bar, next to the agent's tit
 
 | Pane | What it does |
 |---|---|
-| **Copilot** | Chat that builds and edits the agent for you |
+| **Ember** | Chat that builds and edits the agent for you |
 | **Editor** | The agent's blocks as a flow you edit by hand, in **Visual** or **YAML** view |
 | **Browser** | The browser the agent drives: **Live** while something runs, then **Recording** and **Screenshots** |
 | **Run** | One run's **Timeline**, **Inputs** and **Outputs**. With no run open, the control reads **Past Runs** and lists earlier runs. |
 | **Triggers** (lightning icon) | This agent's event triggers, which start it from a signed HTTP request. Shown only for an agent you can change: not a deleted agent, and not a read-only one that offers **Make a Copy to Edit**. See [Event triggers](/developers/event-triggers). |
 
-The right side of the top bar holds the agent's controls. **Schedule**, **More actions** and **Inputs** show while the Copilot or Editor pane is open, and Save shows then or whenever you have unsaved changes. Under 720 pixels wide, **Schedule** and **Inputs** move into **More actions**.
+The right side of the top bar holds the agent's controls. **Schedule**, **More actions** and **Inputs** show while the Ember or Editor pane is open, and Save shows then or whenever you have unsaved changes. Under 720 pixels wide, **Schedule** and **Inputs** move into **More actions**.
 
 | Control | What it does |
 |---|---|
-| Save (disk icon) | Saves your hand edits. A dot on the icon means unsaved changes. It is disabled, and its tooltip says why, while Copilot is working on a request or applying changes and while YAML edits are being applied. When Copilot pauses saving so you don't overwrite a newer change (for example, the agent changed after Copilot proposed its changes), Save stays clickable and opens **Save is paused**, which explains why and offers **Reload and discard my edits**. |
+| Save (disk icon) | Saves your hand edits. A dot on the icon means unsaved changes. It is disabled, and its tooltip says why, while Ember is working on a request or applying changes and while YAML edits are being applied. When Ember pauses saving so you don't overwrite a newer change (for example, the agent changed after Ember proposed its changes), Save stays clickable and opens **Save is paused**, which explains why and offers **Reload and discard my edits**. |
 | **Schedule** (calendar icon) | Lists this agent's schedules and adds new ones. See [Runs and schedules](/cloud/runs#schedule-an-agent). |
 | **More actions** (⋯) | **Version history**, **Save as Template**, **Take a tour** |
 | **Inputs** | The values the agent takes on each run. See [Inputs](#inputs). |
@@ -47,48 +47,48 @@ The right side of the top bar holds the agent's controls. **Schedule**, **More a
 
 Click the agent's title at the top left to rename it. **Take a tour** (or <kbd>Shift</kbd>+<kbd>?</kbd>) walks you through Studio in the app.
 
-## Build with Copilot
+## Build with Ember
 
-Type what you want in the Copilot message box ("Ask Copilot to build or change your workflow…") and send. Copilot plans the steps, opens the site in the **Browser** pane, adds or edits blocks and runs them to test them.
+Type what you want in the Ember message box ("Ask Ember to build or change your workflow…") and send. Ember plans the steps, opens the site in the **Browser** pane, adds or edits blocks and runs them to test them.
 
-Every change Copilot makes arrives as a **Proposed changes** card:
+Every change Ember makes arrives as a **Proposed changes** card:
 
 - The card lists each block **Added**, **Changed** or **Removed**, and shows **Tested**, **Untested**, **Test failed** or **Couldn't test**. **Couldn't test** means the test wasn't allowed to use a connected account, so it says nothing about the blocks; the card offers to run it once with your account.
 - **Accept** applies the changes and saves them to the agent.
 - **Review** compares the proposed agent with the previous version before you decide.
 - **Reject** discards them and puts the agent back to the previous version.
-- **Always accept** (the arrow next to **Accept**) applies Copilot's future changes in this chat without asking. Turn it off with **Turn off** next to **Auto-accepting**.
+- **Always accept** (the arrow next to **Accept**) applies Ember's future changes in this chat without asking. Turn it off with **Turn off** next to **Auto-accepting**.
 - **Test end-to-end** runs all the blocks together on the real site.
 
 <Warning>
 **Test end-to-end** performs real actions. It can submit forms, place orders or send messages.
 </Warning>
 
-When a block uses a [Connected Gmail account](/cloud/integrations#google-and-microsoft-accounts), the **Test end-to-end** confirmation says so: that one run is allowed to use the account. Tests Copilot starts on its own, and tests started through the API or an MCP client, are not; save the agent and run it to use the account.
+When a block uses a [Connected Gmail account](/cloud/integrations#google-and-microsoft-accounts), the **Test end-to-end** confirmation says so: that one run is allowed to use the account. Tests Ember starts on its own, and tests started through the API or an MCP client, are not; save the agent and run it to use the account.
 
-Other things you can do in the Copilot pane:
+Other things you can do in the Ember pane:
 
-- **Attach files** with the **+** button in the message box, or attach a PDF or Word (.docx) procedure (an SOP) for Copilot to turn into blocks.
-- **Answer questions.** When Copilot asks one, pick an answer or type your own.
-- **Give it a login.** When a site needs an account, the **Copilot needs to sign in** card lets you pick from **Saved logins**. See [Credentials and 2FA](/credentials).
+- **Attach files** with the **+** button in the message box, or attach a PDF or Word (.docx) procedure (an SOP) for Ember to turn into blocks.
+- **Answer questions.** When Ember asks one, pick an answer or type your own.
+- **Give it a login.** When a site needs an account, the **Ember needs to sign in** card lets you pick from **Saved logins**. See [Credentials and 2FA](/credentials).
 - **Start over or go back.** **New chat** starts a fresh conversation. **History** reopens earlier chats on this agent.
 
-If a run fails, the Run pane offers **Fix with Copilot**, which sends the failure to Copilot to diagnose and propose a fix.
+If a run fails, the Run pane offers **Fix with Ember**, which sends the failure to Ember to diagnose and propose a fix.
 
-<img src="/images/cloud/cloud-copilot-proposal.png" alt="Copilot reply with the extracted posts and a Proposed changes card marked Tested, with Accept, its Always accept option, Review and Reject" />
+<img src="/images/cloud/cloud-copilot-proposal.png" alt="Ember reply with the extracted posts and a Proposed changes card marked Tested, with Accept, its Always accept option, Review and Reject" />
 
 ### Demonstrate a task
 
-When a site is easier to show than to describe, do the steps yourself and let Copilot build the blocks from them. Start with **Demonstrate task** in the **+** menu of the message box or in the Editor's add menu. The browser has to be ready first. When you tell Copilot you would rather show it, its reply carries a **Show Copilot how in the browser** card with **Start demonstration**.
+When a site is easier to show than to describe, do the steps yourself and let Ember build the blocks from them. Start with **Demonstrate task** in the **+** menu of the message box or in the Editor's add menu. The browser has to be ready first. When you tell Ember you would rather show it, its reply carries a **Show Ember how in the browser** card with **Start demonstration**.
 
 While you drive the browser, the message box reads **Demonstrating** with the number of actions recorded so far, and each action becomes a step: clicks, typing, dropdown choices, key presses, navigation, dragging one element onto another, and a hover that reveals the control your next step uses, such as one that opens a hover menu. A nested menu records a hover for each level on the way down. A hover that reveals nothing your next step uses is not recorded. A freehand stroke on a canvas or on a slider the page builds itself, and a drag inside an embedded page, read **Drag not recorded** instead. A browser's built-in slider or color picker reads **Step not recorded**. When a step acts on a control that an earlier moment in the recording saw hidden and no recorded hover explains it, the step before it reads **Reveal not attributed**. On a page too large to check for reveals, a step reads **Reveal check skipped**.
 
 Two requests come to the chat instead of the browser:
 
 - **A sign-in.** When you focus a password or one-time-code field, Skyvern asks you to fill it from a saved login or type it yourself. The step records the field and not the value, as **Fill password (value not recorded)** or **Fill one-time code (value not recorded)**. Skip the field without typing and no step is recorded for it.
-- **A file.** When the page opens a file picker, the chat asks you to choose a file for that field, with **Choose file** and **Skip**. The file you choose is attached in the page, and Copilot makes it the default for the agent's file input.
+- **A file.** When the page opens a file picker, the chat asks you to choose a file for that field, with **Choose file** and **Skip**. The file you choose is attached in the page, and Ember makes it the default for the agent's file input.
 
-While you record, the send button reads **Done, build the workflow**. Click it and Copilot builds the agent from what you did. **Discard** throws the demonstration away.
+While you record, the send button reads **Done, build the workflow**. Click it and Ember builds the agent from what you did. **Discard** throws the demonstration away.
 
 ## Edit blocks by hand
 
@@ -101,7 +101,7 @@ Open the **Editor** pane. Blocks run top to bottom in the order shown.
     Hover over the **+** on the line between two blocks (or under **Start** on a new agent).
   </Step>
   <Step title="Choose Add Block">
-    The menu offers **Add Block**, **Demonstrate task** (do the steps yourself in a live browser and turn them into blocks) and **Upload SOP** (attach a PDF or Word (.docx) procedure to Copilot with a draft message you can edit and send).
+    The menu offers **Add Block**, **Demonstrate task** (do the steps yourself in a live browser and turn them into blocks) and **Upload SOP** (attach a PDF or Word (.docx) procedure to Ember with a draft message you can edit and send).
   </Step>
   <Step title="Pick a block">
     The block library lists every block. Type in **Search blocks...** to filter, then click a block to insert it.
@@ -199,7 +199,7 @@ These names are built in, so you can't use them as input keys:
 
 ## Save and versions
 
-Copilot's changes are saved when you accept them. Your own edits in the Editor or YAML are saved when you click the save icon. A **Saving Changes** dialog lists what will change before it saves.
+Ember's changes are saved when you accept them. Your own edits in the Editor or YAML are saved when you click the save icon. A **Saving Changes** dialog lists what will change before it saves.
 
 Each save creates a new version. Open **More actions** → **Version history** to see them in the **Agent History** panel. Select two versions and click **Visual Compare** to see what changed.
 
@@ -213,7 +213,7 @@ Each save creates a new version. Open **More actions** → **Version history** t
 
 <img src="/images/cloud/cloud-agents-list.png" alt="All Agents page with Folders, the search box, Import and Create buttons, and a row menu open with Open in editor, Run, Move to folder, Duplicate Agent, Save as template, Export and Delete" />
 
-- **Create** → **Blank Agent** or **From Template** starts a new agent. **Or start from a description →** goes to Home and Copilot.
+- **Create** → **Blank Agent** or **From Template** starts a new agent. **Or start from a description →** goes to Home and Ember.
 - **Folders**: click **+ New folder** to create one, and click a folder card to show only its agents. Each agent's row shows its folder.
 - **Search by title or input...** filters the list.
 - Row buttons open the agent in Studio (**Open in Editor**) or start a run (**Create New Run**).
