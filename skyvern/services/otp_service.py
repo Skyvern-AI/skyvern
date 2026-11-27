@@ -104,22 +104,38 @@ def otp_sources_checked(
     # An identifier without an "@" never reaches the inbox search, so no mailbox fact holds for it.
     inboxes_apply = "@" in totp_identifier
     connected_everywhere_empty = inboxes_apply
+    sources: list[tuple[str, str]] = []
     if inboxes_apply:
-        gmail = email_context.per_source.get(GmailOTPSource.name)
-        needs_reconnect = gmail.needs_reconnect_count if gmail is not None else 0
-        if needs_reconnect:
-            connected_everywhere_empty = False
-            lead_facts.append(
-                "1 Gmail inbox connected to this organization needs reconnecting in Integrations, "
-                "and codes sent to it cannot be read until it is reconnected"
-                if needs_reconnect == 1
-                else f"{needs_reconnect} Gmail inboxes connected to this organization need reconnecting in "
-                "Integrations, and codes sent to them cannot be read until they are reconnected"
-            )
-        for label, source_name in (
-            ("Gmail", GmailOTPSource.name),
-            ("Outlook", OutlookOTPSource.name),
-        ):
+        builtin_sources = (("Gmail", GmailOTPSource.name), ("Outlook", OutlookOTPSource.name))
+        builtin_names = {source_name for _, source_name in builtin_sources}
+        sources = [
+            *builtin_sources,
+            *(
+                (context.label, source_name)
+                for source_name, context in email_context.per_source.items()
+                if source_name not in builtin_names and context.label
+            ),
+        ]
+        for label, source_name in sources:
+            source = email_context.per_source.get(source_name)
+            if source is not None and source.rerun_required:
+                connected_everywhere_empty = False
+                lead_facts.append(
+                    f"1 {label} inbox changed after this run started, so only a new run can read codes sent to it"
+                )
+            needs_reconnect = source.needs_reconnect_count if source is not None else 0
+            if needs_reconnect:
+                connected_everywhere_empty = False
+                lead_facts.append(
+                    f"1 {label} inbox connected to this organization needs reconnecting in Integrations, "
+                    "and codes sent to it cannot be read until it is reconnected"
+                    if needs_reconnect == 1
+                    else f"{needs_reconnect} {label} inboxes connected to this organization need reconnecting in "
+                    "Integrations, and codes sent to them cannot be read until they are reconnected"
+                )
+        # Absent inboxes go last, so a downstream prefix cap keeps the facts about inboxes that were searched.
+        absent_inbox_facts: list[str] = []
+        for label, source_name in sources:
             source = email_context.per_source.get(source_name)
             if source is None:
                 inbox_facts.append(f"{label} inboxes not checked")
@@ -132,7 +148,7 @@ def otp_sources_checked(
                     inbox_facts.append(f"{label} inbox list not refreshed")
                     connected_everywhere_empty = False
                 elif not source.needs_reconnect_count:
-                    inbox_facts.append(f"no {label} inbox connected")
+                    absent_inbox_facts.append(f"no {label} inbox connected")
             else:
                 connected_everywhere_empty = False
                 connected = set(source.credential_ids)
@@ -166,12 +182,15 @@ def otp_sources_checked(
                     else f"{inboxes} {label} inbox{plural} connected"
                 )
                 inbox_facts.append(f"{coverage}, {read_fact}")
+        inbox_facts += absent_inbox_facts
     # Rows bound to another run come from a separate lookup, so "found" must count them too.
     rows = len(raw_context.seen_row_ids | raw_context.other_run_row_ids)
     noun = _OTP_NOUN_BY_TYPE.get(expected_otp_type, "OTP")
     store_empty = raw_context.store_queried and not rows
     if not lead_facts and connected_everywhere_empty and store_empty:
-        return f"No Gmail or Outlook inbox is connected and no {noun} has been stored."
+        labels = [label for label, _ in sources]
+        named = f"{', '.join(labels[:-1])} or {labels[-1]}"
+        return f"No {named} inbox is connected and no {noun} has been stored."
     if not lead_facts and not raw_context.store_queried and all(fact.endswith("not checked") for fact in inbox_facts):
         return "No delivery source was checked before the wait ended."
     if not raw_context.store_queried:
