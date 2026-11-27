@@ -646,7 +646,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             self._workflow_session_uris(organization_id, workflow_permanent_id),
             organization_id,
             workflow_permanent_id,
-            download=self.async_client.download_file,
+            download=self._download_profile_archive,
             stat=self._profile_object_info,
             purpose=WORKFLOW_SESSION_ENCRYPTION_PURPOSE,
             allow_sealed_fallback=allow_sealed_fallback,
@@ -660,6 +660,13 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
     def _profile_uris(organization_id: str, profile_id: str) -> tuple[str, str]:
         base = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}"
         return profile_archive_uris(base, organization_id, profile_id)
+
+    async def _download_profile_archive(
+        self, uri: str, *, log_exception: bool, raise_on_error: bool = False, on_version: Callable[[str], None]
+    ) -> bytes | None:
+        return await self.async_client.download_file(
+            uri, log_exception=log_exception, raise_on_error=raise_on_error, on_version=on_version
+        )
 
     async def _profile_object_info(self, uri: str) -> dict | None:
         return await s3_object_info_if_exists(self.async_client, uri)
@@ -717,7 +724,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             self._profile_uris(organization_id, profile_id),
             organization_id,
             profile_id,
-            download=self.async_client.download_file,
+            download=self._download_profile_archive,
             stat=self._profile_object_info,
         )
 
