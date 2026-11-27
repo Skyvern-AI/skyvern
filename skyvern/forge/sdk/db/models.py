@@ -453,6 +453,7 @@ class ArtifactModel(Base):
     file_size = Column(BigInteger, nullable=True)
     # The checksum of the content a configured download name was given to; it vouches for no other content.
     configured_name_sha256 = Column(String(64), nullable=True)
+    download_filename = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

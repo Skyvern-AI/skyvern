@@ -1539,10 +1539,10 @@ def sanitize_filename(filename: str) -> str:
     return "".join(c for c in filename if c.isalnum() or c in ["-", "_", ".", "%", " "])
 
 
-def guess_extension_from_file(file_path: str | Path) -> str:
+def guess_extension_from_file(file_path: str | Path | bytes) -> str:
     """Infer a file's extension (with leading dot) from its magic bytes, or "" if unreadable/unknown."""
     try:
-        kind = filetype.guess(str(file_path))
+        kind = filetype.guess(file_path if isinstance(file_path, bytes) else str(file_path))
     except OSError:
         return ""
     return f".{kind.extension}" if kind else ""

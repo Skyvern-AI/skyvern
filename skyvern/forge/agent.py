@@ -123,6 +123,7 @@ from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     get_path_for_workflow_download_directory,
+    guess_extension_from_file,
     list_downloading_files_in_directory,
     list_files_in_directory,
     normalize_download_identity,
@@ -157,9 +158,21 @@ from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata, uses_only
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.api.real_gcp import get_gcs_client
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
-from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import (
+    get_download_retry_started_at,
+    is_download_timestamp_current,
+    scope_session_downloads,
+)
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import ResponseComparison
+from skyvern.forge.sdk.artifact.utils import (
+    CELL_DOWNLOAD_COPIES,
+    browser_cell_download_artifact_id,
+    is_browser_cell_download_uri,
+    is_cell_download_copy,
+    load_verified_cell_download,
+    write_cell_download_copy,
+)
 from skyvern.forge.sdk.browser_action_preflight import (
     observed_page,
     preflight_action,
@@ -439,6 +452,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     record_download_artifact_outcome_for_context,
     replay_candidate_holds,
     settle_browser_downloads_for_context,
+    unique_download_filename,
     unsaved_downloads_since,
 )
 from skyvern.webeye.computer_surface import BrowserComputerSurface, ComputerSurfaceEngineRefused, SurfaceBrowserState
@@ -2568,24 +2582,26 @@ class ForgeAgent:
     ) -> list[str]:
         """Rename newly downloaded files for a task before persistence.
 
-        Returns the list of pre-rename file names discovered as new since
-        ``list_files_before``, for logging continuity with the legacy inline
-        path. ``recorded_into`` and ``rejected_into`` receive paths recorded or rejected by this call.
+        Returns new pre-rename paths and confirmed cell download URIs. ``recorded_into``
+        receives local output paths, including private copies of registered cell downloads.
         """
         if not task.workflow_run_id:
             return []
 
         context = skyvern_context.current()
-        workflow_download_directory = get_path_for_workflow_download_directory(
-            resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
-        )
+        download_run_id = resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.workflow_run_id
+        workflow_download_directory = get_path_for_workflow_download_directory(download_run_id)
         list_files_after = list_files_in_directory(workflow_download_directory, attempt_started_at=attempt_started_at)
+        registered_cell_downloads: dict[str, Artifact] = {}
         if task.browser_session_id:
-            browser_session_downloaded_files_after = await app.STORAGE.list_downloaded_files_in_browser_session(
+            session_files, registered_cell_downloads = await scope_session_downloads(
                 organization_id=organization_id,
                 browser_session_id=task.browser_session_id,
+                run_id=download_run_id,
+                attempt_started_at=attempt_started_at,
+                storage=app.STORAGE,
             )
-            list_files_after = list_files_after + browser_session_downloaded_files_after
+            list_files_after += session_files
 
         files_to_rename = [
             file
@@ -2594,8 +2610,8 @@ class ForgeAgent:
         ]
         if not files_to_rename:
             return []
+        requested_download_failure_reason = BROWSER_DOWNLOAD_FAILED_REASON
         if validate_claimed_type:
-            requested_download_failure_reason = BROWSER_DOWNLOAD_FAILED_REASON
             valid_files_to_rename = []
             for file in files_to_rename:
                 if file.startswith(("s3://", "gs://")):
@@ -2657,7 +2673,9 @@ class ForgeAgent:
         # a new session download that happens to share bytes with a baseline would be wrongly dropped. With
         # no s3://, gs:// candidate nothing consults the snapshot, so no local file is hashed either.
         run_dir_checksums: set[str] = set()
-        if any(file.startswith(("s3://", "gs://")) for file in files_to_rename):
+        if any(
+            file.startswith(("s3://", "gs://")) and file not in registered_cell_downloads for file in files_to_rename
+        ):
             for local_file in files_to_rename:
                 if local_file.startswith(("s3://", "gs://")):
                     continue
@@ -2669,22 +2687,53 @@ class ForgeAgent:
                     continue
         rejected_session_downloads: set[str] = set()
         uncredited_session_downloads: set[str] = set()
+        cell_copy_names: set[str] | None = None
         for file in files_to_rename:
+            cell_artifact = registered_cell_downloads.get(file)
+            cell_copy = None
+            file_data = None
+            if cell_artifact is not None:
+                if cell_artifact.task_id not in (None, task.task_id) or not is_download_timestamp_current(
+                    cell_artifact.created_at, task.created_at
+                ):
+                    uncredited_session_downloads.add(file)
+                    continue
+                verified = await load_verified_cell_download(
+                    workflow_download_directory, cell_artifact, app.STORAGE.retrieve_artifact
+                )
+                if verified is None:
+                    uncredited_session_downloads.add(file)
+                    continue
+                cell_copy, file_data = verified
+                if (
+                    cell_copy is not None
+                    and cell_artifact.task_id == task.task_id
+                    and cell_copy.name == cell_artifact.download_filename
+                    and not validate_claimed_type
+                ):
+                    if recorded_into is not None:
+                        recorded_into.append(str(cell_copy))
+                    continue
             local_file_name = file
             if file.startswith(("s3://", "gs://")):
-                if file.startswith("s3://"):
-                    file_data = await get_aws_client().download_file(file, log_exception=False)
-                else:
-                    file_data = await get_gcs_client().download_file(file, log_exception=False)
+                if cell_artifact is None:
+                    if file.startswith("s3://"):
+                        file_data = await get_aws_client().download_file(file, log_exception=False)
+                    else:
+                        file_data = await get_gcs_client().download_file(file, log_exception=False)
                 if file_data is None:
-                    if validate_claimed_type:
+                    if validate_claimed_type or cell_artifact is not None:
                         uncredited_session_downloads.add(file)
                     continue
-                if not file_data and not validate_claimed_type:
+                if not file_data and not validate_claimed_type and cell_artifact is None:
                     continue
                 local_file_name = file.split("/")[-1]
                 if validate_claimed_type:
-                    applied_download = context.download_suffix_applied_files.get(local_file_name) if context else None
+                    applied_download = (
+                        context.download_suffix_applied_files.get(local_file_name)
+                        if context and cell_artifact is None
+                        else None
+                    )
                     original_filename = applied_download[0] if applied_download else local_file_name
                     rejection_reason = _payload_contradiction_reason(
                         file_data, "", original_filename, allow_typed_extensionless_html=True
@@ -2704,6 +2753,39 @@ class ForgeAgent:
                             rejected_into.append(file)
                         rejected_session_downloads.add(file)
                         continue
+                if cell_artifact is not None:
+                    if cell_copy_names is None:
+                        cell_copy_names = {
+                            Path(path).name for path in list_files_in_directory(workflow_download_directory)
+                        }
+                        cell_copy_names.update(
+                            path.name for path in (workflow_download_directory / CELL_DOWNLOAD_COPIES).glob("*/*")
+                        )
+                    extension = Path(local_file_name).suffix or guess_extension_from_file(file_data)
+                    if download_suffix:
+                        filename = download_filename_from_suffix(
+                            download_suffix, extension, cell_copy_names, original_filename=local_file_name
+                        )
+                    else:
+                        filename = local_file_name
+                        if randomize_if_missing:
+                            file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+                            filename = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{file_id}"
+                        filename = unique_download_filename(filename, extension, cell_copy_names)
+                    stored_name = await app.DATABASE.artifacts.name_observed_session_download(
+                        cell_artifact, filename=filename, task_id=task.task_id
+                    )
+                    if stored_name is None:
+                        uncredited_session_downloads.add(file)
+                        continue
+                    if cell_copy is None or cell_copy.name != stored_name:
+                        cell_copy = write_cell_download_copy(
+                            workflow_download_directory, cell_artifact.artifact_id, stored_name, file_data
+                        )
+                    cell_copy_names.add(cell_copy.name)
+                    if recorded_into is not None:
+                        recorded_into.append(str(cell_copy))
+                    continue
                 candidate_checksum = hashlib.sha256(file_data).hexdigest()
                 if candidate_checksum in run_dir_checksums:
                     continue
@@ -2771,8 +2853,7 @@ class ForgeAgent:
                 if local_basename != desired_name:
                     recorded_path = rename_file(recorded_path, desired_name)
                 # rename_file returns the old path when it fails, so only a rename that took effect records a receipt.
-                download_run_id = resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
-                if context is not None and download_run_id and recorded_path != unnamed_path:
+                if context is not None and recorded_path != unnamed_path:
                     await context.record_configured_download(recorded_path, download_run_id)
                 if recorded_into is not None:
                     recorded_into.append(recorded_path)
@@ -3691,12 +3772,14 @@ class ForgeAgent:
                 return False
             landed = set(list_files_in_directory(workflow_download_directory, attempt_started_at=attempt_started_at))
             if task.browser_session_id:
-                landed |= set(
-                    await app.STORAGE.list_downloaded_files_in_browser_session(
-                        organization_id=organization.organization_id,
-                        browser_session_id=task.browser_session_id,
-                    )
+                session_files, _ = await scope_session_downloads(
+                    organization_id=organization.organization_id,
+                    browser_session_id=task.browser_session_id,
+                    run_id=resolve_run_download_id(context, fallback_run_id=task.workflow_run_id),
+                    attempt_started_at=attempt_started_at,
+                    storage=app.STORAGE,
                 )
+                landed.update(session_files)
             landed -= set(download_baseline_files)
             landed -= {str(workflow_download_directory / name) for name in staged_downloads}
             return any(Path(name).suffix != BROWSER_DOWNLOADING_SUFFIX for name in landed)
@@ -3712,6 +3795,29 @@ class ForgeAgent:
                 # What still names a recorded file: its run-directory output, and a session id (never removed). A local
                 # name the rename vacated is excluded no longer, so a later download saved under it is still new.
                 return [*outputs, *(name for name in recorded if name.startswith(("s3://", "gs://")))]
+
+            def _download_lines(files: list[str], outputs: list[str], sizes: dict[str, int]) -> list[str]:
+                cell_copies = {Path(file).parent.name: Path(file) for file in outputs if is_cell_download_copy(file)}
+                lines = []
+                for file in files:
+                    copy = (
+                        cell_copies.get(browser_cell_download_artifact_id(file))
+                        if is_browser_cell_download_uri(file)
+                        else None
+                    )
+                    line = downloaded_line(
+                        copy.name if copy is not None else Path(file).name,
+                        sizes.get(file),
+                        file.startswith(("s3://", "gs://")),
+                    )
+                    if copy is not None:
+                        with contextlib.suppress(OSError), copy.open("rb") as payload:
+                            shape = _sniff_payload_type(payload.read(4096))
+                            line += (
+                                f" (claimed extension {Path(file).suffix or 'none'}, detected payload shape {shape})"
+                            )
+                    lines.append(line)
+                return lines
 
             replay_drain_until: float | None = None
 
@@ -3780,9 +3886,7 @@ class ForgeAgent:
                     )
                     if later:
                         recorded_files = [*recorded_files, *_kept_after_recording(later, recorded_now)]
-                        landed_lines += [
-                            downloaded_line(Path(f).name, sizes.get(f), f.startswith(("s3://", "gs://"))) for f in later
-                        ]
+                        landed_lines += _download_lines(later, recorded_now, sizes)
                         download_completion_reason = "\n".join(landed_lines)
                         LOG.info("Task V3 download finalized", task_id=task.task_id, num_new_files=len(later))
                     return download_completion_reason
@@ -3829,9 +3933,7 @@ class ForgeAgent:
                     context.download_completed_task_ids.add(task.task_id)
                 download_finalized = True
                 recorded_files = _kept_after_recording(new_files, recorded_now)
-                landed_lines = [
-                    downloaded_line(Path(f).name, sizes.get(f), f.startswith(("s3://", "gs://"))) for f in new_files
-                ]
+                landed_lines = _download_lines(new_files, recorded_now, sizes)
                 download_completion_reason = "\n".join(landed_lines)
                 LOG.info(
                     "Task V3 download finalized",
@@ -4582,6 +4684,8 @@ class ForgeAgent:
                 ),
                 download_wait=download_wait,
                 download_until=download_until,
+                uses_cell_downloads=lambda: browser_state.browser_artifacts.download_binding
+                is DownloadBinding.CELL_SESSION,
                 download_settle=download_settle,
                 unsaved_downloads=unsaved_downloads,
                 native_download_attempt=native_download_attempt,
@@ -9081,7 +9185,27 @@ class ForgeAgent:
                 # A persistent-session download can land ONLY in session storage; mirror the credit
                 # seam's local+session union so it is not missed through the grace. Only for claims whose
                 # baseline was session-aware (never the local-only v4 false-click claim).
-                files = files + await _bounded_session_read(app.STORAGE.list_downloaded_files_in_browser_session)
+                session_files = await _bounded_session_read(app.STORAGE.list_downloaded_files_in_browser_session)
+                budget = deadline - time.monotonic()
+                if any(is_browser_cell_download_uri(file) for file in session_files):
+                    unconfirmed_files = [file for file in session_files if not is_browser_cell_download_uri(file)]
+                    if task.organization_id and budget > 0:
+                        try:
+                            session_files, _ = await asyncio.wait_for(
+                                scope_session_downloads(
+                                    session_files,
+                                    organization_id=task.organization_id,
+                                    browser_session_id=task.browser_session_id,
+                                    run_id=download_id,
+                                    attempt_started_at=attempt_started_at,
+                                ),
+                                timeout=budget,
+                            )
+                        except TimeoutError:
+                            session_files = unconfirmed_files
+                    else:
+                        session_files = unconfirmed_files
+                files += session_files
             return any(
                 Path(path).suffix != BROWSER_DOWNLOADING_SUFFIX and normalize_download_identity(path) not in baseline
                 for path in files
@@ -10969,12 +11093,12 @@ class ForgeAgent:
             download_context.consume_download_failures(task.task_id) if download_context is not None else []
         )
         if download_completion_pending and task.status == TaskStatus.running:
-            # A finalized name proves only that the file existed then; the waiver needs that file's
-            # registered artifact, so a deliverable lost before the storage scan keeps the failure.
+            # A cell receipt already proved registration. A local file still needs an artifact after cleanup.
             retained_failure_reasons = drop_requested_download_failure_reasons(
                 download_failure_reasons,
                 materialized_a_file=any(
-                    Path(file).name in registered_download_names for file in materialized_download_files
+                    is_cell_download_copy(file) or Path(file).name in registered_download_names
+                    for file in materialized_download_files
                 ),
             )
             if len(retained_failure_reasons) != len(download_failure_reasons):

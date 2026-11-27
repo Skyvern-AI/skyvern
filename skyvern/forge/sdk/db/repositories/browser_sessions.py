@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import structlog
-from sqlalchemy import Select, and_, case, delete, desc, exists, func, or_, select, union, update
+from sqlalchemy import Select, Update, and_, case, delete, desc, exists, func, or_, select, union, update
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
@@ -62,6 +62,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     resolve_terminal_status,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import EMBER_PRESTART_RUNNABLE_TYPE
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, parse_proxy_location_input
@@ -83,11 +84,57 @@ _VISIBLE_TO_CUSTOMER = or_(
 _NOT_EXTERNAL_CDP = PersistentBrowserSessionModel.browser_vendor.is_distinct_from(EXTERNAL_CDP_BROWSER_VENDOR)
 
 
+def release_browser_session_update(
+    session_id: str,
+    organization_id: str,
+    *,
+    expected_runnable_id: str,
+    expected_runnable_generation_id: str | None,
+    observed_last_activity_at: datetime | None,
+    allow_retirement_release: bool,
+) -> Update:
+    model = PersistentBrowserSessionModel
+    statement = update(model).where(
+        model.persistent_browser_session_id == session_id,
+        model.organization_id == organization_id,
+        model.deleted_at.is_(None),
+        model.runnable_id == expected_runnable_id,
+    )
+    if not allow_retirement_release:
+        statement = statement.where(model.runnable_type.is_distinct_from(SESSION_RETIREMENT_RUNNABLE_TYPE))
+    if expected_runnable_generation_id is not None:
+        statement = statement.where(model.runnable_generation_id == expected_runnable_generation_id)
+    if observed_last_activity_at is not None:
+        statement = statement.where(
+            model.last_activity_at.is_not_distinct_from(to_naive_utc(observed_last_activity_at))
+        )
+    return statement.values(runnable_type=None, runnable_id=None, runnable_generation_id=None, download_run_id=None)
+
+
 def clear_terminal_session_fields(row: PersistentBrowserSessionModel) -> None:
     """A registration's upstream carries the caller's CDP credential, which must not outlive it."""
     row.download_run_id = None
     if row.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR:
         row.upstream_cdp_url = None
+
+
+def complete_browser_session_row(row: PersistentBrowserSessionModel, close_reason: str | None = None) -> bool:
+    """Apply the normal completed outcome to a locked row. The caller commits."""
+    if row.completed_at is not None:
+        return False
+    row.completed_at = naive_utc_now()
+    row.close_reason = row.close_reason or close_reason
+    row.status = resolve_terminal_status("completed", row.close_reason)
+    clear_terminal_session_fields(row)
+    return True
+
+
+def archive_browser_session_row(row: PersistentBrowserSessionModel) -> bool:
+    address = row.browser_address
+    if not address or "::closed::" in address:
+        return False
+    row.browser_address = f"{address}::closed::{uuid.uuid4().hex}"
+    return True
 
 
 # Longer than a registration probe can run: a 10 s connect plus a detach bounded by BROWSER_CLOSE_TIMEOUT (180 s).
@@ -222,6 +269,23 @@ async def _session_folder_filter(organization_id: str) -> ColumnElement[bool] | 
             WorkflowRunAttemptModel.workflow_run_id == WorkflowRunModel.workflow_run_id,
             WorkflowRunModel.workflow_permanent_id.in_(hidden),
         ),
+    )
+
+
+def browser_cell_download_drain_failure_update(session_id: str, organization_id: str) -> Update:
+    # Keep an open session eligible for reaping while making an already closed session failed.
+    return (
+        update(PersistentBrowserSessionModel)
+        .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
+        .where(PersistentBrowserSessionModel.organization_id == organization_id)
+        .where(PersistentBrowserSessionModel.deleted_at.is_(None))
+        .values(
+            close_reason=BrowserSessionCloseReason.download_drain_failed,
+            status=case(
+                (PersistentBrowserSessionModel.completed_at.is_not(None), PersistentBrowserSessionStatus.failed),
+                else_=PersistentBrowserSessionModel.status,
+            ),
+        )
     )
 
 
@@ -1606,6 +1670,8 @@ class BrowserSessionsRepository(BaseRepository):
                             browser_session_id, existing.status, existing.completed_at
                         )
                 else:
+                    if completed_at or is_final_status(status):
+                        query = query.with_for_update()
                     persistent_browser_session = (await session.scalars(query)).first()
                     if persistent_browser_session is None:
                         raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
@@ -1642,6 +1708,8 @@ class BrowserSessionsRepository(BaseRepository):
         upstream_cdp_url: str | None = None,
         browser_vendor: str | None = None,
         mark_started: bool = False,
+        *,
+        require_no_close_request: bool = False,
     ) -> None:
         """Set the browser address for a persistent browser session.
 
@@ -1656,7 +1724,7 @@ class BrowserSessionsRepository(BaseRepository):
 
         Terminal is absorbing: the conditional predicate travels inside the UPDATE, so it refuses
         to publish liveness onto a row a concurrent close/timeout already ended. A late worker
-        cannot resurrect an ended session.
+        cannot resurrect an ended session. Cell provisioning also requires an open reservation.
         """
         values: dict[str, object] = {}
         if browser_address:
@@ -1696,6 +1764,9 @@ class BrowserSessionsRepository(BaseRepository):
                             PersistentBrowserSessionModel.organization_id == organization_id,
                             PersistentBrowserSessionModel.deleted_at.is_(None),
                             PersistentBrowserSessionModel.completed_at.is_(None),
+                            or_(
+                                not require_no_close_request, PersistentBrowserSessionModel.close_requested_at.is_(None)
+                            ),
                             or_(
                                 PersistentBrowserSessionModel.status.is_(None),
                                 PersistentBrowserSessionModel.status.not_in(_FINAL_STATUS_VALUES),
@@ -1776,6 +1847,74 @@ class BrowserSessionsRepository(BaseRepository):
                 await session.refresh(persistent_browser_session)
             else:
                 raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
+
+    @db_operation("prepare_browser_cell_download_lease", log_errors=False)
+    async def prepare_browser_cell_download_lease(self, session_id: str, organization_id: str) -> None:
+        """Give a preassigned lease its generation before sampling the unpublished browser."""
+        model = PersistentBrowserSessionModel
+        async with self.Session() as session:
+            await session.execute(
+                update(model)
+                .where(
+                    model.persistent_browser_session_id == session_id,
+                    model.organization_id == organization_id,
+                    model.runnable_id.is_not(None),
+                    model.runnable_generation_id.is_(None),
+                    model.upstream_cdp_url.is_(None),
+                    model.close_requested_at.is_(None),
+                    model.completed_at.is_(None),
+                    model.deleted_at.is_(None),
+                )
+                .values(runnable_generation_id=uuid.uuid4().hex)
+            )
+            await session.commit()
+
+    @db_operation("publish_armed_browser_cell", log_errors=False)
+    async def publish_armed_browser_cell(
+        self,
+        session_id: str,
+        organization_id: str,
+        upstream: str,
+        browser_vendor: str,
+        observed_lease: tuple[str, str] | None,
+    ) -> str | None:
+        """Publish only the lease covered by the collector's initial snapshot."""
+        model = PersistentBrowserSessionModel
+        async with self.Session() as session:
+            row = await session.scalar(
+                select(model)
+                .where(
+                    model.persistent_browser_session_id == session_id,
+                    model.organization_id == organization_id,
+                    model.deleted_at.is_(None),
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
+            if row.close_requested_at is not None or row.completed_at is not None or row.status in FINAL_STATUSES:
+                raise BrowserSessionAlreadyEndedError(
+                    session_id, cast(str | None, row.status), cast(datetime | None, row.completed_at)
+                )
+            if row.runnable_id and row.download_run_id and row.download_run_id != session_id:
+                if observed_lease != (row.download_run_id, f"lease:{row.runnable_generation_id}"):
+                    return None
+            elif observed_lease is not None:
+                return None
+            if not row.browser_address or (row.upstream_cdp_url and row.upstream_cdp_url != upstream):
+                raise ValueError("browser cell readiness does not match the current session")
+            address = row.browser_address
+            if not row.upstream_cdp_url:
+                row.upstream_cdp_url = upstream
+                row.browser_vendor = browser_vendor
+                row.started_at = naive_utc_now()
+                row.status = PersistentBrowserSessionStatus.running.value
+                try:
+                    await session.commit()
+                except StatementError as exc:
+                    exc.hide_parameters = True
+                    raise
+            return address
 
     @db_operation("occupy_persistent_browser_session")
     async def occupy_persistent_browser_session(
@@ -1880,29 +2019,15 @@ class BrowserSessionsRepository(BaseRepository):
                 PersistentBrowserSessionModel.deleted_at.is_(None),
             )
             if expected_runnable_id is not None:
-                statement = update(PersistentBrowserSessionModel).where(
-                    *base_filters,
-                    PersistentBrowserSessionModel.runnable_id == expected_runnable_id,
+                statement = release_browser_session_update(
+                    session_id,
+                    organization_id,
+                    expected_runnable_id=expected_runnable_id,
+                    expected_runnable_generation_id=expected_runnable_generation_id,
+                    observed_last_activity_at=observed_last_activity_at,
+                    allow_retirement_release=allow_retirement_release,
                 )
-                if not allow_retirement_release:
-                    statement = statement.where(
-                        PersistentBrowserSessionModel.runnable_type.is_distinct_from(SESSION_RETIREMENT_RUNNABLE_TYPE)
-                    )
-                if expected_runnable_generation_id is not None:
-                    statement = statement.where(
-                        PersistentBrowserSessionModel.runnable_generation_id == expected_runnable_generation_id
-                    )
-                if observed_last_activity_at is not None:
-                    statement = statement.where(
-                        PersistentBrowserSessionModel.last_activity_at.is_not_distinct_from(
-                            to_naive_utc(observed_last_activity_at)
-                        )
-                    )
-                result = await session.scalars(
-                    statement.values(
-                        runnable_type=None, runnable_id=None, runnable_generation_id=None, download_run_id=None
-                    ).returning(PersistentBrowserSessionModel)
-                )
+                result = await session.scalars(statement.returning(PersistentBrowserSessionModel))
                 persistent_browser_session = result.first()
                 if persistent_browser_session is None:
                     return None
@@ -1953,17 +2078,12 @@ class BrowserSessionsRepository(BaseRepository):
                     .filter_by(persistent_browser_session_id=session_id)
                     .filter_by(organization_id=organization_id)
                     .filter_by(deleted_at=None)
+                    .with_for_update()
                 )
             ).first()
             if persistent_browser_session:
-                if persistent_browser_session.completed_at:
+                if not complete_browser_session_row(persistent_browser_session, close_reason):
                     return self._session_from_row(persistent_browser_session)
-                persistent_browser_session.completed_at = naive_utc_now()
-                persistent_browser_session.close_reason = persistent_browser_session.close_reason or close_reason
-                persistent_browser_session.status = resolve_terminal_status(
-                    "completed", persistent_browser_session.close_reason
-                )
-                clear_terminal_session_fields(persistent_browser_session)
                 await session.commit()
                 await session.refresh(persistent_browser_session)
                 return self._session_from_row(persistent_browser_session)
@@ -1990,13 +2110,8 @@ class BrowserSessionsRepository(BaseRepository):
                 )
             ).first()
 
-            if not row or not row.browser_address:
-                return
-            if "::closed::" in row.browser_address:
-                return
-
-            row.browser_address = f"{row.browser_address}::closed::{uuid.uuid4().hex}"
-            await session.commit()
+            if row is not None and archive_browser_session_row(row):
+                await session.commit()
 
     @db_operation("get_uncompleted_persistent_browser_sessions")
     async def get_uncompleted_persistent_browser_sessions(

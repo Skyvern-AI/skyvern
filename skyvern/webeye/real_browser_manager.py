@@ -251,7 +251,7 @@ async def _rebind_pbs_download_dir(
     download_run_id: str,
     browser_session_id: str,
 ) -> None:
-    if browser_state.browser_artifacts.download_binding == DownloadBinding.SESSION_DIR:
+    if DownloadBinding.is_session_owned(browser_state.browser_artifacts.download_binding):
         # Provider-owned remote binding: preserve the provider-selected destination. Re-pointing to a
         # run-scoped dir would overwrite it, so skip the rebind.
         LOG.info(

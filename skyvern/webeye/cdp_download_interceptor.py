@@ -72,6 +72,7 @@ from skyvern.forge.sdk.core.http_request_authorization import (
 )
 from skyvern.settings_manager import SettingsManager
 from skyvern.webeye.action_deadline import cancellable_driver_call
+from skyvern.webeye.browser_download_events import BROWSER_DOWNLOAD_WILL_BEGIN, set_browser_download_behavior
 from skyvern.webeye.browser_response_capture import BrowserResponseAdmission, BrowserResponseCapture
 from skyvern.webeye.utils.page import BlobTooLargeError, SkyvernFrame
 
@@ -2243,10 +2244,7 @@ class CDPDownloadInterceptor:
                 # filesystem, not the client's, so a local tempdir path would be invalid.
                 # Browser.downloadWillBegin events still fire with eventsEnabled=True, giving us
                 # the URL to download directly.
-                await browser_session.send(
-                    "Browser.setDownloadBehavior",
-                    {"behavior": "deny", "eventsEnabled": True},
-                )
+                await set_browser_download_behavior(browser_session, "deny")
             except BaseException:
                 try:
                     await browser_session.detach()
@@ -2257,7 +2255,7 @@ class CDPDownloadInterceptor:
             def download_listener(event: dict[str, Any]) -> None:
                 self._schedule_browser_download_handler(event)
 
-            browser_session.on("Browser.downloadWillBegin", download_listener)
+            browser_session.on(BROWSER_DOWNLOAD_WILL_BEGIN, download_listener)
             self._browser_session = browser_session
             self._browser_context = browser_context
             self._browser_download_listener = download_listener

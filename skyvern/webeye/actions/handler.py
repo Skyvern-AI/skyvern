@@ -135,7 +135,11 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
 from skyvern.forge.sdk.api.llm.exceptions import BaseLLMError, LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import extraction_shape_matches, validate_and_fill_extraction_result
 from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
-from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
+from skyvern.forge.sdk.artifact.storage.base import (
+    get_download_retry_started_at,
+    is_file_from_retry_attempt,
+    scope_session_downloads,
+)
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import starts_like_pdf
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
@@ -5088,8 +5092,10 @@ class ScopedXhrDownloadCapture:
         page.remove_listener("requestfinished", self._on_request_finished)
         page.remove_listener("requestfailed", self._on_request_finished)
 
-    def enable(self) -> None:
-        self._capture_responses = not getattr(self._page.context, "_skyvern_cdp_download_active", False)
+    def enable(self, *, capture_responses: bool = True) -> None:
+        self._capture_responses = capture_responses and not getattr(
+            self._page.context, "_skyvern_cdp_download_active", False
+        )
         self._active = True
         self._accept_new_requests = True
         self._attach_page(self._page)
@@ -5285,6 +5291,10 @@ class ActionHandler:
         # exceptional-exit fallback below stamps this execution, not the previous one.
         action.finished_at = None
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+        cell_downloads = (
+            browser_state is not None
+            and browser_state.browser_artifacts.download_binding is DownloadBinding.CELL_SESSION
+        )
         # Ownership transfer: this action's incoming page is now accepted navigation state, so retire any
         # stale task-scoped popup claim for that exact Page left by an earlier action that never got a durable
         # download credit. Identity-based, before any action-specific branch so it covers the false-click,
@@ -5475,7 +5485,7 @@ class ActionHandler:
                             # Persistence and every side effect it needs (run id, download dir, storage
                             # listing, creation, persist, finalize) stay grace-gated; at grace=0 we skip all
                             # of it and only the popup cleanup/restore below runs.
-                            if not persist_false_click_download:
+                            if not persist_false_click_download or cell_downloads:
                                 return
                             context = skyvern_context.current()
                             run_id = resolve_run_download_id(context, task.workflow_run_id or task.task_id)
@@ -5485,10 +5495,14 @@ class ActionHandler:
                             async def list_false_click_files(extra: Path | None = None) -> list[str]:
                                 files = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
                                 if task.browser_session_id:
-                                    files += await app.STORAGE.list_downloaded_files_in_browser_session(
+                                    session_files, _ = await scope_session_downloads(
                                         organization_id=task.organization_id,
                                         browser_session_id=task.browser_session_id,
+                                        run_id=run_id,
+                                        attempt_started_at=attempt_started_at,
+                                        storage=app.STORAGE,
                                     )
+                                    files += session_files
                                 if (
                                     extra
                                     and extra.is_file()
@@ -5662,7 +5676,7 @@ class ActionHandler:
         attempt_started_at = await get_download_retry_started_at(task.organization_id, run_id)
         download_event: asyncio.Future[Download] = asyncio.get_running_loop().create_future()
         eager_blob_capture = _EagerAdoptedBlobCapture(
-            enabled=bool(task.browser_session_id),
+            enabled=bool(task.browser_session_id) and not cell_downloads,
             clicked_page=page,
             workflow_run_id=task.workflow_run_id,
         )
@@ -5691,8 +5705,8 @@ class ActionHandler:
                     task.task_id,
                     popup_page,
                     baseline_files=list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
-                    + session_download_baseline,
-                    session_observed=bool(task.browser_session_id),
+                    + (session_download_baseline or []),
+                    session_observed=session_observed,
                     # Augment the per-page session baseline so the action-finally resnapshot (which re-records
                     # this same popup) can union a later, more conservative session view over this one.
                     session_baseline_files=session_download_baseline,
@@ -5701,19 +5715,30 @@ class ActionHandler:
         def _download_signal_identity(file: str) -> str:
             return _normalize_download_identity(file)
 
-        async def _list_download_signal_files(*, capture_session_into: list[str] | None = None) -> list[str]:
+        async def _list_session_downloads(*, include_partial: bool = False) -> list[str] | None:
+            if not task.browser_session_id:
+                return []
+            try:
+                scoped, _ = await scope_session_downloads(
+                    organization_id=task.organization_id,
+                    browser_session_id=task.browser_session_id,
+                    run_id=run_id,
+                    attempt_started_at=attempt_started_at,
+                    cell_session=cell_downloads,
+                    include_partials=include_partial,
+                    raise_on_lookup_error=cell_downloads,
+                    storage=app.STORAGE,
+                )
+            except Exception:
+                if not cell_downloads:
+                    raise
+                return None
+            return scoped
+
+        async def _list_download_signal_files() -> list[str]:
             files = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
-            if task.browser_session_id:
-                downloading_files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
-                    organization_id=task.organization_id, browser_session_id=task.browser_session_id
-                )
-                downloaded_files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
-                    organization_id=task.organization_id, browser_session_id=task.browser_session_id
-                )
-                session_files = downloaded_files_in_browser_session + downloading_files_in_browser_session
-                if capture_session_into is not None:
-                    capture_session_into.extend(session_files)
-                files = files + session_files
+            if session_download_baseline is not None:
+                files += (await _list_session_downloads(include_partial=True)) or []
             return files
 
         async def _list_final_download_files() -> list[str]:
@@ -5722,10 +5747,8 @@ class ActionHandler:
                 for file in list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
                 if not file.endswith(BROWSER_DOWNLOADING_SUFFIX)
             ]
-            if task.browser_session_id:
-                files += await app.STORAGE.list_downloaded_files_in_browser_session(
-                    organization_id=task.organization_id, browser_session_id=task.browser_session_id
-                )
+            if session_download_baseline is not None:
+                files += (await _list_session_downloads()) or []
             return files
 
         # Provider-owned downloads (vendor remote sessions) are observed per action. The source is
@@ -5795,14 +5818,13 @@ class ActionHandler:
         if browser_state:
             initial_page_count = len(await browser_state.list_valid_pages())
 
-        # The per-claim session baseline is the SESSION portion of the single authoritative pre-click read
-        # below -- captured in one listing, never a second one. Pre-click, so it can never include this
-        # action's own download (round-14 invariant); if the read fails, the whole action fails on the
-        # authoritative baseline (as before this PR) rather than minting false durable credit.
-        session_download_baseline: list[str] = []
+        # Read the session once before clicking. An unavailable Cell baseline cannot support a delta,
+        # including later popup recovery. Local files still have their own baseline.
+        local_download_baseline = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
+        session_download_baseline = await _list_session_downloads(include_partial=True)
+        session_observed = bool(task.browser_session_id) and session_download_baseline is not None
         signal_file_identities_before = {
-            _download_signal_identity(file)
-            for file in await _list_download_signal_files(capture_session_into=session_download_baseline)
+            _download_signal_identity(file) for file in local_download_baseline + (session_download_baseline or [])
         }
         list_files_before = list(signal_file_identities_before)
         sampler = _DownloadProgressSampler(download_dir, attempt_started_at, signal_file_identities_before)
@@ -5856,7 +5878,9 @@ class ActionHandler:
         # sessions and any context bound to a CDPDownloadInterceptor (which includes pooled sessions).
         # A page that mints a PDF blob and synchronously revokes it drops the object URL before the
         # interceptor's post-event in-page read; retention defers the revoke so the read can recover it.
-        retention_armed = bool(task.browser_session_id) or has_download_interceptor_for_context(page.context)
+        retention_armed = not cell_downloads and (
+            bool(task.browser_session_id) or has_download_interceptor_for_context(page.context)
+        )
         try:
             if retention_armed:
                 # Install before the interaction so the createObjectURL/revokeObjectURL patch is in place
@@ -5870,7 +5894,10 @@ class ActionHandler:
                         "Failed to install blob URL retention before download action",
                         workflow_run_id=task.workflow_run_id,
                     )
-            xhr_capture.enable()
+            if cell_downloads:
+                xhr_capture.enable(capture_responses=False)
+            else:
+                xhr_capture.enable()
             with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
                 apply_context_attrs(_hi_span)
                 results = await ActionHandler._handle_action(
@@ -5985,6 +6012,7 @@ class ActionHandler:
 
                             if (
                                 task.browser_session_id
+                                and not cell_downloads
                                 and captured_download is not None
                                 and not download_event_fallback_attempted
                             ):
@@ -6410,7 +6438,7 @@ class ActionHandler:
                 download_dir=download_dir,
                 attempt_started_at=attempt_started_at,
                 session_baseline_files=session_download_baseline,
-                session_observed=bool(task.browser_session_id),
+                session_observed=session_observed,
             )
             if explicit_delta.context_replaced:
                 with contained_effect("record download popup context replacement"):

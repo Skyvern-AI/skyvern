@@ -124,6 +124,7 @@ from skyvern.utils.templating import get_jinja_template_variable_roots, get_miss
 if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.block import SendEmailBlock
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunParameter
+    from skyvern.webeye.browser_artifacts import DownloadBinding
 
 LOG = structlog.get_logger()
 
@@ -781,6 +782,8 @@ class WorkflowRunContext:
         self.workflow_permanent_id = workflow_permanent_id
         self.workflow_run_id = workflow_run_id
         self.parent_workflow_run_id = parent_workflow_run_id
+        # Keep the observed browser binding until the run finishes, even if its cached wrapper retires.
+        self.browser_session_download_binding: tuple[str, str, DownloadBinding] | None = None
         self.requested_by = requested_by
         self._powerbi_hop_tokens = dict(powerbi_hop_tokens or {})
         self._powerbi_hop_refusals = dict(powerbi_hop_refusals or {})

@@ -52,10 +52,16 @@ class DownloadBinding(str, Enum):
     the local/default behavior for local runs and any non-provider-owned session.
     SESSION_DIR: a provider-owned remote download destination. The run-dir rebind must be skipped and a
     URL replay is forbidden, so the provider-selected destination is preserved.
+    CELL_SESSION: the browser cell's managed session download destination.
     """
 
     RUN_DIR = "run_dir"
     SESSION_DIR = "session_dir"
+    CELL_SESSION = "cell_session"
+
+    @staticmethod
+    def is_session_owned(binding: object) -> bool:
+        return binding in (DownloadBinding.SESSION_DIR, DownloadBinding.CELL_SESSION)
 
 
 @dataclass(frozen=True)

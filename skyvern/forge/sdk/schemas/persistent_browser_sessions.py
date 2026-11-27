@@ -50,7 +50,8 @@ def is_final_status(status: str | None) -> bool:
 
 
 def resolve_terminal_status(status: str, close_reason: str | None) -> str:
-    """A close requested as an abort lands on failed; every other terminal write keeps what it asked for."""
+    if close_reason == BrowserSessionCloseReason.download_drain_failed and is_final_status(status):
+        return PersistentBrowserSessionStatus.failed.value
     if status == PersistentBrowserSessionStatus.completed and close_reason == BrowserSessionCloseReason.aborted:
         return PersistentBrowserSessionStatus.failed.value
     return status

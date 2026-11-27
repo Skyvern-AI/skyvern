@@ -14,6 +14,7 @@ class BrowserSessionCloseReason(StrEnum):
     shutdown = "shutdown"
     aborted = "aborted"
     browser_exited = "browser_exited"
+    download_drain_failed = "download_drain_failed"
     run_ended = "run_ended"
     turn_ended = "turn_ended"
     test_superseded = "test_superseded"

@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Collection
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
 from sqlalchemy import String, and_, case, delete, false, func, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from skyvern.constants import BROWSER_CELL_DOWNLOAD_ARTIFACT_ID_PREFIX
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.models import ActionModel, ArtifactModel, StepModel, TaskModel, WorkflowRunBlockModel
 from skyvern.forge.sdk.db.protocols import RunReader
 from skyvern.forge.sdk.db.utils import convert_to_artifact
@@ -22,6 +26,14 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
 LOG = structlog.get_logger()
+
+
+def _legacy_unbound_download() -> ColumnElement[bool]:
+    # Cell IDs carry the observed producer, including NULL. Legacy keys can share their path layout.
+    return and_(
+        ArtifactModel.run_id.is_(None),
+        ~ArtifactModel.artifact_id.startswith(BROWSER_CELL_DOWNLOAD_ARTIFACT_ID_PREFIX, autoescape=True),
+    )
 
 
 def _session_download_scope_filters(
@@ -51,7 +63,7 @@ def _session_download_filters(
     stamping."""
     return [
         *_session_download_scope_filters(browser_session_id, organization_id, run_started_at),
-        or_(ArtifactModel.run_id == run_id, ArtifactModel.run_id.is_(None)),
+        or_(ArtifactModel.run_id == run_id, _legacy_unbound_download()),
     ]
 
 
@@ -172,6 +184,71 @@ class ArtifactsRepository(BaseRepository):
             artifact = convert_to_artifact(new_artifact, self.debug_enabled)
             await session.commit()
             return artifact
+
+    @db_operation("register_observed_session_download", log_errors=False)
+    async def register_observed_session_download(
+        self,
+        *,
+        artifact_id: str,
+        organization_id: str,
+        browser_session_id: str,
+        uri: str,
+        checksum: str,
+        file_size: int,
+        run_id: str | None,
+        observed_at: datetime.datetime,
+        transaction: AsyncSession | None = None,
+    ) -> None:
+        observed_at = to_naive_utc(observed_at)
+        values = {
+            "artifact_type": ArtifactType.DOWNLOAD,
+            "organization_id": organization_id,
+            "browser_session_id": browser_session_id,
+            "uri": uri,
+            "checksum": checksum,
+            "file_size": file_size,
+            "run_id": run_id,
+            "created_at": observed_at,
+        }
+        async with nullcontext(transaction) if transaction is not None else self.Session() as session:
+            inserted = await session.scalar(
+                insert(ArtifactModel)
+                .values(artifact_id=artifact_id, modified_at=observed_at, **values)
+                .on_conflict_do_nothing(index_elements=[ArtifactModel.artifact_id])
+                .returning(ArtifactModel.artifact_id)
+            )
+            if inserted is None:
+                existing = await session.get(ArtifactModel, artifact_id)
+                if existing is None or any(getattr(existing, key) != value for key, value in values.items()):
+                    raise ValueError("conflicting observed session download")
+            if transaction is None:
+                await session.commit()
+
+    @db_operation("name_observed_session_download", log_errors=False)
+    async def name_observed_session_download(self, artifact: Artifact, *, filename: str, task_id: str) -> str | None:
+        """Record the validated name and task on the canonical row without changing its producer or observation time."""
+        async with self.Session() as session:
+            name = await session.scalar(
+                update(ArtifactModel)
+                .where(
+                    ArtifactModel.artifact_id == artifact.artifact_id,
+                    ArtifactModel.organization_id == artifact.organization_id,
+                    ArtifactModel.browser_session_id == artifact.browser_session_id,
+                    ArtifactModel.artifact_type == ArtifactType.DOWNLOAD,
+                    ArtifactModel.run_id.is_not(None),
+                    ArtifactModel.run_id == artifact.run_id,
+                    ArtifactModel.checksum == artifact.checksum,
+                    or_(ArtifactModel.task_id.is_(None), ArtifactModel.task_id == task_id),
+                )
+                .values(
+                    download_filename=func.coalesce(ArtifactModel.download_filename, filename),
+                    task_id=task_id,
+                    modified_at=ArtifactModel.modified_at,
+                )
+                .returning(ArtifactModel.download_filename)
+            )
+            await session.commit()
+            return name
 
     @db_operation("refresh_download_artifact_content")
     async def refresh_download_artifact_content(
@@ -780,7 +857,7 @@ class ArtifactsRepository(BaseRepository):
             query = (
                 update(ArtifactModel)
                 .where(*_session_download_scope_filters(browser_session_id, organization_id, run_started_at))
-                .where(ArtifactModel.run_id.is_(None))
+                .where(_legacy_unbound_download())
             )
             if excluded_uris:
                 query = query.where(ArtifactModel.uri.not_in(excluded_uris))
@@ -803,7 +880,7 @@ class ArtifactsRepository(BaseRepository):
                 .where(ArtifactModel.artifact_id == artifact_id)
                 .where(ArtifactModel.organization_id == organization_id)
                 .where(ArtifactModel.artifact_type == ArtifactType.DOWNLOAD)
-                .where(ArtifactModel.run_id.is_(None))
+                .where(_legacy_unbound_download())
                 .values(run_id=run_id)
             )
             await session.commit()

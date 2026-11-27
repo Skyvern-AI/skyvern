@@ -3699,7 +3699,7 @@ def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     else:
         media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
     if artifact.artifact_type == ArtifactType.DOWNLOAD:
-        return media_type, build_attachment_disposition(raw_name)
+        return media_type, build_attachment_disposition(artifact.download_filename or raw_name)
     return media_type, "inline"
 
 
