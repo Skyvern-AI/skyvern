@@ -604,6 +604,9 @@ async def on_terminal_transition(
         retry, decision_reason = evaluate_retry_policy(
             policy, status, error_codes, retries_used, worker_container_restarted=worker_container_restarted
         )
+        # A run a person may not retry is not retried automatically either: a new attempt would replay its effects.
+        if retry and await app.AGENT_FUNCTION.get_workflow_run_retry_refusal(workflow_run) is not None:
+            retry, decision_reason = False, "retry_refused"
         if retry:
             next_attempt_at = naive_utc_now() + timedelta(seconds=policy.delay_seconds)
             retry_decision = RETRY_DECISION_RETRY

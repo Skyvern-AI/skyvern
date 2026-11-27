@@ -35,6 +35,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     BranchCondition,
     CodeBlock,
     CodeBlockStep,
+    ComputerUseBlock,
     ConditionalBlock,
     DownloadToS3Block,
     ExtractionBlock,
@@ -804,6 +805,18 @@ def block_yaml_to_block(
             terminate_criterion=block_yaml.terminate_criterion,
             complete_verification=block_yaml.complete_verification,
             include_action_history_in_verification=block_yaml.include_action_history_in_verification,
+        )
+
+    elif block_yaml.block_type == BlockType.COMPUTER_USE:
+        return ComputerUseBlock(
+            **base_kwargs,
+            engine=block_yaml.engine,
+            parameters=_resolve_block_parameters(block_yaml, parameters),
+            navigation_goal=block_yaml.navigation_goal,
+            max_steps_per_run=block_yaml.max_steps_per_run,
+            max_retries=block_yaml.max_retries,
+            complete_criterion=block_yaml.complete_criterion,
+            terminate_criterion=block_yaml.terminate_criterion,
         )
 
     elif block_yaml.block_type == BlockType.HUMAN_INTERACTION:

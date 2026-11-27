@@ -57,6 +57,8 @@ async def _available_block_summaries() -> dict[str, str]:
         available.pop(BlockType.POWERBI_QUERY.value)
     if not await _agent_step_enabled():
         available.pop(BlockType.AGENT_STEP.value)
+    # ponytail: desktop machines have no published client yet, so no agent is offered this block.
+    available.pop(BlockType.COMPUTER_USE.value)
     return available
 
 
@@ -113,6 +115,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "powerbi_query": "Run one read-only DAX query against a user's authorized Power BI dataset",
     "agent_step": AGENT_STEP_BLOCK_SUMMARY,
     "integration_action": "Run one integration catalog action (e.g. Google Sheets read rows) as a connected account",
+    "computer_use": "Run a computer-use goal on the run's enrolled desktop machine",
 }
 
 # ---------------------------------------------------------------------------

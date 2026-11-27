@@ -291,6 +291,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     BranchCondition,
     CodeBlock,
+    ComputerUseBlock,
     ConditionalBlock,
     ExtractionBlock,
     FileParserBlock,
@@ -8667,6 +8668,18 @@ class WorkflowService:
             )
             return workflow_run
 
+        blocks = workflow.workflow_definition.blocks
+        computer_use = [block for block in blocks if isinstance(block, ComputerUseBlock)]
+        # Every block acts on a computer surface, so the run never needs a hosted browser. A run that brings its own
+        # browser session or address would still lease or attach it, so it is not desktop-only and dispatch refuses it.
+        computer_use_engines = (
+            frozenset(block.engine for block in computer_use)
+            if computer_use
+            and len(computer_use) == len(blocks)
+            and not browser_session_id
+            and not workflow_run.browser_address
+            else None
+        )
         try:
             await app.AGENT_FUNCTION.before_workflow_run_start(
                 workflow_run,
@@ -8674,7 +8687,10 @@ class WorkflowService:
                 dispatch_claim_started_at=dispatch_claim_started_at,
             )
             await app.AGENT_FUNCTION.before_run_target_dispatch(
-                organization_id=organization_id, run_id=workflow_run_id, run_kind="workflow_run"
+                organization_id=organization_id,
+                run_id=workflow_run_id,
+                run_kind="workflow_run",
+                computer_use_engines=computer_use_engines,
             )
         except WorkflowAttemptDispatchSuperseded:
             raise
@@ -8833,7 +8849,8 @@ class WorkflowService:
                     workflow_run = reseeded_workflow_run
                     browser_profile_id = workflow_run.browser_profile_id
             if (
-                (workflow_run.reuse_bound_key or "").startswith("off:force_pending:")
+                computer_use_engines is None
+                and (workflow_run.reuse_bound_key or "").startswith("off:force_pending:")
                 and not browser_session_id
                 and not workflow_run.browser_address
                 and not should_acquire_reused_session(
@@ -8984,7 +9001,7 @@ class WorkflowService:
             )
             return failed_run
 
-        if should_acquire_reused_session(
+        if computer_use_engines is None and should_acquire_reused_session(
             browser_session_id=browser_session_id,
             start_fresh_browser=workflow_run.start_fresh_browser,
             run_override=workflow_run.reuse_browser_session,
@@ -9056,7 +9073,9 @@ class WorkflowService:
             and not any(isinstance(block, LoginBlock) for block in get_all_blocks(workflow.workflow_definition.blocks))
             and not await app.AGENT_FUNCTION.is_browser_memory_engine_enabled(workflow_run)
         )
-        if not browser_profile_id or using_managed_browser_profile or using_ordinary_browser_profile:
+        if computer_use_engines is None and (
+            not browser_profile_id or using_managed_browser_profile or using_ordinary_browser_profile
+        ):
             browser_run_kwargs: dict[str, Any] = {"workflow_run_id": workflow_run_id} if browser_dispatch else {}
             try:
                 browser_session = await self.auto_create_browser_session_if_needed(
