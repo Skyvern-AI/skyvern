@@ -293,7 +293,7 @@ for (const file of result.downloaded_files ?? []) {
 ```
 </CodeGroup>
 
-- **`download_suffix`** sets the saved file name. Without an extension, Skyvern keeps the downloaded file's (`"statement-2026-09"` becomes `statement-2026-09.pdf`). With an extension, it's the full name. Don't pass a bare extension like `".pdf"`; that saves as `.pdf.pdf`. Without a suffix, files get a generated name like `download-<timestamp>-<random>.pdf`. To keep the name the site gave the file, use `{{ original_filename }}`, alone or with other text: `"{{ fund }}_{{ original_filename }}"` saves `Fund A_Q4 Report.pdf`. Use it as a plain placeholder, without filters.
+- **`download_suffix`** sets the saved file name. Without an extension, Skyvern keeps the downloaded file's (`"statement-2026-09"` becomes `statement-2026-09.pdf`). With an extension, it's the full name. Don't pass a bare extension like `".pdf"`; that saves as `pdf.pdf`. Without a suffix, files get a generated name like `download-<timestamp>-<random>.pdf`. To keep the name the site gave the file, use `{{ original_filename }}`, alone or with other text: `"{{ fund }}_{{ original_filename }}"` saves `Fund A_Q4 Report.pdf`. Use it as a plain placeholder, without filters.
 - **`download_timeout`** is a hint, in seconds, for how long to wait for the download to start. The overall `timeout` is what fails the call.
 - Each file has `url` (presigned, expires), `filename`, `checksum` (SHA-256), `file_size` and `modified_at`. Files stay in Skyvern's storage; fetch the URL to save a copy, as the [worked example](#worked-example-download-invoices-from-a-vendor-portal) does.
 
