@@ -48,9 +48,23 @@ def site_of(url: str | None) -> tuple[str, int | None, str] | None:
     return (origin.scheme, origin.port, site) if site else None
 
 
+def _is_https_upgrade(
+    current_scheme: str, current_port: int | None, granted_scheme: str, granted_port: int | None
+) -> bool:
+    """A grant saved for http:// on its default port also covers the https:// page on its default port."""
+    return (
+        current_scheme == "https"
+        and granted_scheme == "http"
+        and current_port == _DEFAULT_PORTS["https"]
+        and granted_port == _DEFAULT_PORTS["http"]
+    )
+
+
 def same_site(current_url: str | None, granted_url: str) -> bool:
     current, granted = site_of(current_url), site_of(granted_url)
-    return bool(current and granted and current == granted)
+    if not (current and granted):
+        return False
+    return current == granted or (current[2] == granted[2] and _is_https_upgrade(*current[:2], *granted[:2]))
 
 
 def same_release_scope(current_url: str | None, granted_url: str) -> bool:
@@ -60,7 +74,11 @@ def same_release_scope(current_url: str | None, granted_url: str) -> bool:
 
 def same_origin(current_url: str | None, granted_url: str) -> bool:
     current, granted = origin_of(current_url), origin_of(granted_url)
-    return bool(current and granted and current == granted)
+    if not (current and granted):
+        return False
+    return current == granted or (
+        current.host == granted.host and _is_https_upgrade(current.scheme, current.port, granted.scheme, granted.port)
+    )
 
 
 @dataclass(frozen=True)
