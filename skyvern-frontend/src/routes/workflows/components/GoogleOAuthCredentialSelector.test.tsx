@@ -352,7 +352,9 @@ test("combines native and additional accounts without changing the selected sour
   expect(screen.getByRole("listbox").hasAttribute("data-private")).toBe(true);
   expect(screen.getByRole("listbox").textContent).not.toMatch(/nango/i);
   expect(
-    screen.getByRole("option", { name: "SYNTHETIC_EMAIL_LABEL" }),
+    screen.getByRole("option", {
+      name: "Primary Drive (SYNTHETIC_EMAIL_LABEL)",
+    }),
   ).toBeTruthy();
   fireEvent.click(screen.getByText("Gmail account · connected yesterday"));
   expect(onSelect).toHaveBeenCalledExactlyOnceWith("nc_synthetic");
@@ -371,7 +373,9 @@ test("combines native and additional accounts without changing the selected sour
   expect(onChange).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("combobox", { name: "Gmail account" }));
   fireEvent.click(
-    screen.getByRole("option", { name: "SYNTHETIC_EMAIL_LABEL" }),
+    screen.getByRole("option", {
+      name: "Primary Drive (SYNTHETIC_EMAIL_LABEL)",
+    }),
   );
   expect(onChange).toHaveBeenCalledExactlyOnceWith("goac-connected");
 });

@@ -51,7 +51,9 @@ function EmailInboxNode({ id, data }: NodeProps<EmailInboxNodeType>) {
       >
         <NodeHeader
           blockLabel={label}
+          blockTitle={`Email Inbox · ${data.emailClient === "outlook" ? "Outlook" : "Gmail"}`}
           editable={editable}
+          integrationLogo={data.emailClient}
           nodeId={id}
           totpIdentifier={null}
           totpUrl={null}

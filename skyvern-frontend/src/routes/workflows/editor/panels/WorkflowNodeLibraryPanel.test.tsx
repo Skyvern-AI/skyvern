@@ -93,6 +93,13 @@ describe("WorkflowNodeLibraryPanel apps", () => {
     id: "send_email",
     name: "Send email",
     description: "",
+    runsVia: "block:send_email",
+    inputs: { properties: { transport: { const: "gmail" } } },
+  };
+  const listLabels = {
+    id: "list_labels",
+    name: "List labels",
+    description: "",
     inputs: {},
   };
   beforeEach(() => {
@@ -110,13 +117,13 @@ describe("WorkflowNodeLibraryPanel apps", () => {
         status: "live",
         oauthProvider: "google",
         requiredScopes: ["gmail.readonly"],
-        actions: [sendEmail],
+        actions: [sendEmail, listLabels],
         triggers: [{ id: "new_email", name: "New email" }],
       },
     ];
   });
 
-  test("lists connected apps first and adds one actionless block per app", () => {
+  test("lists connected apps first and adds the block an app action runs", () => {
     const added: Array<Record<string, unknown>> = [];
     render(
       <WorkflowNodeLibraryPanel onNodeClick={(props) => added.push(props)} />,
@@ -129,21 +136,26 @@ describe("WorkflowNodeLibraryPanel apps", () => {
     expect(apps[0]?.textContent).toContain("Connected");
 
     fireEvent.click(screen.getByTestId("block-library-app-gmail"));
-    expect(added).toMatchObject([
-      {
-        nodeType: "integrationAction",
-        label: "gmail",
-        integrationAction: { integrationId: "gmail", actionId: "" },
-      },
-    ]);
-
-    fireEvent.click(
-      screen.getByRole("button", { name: "Show Gmail triggers" }),
-    );
+    expect(added).toEqual([]);
     fireEvent.click(
       screen.getByTestId("block-library-app-trigger-gmail-new_email"),
     );
     expect(openPanes).toContain("triggers");
+
+    fireEvent.click(
+      screen.getByTestId("block-library-app-action-gmail-send_email"),
+    );
+    fireEvent.click(
+      screen.getByTestId("block-library-app-action-gmail-list_labels"),
+    );
+    expect(added).toMatchObject([
+      { nodeType: "sendEmail", data: { transport: "gmail" } },
+      {
+        nodeType: "integrationAction",
+        label: "gmail",
+        integrationAction: { integrationId: "gmail", actionId: "list_labels" },
+      },
+    ]);
   });
 
   test("search finds the action in every app next to the built-in block", () => {

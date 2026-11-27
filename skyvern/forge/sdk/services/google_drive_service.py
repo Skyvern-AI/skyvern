@@ -899,6 +899,8 @@ async def upload_file(
 
 GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 DRIVE_LIST_FOLDER_MAX_RESULTS = 1000
+# Drive can return short or empty pages that still carry a token, so the cap on items alone does not end a listing.
+DRIVE_LIST_FOLDER_MAX_PAGES = 30
 DRIVE_ITEM_FIELDS = "id,name,mimeType,parents,driveId,webViewLink,trashed"
 DRIVE_LIST_FIELDS = "nextPageToken,files(id,name,mimeType,modifiedTime,size,webViewLink)"
 DRIVE_LIST_FIELDS_WITH_RESOURCE_KEYS = "nextPageToken,files(id,name,mimeType,modifiedTime,size,webViewLink,resourceKey)"
@@ -950,7 +952,7 @@ class _FolderActionInputError(GoogleDriveAPIError):
 
 def folder_action_error(exc: GoogleDriveAPIError, operation: DriveFolderOperation) -> GoogleDriveAPIError:
     # Google's own message is never passed on: for notFound it echoes the file or folder ID.
-    if exc.code == "upstream_unavailable":
+    if isinstance(exc, _FolderActionInputError) or exc.code == "upstream_unavailable":
         return exc
     if exc.code == "reconnect_required" or exc.status == 401:
         hint = "Reconnect this Google account with Google Drive access, then run again."
@@ -1179,7 +1181,7 @@ async def list_folder_with_transport(
     }
     items: list[dict[str, Any]] = []
     next_page_token = page_token
-    while True:
+    for _ in range(DRIVE_LIST_FOLDER_MAX_PAGES):
         page = await list_page(
             {
                 **params,
@@ -1193,6 +1195,15 @@ async def list_folder_with_transport(
         next_page_token = raw_token if isinstance(raw_token, str) and raw_token else None
         if not next_page_token or len(items) >= limit:
             break
+    else:
+        raise _FolderActionInputError(
+            status=502,
+            code="pageLimitExceeded",
+            message=(
+                f"Google Drive returned {DRIVE_LIST_FOLDER_MAX_PAGES} pages without finishing the folder listing. "
+                "Run again in a few minutes."
+            ),
+        )
     listed = items[:limit]
     return {
         "folder_id": meta.get("id") or folder_id,

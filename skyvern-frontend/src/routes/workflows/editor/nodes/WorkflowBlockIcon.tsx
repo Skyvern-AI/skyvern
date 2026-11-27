@@ -1,6 +1,8 @@
 import { ClickIcon } from "@/components/icons/ClickIcon";
+import { GmailIcon } from "@/components/icons/GmailIcon";
 import { GoogleDriveIcon } from "@/components/icons/GoogleDriveIcon";
 import { GoogleSheetsIcon } from "@/components/icons/GoogleSheetsIcon";
+import { OutlookIcon } from "@/components/icons/OutlookIcon";
 import { PowerBIIcon } from "@/components/icons/PowerBIIcon";
 import type { ComponentType } from "react";
 import { WorkflowBlockType } from "../../types/workflowTypes";
@@ -39,8 +41,10 @@ const integrationLogoIcons: Record<
   string,
   ComponentType<{ className?: string }>
 > = {
+  gmail: GmailIcon,
   google_drive: GoogleDriveIcon,
   google_sheets: GoogleSheetsIcon,
+  outlook: OutlookIcon,
 };
 
 function WorkflowBlockIcon({
@@ -48,6 +52,10 @@ function WorkflowBlockIcon({
   className,
   integrationLogo,
 }: Props) {
+  const IntegrationLogo = integrationLogo
+    ? integrationLogoIcons[integrationLogo]
+    : undefined;
+  if (IntegrationLogo) return <IntegrationLogo className={className} />;
   switch (workflowBlockType) {
     case "action": {
       return <ClickIcon className={className} />;
@@ -151,10 +159,6 @@ function WorkflowBlockIcon({
       return <PowerBIIcon className={className} />;
     }
     case "integration_action": {
-      const IntegrationLogo = integrationLogo
-        ? integrationLogoIcons[integrationLogo]
-        : undefined;
-      if (IntegrationLogo) return <IntegrationLogo className={className} />;
       return <Link2Icon className={className} />;
     }
   }

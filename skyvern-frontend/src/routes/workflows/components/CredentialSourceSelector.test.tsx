@@ -91,7 +91,7 @@ it.each(["send", "reply"] as const)(
     expect(Boolean(screen.queryByText("SYNTHETIC_SEND_ONLY"))).toBe(
       purpose === "send",
     );
-    expect(screen.queryByText("SYNTHETIC_EMAIL_LABEL")).toBeNull();
+    expect(screen.queryByText(/SYNTHETIC_EMAIL_LABEL/)).toBeNull();
     fireEvent.click(screen.getByText("SYNTHETIC_REPLY"));
     expect(onChange).toHaveBeenCalledWith("native", "goac_reply");
   },
@@ -151,7 +151,9 @@ it.each([false, true])(
     expect(onChange).not.toHaveBeenCalled();
     if (!disabled) {
       fireEvent.click(picker);
-      fireEvent.click(screen.getByText("SYNTHETIC_EMAIL_LABEL"));
+      fireEvent.click(
+        screen.getByText("Synthetic account (SYNTHETIC_EMAIL_LABEL)"),
+      );
       expect(onChange).toHaveBeenCalledExactlyOnceWith(
         "native",
         "goac_synthetic",

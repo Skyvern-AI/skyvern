@@ -8,7 +8,11 @@ import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { AGENT_BLOCK_FLAG } from "@/util/featureFlags";
 import { availableNodeLibraryItems } from "./nodeLibraryItems";
 import { useIntegrationCatalogQuery } from "@/hooks/useIntegrationCatalogQuery";
-import type { IntegrationCatalogEntryWithActions } from "../nodes/IntegrationActionNode/types";
+import {
+  builtInBlockFor,
+  findIntegrationAction,
+  type IntegrationCatalogEntryWithActions,
+} from "../nodes/IntegrationActionNode/types";
 import { appRows, matchingAppActions } from "./appLibrary";
 import { LibraryApps } from "./LibraryApps";
 
@@ -91,10 +95,12 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
   const addNode = (
     nodeType: AddNodeProps["nodeType"],
     integrationAction?: AddNodeProps["integrationAction"],
+    data?: AddNodeProps["data"],
   ) => {
     onNodeClick({
       nodeType,
       integrationAction,
+      data,
       label: integrationAction ? integrationAction.integrationId : undefined,
       next: workflowPanelData?.next ?? null,
       parent: workflowPanelData?.parent,
@@ -104,6 +110,19 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
       branch: workflowPanelData?.branchContext,
     });
     closeWorkflowPanel();
+  };
+
+  const addAppAction = (
+    integrationAction: NonNullable<AddNodeProps["integrationAction"]>,
+  ) => {
+    const found = findIntegrationAction(
+      integrationCatalog,
+      integrationAction.integrationId,
+      integrationAction.actionId,
+    );
+    const builtIn = found ? builtInBlockFor(found.action) : null;
+    if (builtIn) addNode(builtIn.nodeType, undefined, builtIn.data);
+    else addNode("integrationAction", integrationAction);
   };
 
   return (
@@ -134,9 +153,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
               <LibraryApps
                 catalog={integrationCatalog ?? []}
                 search={appSearch}
-                onAdd={(integrationAction) =>
-                  addNode("integrationAction", integrationAction)
-                }
+                onAdd={addAppAction}
               />
             ) : null}
             {filteredItems.length > 0 || actionMatches.length > 0 ? (
@@ -172,9 +189,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
               <LibraryApps
                 catalog={integrationCatalog ?? []}
                 search=""
-                onAdd={(integrationAction) =>
-                  addNode("integrationAction", integrationAction)
-                }
+                onAdd={addAppAction}
               />
             ) : null}
           </div>

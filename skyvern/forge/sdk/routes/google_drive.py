@@ -6,7 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event_strict
-from skyvern.forge.sdk.experimentation.drive_shared_drive_search import drive_shared_drive_search_enabled
+from skyvern.forge.sdk.experimentation.drive_shared_drive_search import resolve_page_search_mode, tag_page_token
 from skyvern.forge.sdk.integrations.google import tokens as google_tokens
 from skyvern.forge.sdk.routes.google_sheets import _mint_access_token
 from skyvern.forge.sdk.schemas.google_drive import GoogleDriveFile, GoogleDriveItem, ListGoogleDriveFilesResponse
@@ -88,7 +88,7 @@ async def list_files(
     page_token: Annotated[str | None, Query(description="Drive v3 pagination token")] = None,
     page_size: Annotated[int, Query(ge=1, le=100)] = 25,
 ) -> ListGoogleDriveFilesResponse:
-    search_all_drives = await drive_shared_drive_search_enabled(current_org.organization_id)
+    page_token, search_all_drives = await resolve_page_search_mode(current_org.organization_id, page_token)
     try:
         if credential_id in await app.AGENT_FUNCTION.nango_connection_ids(current_org.organization_id, {credential_id}):
             principal = get_request_principal()
@@ -121,7 +121,7 @@ async def list_files(
         raise _http_error(exc)
     response = ListGoogleDriveFilesResponse(
         files=[GoogleDriveFile.model_validate(item) for item in page.files],
-        next_page_token=page.next_page_token,
+        next_page_token=tag_page_token(page.next_page_token, search_all_drives),
     )
     if search_all_drives:
         response.incomplete_search = page.incomplete_search

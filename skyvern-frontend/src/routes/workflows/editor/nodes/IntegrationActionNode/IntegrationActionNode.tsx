@@ -72,6 +72,7 @@ import { IntegrationAccountPicker } from "./IntegrationAccountPicker";
 import { knownAccountBackends } from "./knownAccounts";
 import {
   actionAcceptsAccount,
+  builtInBlockFor,
   editableInputs,
   fieldLabel,
   isGenericActionAvailable,
@@ -757,7 +758,8 @@ function IntegrationActionEditor({ blockId }: { blockId: string }) {
             {(entry.actions ?? [])
               .filter(
                 (item) =>
-                  item.id === data.actionId || isGenericActionAvailable(item),
+                  item.id === data.actionId ||
+                  (isGenericActionAvailable(item) && !builtInBlockFor(item)),
               )
               .map((item) => (
                 <SelectItem key={item.id} value={item.id}>

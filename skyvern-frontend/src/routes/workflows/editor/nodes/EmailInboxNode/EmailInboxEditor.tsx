@@ -344,7 +344,7 @@ function EmailInboxEditorBody({
         <div className="space-y-2">
           <FieldLabel
             field="emailClient"
-            label="Email Client"
+            label="Inbox"
             fallback="The email provider to read from."
           />
           <Select
@@ -365,9 +365,7 @@ function EmailInboxEditorBody({
           <FieldLabel
             field="credentialId"
             label={
-              data.emailClient === "gmail"
-                ? "Gmail account"
-                : "Microsoft Account"
+              data.emailClient === "gmail" ? "Gmail account" : "Outlook account"
             }
             fallback="The connected account used to read email."
           />

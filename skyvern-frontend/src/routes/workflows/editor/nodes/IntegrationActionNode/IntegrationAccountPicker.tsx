@@ -11,6 +11,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   isGoogleOAuthCredentialActive,
+  oauthAccountLabel,
   useGoogleOAuthCredentials,
 } from "@/hooks/useGoogleOAuthCredentials";
 import {
@@ -41,9 +42,13 @@ function useOAuthAccounts(
   provider: IntegrationCatalogEntryWithActions["oauthProvider"],
   actionKey: string,
 ): { accounts: PickerAccount[]; isLoading: boolean; isError: boolean } {
-  const google = useGoogleOAuthCredentials({ enabled: provider === "google" });
+  const google = useGoogleOAuthCredentials({
+    enabled: provider === "google",
+    includeEmail: true,
+  });
   const microsoft = useMicrosoftOAuthCredentials({
     enabled: provider === "microsoft",
+    includeEmail: true,
   });
   if (provider === "google") {
     return {
@@ -51,7 +56,7 @@ function useOAuthAccounts(
       isError: Boolean(google.error),
       accounts: google.credentials.map((credential) => ({
         id: credential.id,
-        label: credential.credential_name,
+        label: oauthAccountLabel(credential),
         active: isGoogleOAuthCredentialActive(credential),
         fit: credential.action_fit?.[actionKey] ?? "unknown",
       })),
@@ -62,7 +67,7 @@ function useOAuthAccounts(
     isError: Boolean(microsoft.error),
     accounts: microsoft.credentials.map((credential) => ({
       id: credential.id,
-      label: credential.credential_name,
+      label: oauthAccountLabel(credential),
       active: isMicrosoftOAuthCredentialActive(credential),
       fit: "unknown",
     })),
@@ -145,7 +150,7 @@ function OAuthAccountPicker({
   const saved = accounts.find((account) => account.id === value);
   const savedHint = saved ? accountHint(saved) : null;
   return (
-    <div className="space-y-2">
+    <div className="ph-no-capture space-y-2" data-private>
       {oauth.isError || additionalError ? (
         <p className="text-xs text-amber-600 dark:text-amber-300">
           Could not load {entry.name} accounts.

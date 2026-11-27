@@ -339,7 +339,7 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     });
     render(<FileUploadBlockForm blockId="f1" />);
 
-    expect(screen.getByText("Storage Type")).toBeDefined();
+    expect(screen.getByText("Save files to")).toBeDefined();
     expect(screen.getByText("AWS Access Key ID")).toBeDefined();
     expect(screen.getByText("AWS Secret Access Key")).toBeDefined();
     expect(screen.getByText("S3 Bucket")).toBeDefined();
@@ -371,7 +371,7 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     });
     render(<FileUploadBlockForm blockId="f1" />);
 
-    expect(screen.getByText("Storage Type")).toBeDefined();
+    expect(screen.getByText("Save files to")).toBeDefined();
     expect(screen.getByText("Storage Account Name")).toBeDefined();
     expect(screen.getByText("Storage Account Key")).toBeDefined();
     expect(screen.getByText("Blob Container Name")).toBeDefined();

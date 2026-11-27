@@ -134,22 +134,22 @@ function SendEmailFields({
     <div data-testid="send-email-block-form" className="space-y-4 px-4 py-4">
       {showTransport ? (
         <div className="space-y-2">
-          <Label className="text-xs text-tertiary-foreground">Send with</Label>
+          <Label className="text-xs text-tertiary-foreground">Send from</Label>
           <Select
             value={transport}
             onValueChange={(next) => changeTransport(next as EmailTransport)}
             disabled={!editable}
           >
             <SelectTrigger
-              aria-label="Send with"
+              aria-label="Send from"
               className="nopan text-xs"
               data-testid="send-email-transport"
             >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="smtp">SMTP</SelectItem>
-              <SelectItem value="gmail">Connected Gmail account</SelectItem>
+              <SelectItem value="smtp">Skyvern or your SMTP server</SelectItem>
+              <SelectItem value="gmail">Gmail account</SelectItem>
             </SelectContent>
           </Select>
         </div>
