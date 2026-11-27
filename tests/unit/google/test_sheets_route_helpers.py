@@ -83,11 +83,22 @@ async def test_mint_access_token_returns_409_reconnect_on_decrypt_failure(monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("organization_id", ["o_flag_on", "o_flag_off"])
+@pytest.mark.parametrize(
+    ("organization_id", "page_token", "all_drives"),
+    [
+        ("o_flag_on", "tok-1", True),
+        ("o_flag_off", "tok-1", False),
+        # A "load more" after the flag flips continues in the mode its token was issued in.
+        ("o_flag_off", "all:tok-1", True),
+        ("o_flag_on", "user:tok-1", False),
+    ],
+)
 async def test_list_spreadsheets_route_searches_all_drives_only_for_flagged_org(
     monkeypatch: pytest.MonkeyPatch,
     mock_sheets_transport: Callable[[Callable[[httpx.Request], httpx.Response]], None],
     organization_id: str,
+    page_token: str,
+    all_drives: bool,
 ) -> None:
     captured: dict[str, str | None] = {}
 
@@ -130,12 +141,12 @@ async def test_list_spreadsheets_route_searches_all_drives_only_for_flagged_org(
     async with real_client(transport=httpx.ASGITransport(app=api), base_url="http://skyvern.test") as client:
         response = await client.get(
             "/v1/google/sheets/spreadsheets",
-            params={"credential_id": "cred_1", "q": "leads", "page_token": "tok-1", "page_size": 50},
+            params={"credential_id": "cred_1", "q": "leads", "page_token": page_token, "page_size": 50},
         )
 
     assert response.status_code == 200
     body = response.json()
-    assert body["next_page_token"] == "tok-2"
+    assert body["next_page_token"] == ("all:tok-2" if all_drives else "user:tok-2")
     assert [s["id"] for s in body["spreadsheets"]] == ["1xyz"]
     assert captured["auth"] == "Bearer at-1"
     params = parse_qs(urlparse(captured["url"]).query)
@@ -143,7 +154,7 @@ async def test_list_spreadsheets_route_searches_all_drives_only_for_flagged_org(
     assert params["pageToken"] == ["tok-1"]
     assert params["supportsAllDrives"] == ["true"]
     assert params["includeItemsFromAllDrives"] == ["true"]
-    if organization_id == "o_flag_on":
+    if all_drives:
         assert params["corpora"] == ["allDrives"]
         assert "incompleteSearch" in params["fields"][0]
         assert body["incomplete_search"] is True

@@ -21,6 +21,7 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
+from skyvern.forge.sdk.experimentation import drive_shared_drive_search
 from skyvern.forge.sdk.experimentation.drive_shared_drive_search import DRIVE_SHARED_DRIVE_SEARCH_FLAG
 from skyvern.forge.sdk.experimentation.sheets_save_as_sheet import SHEETS_SAVE_AS_SHEET_FLAG
 from skyvern.forge.sdk.routes import google_oauth as google_oauth_routes
@@ -2037,6 +2038,7 @@ async def test_google_drive_list_folder_lists_at_most_the_cap_in_one_call(
     cap = google_drive_service.DRIVE_LIST_FOLDER_MAX_RESULTS
     page_sizes: list[int] = []
     resource_key_headers: list[str | None] = []
+    empty_pages: list[bool] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         resource_key_headers.append(request.headers.get("X-Goog-Drive-Resource-Keys"))
@@ -2047,6 +2049,8 @@ async def test_google_drive_list_folder_lists_at_most_the_cap_in_one_call(
         assert request.url.path == "/drive/v3/files"
         page_size = int(request.url.params["pageSize"])
         page_sizes.append(page_size)
+        if empty_pages:
+            return httpx.Response(200, json={"files": [], "nextPageToken": "again"})
         # Like Drive, return at most 1,000 items a page, from a folder that always has more.
         files = [
             {"id": f"f{len(page_sizes)}_{i}", "name": "item", "resourceKey": "child_key"}
@@ -2076,6 +2080,12 @@ async def test_google_drive_list_folder_lists_at_most_the_cap_in_one_call(
         assert resource_key_headers == [expected_header, expected_header]
     with pytest.raises(ValueError, match="resource key"):
         await google_drive_service.list_folder(access_token="token", folder="folder_1", resource_key="bad!")
+    page_sizes.clear()
+    empty_pages.append(True)
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as page_limit:
+        await google_drive_service.list_folder(access_token="token", folder="folder_1")
+    assert page_limit.value.code == "pageLimitExceeded" and "pages without finishing" in str(page_limit.value)
+    assert len(page_sizes) == google_drive_service.DRIVE_LIST_FOLDER_MAX_PAGES
     assert (
         await google_drive_service.get_item(
             access_token="token", item="https://drive.google.com/drive/folders/folder_1"
@@ -2118,7 +2128,7 @@ async def test_google_drive_list_folder_lists_at_most_the_cap_in_one_call(
         "get_request_principal",
         lambda: SimpleNamespace(organization_id="org"),
     )
-    monkeypatch.setattr(drive_routes, "drive_shared_drive_search_enabled", AsyncMock(return_value=False))
+    monkeypatch.setattr(drive_shared_drive_search, "drive_shared_drive_search_enabled", AsyncMock(return_value=False))
     nango_item_response = await drive_routes.get_item(
         item_id="nango-file", credential_id="connected-drive", current_org=SimpleNamespace(organization_id="org")
     )
@@ -2133,7 +2143,7 @@ async def test_google_drive_list_folder_lists_at_most_the_cap_in_one_call(
     }
     assert nango_list_response.model_dump(exclude_unset=True) == {
         "files": [{"id": "nango-file", "name": "from-nango"}],
-        "next_page_token": "nango-next",
+        "next_page_token": "user:nango-next",
     }
 
     async def database_unavailable(*_args: Any, **_kwargs: Any) -> set[str]:
