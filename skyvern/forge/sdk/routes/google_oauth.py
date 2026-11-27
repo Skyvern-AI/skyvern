@@ -13,7 +13,7 @@ from oauthlib.oauth2 import InvalidGrantError, OAuth2Error
 from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.integrations.account_fit import action_fits
-from skyvern.forge.sdk.integrations.catalog import has_native_gmail_credential
+from skyvern.forge.sdk.integrations.catalog import has_native_gmail_credential, has_native_google_drive_credential
 from skyvern.forge.sdk.schemas.google_oauth import (
     CreateGoogleOAuthAuthorizeRequest,
     CreateGoogleOAuthCallbackRequest,
@@ -140,6 +140,9 @@ def _require_scopes_from_token(token_data: dict) -> list[str]:
 
 
 CONNECTED_GMAIL_DEFAULT_MESSAGE = "New Gmail connections use Connected Gmail. Connect Gmail from the Integrations page."
+CONNECTED_GOOGLE_DRIVE_DEFAULT_MESSAGE = (
+    "New Google Drive connections use Connected Google Drive. Connect Google Drive from the Integrations page."
+)
 _GMAIL_SCOPE_PROFILES = frozenset(
     {
         google_oauth_service.GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL,
@@ -149,22 +152,36 @@ _GMAIL_SCOPE_PROFILES = frozenset(
 )
 
 
-async def _connected_gmail_replaces_new_native_gmail(
+async def _connected_account_replaces_new_native_account(
     request: CreateGoogleOAuthAuthorizeRequest, organization_id: str, user_id: str | None
-) -> bool:
-    # Connected Gmail is per user, so a caller with no user keeps the native path as its only way to add Gmail.
-    if request.credential_id is not None or request.scope_profile not in _GMAIL_SCOPE_PROFILES or user_id is None:
-        return False
+) -> str | None:
+    # Connected accounts are per user, so a caller with no user keeps the native path as its only way to connect.
+    if request.credential_id is not None or request.native_only or user_id is None:
+        return None
+    if request.scope_profile in _GMAIL_SCOPE_PROFILES:
+        available, has_native, detail = (
+            app.AGENT_FUNCTION.nango_gmail_catalog_available,
+            has_native_gmail_credential,
+            CONNECTED_GMAIL_DEFAULT_MESSAGE,
+        )
+    elif request.scope_profile == google_oauth_service.GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE:
+        available, has_native, detail = (
+            app.AGENT_FUNCTION.nango_google_drive_catalog_available,
+            has_native_google_drive_credential,
+            CONNECTED_GOOGLE_DRIVE_DEFAULT_MESSAGE,
+        )
+    else:
+        return None
     try:
-        if not await app.AGENT_FUNCTION.nango_gmail_catalog_available(organization_id):
-            return False
+        if not await available(organization_id):
+            return None
     except Exception:  # noqa: BLE001 - an unknown availability keeps the native path open.
-        return False
+        return None
     try:
         credentials = await google_oauth_service.get_visible_credentials_for_org(organization_id)
     except Exception:  # noqa: BLE001 - as on the page, an unreadable native list keeps the native path open.
-        return False
-    return not has_native_gmail_credential(credentials)
+        return None
+    return None if has_native(credentials) else detail
 
 
 @google_oauth_router.post("/oauth/authorize")
@@ -175,8 +192,10 @@ async def google_oauth_authorize(
     _request_authorization: None = Depends(require_request_actions(frozenset({"google_oauth.authorize"}))),
 ) -> GoogleOAuthAuthorizeResponse:
     """Kick off the Google OAuth 2.0 authorization flow."""
-    if await _connected_gmail_replaces_new_native_gmail(request, current_org.organization_id, current_user_id):
-        raise HTTPException(status_code=409, detail=CONNECTED_GMAIL_DEFAULT_MESSAGE)
+    if detail := await _connected_account_replaces_new_native_account(
+        request, current_org.organization_id, current_user_id
+    ):
+        raise HTTPException(status_code=409, detail=detail)
     try:
         start = await google_oauth_service.start_authorization(
             organization_id=current_org.organization_id,
