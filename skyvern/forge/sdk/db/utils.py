@@ -671,6 +671,7 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         bundle_key=artifact_model.bundle_key,
         checksum=artifact_model.checksum,
         configured_name_sha256=artifact_model.configured_name_sha256,
+        download_filename=artifact_model.download_filename,
         file_size=artifact_model.file_size,
         task_id=artifact_model.task_id,
         step_id=artifact_model.step_id,

@@ -44,7 +44,7 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, scope_session_downloads
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
@@ -76,6 +76,7 @@ from skyvern.webeye.actions.handler import (
     handle_terminate_action,
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss, raise_if_browser_connection_lost
 from skyvern.webeye.navigation import default_navigation_settle, navigate_with_retry, redact_url_secrets
@@ -318,9 +319,33 @@ class ScriptSkyvernPage(SkyvernPage):
         # Download detection for click actions
         download_triggered: bool | None = None
         downloaded_files: list[str] | None = None
-        files_before: list[str] = []
+        local_files_before: list[str] | None = None
+        session_files_before: list[str] | None = None
         download_dir: Path | None = None
+        download_run_id: str | None = None
         attempt_started_at: datetime | None = None
+
+        async def list_session_downloads() -> list[str] | None:
+            if context is None or not context.browser_session_id or not context.organization_id:
+                return []
+            cell_downloads = (
+                _get_scraped_page(self)._browser_state.browser_artifacts.download_binding
+                is DownloadBinding.CELL_SESSION
+            )
+            try:
+                session_files, _ = await scope_session_downloads(
+                    organization_id=context.organization_id,
+                    browser_session_id=context.browser_session_id,
+                    run_id=download_run_id,
+                    attempt_started_at=attempt_started_at,
+                    cell_session=cell_downloads,
+                    raise_on_lookup_error=cell_downloads,
+                )
+            except Exception:
+                if not cell_downloads:
+                    raise
+                return None
+            return session_files
 
         # Capture files before click action for download detection
         if action == ActionType.CLICK and context and context.workflow_run_id:
@@ -328,14 +353,12 @@ class ScriptSkyvernPage(SkyvernPage):
                 download_run_id = resolve_run_download_id(context, fallback_run_id=context.workflow_run_id)
                 attempt_started_at = await get_download_retry_started_at(context.organization_id, download_run_id)
                 download_dir = get_path_for_workflow_download_directory(context.workflow_run_id)
-                if download_dir.exists():
-                    files_before = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
-                if context.browser_session_id and context.organization_id:
-                    browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
-                        organization_id=context.organization_id,
-                        browser_session_id=context.browser_session_id,
-                    )
-                    files_before = files_before + browser_session_downloaded_files
+                local_files_before = (
+                    list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
+                    if download_dir.exists()
+                    else []
+                )
+                session_files_before = await list_session_downloads()
 
             except Exception:
                 pass  # Don't block action execution if file listing fails
@@ -413,17 +436,19 @@ class ScriptSkyvernPage(SkyvernPage):
                             browser_session_id=context.browser_session_id,
                             attempt_started_at=attempt_started_at,
                         )
-                        files_after = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
-                        if context.browser_session_id and context.organization_id:
-                            browser_session_downloaded_files = (
-                                await app.STORAGE.list_downloaded_files_in_browser_session(
-                                    organization_id=context.organization_id,
-                                    browser_session_id=context.browser_session_id,
-                                )
-                            )
-                            files_after = files_after + browser_session_downloaded_files
+                        files_after = (
+                            list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
+                            if local_files_before is not None
+                            else []
+                        )
+                        session_files_after = (
+                            await list_session_downloads() if session_files_before is not None else None
+                        )
+                        files_after += session_files_after or []
 
-                        new_file_paths = set(files_after) - set(files_before)
+                        new_file_paths = set(files_after) - set(
+                            (local_files_before or []) + (session_files_before or [])
+                        )
                         if new_file_paths:
                             download_triggered = True
                             downloaded_files = [os.path.basename(fp) for fp in new_file_paths]
@@ -432,7 +457,7 @@ class ScriptSkyvernPage(SkyvernPage):
                                 downloaded_files=downloaded_files,
                                 workflow_run_id=context.workflow_run_id,
                             )
-                        else:
+                        elif session_files_after is not None:
                             download_triggered = False
                 except Exception:
                     pass  # Don't block if download detection fails

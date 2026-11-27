@@ -45,7 +45,12 @@ from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
 from skyvern.exceptions import ActionDeadlineExceeded
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
-from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
+from skyvern.forge.sdk.artifact.storage.base import (
+    get_download_retry_started_at,
+    is_cell_download_session,
+    is_file_from_retry_attempt,
+    scope_session_downloads,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import (
     URL_IN_TEXT,
@@ -15067,6 +15072,7 @@ def build_browser_tools(
     download_failures: DownloadFailureWatch | None = None,
     download_wait: Callable[[], Awaitable[None]] | None = None,
     download_until: DownloadUntil | None = None,
+    uses_cell_downloads: Callable[[], bool] | None = None,
     recover_page: Callable[[Any], Awaitable[bool | None]] | None = None,
 ) -> list[ToolSpec]:
     """Raw-browser tools that resolve their page from `page_provider` on every call.
@@ -26286,7 +26292,14 @@ def build_browser_tools(
     # Inside the download signal, so download lines and failures follow the page-text delta.
     _apply_text_delta(tools)
     _apply_download_signal(
-        tools, downloads_dir, download_failures, download_wait, page_provider, download_until, opaque_refs
+        tools,
+        downloads_dir,
+        download_failures,
+        download_wait,
+        page_provider,
+        download_until,
+        opaque_refs,
+        uses_cell_downloads=uses_cell_downloads,
     )
     if observe_screenshot_width:
         # Outermost, so the screenshot line is the result's last line, after text-delta and download lines.
@@ -27306,6 +27319,8 @@ def _apply_download_signal(
     page_provider: PageProvider | None = None,
     download_until: DownloadUntil | None = None,
     opaque_refs: OpaqueUrlRefs | None = None,
+    *,
+    uses_cell_downloads: Callable[[], bool] | None = None,
 ) -> None:
     """Wrap every tool so the next wrapped result reports files landing in `downloads_dir` and failures `failure_watch`
     saw. A billable call, or one that leaves a download in flight, first awaits `download_wait` so it names its file.
@@ -27353,17 +27368,46 @@ def _apply_download_signal(
         context = skyvern_context.current()
         return bool(context and context.browser_session_id and context.organization_id)
 
-    async def _session_files() -> list[str] | None:
-        """A persistent browser session's stored downloads, which never reach downloads_dir; None when unknown."""
+    async def _session_files(*, in_progress: bool = False) -> list[str] | None:
+        """Read a persistent session's downloads; None when the snapshot is unknown."""
         context = skyvern_context.current()
-        if failure_watch is None and download_wait is None:
+        if not in_progress and failure_watch is None and download_wait is None:
             return []
         if context is None or not context.browser_session_id or not context.organization_id:
             return []
         try:
             # Every wrapped call lists, so a slow store must not hold up the call's own result.
             async with asyncio.timeout(_SESSION_DOWNLOAD_LIST_TIMEOUT_SECONDS):
-                return await app.STORAGE.list_downloaded_files_in_browser_session(
+                if uses_cell_downloads is None:
+                    session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                        context.browser_session_id, context.organization_id
+                    )
+                    if session is None:
+                        return None
+                    cell_session = is_cell_download_session(session)
+                else:
+                    cell_session = uses_cell_downloads()
+                if cell_session:
+                    if in_progress:
+                        return []  # Cell downloads become visible only after registration.
+                    run_id = resolve_run_download_id(context)
+                    if run_id is None:
+                        return None
+                    files, _ = await scope_session_downloads(
+                        organization_id=context.organization_id,
+                        browser_session_id=context.browser_session_id,
+                        run_id=run_id,
+                        attempt_started_at=attempt_started_at,
+                        cell_session=True,
+                        raise_on_lookup_error=True,
+                    )
+                    return files
+                list_files = (
+                    app.STORAGE.list_downloading_files_in_browser_session
+                    if in_progress
+                    else app.STORAGE.list_downloaded_files_in_browser_session
+                )
+                return await list_files(
                     organization_id=context.organization_id, browser_session_id=context.browser_session_id
                 )
         except Exception:
@@ -27412,19 +27456,8 @@ def _apply_download_signal(
 
     async def _session_downloading() -> set[str] | None:
         """The session's rows still marked downloading; None when the listing could not be read."""
-        context = skyvern_context.current()
-        if context is None or not context.browser_session_id or not context.organization_id:
-            return set()
-        try:
-            async with asyncio.timeout(_SESSION_DOWNLOAD_LIST_TIMEOUT_SECONDS):
-                return set(
-                    await app.STORAGE.list_downloading_files_in_browser_session(
-                        organization_id=context.organization_id, browser_session_id=context.browser_session_id
-                    )
-                )
-        except Exception:
-            LOG.info("taskv3 browser session in-progress listing failed", exc_info=True)
-            return None
+        files = await _session_files(in_progress=True)
+        return set(files) if files is not None else None
 
     def _documents_not_shown(browser_page: Page | None) -> dict[Frame, tuple[str, str, int | None]]:
         if browser_page is None or failure_watch is None:

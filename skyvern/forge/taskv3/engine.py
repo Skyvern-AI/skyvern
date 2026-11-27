@@ -343,6 +343,7 @@ async def run_task_v3_agent_loop(
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     download_wait: DownloadWait | None = None,
     download_until: DownloadUntil | None = None,
+    uses_cell_downloads: Callable[[], bool] | None = None,
     download_settle: DownloadSettle | None = None,
     unsaved_downloads: UnsavedDownloads | None = None,
     hold_completed_on_landed_file: bool = False,
@@ -534,6 +535,7 @@ async def run_task_v3_agent_loop(
             download_failures=failure_watch,
             download_wait=download_wait,
             download_until=download_until,
+            uses_cell_downloads=uses_cell_downloads,
             recover_page=_recover if recover_page is not None else None,
         )
     )

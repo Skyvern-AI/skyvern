@@ -1841,7 +1841,7 @@ async def _connect_to_cdp_browser(
         validate_browser_address=validate_browser_address,
     )
 
-    if apply_download_behaviour and download_binding == DownloadBinding.SESSION_DIR:
+    if apply_download_behaviour and DownloadBinding.is_session_owned(download_binding):
         # Provider-owned remote binding: preserve the provider-selected destination. Re-sending a
         # run-scoped download path here would overwrite it, so leave the binding untouched.
         LOG.info(
@@ -1879,7 +1879,7 @@ async def _connect_to_cdp_browser(
 
     # Enable CDPDownloadInterceptor when enable_download is set.
     # This captures downloads via the Fetch domain and saves them locally.
-    if parsed_headers.enable_download:
+    if parsed_headers.enable_download and download_binding is not DownloadBinding.CELL_SESSION:
         download_dir = initialize_download_dir()
         # No run-scoped network authority is threaded into this OSS creator; the interceptor stays
         # unenrolled, which fails closed on every intercepted request rather than defaulting open.

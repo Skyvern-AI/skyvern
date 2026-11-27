@@ -215,8 +215,14 @@ from skyvern.forge.sdk.api.llm.utils import (
     llm_response_log_metadata,
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
+from skyvern.forge.sdk.artifact.storage.base import (
+    get_download_retry_started_at,
+    is_cell_download_session,
+    is_file_from_retry_attempt,
+    list_run_cell_downloads,
+)
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import run_stoppable_comparison, unique_pdf_paths
+from skyvern.forge.sdk.artifact.utils import load_verified_cell_download, write_cell_download_copy
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
@@ -495,11 +501,13 @@ from skyvern.webeye.browser_state import (
 from skyvern.webeye.cdp_download_interceptor import (
     ORIGINAL_FILENAME_MARKER,
     ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+    _payload_contradiction_reason,
     begin_replay_candidate_hold,
     end_replay_candidate_holds,
     normalize_download_filename,
     replay_candidate_holds,
     settle_browser_downloads_for_context,
+    unique_download_filename,
 )
 from skyvern.webeye.computer_surface import ComputerUseTargetRequired
 from skyvern.webeye.navigation import (
@@ -720,10 +728,9 @@ def download_binding_of(browser_state: BrowserState | None) -> DownloadBinding:
 
 
 def session_download_lane_active(browser_state: BrowserState | None) -> bool:
-    """A session-keyed DOWNLOAD row only reaches a run-scoped read on the artifact-first path; without
-    HMAC signing that read falls back to an S3 listing under the run prefix, which never holds one."""
-    return download_binding_of(browser_state) is DownloadBinding.SESSION_DIR and bool(
-        settings.ARTIFACT_CONTENT_HMAC_KEYRING
+    binding = download_binding_of(browser_state)
+    return binding is DownloadBinding.CELL_SESSION or (
+        binding is DownloadBinding.SESSION_DIR and bool(settings.ARTIFACT_CONTENT_HMAC_KEYRING)
     )
 
 
@@ -1890,7 +1897,7 @@ class Block(BaseModel, abc.ABC):
                 skyvern_context.current(), fallback_run_id=workflow_run_id
             )
             try:
-                if browser_state.browser_artifacts.download_binding == DownloadBinding.SESSION_DIR:
+                if DownloadBinding.is_session_owned(browser_state.browser_artifacts.download_binding):
                     # Defense-in-depth: a mismatched caller (e.g. a cached adopted state fetched without a
                     # browser_session_id) must never rebind a provider-owned remote binding off its
                     # provider-selected destination.
@@ -3501,6 +3508,13 @@ class BaseTaskBlock(Block):
                     organization_id=workflow_run.organization_id,
                 )
                 success = updated_task.status == TaskStatus.completed
+                producing_session_id = browser_session_id or current_context.browser_session_id
+                if success and browser_state is not None and producing_session_id:
+                    workflow_run_context.browser_session_download_binding = (
+                        workflow_run.organization_id,
+                        producing_session_id,
+                        browser_state.browser_artifacts.download_binding,
+                    )
 
                 downloaded_files: list[FileInfo] | None = None
                 try:
@@ -6807,9 +6821,11 @@ async def _registered_download_source(
 ) -> RegisteredDownloadSource | None:
     """What a claimed download can be resolved from when its bytes never reach this worker's disk."""
     # Without artifact signing the run-scoped listing carries no artifact ids, so no row could ever resolve.
-    if download_evidence is None or not organization_id or not settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+    if download_evidence is None or not organization_id:
         return None
-    if download_binding is not DownloadBinding.SESSION_DIR and not _download_monitor_owns_binding(page):
+    if not settings.ARTIFACT_CONTENT_HMAC_KEYRING and download_binding is not DownloadBinding.CELL_SESSION:
+        return None
+    if not DownloadBinding.is_session_owned(download_binding) and not _download_monitor_owns_binding(page):
         return None
     identities = await _registered_download_identities(download_evidence)
     return RegisteredDownloadSource(
@@ -6873,7 +6889,7 @@ async def _code_block_click_and_claim_download_builtin(
         if outcome_recorder is not None:
             outcome_recorder.record(outcome)
 
-    if download_binding is None or download_binding not in (DownloadBinding.RUN_DIR, DownloadBinding.SESSION_DIR):
+    if not isinstance(download_binding, DownloadBinding):
         _record("raised")
         raise CodeBlockDownloadClaimError(
             "click_and_claim_download is only supported when downloads are bound to a known destination."
@@ -6887,7 +6903,7 @@ async def _code_block_click_and_claim_download_builtin(
     # the extra registration read is taken for those claims alone.
     if registered_downloads is not None:
         registered_before_click = registered_downloads.baseline
-    elif download_binding is DownloadBinding.SESSION_DIR or _download_monitor_owns_binding(page):
+    elif DownloadBinding.is_session_owned(download_binding) or _download_monitor_owns_binding(page):
         registered_before_click = await _registered_download_identities(download_evidence)
     else:
         registered_before_click = None
@@ -6896,7 +6912,7 @@ async def _code_block_click_and_claim_download_builtin(
     # since registration evidence, not the event, is that binding's proof of delivery.
     # Always finite: Playwright removes an abandoned claim's listeners only when its timeout fires,
     # so an unbounded window would strand them on a page later blocks reuse.
-    if download_binding is DownloadBinding.SESSION_DIR:
+    if DownloadBinding.is_session_owned(download_binding):
         observe_seconds: float = min(
             timeout_seconds if timeout_seconds is not None else _DOWNLOAD_CLAIM_SESSION_OBSERVE_SECONDS,
             _DOWNLOAD_CLAIM_SESSION_OBSERVE_SECONDS,
@@ -6938,7 +6954,7 @@ async def _code_block_click_and_claim_download_builtin(
         )
         delivered_name = (
             await _newly_registered_download_name(download_evidence, registered_before_click)
-            if download_binding is DownloadBinding.SESSION_DIR or claim_monitor_owns_binding
+            if DownloadBinding.is_session_owned(download_binding) or claim_monitor_owns_binding
             else None
         )
         if click_error is not None:
@@ -6951,7 +6967,7 @@ async def _code_block_click_and_claim_download_builtin(
             # failing here would fail a download that arrived.
             _record("returned_proven")
             return delivered_name
-        if download_binding is DownloadBinding.SESSION_DIR or claim_monitor_owns_binding:
+        if DownloadBinding.is_session_owned(download_binding) or claim_monitor_owns_binding:
             # The click landed, and this binding's delivery belongs to the session watcher or to the
             # monitor -- which denies browser-native downloads and fetches the bytes itself, so no
             # Download event need ever reach this page. Failing here would fail a download that
@@ -13109,6 +13125,75 @@ class FileDestinationBlock(Block):
             sftp_host_key=host_key,
         )
 
+    async def _uses_cell_downloads(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        session_id: str,
+        allow_local_fallback: bool = False,
+        download_binding: tuple[str, str, DownloadBinding] | None = None,
+    ) -> bool:
+        state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+        if state is not None:
+            return download_binding_of(state) is DownloadBinding.CELL_SESSION
+        if download_binding is not None and download_binding[:2] == (organization_id, session_id):
+            return download_binding[2] is DownloadBinding.CELL_SESSION
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                    session_id, organization_id
+                )
+        except Exception as exc:
+            if not allow_local_fallback:
+                raise
+            LOG.warning(
+                "Browser session lookup failed for local file upload",
+                workflow_run_id=workflow_run_id,
+                error_type=type(exc).__name__,
+            )
+            return False
+        return is_cell_download_session(session)
+
+    async def _append_cell_downloads(
+        self,
+        files: list[str],
+        *,
+        run_dir: Path,
+        run_id: str,
+        organization_id: str,
+        browser_session_id: str,
+        attempt_started_at: datetime | None,
+        task_id: str | None = None,
+    ) -> None:
+        async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+            registered = await list_run_cell_downloads(
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                run_id=run_id,
+                attempt_started_at=attempt_started_at,
+                task_id=task_id,
+            )
+        names = {Path(file).name for file in files}
+        for artifact in registered.values():
+            verified = await load_verified_cell_download(run_dir, artifact, app.STORAGE.retrieve_artifact)
+            if verified is None:
+                raise ValueError("Could not read the registered browser cell download")
+            copy, data = verified
+            captured_name = Path(artifact.uri).name
+            name = artifact.download_filename or captured_name
+            filename = unique_download_filename(name, Path(name).suffix, names)
+            if (
+                copy is None
+                and artifact.download_filename is None
+                and _payload_contradiction_reason(data, "", captured_name, allow_typed_extensionless_html=True)
+            ):
+                continue
+            if copy is None or copy.name != filename:
+                copy = write_cell_download_copy(run_dir, artifact.artifact_id, filename, data)
+            names.add(copy.name)
+            files.append(str(copy))
+
     async def _dispatch_files_to_storage(
         self,
         *,
@@ -13710,6 +13795,33 @@ class FileUploadBlock(FileDestinationBlock):
                     stop=stop,
                 )
             )
+            session_id = browser_session_id or (context.browser_session_id if context else None)
+            storage_org_id = organization_id or workflow_run_context.organization_id
+            if (
+                run_download_id
+                and storage_org_id
+                and session_id
+                and await self._uses_cell_downloads(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=storage_org_id,
+                    session_id=session_id,
+                    allow_local_fallback=bool(files_to_upload),
+                    download_binding=workflow_run_context.browser_session_download_binding,
+                )
+            ):
+                await self._append_cell_downloads(
+                    files_to_upload,
+                    run_dir=Path(download_files_path),
+                    run_id=run_download_id,
+                    organization_id=storage_org_id,
+                    browser_session_id=session_id,
+                    attempt_started_at=attempt_started_at,
+                )
+                if files_to_upload and not self._selects_files_by_prompt():
+                    scoped_files = files_to_upload
+                    files_to_upload = await run_stoppable_comparison(lambda stop: unique_pdf_paths(scoped_files, stop))
+                if len(files_to_upload) > max_file_count:
+                    raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
 
             if not files_to_upload and not self.continue_on_empty:
                 (
@@ -18267,13 +18379,45 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                 ):
                     files_to_upload.append(local_file)
 
-            if not files_to_upload:
-                return result
+            context = skyvern_context.current()
+            session_id = browser_session_id or (context.browser_session_id if context else None)
+            storage_org_id = organization_id or workflow_run_context.organization_id
+            if (
+                direct_download is None
+                and session_id
+                and storage_org_id
+                and await self._uses_cell_downloads(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=storage_org_id,
+                    session_id=session_id,
+                    allow_local_fallback=bool(files_to_upload),
+                    download_binding=workflow_run_context.browser_session_download_binding,
+                )
+            ):
+                producing_block = await app.DATABASE.observer.get_workflow_run_block(
+                    workflow_run_block_id, storage_org_id
+                )
+                if producing_block.workflow_run_id != workflow_run_id or producing_block.task_id is None:
+                    raise ValueError("Could not establish the task that produced the browser cell download")
+                await self._append_cell_downloads(
+                    files_to_upload,
+                    run_dir=Path(download_files_path),
+                    run_id=run_download_id,
+                    organization_id=storage_org_id,
+                    browser_session_id=session_id,
+                    attempt_started_at=attempt_started_at,
+                    task_id=producing_block.task_id,
+                )
+                if not files_to_upload:
+                    raise ValueError("No registered browser cell downloads from this block were available for delivery")
 
-            if not (self.prompt and self.prompt.strip()):
+            if files_to_upload and not (self.prompt and self.prompt.strip()):
                 # Automatic delivery sends each PDF content once; a prompt's explicit selection keeps duplicates.
                 scoped_files = files_to_upload
                 files_to_upload = await run_stoppable_comparison(lambda stop: unique_pdf_paths(scoped_files, stop))
+
+            if not files_to_upload:
+                return result
             if len(files_to_upload) > max_file_count:
                 raise ValueError(f"Too many scoped downloaded files to upload. Max: {max_file_count}")
 

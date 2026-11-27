@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import io
 import os
@@ -814,6 +815,33 @@ class AsyncAWSClient:
         except Exception:
             LOG.exception("S3 upload failed.", uri=uri)
             return None
+
+    async def put_file_if_absent(self, uri: str, data: bytes, checksum: str, storage_class: S3StorageClass) -> None:
+        parsed = S3Uri(uri)
+
+        async def _put() -> None:
+            async with self._s3_client() as client:
+                try:
+                    await client.put_object(
+                        Bucket=parsed.bucket,
+                        Key=parsed.key,
+                        Body=data,
+                        IfNoneMatch="*",
+                        ChecksumSHA256=base64.b64encode(bytes.fromhex(checksum)).decode("ascii"),
+                        Metadata={"sha256_checksum": checksum},
+                        StorageClass=str(storage_class),
+                    )
+                except ClientError as exc:
+                    if exc.response["ResponseMetadata"]["HTTPStatusCode"] != 412:
+                        raise
+                    existing = await client.head_object(Bucket=parsed.bucket, Key=parsed.key)
+                    if (
+                        existing.get("ContentLength") != len(data)
+                        or existing.get("Metadata", {}).get("sha256_checksum") != checksum
+                    ):
+                        raise ValueError("existing object differs from the confirmed download") from None
+
+        await self._s3_with_retry("put_file_if_absent", _put)
 
     async def upload_file_stream(
         self,

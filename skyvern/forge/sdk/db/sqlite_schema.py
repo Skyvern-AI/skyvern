@@ -17,6 +17,7 @@ _SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("tasks", "task_queue", "VARCHAR"),
     ("browser_profiles", "source_browser_session_id", "VARCHAR"),
     ("browser_profiles", "source_workflow_run_id", "VARCHAR"),
+    ("artifacts", "download_filename", "VARCHAR"),
 )
 
 

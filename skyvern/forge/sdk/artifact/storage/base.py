@@ -4,15 +4,16 @@ from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import BinaryIO, Protocol, cast
-from urllib.parse import unquote
+from typing import TYPE_CHECKING, BinaryIO, Protocol, cast
+from urllib.parse import unquote, urlsplit
 
 import structlog
 
-from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
+from skyvern.constants import BROWSER_CELL_DOWNLOAD_CDP_PATH, BROWSER_DOWNLOADING_SUFFIX
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_TYPES, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
+from skyvern.forge.sdk.artifact.utils import is_browser_cell_download_artifact, is_browser_cell_download_uri
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -20,6 +21,9 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.loop_download_filter import DownloadedFileSignature
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
 LOG = structlog.get_logger()
 
@@ -203,9 +207,8 @@ async def _file_infos_from_artifacts(artifacts: list[Artifact], *, artifact_type
     """Build the API-shaped ``FileInfo`` list from a homogeneous batch of
     artifact rows (e.g. all DOWNLOAD or all RECORDING).
 
-    Filename is the URI basename (the save site writes ``{base_uri}/{file}``);
-    checksum and modified_at come straight from the row, so retrieval needs
-    zero S3 round-trips.
+    Downloads use their persisted filename when present. Otherwise the filename
+    is the URI basename. Checksum and modified_at come straight from the row.
 
     All artifacts in a single batch share the same organization (downloads /
     recordings are scoped to a run or browser session, which is scoped to an
@@ -223,6 +226,8 @@ async def _file_infos_from_artifacts(artifacts: list[Artifact], *, artifact_type
     infos: list[FileInfo] = []
     for artifact in artifacts:
         filename = artifact_filename_from_uri(artifact.uri)
+        if artifact.artifact_type == ArtifactType.DOWNLOAD:
+            filename = artifact.download_filename or filename
         url = await app.ARTIFACT_MANAGER.resolve_share_url(artifact, expiry_seconds=expiry_seconds)
         if url is None:
             continue
@@ -270,6 +275,110 @@ def is_download_timestamp_current(timestamp: datetime | None, attempt_started_at
     return timestamp >= attempt_started_at
 
 
+async def list_run_cell_downloads(
+    *,
+    organization_id: str,
+    browser_session_id: str | None,
+    run_id: str,
+    attempt_started_at: datetime | None,
+    task_id: str | None = None,
+) -> dict[str, Artifact]:
+    if attempt_started_at is None:
+        # Legacy callers use None for both an initial attempt and a failed lookup.
+        # Confirm the scope before authorizing cell files across attempts.
+        _, attempt_number, started_at = await resolve_download_attempt(organization_id, run_id)
+        if attempt_number > 1:
+            if started_at is None:
+                raise ValueError("Could not establish the browser cell download attempt")
+            attempt_started_at = started_at
+    artifacts = await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
+        run_id=run_id, organization_id=organization_id, artifact_type=ArtifactType.DOWNLOAD
+    )
+    return {
+        artifact.uri: artifact
+        for artifact in artifacts
+        if artifact.browser_session_id
+        and (browser_session_id is None or artifact.browser_session_id == browser_session_id)
+        and (task_id is None or artifact.task_id == task_id)
+        and is_browser_cell_download_artifact(artifact.artifact_id, artifact.uri)
+        and is_download_timestamp_current(artifact.created_at, attempt_started_at)
+    }
+
+
+def is_cell_download_session(session: "PersistentBrowserSession | None") -> bool:
+    return (
+        session is not None
+        and session.browser_vendor == "skyvern_sandbox"
+        and urlsplit(session.upstream_cdp_url or "").path == BROWSER_CELL_DOWNLOAD_CDP_PATH
+    )
+
+
+async def scope_session_downloads(
+    files: list[str] | None = None,
+    *,
+    organization_id: str | None,
+    browser_session_id: str,
+    run_id: str | None,
+    attempt_started_at: datetime | None,
+    cell_session: bool = False,
+    include_partials: bool = False,
+    raise_on_lookup_error: bool = False,
+    storage: "BaseStorage | None" = None,
+) -> tuple[list[str], dict[str, Artifact]]:
+    """Scope registered cell downloads and retain legacy listings.
+
+    Callers comparing snapshots can opt to distinguish an unknown result from an empty listing.
+    """
+    if files is None and not cell_session:
+        if organization_id is None:
+            return [], {}
+        if storage is None:
+            storage = app.STORAGE
+        partials = (
+            await storage.list_downloading_files_in_browser_session(
+                organization_id=organization_id, browser_session_id=browser_session_id
+            )
+            if include_partials
+            else []
+        )
+        files = await storage.list_downloaded_files_in_browser_session(
+            organization_id=organization_id, browser_session_id=browser_session_id
+        )
+        files = files + partials
+
+    candidates = {file for file in files or () if is_browser_cell_download_uri(file)}
+    if files is not None and not candidates:
+        return files if not cell_session else [], {}
+    registered: dict[str, Artifact] = {}
+    try:
+        if organization_id and files is not None and not cell_session:
+            session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                browser_session_id, organization_id
+            )
+            if session is not None:
+                cell_session = is_cell_download_session(session)
+                if not cell_session:
+                    return files, {}
+        if organization_id and run_id:
+            registered = await list_run_cell_downloads(
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                run_id=run_id,
+                attempt_started_at=attempt_started_at,
+            )
+    except Exception as exc:
+        if raise_on_lookup_error:
+            raise
+        LOG.warning(
+            "Could not confirm cell download ownership",
+            browser_session_id=browser_session_id,
+            error_type=type(exc).__name__,
+        )
+    if files is None:
+        return list(registered), registered
+    return [file for file in files if file in registered or (not cell_session and file not in candidates)], registered
+
+
 def dedupe_run_scoped_download_artifacts(
     artifacts: list[Artifact], attempt_started_at: datetime | None = None
 ) -> list[Artifact]:
@@ -282,6 +391,7 @@ def dedupe_run_scoped_download_artifacts(
     most N session rows, so two legitimate same-content session downloads backed by a single run-scoped
     row keep one. Order is preserved; distinct/absent checksums, twinless session rows, and multiple
     run-scoped rows are all kept. Rows before the attempt cutoff pass through without pairing.
+    A cell DOWNLOAD row identifies a complete logical download and is never checksum-paired.
     Run-scoped only — never call on a session listing.
     """
     run_scoped_checksums = Counter(
@@ -297,6 +407,7 @@ def dedupe_run_scoped_download_artifacts(
     for a in artifacts:
         if (
             a.browser_session_id is not None
+            and not is_browser_cell_download_artifact(a.artifact_id, a.uri)
             and a.checksum
             and run_scoped_checksums[a.checksum] > 0
             and is_download_timestamp_current(a.modified_at or a.created_at, attempt_started_at)

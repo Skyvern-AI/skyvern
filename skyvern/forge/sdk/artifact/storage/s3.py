@@ -1,11 +1,12 @@
 import asyncio
+import hashlib
 import io
 import os
 import re
 import threading
 import uuid
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import aclosing
 from datetime import datetime, timezone
 from functools import partial
@@ -18,7 +19,11 @@ from anyio.lowlevel import RunVar
 from botocore.exceptions import ClientError
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
+from skyvern.constants import (
+    BROWSER_CELL_DOWNLOAD_URI_SEGMENT,
+    BROWSER_DOWNLOADING_SUFFIX,
+    DOWNLOAD_FILE_PREFIX,
+)
 from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import (
@@ -74,7 +79,12 @@ from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     sync_run_recording_clips,
 )
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import settle
-from skyvern.forge.sdk.artifact.utils import replace_file_extension
+from skyvern.forge.sdk.artifact.utils import (
+    browser_cell_download_artifact_id,
+    is_browser_cell_download_artifact,
+    is_browser_cell_download_uri,
+    replace_file_extension,
+)
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -460,6 +470,9 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         return await _S3ZipReader(self.async_client, uri, size, etag).extract(bundle_key)
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
+        if is_browser_cell_download_artifact(artifact.artifact_id, artifact.uri):
+            self.assert_managed_file_access(artifact.uri, artifact.organization_id)
+            return await self.async_client.download_file(artifact.uri)
         compressed = artifact.uri.endswith(S3_ZSTD_COMPRESSED_SUFFIX)
         try:
             if artifact.bundle_key and not compressed:
@@ -799,10 +812,9 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
                 # Honour the partial-vs-final discriminator the agent expects.
                 return [a.uri for a in artifacts if a.uri and a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX) == in_progress]
 
-        bucket = settings.AWS_S3_BUCKET_ARTIFACTS
-        uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
-        files = [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=uri)]
-        return [f for f in files if f.endswith(BROWSER_DOWNLOADING_SUFFIX) == in_progress]
+        return list(
+            await self._list_session_download_objects(organization_id, browser_session_id, in_progress=in_progress)
+        )
 
     async def get_shared_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
@@ -894,19 +906,15 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         # Direct S3 LIST, only for OSS deployments without a keyring and for a
         # failed row lookup. ``list_downloaded_files_in_browser_session`` returns
         # S3 URIs, not presigned FileInfos, so it is not reused here.
-        bucket = settings.AWS_S3_BUCKET_ARTIFACTS
-        listing_uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
-        object_keys = [
-            f"s3://{bucket}/{file}"
-            for file in await self.async_client.list_files(uri=listing_uri)
-            if not file.endswith(BROWSER_DOWNLOADING_SUFFIX)
-        ]
+        objects = await self._list_session_download_objects(organization_id, browser_session_id, in_progress=False)
+        object_keys = list(objects)
         if len(object_keys) == 0:
             return []
 
         object_infos = await self._bounded_get_object_infos(object_keys)
         filenames = [
-            ((object_info or {}).get("Metadata") or {}).get("original_filename", os.path.basename(key))
+            getattr(objects[key], "download_filename", None)
+            or ((object_info or {}).get("Metadata") or {}).get("original_filename", os.path.basename(key))
             for key, object_info in zip(object_keys, object_infos)
         ]
         presigned_urls = await self._resilient_presign(object_keys, attachment_filenames=filenames)
@@ -931,6 +939,52 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             )
 
         return file_infos
+
+    async def _list_session_download_objects(
+        self, organization_id: str, browser_session_id: str, *, in_progress: bool
+    ) -> dict[str, Artifact | None]:
+        bucket = settings.AWS_S3_BUCKET_ARTIFACTS
+        base = (
+            f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}"
+        )
+        keys = [
+            f"s3://{bucket}/{key}"
+            for key in await self.async_client.list_files(uri=f"{base}/downloads")
+            if key.endswith(BROWSER_DOWNLOADING_SUFFIX) == in_progress
+        ]
+        cell_keys = {key for key in keys if is_browser_cell_download_uri(key)}
+        registered = {}
+        if cell_keys:
+            try:
+                rows = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
+                    browser_session_id, organization_id, ArtifactType.DOWNLOAD
+                )
+                registered = {row.uri: row for row in rows}
+            except Exception:
+                LOG.warning(
+                    "Browser cell download registration unavailable",
+                    browser_session_id=browser_session_id,
+                    exc_info=True,
+                )
+        legacy_session = False
+        if cell_keys.difference(registered):
+            # The controller also uploads nested paths with no date directory. Only a positively
+            # identified ordinary session can expose a key whose Cell registration is unproven.
+            try:
+                async with asyncio.timeout(2):
+                    session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                        browser_session_id, organization_id
+                    )
+                legacy_session = (
+                    session is not None
+                    and session.browser_vendor != "skyvern_sandbox"
+                    and (session.browser_vendor is not None or session.started_at is not None)
+                )
+            except Exception:
+                LOG.warning(
+                    "Browser session download provider could not be confirmed", browser_session_id=browser_session_id
+                )
+        return {key: registered.get(key) for key in keys if legacy_session or key in registered or key not in cell_keys}
 
     async def list_downloading_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
@@ -1311,7 +1365,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         key_prefix = f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         uri = f"s3://{bucket}/{key_prefix}"
         object_keys = await self.async_client.list_files(uri=f"{uri}/" if standalone else uri)
-        if len(object_keys) == 0:
+        if standalone and not object_keys:
             return []
 
         expiry_seconds = ARTIFACT_URL_EXPIRY_SECONDS_MIN
@@ -1322,6 +1376,30 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
                 LOG.warning("Using minimum standalone download link expiry", error_type=type(error).__name__)
 
         file_infos: list[FileInfo] = []
+        # Standalone serves registered rows through signed artifact URLs; its fallback only serves the run prefix.
+        for cell_artifact in download_artifacts or []:
+            if (
+                standalone
+                or cell_artifact.browser_session_id is None
+                or not is_browser_cell_download_artifact(cell_artifact.artifact_id, cell_artifact.uri)
+            ):
+                continue
+            self.assert_managed_file_access(cell_artifact.uri, organization_id)
+            display_name = cell_artifact.download_filename or os.path.basename(cell_artifact.uri)
+            urls = await self.async_client.create_presigned_urls(
+                [cell_artifact.uri], attachment_filenames=[display_name]
+            )
+            if urls:
+                file_infos.append(
+                    FileInfo(
+                        url=urls[0],
+                        filename=display_name,
+                        checksum=cell_artifact.checksum,
+                        file_size=cell_artifact.file_size,
+                        modified_at=cell_artifact.modified_at,
+                        artifact_id=cell_artifact.artifact_id,
+                    )
+                )
         for key in object_keys:
             if key.endswith(BROWSER_DOWNLOADING_SUFFIX):
                 continue
@@ -1442,6 +1520,44 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         if date:
             return f"{base}/{date}/{remote_path}"
         return f"{base}/{remote_path}"
+
+    async def store_observed_session_download(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        download_id: uuid.UUID,
+        filename: str,
+        data: bytes,
+        run_id: str | None,
+        observed_at: datetime,
+        register: Callable[..., Awaitable[None]] | None = None,
+    ) -> str:
+        if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
+            raise ValueError("session download requires a filename")
+        uri = self._build_browser_session_uri(
+            organization_id,
+            browser_session_id,
+            BROWSER_CELL_DOWNLOAD_URI_SEGMENT.strip("/"),
+            f"{download_id}/{filename}",
+        )
+        self.assert_managed_file_access(uri, organization_id)
+        checksum = hashlib.sha256(data).hexdigest()
+        artifact_id = browser_cell_download_artifact_id(uri)
+        storage_class = await self._get_storage_class_for_org(organization_id, self.bucket, object_size_bytes=len(data))
+        await self.async_client.put_file_if_absent(uri, data, checksum, storage_class)
+        register = register or app.DATABASE.artifacts.register_observed_session_download
+        await register(
+            artifact_id=artifact_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            uri=uri,
+            checksum=checksum,
+            file_size=len(data),
+            run_id=run_id,
+            observed_at=observed_at,
+        )
+        return artifact_id
 
     async def sync_browser_session_file(
         self,
