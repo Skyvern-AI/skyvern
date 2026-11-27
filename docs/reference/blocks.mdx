@@ -295,7 +295,7 @@ ZIP inputs are unzipped, and the block outputs the extracted file list as `file_
 
 For a CSV, Skyvern picks the delimiter from comma, tab, semicolon, pipe and colon. When none of them fits, it uses comma, or tab for a `.tsv` file. A one-column file stays one column, and a space-separated file parses as one column. The exception is a file whose lines, up to the first five, all hold the same number of colons, at least one, such as a list of URLs or times with no header row. Skyvern splits that file at the colons. A header row with no colon in it keeps the file in one column. A UTF-8 byte order mark is dropped, so the first column's name is the header the file shows.
 
-Very large files can exceed the parser's time budget and fail the block. When a File Parser sits inside a loop, set **On block failure** (Advanced Settings) to *Skip to next iteration* so files that cannot be parsed are skipped and the rest of the list still runs.
+Very large files can exceed the parser's time budget and fail the block. A CSV or Excel file also fails when it passes a parse limit, which by default is 250,000 rows, 5,000,000 cells, or 200 MiB of data once decoded. A worksheet's cells are counted from A1 to its last filled cell, and a zipped workbook (`.xlsx`, `.xlsm`, `.xlsb`, `.ods`) counts its uncompressed size. The message names the limit the file passed, so split the file into smaller files, or remove unused rows and columns, and run it again. When a File Parser sits inside a loop, set **On block failure** (Advanced Settings) to *Skip to next iteration* so files that cannot be parsed are skipped and the rest of the list still runs.
 
 | Field | Type | Description |
 |-------|------|-------------|
