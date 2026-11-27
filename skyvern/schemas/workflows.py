@@ -2297,7 +2297,9 @@ class WorkflowCreateYAMLRequest(BaseModel):
         default=None,
         description=(
             "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. "
-            "An empty object ({}) clears the header map. Values, including ***, are literal."
+            "An empty object ({}) clears the header map. On updates and runs, a *** value keeps the stored value for "
+            "that key, and a *** value for a key with no stored value is rejected with 422. A new workflow has no "
+            "stored values, so creating one drops *** entries."
         ),
     )
     cdp_connect_headers: dict[str, str] | None = Field(

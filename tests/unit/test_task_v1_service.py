@@ -284,6 +284,11 @@ async def test_run_task_rejects_or_terminalizes_admission_failures(monkeypatch: 
             TaskRequest(url="https://example.com", navigation_goal="go"), organization, engine=RunEngine.ui_tars
         )
     assert create_task_calls == []
+    with pytest.raises(HTTPException) as masked:
+        await run_task(TaskRequest(url="https://example.com", extra_http_headers={"X-Key": "***"}), organization)
+    assert masked.value.status_code == 422
+    assert masked.value.detail == "extra_http_headers value for X-Key is masked (***); send the real value"
+    assert create_task_calls == []
 
     monkeypatch.setattr(
         app,

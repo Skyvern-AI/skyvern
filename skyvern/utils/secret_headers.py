@@ -37,3 +37,24 @@ def merge_masked_headers(
             continue
         merged[key] = value
     return merged
+
+
+class UnresolvedMaskedHeader(ValueError):
+    def __init__(self, field_name: str, key: str) -> None:
+        self.field_name = field_name
+        self.key = key
+        super().__init__(f"{field_name} value for {key} is masked ({SECRET_HEADER_MASK}); send the real value")
+
+
+def resolve_masked_headers(
+    new_headers: dict[str, str] | None,
+    stored_headers: dict[str, str] | None,
+    *,
+    field_name: str,
+) -> dict[str, str] | None:
+    """Like ``merge_masked_headers`` but raises ``UnresolvedMaskedHeader`` for a masked key with no stored value."""
+    stored = stored_headers or {}
+    for key, value in (new_headers or {}).items():
+        if value == SECRET_HEADER_MASK and key not in stored:
+            raise UnresolvedMaskedHeader(field_name, key)
+    return merge_masked_headers(new_headers, stored_headers)

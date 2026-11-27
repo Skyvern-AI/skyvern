@@ -27,6 +27,7 @@ from skyvern.schemas.runs import RunEngine, RunStatus, RunType
 from skyvern.services import uploaded_file_service
 from skyvern.services.strict_otp_terminalization import fail_unclaimed_strict_task
 from skyvern.utils.deferred_cleanup import finish_cleanup_deferring_cancellation
+from skyvern.utils.secret_headers import UnresolvedMaskedHeader, resolve_masked_headers
 from skyvern.utils.url_validators import validate_fetch_url
 
 LOG = structlog.get_logger()
@@ -115,6 +116,14 @@ async def generate_task(user_prompt: str, organization: Organization) -> TaskGen
         raise HTTPException(status_code=500, detail="Failed to generate task. Please try again later.")
 
 
+def reject_masked_extra_http_headers(headers: dict[str, str] | None) -> None:
+    # A new run has no stored headers, so a *** value could only be sent literally.
+    try:
+        resolve_masked_headers(headers, None, field_name="extra_http_headers")
+    except UnresolvedMaskedHeader as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 async def run_task(
     task: TaskRequest,
     organization: Organization,
@@ -126,6 +135,7 @@ async def run_task(
     ab_routing_eligible: bool = True,
     file_ids: list[str] | None = None,
 ) -> tuple[Task, RunEngine]:
+    reject_masked_extra_http_headers(task.extra_http_headers)
     if task.totp_identifier is not None and not task.totp_identifier.strip():
         task.totp_identifier = None
     if task.browser_session_id or task.totp_identifier:

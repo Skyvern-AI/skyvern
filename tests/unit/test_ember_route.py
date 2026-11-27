@@ -7357,20 +7357,23 @@ async def test_chat_history_leaves_a_turn_inside_its_enforcement_budget_alone(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("field_name", ["cdp_connect_headers", "extra_http_headers"])
 async def test_reconcile_restores_real_cdp_headers_not_the_masked_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, field_name: str
 ) -> None:
-    """The pre-turn snapshot is a JSON dump, which masks cdp_connect_headers; restoring it verbatim would destroy them."""
+    """The pre-turn snapshot is a JSON dump, which can mask header values; restoring it verbatim would destroy them."""
     pre_turn = _make_ember_workflow("Before the turn", _NOW - timedelta(hours=2))
-    pre_turn.cdp_connect_headers = {"x-api-key": "real-secret"}
+    setattr(pre_turn, field_name, {"x-api-key": "real-secret"})
     mid_turn_draft = _make_ember_workflow("Half-built draft", datetime.now(UTC) - timedelta(seconds=1500))
-    mid_turn_draft.cdp_connect_headers = {"x-api-key": "real-secret"}
+    setattr(mid_turn_draft, field_name, {"x-api-key": "real-secret"})
+    snapshot = pre_turn.model_dump(mode="json")
+    snapshot[field_name] = {"x-api-key": "***"}
     chat = _make_persisted_chat(
         [
             _make_pending_turn(
                 "turn-a",
                 RECONCILE_ABANDON_AFTER_SECONDS + 60,
-                pre_turn_workflow=pre_turn.model_dump(mode="json"),
+                pre_turn_workflow=snapshot,
                 canonical_write_fingerprint=_fingerprint_of(mid_turn_draft),
             )
         ]
@@ -7381,7 +7384,7 @@ async def test_reconcile_restores_real_cdp_headers_not_the_masked_snapshot(
     await _load_history()
 
     restore_mock.assert_awaited_once()
-    assert restore_mock.await_args.args[0].cdp_connect_headers == {"x-api-key": "real-secret"}
+    assert getattr(restore_mock.await_args.args[0], field_name) == {"x-api-key": "real-secret"}
 
 
 @pytest.mark.asyncio

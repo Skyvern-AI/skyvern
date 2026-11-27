@@ -4280,10 +4280,13 @@ async def _restore_canonical_after_interrupted_turn(
         chat.proposed_workflow = stashed_draft
 
     pre_turn_workflow = Workflow.model_validate(entry.pre_turn_workflow)
-    # The snapshot was taken with model_dump, which masks cdp_connect_headers, so restoring it
-    # verbatim would overwrite the live browser credentials with the mask string.
+    # The snapshot was taken with model_dump, which may mask either header map, so restoring it
+    # verbatim would overwrite the live header values with the mask string.
     pre_turn_workflow.cdp_connect_headers = merge_masked_headers(
         pre_turn_workflow.cdp_connect_headers, current.cdp_connect_headers
+    )
+    pre_turn_workflow.extra_http_headers = merge_masked_headers(
+        pre_turn_workflow.extra_http_headers, current.extra_http_headers
     )
     await _restore_workflow_definition(pre_turn_workflow, organization_id)
     return True
