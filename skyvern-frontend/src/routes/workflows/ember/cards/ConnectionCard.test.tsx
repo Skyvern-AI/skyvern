@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { GoogleOAuthCredential } from "@/api/types";
@@ -474,7 +475,7 @@ describe("ConnectionCard", () => {
     expect(screen.queryByText(/Google/)).toBeNull();
     microsoftCredentials.current = [];
   });
-  it("starts Connected Gmail for a new Gmail card, and keeps a reconnect on the native sign-in", () => {
+  it("starts Connected Gmail for a new Gmail card, and keeps a reconnect on the native sign-in", async () => {
     startAuthorize.mockClear();
     const start = vi.fn();
     const flow: ConnectedGmailFlow = {
@@ -513,18 +514,33 @@ describe("ConnectionCard", () => {
     expect(startAuthorize).not.toHaveBeenCalled();
     unmount();
 
-    const driveFlow = {
+    let driveFlow: ConnectedGmailFlow = {
       ...flow,
       connections: [{ connection_id: "ngc_drive", name: "Broker Drive" }],
     };
-    const driveSlots = {
-      connectedGoogleDriveFlow: ({
-        children,
-      }: {
-        children: (value: ConnectedGmailFlow) => React.ReactNode;
-      }) => <>{children(driveFlow)}</>,
-    };
-    const drive = render(
+    // Starting this flow finishes a Connected Drive sign-in, as the real flow does once the user consents.
+    function BrokerDriveFlow({
+      children,
+    }: {
+      children: (value: ConnectedGmailFlow) => ReactNode;
+    }) {
+      const [current, setCurrent] = useState<ConnectedGmailFlow>(() => ({
+        ...driveFlow,
+        start: () =>
+          setCurrent((value) => ({
+            ...value,
+            connections: [
+              ...value.connections,
+              { connection_id: "ngc_new", name: "New Drive" },
+            ],
+            completedConnectionId: "ngc_new",
+          })),
+      }));
+      return <>{children(current)}</>;
+    }
+    const driveSlots = { connectedGoogleDriveFlow: BrokerDriveFlow };
+    const picks: string[] = [];
+    const driveCard = (
       <PageSlotsProvider value={driveSlots}>
         <ConnectionCard
           card={{
@@ -536,17 +552,40 @@ describe("ConnectionCard", () => {
             reconnectConnectionId: null,
             credentialBackends: ["native", "nango"],
           }}
+          onSelect={(connectionId) => picks.push(connectionId)}
         />
-      </PageSlotsProvider>,
+      </PageSlotsProvider>
     );
+    // An org with no native Drive account gets one Connect, and the account it brings in is the card's pick.
+    const drive = render(driveCard);
+    expect(
+      screen.queryByRole("button", { name: "Connect Connected Google Drive" }),
+    ).toBeNull();
+    expect(screen.getByText("Broker Drive")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    await waitFor(() => expect(picks).toEqual(["ngc_new"]));
+    drive.unmount();
+    // While the flow is still deciding, the card holds one disabled Connect, so no click can start native sign-in.
+    driveFlow = { ...driveFlow, status: "loading" };
+    const loadingDrive = render(driveCard);
+    expect(
+      screen.queryByRole("button", { name: "Connect Connected Google Drive" }),
+    ).toBeNull();
+    expect(
+      (screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    loadingDrive.unmount();
+    // An org that already has native Drive keeps both ways to connect.
+    driveFlow = { ...driveFlow, status: "unavailable" };
+    const nativeDrive = render(driveCard);
     expect(
       screen.getByRole("button", { name: "Connect Connected Google Drive" }),
     ).toBeTruthy();
     expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
-    expect(screen.getByText("Broker Drive")).toBeTruthy();
-    drive.unmount();
+    nativeDrive.unmount();
 
-    render(
+    const nativeOnlyDrive = render(
       <PageSlotsProvider value={driveSlots}>
         <ConnectionCard
           card={{
@@ -566,6 +605,22 @@ describe("ConnectionCard", () => {
       screen.queryByRole("button", { name: "Connect Connected Google Drive" }),
     ).toBeNull();
     expect(screen.queryByText("Broker Drive")).toBeNull();
+    // The server refuses a new native Drive sign-in unless it is for a native-only action, so this card's opens.
+    stubPopup();
+    startAuthorize.mockImplementation(async (request) =>
+      request.native_only
+        ? {
+            authorize_url: "https://accounts.google.com/oauth",
+            state: "attempt",
+            credential_id: "goac_new",
+          }
+        : Promise.reject({ response: { status: 409 } }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    expect(await screen.findByText("Waiting for sign-in…")).toBeTruthy();
+    expect(screen.queryByText("Could not start the connection.")).toBeNull();
+    nativeOnlyDrive.unmount();
+    open.mockClear();
 
     googleCredentials.current = [row("goac_gmail", [GMAIL], "error")];
     render(

@@ -483,6 +483,8 @@ export interface CreateGoogleOAuthAuthorizeRequest {
   // workflows referencing it keep working without edits.
   credential_id?: string;
   set_account?: boolean;
+  // For an action that runs only on a native account; skips the Connected-account default for new connections.
+  native_only?: boolean;
 }
 
 export interface GoogleOAuthAuthorizeResponse {

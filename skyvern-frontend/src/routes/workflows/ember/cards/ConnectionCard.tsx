@@ -180,6 +180,8 @@ function ConnectionCardBody({
   // failure and retry show; a flow that can no longer connect falls back to native sign-in like any non-live flow.
   const [switchedToConnectedGmail, setSwitchedToConnectedGmail] =
     useState(false);
+  const [switchedToConnectedDrive, setSwitchedToConnectedDrive] =
+    useState(false);
   // An existing Connected Gmail account stays a choice even when a native credential makes it no longer the default.
   // A step that runs only on Connected Gmail always takes that flow, even one that cannot connect: native sign-in would
   // add an account the step cannot use.
@@ -249,6 +251,9 @@ function ConnectionCardBody({
   const refetchGoogle = google.refetchCredentials;
   const targetConnectionId =
     card.reconnectConnectionId ?? partialConnectionId ?? null;
+  // Until the Drive flow knows whether the org has native Drive, a new card offers neither way to connect.
+  const driveFlowLoading =
+    !targetConnectionId && connectedDrive?.status === "loading";
   const requiredScopesKey = card.requiredScopes.join(" ");
   const postedMs = postedAt ? parseServerStamp(postedAt) : Number.NaN;
   // Connected Gmail rows carry no creation time, so they keep a baseline taken once the flow has loaded; one that
@@ -425,6 +430,9 @@ function ConnectionCardBody({
         ...(targetConnectionId ? { credential_id: targetConnectionId } : {}),
         scope_profile: googleScopeProfile(card.scopeProfile),
         ...(setAccount ? { set_account: true } : {}),
+        ...(card.credentialBackends?.includes("nango") === false
+          ? { native_only: true }
+          : {}),
       });
       attemptRef.current = response.credential_id
         ? {
@@ -448,6 +456,12 @@ function ConnectionCardBody({
         settle({ attempt: "idle", partialConnectionId });
         setSwitchedToConnectedGmail(true);
         connectedGmail.start();
+        return;
+      }
+      if (responseStatus(startError) === 409 && connectedDrive?.canConnect) {
+        settle({ attempt: "idle", partialConnectionId });
+        setSwitchedToConnectedDrive(true);
+        connectedDrive.start();
         return;
       }
       // The partly granted account was deleted or can no longer be reauthorized, so the card offers a fresh connect.
@@ -495,6 +509,11 @@ function ConnectionCardBody({
       ? `${targetCredential?.credential_name ?? "The account"} was connected without the ${card.integrationName} permission. Reconnect it and leave every permission checked.`
       : ATTEMPT_FAILURES[attempt]);
   const actionLabel = targetConnectionId ? "Reconnect" : "Connect";
+  // With no native Drive account in the org, a new Drive account connects only through Connected Drive.
+  const connectedDriveOnly =
+    !targetConnectionId &&
+    (connectedDrive?.status === "default" || switchedToConnectedDrive) &&
+    Boolean(connectedDrive?.canConnect);
   // The account a new Gmail card cannot add to: the user's one Connected Gmail, there before this card.
   const onlyConnectedGmail =
     !card.reconnectConnectionId &&
@@ -605,6 +624,18 @@ function ConnectionCardBody({
           >
             Try again
           </button>
+        ) : isGoogle && connectedDriveOnly && connectedDrive ? (
+          <button
+            type="button"
+            className="mt-3 rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-60"
+            disabled={connectedDrive.busy || disabled}
+            onClick={() => {
+              captureConnectStarted();
+              connectedDrive.start();
+            }}
+          >
+            {connectedDrive.busy ? "Waiting for sign-in…" : actionLabel}
+          </button>
         ) : isGoogle ? (
           <button
             type="button"
@@ -614,6 +645,7 @@ function ConnectionCardBody({
               Boolean(connectedGmail?.busy) ||
               Boolean(connectedDrive?.busy) ||
               gmailFlowLoading ||
+              driveFlowLoading ||
               !canAuthorize ||
               (Boolean(targetConnectionId) && google.isLoading)
             }
@@ -651,7 +683,10 @@ function ConnectionCardBody({
             page
           </a>
         )}
-        {isGoogle && connectedDrive?.canConnect ? (
+        {isGoogle &&
+        connectedDrive?.canConnect &&
+        !connectedDriveOnly &&
+        !driveFlowLoading ? (
           <button
             type="button"
             className="ml-2 mt-3 rounded border border-input px-3 py-1.5 text-xs font-medium disabled:opacity-60"
