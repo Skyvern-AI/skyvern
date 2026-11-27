@@ -1689,9 +1689,13 @@ async def test_worker_restart_failure_matches_timed_out_retry_rules(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version_exists", [True, False], ids=["soft_deleted", "missing"])
+@pytest.mark.parametrize(
+    ("version_exists", "refusal"),
+    [(True, None), (False, None), (True, "This run cannot be retried.")],
+    ids=["soft_deleted", "missing", "retry_refused"],
+)
 async def test_terminal_retry_resolves_deleted_pinned_workflow(
-    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, version_exists: bool
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, version_exists: bool, refusal: str | None
 ) -> None:
     now = datetime.now(UTC).replace(tzinfo=None)
     run = WorkflowRun(
@@ -1747,13 +1751,18 @@ async def test_terminal_retry_resolves_deleted_pinned_workflow(
     monkeypatch.setattr(service_module.app, "WORKFLOW_SERVICE", WorkflowService())
     monkeypatch.setattr(service_module.app.DATABASE.tasks, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
     monkeypatch.setattr(service_module.app.DATABASE.observer, "get_workflow_run_blocks", AsyncMock(return_value=[]))
+    # A run a person may not retry (e.g. one that drove a desktop machine) is not retried by its policy either.
+    monkeypatch.setattr(
+        service_module.app.AGENT_FUNCTION, "get_workflow_run_retry_refusal", AsyncMock(return_value=refusal)
+    )
+    retried = version_exists and refusal is None
 
     assert await _get_retry_policy(run) == (policy if version_exists else None)
     decision = await on_terminal_transition(run, WorkflowRunStatus.failed, None, None)
-    assert decision.retry is version_exists
-    assert decision.delay_seconds == (7 if version_exists else 0)
+    assert decision.retry is retried
+    assert decision.delay_seconds == (7 if retried else 0)
     recorded_attempts = await attempts.get_attempts(run.workflow_run_id)
-    assert recorded_attempts[0].retry_decision == ("retry" if version_exists else "final")
+    assert recorded_attempts[0].retry_decision == ("retry" if retried else "final")
 
 
 @pytest.mark.asyncio

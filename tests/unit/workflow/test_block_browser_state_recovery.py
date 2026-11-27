@@ -41,6 +41,7 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, Paramet
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import evaluate_retry_policy
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, WorkflowRetryPolicy
 from skyvern.webeye import navigation as navigation_module
 from skyvern.webeye import real_browser_state as real_browser_state_module
@@ -777,13 +778,16 @@ async def test_task_block_does_not_take_over_a_browser_its_finished_child_lost()
         state._on_browser_context_closed(context)
         # The real step fails its task on either refusal and returns.
         with contextlib.suppress(MissingBrowserState, MissingBrowserStatePage):
-            await ForgeAgent().initialize_execution_state(task, step, workflow_run)
+            await ForgeAgent().initialize_execution_state(task, step, workflow_run, engine=RunEngine.skyvern_v1)
 
     with (
         skyvern_context.scoped(SkyvernContext()),
         mock_block_execute_deps(working_page_url="https://example.com") as deps,
         patch.object(object.__getattribute__(app, "_inst"), "BROWSER_MANAGER", manager),
         patch.object(manager, "_create_browser_state", new=AsyncMock()) as mock_create,
+        patch.object(
+            object.__getattribute__(app, "_inst").AGENT_FUNCTION, "get_computer_surface", AsyncMock(return_value=None)
+        ),
     ):
         deps.browser_manager.get_for_workflow_run = MagicMock(return_value=state)
         deps.agent.create_task_and_step_from_block = AsyncMock(return_value=(task, step))

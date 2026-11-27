@@ -538,6 +538,7 @@ class TestCleanUpTaskTargetClosed:
         app_mock.DATABASE.tasks.get_task = AsyncMock(return_value=task)
         app_mock.BROWSER_MANAGER.get_for_task = MagicMock(return_value=browser_state)
         app_mock.ARTIFACT_MANAGER.create_artifact = AsyncMock()
+        app_mock.AGENT_FUNCTION.get_computer_surface = AsyncMock(return_value=None)
         monkeypatch.setattr(agent_mod, "app", app_mock)
         monkeypatch.setattr(agent_mod.analytics, "capture", MagicMock())
         monkeypatch.setattr(agent_mod, "settle_browser_downloads_for_context", _noop_async_context)
@@ -616,6 +617,7 @@ class TestCleanUpTaskWorkflowRunBrowser:
         app_mock.DATABASE.tasks.get_task = AsyncMock(return_value=task)
         app_mock.BROWSER_MANAGER = manager
         app_mock.ARTIFACT_MANAGER.create_artifact = AsyncMock()
+        app_mock.AGENT_FUNCTION.get_computer_surface = AsyncMock(return_value=None)
         monkeypatch.setattr(agent_mod, "app", app_mock)
         monkeypatch.setattr(agent_mod.analytics, "capture", MagicMock())
         settled_contexts: list[object] = []
@@ -773,9 +775,10 @@ class TestStepBoundaryBrowserLoss:
         manager = RealBrowserManager()
         manager.pages[task.task_id] = browser_state  # type: ignore[assignment]
         monkeypatch.setattr(agent_mod.app, "BROWSER_MANAGER", manager)
+        monkeypatch.setattr(agent_mod.app.AGENT_FUNCTION, "get_computer_surface", AsyncMock(return_value=None))
         skyvern_context.set(SkyvernContext(task_id=task.task_id, organization_id=task.organization_id))
 
-        return ForgeAgent(), {"task": task, "step": step}
+        return ForgeAgent(), {"task": task, "step": step, "engine": RunEngine.skyvern_v1}
 
     @pytest.mark.asyncio
     async def test_cached_dead_browser_fails_the_step_before_it_starts(self, monkeypatch: pytest.MonkeyPatch) -> None:
