@@ -387,11 +387,12 @@ export class SkyvernBrowserPageAgent {
             // Check if the run is in a final state
             const status = run.status;
             if (
-                status === "completed" ||
-                status === "failed" ||
-                status === "terminated" ||
-                status === "timed_out" ||
-                status === "canceled"
+                (status === "completed" ||
+                    status === "failed" ||
+                    status === "terminated" ||
+                    status === "timed_out" ||
+                    status === "canceled") &&
+                !run.retry_pending
             ) {
                 return run;
             }
