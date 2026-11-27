@@ -1656,6 +1656,10 @@ async def test_run_task_does_not_schedule_run_created_hook_when_creation_fails(
         ("workflow", "/v1/otp-bound/run/agents", True, "otpr_test", {}, False, 501, "not supported"),
         ("task_v1", "/v1/renamed/run/tasks", True, None, {}, True, 400, "otp_request_id is required"),
         ("task_v1", "/v1/otp-bound/run/tasks", False, "otpr_test", {}, True, 400, "accepted only"),
+        *[
+            (kind, "/v1/run/tasks", False, None, {"extra_http_headers": {"X-Key": "***"}}, True, 422, "X-Key is masked")
+            for kind in ("task_v1", "task_v2")
+        ],
     ],
 )
 async def test_run_task_refuses_ambiguous_strict_admission_before_creation(
@@ -1752,6 +1756,18 @@ async def test_legacy_task_routes_schedule_run_created_hook(monkeypatch: pytest.
         x_user_agent=None,
         x_api_key="api-key",
     )
+    with pytest.raises(HTTPException, match="X-Key is masked") as masked:
+        await agent_protocol.run_task_v2(
+            request=pathless_request,
+            background_tasks=background_tasks,
+            caller=caller,
+            data=MagicMock(browser_session_id=None, otp_request_id=None, extra_http_headers={"X-Key": "***"}),
+            x_max_iterations_override=None,
+            x_max_steps_override=None,
+            x_user_agent=None,
+            x_api_key="api-key",
+        )
+    assert masked.value.status_code == 422
     agent_protocol.task_v2_service.initialize_task_v2.side_effect = OTPRequestAlreadyBoundError(
         owner_type="workflow_run", owner_id="wr_owner"
     )

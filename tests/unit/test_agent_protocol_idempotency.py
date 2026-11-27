@@ -1011,9 +1011,17 @@ _MASKED_HEADERS = {"X-Test": "***", "X-New": "***"}
         ("put", "extra_http_headers", {"value": None}, {}),
         ("put", "extra_http_headers", {"value": {}}, {}),
         ("put", "extra_http_headers", {"value": {"X-New": "new-value"}}, {"X-New": "new-value"}),
-        ("put", "extra_http_headers", {"value": _MASKED_HEADERS}, _MASKED_HEADERS),
+        (
+            "put",
+            "extra_http_headers",
+            {"value": {"X-Test": "***", "X-Keep": "v"}},
+            {"X-Test": "stored-value", "X-Keep": "v"},
+        ),
+        ("put", "extra_http_headers", {"value": _MASKED_HEADERS}, 422),
         ("json", "extra_http_headers", {}, {"X-Test": "stored-value"}),
-        ("json", "extra_http_headers", {"value": _MASKED_HEADERS}, _MASKED_HEADERS),
+        ("json", "extra_http_headers", {"value": {"X-Test": "***"}}, {"X-Test": "stored-value"}),
+        ("json", "extra_http_headers", {"value": _MASKED_HEADERS}, 422),
+        ("create", "extra_http_headers", {"value": {**_MASKED_HEADERS, "X-Keep": "v"}}, {"X-Keep": "v"}),
         *[
             (entrypoint, "extra_http_headers", supplied, expected)
             for entrypoint in ("auto_accept", "manual_accept", "legacy_proposal", "manual_accept_updated_headers")
@@ -1058,8 +1066,10 @@ async def test_workflow_setting_presence_preserves_persisted_values(
             **({field_name: supplied["value"]} if supplied else {}),
         }
         document = yaml.safe_dump(definition)
-        if entrypoint in {"put", "json"}:
-            if entrypoint == "put":
+        if entrypoint in {"put", "json", "create"}:
+            if entrypoint == "create":
+                response = await lab.client.post("/v1/workflows", json={"json_definition": definition})
+            elif entrypoint == "put":
                 response = await lab.client.put(
                     f"/api/v1/workflows/{stored.workflow_permanent_id}",
                     content=document,
@@ -1070,6 +1080,15 @@ async def test_workflow_setting_presence_preserves_persisted_values(
                     f"/v1/workflows/{stored.workflow_permanent_id}",
                     json={"json_definition": definition},
                 )
+            if expected == 422:
+                assert response.status_code == 422, response.text
+                assert "X-New" in response.text and "stored-value" not in response.text
+                latest = await lab.database.workflows.get_workflow_by_permanent_id(
+                    workflow_permanent_id=stored.workflow_permanent_id,
+                    organization_id=lab.organization.organization_id,
+                )
+                assert latest is not None and latest.extra_http_headers == {"X-Test": "stored-value"}
+                return
             assert response.status_code == 200, response.text
             saved_id = response.json()["workflow_id"]
         else:

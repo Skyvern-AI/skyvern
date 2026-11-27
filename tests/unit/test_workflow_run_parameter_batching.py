@@ -90,6 +90,7 @@ def _make_service_with_mocks(
     browser_profile_id: str | None = None,
     browser_type: str | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
+    extra_http_headers: dict[str, str] | None = None,
     definition_parameters: list | None = None,
 ) -> tuple[WorkflowService, SimpleNamespace, WorkflowRun]:
     """Helper to build a WorkflowService with mocked internals for setup_workflow_run tests."""
@@ -100,7 +101,7 @@ def _make_service_with_mocks(
         organization_id="org_test",
         proxy_location=None,
         webhook_callback_url=None,
-        extra_http_headers=None,
+        extra_http_headers=extra_http_headers,
         cdp_connect_headers=cdp_connect_headers,
         browser_profile_id=browser_profile_id,
         persist_browser_session=persist_browser_session,
@@ -1496,21 +1497,53 @@ async def test_setup_workflow_run_skips_browser_inheritance_for_fallback_retry()
 
 
 @pytest.mark.asyncio
-async def test_setup_workflow_run_inherits_browser_profile_for_normal_run() -> None:
+@pytest.mark.parametrize(
+    ("requested_extra_headers", "expected_extra_headers"),
+    [
+        (None, {"authorization": "Bearer workflow"}),
+        (
+            {"authorization": "***", "x-template": "{{ token }}"},
+            {"authorization": "Bearer workflow", "x-template": "{{ token }}"},
+        ),
+        ({"authorization": "***", "x-unknown": "***"}, 422),
+    ],
+    ids=["inherited", "masked-echo", "unknown-masked-key"],
+)
+async def test_setup_workflow_run_inherits_browser_profile_for_normal_run(
+    requested_extra_headers: dict[str, str] | None, expected_extra_headers: dict[str, str] | int
+) -> None:
     # The fallback-retry gate is conditional: a normal run (no retried_from) still inherits the
-    # workflow's configured browser profile / cdp headers.
+    # workflow's configured browser profile and headers; a masked extra header resolves to the workflow's value.
     service, organization, _ = _make_service_with_mocks(
         workflow_parameters=[],
         browser_profile_id="bp_workflow",
         cdp_connect_headers={"authorization": "Bearer workflow"},
+        extra_http_headers={"authorization": "Bearer workflow"},
     )
-    request = WorkflowRequestBody(data={}, browser_profile_id=None, browser_session_id=None, cdp_connect_headers=None)
+    request = WorkflowRequestBody(
+        data={},
+        browser_profile_id=None,
+        browser_session_id=None,
+        cdp_connect_headers=None,
+        extra_http_headers=requested_extra_headers,
+    )
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
+        if expected_extra_headers == 422:
+            with pytest.raises(SkyvernHTTPException, match="x-unknown") as rejected:
+                await service.setup_workflow_run(
+                    request_id="req_test",
+                    workflow_request=request,
+                    workflow_permanent_id="wpid_test",
+                    organization=organization,
+                )
+            assert rejected.value.status_code == 422
+            assert "Bearer workflow" not in str(rejected.value)
+            return
         await service.setup_workflow_run(
             request_id="req_test",
             workflow_request=request,
@@ -1520,6 +1553,7 @@ async def test_setup_workflow_run_inherits_browser_profile_for_normal_run() -> N
 
     assert request.browser_profile_id == "bp_workflow"
     assert request.cdp_connect_headers == {"authorization": "Bearer workflow"}
+    assert request.extra_http_headers == expected_extra_headers
 
 
 def _make_bitwarden_login_parameter(bitwarden_item_id: str | None) -> BitwardenLoginCredentialParameter:
