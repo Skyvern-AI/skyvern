@@ -18,13 +18,22 @@ from skyvern.forge.sdk.db.models import (
     TOTPCodeModel,
     WorkflowRunModel,
 )
-from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
+from skyvern.forge.sdk.encrypt.totp_fields import encrypt_totp_field, totp_code_digest
+from skyvern.forge.sdk.schemas.totp_codes import (
+    OTPType,
+    RawTOTPCode,
+    TOTPCode,
+    raw_totp_code_from_row,
+    totp_code_from_row,
+)
 from skyvern.utils.email_validation import SAFE_EMAIL_ADDRESS_PATTERN, normalize_email_address
 from skyvern.utils.phone_validation import looks_like_phone_identifier, phone_identifier_candidates
 
 _EXTERNAL_MESSAGE_DEDUPE_INDEX = "uq_totp_codes_org_external_message_id"
 _STRICT_CODE_DEDUPE_INDEX = "uq_totp_codes_strict_code"
 _STRICT_WEBHOOK_CODE_DEDUPE_INDEX = "uq_totp_codes_strict_webhook_code"
+_STRICT_CODE_DIGEST_DEDUPE_INDEX = "uq_totp_codes_strict_code_digest"
+_STRICT_WEBHOOK_CODE_DIGEST_DEDUPE_INDEX = "uq_totp_codes_strict_webhook_code_digest"
 _STRICT_WEBHOOK_SOURCE = "verification_url"
 _STRICT_IDENTIFIER_NAMESPACE = "strict:v1:"
 _STRICT_PARSED_STATUS = "strict_parsed"
@@ -45,28 +54,29 @@ def _is_duplicate_external_message(error: IntegrityError) -> bool:
 
 def _is_duplicate_strict_code(error: IntegrityError) -> bool:
     constraint_name = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
-    if constraint_name == _STRICT_CODE_DEDUPE_INDEX:
+    if constraint_name in (_STRICT_CODE_DEDUPE_INDEX, _STRICT_CODE_DIGEST_DEDUPE_INDEX):
         return True
     error_text = str(error.orig).lower()
+    sqlite_prefix = (
+        "unique constraint failed: totp_codes.organization_id, totp_codes.otp_request_id, totp_codes.totp_identifier, "
+    )
     return (
         _STRICT_CODE_DEDUPE_INDEX in error_text
-        or (
-            "unique constraint failed: totp_codes.organization_id, totp_codes.otp_request_id, "
-            "totp_codes.totp_identifier, totp_codes.code"
-        )
-        in error_text
+        # Also matches the code_digest index, whose column list shares this prefix.
+        or f"{sqlite_prefix}totp_codes.code" in error_text
     )
 
 
 def _is_duplicate_strict_webhook_code(error: IntegrityError) -> bool:
     constraint_name = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
-    if constraint_name == _STRICT_WEBHOOK_CODE_DEDUPE_INDEX:
+    if constraint_name in (_STRICT_WEBHOOK_CODE_DEDUPE_INDEX, _STRICT_WEBHOOK_CODE_DIGEST_DEDUPE_INDEX):
         return True
     error_text = str(error.orig).lower()
+    sqlite_prefix = "unique constraint failed: totp_codes.organization_id, totp_codes.otp_request_id, "
     return (
         _STRICT_WEBHOOK_CODE_DEDUPE_INDEX in error_text
-        or ("unique constraint failed: totp_codes.organization_id, totp_codes.otp_request_id, totp_codes.code")
-        in error_text
+        # Also matches the code_digest index, whose column list shares this prefix.
+        or f"{sqlite_prefix}totp_codes.code" in error_text
     )
 
 
@@ -283,6 +293,7 @@ class OTPRepository(BaseRepository):
                 totp_identifier=None,
                 content=content,
                 code=code,
+                code_digest=totp_code_digest(organization_id, code),
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 otp_request_id=otp_request_id,
@@ -423,7 +434,7 @@ class OTPRepository(BaseRepository):
             if limit is not None:
                 query = query.limit(limit)
             totp_codes = (await session.scalars(query)).all()
-            return [TOTPCode.model_validate(code) for code in totp_codes]
+            return [await totp_code_from_row(code) for code in totp_codes]
 
     @db_operation("get_otp_codes_by_run")
     async def get_otp_codes_by_run(
@@ -455,7 +466,7 @@ class OTPRepository(BaseRepository):
                 query = query.filter(TOTPCodeModel.task_id == task_id)
             query = query.order_by(TOTPCodeModel.created_at.desc()).limit(limit)
             results = (await session.scalars(query)).all()
-            return [TOTPCode.model_validate(r) for r in results]
+            return [await totp_code_from_row(r) for r in results]
 
     @db_operation("get_recent_otp_codes")
     async def get_recent_otp_codes(
@@ -494,7 +505,7 @@ class OTPRepository(BaseRepository):
             query = query.order_by(TOTPCodeModel.created_at.desc(), TOTPCodeModel.totp_code_id.desc())
             query = query.offset(offset).limit(limit)
             totp_codes = (await session.scalars(query)).all()
-            return [TOTPCode.model_validate(totp_code) for totp_code in totp_codes]
+            return [await totp_code_from_row(totp_code) for totp_code in totp_codes]
 
     @db_operation("count_otp_codes_since")
     async def count_otp_codes_since(
@@ -542,6 +553,7 @@ class OTPRepository(BaseRepository):
                 totp_identifier=stored_identifier,
                 content=content,
                 code=code,
+                code_digest=totp_code_digest(organization_id, code),
                 # These columns are FKs: a blank string from an API caller is "not set",
                 # but only NULL satisfies the constraint.
                 task_id=task_id or None,
@@ -557,7 +569,7 @@ class OTPRepository(BaseRepository):
             # The flush fills Python defaults and RETURNING brings back server defaults, so the row needs no
             # re-read; validate it before commit expires it.
             await session.flush()
-            totp_code = TOTPCode.model_validate(new_totp_code)
+            totp_code = await totp_code_from_row(new_totp_code)
             await session.commit()
             if otp_request_id is not None:
                 _restore_public_identifier(totp_code, totp_identifier)
@@ -597,6 +609,7 @@ class OTPRepository(BaseRepository):
                 totp_identifier=stored_identifier,
                 content=content,
                 code=code,
+                code_digest=totp_code_digest(organization_id, code),
                 task_id=task_id or None,
                 workflow_id=workflow_id or None,
                 workflow_run_id=workflow_run_id or None,
@@ -617,7 +630,7 @@ class OTPRepository(BaseRepository):
                     return None
                 raise
             await session.refresh(row)
-            totp_code = TOTPCode.model_validate(row)
+            totp_code = await totp_code_from_row(row)
             if otp_request_id is not None:
                 _restore_public_identifier(totp_code, totp_identifier)
             return totp_code
@@ -655,7 +668,7 @@ class OTPRepository(BaseRepository):
             )
             session.add(row)
             await session.flush()
-            raw_code = RawTOTPCode.model_validate(row)
+            raw_code = await raw_totp_code_from_row(row)
             await session.commit()
             if otp_request_id is not None:
                 _restore_public_identifier(raw_code, totp_identifier)
@@ -713,7 +726,7 @@ class OTPRepository(BaseRepository):
                     return None
                 raise
             await session.refresh(row)
-            raw_code = RawTOTPCode.model_validate(row)
+            raw_code = await raw_totp_code_from_row(row)
             if otp_request_id is not None:
                 _restore_public_identifier(raw_code, totp_identifier)
             return raw_code
@@ -755,7 +768,7 @@ class OTPRepository(BaseRepository):
             if limit is not None:
                 query = query.limit(limit)
             rows = (await session.scalars(query)).all()
-            return [RawTOTPCode.model_validate(row) for row in rows]
+            return [await raw_totp_code_from_row(row) for row in rows]
 
     @db_operation("get_other_run_otp_code_ids")
     async def get_other_run_otp_code_ids(
@@ -902,7 +915,7 @@ class OTPRepository(BaseRepository):
             row = (await session.scalars(query)).one_or_none()
             if row is None:
                 return None
-            claimed = TOTPCode.model_validate(row)
+            claimed = await totp_code_from_row(row)
             await session.commit()
             _restore_public_identifier(claimed, totp_identifier)
             return claimed
@@ -955,15 +968,25 @@ class OTPRepository(BaseRepository):
         otp_type: OTPType,
     ) -> TOTPCode | None:
         async with self.Session() as session:
+            fields_encrypted = await session.scalar(
+                select(TOTPCodeModel.fields_encrypted).where(
+                    TOTPCodeModel.totp_code_id == totp_code_id,
+                    TOTPCodeModel.organization_id == organization_id,
+                )
+            )
             query = (
                 update(TOTPCodeModel)
                 .where(
                     TOTPCodeModel.totp_code_id == totp_code_id,
                     TOTPCodeModel.organization_id == organization_id,
                     TOTPCodeModel.parse_status.in_(("raw", _STRICT_RAW_STATUS)),
+                    TOTPCodeModel.fields_encrypted.is_(True)
+                    if fields_encrypted
+                    else TOTPCodeModel.fields_encrypted.is_not(True),
                 )
                 .values(
-                    code=code,
+                    code=await encrypt_totp_field(code) if fields_encrypted else code,
+                    code_digest=totp_code_digest(organization_id, code),
                     otp_type=otp_type,
                     parse_status=case(
                         (TOTPCodeModel.otp_request_id.is_not(None), _STRICT_PARSED_STATUS),
@@ -978,6 +1001,6 @@ class OTPRepository(BaseRepository):
                 return None
             # Read the row before committing: commit expires the instance, and the
             # refetch it would trigger runs outside the async greenlet context.
-            promoted = TOTPCode.model_validate(row)
+            promoted = await totp_code_from_row(row)
             await session.commit()
             return promoted

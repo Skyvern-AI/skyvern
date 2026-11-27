@@ -27,7 +27,7 @@ from skyvern.forge.sdk.schemas.email_forwarding import (
     InboundEmail,
     InboundEmailCategory,
 )
-from skyvern.forge.sdk.schemas.totp_codes import RawTOTPCode
+from skyvern.forge.sdk.schemas.totp_codes import RawTOTPCode, raw_totp_code_from_row
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.utils.email_validation import normalize_email_address
 
@@ -715,7 +715,7 @@ class EmailForwardingRepository(BaseRepository):
                     )
                     session.add(raw_row)
                     await session.flush()
-                    raw_result = RawTOTPCode.model_validate(raw_row)
+                    raw_result = await raw_totp_code_from_row(raw_row)
                 inbound = OrganizationInboundEmailModel(
                     organization_id=organization_id,
                     forwarding_address_id=forwarding_address_id,

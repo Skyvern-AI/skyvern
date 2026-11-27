@@ -2,7 +2,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.db.models import Base, TOTPCodeModel
 
 # Columns that migrations added to tables an older local SQLite database already has. create_all only
 # creates missing tables, so an upgraded install needs each of these added here.
@@ -18,7 +18,10 @@ _SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("browser_profiles", "source_browser_session_id", "VARCHAR"),
     ("browser_profiles", "source_workflow_run_id", "VARCHAR"),
     ("artifacts", "download_filename", "VARCHAR"),
+    ("totp_codes", "code_digest", "VARCHAR"),
+    ("totp_codes", "fields_encrypted", "BOOLEAN"),
 )
+_SQLITE_ADDED_TOTP_INDEXES = frozenset({"uq_totp_codes_strict_code_digest", "uq_totp_codes_strict_webhook_code_digest"})
 
 
 def upgrade_sqlite_schema(connection: Connection) -> None:
@@ -28,6 +31,10 @@ def upgrade_sqlite_schema(connection: Connection) -> None:
     for table, column, column_type in _SQLITE_ADDED_COLUMNS:
         if table in tables and column not in {existing["name"] for existing in inspector.get_columns(table)}:
             connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"))
+    if "totp_codes" in tables:
+        for index in TOTPCodeModel.__table__.indexes:
+            if index.name in _SQLITE_ADDED_TOTP_INDEXES:
+                index.create(connection, checkfirst=True)
     if "organizations" in tables:
         connection.execute(
             text(
