@@ -88,6 +88,16 @@ export function credentialsWithActionFit(
   }));
 }
 
+// The Integrations page's account format: "Name (address)", or one of them when they match or one is missing.
+export function oauthAccountLabel(credential: {
+  credential_name: string;
+  email_address?: string | null;
+}): string {
+  const { credential_name: name, email_address: email } = credential;
+  if (!email || email === name) return name;
+  return name ? `${name} (${email})` : email;
+}
+
 export function isGoogleOAuthCredentialActive(
   credential: GoogleOAuthCredential,
 ): boolean {

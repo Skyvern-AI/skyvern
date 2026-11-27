@@ -35,6 +35,40 @@ export function isGenericActionAvailable(
   return action.inputs.properties?.credential_source?.const !== "nango";
 }
 
+const BUILT_IN_BLOCKS = {
+  send_email: "sendEmail",
+  email_inbox: "emailInbox",
+  file_download: "fileDownload",
+  file_upload: "fileUpload",
+  google_sheets_read: "googleSheetsRead",
+  google_sheets_write: "googleSheetsWrite",
+} as const;
+
+// An action that one of our blocks runs is added as that block, preset with the
+// action's pinned inputs, so the library's app rows and block rows open one editor.
+export function builtInBlockFor(action: IntegrationActionSpec) {
+  const blockType = action.runsVia?.startsWith("block:")
+    ? action.runsVia.slice("block:".length)
+    : "";
+  if (!Object.prototype.hasOwnProperty.call(BUILT_IN_BLOCKS, blockType)) {
+    return null;
+  }
+  const key = blockType as keyof typeof BUILT_IN_BLOCKS;
+  const pinned = Object.entries(action.inputs.properties ?? {}).filter(
+    ([, schema]) => schema.const !== undefined,
+  );
+  return {
+    blockType: key,
+    nodeType: BUILT_IN_BLOCKS[key],
+    data: Object.fromEntries(
+      pinned.map(([field, schema]) => [
+        field.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase()),
+        schema.const,
+      ]),
+    ),
+  };
+}
+
 export type IntegrationCatalogEntryWithActions = IntegrationCatalogEntry & {
   name: string;
   logo?: string;

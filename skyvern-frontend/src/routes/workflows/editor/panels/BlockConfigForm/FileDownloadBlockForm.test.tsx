@@ -354,12 +354,12 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     expect(navigationGoal.value).toBe("download the latest invoice");
   });
 
-  test("renders Download Target defaulted to Website without destination fields", () => {
+  test("renders Save files to defaulted to Keep in Skyvern without destination fields", () => {
     setFileDownloadNode("d1");
     render(<FileDownloadBlockForm blockId="d1" />);
 
-    expect(screen.getByText("Download Target")).toBeDefined();
-    expect(screen.getByText("Website")).toBeDefined();
+    expect(screen.getByText("Save files to")).toBeDefined();
+    expect(screen.getByText("Keep in Skyvern")).toBeDefined();
     expect(screen.queryByText("Prompt")).toBeNull();
     expect(screen.queryByText("S3 Bucket")).toBeNull();
     expect(screen.queryByText("Storage Account Name")).toBeNull();
@@ -713,7 +713,7 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     ).toBeDefined();
   });
 
-  test("keeps SFTP connection fields beside Download Target when SFTP is the destination", () => {
+  test("keeps SFTP connection fields beside Save files to when SFTP is the destination", () => {
     setFileDownloadNode("d1", {
       downloadTarget: "sftp",
       sftpSourcePath: "/reports/report.csv",

@@ -355,6 +355,8 @@ export type AddNodeProps = {
   // A step that leaves the graph in the same pass that adds this one.
   replacing?: string;
   integrationAction?: { integrationId: string; actionId: string };
+  // Fields merged into the new block's data, such as an app action's preset provider.
+  data?: Record<string, unknown>;
 };
 
 // eslint-disable-next-line react-refresh/only-export-components -- Exercise the production apply callback without mounting the entire workspace.
@@ -1644,6 +1646,7 @@ function Workspace({
     select = true,
     replacing,
     integrationAction,
+    data,
   }: AddNodeProps): string | undefined {
     if (refuseMutationDuringYamlCommit()) return;
     const newNodes: Array<AppNode> = [];
@@ -1679,6 +1682,9 @@ function Workspace({
     usedLabelsRef.current.add(newLabel);
     if (integrationAction && node.type === "integrationAction") {
       node.data = { ...node.data, ...integrationAction };
+    }
+    if (data && "data" in node) {
+      node.data = { ...node.data, ...data };
     }
 
     if (branch && "data" in node) {

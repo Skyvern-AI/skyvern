@@ -51,7 +51,11 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
       >
         <NodeHeader
           blockLabel={label}
+          blockTitle={
+            data.transport === "gmail" ? "Send Email · Gmail" : undefined
+          }
           editable={editable}
+          integrationLogo={data.transport === "gmail" ? "gmail" : undefined}
           nodeId={id}
           totpIdentifier={null}
           totpUrl={null}

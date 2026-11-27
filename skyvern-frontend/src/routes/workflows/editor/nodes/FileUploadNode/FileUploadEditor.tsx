@@ -76,7 +76,7 @@ function FileUploadEditorBody({
     <div data-testid="file-upload-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex items-center gap-2">
-          <Label className="text-sm text-muted-foreground">Storage Type</Label>
+          <Label className="text-sm text-muted-foreground">Save files to</Label>
           <HelpTooltip content={helpTooltips["fileUpload"]["storage_type"]} />
         </div>
         <Select
@@ -89,8 +89,8 @@ function FileUploadEditorBody({
           }
           disabled={!editable}
         >
-          <SelectTrigger className="nopan text-xs">
-            <SelectValue placeholder="Select storage type" />
+          <SelectTrigger className="nopan text-xs" aria-label="Save files to">
+            <SelectValue placeholder="Select where to save files" />
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="s3">Amazon S3</SelectItem>
@@ -316,6 +316,7 @@ function FileUploadEditorBody({
               value={googleCredentialId ?? ""}
               onChange={(value) => update({ googleCredentialId: value })}
               requiredScopes={GOOGLE_DRIVE_STEP_SCOPES}
+              showEmail
             />
           </div>
           <div className="space-y-2">

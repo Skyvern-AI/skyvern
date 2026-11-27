@@ -18,9 +18,11 @@ import {
 } from "@/hooks/useMicrosoftOAuthCredentials";
 
 import {
+  builtInBlockFor,
   integrationActionTitle,
   type IntegrationCatalogEntryWithActions,
 } from "../nodes/IntegrationActionNode/types";
+import { workflowBlockTitle } from "../nodes/types";
 import { appRowMeta, appRows, matchingAppActions } from "./appLibrary";
 import { useStudioPaneIds, useStudioPanes } from "../../studio/useStudioPanes";
 
@@ -124,51 +126,65 @@ function LibraryApps({ catalog, search, onAdd }: Props) {
       </div>
       {apps.map((row) => {
         const { entry } = row;
-        const hasActions = Boolean(entry.actions?.length);
+        const actions = entry.actions ?? [];
         const triggers = canOpenTriggers ? (entry.triggers ?? []) : [];
-        const expanded = triggers.length > 0 && expandedApp === entry.id;
+        const canExpand = actions.length + triggers.length > 0;
+        const expanded = canExpand && expandedApp === entry.id;
         return (
           <div
             key={entry.id}
             className="overflow-hidden rounded-sm bg-slate-elevation4"
           >
-            <div className="flex min-w-0">
-              <button
-                type="button"
-                disabled={!hasActions}
-                data-testid={`block-library-app-${entry.id}`}
-                className="flex min-w-0 flex-1 items-center gap-2 p-4 text-left enabled:hover:bg-slate-elevation5 disabled:cursor-default"
-                onClick={() => onAdd({ integrationId: entry.id, actionId: "" })}
-              >
-                <AppBadge name={entry.name} />
-                <div className="flex min-w-0 flex-1 flex-col gap-1">
-                  <span className="min-w-0 truncate text-base">
-                    {entry.name}
-                  </span>
-                  <span className="min-w-0 truncate text-xs text-slate-600 dark:text-slate-400">
-                    {appRowMeta(row)}
-                  </span>
-                </div>
-                {hasActions ? <PlusIcon className="size-6 shrink-0" /> : null}
-              </button>
-              {triggers.length ? (
-                <button
-                  type="button"
-                  aria-label={`${expanded ? "Hide" : "Show"} ${entry.name} triggers`}
-                  aria-expanded={expanded}
-                  className="px-4 hover:bg-slate-elevation5"
-                  onClick={() => setExpandedApp(expanded ? null : entry.id)}
-                >
-                  {expanded ? (
-                    <ChevronDownIcon className="size-4" />
-                  ) : (
-                    <ChevronRightIcon className="size-4" />
-                  )}
-                </button>
+            <button
+              type="button"
+              disabled={!canExpand}
+              aria-expanded={canExpand ? expanded : undefined}
+              data-testid={`block-library-app-${entry.id}`}
+              className="flex w-full min-w-0 items-center gap-2 p-4 text-left enabled:hover:bg-slate-elevation5 disabled:cursor-default"
+              onClick={() => setExpandedApp(expanded ? null : entry.id)}
+            >
+              <AppBadge name={entry.name} />
+              <div className="flex min-w-0 flex-1 flex-col gap-1">
+                <span className="min-w-0 truncate text-base">{entry.name}</span>
+                <span className="min-w-0 truncate text-xs text-slate-600 dark:text-slate-400">
+                  {appRowMeta(row)}
+                </span>
+              </div>
+              {canExpand ? (
+                expanded ? (
+                  <ChevronDownIcon className="size-4 shrink-0" />
+                ) : (
+                  <ChevronRightIcon className="size-4 shrink-0" />
+                )
               ) : null}
-            </div>
-            {expanded
-              ? triggers.map((trigger) => (
+            </button>
+            {expanded ? (
+              <>
+                {actions.map((action) => {
+                  const builtIn = builtInBlockFor(action);
+                  return (
+                    <button
+                      type="button"
+                      key={action.id}
+                      data-testid={`block-library-app-action-${entry.id}-${action.id}`}
+                      className="flex w-full min-w-0 items-center gap-2 border-t border-border py-2.5 pl-16 pr-4 text-left text-sm hover:bg-slate-elevation5 dark:border-slate-700"
+                      onClick={() =>
+                        onAdd({ integrationId: entry.id, actionId: action.id })
+                      }
+                    >
+                      <span className="min-w-0 flex-1 truncate">
+                        {action.name}
+                      </span>
+                      {builtIn ? (
+                        <span className="shrink-0 text-xs text-slate-600 dark:text-slate-400">
+                          {workflowBlockTitle[builtIn.blockType]} block
+                        </span>
+                      ) : null}
+                      <PlusIcon className="size-5 shrink-0" />
+                    </button>
+                  );
+                })}
+                {triggers.map((trigger) => (
                   <button
                     type="button"
                     key={trigger.id}
@@ -184,8 +200,9 @@ function LibraryApps({ catalog, search, onAdd }: Props) {
                     </span>
                     <PlusIcon className="size-5 shrink-0" />
                   </button>
-                ))
-              : null}
+                ))}
+              </>
+            ) : null}
           </div>
         );
       })}

@@ -15,6 +15,7 @@ import {
   getDefaultGoogleOAuthCredentialId,
   hasGoogleOAuthCredentialScopes,
   isGoogleOAuthCredentialActive,
+  oauthAccountLabel,
   useGoogleOAuthCredentials,
 } from "@/hooks/useGoogleOAuthCredentials";
 import { useOAuthCredentialAutoFill } from "@/routes/workflows/editor/hooks/useOAuthCredentialAutoFill";
@@ -35,7 +36,12 @@ type Props = {
   ariaLabel?: string;
   showEmail?: boolean;
   additionalAccounts?: {
-    options: Array<{ id: string; label: string; disabled?: boolean }>;
+    options: Array<{
+      id: string;
+      label: string;
+      description?: string;
+      disabled?: boolean;
+    }>;
     selectedId?: string;
     onSelect: (id: string) => void;
   };
@@ -301,7 +307,13 @@ function GoogleOAuthCredentialSelector({
             onValueChange={handlePickerValueChange}
             disabled={disabled}
           >
-            <SelectTrigger className="nopan text-xs" aria-label={ariaLabel}>
+            <SelectTrigger
+              className={
+                showEmail ? "nopan ph-no-capture text-xs" : "nopan text-xs"
+              }
+              data-private={showEmail ? "" : undefined}
+              aria-label={ariaLabel}
+            >
               <SelectValue placeholder="Select a Google account" />
             </SelectTrigger>
             <SelectContent
@@ -323,7 +335,7 @@ function GoogleOAuthCredentialSelector({
                     <p className="text-sm font-medium">
                       <SelectItemText>
                         {showEmail
-                          ? cred.email_address || cred.credential_name
+                          ? oauthAccountLabel(cred)
                           : cred.credential_name}
                       </SelectItemText>
                     </p>
@@ -333,14 +345,23 @@ function GoogleOAuthCredentialSelector({
               ))}
 
               {additionalAccounts?.options.map((account) => (
-                <SelectItem
+                <CustomSelectItem
                   key={account.id}
                   value={`${ADDITIONAL_PREFIX}${account.id}`}
                   disabled={account.disabled}
                   textValue={stripBidiIsolates(account.label)}
                 >
-                  {account.label}
-                </SelectItem>
+                  <div className="space-y-0.5">
+                    <p className="text-sm font-medium">
+                      <SelectItemText>{account.label}</SelectItemText>
+                    </p>
+                    {account.description ? (
+                      <p className="text-xs text-muted-foreground">
+                        {account.description}
+                      </p>
+                    ) : null}
+                  </div>
+                </CustomSelectItem>
               ))}
 
               <SelectItem value={SETTINGS_OPTION} disabled={!canAuthorize}>

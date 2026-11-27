@@ -296,6 +296,9 @@ function FileDownloadEditorBody({
   return (
     <div data-testid="file-download-block-form" className="space-y-4">
       <div className="space-y-4">
+        <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Get files
+        </div>
         <div className="space-y-2">
           <div className="flex gap-2">
             <Label className="text-xs text-tertiary-foreground">URL</Label>
@@ -356,6 +359,24 @@ function FileDownloadEditorBody({
             )
           )}
         </div>
+        {showGoogleDriveSourceAccount && (
+          <div className="space-y-2">
+            <div className="flex gap-2">
+              <Label className="text-xs text-tertiary-foreground">
+                Google Drive Source Account (Optional)
+              </Label>
+              <HelpTooltip content="Only applies when the URL above is a private Google Drive link: the file is fetched through this connected account instead of the browser." />
+            </div>
+            <GoogleOAuthCredentialSelector
+              nodeId={blockId}
+              value={googleCredentialId ?? ""}
+              onChange={(value) => update({ googleCredentialId: value })}
+              requiredScopes={GOOGLE_DRIVE_STEP_SCOPES}
+              showEmail
+              optional
+            />
+          </div>
+        )}
         {!hasSftpSource && (
           <>
             <div className="space-y-2">
@@ -409,9 +430,12 @@ function FileDownloadEditorBody({
           </>
         )}
 
+        <Separator />
         <div className="space-y-2">
           <div className="flex items-center gap-2">
-            <Label className="text-sm text-slate-400">Download Target</Label>
+            <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              Save files to
+            </div>
             <HelpTooltip
               content={helpTooltips["fileDownload"]["download_target"]}
             />
@@ -431,11 +455,11 @@ function FileDownloadEditorBody({
             }
             disabled={!editable}
           >
-            <SelectTrigger className="nopan text-xs">
-              <SelectValue placeholder="Select download target" />
+            <SelectTrigger className="nopan text-xs" aria-label="Save files to">
+              <SelectValue placeholder="Select where to save files" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="website">Website</SelectItem>
+              <SelectItem value="website">Keep in Skyvern</SelectItem>
               <SelectItem value="s3">AWS S3</SelectItem>
               <SelectItem value="azure">Azure Blob Storage</SelectItem>
               <SelectItem value="google_drive">Google Drive</SelectItem>
@@ -588,6 +612,7 @@ function FileDownloadEditorBody({
                 value={googleCredentialId ?? ""}
                 onChange={(value) => update({ googleCredentialId: value })}
                 requiredScopes={GOOGLE_DRIVE_STEP_SCOPES}
+                showEmail
               />
             </DestinationField>
             <DestinationField
@@ -607,21 +632,6 @@ function FileDownloadEditorBody({
         )}
 
         {downloadTarget === "sftp" && sftpConnectionFields}
-
-        {showGoogleDriveSourceAccount && (
-          <DestinationField
-            label="Google Drive Source Account (Optional)"
-            help="Only applies when the URL above is a private Google Drive link: the file is fetched through this connected account instead of the browser."
-          >
-            <GoogleOAuthCredentialSelector
-              nodeId={blockId}
-              value={googleCredentialId ?? ""}
-              onChange={(value) => update({ googleCredentialId: value })}
-              requiredScopes={GOOGLE_DRIVE_STEP_SCOPES}
-              optional
-            />
-          </DestinationField>
-        )}
 
         {downloadTarget !== "website" && (
           <DestinationField

@@ -145,7 +145,7 @@ export const nodeLibraryItems: Array<{
       />
     ),
     title: "Send Email Block",
-    description: "Send email notifications",
+    description: "Send from Skyvern or a Gmail account",
   },
   {
     nodeType: "loop",
@@ -221,7 +221,7 @@ export const nodeLibraryItems: Array<{
       />
     ),
     title: "Cloud Storage Block",
-    description: "Upload files to storage",
+    description: "Save files to Drive, S3, Azure or SFTP",
   },
   {
     nodeType: "fileDownload",
