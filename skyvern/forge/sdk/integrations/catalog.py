@@ -840,6 +840,14 @@ def has_native_gmail_credential(credentials: Sequence[GoogleOAuthCredentialBase]
     )
 
 
+def has_native_google_drive_credential(credentials: Sequence[GoogleOAuthCredentialBase]) -> bool:
+    """Whether any credential sits under the Google Drive entry, by the same placement the page and Copilot use."""
+    entries = _entries_for_provider("google")
+    return any(
+        _GOOGLE_DRIVE_ENTRY_ID in google_entry_ids_for_credential(credential, entries) for credential in credentials
+    )
+
+
 async def _google_accounts(organization_id: str) -> AccountsById:
     credentials = await google_oauth_service.get_visible_credentials_for_org(organization_id)
     entries = _entries_for_provider("google")

@@ -140,6 +140,11 @@ class CreateGoogleOAuthAuthorizeRequest(BaseModel):
         "its identity so workflows referencing it continue to work without edits.",
     )
     set_account: bool = False
+    native_only: bool = Field(
+        default=False,
+        description="The connection is for an action that runs only on a native Google account, so it is not "
+        "redirected to the Connected account that new connections otherwise use.",
+    )
 
 
 class GoogleOAuthAuthorizeResponse(BaseModel):
