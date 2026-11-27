@@ -67,6 +67,10 @@ class EmailOTPSourceContext:
     messages_evicted: bool = False
     # Set by the same list call as credential_ids, so it can lag a reconnect by one refresh interval.
     needs_reconnect_count: int = 0
+    # Set by a source a deployment adds, naming it in wait diagnostics; the built-in sources are named there.
+    label: str | None = None
+    # Set by a source whose access changed after the run started, so only a new run can read that inbox.
+    rerun_required: bool = False
     provider_state: dict[str, dict] = field(default_factory=dict)
 
     def has_seen_message(self, credential_id: str, message_id: str) -> bool:
