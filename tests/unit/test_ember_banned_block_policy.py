@@ -153,7 +153,7 @@ async def test_pre_hook_blocks_banned_types_case_and_whitespace_insensitive(bloc
 
     assert result is not None
     assert result["ok"] is False
-    assert "not available in the workflow copilot" in result["error"]
+    assert "not available in Ember" in result["error"]
     for alternative in ("navigation", "extraction", "validation", "login"):
         assert alternative in result["error"]
 
@@ -282,7 +282,7 @@ async def test_code_only_schema_pre_hook_rejects_table_entries(block_type: str, 
 
     assert result is not None
     assert result["ok"] is False
-    assert "not available in the workflow copilot" in result["error"]
+    assert "not available in Ember" in result["error"]
     assert _CODE_ONLY_REQUIRED_TEXT.get(block_type, "focused `code` blocks") in result["error"]
 
 

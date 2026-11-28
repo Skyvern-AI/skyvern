@@ -4929,10 +4929,10 @@ workflow_definition:
         )
 
         assert "An unexpected error occurred. Please try again." not in agent_result.user_response
-        assert "Copilot hit an internal error before it could finish this turn" in agent_result.user_response
+        assert "Ember hit an internal error before it could finish this turn" in agent_result.user_response
         assert "The workflow was not modified" in agent_result.user_response
         assert "reference cpe_" in agent_result.user_response
-        assert "copilot turn failed: unknown cpe_" in (agent_result.global_llm_context or "")
+        assert "ember turn failed: unknown cpe_" in (agent_result.global_llm_context or "")
         assert agent_result.updated_workflow is None
 
     def test_unexpected_error_exit_redacts_sensitive_identifiers(self) -> None:
@@ -4948,7 +4948,7 @@ workflow_definition:
         assert "https://example.com/private/path" not in agent_result.user_response
         assert "credential" not in agent_result.user_response.lower()
         assert "https://example.com" not in agent_result.user_response
-        assert "Copilot hit an internal error before it could finish this turn" in agent_result.user_response
+        assert "Ember hit an internal error before it could finish this turn" in agent_result.user_response
         assert "The workflow was preserved" in agent_result.user_response
         assert "reference cpe_" in agent_result.user_response
 
@@ -4970,7 +4970,7 @@ workflow_definition:
 
         assert "user@example.com" not in (agent_result.global_llm_context or "")
         assert "hunter2" not in (agent_result.global_llm_context or "")
-        assert "copilot turn failed: unknown cpe_" in (agent_result.global_llm_context or "")
+        assert "ember turn failed: unknown cpe_" in (agent_result.global_llm_context or "")
 
     def test_recoverable_failure_maps_expected_exception_families(self) -> None:
         assert (
@@ -5015,7 +5015,7 @@ workflow_definition:
         failure = build_recoverable_failure(wrapped, workflow_modified=False, internal_error_id="cpe_transport")
 
         assert failure.failure_kind == "external_dep"
-        assert failure.reason_summary == "A Copilot dependency stopped responding"
+        assert failure.reason_summary == "An Ember dependency stopped responding"
 
     def test_recoverable_failure_ignores_a_transient_inherited_from_the_previous_attempt(self) -> None:
         try:

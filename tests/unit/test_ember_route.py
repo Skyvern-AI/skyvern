@@ -3125,7 +3125,7 @@ async def test_flag_on_pre_agent_failure_persists_recoverable_reply(
     ]
     assert len(assistant_contents) == 1
     assert "An unexpected error occurred. Please try again." not in assistant_contents[0]
-    assert "Copilot hit an internal error before it could finish this turn" in assistant_contents[0]
+    assert "Ember hit an internal error before it could finish this turn" in assistant_contents[0]
     assert "The workflow was not modified" in assistant_contents[0]
     assert "reference cpe_" in assistant_contents[0]
 
@@ -3141,8 +3141,8 @@ async def test_flag_on_pre_agent_failure_persists_recoverable_reply(
 @pytest.mark.parametrize(
     ("error", "expected_summary"),
     [
-        (RuntimeError("route boom"), "Copilot hit an internal error before it could finish this turn"),
-        (LLMProviderError("OPENAI_GPT5_5"), "A Copilot dependency stopped responding"),
+        (RuntimeError("route boom"), "Ember hit an internal error before it could finish this turn"),
+        (LLMProviderError("OPENAI_GPT5_5"), "An Ember dependency stopped responding"),
     ],
 )
 async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
@@ -6542,7 +6542,7 @@ async def test_every_accept_refusal_after_the_claim_releases_it(
     if refusal.startswith("yaml_"):
         assert isinstance(exc_info.value, HTTPException)
         assert exc_info.value.status_code == 400
-        assert exc_info.value.detail.startswith("Proposed copilot YAML is invalid:")
+        assert exc_info.value.detail.startswith("Proposed Ember YAML is invalid:")
         assert "WorkflowCreateYAMLRequest" in exc_info.value.detail
     if refusal != "create_failed":
         create.assert_not_awaited()
@@ -9616,7 +9616,7 @@ async def test_a_database_outage_reaches_the_user_as_a_dependency_failure_not_an
     ]
     assert errors, "a persistent outage must still terminate the stream"
     assert "dependency stopped responding" in errors[-1]
-    assert "Copilot hit an internal error" not in errors[-1]
+    assert "Ember hit an internal error" not in errors[-1]
 
 
 @pytest.mark.asyncio
@@ -9659,7 +9659,7 @@ async def test_recovery_writes_exactly_one_assistant_row_naming_the_cause(
         if call.kwargs["sender"] == EmberChatSender.AI
     ]
     assert len(ai_rows) == 1
-    assert "Copilot hit an internal error" in ai_rows[0]["content"]
+    assert "Ember hit an internal error" in ai_rows[0]["content"]
 
 
 @pytest.mark.asyncio
