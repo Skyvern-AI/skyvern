@@ -112,6 +112,10 @@ Open the **Editor** pane. Blocks run top to bottom in the order shown.
 
 The library holds browser blocks (such as **Browser Task**, **Extraction** and **Login**), data blocks (such as **Text Prompt**, **File Parser** and **Code**), control flow (**Loop**, **Conditional**, **Wait**, **Terminate**) and integrations (**Send Email**, **HTTP Request**, **Google Sheets Read** and **Write**, and others). The [blocks reference](/reference/blocks) documents every block and its fields.
 
+Below the blocks, the **Apps** group lists the [integrations](/cloud/integrations) that offer actions: Gmail (**Read inbox**, **Send email**), Outlook (**Read inbox**), Google Sheets (**Read rows**, **Write rows**) and Google Drive (**Upload files**, **Save website downloads to Drive**, **List folder**, **Create subfolder**, **Move file** and **Download from Google Drive**). Apps with an account you have already connected come first, marked **Connected**. Click an app to show its actions, then click an action to insert it as a block. A search also matches app actions by app and action name, so `send email` finds Gmail's **Send email**. **Browse all apps** opens Integrations in a new tab.
+
+An app action block shows an **Account** picker with the app's connected accounts, followed by the action's own fields. In Google Drive actions, folder and file fields open a Drive picker. It runs the same way as the matching built-in block. Its label defaults to the app and action IDs, such as `gmail_send_email`, so later blocks read its output as `{{ gmail_send_email_output }}`.
+
 ### Configure a block
 
 Click a block to open its settings in the block config sidebar. Every block has a **Label**. The label also names the block's output, which later blocks read as `{{ <label>_output }}`.

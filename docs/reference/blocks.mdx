@@ -516,6 +516,8 @@ The model can always read this run's data (`read_run_data`), return its answer (
 
 A tool named after a block, such as **Browser Task** or **HTTP Request**, runs that block as an ordinary block and is billed as usual. **Go to URL**, **Click**, **Input Text** and **Extract Data** act on the run's current page. **Browser Task**, **File Download** and **Login** each start a separate browser agent that uses your organization's default step limit.
 
+App actions are tools too: Gmail **Read inbox** and **Send email**, Outlook **Read inbox**, Google Sheets **Read rows** and **Write rows**, and Google Drive **Upload files**. In the API and YAML `tools` list, each is named `<integration id>__<action id>`, such as `gmail__read_inbox` or `google_sheets__write_rows`, and Skyvern maps the retired `google_sheets_read` and `google_sheets_write` names to `google_sheets__read_rows` and `google_sheets__write_rows`. When the model calls an app action, it picks one of the run owner's accounts connected on [Integrations](/cloud/integrations), leaving out accounts known to lack the permission the action needs. An action that no connected account can run is not offered in that run. Power BI **Run DAX query** is not an Agent block tool, so run it as its own block before or after the Agent block.
+
 To sign in, check **Login** in Tools and add a credential to Inputs. Login is checked by default; it is offered to the model only when Inputs has a credential. Skyvern masks the run's registered secrets in the tool results the model reads and in the recorded tool calls. The answer is saved as the model returns it, so do not ask the model to return a secret.
 
 [Copilot](/cloud/studio#build-with-copilot) can add an Agent block to your agent and choose its Tools.
