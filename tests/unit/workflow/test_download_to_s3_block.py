@@ -29,8 +29,8 @@ async def test_download_to_s3_preserves_same_run_file_uri(
     workflow_run_context.has_parameter.return_value = False
     workflow_run_context.has_value.return_value = False
 
-    class FakeS3Client:
-        async def upload_file_from_path(self, *, uri: str, file_path: str) -> None:
+    class FakeStorage:
+        async def upload_managed_file_from_path(self, *, uri: str, file_path: str) -> None:
             if upload_fails:
                 raise RuntimeError("upload failed")
 
@@ -47,7 +47,7 @@ async def test_download_to_s3_preserves_same_run_file_uri(
     )
     monkeypatch.setattr(DownloadToS3Block, "get_workflow_run_context", lambda self, _: workflow_run_context)
     monkeypatch.setattr(DownloadToS3Block, "record_output_parameter_value", AsyncMock())
-    monkeypatch.setattr(DownloadToS3Block, "get_async_aws_client", lambda self: FakeS3Client())
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.app.STORAGE", FakeStorage())
     monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", lambda: None)
 
     if upload_fails:

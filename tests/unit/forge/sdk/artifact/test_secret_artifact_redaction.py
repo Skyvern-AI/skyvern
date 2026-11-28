@@ -21,7 +21,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.models import ArtifactModel
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
-from skyvern.utils import raw_secret_redaction
+from skyvern.utils import raw_secret_redaction, run_data_scrub
 from skyvern.utils.secret_redaction import (
     REDACTED_SECRET_PLACEHOLDER,
     REDACTION_FAILED_STUB,
@@ -529,7 +529,7 @@ def _strict_json(data: bytes) -> object:
 
 class _FakeStorage:
     def __init__(self) -> None:
-        self.stored: list[tuple[Artifact, bytes]] = []
+        self.stored: list[tuple[Artifact | None, bytes]] = []
 
     def build_uri(self, **_: object) -> str:
         return "s3://bucket/artifact"
@@ -616,6 +616,7 @@ def artifact_redaction_setup(
     [
         (ArtifactType.HTML_SCRAPE, b"<html>secret-value</html>", None),
         (ArtifactType.HASHED_HREF_MAP, b'{"h1": "https://example.test/callback?token=secret-value"}', None),
+        (ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP, b'{"el_1": "input[value=secret-value]"}', None),
         pytest.param(
             ArtifactType.HTML_SCRAPE,
             (_UNTOUCHED_PAGE + _CREDENTIALS_PAGE).encode(),
@@ -830,7 +831,9 @@ def artifact_redaction_setup(
     ],
 )
 @pytest.mark.parametrize("mask_secrets", [True, False])
-@pytest.mark.parametrize("write_path", ["create_artifact", "step_archive", "bundled_step_archive"])
+@pytest.mark.parametrize(
+    "write_path", ["create_artifact", "overwrite_artifact_data", "step_archive", "bundled_step_archive"]
+)
 async def test_create_artifact_redacts_textual_artifact_data(
     artifact_redaction_setup: _FakeStorage,
     monkeypatch: pytest.MonkeyPatch,
@@ -850,6 +853,11 @@ async def test_create_artifact_redacts_textual_artifact_data(
     if write_path == "create_artifact":
         await manager.create_artifact(step=step, artifact_type=artifact_type, data=data)
         await manager.wait_for_upload_aiotasks([step.task_id])
+    elif write_path == "overwrite_artifact_data":
+        artifact = await _FakeArtifactDatabase().create_artifact(
+            "a_overwrite", artifact_type, "s3://bucket/artifact", organization_id="o_1", workflow_run_id="wr_redact"
+        )
+        await manager.overwrite_artifact_data(artifact, data)
     else:
         manager._add_to_step_archive(
             manager._get_or_create_step_archive(step, None, None, None), "a", data, artifact_type
@@ -1123,7 +1131,7 @@ async def test_create_artifact_never_stores_raw_data_when_secret_lookup_fails(
         raise RuntimeError("scrub failed")
 
     if failure == "shape_scrub":
-        monkeypatch.setattr(artifact_manager_module, "redact_credential_shapes_from_bytes", failing_scrub)
+        monkeypatch.setattr(run_data_scrub, "redact_credential_shapes_from_bytes", failing_scrub)
     elif failure == "shape_scrub_budget":
         # A scan past its budget is withheld, so no input shape can hold the event loop.
         monkeypatch.setattr(raw_secret_redaction, "SCAN_BUDGET_BASE_SECONDS", -1.0)
@@ -1132,7 +1140,7 @@ async def test_create_artifact_never_stores_raw_data_when_secret_lookup_fails(
             artifact_manager_module.app.WORKFLOW_CONTEXT_MANAGER, "get_secret_values_for_run", failing_lookup
         )
     if failure == "lookup_and_har_scrub":
-        monkeypatch.setattr(artifact_manager_module, "redact_har_bytes", failing_scrub)
+        monkeypatch.setattr(run_data_scrub, "redact_har_bytes", failing_scrub)
     if failure == "lookup_with_redaction_switched_off":
         # With the switch off the run's opt-in is never read, so the failure has to come from that read.
         monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", False)

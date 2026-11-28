@@ -10,11 +10,11 @@ from unittest.mock import Mock
 import pytest
 
 from skyvern.config import settings
-from skyvern.forge.sdk.artifact import manager as artifact_manager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.utils import run_data_scrub
 from skyvern.utils import secret_redaction as secret_redaction_module
 from skyvern.utils.secret_redaction import (
     REDACTED_SECRET_PLACEHOLDER,
@@ -1095,8 +1095,8 @@ def test_artifact_redaction_exempts_the_runs_registered_placeholder_ids(
         mask_secrets=mask_secrets,
         secrets={"placeholder_ab12_password": "password"},
     )
-    monkeypatch.setattr(artifact_manager.app, "WORKFLOW_CONTEXT_MANAGER", manager)
-    monkeypatch.setattr(artifact_manager, "_RUNS_WARNED_MISSING_CONTEXT", {})
+    monkeypatch.setattr(run_data_scrub.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    monkeypatch.setattr(run_data_scrub, "_RUNS_WARNED_MISSING_CONTEXT", {})
     if context_removed:
         assert manager.remove_workflow_run_context_if_current(
             "wr_artifact", manager.workflow_run_contexts["wr_artifact"]
@@ -1104,12 +1104,12 @@ def test_artifact_redaction_exempts_the_runs_registered_placeholder_ids(
         assert manager.has_workflow_run_context("wr_artifact") is False
 
     with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_artifact")):
-        redacted = artifact_manager._maybe_redact_artifact_data(
+        redacted = run_data_scrub.scrub_run_bytes_sync(
             ArtifactType.LLM_PROMPT, b"type placeholder_ab12_password, never placeholder_password"
         )
 
     assert redacted == f"type placeholder_ab12_password, never placeholder_{REDACTED_SECRET_PLACEHOLDER}".encode()
-    assert artifact_manager._RUNS_WARNED_MISSING_CONTEXT == {}
+    assert run_data_scrub._RUNS_WARNED_MISSING_CONTEXT == {}
 
 
 def test_get_secret_values_for_run_returns_empty_when_global_flag_disabled(
@@ -1215,7 +1215,7 @@ def test_multi_box_artifact_retention_masks_representations_only_with_state(monk
                 hashlib.sha256(b"ABCDEF").hexdigest(), datetime.now(UTC), None, "Rejected"
             )
         monkeypatch.setattr(
-            artifact_manager,
+            run_data_scrub,
             "app",
             SimpleNamespace(
                 WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
@@ -1237,10 +1237,10 @@ def test_multi_box_artifact_retention_masks_representations_only_with_state(monk
                 .replace("ABC / — DEF", REDACTED_SECRET_PLACEHOLDER)
                 .encode()
             )
-            assert artifact_manager._maybe_redact_artifact_data(artifact_type, original) == expected
+            assert run_data_scrub.scrub_run_bytes_sync(artifact_type, original) == expected
             assert redact_secrets_from_bytes(original, set()) == expected
         sample = b"other-secret ABC DEF placeholder_abcdef"
-        assert artifact_manager._maybe_redact_artifact_data(ArtifactType.HTML_ACTION, sample) == (
+        assert run_data_scrub.scrub_run_bytes_sync(ArtifactType.HTML_ACTION, sample) == (
             b"[REDACTED_SECRET] ABC DEF placeholder_abcdef"
             if state == "none"
             else b"other-secret [REDACTED_SECRET] placeholder_abcdef"
@@ -1250,13 +1250,13 @@ def test_multi_box_artifact_retention_masks_representations_only_with_state(monk
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("multi_box", [False, True])
 def test_artifact_otp_floor_is_independent_of_credential_masking(monkeypatch, enabled: bool, multi_box: bool) -> None:
-    monkeypatch.setattr(artifact_manager.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", False)
+    monkeypatch.setattr(run_data_scrub.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", False)
     context = SkyvernContext(task_id="task")
     manager = SimpleNamespace(
         artifact_redaction_enabled=Mock(return_value=enabled),
         get_secret_values_for_run=Mock(return_value={"password-secret"}),
     )
-    monkeypatch.setattr(artifact_manager, "app", SimpleNamespace(WORKFLOW_CONTEXT_MANAGER=manager))
+    monkeypatch.setattr(run_data_scrub, "app", SimpleNamespace(WORKFLOW_CONTEXT_MANAGER=manager))
     with skyvern_context.scoped(context):
         if multi_box:
             skyvern_context.normalize_multi_field_totp_code("ABC-DEF", 6)
@@ -1264,9 +1264,9 @@ def test_artifact_otp_floor_is_independent_of_credential_masking(monkeypatch, en
         expected = data.replace(b"ABC DEF", b"[REDACTED_SECRET]") if multi_box else data
         if enabled:
             expected = expected.replace(b"password-secret", b"[REDACTED_SECRET]")
-        assert artifact_manager._maybe_redact_artifact_data(ArtifactType.HTML_ACTION, data) == expected
-        for artifact_type in (ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP, ArtifactType.BROWSER_SESSION_ACTION_LOG):
-            assert artifact_manager._maybe_redact_artifact_data(artifact_type, data) == (
+        assert run_data_scrub.scrub_run_bytes_sync(ArtifactType.HTML_ACTION, data) == expected
+        for artifact_type in (ArtifactType.EVAL_SCORE, ArtifactType.SCRIPT_FILE):
+            assert run_data_scrub.scrub_run_bytes_sync(artifact_type, data) == (
                 data.replace(b"ABC DEF", b"[REDACTED_SECRET]") if multi_box else data
             )
 
@@ -1274,10 +1274,10 @@ def test_artifact_otp_floor_is_independent_of_credential_masking(monkeypatch, en
 @pytest.mark.parametrize("spelling", ["ＡＢＣＤＥＦ", "A\nB\nC\nD\nE\nF"])
 @pytest.mark.parametrize("artifact_type", [ArtifactType.HAR, ArtifactType.LLM_RESPONSE])
 def test_json_artifact_masks_decoded_code_spellings(monkeypatch, spelling: str, artifact_type: ArtifactType) -> None:
-    monkeypatch.setattr(artifact_manager.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", False)
+    monkeypatch.setattr(run_data_scrub.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", False)
     context = SkyvernContext(task_id="task")
     monkeypatch.setattr(
-        artifact_manager,
+        run_data_scrub,
         "app",
         SimpleNamespace(
             WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
@@ -1294,7 +1294,7 @@ def test_json_artifact_masks_decoded_code_spellings(monkeypatch, spelling: str, 
     with skyvern_context.scoped(context):
         skyvern_context.normalize_multi_field_totp_code("ABC-DEF", 6)
         data = json.dumps(payload).encode()
-        retained = artifact_manager._maybe_redact_artifact_data(artifact_type, data)
+        retained = run_data_scrub.scrub_run_bytes_sync(artifact_type, data)
         parsed = json.loads(retained)
         value = (
             parsed["log"]["entries"][0]["response"]["content"]["text"]
@@ -1318,12 +1318,12 @@ def test_har_base64_content_keeps_representation_masking(monkeypatch, spelling: 
         ).encode()
         if entry == "artifact":
             monkeypatch.setattr(
-                artifact_manager.app.WORKFLOW_CONTEXT_MANAGER, "artifact_redaction_enabled", lambda _: False
+                run_data_scrub.app.WORKFLOW_CONTEXT_MANAGER, "artifact_redaction_enabled", lambda _: False
             )
             monkeypatch.setattr(
-                artifact_manager.app.WORKFLOW_CONTEXT_MANAGER, "runtime_secret_values_for_artifacts", lambda: set()
+                run_data_scrub.app.WORKFLOW_CONTEXT_MANAGER, "runtime_secret_values_for_artifacts", lambda: set()
             )
-            data = artifact_manager._maybe_redact_artifact_data(ArtifactType.HAR, data)
+            data = run_data_scrub.scrub_run_bytes_sync(ArtifactType.HAR, data)
         else:
             data = redact_har_bytes(data, set())
         content = json.loads(data)["log"]["entries"][0]["response"]["content"]

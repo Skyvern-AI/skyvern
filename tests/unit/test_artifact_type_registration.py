@@ -6,11 +6,12 @@ public enum literal in the vendored client."""
 import typing
 
 from skyvern.client.types.artifact_type import ArtifactType as ClientArtifactType
-from skyvern.forge.sdk.artifact.manager import _REDACTABLE_TEXT_ARTIFACT_TYPES, _SCREENSHOT_PREFIX_MAP
+from skyvern.forge.sdk.artifact.manager import _SCREENSHOT_PREFIX_MAP
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_TYPES
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP
 from skyvern.forge.sdk.routes.agent_protocol import _ARTIFACT_CONTENT_TYPES
+from skyvern.utils.run_data_scrub import REDACTABLE_TEXT_ARTIFACT_TYPES
 
 # Written through a path that builds its own URI (uploads bucket, eval ingest, session logs, cdp proxy
 # sink, legacy/deprecated values, the read-side sentinel) — not through build_uri's extension lookup.
@@ -50,7 +51,7 @@ def test_every_screenshot_type_is_sensitive_and_has_a_distinct_prefix() -> None:
 
 def test_every_html_type_is_redacted_and_served_as_html() -> None:
     html_types = [t for t in ArtifactType if t.value.startswith("html")]
-    assert [t for t in html_types if t not in _REDACTABLE_TEXT_ARTIFACT_TYPES] == []
+    assert [t for t in html_types if t not in REDACTABLE_TEXT_ARTIFACT_TYPES] == []
     # A filled-form document is at least as sensitive as its screenshot: same short URL expiry.
     assert ArtifactType.HTML_PRE_SUBMIT in SENSITIVE_ARTIFACT_TYPES
     assert [t for t in html_types if t in FILE_EXTENTSION_MAP and t not in _ARTIFACT_CONTENT_TYPES] == []

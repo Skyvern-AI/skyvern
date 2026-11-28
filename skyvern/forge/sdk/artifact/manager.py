@@ -1,7 +1,6 @@
 import asyncio
 import io
 import os
-import re
 import time
 import weakref
 import zipfile
@@ -27,7 +26,7 @@ from skyvern.forge.sdk.artifact.signing import (
     sign_artifact_url,
     verify_artifact_signature,
 )
-from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, artifact_filename_from_uri
+from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
 from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import generate_artifact_id
@@ -38,14 +37,11 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.services.artifact_reference_access import check_run_artifact_reference
 from skyvern.forge.sdk.services.request_reads import note_shared_artifact_links
-from skyvern.utils.secret_redaction import (
-    MIN_UNANCHORED_SECRET_LENGTH,
-    REDACTION_FAILED_STUB,
-    redact_credential_shapes_from_bytes,
-    redact_har_bytes,
-    redact_multi_field_totp_artifact_bytes,
-    redact_secrets_from_bytes,
-    redact_secrets_from_json_bytes,
+from skyvern.utils.run_data_scrub import (
+    credential_shape_scrub_inputs,
+    scrub_credential_shapes_of_entries,
+    scrub_run_bytes,
+    scrub_run_bytes_sync,
 )
 
 if TYPE_CHECKING:
@@ -93,275 +89,6 @@ _SCREENSHOT_PREFIX_MAP: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_FINAL: "screenshot_final",
     ArtifactType.SCREENSHOT_PRE_SUBMIT: "screenshot_pre_submit",
 }
-
-_REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
-    {
-        ArtifactType.HTML,
-        ArtifactType.HTML_SCRAPE,
-        ArtifactType.HTML_ACTION,
-        ArtifactType.HTML_PRE_SUBMIT,
-        ArtifactType.VISIBLE_ELEMENTS_TREE,
-        ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
-        ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
-        ArtifactType.LLM_PROMPT,
-        ArtifactType.LLM_REQUEST,
-        ArtifactType.LLM_RESPONSE,
-        ArtifactType.LLM_RESPONSE_PARSED,
-        ArtifactType.LLM_RESPONSE_RENDERED,
-        ArtifactType.BROWSER_CONSOLE_LOG,
-        ArtifactType.SKYVERN_LOG,
-        ArtifactType.SKYVERN_LOG_RAW,
-        ArtifactType.HASHED_HREF_MAP,
-    }
-)
-
-
-_JSON_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
-    artifact_type
-    for artifact_type in _REDACTABLE_TEXT_ARTIFACT_TYPES
-    if FILE_EXTENTSION_MAP.get(artifact_type) == "json"
-)
-
-
-# HARs take their own path through `_scrub_har`.
-_MULTI_FIELD_TOTP_TEXT_ARTIFACT_TYPES = _REDACTABLE_TEXT_ARTIFACT_TYPES | frozenset(
-    {
-        ArtifactType.BROWSER_SESSION_ACTION_LOG,
-        ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
-        ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
-        ArtifactType.VISIBLE_ELEMENTS_ID_XPATH_MAP,
-        ArtifactType.EVAL_SCORE,
-        ArtifactType.EVAL_TRAJECTORY,
-        ArtifactType.EVAL_RUBRICS,
-        ArtifactType.SCRIPT_FILE,
-    }
-)
-
-
-_RUNS_WARNED_MISSING_CONTEXT: TTLCache[str, bool] = TTLCache(maxsize=10_000, ttl=3600)
-
-
-def _warn_if_run_context_missing(artifact_type: ArtifactType, workflow_run_id: str | None) -> None:
-    # The run's Mask Secrets setting and secret values live only in its in-process context, so a write
-    # after the context is gone (or from another process) is stored as if the run had opted out.
-    # Warned once per run per process to bound log volume.
-    if (
-        not settings.ENABLE_SECRET_ARTIFACT_REDACTION
-        or workflow_run_id is None
-        or workflow_run_id in _RUNS_WARNED_MISSING_CONTEXT
-    ):
-        return
-    try:
-        if app.WORKFLOW_CONTEXT_MANAGER.redaction_inputs_for_run(workflow_run_id) is not None:
-            return
-    except Exception:
-        return
-    _RUNS_WARNED_MISSING_CONTEXT[workflow_run_id] = True
-    LOG.warning(
-        "No live run context; storing artifact without the run's secret scrub",
-        artifact_type=artifact_type,
-        workflow_run_id=workflow_run_id,
-    )
-
-
-def _all_runs_artifact_secret_values(artifact_type: ArtifactType, workflow_run_id: str | None) -> set[str]:
-    # Shorter values match on word boundaries and would rewrite ordinary words such as a short username;
-    # browser diagnostics keep the runtime-code floor they already had.
-    values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
-        workflow_run_id, respect_artifact_redaction_flag=False
-    )
-    long_values = {value for value in values if len(value) >= MIN_UNANCHORED_SECRET_LENGTH}
-    if artifact_type in (ArtifactType.HAR, ArtifactType.BROWSER_CONSOLE_LOG):
-        long_values |= app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-    return long_values
-
-
-def _resolve_redaction_workflow_run_id(workflow_run_id: str | None) -> str | None:
-    if workflow_run_id:
-        return workflow_run_id
-    context = skyvern_context.current()
-    return context.workflow_run_id if context else None
-
-
-def _placeholder_ids_for_run(workflow_run_id: str | None) -> frozenset[str]:
-    # The prompt/response artifacts are the record of what crossed the model boundary, which exempts
-    # the run's placeholder ids; scrubbing one here would make the record disagree. Read separately
-    # from the secret lookup: losing an exemption only widens the scrub, so it must not take the same
-    # bail-out that stops redacting altogether.
-    try:
-        return app.WORKFLOW_CONTEXT_MANAGER.registered_placeholder_ids_for_run(workflow_run_id)
-    except Exception:
-        return frozenset()
-
-
-def _har_redaction_inputs(workflow_run_id: str | None) -> tuple[set[str], frozenset[str]] | None:
-    """The secret values and placeholder ids for a HAR scrub, or None when the HAR is stored as is."""
-    try:
-        resolved_workflow_run_id = _resolve_redaction_workflow_run_id(workflow_run_id)
-        if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(resolved_workflow_run_id):
-            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
-        else:
-            _warn_if_run_context_missing(ArtifactType.HAR, resolved_workflow_run_id)
-            # Opted-out runs get the header, cookie and named-field scrub under the global switch, plus
-            # runtime-resolved secrets (e.g. verification codes) and, under the all-runs switch, long values.
-            if settings.ENABLE_SECRET_ARTIFACT_REDACTION and settings.ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS:
-                try:
-                    secret_values = _all_runs_artifact_secret_values(ArtifactType.HAR, resolved_workflow_run_id)
-                except Exception:
-                    LOG.warning("Secret lookup failed; storing HAR with the runtime-code scrub", exc_info=True)
-                    secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-            else:
-                secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-            if (
-                not settings.ENABLE_SECRET_ARTIFACT_REDACTION
-                and not secret_values
-                and not skyvern_context.multi_field_totp_masking_task_ids()
-            ):
-                return None
-    except Exception:
-        if not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
-            return None
-        # The header, cookie and named-field scrub needs no run data, so a failed lookup keeps it.
-        LOG.warning("Secret lookup failed; storing HAR with the name-based scrub only", exc_info=True)
-        return set(), frozenset()
-    return secret_values, _placeholder_ids_for_run(resolved_workflow_run_id)
-
-
-def _scrub_har(data: bytes, inputs: tuple[set[str], frozenset[str]] | None) -> bytes:
-    if skyvern_context.multi_field_totp_masking_task_ids():
-        data = redact_har_bytes(data, set())
-    if inputs is None:
-        return data
-    secret_values, placeholder_ids = inputs
-    started = time.thread_time()
-    try:
-        return redact_har_bytes(data, secret_values, multi_field_totp=False, placeholder_ids=placeholder_ids)
-    except Exception:
-        # Redaction was required and did not complete, so the HAR is withheld rather than stored raw.
-        _log_withheld("HAR scrub failed; withholding artifact data", ArtifactType.HAR, data, started)
-        return REDACTION_FAILED_STUB
-
-
-def _log_withheld(message: str, artifact_type: ArtifactType, data: bytes, started: float) -> None:
-    LOG.warning(
-        message,
-        artifact_type=artifact_type,
-        size_bytes=len(data),
-        cpu_seconds=round(time.thread_time() - started, 3),
-        exc_info=True,
-    )
-
-
-# An optional UTF-8 byte order mark, any amount of leading whitespace, then the document's first byte.
-_JSON_DOCUMENT_START_RE = re.compile(rb"(?:\xef\xbb\xbf)?\s*[\[{]")
-
-
-def _maybe_redact_artifact_data(
-    artifact_type: ArtifactType,
-    data: bytes,
-    workflow_run_id: str | None = None,
-    *,
-    scrub_credential_shapes: bool = True,
-) -> bytes:
-    """Async callers pass HARs through `_maybe_redact_artifact_data_off_loop` instead."""
-    if artifact_type == ArtifactType.HAR:
-        return _scrub_har(data, _har_redaction_inputs(workflow_run_id))
-    data = _redact_known_secret_values(artifact_type, data, workflow_run_id)
-    if not scrub_credential_shapes:
-        return data
-    return _scrub_credential_shapes(artifact_type, data, _credential_shape_scrub_inputs(artifact_type, workflow_run_id))
-
-
-def _credential_shape_scrub_inputs(artifact_type: ArtifactType, workflow_run_id: str | None) -> frozenset[str] | None:
-    """The run's placeholder ids to keep, or None when the artifact is stored without the credential shape scrub."""
-    if (
-        artifact_type not in _REDACTABLE_TEXT_ARTIFACT_TYPES
-        or not settings.ENABLE_SECRET_ARTIFACT_REDACTION
-        or not settings.ENABLE_ARTIFACT_CREDENTIAL_SHAPE_SCRUB
-    ):
-        return None
-    return _placeholder_ids_for_run(_resolve_redaction_workflow_run_id(workflow_run_id))
-
-
-def _scrub_credential_shapes(artifact_type: ArtifactType, data: bytes, placeholder_ids: frozenset[str] | None) -> bytes:
-    if placeholder_ids is None:
-        return data
-    started = time.thread_time()
-    try:
-        json_document = artifact_type in _JSON_TEXT_ARTIFACT_TYPES or _JSON_DOCUMENT_START_RE.match(data) is not None
-        return redact_credential_shapes_from_bytes(data, json_document=json_document, placeholder_ids=placeholder_ids)
-    except Exception:
-        _log_withheld("Credential shape scrub failed; withholding artifact data", artifact_type, data, started)
-        return REDACTION_FAILED_STUB
-
-
-def _scrub_credential_shapes_of_entries(
-    entries: dict[str, bytes], pending: dict[str, tuple[ArtifactType, frozenset[str]]]
-) -> dict[str, bytes]:
-    return {
-        filename: _scrub_credential_shapes(artifact_type, entries[filename], placeholder_ids)
-        for filename, (artifact_type, placeholder_ids) in pending.items()
-    }
-
-
-def _redact_known_secret_values(artifact_type: ArtifactType, data: bytes, workflow_run_id: str | None) -> bytes:
-    if artifact_type in _MULTI_FIELD_TOTP_TEXT_ARTIFACT_TYPES:
-        data = redact_multi_field_totp_artifact_bytes(data)
-    if artifact_type not in _REDACTABLE_TEXT_ARTIFACT_TYPES:
-        return data
-    started = time.thread_time()
-    try:
-        resolved_workflow_run_id = _resolve_redaction_workflow_run_id(workflow_run_id)
-        if not app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(resolved_workflow_run_id):
-            _warn_if_run_context_missing(artifact_type, resolved_workflow_run_id)
-            if settings.ENABLE_SECRET_ARTIFACT_REDACTION and settings.ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS:
-                secret_values = _all_runs_artifact_secret_values(artifact_type, resolved_workflow_run_id)
-            elif artifact_type == ArtifactType.BROWSER_CONSOLE_LOG:
-                # Runtime-resolved secrets (e.g. verification codes) still redact from browser
-                # diagnostics under the global switch alone, matching the workflow-finalization floor.
-                secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-            else:
-                return data
-            if not secret_values and not skyvern_context.multi_field_totp_masking_task_ids():
-                return data
-        else:
-            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
-    except Exception:
-        if not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
-            return data
-        # Without the run's settings it is unknown whether this artifact holds secrets, so it is withheld.
-        _log_withheld("Secret lookup failed; withholding artifact data", artifact_type, data, started)
-        return REDACTION_FAILED_STUB
-    placeholder_ids = _placeholder_ids_for_run(resolved_workflow_run_id)
-    if not secret_values and not skyvern_context.multi_field_totp_masking_task_ids():
-        return data
-    # A JSON artifact's root can be a bare number or string (a scalar extraction result).
-    if secret_values and (
-        artifact_type in _JSON_TEXT_ARTIFACT_TYPES or _JSON_DOCUMENT_START_RE.match(data) is not None
-    ):
-        scrubbed = redact_secrets_from_json_bytes(data, secret_values, placeholder_ids=placeholder_ids)
-        if scrubbed is not None:
-            return scrubbed
-    return redact_secrets_from_bytes(data, secret_values, multi_field_totp=False, placeholder_ids=placeholder_ids)
-
-
-_CREDENTIAL_SHAPE_SCRUB_THREAD_BYTES = 32 * 1024
-
-
-async def _maybe_redact_artifact_data_off_loop(
-    artifact_type: ArtifactType, data: bytes, workflow_run_id: str | None = None
-) -> bytes:
-    # A HAR can be tens of MB and its scrub parses and re-serializes the whole JSON. The run's secret
-    # sets are read on the event loop, which owns them; only the scrub runs in the thread.
-    if artifact_type == ArtifactType.HAR:
-        return await asyncio.to_thread(_scrub_har, data, _har_redaction_inputs(workflow_run_id))
-    data = _redact_known_secret_values(artifact_type, data, workflow_run_id)
-    placeholder_ids = _credential_shape_scrub_inputs(artifact_type, workflow_run_id)
-    # The scan holds the GIL inside each regex call, so the thread only lets the loop run between calls. Crafted input
-    # under this size was measured at 2.2 to 2.9 s of CPU per MB worst case, so it holds the loop under 0.1 s.
-    if placeholder_ids is not None and len(data) >= _CREDENTIAL_SHAPE_SCRUB_THREAD_BYTES:
-        return await asyncio.to_thread(_scrub_credential_shapes, artifact_type, data, placeholder_ids)
-    return _scrub_credential_shapes(artifact_type, data, placeholder_ids)
 
 
 def _read_file_bytes(path: str) -> bytes:
@@ -610,7 +337,7 @@ class ArtifactManager:
             path = None
 
         if data is not None:
-            data = await _maybe_redact_artifact_data_off_loop(artifact_type, data, workflow_run_id=workflow_run_id)
+            data = await scrub_run_bytes(artifact_type, data, workflow_run_id=workflow_run_id)
             file_size = len(data)
 
         if file_size is None:
@@ -1263,7 +990,7 @@ class ArtifactManager:
                 artifact_data.data = await asyncio.to_thread(_read_file_bytes, artifact_data.path)
                 artifact_data.path = None
             if artifact_data.data is not None:
-                artifact_data.data = await _maybe_redact_artifact_data_off_loop(
+                artifact_data.data = await scrub_run_bytes(
                     artifact_type,
                     artifact_data.data,
                     workflow_run_id=artifact_data.artifact_model.workflow_run_id,
@@ -1567,6 +1294,15 @@ class ArtifactManager:
         else:
             return None
 
+    async def overwrite_artifact_data(self, artifact: Artifact, data: bytes) -> None:
+        """Replace an artifact's stored bytes and wait for the write, unlike `update_artifact_data`."""
+        if artifact.artifact_type == ArtifactType.UNKNOWN:
+            # As in update_artifact_data: the row's redaction tier cannot be known, so nothing is written.
+            LOG.warning("Refusing to overwrite data of an artifact of unknown type", artifact_id=artifact.artifact_id)
+            return
+        data = await scrub_run_bytes(artifact.artifact_type, data, workflow_run_id=artifact.workflow_run_id)
+        await app.STORAGE.store_artifact(artifact, data)
+
     async def update_artifact_data(
         self,
         artifact_id: str | None,
@@ -1585,7 +1321,7 @@ class ArtifactManager:
             # This image cannot tell whether the row's type is redactable; fail closed, write nothing.
             LOG.warning("Refusing to update data of an artifact of unknown type", artifact_id=artifact_id)
             return None
-        data = await _maybe_redact_artifact_data_off_loop(
+        data = await scrub_run_bytes(
             ArtifactType(artifact.artifact_type),
             data,
             workflow_run_id=artifact.workflow_run_id,
@@ -2002,10 +1738,10 @@ class ArtifactManager:
         Returns the artifact_id (pre-generated or provided) so callers can link it
         in DB foreign keys (e.g. action.screenshot_artifact_id) before flush.
         """
-        acc.entries[filename] = _maybe_redact_artifact_data(
+        acc.entries[filename] = scrub_run_bytes_sync(
             artifact_type, data, workflow_run_id=acc.workflow_run_id, scrub_credential_shapes=False
         )
-        placeholder_ids = _credential_shape_scrub_inputs(artifact_type, acc.workflow_run_id)
+        placeholder_ids = credential_shape_scrub_inputs(artifact_type, acc.workflow_run_id)
         if placeholder_ids is None:
             acc.pending_credential_shape_scrubs.pop(filename, None)
         else:
@@ -2156,7 +1892,7 @@ class ArtifactManager:
         pending = accumulator.pending_credential_shape_scrubs
         while pending:
             originals = {filename: accumulator.entries[filename] for filename in pending}
-            scrubbed = await asyncio.to_thread(_scrub_credential_shapes_of_entries, originals, dict(pending))
+            scrubbed = await asyncio.to_thread(scrub_credential_shapes_of_entries, originals, dict(pending))
             for filename, data in scrubbed.items():
                 if accumulator.entries.get(filename) is originals[filename]:
                     accumulator.entries[filename] = data
@@ -2408,7 +2144,7 @@ class ArtifactManager:
             for _, (artifact_type, data) in entries.items():
                 # Callers redact before archiving, but route through the gate anyway (idempotent) so
                 # no archive path can persist an unredacted browser diagnostic.
-                data = await _maybe_redact_artifact_data_off_loop(artifact_type, data, resolved_workflow_run_id)
+                data = await scrub_run_bytes(artifact_type, data, resolved_workflow_run_id)
                 artifact_id = generate_artifact_id()
                 uri = app.STORAGE.build_uri(
                     organization_id=step.organization_id,
@@ -2456,9 +2192,7 @@ class ArtifactManager:
         )
 
         zip_entries = {
-            filename: await _maybe_redact_artifact_data_off_loop(
-                artifact_type, data, workflow_run_id=archive_artifact.workflow_run_id
-            )
+            filename: await scrub_run_bytes(artifact_type, data, workflow_run_id=archive_artifact.workflow_run_id)
             for filename, (artifact_type, data) in entries.items()
         }
         zip_bytes = await asyncio.to_thread(self._build_zip, zip_entries)

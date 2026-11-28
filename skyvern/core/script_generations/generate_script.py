@@ -4370,7 +4370,7 @@ async def create_or_update_script_block(
             if script_file and script_file.artifact_id:
                 artifact = await app.DATABASE.artifacts.get_artifact_by_id(script_file.artifact_id, organization_id)
                 if artifact:
-                    await app.STORAGE.store_artifact(artifact, block_code_bytes)
+                    await app.ARTIFACT_MANAGER.overwrite_artifact_data(artifact, block_code_bytes)
                     await app.DATABASE.scripts.update_script_file(
                         script_file_id=script_file.file_id,
                         organization_id=organization_id,

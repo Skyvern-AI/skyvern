@@ -168,7 +168,6 @@ from skyvern.forge import app
 from skyvern.forge.failure_classifier import CLASSIFIER_LABEL_REASON_CODES, FailureCategory, is_v3_stop_entry
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
-from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.files import (
     _sibling_filename,
     calculate_sha256_for_file,
@@ -2200,10 +2199,6 @@ class Block(BaseModel, abc.ABC):
                 workflow_permanent_id=workflow.workflow_permanent_id,
             )
             return None
-
-    @staticmethod
-    def get_async_aws_client() -> AsyncAWSClient:
-        return app.WORKFLOW_CONTEXT_MANAGER.aws_client
 
     @abc.abstractmethod
     async def execute(
@@ -12472,8 +12467,7 @@ class DownloadToS3Block(Block):
 
     async def _upload_file_to_s3(self, uri: str, file_path: str, cleanup_file: bool = True) -> None:
         try:
-            client = self.get_async_aws_client()
-            await client.upload_file_from_path(uri=uri, file_path=file_path)
+            await app.STORAGE.upload_managed_file_from_path(uri=uri, file_path=file_path)
         finally:
             # Clean up the temporary file since it's created with delete=False
             if cleanup_file:
@@ -12643,7 +12637,6 @@ class UploadToS3Block(Block):
         uploads_organization_id = _resolve_uploads_organization_id(organization_id)
         s3_uris = []
         try:
-            client = self.get_async_aws_client()
             # is the file path a file or a directory?
             if os.path.isdir(resolved_path):
                 attempt_started_at = await get_download_retry_started_at(
@@ -12673,11 +12666,11 @@ class UploadToS3Block(Block):
                 for file_path in file_paths:
                     s3_uri = self._get_s3_uri(uploads_organization_id, workflow_run_id, file_path)
                     s3_uris.append(s3_uri)
-                    await client.upload_file_from_path(uri=s3_uri, file_path=file_path)
+                    await app.STORAGE.upload_managed_file_from_path(uri=s3_uri, file_path=file_path)
             else:
                 s3_uri = self._get_s3_uri(uploads_organization_id, workflow_run_id, resolved_path)
                 s3_uris.append(s3_uri)
-                await client.upload_file_from_path(uri=s3_uri, file_path=resolved_path)
+                await app.STORAGE.upload_managed_file_from_path(uri=s3_uri, file_path=resolved_path)
         except Exception as e:
             LOG.exception("UploadToS3Block Failed to upload file to S3", file_path=self.path)
             raise e

@@ -762,6 +762,10 @@ class BaseStorage(ABC):
     ) -> list[FileInfo]:
         pass
 
+    async def upload_managed_file_from_path(self, *, uri: str, file_path: str) -> None:
+        # Same client as before the move, on every backend: self-hosted installs on local storage keep uploading.
+        await app.WORKFLOW_CONTEXT_MANAGER.aws_client.upload_file_from_path(uri=uri, file_path=file_path)
+
     @abstractmethod
     async def save_legacy_file(
         self, *, organization_id: str, filename: str, fileObj: BinaryIO
