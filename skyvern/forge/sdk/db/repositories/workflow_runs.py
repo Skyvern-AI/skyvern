@@ -2166,7 +2166,9 @@ class WorkflowRunsRepository(BaseRepository):
                     if failure_reason is None:
                         update_values["failure_reason"] = None
             if failure_reason:
-                update_values["failure_reason"] = failure_reason
+                update_values["failure_reason"] = scrub_run_text(
+                    failure_reason, workflow_run_ids[0] if len(workflow_run_ids) == 1 else None
+                )
 
             if not update_values:
                 return []

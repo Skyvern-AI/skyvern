@@ -1901,7 +1901,7 @@ class ScriptsRepository(BaseRepository):
         if reviewer_version is not None:
             values["reviewer_version"] = reviewer_version
         if error_message is not None:
-            values["error_message"] = sanitize_postgres_text(error_message)
+            values["error_message"] = sanitize_postgres_text(scrub_run_text(error_message))
         if classify_result is not None:
             values["classify_result"] = sanitize_postgres_text(classify_result)
         if new_script_revision_id is not None:

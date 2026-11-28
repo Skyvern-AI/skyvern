@@ -1302,7 +1302,50 @@ async def _scrub_fallback_episode_row(db: AgentDB, org: str) -> tuple[list[objec
     )
     stored = await db.scripts.get_fallback_episode(episode.episode_id, org)
     assert stored is not None
-    return [stored.error_message], []
+    skyvern_context.set(SkyvernContext(organization_id=org, workflow_run_id=_SCRUB_RUN_ID))
+    await db.scripts.update_fallback_episode(episode.episode_id, org, error_message=f"Retried {_RUN_SECRET}")
+    updated = await db.scripts.get_fallback_episode(episode.episode_id, org)
+    assert updated is not None
+    return [stored.error_message, updated.error_message], []
+
+
+async def _scrub_bulk_failure_rows(db: AgentDB, org: str) -> tuple[list[object], list[object]]:
+    pending = [TaskStatus.created, TaskStatus.queued, TaskStatus.running]
+    cascaded, sibling = [
+        await db.tasks.create_task(
+            url="https://example.test/",
+            title="Scrub",
+            navigation_goal=None,
+            data_extraction_goal=None,
+            navigation_payload=None,
+            organization_id=org,
+            workflow_run_id=_SCRUB_RUN_ID,
+        )
+        for _ in range(2)
+    ]
+    await db.tasks.bulk_update_tasks_by_workflow_run_ids(
+        [_SCRUB_RUN_ID], TaskStatus.failed, pending, failure_reason=f"Cascade after {_RUN_SECRET}"
+    )
+    # Before any context is set, so the single-run id argument is what scrubs it.
+    await db.workflow_runs.bulk_update_workflow_runs(
+        [_SCRUB_RUN_ID], WorkflowRunStatus.failed, f"Cleanup after {_RUN_SECRET}"
+    )
+    # Task ids carry no run id, so the run comes from the current context.
+    skyvern_context.set(SkyvernContext(organization_id=org, workflow_run_id=_SCRUB_RUN_ID))
+    second = await db.tasks.create_task(
+        url="https://example.test/",
+        title="Scrub",
+        navigation_goal=None,
+        data_extraction_goal=None,
+        navigation_payload=None,
+        organization_id=org,
+        workflow_run_id=_SCRUB_RUN_ID,
+    )
+    await db.tasks.bulk_update_tasks([second.task_id], TaskStatus.failed, f"Timed out on {_RUN_SECRET}", pending)
+    tasks = [await db.tasks.get_task(task.task_id, organization_id=org) for task in (cascaded, sibling, second)]
+    run = await db.workflow_runs.get_workflow_run(_SCRUB_RUN_ID)
+    assert all(task is not None for task in tasks) and run is not None
+    return [*(task.failure_reason for task in tasks if task), run.failure_reason], []
 
 
 async def _scrub_task_run_row(db: AgentDB, org: str) -> tuple[list[object], list[object]]:
@@ -1346,6 +1389,7 @@ _RUN_TEXT_WRITES: dict[str, Callable[[AgentDB, str], Awaitable[tuple[list[object
     "workflow_run_blocks": _scrub_block_row,
     "observer_thoughts": _scrub_thought_row,
     "script_fallback_episodes": _scrub_fallback_episode_row,
+    "bulk_failure_reasons": _scrub_bulk_failure_rows,
     "task_runs": _scrub_task_run_row,
     "task_generations": _scrub_task_generation_row,
 }
