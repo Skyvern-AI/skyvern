@@ -72,8 +72,22 @@ jobs:
       - name: Auto-merge PR
         env:
           GH_TOKEN: ${{ steps.set-token.outputs.GH_PAT }}
+          FALLBACK_GH_TOKEN: ${{ secrets.SKYVERN_CLOUD_GH_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          gh pr merge ${{ github.event.pull_request.number }} \
-            --squash \
-            --admin \
-            --repo "${{ github.repository }}"
+          if out=$(gh pr merge "$PR_NUMBER" --squash --admin --repo "$REPO" 2>&1); then
+            echo "$out"
+            exit 0
+          fi
+          echo "$out"
+          # The author's token shares its hourly API quota with everything else that account runs.
+          case "$out" in
+            *"rate limit"*)
+              echo "The author's token is rate limited; merging with the shared sync token instead."
+              GH_TOKEN="$FALLBACK_GH_TOKEN" gh pr merge "$PR_NUMBER" --squash --admin --repo "$REPO"
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
