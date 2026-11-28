@@ -266,6 +266,8 @@ A profile is a snapshot of a browser's state. Start a session or a run from it a
 
     The session uploads its state after it closes. Until the upload finishes, `create_browser_profile` returns `400` with "does not have a persisted profile archive"; retry for a few seconds. Any other `400` is final: the session wasn't set to save its state, or its state was already saved once. You can turn saving on for a live session with `update_browser_session(browser_session_id, generate_browser_profile=True)`.
 
+    A session used by runs of more than one agent can't be saved as one profile: `create_browser_profile` returns `409`. Several runs of the same agent are fine. Save the profile from one of those runs instead, with `workflow_run_id`.
+
     Other ways to get a profile:
 
     - **From an agent run**: turn on `persist_browser_session` in the agent definition (it is not a run parameter), run it, then call `create_browser_profile(name=..., workflow_run_id=...)`. Retry the same way while the state uploads.
