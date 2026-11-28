@@ -185,6 +185,11 @@ def a1_to_grid_range(a1: str, sheet_id: int) -> dict[str, int]:
     start_row = int(start_match.group(2)) - 1
     end_col = column_letters_to_index(end_match.group(1))
     end_row = int(end_match.group(2)) - 1
+    # A1 rows are 1-based. `_A1_CELL_RE` accepts "A0", which used to come back as
+    # startRowIndex=-1: the Sheets API rejects that grid range with a 400, and callers
+    # that treat startRowIndex as an origin would shift their merges by one row.
+    if start_row < 0 or end_row < 0:
+        raise ValueError(f"A1 rows are 1-based, got: {a1!r}")
     return {
         "sheetId": sheet_id,
         "startRowIndex": start_row,
