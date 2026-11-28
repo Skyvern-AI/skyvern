@@ -50,7 +50,13 @@ from ._workflow_http import (
     update_workflow_folder_raw,
     update_workflow_raw,
 )
-from .response import MCP_MAX_RESPONSE_BYTES, MCP_MAX_RESPONSE_CHARS, _response_size, within_response_limits
+from .response import (
+    MCP_MAX_RESPONSE_BYTES,
+    MCP_MAX_RESPONSE_CHARS,
+    _response_size,
+    _response_size_bytes,
+    within_response_limits,
+)
 
 LOG = structlog.get_logger()
 _SUMMARY_TOP_LEVEL_KEY_LIMIT = 8
@@ -431,6 +437,10 @@ _RUN_LIST_DETAILS_HINT = (
 
 
 _BLOCK_FAILURE_PREVIEW_COUNT = 3
+# A truncation marker is ~200 bytes, so shorter strings are never worth replacing.
+_MIN_MARKED_STRING_CHARS = 64
+# Outputs above this lose their long strings before any smaller output (a summary, a note) does.
+_LARGE_OUTPUT_BYTES = 10_000
 
 
 def _failed_block_rows(run: Any) -> list[dict[str, Any]]:
@@ -461,6 +471,104 @@ async def _block_screenshot_url(row: dict[str, Any]) -> str | None:
             if artifact.get("artifact_type") == artifact_type and not artifact.get("archived") and signed_url:
                 return str(signed_url)
     return None
+
+
+def _long_strings(outputs: dict[str, Any]) -> list[tuple[int, Any, Any, str]]:
+    """Every string inside ``outputs`` long enough to be worth a marker, as (size, container, key, output key)."""
+    found: list[tuple[int, Any, Any, str]] = []
+    stack: list[tuple[Any, Any, str]] = [(outputs, key, key) for key in outputs]
+    while stack:
+        container, key, output_key = stack.pop()
+        value = container[key]
+        if isinstance(value, str) and len(value) > _MIN_MARKED_STRING_CHARS:
+            found.append((_response_size_bytes(value), container, key, output_key))
+        elif isinstance(value, dict):
+            stack.extend((value, nested_key, output_key) for nested_key in value)
+        elif isinstance(value, list):
+            stack.extend((value, index, output_key) for index in range(len(value)))
+    return found
+
+
+def _truncation_marker(original_size: int, run_id: str) -> dict[str, Any]:
+    return {
+        "truncated": True,
+        "reason": "exceeded_mcp_response_size_limit",
+        "original_size_bytes": original_size,
+        "hint": f"Fetch the full output over the HTTP API at /v1/runs/{run_id}.",
+    }
+
+
+def _trim_outputs_to_fit(
+    outputs: dict[str, Any],
+    run_id: str,
+    untrimmed_size: int,
+    build_result: Callable[[dict[str, Any], str], dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Replace the largest values in ``outputs`` with markers until the built result fits, else None."""
+    trimmed_outputs = copy.deepcopy(outputs)
+    trimmed_keys: set[str] = set()
+
+    def _warning() -> str:
+        return (
+            f"Replaced values in output(s) {', '.join(k for k in outputs if k in trimmed_keys)} with "
+            f"truncation markers so the response fits the MCP response size limit "
+            f"({MCP_MAX_RESPONSE_CHARS} chars / {MCP_MAX_RESPONSE_BYTES} bytes). "
+            f"Fetch the full run over the HTTP API at /v1/runs/{run_id}."
+        )
+
+    def _marker_size(original_size: int) -> int:
+        return _response_size_bytes(_truncation_marker(original_size, run_id))
+
+    # Count the warning the trimmed result will carry; each newly trimmed key adds its name to it below.
+    estimated_size = untrimmed_size + _response_size_bytes(_warning())
+    original_sizes = {key: _response_size_bytes(value) for key, value in outputs.items()}
+    if estimated_size - sum(original_sizes.values()) > MCP_MAX_RESPONSE_BYTES:
+        return None
+    current_sizes = dict(original_sizes)
+    # What replacing each output's remaining long strings would still save, per output.
+    string_savings = dict.fromkeys(outputs, 0)
+    pending: list[tuple[int, int, Any, Any, str]] = []
+    for size, container, slot_key, output_key in _long_strings(trimmed_outputs):
+        saving = size - _marker_size(size)
+        if saving > 0:
+            pending.append((saving, size, container, slot_key, output_key))
+            string_savings[output_key] += saving
+    # Small outputs (a summary, a note) lose their strings only after every large output has.
+    pending.sort(key=lambda entry: (original_sizes[entry[4]] > _LARGE_OUTPUT_BYTES, entry[0]))
+    replaced_outputs: set[str] = set()
+
+    while True:
+        while pending and pending[-1][4] in replaced_outputs:
+            pending.pop()
+        # Long strings first, largest first, while replacing them could still make the response fit.
+        # Otherwise the bulk is many small values, so replace the output holding the most of it.
+        if pending and estimated_size - sum(string_savings.values()) <= MCP_MAX_RESPONSE_BYTES:
+            saving, size, container, slot_key, output_key = pending.pop()
+            container[slot_key] = _truncation_marker(size, run_id)
+            string_savings[output_key] -= saving
+            current_sizes[output_key] -= saving
+        else:
+            whole_savings = {
+                key: current_sizes[key] - _marker_size(original_sizes[key])
+                for key in outputs
+                if key not in replaced_outputs
+            }
+            worth_replacing = [key for key, whole_saving in whole_savings.items() if whole_saving > 0]
+            if not worth_replacing:
+                return None
+            output_key = max(worth_replacing, key=lambda key: current_sizes[key] - string_savings[key])
+            saving = whole_savings[output_key]
+            trimmed_outputs[output_key] = _truncation_marker(original_sizes[output_key], run_id)
+            replaced_outputs.add(output_key)
+            string_savings[output_key] = 0
+        if output_key not in trimmed_keys:
+            trimmed_keys.add(output_key)
+            estimated_size += len(output_key.encode()) + 2
+        estimated_size -= saving
+        if estimated_size <= MCP_MAX_RESPONSE_BYTES:
+            trimmed_result = build_result(trimmed_outputs, _warning())
+            if within_response_limits(trimmed_result):
+                return trimmed_result
 
 
 def _serialize_run_summary(run: Any) -> dict[str, Any]:
@@ -2415,6 +2523,25 @@ async def skyvern_workflow_status(
     )
     if within_response_limits(result):
         return result
+
+    # Replace the largest values first until the payload fits, so one oversized output (a whole
+    # parsed document, or one loop iteration's) does not take every small output down with it.
+    full_data = result["data"]
+    outputs = full_data.get("output")
+    if verbosity == "full" and isinstance(outputs, dict) and outputs:
+        fitting = _trim_outputs_to_fit(
+            outputs,
+            run_id,
+            _response_size_bytes(result),
+            lambda trimmed, warning: make_result(
+                "skyvern_workflow_status",
+                data={**full_data, "output": trimmed},
+                timing_ms=timer.timing_ms,
+                warnings=[warning, *status_warnings],
+            ),
+        )
+        if fitting:
+            return fitting
 
     # The generic size cap preserves only top-level `ok`/`error`/`*_id`, and this result
     # nests the run under `data` — so it would strip run_id and status and leave a polling
