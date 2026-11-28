@@ -4,6 +4,7 @@ import { SkyvernEnvironment } from "../environments.js";
 import { DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT } from "./constants.js";
 import type { SkyvernBrowser } from "./SkyvernBrowser.js";
 import { LOG } from "./logger.js";
+import { isRunSettled } from "./runStatus.js";
 
 function getAppUrlForRun(runId: string): string {
     return `https://app.skyvern.com/runs/${runId}`;
@@ -384,15 +385,7 @@ export class SkyvernBrowserPageAgent {
         while (true) {
             const run = await this._browser.skyvern.getRun(runId);
 
-            // Check if the run is in a final state
-            const status = run.status;
-            if (
-                status === "completed" ||
-                status === "failed" ||
-                status === "terminated" ||
-                status === "timed_out" ||
-                status === "canceled"
-            ) {
+            if (isRunSettled(run)) {
                 return run;
             }
 

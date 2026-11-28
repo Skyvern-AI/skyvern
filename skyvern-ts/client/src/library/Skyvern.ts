@@ -7,6 +7,7 @@ import { SkyvernEnvironment } from "../environments.js";
 import { SkyvernBrowser } from "./SkyvernBrowser.js";
 import type { GetRunResponse, ProxyLocation } from "../api/index.js";
 import { LOG } from "./logger.js";
+import { isRunSettled } from "./runStatus.js";
 import * as core from "../core/index.js";
 
 function _getBrowserSessionUrl(browserSessionId: string): string {
@@ -340,15 +341,7 @@ export class Skyvern extends SkyvernClient {
         while (true) {
             const run = await this.getRun(runId);
 
-            // Check if the run is in a final state
-            const status = run.status;
-            if (
-                status === "completed" ||
-                status === "failed" ||
-                status === "terminated" ||
-                status === "timed_out" ||
-                status === "canceled"
-            ) {
+            if (isRunSettled(run)) {
                 return run;
             }
 
