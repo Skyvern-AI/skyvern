@@ -354,7 +354,7 @@ Go to **Settings → Audit log**. Every Admin and Member can open it. Once your 
 - **Changes** lists organization configuration and membership activity, including who acted, the action, the resource and the time.
 - **Runs** lists top-level workflow runs, including when they were created, who started them and their trigger.
 
-Many change events are best effort: a successful change can lack a row if the audit store fails or times out. RBAC role, grant and RBAC settings changes write their audit events in the same transaction as the change. Ordinary workflow and credential reads are not audited, so a missing entry is not proof that no activity occurred.
+Many change events are best effort: a successful change can lack a row if the audit store fails or times out. RBAC role, grant and RBAC settings changes write their audit events in the same transaction as the change. Skyvern also records, on a best-effort basis, reads of run data and Copilot's use of a credential. Run data reads include downloading a run's artifacts and receiving links to a run's or browser session's artifacts, recordings and downloaded files. Other workflow and credential reads are not audited, so a missing entry is not proof that no activity occurred.
 
 Rows show who, what and when, where available. They are designed not to include request payloads, workflow parameter values or credential secrets; resource identifiers can include tag keys and values. Open **Details** on a row for more information.
 
