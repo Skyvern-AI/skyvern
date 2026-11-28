@@ -3992,6 +3992,9 @@ class RunContext:
                 if key not in self.parameters:
                     self.parameters[key] = value
         self.page = page
+        # Parameters the cached-input merge filled from a model answer, with the value it wrote. Each call may refill
+        # them (a loop child asks again per iteration); a key whose value changed since is someone else's and is kept.
+        self.model_filled_parameters: dict[str, str] = {}
         self.trace: list[ActionCall] = []
         # Store actions and results for step output (similar to agent flow)
         self.actions_and_results: list[tuple[Action, list[ActionResult]]] = []

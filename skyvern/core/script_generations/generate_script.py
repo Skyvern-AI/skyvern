@@ -11,7 +11,7 @@ import json
 import keyword
 import re
 import zlib
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
@@ -29,6 +29,7 @@ from skyvern.core.script_generations.constants import (
 from skyvern.core.script_generations.deterministic_field_naming import (
     infer_credential_subscript_for_emit,
     pick_credential_root_for_block,
+    sanitize_intention_to_field_name,
 )
 from skyvern.core.script_generations.generate_workflow_parameters import (
     CUSTOM_FIELD_ACTIONS,
@@ -544,6 +545,90 @@ def _build_value_to_param_lookup(
 
     # Sort by descending value length so longer matches are attempted first.
     return dict(sorted(raw.items(), key=lambda kv: len(kv[0]), reverse=True))
+
+
+def _typed_value_param_lookup(
+    workflow: dict[str, Any], run_parameters: dict[str, Any] | None, secret_param_keys: frozenset[str]
+) -> dict[str, str]:
+    # Only declared string and file URL parameters: a reference is passed to the page unconverted.
+    text_types = {WorkflowParameterType.STRING, WorkflowParameterType.FILE_URL}
+    text_keys: set[str] = set()
+    declared_keys: set[str] = set()
+    defn = workflow.get("workflow_definition") or {}
+    for param in (defn.get("parameters") or []) if isinstance(defn, dict) else []:
+        if isinstance(param, dict) and param.get("key"):
+            declared_keys.add(param["key"])
+            if param.get("workflow_parameter_type") in text_types:
+                text_keys.add(param["key"])
+    lookup = _build_value_to_param_lookup(
+        {}, workflow_parameters=run_parameters, declared_keys=frozenset(text_keys), secret_param_keys=secret_param_keys
+    )
+    # A value shared by two declared parameters of any type could belong to either field, so it stays a literal.
+    owners = Counter(
+        str(run_parameters[key])
+        for key in declared_keys - secret_param_keys
+        if run_parameters and key in run_parameters
+    )
+    return {value: key for value, key in lookup.items() if owners[value] == 1}
+
+
+def _reused_cached_task_ids(
+    blocks: list[dict[str, Any]],
+    task_v2_child_blocks: dict[str, list[dict[str, Any]]],
+    cached_blocks: dict[str, ScriptBlockSource],
+    updated_block_labels: set[str],
+) -> frozenset[str]:
+    """Task ids whose actions belong to a block this generation reuses from the cache, labelled as the save sites do."""
+    reused: set[str] = set()
+
+    def walk(level: list[dict[str, Any]]) -> None:
+        for block in level:
+            if block.get("block_type") == "task_v2":
+                label = block.get("label") or f"task_v2_{block.get('workflow_run_block_id')}"
+                if label in cached_blocks and label not in updated_block_labels:
+                    reused.update(
+                        child["task_id"] for child in task_v2_child_blocks.get(label, []) if child.get("task_id")
+                    )
+            elif block.get("block_type") in SCRIPT_TASK_BLOCKS and (task_id := block.get("task_id")):
+                label = block.get("label") or block.get("title") or task_id
+                if label in cached_blocks and label not in updated_block_labels:
+                    reused.add(task_id)
+            nested = block.get("loop_blocks")
+            if isinstance(nested, list):
+                walk(nested)
+
+    walk(blocks)
+    return frozenset(reused)
+
+
+def _reference_typed_values(
+    actions_by_task: dict[str, list[dict[str, Any]]],
+    literal_to_param: dict[str, str],
+    filled_keys: frozenset[str],
+    reused_task_ids: frozenset[str],
+) -> None:
+    # A synthesized field holds "" at run time and an unnamed action stores its value in the script. When the value
+    # an action entered equals one declared parameter's value, the action reads that parameter instead. A block reused
+    # from the cache keeps its names, as its cached code reads them.
+    for task_id, actions in actions_by_task.items():
+        if task_id in reused_task_ids:
+            continue
+        for act in actions:
+            if act.get("field_name") in filled_keys:
+                continue
+            action_type = act.get("action_type")
+            if action_type == ActionType.INPUT_TEXT:
+                value = act.get("text")
+            elif action_type == ActionType.UPLOAD_FILE:
+                value = act.get("file_url")
+            elif action_type == ActionType.SELECT_OPTION:
+                option = act.get("option")
+                value = (option.get("value") or option.get("label")) if isinstance(option, dict) else None
+            else:
+                continue
+            key = literal_to_param.get(value) if isinstance(value, str) else None
+            if key:
+                act["field_name"] = key
 
 
 def _escape_for_fstring_text(text: str) -> str:
@@ -3563,6 +3648,14 @@ async def generate_workflow_script_python_code(
         goal_template_by_task=goal_template_by_task,
     )
     actions_by_task = hydrate_input_text_actions_with_field_names(actions_by_task, field_mappings)
+    _reference_typed_values(
+        actions_by_task,
+        _typed_value_param_lookup(
+            workflow, workflow_run_request.get("parameters") if workflow_run_request else None, secret_param_keys
+        ),
+        declared_keys | upstream_keys | {sanitize_intention_to_field_name(key, fallback=key) for key in upstream_keys},
+        _reused_cached_task_ids(blocks, task_v2_child_blocks, cached_blocks, updated_block_labels),
+    )
 
     # Build a lookup from literal parameter values to field names so that click
     # prompt strings can be parameterized (e.g. patient ID → context.parameters[...]).
