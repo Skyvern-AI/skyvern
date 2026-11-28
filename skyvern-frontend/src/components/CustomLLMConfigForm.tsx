@@ -94,9 +94,7 @@ const configSchema = z
       });
     }
     if (
-      (value.provider === "openai_compatible" ||
-        value.provider === "openrouter" ||
-        value.provider === "gemini") &&
+      (value.provider === "openrouter" || value.provider === "gemini") &&
       !value.api_key
     ) {
       ctx.addIssue({
@@ -221,6 +219,8 @@ export function CustomLLMConfigForm() {
   });
   const provider = form.watch("config.provider");
   const isMutating = isCreating || isUpdating || isDeleting;
+  const apiKeyOptional =
+    provider === "ollama" || provider === "openai_compatible";
   const formControlsDisabled =
     isLoading || isMutating || !(editing ? canUpdate : canCreate);
 
@@ -463,7 +463,7 @@ export function CustomLLMConfigForm() {
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>
-                    API Key{provider === "ollama" ? " (optional)" : ""}
+                    API Key{apiKeyOptional ? " (optional)" : ""}
                   </FormLabel>
                   <div className="relative">
                     <FormControl>
@@ -471,9 +471,7 @@ export function CustomLLMConfigForm() {
                         {...field}
                         value={field.value ?? ""}
                         type={showApiKey ? "text" : "password"}
-                        placeholder={
-                          provider === "ollama" ? "optional" : "sk-..."
-                        }
+                        placeholder={apiKeyOptional ? "optional" : "sk-..."}
                         disabled={formControlsDisabled}
                       />
                     </FormControl>
@@ -493,6 +491,11 @@ export function CustomLLMConfigForm() {
                       )}
                     </Button>
                   </div>
+                  {provider === "openai_compatible" && (
+                    <FormDescription>
+                      Leave blank if your endpoint does not require an API key.
+                    </FormDescription>
+                  )}
                   <FormMessage />
                 </FormItem>
               )}
