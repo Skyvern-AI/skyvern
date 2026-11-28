@@ -1440,12 +1440,22 @@ async def _prepare_cached_block_inputs(cache_key: str, prompt: str | None, step_
     if not run_context:
         return
 
+    # A caller's input or an upstream output is never model-filled; a value this merge wrote earlier is asked again.
+    provided = {
+        key
+        for key, value in run_context.parameters.items()
+        if value and run_context.model_filled_parameters.get(key) != value
+    }
+    # Clear an earlier iteration's answer first, so a blank or failed answer leaves the field empty instead of stale.
+    for field_name in {name for _, name in action_entries if name and name not in provided}:
+        if run_context.model_filled_parameters.pop(field_name, None) is not None:
+            run_context.parameters[field_name] = ""
+    parameters = {key: str(value) for key, value in run_context.parameters.items() if value}
     try:
-        parameters = {key: str(value) for key, value in run_context.parameters.items() if value}
         serialized_params = json.dumps(parameters)
         field_prompts = []
         for action, field_name in action_entries:
-            if not field_name:
+            if not field_name or field_name in provided:
                 continue
             # A v3 row's reasoning is the whole turn's text, shared across the round — not a
             # per-field prompt; using it would give N fields one prompt naming all N. Its intention is
@@ -1493,9 +1503,10 @@ async def _prepare_cached_block_inputs(cache_key: str, prompt: str | None, step_
         ai_mode = _determine_action_ai_mode(action, merged_value)
         overrides[idx] = ai_mode
 
-        if ai_mode == "fallback" and field_name and isinstance(merged_value, str):
+        if ai_mode == "fallback" and field_name and field_name not in provided and isinstance(merged_value, str):
             # Seed the run context parameters with merged values for cached execution.
             run_context.parameters[field_name] = merged_value
+            run_context.model_filled_parameters[field_name] = merged_value
 
     # if overrides:
     #     context.action_ai_overrides[cache_key] = overrides

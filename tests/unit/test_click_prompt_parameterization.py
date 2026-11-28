@@ -6,9 +6,12 @@ replace literal parameter values with f-string references to context.parameters[
 so that re-runs with different values produce correct behavior.
 """
 
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import libcst as cst
+import pytest
 
 from skyvern.core.script_generations.generate_script import (
     MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB,
@@ -16,9 +19,14 @@ from skyvern.core.script_generations.generate_script import (
     _build_parameterized_prompt_cst,
     _build_value_to_param_lookup,
     _collect_secret_param_keys,
+    _reference_typed_values,
+    _typed_value_param_lookup,
 )
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.models.parameter import is_sensitive_workflow_parameter
-from skyvern.webeye.actions.actions import ActionType
+from skyvern.services import script_service
+from skyvern.webeye.actions.actions import ActionType, InputTextAction
 
 
 def _make_action(
@@ -521,23 +529,99 @@ class TestActionToStmtClickParameterization:
         assert "Click the submit button" in code
         assert "context.parameters" not in code
 
-    def test_fill_action_unaffected_by_value_to_param(self) -> None:
-        """Fill actions should still use the field_name mechanism, not value_to_param."""
-        act: dict[str, Any] = {
-            "action_type": "input_text",
-            "xpath": "//input[@name='search']",
-            "text": "542-641-668",
-            "field_name": "patient_id",
+    @pytest.mark.parametrize(
+        ("act", "parameters", "expected", "leaked"),
+        [
+            (
+                {"action_type": "input_text", "text": "542-641-668", "field_name": "patient_id"},
+                {"patient_id": "542-641-668"},
+                "context.parameters['patient_id']",
+                "542-641-668",
+            ),
+            (
+                {"action_type": "input_text", "text": "542-641-668"},
+                {"patient_id": "542-641-668"},
+                "context.parameters['patient_id']",
+                "542-641-668",
+            ),
+            (
+                {"action_type": "input_text", "text": "542-641-668", "field_name": "enter_the_patient_id"},
+                {"patient_id": "542-641-668", "visit_reason": "Annual checkup"},
+                "context.parameters['patient_id']",
+                "542-641-668",
+            ),
+            (
+                {"action_type": "input_text", "text": "INV-2026-0042", "field_name": "invoice_number"},
+                {"reference": "INV-2026-0042"},
+                "context.parameters['invoice_number']",
+                "INV-2026-0042",
+            ),
+            (
+                {"action_type": "select_option", "option": {"value": "Northwest Region"}},
+                {"region": "Northwest Region"},
+                "context.parameters['region']",
+                "Northwest Region",
+            ),
+            (
+                {"action_type": "upload_file", "file_url": "https://files.example.com/resume.pdf"},
+                {"resume": "https://files.example.com/resume.pdf"},
+                "context.parameters['resume']",
+                "resume.pdf",
+            ),
+            (
+                {"action_type": "input_text", "text": "Typed by hand"},
+                {"patient_id": "542-641-668"},
+                "Typed by hand",
+                None,
+            ),
+            ({"action_type": "input_text", "text": "abc"}, {"code": "abc"}, "'abc'", None),
+            (
+                {"action_type": "input_text", "text": "Jordan Lee"},
+                {"first_name": "Jordan Lee", "nickname": "Jordan Lee"},
+                "'Jordan Lee'",
+                None,
+            ),
+            ({"action_type": "input_text", "text": "51410020"}, {"account": "51410020"}, "'51410020'", None),
+            (
+                {"action_type": "input_text", "text": "51410020"},
+                {"zip_code": "51410020", "account": 51410020},
+                "'51410020'",
+                None,
+            ),
+            (
+                {"action_type": "input_text", "text": "Hunter-2026"},
+                {"secret_code": "Hunter-2026"},
+                "'Hunter-2026'",
+                None,
+            ),
+        ],
+    )
+    def test_typed_value_references_the_parameter_it_came_from(
+        self, act: dict[str, Any], parameters: dict[str, Any], expected: str, leaked: str | None
+    ) -> None:
+        act = {"xpath": "//input[@name='field']", **act}
+        types = {"account": "integer", "resume": "file_url"}
+        workflow = {
+            "workflow_definition": {
+                "parameters": [
+                    {"parameter_type": "workflow", "key": key, "workflow_parameter_type": types.get(key, "string")}
+                    for key in parameters
+                ]
+            }
         }
-        task: dict[str, Any] = {}
-        value_to_param = {"542-641-668": "patient_id"}
+        actions_by_task = {"t1": [act]}
+        _reference_typed_values(
+            actions_by_task,
+            _typed_value_param_lookup(workflow, parameters, frozenset({"secret_code"})),
+            frozenset(parameters) | {"invoice_number"},
+            frozenset(),
+        )
 
-        stmt = _action_to_stmt(act, task, value_to_param=value_to_param)
-        code = self._render(stmt)
+        code = self._render(_action_to_stmt(actions_by_task["t1"][0], {}))
 
-        # Should use context.parameters via the field_name mechanism, not f-string
-        assert "context.parameters" in code  # nosemgrep: incomplete-url-substring-sanitization
-        assert "patient_id" in code
+        assert expected in code
+        if leaked is not None:
+            assert leaked not in code
 
 
 # ---------------------------------------------------------------------------
@@ -693,3 +777,54 @@ class TestTurnScopedReasoningExcludedFromPrompts:
         stmt = _action_to_stmt(act, {}, value_to_param=None)
         code = self._render(stmt)
         assert "Click the submit button" in code
+
+
+@pytest.mark.asyncio
+async def test_cached_block_input_merge_never_overwrites_a_filled_parameter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller's input under a declared key keeps its value; a model-filled field is asked again on each call, as a
+    cached loop child does once per iteration."""
+    run_context = SimpleNamespace(
+        parameters={"patient_id": "542-641-668", "visit_note": ""}, model_filled_parameters={}
+    )
+    prompts: list[str] = []
+    answers = iter(["Annual checkup", "Follow-up visit", ""])
+
+    async def answer(prompt: str, **_: Any) -> dict[str, str]:
+        prompts.append(prompt)
+        return {"patient_id": "000-000-000", "visit_note": next(answers)}
+
+    database = SimpleNamespace(
+        scripts=SimpleNamespace(
+            get_script_block_by_label=AsyncMock(
+                return_value=SimpleNamespace(input_fields=["patient_id", "visit_note"], workflow_run_block_id="wrb_1")
+            )
+        ),
+        observer=SimpleNamespace(get_workflow_run_block=AsyncMock(return_value=SimpleNamespace(task_id="tsk_1"))),
+        tasks=SimpleNamespace(
+            get_task_actions_hydrated=AsyncMock(
+                return_value=[
+                    InputTextAction(element_id="e1", text="542-641-668", intention="Enter the patient ID"),
+                    InputTextAction(element_id="e2", text="Annual checkup", intention="Enter the visit note"),
+                ]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        script_service, "app", SimpleNamespace(DATABASE=database, SCRIPT_GENERATION_LLM_API_HANDLER=answer)
+    )
+    monkeypatch.setattr(script_service, "get_org_aware_secondary_llm_api_handler", lambda **_: answer)
+    monkeypatch.setattr(script_service.script_run_context_manager, "get_run_context", lambda: run_context)
+    skyvern_context.set(SkyvernContext(organization_id="o_1", script_revision_id="sr_1"))
+    try:
+        await script_service._prepare_cached_block_inputs("find_patient", "Look up patient 1")
+        assert run_context.parameters == {"patient_id": "542-641-668", "visit_note": "Annual checkup"}
+        await script_service._prepare_cached_block_inputs("find_patient", "Look up patient 2")
+        assert run_context.parameters == {"patient_id": "542-641-668", "visit_note": "Follow-up visit"}
+        await script_service._prepare_cached_block_inputs("find_patient", "Look up patient 3")
+    finally:
+        skyvern_context.reset()
+
+    assert run_context.parameters == {"patient_id": "542-641-668", "visit_note": ""}
+    assert len(prompts) == 3
+    assert "Follow-up visit" not in prompts[2]
+    assert all('"name": "patient_id"' not in prompt for prompt in prompts)

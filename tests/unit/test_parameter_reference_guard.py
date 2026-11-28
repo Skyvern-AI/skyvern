@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from skyvern.core.script_generations import generate_script as generate_script_module
 from skyvern.core.script_generations.generate_script import (
     ScriptBlockSource,
     _collect_declared_param_keys,
@@ -33,37 +34,26 @@ await page.fill(value=context.parameters['real'])
 """
 
 
-def test_guard_passes_when_all_refs_declared() -> None:
+@pytest.mark.parametrize(
+    ("code", "declared", "upstream", "synthesized"),
+    [
+        (SCRIPT_WITH_TWO_REFS, {"search_term", "other_key"}, set(), set()),
+        (SCRIPT_WITH_PHANTOM, set(), set(), {"preprint_search_term"}),
+        ("value=context.parameters['invoice_date']", set(), {"invoice_date"}, set()),
+    ],
+    ids=["declared", "synthesized", "upstream_schema"],
+)
+def test_guard_passes_when_every_ref_is_covered(
+    code: str, declared: set[str], upstream: set[str], synthesized: set[str]
+) -> None:
     result = validate_context_parameter_refs(
-        code=SCRIPT_WITH_TWO_REFS,
-        declared_param_keys=frozenset({"search_term", "other_key"}),
-        upstream_schema_keys=frozenset(),
-        synthesized_keys=frozenset(),
+        code=code,
+        declared_param_keys=frozenset(declared),
+        upstream_schema_keys=frozenset(upstream),
+        synthesized_keys=frozenset(synthesized),
     )
     assert result.valid
     assert result.undeclared_refs == []
-
-
-def test_guard_accepts_via_synthesized_keys() -> None:
-    """Phase 1: synthesized `GeneratedWorkflowParameters` fields count as valid."""
-    result = validate_context_parameter_refs(
-        code=SCRIPT_WITH_PHANTOM,
-        declared_param_keys=frozenset(),
-        upstream_schema_keys=frozenset(),
-        synthesized_keys=frozenset({"preprint_search_term"}),
-    )
-    assert result.valid
-
-
-def test_guard_accepts_via_upstream_schema() -> None:
-    code = "value=context.parameters['invoice_date']"
-    result = validate_context_parameter_refs(
-        code=code,
-        declared_param_keys=frozenset(),
-        upstream_schema_keys=frozenset({"invoice_date"}),
-        synthesized_keys=frozenset(),
-    )
-    assert result.valid
 
 
 def test_guard_detects_phantom_param_when_nothing_covers_it() -> None:
@@ -301,6 +291,69 @@ async def test_carried_forward_cached_block_does_not_fail_codegen() -> None:
     )
 
     assert CARRIED_FORWARD_FIELD in result.source_code
+
+
+REUSED_FIELD = "enter_the_patient_id"
+REUSED_BLOCK_CODE = f'''@skyvern.cached(cache_key="find_patient")
+async def find_patient(page, context):
+    await page.fill(
+        selector="xpath=//input[@id='pid']",
+        value=context.parameters["{REUSED_FIELD}"],
+        prompt="Enter the patient ID",
+    )
+'''
+
+
+@pytest.mark.asyncio
+async def test_partial_regeneration_keeps_the_field_names_of_a_reused_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A block reused from the cache keeps the input field its cached code reads; a regenerated one references the
+    parameter its typed value came from."""
+    saved: dict[str, list[str] | None] = {}
+
+    async def record_block(**kwargs: object) -> bool:
+        saved[str(kwargs["block_label"])] = kwargs.get("input_fields")  # type: ignore[assignment]
+        return True
+
+    monkeypatch.setattr(generate_script_module, "create_or_update_script_block", record_block)
+    typed = {"action_type": "input_text", "xpath": "//input[@id='pid']", "text": "542-641-668"}
+    result = await generate_workflow_script_python_code(
+        file_name="main.py",
+        workflow_run_request={"parameters": {"patient_id": "542-641-668"}},
+        workflow={
+            "workflow_permanent_id": "wpid_test",
+            "title": "patient lookup",
+            "workflow_definition": {
+                "parameters": [{"key": "patient_id", "parameter_type": "workflow", "workflow_parameter_type": "string"}]
+            },
+        },
+        blocks=[
+            {"block_type": "task", "label": label, "task_id": f"tsk_{label}", "workflow_run_block_id": f"wrb_{label}"}
+            | {"navigation_goal": "Enter the patient ID", "url": "https://example.com"}
+            for label in ("find_patient", "open_chart")
+        ],
+        actions_by_task={
+            "tsk_find_patient": [{**typed, "action_id": "act_1", "intention": "Enter the patient ID"}],
+            "tsk_open_chart": [{**typed, "action_id": "act_2", "intention": "Enter the patient ID"}],
+        },
+        cached_blocks={
+            "find_patient": ScriptBlockSource(
+                label="find_patient",
+                code=REUSED_BLOCK_CODE,
+                run_signature="await find_patient(page, context)",
+                workflow_run_id="wr_previous",
+                workflow_run_block_id="wrb_find_patient",
+                input_fields=[REUSED_FIELD],
+            )
+        },
+        updated_block_labels={"open_chart"},
+        script_id="s_1",
+        script_revision_id="sr_1",
+        organization_id="o_1",
+    )
+
+    assert saved["find_patient"] == [REUSED_FIELD]
+    assert saved["open_chart"] == ["patient_id"]
+    assert f'context.parameters["{REUSED_FIELD}"]' in result.source_code
 
 
 def test_collect_upstream_schema_keys_recurses_into_loop_blocks() -> None:
