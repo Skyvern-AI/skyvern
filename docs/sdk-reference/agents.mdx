@@ -1184,15 +1184,15 @@ Default: `None`
 </ParamField>
 
 <ParamField path={"created_at_start"} type={"datetime | None"}>
-Only include runs created at or after this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Supplying it replaces the 30-day default window of a free-text search_key.
+Only include runs created at or after this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Supplying it replaces the 30-day default window of a free-text search_key. In TypeScript, pass an ISO 8601 string; a value without an offset is read as UTC.
 
-Default: `None` · Python only
+Default: `None`
 </ParamField>
 
 <ParamField path={"created_at_end"} type={"datetime | None"}>
-Only include runs created strictly before this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Without created_at_start, a free-text search_key covers the 30 days before this time.
+Only include runs created strictly before this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Without created_at_start, a free-text search_key covers the 30 days before this time. In TypeScript, pass an ISO 8601 string; a value without an offset is read as UTC.
 
-Default: `None` · Python only
+Default: `None`
 </ParamField>
 
 **Returns** `list[WorkflowRun]` · TypeScript `Promise<WorkflowRun[]>`
