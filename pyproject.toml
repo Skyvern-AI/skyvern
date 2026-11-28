@@ -3,7 +3,7 @@ name = "skyvern"
 version = "1.0.58"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
-requires-python = ">=3.11,<3.15"
+requires-python = ">=3.11.5,<3.15"
 readme = "README.md"
 
 dependencies = [
