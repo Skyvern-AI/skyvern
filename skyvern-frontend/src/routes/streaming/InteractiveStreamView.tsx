@@ -192,6 +192,86 @@ function NavigableUrlBar({
   );
 }
 
+// Swapping an img's src can paint one empty frame while the new picture loads, which
+// flashes on every screencast frame. Each frame is decoded in the hidden back image and
+// only then raised, and the previous frame stays painted underneath when it is the same shape.
+function BufferedFrame({
+  src,
+  frameToken,
+  onFrameLoad,
+  className,
+}: {
+  src: string;
+  frameToken?: number;
+  onFrameLoad?: (token: number) => void;
+  className?: string;
+}) {
+  const firstRef = useRef<HTMLImageElement>(null);
+  const secondRef = useRef<HTMLImageElement>(null);
+  const frontRef = useRef(0);
+  const shownSrcRef = useRef<string | null>(null);
+  const busyRef = useRef(false);
+  const latestRef = useRef({ src, frameToken, onFrameLoad });
+  latestRef.current = { src, frameToken, onFrameLoad };
+
+  useEffect(() => {
+    if (busyRef.current) {
+      return;
+    }
+    busyRef.current = true;
+    void (async () => {
+      try {
+        // Loops so a frame that arrived mid-decode is picked up without a second pump.
+        while (latestRef.current.src !== shownSrcRef.current) {
+          const next = latestRef.current;
+          const front = (frontRef.current === 0 ? firstRef : secondRef).current;
+          const back = (frontRef.current === 0 ? secondRef : firstRef).current;
+          if (!front || !back) {
+            return;
+          }
+          shownSrcRef.current = next.src;
+          back.style.visibility = "hidden";
+          back.src = next.src;
+          try {
+            await back.decode?.();
+          } catch {
+            continue;
+          }
+          back.dataset.frameToken = String(next.frameToken ?? 0);
+          back.style.zIndex = "1";
+          back.style.visibility = "visible";
+          front.style.zIndex = "0";
+          // A differently shaped old frame would show around the new one in the letterbox bars.
+          if (
+            front.naturalWidth * back.naturalHeight !==
+            back.naturalWidth * front.naturalHeight
+          ) {
+            front.style.visibility = "hidden";
+          }
+          frontRef.current = 1 - frontRef.current;
+          next.onFrameLoad?.(next.frameToken ?? 0);
+        }
+      } finally {
+        busyRef.current = false;
+      }
+    })();
+  }, [src]);
+
+  return (
+    <div className={cn("relative overflow-hidden", className)}>
+      {[firstRef, secondRef].map((ref, index) => (
+        <img
+          key={index}
+          ref={ref}
+          alt=""
+          decoding="sync"
+          className="absolute inset-0 h-full w-full object-contain"
+        />
+      ))}
+    </div>
+  );
+}
+
 function InteractiveStreamView({
   streamImgSrc,
   streamFormat,
@@ -425,13 +505,12 @@ function InteractiveStreamView({
     return (
       <div className="flex h-full w-full flex-col">
         {currentUrl && <UrlBar url={currentUrl} />}
-        <img
+        <BufferedFrame
           src={imgDataUrl}
-          data-frame-token={frameToken}
-          onLoad={() => onFrameLoad?.(frameToken ?? 0)}
-          decoding="sync"
+          frameToken={frameToken}
+          onFrameLoad={onFrameLoad}
           className={cn(
-            "min-h-0 w-full flex-1 object-contain",
+            "min-h-0 w-full flex-1",
             currentUrl ? "rounded-b-md" : "rounded-md",
           )}
         />
