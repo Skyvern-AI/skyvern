@@ -31894,20 +31894,16 @@
             "description": "Author-facing identifier for a block; unique within a workflow."
           },
           "next_block_label": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "type": "string",
+            "nullable": true,
             "title": "Next Block Label",
             "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
-            "const": "while_loop",
+            "enum": [
+              "while_loop"
+            ],
             "title": "Block Type",
             "default": "while_loop"
           },
@@ -31920,15 +31916,9 @@
             "default": false
           },
           "model": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "type": "object",
+            "additionalProperties": true,
+            "nullable": true,
             "title": "Model"
           },
           "disable_cache": {
@@ -32140,7 +32130,9 @@
         "properties": {
           "block_type": {
             "type": "string",
-            "const": "while_loop",
+            "enum": [
+              "while_loop"
+            ],
             "title": "Block Type",
             "default": "while_loop"
           },
@@ -32150,14 +32142,8 @@
             "description": "Author-facing identifier; must be unique per workflow."
           },
           "next_block_label": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "type": "string",
+            "nullable": true,
             "title": "Next Block Label",
             "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
@@ -32167,15 +32153,9 @@
             "default": false
           },
           "model": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "type": "object",
+            "additionalProperties": true,
+            "nullable": true,
             "title": "Model"
           },
           "ignore_workflow_system_prompt": {
