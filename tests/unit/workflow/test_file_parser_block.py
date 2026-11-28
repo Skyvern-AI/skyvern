@@ -8,6 +8,7 @@ token truncation, and error handling for DOCX files.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import gc
 import gzip
 import json
@@ -3568,6 +3569,102 @@ def _block_from_yaml(**overrides: str) -> FileParserBlock:
     block = block_yaml_to_block(block_yaml, {"parse_workbook_output": _make_output_parameter("parse_workbook_output")})
     assert isinstance(block, FileParserBlock)
     return block
+
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+# (file name, raw bytes, rows the parser must return)
+_CSV_PARSE_CASES: list[tuple[str, bytes, list[dict[str, str]]]] = [
+    (
+        "emails.csv",
+        b"email\nana@x.com\nbo@y.com\ncy@z.com\n",
+        [{"email": "ana@x.com"}, {"email": "bo@y.com"}, {"email": "cy@z.com"}],
+    ),
+    ("names.csv", b"name\nAna Smith\nBo Jones\n", [{"name": "Ana Smith"}, {"name": "Bo Jones"}]),
+    ("names.tsv", b"name\nAna Smith\nBo Jones\n", [{"name": "Ana Smith"}, {"name": "Bo Jones"}]),
+    ("bom_comma.csv", _UTF8_BOM + b"name,email\nAna,ana@x.com\n", [{"name": "Ana", "email": "ana@x.com"}]),
+    ("bom_semicolon.csv", _UTF8_BOM + b"name;city\nAna;Paris\n", [{"name": "Ana", "city": "Paris"}]),
+    ("bom_one_column.csv", _UTF8_BOM + b"email\nana@x.com\n", [{"email": "ana@x.com"}]),
+    ("bom_non_ascii.csv", _UTF8_BOM + "name,city\nJosé,Zürich\n".encode(), [{"name": "José", "city": "Zürich"}]),
+    ("files.csv", b"file\na.pdf\nb.pdf\n", [{"file": "a.pdf"}, {"file": "b.pdf"}]),
+    ("accented.csv", "name\nJosé Núñez\nZoë Ågren\n".encode(), [{"name": "José Núñez"}, {"name": "Zoë Ågren"}]),
+    (
+        "bom_quoted_header.csv",
+        _UTF8_BOM + b'"name","email"\n"Ana","ana@x.com"\n',
+        [{"name": "Ana", "email": "ana@x.com"}],
+    ),
+    # Controls: files the parser already read correctly must not change.
+    ("spaces.csv", b"a b\n1 2\n3 4\n", [{"a": "1", "b": "2"}, {"a": "3", "b": "4"}]),
+    ("colons.csv", b"a:b\n1:2\n3:4\n", [{"a": "1", "b": "2"}, {"a": "3", "b": "4"}]),
+    ("caret.csv", b"a^b\n1^2\n3^4\n", [{"a": "1", "b": "2"}, {"a": "3", "b": "4"}]),
+    ("tilde.csv", b"a~b\n1~2\n3~4\n", [{"a": "1", "b": "2"}, {"a": "3", "b": "4"}]),
+    ("header_only.csv", b"email\n", []),
+    ("comma.csv", b"name,email\nAna,ana@x.com\n", [{"name": "Ana", "email": "ana@x.com"}]),
+    ("semicolon.csv", b"name;amount\nAna;1,50\n", [{"name": "Ana", "amount": "1,50"}]),
+    ("tabs.tsv", b"name\tcity\nAna\tParis\n", [{"name": "Ana", "city": "Paris"}]),
+    ("pipe.csv", b"name|city\nAna|Paris\n", [{"name": "Ana", "city": "Paris"}]),
+    ("quoted.csv", b'name,address\n"Ana","1 Main St, Apt 2"\n', [{"name": "Ana", "address": "1 Main St, Apt 2"}]),
+    ("urls.csv", b"url\nhttps://a.com/p\nhttps://b.com/q\n", [{"url": "https://a.com/p"}, {"url": "https://b.com/q"}]),
+    ("utf16.csv", "name,city\nJosé,Zürich\n".encode("utf-16"), [{"name": "José", "city": "Zürich"}]),
+]
+
+
+class TestCsvDelimiterAndEncoding:
+    """One-column files and UTF-8 BOM files parse to the rows a user sees in the file."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("file_name", "content", "expected_rows"), _CSV_PARSE_CASES, ids=[case[0] for case in _CSV_PARSE_CASES]
+    )
+    async def test_parse_csv_file_returns_the_rows_in_the_file(
+        self, tmp_path: Path, file_name: str, content: bytes, expected_rows: list[dict[str, str]]
+    ) -> None:
+        path = tmp_path / file_name
+        path.write_bytes(content)
+        block = _make_file_parser_block(f"https://example.com/{file_name}", FileType.CSV)
+
+        block.validate_file_type(block.file_url, str(path))
+
+        assert await block._parse_csv_file(str(path)) == expected_rows
+
+    @pytest.mark.asyncio
+    async def test_execute_outputs_every_row_of_a_one_column_excel_export(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "emails.csv"
+        path.write_bytes(_UTF8_BOM + b"email\nana@x.com\nbo@y.com\n")
+        block = _make_file_parser_block("https://example.com/emails.csv", FileType.CSV)
+        monkeypatch.setattr(settings, "FILE_PARSER_SERVICE_TARGET", "")
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == [{"email": "ana@x.com"}, {"email": "bo@y.com"}]
+
+    @pytest.mark.parametrize("bom", [_UTF8_BOM, codecs.BOM_UTF16_LE], ids=["utf8", "utf16"])
+    def test_bom_only_file_is_rejected_as_empty(self, tmp_path: Path, bom: bytes) -> None:
+        """A BOM with no text is an empty file, as a 0-byte file already is."""
+        path = tmp_path / "empty.csv"
+        path.write_bytes(bom)
+        block = _make_file_parser_block("https://example.com/empty.csv", FileType.CSV)
+
+        with pytest.raises(InvalidFileType, match="File is empty"):
+            block.validate_file_type(block.file_url, str(path))
+
+    def test_csv_fallback_facts_count_one_column(self, tmp_path: Path) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"email\nana@x.com\nbo@y.com\ncy@z.com\n")
+        block = _make_file_parser_block("https://example.com/export", FileType.AUTO_DETECT)
+
+        with structlog.testing.capture_logs() as logs:
+            detected = block._detect_file_type_from_url(block.file_url, file_path=str(path))
+
+        assert detected == FileType.CSV
+        (event,) = _events(logs, CSV_FALLBACK_EVENT)
+        assert event["delimiter"] == ","
+        assert event["delimiter_sniffed"] is False
+        assert event["column_count"] == 1
+        assert event["consistent_columns"] is True
 
 
 class TestFileParserWorksheetSelector:

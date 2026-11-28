@@ -15367,8 +15367,6 @@ class FileParserBlock(Block):
     _CSV_SNIFF_LINES = 5
     _CSV_BINARY_PREFIX_BYTES = 4096
     _CSV_UTF_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)
-    # Unrestricted, csv.Sniffer picks a letter as the delimiter of a one-column file.
-    _CSV_DELIMITERS = ",\t;|:"
     # Shape checks on the head of a file that reached the CSV fallback (log only; detection is unchanged).
     _FALLBACK_SNIFF_BYTES: ClassVar[int] = 8192
     _FALLBACK_SNIFF_ROWS: ClassVar[int] = 20
@@ -15552,7 +15550,10 @@ class FileParserBlock(Block):
             return
         facts["sampled_rows"] = len(rows) - 1
         try:
-            delimiter = csv.Sniffer().sniff("".join(rows), delimiters=self._CSV_DELIMITERS).delimiter
+            delimiter = csv.Sniffer().sniff("".join(rows)).delimiter
+            # Same guard as _sniff_csv_delimiter, so the logged shape matches what the parser reads.
+            if delimiter.isalnum():
+                raise csv.Error("Could not determine delimiter")
             facts["delimiter_sniffed"] = True
         except csv.Error:
             # Same fallback the CSV parser applies when the sniffer gives up (see _sniff_csv_delimiter).
@@ -15669,7 +15670,10 @@ class FileParserBlock(Block):
             raise csv.Error("File is empty")
 
         try:
-            delimiter = csv.Sniffer().sniff(sample, delimiters=self._CSV_DELIMITERS).delimiter
+            delimiter = csv.Sniffer().sniff(sample).delimiter
+            # The sniffer can pick a letter or digit as the delimiter of a one-column file ("email" -> "m").
+            if delimiter.isalnum():
+                raise csv.Error("Could not determine delimiter")
         except csv.Error:
             delimiter = "\t" if file_path.lower().endswith(".tsv") else ","
         return delimiter, encoding
