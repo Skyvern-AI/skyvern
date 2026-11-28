@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -47,6 +48,7 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import retry_policy as retry_policy_module
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import RETRY_DECISION_GRACE_SECONDS, RetryDecision, mark_attempt_started
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -55,6 +57,8 @@ from skyvern.schemas.run_enums import WebhookDeliveryStatus
 from skyvern.services import orphaned_run_reaper
 from skyvern.services import workflow_schedule_service as schedule_service_module
 from skyvern.services.webhook_delivery import PreparedWorkflowWebhook
+from skyvern.utils import run_data_scrub
+from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from tests.unit.conftest import SqliteEngineFactory
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -3207,6 +3211,9 @@ async def test_no_policy_initializer_failure_fails_the_run_durably(
     [
         "duplicate",
         "terminal_reread",
+        "scrubbed_reread",
+        "withheld_reread",
+        "foreign_withheld_reread",
         "foreign_terminal",
         "nonfinal_reread",
         "reread_failure",
@@ -3215,7 +3222,10 @@ async def test_no_policy_initializer_failure_fails_the_run_durably(
     ],
 )
 async def test_fail_run_without_attempt_row_finalization_outcomes(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, scenario: str
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+    scenario: str,
 ) -> None:
     run = SimpleNamespace(
         workflow_run_id="wr_test", status=WorkflowRunStatus.failed, failure_reason="initialization failed"
@@ -3238,6 +3248,21 @@ async def test_fail_run_without_attempt_row_finalization_outcomes(
             reread.side_effect = RuntimeError("re-read failed")
         elif scenario == "missing_reread":
             reread.return_value = None
+        elif scenario == "scrubbed_reread":
+            # The stored reason was scrubbed of a run secret that the in-memory reason still holds.
+            run.failure_reason = f"{REDACTED_SECRET_PLACEHOLDER} failed"
+            monkeypatch.setattr(run_data_scrub.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+            monkeypatch.setattr(
+                run_data_scrub.app,
+                "WORKFLOW_CONTEXT_MANAGER",
+                workflow_context_manager_factory(workflow_run_id="wr_test", secrets={"password": "initialization"}),
+            )
+        elif scenario == "withheld_reread":
+            # The run's secrets could not be read at the write, so the stored reason is this reason withheld.
+            run.failure_reason = run_data_scrub._withheld_text(b"initialization failed")
+        elif scenario == "foreign_withheld_reread":
+            # Another finalizer's withheld reason is not this write.
+            run.failure_reason = run_data_scrub._withheld_text(b"the server that ran it stopped")
     get_attempts = AsyncMock(return_value=[])
     monkeypatch.setattr(
         retry_policy_module,
@@ -3269,7 +3294,7 @@ async def test_fail_run_without_attempt_row_finalization_outcomes(
         reread.assert_not_awaited()
     else:
         reread.assert_awaited_once_with("wr_test")
-    if scenario in {"terminal_reread", "delivery_failure"}:
+    if scenario in {"terminal_reread", "scrubbed_reread", "withheld_reread", "delivery_failure"}:
         webhook.assert_awaited_once_with(run, api_key=None, claim_kind=None, finalizer="failed_before_execution")
     else:
         webhook.assert_not_awaited()
@@ -4710,7 +4735,11 @@ def _reaper_lease(run_id: str, attempt_number: int | None = None) -> SimpleNames
 
 
 def _workflow_rows(
-    monkeypatch: pytest.MonkeyPatch, status: WorkflowRunStatus, attempts: list[int], finished_meanwhile: bool = False
+    monkeypatch: pytest.MonkeyPatch,
+    status: WorkflowRunStatus,
+    attempts: list[int],
+    finished_meanwhile: bool = False,
+    stored_reason: str | None = None,
 ) -> SimpleNamespace:
     run = SimpleNamespace(
         workflow_run_id="wr_orphan", organization_id="org_1", status=status, failure_reason=None, failure_category=None
@@ -4724,7 +4753,9 @@ def _workflow_rows(
         if run.status.is_final() or run.status not in only_from:
             return None
         run.status = WorkflowRunStatus.failed
-        run.failure_reason = reason
+        run.failure_reason = reason if stored_reason is None else stored_reason
+        if stored_reason is not None:
+            raise RuntimeError("finalizer failed after the failure write committed")
         return run
 
     monkeypatch.setattr(
@@ -4745,10 +4776,17 @@ def _workflow_rows(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored_reason",
+    # A write whose run secrets could not be read stores the withheld stub, then its finalizer raises.
+    [None, run_data_scrub._withheld_text(_REAP_REASON.encode())],
+    ids=["finalized", "withheld_reason_committed_before_finalizer_failed"],
+)
 async def test_reaper_fails_a_workflow_run_whose_dispatcher_stopped_before_starting_it(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, stored_reason: str | None
 ) -> None:
-    run = _workflow_rows(monkeypatch, WorkflowRunStatus.queued, attempts=[])
+    run = _workflow_rows(monkeypatch, WorkflowRunStatus.queued, attempts=[], stored_reason=stored_reason)
+    monkeypatch.setattr(orphaned_run_reaper, "_finish_committed_failure", AsyncMock())
 
     handled, effect = await orphaned_run_reaper._reap_workflow(_reaper_lease("wr_orphan"), _REAP_REASON, None)
 

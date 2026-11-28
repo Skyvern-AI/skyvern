@@ -27,6 +27,7 @@ from skyvern.services.webhook_delivery import (
     WEBHOOK_DELIVERY_MAX_RETRY_AFTER_SECONDS,
     WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS,
 )
+from skyvern.utils.run_data_scrub import stored_text_matches
 
 LOG = structlog.get_logger()
 
@@ -386,7 +387,8 @@ async def fail_run_without_attempt_row(
             exc_info=True,
         )
         if workflow_run is not None and (
-            workflow_run.status != WorkflowRunStatus.failed or workflow_run.failure_reason != failure_reason
+            workflow_run.status != WorkflowRunStatus.failed
+            or not stored_text_matches(workflow_run.failure_reason, failure_reason, workflow_run_id)
         ):
             workflow_run = None
     if workflow_run is not None and need_call_webhook:

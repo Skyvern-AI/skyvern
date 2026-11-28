@@ -44,6 +44,7 @@ from skyvern.schemas.scripts import (
     ScriptStatus,
     WorkflowScript,
 )
+from skyvern.utils.run_data_scrub import scrub_run_text
 
 LOG = structlog.get_logger()
 
@@ -1830,7 +1831,9 @@ class ScriptsRepository(BaseRepository):
                 block_label=block_label,
                 fallback_type=fallback_type,
                 script_revision_id=script_revision_id,
-                error_message=sanitize_postgres_text(error_message) if error_message else None,
+                error_message=(
+                    sanitize_postgres_text(scrub_run_text(error_message, workflow_run_id)) if error_message else None
+                ),
                 classify_result=sanitize_postgres_text(classify_result) if classify_result else None,
                 agent_actions=agent_actions,
                 page_url=sanitize_postgres_text(page_url) if page_url else None,

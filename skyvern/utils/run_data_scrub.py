@@ -7,21 +7,27 @@ replaced under ``ENABLE_ARTIFACT_CREDENTIAL_SHAPE_SCRUB``.
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import re
 import time
-from typing import Any
+from collections.abc import Sequence
+from typing import Any, overload
 
 import structlog
 from cachetools import TTLCache
+from pydantic.deprecated.json import pydantic_encoder
 
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.workflow.reached_download_target import GENERATED_FILE_ARTIFACT_IDS_KEY
 from skyvern.utils.secret_redaction import (
     MIN_UNANCHORED_SECRET_LENGTH,
+    REDACTED_SECRET_PLACEHOLDER,
     REDACTION_FAILED_STUB,
     redact_credential_shapes_from_bytes,
     redact_har_bytes,
@@ -244,7 +250,9 @@ def _text_redaction_inputs(
     try:
         resolved_workflow_run_id = _resolve_redaction_workflow_run_id(workflow_run_id)
         if not app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(resolved_workflow_run_id):
-            _warn_if_run_context_missing(artifact_type, resolved_workflow_run_id)
+            # A row write (no artifact type) can run before the run's context exists, as create_task_run does.
+            if artifact_type is not None:
+                _warn_if_run_context_missing(artifact_type, resolved_workflow_run_id)
             if settings.ENABLE_SECRET_ARTIFACT_REDACTION and settings.ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS:
                 secret_values = _all_runs_artifact_secret_values(artifact_type, resolved_workflow_run_id)
             elif artifact_type == ArtifactType.BROWSER_CONSOLE_LOG:
@@ -328,21 +336,218 @@ async def scrub_run_bytes(kind: ArtifactType, data: bytes, workflow_run_id: str 
     return scrub_credential_shape_bytes(kind, data, placeholder_ids)
 
 
-def scrub_run_value(obj: Any, workflow_run_id: str | None = None) -> Any:
-    """Scrub a str, or a JSON-serializable dict or list, with the text-artifact tiers; other values pass through.
+# Run text the repositories scrub on write, as `table.column`. Columns read back as a later block's input
+# stay raw and are listed with a reason in scripts/run_data_write_exceptions.json.
+RUN_TEXT_COLUMNS: frozenset[str] = frozenset(
+    {
+        "actions.reasoning",
+        "actions.response",
+        "actions.input_or_select_context",
+        "tasks.failure_reason",
+        "tasks.failure_category",
+        "tasks.errors",
+        "workflow_runs.failure_reason",
+        "workflow_runs.failure_category",
+        "workflow_run_attempts.failure_reason",
+        "workflow_run_attempts.failure_category",
+        "observer_cruises.failure_category",
+        "workflow_run_blocks.output",
+        "workflow_run_blocks.capped_output",
+        "workflow_run_blocks.failure_reason",
+        "workflow_run_blocks.prompt",
+        "workflow_run_blocks.loop_values",
+        "workflow_run_blocks.current_value",
+        "observer_thoughts.user_input",
+        "observer_thoughts.observation",
+        "observer_thoughts.thought",
+        "observer_thoughts.answer",
+        "observer_thoughts.output",
+        "task_generations.llm_prompt",
+        "task_generations.llm_response",
+        "task_runs.searchable_text",
+        "script_fallback_episodes.error_message",
+    }
+)
 
-    A value whose run settings cannot be read becomes a fixed withheld string.
-    """
-    if not isinstance(obj, (str, dict, list)):
-        return obj
-    data = obj.encode() if isinstance(obj, str) else json.dumps(obj).encode()
-    data = redact_multi_field_totp_artifact_bytes(data)
+# Keys of `actions.action_json` scrubbed like their columns: a hydrated action takes these keys over the columns.
+# The other keys stay raw because script generation reads them back (typed text, element data, intention).
+ACTION_JSON_SCRUBBED_KEYS: tuple[str, ...] = ("reasoning", "response")
+
+
+# Machine codes in a `tasks.errors` row: retry policy, the diagnostic dedupe and the rerun reset read them back.
+_ERROR_ROW_MACHINE_KEYS: tuple[str, ...] = ("error_type", "error_code")
+
+# Machine codes in a `failure_category` entry: dbt reads `[0].category`, and the engine reads the reason code and
+# confidence. Its `reasoning` can quote the run's failure text.
+_FAILURE_CATEGORY_MACHINE_KEYS: tuple[str, ...] = ("category", "confidence_float", "reason_code")
+
+# Block output keys read back by the engine: the terminal outcome copies failure_category onto the run, and the
+# download count subtracts the generated file ids. A withheld output keeps them, less their free text.
+_BLOCK_OUTPUT_WITHHELD_KEPT_KEYS: frozenset[str] = frozenset({"failure_category", GENERATED_FILE_ARTIFACT_IDS_KEY})
+
+
+# Free text inside a kept subtree: classifier and user-error reasoning.
+_WITHHELD_KEPT_FREE_TEXT_KEYS: frozenset[str] = frozenset({"reasoning"})
+
+
+def _withheld_in_shape(value: Any, kept_keys: frozenset[str] = frozenset()) -> Any:
+    if isinstance(value, str):
+        return REDACTED_SECRET_PLACEHOLDER
+    if isinstance(value, dict):
+        # A key that is not an identifier can be run data (an email or account number keying a loop output); its
+        # keyed digest keeps keys distinct. Identifier keys are the shape the engine reads.
+        return {
+            key if not isinstance(key, str) or key.isidentifier() else _withheld_text(key.encode()): (
+                _kept_without_free_text(item) if key in kept_keys else _withheld_in_shape(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_withheld_in_shape(item) for item in value]
+    return value
+
+
+def _kept_without_free_text(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (
+                REDACTED_SECRET_PLACEHOLDER
+                if key in _WITHHELD_KEPT_FREE_TEXT_KEYS and isinstance(item, str)
+                else _kept_without_free_text(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_kept_without_free_text(item) for item in value]
+    return value
+
+
+@overload
+def scrub_run_text(text: str, workflow_run_id: str | None = None) -> str: ...
+
+
+@overload
+def scrub_run_text(text: None, workflow_run_id: str | None = None) -> None: ...
+
+
+@overload
+def scrub_run_text(text: str | None, workflow_run_id: str | None = None) -> str | None: ...
+
+
+def scrub_run_text(text: str | None, workflow_run_id: str | None = None) -> str | None:
+    """Scrub display text with the text-artifact tiers; text whose run settings cannot be read is withheld."""
+    if not text:
+        return text
+    original = text.encode("utf-8", errors="surrogatepass")
+    data = redact_multi_field_totp_artifact_bytes(original)
     started = time.thread_time()
     try:
         inputs = _text_redaction_inputs(None, workflow_run_id)
     except _WithholdData:
-        _log_withheld("Secret lookup failed; withholding artifact data", None, data, started)
-        return _WITHHELD_VALUE
+        _log_withheld("Secret lookup failed; withholding run text", None, original, started)
+        return _withheld_text(original)
     if inputs is not None:
         data = _redact_text_bytes(data, None, inputs)
-    return data.decode() if isinstance(obj, str) else json.loads(data)
+    return text if data == original else data.decode("utf-8", errors="replace")
+
+
+def _withheld_text(original: bytes) -> str:
+    # A keyed digest of the original lets its own writer recognize the row on a re-read; it reveals nothing without
+    # SECRET_KEY, and two different texts never share a withheld value.
+    digest = hmac.new(settings.SECRET_KEY.encode(), b"run-text-withheld-v1\0" + original, hashlib.sha256).hexdigest()
+    return f"{_WITHHELD_VALUE} ({digest[:16]})"
+
+
+def scrub_run_json(
+    value: Any, workflow_run_id: str | None = None, *, withheld_kept_keys: frozenset[str] = frozenset()
+) -> Any:
+    """Scrub the strings inside a JSON column value; the value keeps its shape and is never replaced by a stub.
+
+    When the run's settings cannot be read, every string inside is replaced by the placeholder, except under the
+    top-level `withheld_kept_keys`.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    try:
+        original = json.dumps(value, default=pydantic_encoder).encode()
+    except (TypeError, ValueError):
+        LOG.warning("Run value is not JSON; storing it without the secret scrub", exc_info=True)
+        return value
+    data = redact_multi_field_totp_artifact_bytes(original)
+    started = time.thread_time()
+    try:
+        inputs = _text_redaction_inputs(None, workflow_run_id)
+    except _WithholdData:
+        _log_withheld("Secret lookup failed; withholding run value", None, original, started)
+        return _withheld_in_shape(json.loads(original), withheld_kept_keys)
+    if inputs is not None:
+        secret_values, placeholder_ids = inputs
+        scrubbed = redact_secrets_from_json_bytes(data, secret_values, placeholder_ids=placeholder_ids)
+        if scrubbed is None:
+            return _withheld_in_shape(json.loads(original), withheld_kept_keys)
+        data = scrubbed
+    if data == original:
+        return value
+    try:
+        return json.loads(data)
+    except ValueError:
+        LOG.warning("Scrubbed run value is not JSON; withholding its strings", exc_info=True)
+        return _withheld_in_shape(json.loads(original), withheld_kept_keys)
+
+
+def scrub_block_output(output: Any, workflow_run_id: str | None = None) -> Any:
+    return scrub_run_json(output, workflow_run_id, withheld_kept_keys=_BLOCK_OUTPUT_WITHHELD_KEPT_KEYS)
+
+
+def _scrub_rows_keeping(rows: list[Any], workflow_run_id: str | None, machine_keys: tuple[str, ...]) -> list[Any]:
+    scrubbed = scrub_run_json(rows, workflow_run_id)
+    return [
+        {**row, **{key: original[key] for key in machine_keys if key in original}}
+        if isinstance(row, dict) and isinstance(original, dict)
+        else row
+        for row, original in zip(scrubbed, rows)
+    ]
+
+
+def scrub_run_errors(errors: Sequence[dict[str, Any]], workflow_run_id: str | None = None) -> list[dict[str, Any]]:
+    """`scrub_run_json` over `tasks.errors` rows; each row keeps its `error_type` and `error_code` as given."""
+    return _scrub_rows_keeping(list(errors), workflow_run_id, _ERROR_ROW_MACHINE_KEYS)
+
+
+@overload
+def scrub_failure_category(categories: None, workflow_run_id: str | None = None) -> None: ...
+
+
+@overload
+def scrub_failure_category(
+    categories: list[dict[str, Any]], workflow_run_id: str | None = None
+) -> list[dict[str, Any]]: ...
+
+
+def scrub_failure_category(
+    categories: list[dict[str, Any]] | None, workflow_run_id: str | None = None
+) -> list[dict[str, Any]] | None:
+    """`scrub_run_json` over `failure_category` entries; each keeps its category, reason code and confidence."""
+    if not categories:
+        return categories
+    return _scrub_rows_keeping(list(categories), workflow_run_id, _FAILURE_CATEGORY_MACHINE_KEYS)
+
+
+def stored_text_matches(stored: str | None, original: str | None, workflow_run_id: str | None = None) -> bool:
+    """Whether a re-read column holds `original` as a scrubbed run text writer stores it: raw, scrubbed or withheld."""
+    if stored == original:
+        return True
+    if not stored or not original:
+        return False
+    if stored == _withheld_text(original.encode("utf-8", errors="surrogatepass")):
+        return True
+    return stored == scrub_run_text(original, workflow_run_id)
+
+
+def scrub_run_value(obj: Any, workflow_run_id: str | None = None) -> Any:
+    """`scrub_run_text` for a str, `scrub_run_json` for a dict or list; other values pass through."""
+    if isinstance(obj, str):
+        return scrub_run_text(obj, workflow_run_id)
+    if isinstance(obj, (dict, list)):
+        return scrub_run_json(obj, workflow_run_id)
+    return obj

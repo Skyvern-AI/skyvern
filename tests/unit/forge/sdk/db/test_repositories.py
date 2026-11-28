@@ -1,28 +1,37 @@
 """Tests for all OSS repository instantiations + dependency injection."""
 
+import importlib
 import inspect
+import json
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import libcst as cst
 import pytest
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from structlog.testing import capture_logs
 
+from skyvern.core.script_generations.generate_script import _action_to_stmt
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunStatus
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.db.models import (
+    ActionModel,
     OrganizationAuthTokenModel,
     OrganizationModel,
     PersistentBrowserSessionModel,
     ScriptBlockModel,
     ScriptModel,
     TaskModel,
+    TaskRunModel,
     WorkflowRunBlockModel,
     WorkflowScriptModel,
 )
@@ -33,50 +42,103 @@ from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.reached_download_target import GENERATED_FILE_ARTIFACT_IDS_KEY
+from skyvern.schemas.runs import ProxyLocation, RunType
+from skyvern.schemas.workflows import BlockType
+from skyvern.utils import run_data_scrub
+from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER, REDACTION_FAILED_STUB
+from skyvern.webeye.actions.actions import InputTextAction
 from tests.unit._sql_recording import recorded_statements
 from tests.unit.conftest import MockAsyncSessionCtx, make_mock_session
 
+_REPOSITORY_METHODS: dict[str, tuple[str, ...]] = {
+    "skyvern.forge.sdk.db.repositories.credentials.CredentialRepository": (
+        "create_credential",
+        "get_credential",
+        "get_credentials",
+        "update_credential",
+        "delete_credential",
+        "create_organization_bitwarden_collection",
+        "get_organization_bitwarden_collection",
+    ),
+    "skyvern.forge.sdk.db.repositories.credential_folders.CredentialFoldersRepository": (
+        "create_credential_folder",
+        "get_credential_folder",
+        "get_credential_folders",
+        "update_credential_folder",
+        "soft_delete_credential_folder",
+        "get_credential_folder_credential_count",
+        "get_credential_folder_credential_counts_batch",
+        "set_credential_folder",
+    ),
+    "skyvern.forge.sdk.db.repositories.otp.OTPRepository": (
+        "get_otp_codes",
+        "create_otp_code",
+    ),
+    "skyvern.forge.sdk.db.repositories.debug.DebugRepository": (
+        "get_debug_session",
+        "create_debug_session",
+        "create_block_run",
+    ),
+    "skyvern.forge.sdk.db.repositories.organizations.OrganizationsRepository": (
+        "get_organization",
+        "create_organization",
+        "create_org_auth_token",
+        "validate_org_auth_token",
+    ),
+    "skyvern.forge.sdk.db.repositories.schedules.SchedulesRepository": (
+        "create_workflow_schedule",
+        "get_workflow_schedules",
+    ),
+    "skyvern.forge.sdk.db.repositories.scripts.ScriptsRepository": (
+        "create_script",
+        "get_scripts",
+        "soft_delete_workflow_script_if_matches",
+        "restore_workflow_script_if_matches",
+    ),
+    "skyvern.forge.sdk.db.repositories.self_heal.SelfHealRepository": (
+        "create_heal_episode",
+        "get_heal_episodes",
+        "create_heal_proposal",
+        "get_heal_proposals",
+        "update_heal_proposal_status",
+    ),
+    "skyvern.forge.sdk.db.repositories.workflow_parameters.WorkflowParametersRepository": (
+        "get_workflow_parameter",
+        "create_workflow_parameter",
+    ),
+    "skyvern.forge.sdk.db.repositories.tasks.TasksRepository": (
+        "create_task",
+        "get_task",
+        "create_step",
+    ),
+    "skyvern.forge.sdk.db.repositories.workflows.WorkflowsRepository": (
+        "get_workflow",
+        "create_workflow",
+        "get_workflow_by_permanent_id",
+        "update_workflow_dispatch_state_if_latest_with_previous",
+        "restore_workflow_script_dispatch_if_matches",
+    ),
+    "skyvern.forge.sdk.db.repositories.browser_sessions.BrowserSessionsRepository": (
+        "create_browser_profile",
+        "get_browser_profile",
+        "update_browser_profile",
+        "delete_browser_profile",
+    ),
+}
 
-def test_credential_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
+
+@pytest.mark.parametrize("repository", list(_REPOSITORY_METHODS))
+def test_repository_instantiation(repository: str) -> None:
+    module_name, class_name = repository.rsplit(".", 1)
+    repository_class = getattr(importlib.import_module(module_name), class_name)
 
     mock_session = MagicMock()
-    repo = CredentialRepository(session_factory=mock_session, debug_enabled=False)
+    repo = repository_class(session_factory=mock_session, debug_enabled=False)
     assert repo.Session is mock_session
-    assert hasattr(repo, "create_credential")
-    assert hasattr(repo, "get_credential")
-    assert hasattr(repo, "get_credentials")
-    assert hasattr(repo, "update_credential")
-    assert hasattr(repo, "delete_credential")
-    assert hasattr(repo, "create_organization_bitwarden_collection")
-    assert hasattr(repo, "get_organization_bitwarden_collection")
-
-
-def test_credential_folders_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.credential_folders import CredentialFoldersRepository
-
-    mock_session = MagicMock()
-    repo = CredentialFoldersRepository(session_factory=mock_session, debug_enabled=False)
-    assert repo.Session is mock_session
-    assert hasattr(repo, "create_credential_folder")
-    assert hasattr(repo, "get_credential_folder")
-    assert hasattr(repo, "get_credential_folders")
-    assert hasattr(repo, "update_credential_folder")
-    assert hasattr(repo, "soft_delete_credential_folder")
-    assert hasattr(repo, "get_credential_folder_credential_count")
-    assert hasattr(repo, "get_credential_folder_credential_counts_batch")
-    assert hasattr(repo, "set_credential_folder")
-
-
-def test_otp_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.otp import OTPRepository
-
-    mock_session = MagicMock()
-    repo = OTPRepository(session_factory=mock_session, debug_enabled=False)
-    assert repo.Session is mock_session
-    assert hasattr(repo, "get_otp_codes")
-    assert hasattr(repo, "create_otp_code")
+    for method in _REPOSITORY_METHODS[repository]:
+        assert hasattr(repo, method)
 
 
 @pytest.mark.asyncio
@@ -206,29 +268,6 @@ async def test_otp_repository_creates_raw_row_without_fabricated_code():
     assert session.added.workflow_run_id is None
 
 
-def test_debug_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.debug import DebugRepository
-
-    mock_session = MagicMock()
-    repo = DebugRepository(session_factory=mock_session, debug_enabled=False)
-    assert repo.Session is mock_session
-    assert hasattr(repo, "get_debug_session")
-    assert hasattr(repo, "create_debug_session")
-    assert hasattr(repo, "create_block_run")
-
-
-def test_organizations_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
-
-    mock_session = MagicMock()
-    repo = OrganizationsRepository(session_factory=mock_session, debug_enabled=False)
-    assert repo.Session is mock_session
-    assert hasattr(repo, "get_organization")
-    assert hasattr(repo, "create_organization")
-    assert hasattr(repo, "create_org_auth_token")
-    assert hasattr(repo, "validate_org_auth_token")
-
-
 @pytest.mark.asyncio
 async def test_organizations_repository_persists_and_clears_default_llm_keys(sqlite_engine: AsyncEngine) -> None:
     session_factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
@@ -309,28 +348,6 @@ async def test_validate_org_auth_token_matches_by_decrypting_each_row(sqlite_eng
         "o_keys", OrganizationAuthTokenType.api, "revoked-plaintext-key", valid=None
     )
     assert revoked is not None and revoked.valid is False
-
-
-def test_schedules_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.schedules import SchedulesRepository
-
-    mock_session = MagicMock()
-    repo = SchedulesRepository(session_factory=mock_session, debug_enabled=False)
-    assert repo.Session is mock_session
-    assert hasattr(repo, "create_workflow_schedule")
-    assert hasattr(repo, "get_workflow_schedules")
-
-
-def test_scripts_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
-
-    mock_session = MagicMock()
-    repo = ScriptsRepository(session_factory=mock_session, debug_enabled=False)
-    assert repo.Session is mock_session
-    assert hasattr(repo, "create_script")
-    assert hasattr(repo, "get_scripts")
-    assert hasattr(repo, "soft_delete_workflow_script_if_matches")
-    assert hasattr(repo, "restore_workflow_script_if_matches")
 
 
 @pytest.mark.asyncio
@@ -452,65 +469,6 @@ async def test_get_cached_block_groups_by_labels_filters_in_sql(sqlite_engine: A
         ("ws_a", "r_a", "sig_a"),
         ("ws_b", "r_b_v2", "sig_b_new"),
     }
-
-
-def test_self_heal_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.self_heal import SelfHealRepository
-
-    mock_session = MagicMock()
-    repo = SelfHealRepository(session_factory=mock_session, debug_enabled=False)
-    assert repo.Session is mock_session
-    assert hasattr(repo, "create_heal_episode")
-    assert hasattr(repo, "get_heal_episodes")
-    assert hasattr(repo, "create_heal_proposal")
-    assert hasattr(repo, "get_heal_proposals")
-    assert hasattr(repo, "update_heal_proposal_status")
-
-
-def test_workflow_parameters_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
-
-    mock_session = MagicMock()
-    repo = WorkflowParametersRepository(session_factory=mock_session, debug_enabled=False)
-    assert repo.Session is mock_session
-    assert hasattr(repo, "get_workflow_parameter")
-    assert hasattr(repo, "create_workflow_parameter")
-
-
-def test_tasks_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
-
-    mock_session = MagicMock()
-    repo = TasksRepository(session_factory=mock_session, debug_enabled=False)
-    assert repo.Session is mock_session
-    assert hasattr(repo, "create_task")
-    assert hasattr(repo, "get_task")
-    assert hasattr(repo, "create_step")
-
-
-def test_workflows_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
-
-    mock_session = MagicMock()
-    repo = WorkflowsRepository(session_factory=mock_session, debug_enabled=False)
-    assert repo.Session is mock_session
-    assert hasattr(repo, "get_workflow")
-    assert hasattr(repo, "create_workflow")
-    assert hasattr(repo, "get_workflow_by_permanent_id")
-    assert hasattr(repo, "update_workflow_dispatch_state_if_latest_with_previous")
-    assert hasattr(repo, "restore_workflow_script_dispatch_if_matches")
-
-
-def test_browser_sessions_repository_instantiation():
-    from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
-
-    mock_session = MagicMock()
-    repo = BrowserSessionsRepository(session_factory=mock_session, debug_enabled=False)
-    assert repo.Session is mock_session
-    assert hasattr(repo, "create_browser_profile")
-    assert hasattr(repo, "get_browser_profile")
-    assert hasattr(repo, "update_browser_profile")
-    assert hasattr(repo, "delete_browser_profile")
 
 
 @pytest.mark.asyncio
@@ -894,7 +852,6 @@ async def test_task_v2_cancel_repository_audits_only_a_winning_transition(monkey
 async def test_workflow_cancel_repository_audits_before_log_flush(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository
     from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
-    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
     events: list[str] = []
 
@@ -1097,6 +1054,343 @@ async def test_create_returns_the_stored_row_without_reading_it_back(
     stored = await read_back(db, organization_id, created)
     assert stored is not None
     assert created.model_dump() == stored.model_dump()
+
+
+_SCRUB_RUN_ID = "wr_scrub_rows"
+_RUN_SECRET = "s3cr3t-value-9f2"
+
+
+async def _scrub_task_row(db: AgentDB, org: str) -> tuple[list[object], list[object]]:
+    task = await db.tasks.create_task(
+        url="https://example.test/",
+        title="Scrub",
+        navigation_goal=None,
+        data_extraction_goal=None,
+        navigation_payload=None,
+        organization_id=org,
+        workflow_run_id=_SCRUB_RUN_ID,
+    )
+    await db.tasks.update_task(
+        task.task_id,
+        organization_id=org,
+        failure_reason=f"Typed {_RUN_SECRET} and failed",
+        errors=[{"error_type": "USER_DEFINED_ERROR", "error_code": "LOGIN_FAILED", "reasoning": f"saw {_RUN_SECRET}"}],
+        extracted_information={"email": _RUN_SECRET},
+        failure_category=_failure_category_with_run_text(),
+    )
+    stored = await db.tasks.get_task(task.task_id, organization_id=org)
+    assert stored is not None
+    assert [(error["error_type"], error["error_code"]) for error in stored.errors] == [
+        ("USER_DEFINED_ERROR", "LOGIN_FAILED")
+    ]
+    _assert_failure_category_machine_codes_kept(stored.failure_category)
+    return [stored.failure_reason, stored.errors, stored.failure_category], [stored.extracted_information]
+
+
+async def _scrub_task_row_when_the_lookup_fails(db: AgentDB, org: str) -> tuple[list[object], list[object]]:
+    def failing_lookup(*_: object, **__: object) -> set[str]:
+        raise RuntimeError("lookup failed")
+
+    run_data_scrub.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = failing_lookup
+    task = await db.tasks.create_task(
+        url="https://example.test/",
+        title="Scrub",
+        navigation_goal=None,
+        data_extraction_goal=None,
+        navigation_payload=None,
+        organization_id=org,
+        workflow_run_id=_SCRUB_RUN_ID,
+    )
+    await db.tasks.update_task(
+        task.task_id,
+        organization_id=org,
+        failure_reason=f"Typed {_RUN_SECRET} and failed",
+        errors=[
+            {
+                "error_type": "USER_DEFINED_ERROR",
+                "error_code": "LOGIN_FAILED",
+                "reasoning": f"saw {_RUN_SECRET}",
+                "attempt": 2,
+            }
+        ],
+    )
+    stored = await db.tasks.get_task(task.task_id, organization_id=org)
+    assert stored is not None
+    # A JSON column keeps its shape with every string withheld; it never becomes a stub string. The error type and
+    # code are machine codes that retry policy and the rerun reset read back, so they stay.
+    assert stored.errors == [
+        {
+            "error_type": "USER_DEFINED_ERROR",
+            "error_code": "LOGIN_FAILED",
+            "reasoning": REDACTED_SECRET_PLACEHOLDER,
+            "attempt": 2,
+        }
+    ]
+    block = await db.observer.create_workflow_run_block(
+        workflow_run_id=_SCRUB_RUN_ID, organization_id=org, block_type=BlockType.CODE
+    )
+    failure_category = [
+        {
+            "category": "LOGIN_ERROR",
+            "confidence_float": 0.9,
+            "reasoning": f"saw {_RUN_SECRET}",
+            "user_errors": [{"error_code": "LOGIN_FAILED", "reasoning": f"typed {_RUN_SECRET}"}],
+        }
+    ]
+    updated = await db.observer.update_workflow_run_block(
+        block.workflow_run_block_id,
+        organization_id=org,
+        output={
+            "failure_category": failure_category,
+            GENERATED_FILE_ARTIFACT_IDS_KEY: ["a_generated"],
+            "email": _RUN_SECRET,
+            _RUN_SECRET: {"status": "done"},
+        },
+    )
+    # The engine copies failure_category onto the run and counts downloads without the generated file ids; a key
+    # holding run text is withheld too.
+    assert _RUN_SECRET not in json.dumps(updated.output)
+    withheld_keys = [key for key in updated.output if key.startswith(json.loads(REDACTION_FAILED_STUB))]
+    assert len(withheld_keys) == 1
+    assert updated.output[withheld_keys[0]] == {"status": REDACTED_SECRET_PLACEHOLDER}
+    assert updated.output["failure_category"] == [
+        {
+            "category": "LOGIN_ERROR",
+            "confidence_float": 0.9,
+            "reasoning": REDACTED_SECRET_PLACEHOLDER,
+            "user_errors": [{"error_code": "LOGIN_FAILED", "reasoning": REDACTED_SECRET_PLACEHOLDER}],
+        }
+    ]
+    assert updated.output[GENERATED_FILE_ARTIFACT_IDS_KEY] == ["a_generated"]
+    return [stored.failure_reason, stored.errors, updated.output], []
+
+
+async def _scrub_action_row(db: AgentDB, org: str) -> tuple[list[object], list[object]]:
+    step = await _create_step(db, org)
+    action = InputTextAction(
+        organization_id=org,
+        workflow_run_id=_SCRUB_RUN_ID,
+        task_id=step.task_id,
+        step_id=step.step_id,
+        step_order=1,
+        action_order=0,
+        element_id="el_1",
+        skyvern_element_data={"xpath": "//input[@id='login']"},
+        text=_RUN_SECRET,
+        reasoning=f"Type {_RUN_SECRET}",
+        intention=f"Enter {_RUN_SECRET}",
+        response=f"Typed {_RUN_SECRET}",
+    )
+    created = await db.workflow_params.create_action(action)
+    async with db.Session() as session:
+        row = (await session.scalars(select(ActionModel).filter_by(action_id=created.action_id))).one()
+    # The API and the timeline read the hydrated action, where a non-null action_json key wins over its column.
+    (hydrated,) = await db.tasks.get_task_actions_hydrated(step.task_id, organization_id=org)
+    assert isinstance(hydrated, InputTextAction)
+    # The intention becomes the AI-fallback prompt of a generated script, so it is stored as typed.
+    assert row.intention == hydrated.intention == f"Enter {_RUN_SECRET}"
+    # Script generation reads the hydrated action back, so the stored action generates the same code as the typed one.
+    stored_code, typed_code = (
+        cst.Module(body=[_action_to_stmt({**act.model_dump(), "xpath": act.get_xpath()}, {})]).code
+        for act in (hydrated, action)
+    )
+    assert stored_code == typed_code
+    assert f"prompt = 'Enter {_RUN_SECRET}'" in stored_code
+    return [row.reasoning, row.response, hydrated.reasoning, hydrated.response], [
+        hydrated.text,
+        row.action_json["text"],
+    ]
+
+
+def _failure_category_with_run_text() -> list[dict[str, object]]:
+    # A block that copies its failure_reason into the entry's reasoning, as the web search block does.
+    return [
+        {
+            "category": "AUTHENTICATION_FAILURE",
+            "confidence_float": 0.9,
+            "reason_code": "LOGIN_FAILED",
+            "reasoning": f"Login as {_RUN_SECRET} failed",
+        }
+    ]
+
+
+def _assert_failure_category_machine_codes_kept(stored: object) -> None:
+    assert isinstance(stored, list)
+    assert {key: stored[0][key] for key in ("category", "confidence_float", "reason_code")} == {
+        "category": "AUTHENTICATION_FAILURE",
+        "confidence_float": 0.9,
+        "reason_code": "LOGIN_FAILED",
+    }
+
+
+async def _scrub_workflow_run_row(db: AgentDB, org: str) -> tuple[list[object], list[object]]:
+    await db.workflow_runs.update_workflow_run(
+        _SCRUB_RUN_ID,
+        status=WorkflowRunStatus.failed,
+        failure_reason=f"Login as {_RUN_SECRET} failed",
+        failure_category=_failure_category_with_run_text(),
+    )
+    await db.workflow_run_attempts.create_attempt(_SCRUB_RUN_ID, org, attempt_number=1, status="running")
+    await db.workflow_run_attempts.finalize_attempt(
+        _SCRUB_RUN_ID,
+        1,
+        status="failed",
+        failure_reason=f"Login as {_RUN_SECRET} failed",
+        failure_category=_failure_category_with_run_text(),
+        error_codes=["LOGIN_FAILED", _RUN_SECRET],
+        finished_at=datetime.now(timezone.utc),
+        retry_decision="final",
+        decision_reason=None,
+        next_attempt_at=None,
+    )
+    run = await db.workflow_runs.get_workflow_run(_SCRUB_RUN_ID, organization_id=org)
+    assert run is not None
+    (attempt,) = await db.workflow_run_attempts.get_attempts(_SCRUB_RUN_ID)
+    # Machine error codes that retry policy reads back are stored as given.
+    assert attempt.error_codes == ["LOGIN_FAILED", _RUN_SECRET]
+    _assert_failure_category_machine_codes_kept(run.failure_category)
+    _assert_failure_category_machine_codes_kept(attempt.failure_category)
+    return [run.failure_reason, attempt.failure_reason, run.failure_category, attempt.failure_category], [
+        attempt.error_codes
+    ]
+
+
+async def _scrub_block_row(db: AgentDB, org: str) -> tuple[list[object], list[object]]:
+    block = await db.observer.create_workflow_run_block(
+        workflow_run_id=_SCRUB_RUN_ID,
+        organization_id=org,
+        block_type=BlockType.FOR_LOOP,
+        current_value=_RUN_SECRET,
+    )
+    updated = await db.observer.update_workflow_run_block(
+        block.workflow_run_block_id,
+        organization_id=org,
+        output={"rows": [{"email": _RUN_SECRET, "count": 2}]},
+        failure_reason=f"Loop over {_RUN_SECRET} failed",
+        loop_values=[{"email": _RUN_SECRET}],
+        prompt=f"Summarize {_RUN_SECRET}",
+    )
+    assert updated.output == {"rows": [{"email": REDACTED_SECRET_PLACEHOLDER, "count": 2}]}
+    assert updated.loop_values == [{"email": REDACTED_SECRET_PLACEHOLDER}]
+    return [block.current_value, updated.output, updated.failure_reason, updated.loop_values, updated.prompt], []
+
+
+async def _scrub_thought_row(db: AgentDB, org: str) -> tuple[list[object], list[object]]:
+    thought = await db.observer.create_thought(
+        task_v2_id="oc_scrub",
+        workflow_run_id=_SCRUB_RUN_ID,
+        organization_id=org,
+        user_input=f"Log in as {_RUN_SECRET}",
+        thought=f"Use {_RUN_SECRET}",
+        output={"answer": _RUN_SECRET},
+    )
+    updated = await db.observer.update_thought(
+        thought.observer_thought_id, organization_id=org, observation=f"Saw {_RUN_SECRET}", answer=_RUN_SECRET
+    )
+    assert updated.output == {"answer": REDACTED_SECRET_PLACEHOLDER}
+    return [updated.user_input, updated.thought, updated.output, updated.observation, updated.answer], []
+
+
+async def _scrub_fallback_episode_row(db: AgentDB, org: str) -> tuple[list[object], list[object]]:
+    episode = await db.scripts.create_fallback_episode(
+        organization_id=org,
+        workflow_permanent_id="wpid_scrub",
+        workflow_run_id=_SCRUB_RUN_ID,
+        block_label="login",
+        fallback_type="element",
+        error_message=f"Selector for {_RUN_SECRET} not found",
+    )
+    stored = await db.scripts.get_fallback_episode(episode.episode_id, org)
+    assert stored is not None
+    return [stored.error_message], []
+
+
+async def _scrub_task_run_row(db: AgentDB, org: str) -> tuple[list[object], list[object]]:
+    # The run's context does not exist yet when its task run row is written, so a row write must not warn.
+    run_data_scrub._RUNS_WARNED_MISSING_CONTEXT.clear()
+    with capture_logs() as logs:
+        await db.tasks.create_task_run(
+            task_run_type=RunType.workflow_run,
+            organization_id=org,
+            run_id="wr_without_context",
+            title=f"Run for {_RUN_SECRET}",
+        )
+    assert not [log for log in logs if log["event"].startswith("No live run context")], logs
+    await db.tasks.create_task_run(
+        task_run_type=RunType.workflow_run, organization_id=org, run_id=_SCRUB_RUN_ID, title=f"Run for {_RUN_SECRET}"
+    )
+    async with db.Session() as session:
+        row = (await session.scalars(select(TaskRunModel).filter_by(run_id=_SCRUB_RUN_ID))).one()
+    return [row.searchable_text], [row.title]
+
+
+async def _scrub_task_generation_row(db: AgentDB, org: str) -> tuple[list[object], list[object]]:
+    skyvern_context.set(SkyvernContext(organization_id=org, workflow_run_id=_SCRUB_RUN_ID))
+    generation = await db.workflow_params.create_task_generation(
+        organization_id=org,
+        user_prompt="Log in",
+        user_prompt_hash="hash_scrub",
+        llm_prompt=f"Log in as {_RUN_SECRET}",
+        llm_response=f'{{"payload": "{_RUN_SECRET}"}}',
+    )
+    return [generation.llm_prompt, generation.llm_response], []
+
+
+# Each row writes a run's text through its repository method and returns what the readers get back: the values that
+# must be scrubbed, and the raw-exception values that later blocks read back as input and must keep the secret.
+_RUN_TEXT_WRITES: dict[str, Callable[[AgentDB, str], Awaitable[tuple[list[object], list[object]]]]] = {
+    "tasks": _scrub_task_row,
+    "tasks_when_the_lookup_fails": _scrub_task_row_when_the_lookup_fails,
+    "actions": _scrub_action_row,
+    "workflow_runs_and_attempts": _scrub_workflow_run_row,
+    "workflow_run_blocks": _scrub_block_row,
+    "observer_thoughts": _scrub_thought_row,
+    "script_fallback_episodes": _scrub_fallback_episode_row,
+    "task_runs": _scrub_task_run_row,
+    "task_generations": _scrub_task_generation_row,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write", list(_RUN_TEXT_WRITES))
+async def test_run_text_writes_store_the_runs_secrets_scrubbed(
+    agent_db: AgentDB,
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+    write: str,
+) -> None:
+    monkeypatch.setattr(run_data_scrub.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+    monkeypatch.setattr(run_data_scrub.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", True)
+    # Mask Secrets off: the all-runs tier, the one every run gets.
+    monkeypatch.setattr(
+        run_data_scrub.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        workflow_context_manager_factory(
+            workflow_run_id=_SCRUB_RUN_ID, mask_secrets=False, secrets={"password": _RUN_SECRET}
+        ),
+    )
+    organization = await agent_db.organizations.create_organization(organization_name="Scrub organization")
+    org = organization.organization_id
+    workflow = await agent_db.workflows.create_workflow(
+        title="wf", workflow_definition={"parameters": [], "blocks": []}, organization_id=org
+    )
+    await agent_db.workflow_runs.create_workflow_run(
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        workflow_id=workflow.workflow_id,
+        organization_id=org,
+        workflow_run_id=_SCRUB_RUN_ID,
+    )
+    skyvern_context.reset()
+    try:
+        scrubbed, raw = await _RUN_TEXT_WRITES[write](agent_db, org)
+    finally:
+        skyvern_context.reset()
+
+    for value in scrubbed:
+        assert _RUN_SECRET not in json.dumps(value)
+        assert REDACTED_SECRET_PLACEHOLDER in json.dumps(value)
+    for value in raw:
+        assert _RUN_SECRET in json.dumps(value)
 
 
 @pytest.mark.asyncio

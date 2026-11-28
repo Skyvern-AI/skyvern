@@ -29,6 +29,7 @@ from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError, OTPRequestAlreadyBoundError
+from skyvern.forge.sdk.db.id import WORKFLOW_RUN_PREFIX
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     OTPRequestBindingModel,
@@ -60,6 +61,7 @@ from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.runs import ProxyLocationInput, RunStatus, RunType
 from skyvern.schemas.steps import AgentStepOutput
+from skyvern.utils.run_data_scrub import scrub_failure_category, scrub_run_errors, scrub_run_text
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 
@@ -122,6 +124,11 @@ def _without_inserted_user_errors(errors: list[dict[str, Any]], inserted: list[s
             continue
         kept.append(error)
     return list(reversed(kept))
+
+
+def _task_run_workflow_run_id(run_id: str) -> str | None:
+    # Other run types have no workflow-run context of their own, so their scrub follows the current context.
+    return run_id if run_id.startswith(f"{WORKFLOW_RUN_PREFIX}_") else None
 
 
 class TasksRepository(BaseRepository):
@@ -944,7 +951,7 @@ class TasksRepository(BaseRepository):
                 )
                 .values(
                     status=TaskStatus.failed,
-                    failure_reason=failure_reason,
+                    failure_reason=scrub_run_text(failure_reason),
                     finished_at=naive_utc_now(),
                 )
                 .returning(TaskModel)
@@ -983,9 +990,9 @@ class TasksRepository(BaseRepository):
                 "finished_at": func.coalesce(TaskModel.finished_at, naive_utc_now()),
             }
             if failure_reason is not None:
-                values["failure_reason"] = failure_reason
+                values["failure_reason"] = scrub_run_text(failure_reason, task.workflow_run_id)
             if errors is not None:
-                values["errors"] = (task.errors or []) + errors
+                values["errors"] = (task.errors or []) + scrub_run_errors(errors, task.workflow_run_id)
             if extracted_information is not None:
                 values["extracted_information"] = extracted_information
             if webhook_failure_reason is not None:
@@ -1076,15 +1083,15 @@ class TasksRepository(BaseRepository):
                 if extracted_information is not None:
                     task.extracted_information = extracted_information
                 if failure_reason is not None:
-                    task.failure_reason = failure_reason
+                    task.failure_reason = scrub_run_text(failure_reason, task.workflow_run_id)
                 if errors is not None:
-                    task.errors = (task.errors or []) + errors
+                    task.errors = (task.errors or []) + scrub_run_errors(errors, task.workflow_run_id)
                 if max_steps_per_run is not None:
                     task.max_steps_per_run = max_steps_per_run
                 if webhook_failure_reason is not None:
                     task.webhook_failure_reason = webhook_failure_reason
                 if failure_category is not None:
-                    task.failure_category = failure_category
+                    task.failure_category = scrub_failure_category(failure_category, task.workflow_run_id)
                 await session.commit()
                 updated_task = await self.get_task(task_id, organization_id=organization_id)
                 if not updated_task:
@@ -1139,9 +1146,11 @@ class TasksRepository(BaseRepository):
             if not with_entry and not missing:
                 return None
             if with_entry:
-                task.failure_category = with_diagnostic_entry(task.failure_category, entry)
+                task.failure_category = scrub_failure_category(
+                    with_diagnostic_entry(task.failure_category, entry), task.workflow_run_id
+                )
             if missing:
-                task.errors = [*(task.errors or []), *missing]
+                task.errors = [*(task.errors or []), *scrub_run_errors(missing, task.workflow_run_id)]
             await session.commit()
             await session.refresh(task)
             return convert_to_task(task, debug_enabled=self.debug_enabled)
@@ -1173,7 +1182,9 @@ class TasksRepository(BaseRepository):
                 return False
             if final_har_user_mapping_digest(task.error_code_mapping) != source.get("mapping"):
                 return False
-            task.failure_category = with_final_har_user_match_claim(task.failure_category, identity, source)
+            task.failure_category = scrub_failure_category(
+                with_final_har_user_match_claim(task.failure_category, identity, source), task.workflow_run_id
+            )
             await session.commit()
             return True
 
@@ -1206,11 +1217,14 @@ class TasksRepository(BaseRepository):
                 return None
             present = {(e.get("error_type"), e.get("error_code")) for e in task.errors or [] if isinstance(e, dict)}
             inserted = [e for e in user_errors if (e["error_type"], e["error_code"]) not in present]
-            task.failure_category = with_final_har_user_match_result(
-                task.failure_category, identity, source, [e["error_code"] for e in inserted]
+            task.failure_category = scrub_failure_category(
+                with_final_har_user_match_result(
+                    task.failure_category, identity, source, [e["error_code"] for e in inserted]
+                ),
+                task.workflow_run_id,
             )
             if inserted:
-                task.errors = [*(task.errors or []), *inserted]
+                task.errors = [*(task.errors or []), *scrub_run_errors(inserted, task.workflow_run_id)]
             await session.commit()
             await session.refresh(task)
             return convert_to_task(task, debug_enabled=self.debug_enabled)
@@ -1749,7 +1763,7 @@ class TasksRepository(BaseRepository):
         # script_run, started_at, finished_at are intentionally omitted here —
         # they are set via update_task_run() after the run starts/finishes (PRs 2-5).
     ) -> Run:
-        searchable_text = " ".join(filter(None, [title, url]))
+        searchable_text = scrub_run_text(" ".join(filter(None, [title, url])), _task_run_workflow_run_id(run_id))
         async with self.Session() as session:
             task_run = TaskRunModel(
                 task_run_type=task_run_type,
@@ -1808,7 +1822,12 @@ class TasksRepository(BaseRepository):
 
             # Recompute searchable_text when title or url changes
             if title is not None or url is not None:
-                task_run.searchable_text = " ".join(filter(None, [task_run.title, task_run.url])) or None
+                task_run.searchable_text = (
+                    scrub_run_text(
+                        " ".join(filter(None, [task_run.title, task_run.url])), _task_run_workflow_run_id(run_id)
+                    )
+                    or None
+                )
 
             await session.commit()
 

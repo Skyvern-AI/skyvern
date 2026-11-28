@@ -36,6 +36,7 @@ from skyvern.schemas.run_enums import (
     WebhookDeliveryStatus,
     resolve_webhook_delivery_projection,
 )
+from skyvern.utils.run_data_scrub import scrub_failure_category, scrub_run_text
 
 # Keep terminal recovery bounded so a degraded database does not load the entire backlog at once.
 ATTEMPT_RECOVERY_BATCH_SIZE = 200
@@ -482,6 +483,7 @@ class WorkflowRunAttemptsRepository(BaseRepository):
         attempt_number: int,
         failure_reason: str,
     ) -> bool:
+        failure_reason = scrub_run_text(failure_reason, workflow_run_id)
         now = naive_utc_now()
         prepared_attempt = select(WorkflowRunAttemptModel.workflow_run_id).where(
             WorkflowRunAttemptModel.workflow_run_id == workflow_run_id,
@@ -605,6 +607,8 @@ class WorkflowRunAttemptsRepository(BaseRepository):
         decision_reason: str | None,
         next_attempt_at: datetime | None,
     ) -> WorkflowRunAttemptModel:
+        failure_reason = scrub_run_text(failure_reason, workflow_run_id)
+        failure_category = scrub_failure_category(failure_category, workflow_run_id)
         normalized_finished_at = to_naive_utc(finished_at)
         assert normalized_finished_at is not None
         next_attempt_at = to_naive_utc(next_attempt_at)
@@ -734,6 +738,8 @@ class WorkflowRunAttemptsRepository(BaseRepository):
         error_codes: list[str] | None = None,
         lease_takeover_seconds: int | None = None,
     ) -> WorkflowRunAttemptModel | None:
+        failure_reason = scrub_run_text(failure_reason, workflow_run_id)
+        failure_category = scrub_failure_category(failure_category, workflow_run_id)
         eligible_decision = or_(
             WorkflowRunAttemptModel.retry_decision == "retry",
             WorkflowRunAttemptModel.retry_decision.is_(None),

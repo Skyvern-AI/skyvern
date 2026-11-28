@@ -43,6 +43,7 @@ from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.runs import ProxyLocationInput, RunEngine, ScriptRunResponse
 from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.utils.run_data_scrub import scrub_block_output, scrub_failure_category, scrub_run_json, scrub_run_text
 
 LOG = structlog.get_logger()
 
@@ -342,13 +343,13 @@ class ObserverRepository(BaseRepository):
                 workflow_id=workflow_id,
                 workflow_permanent_id=workflow_permanent_id,
                 workflow_run_block_id=workflow_run_block_id,
-                user_input=user_input,
-                observation=observation,
-                thought=thought,
-                answer=answer,
+                user_input=scrub_run_text(user_input, workflow_run_id),
+                observation=scrub_run_text(observation, workflow_run_id),
+                thought=scrub_run_text(thought, workflow_run_id),
+                answer=scrub_run_text(answer, workflow_run_id),
                 observer_thought_scenario=thought_scenario,
                 observer_thought_type=thought_type,
-                output=output,
+                output=scrub_run_json(output, workflow_run_id),
                 input_token_count=input_token_count,
                 output_token_count=output_token_count,
                 reasoning_token_count=reasoning_token_count,
@@ -398,14 +399,15 @@ class ObserverRepository(BaseRepository):
                     thought_obj.workflow_id = workflow_id
                 if workflow_permanent_id:
                     thought_obj.workflow_permanent_id = workflow_permanent_id
+                run_id = thought_obj.workflow_run_id
                 if observation:
-                    thought_obj.observation = observation
+                    thought_obj.observation = scrub_run_text(observation, run_id)
                 if thought:
-                    thought_obj.thought = thought
+                    thought_obj.thought = scrub_run_text(thought, run_id)
                 if answer:
-                    thought_obj.answer = answer
+                    thought_obj.answer = scrub_run_text(answer, run_id)
                 if output:
-                    thought_obj.output = output
+                    thought_obj.output = scrub_run_json(output, run_id)
                 if input_token_count is not None:
                     thought_obj.input_token_count = input_token_count
                 if output_token_count is not None:
@@ -438,7 +440,7 @@ class ObserverRepository(BaseRepository):
         if status.is_final():
             values["finished_at"] = func.coalesce(TaskV2Model.finished_at, now)
         if failure_category is not None:
-            values["failure_category"] = failure_category
+            values["failure_category"] = scrub_failure_category(failure_category)
         async with self.Session() as session:
             result = await session.execute(
                 update(TaskV2Model)
@@ -509,7 +511,7 @@ class ObserverRepository(BaseRepository):
                 if webhook_failure_reason is not None:
                     task_v2.webhook_failure_reason = webhook_failure_reason
                 if failure_category is not None:
-                    task_v2.failure_category = failure_category
+                    task_v2.failure_category = scrub_failure_category(failure_category, task_v2.workflow_run_id)
                 await session.commit()
                 await session.refresh(task_v2)
                 return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
@@ -556,7 +558,9 @@ class ObserverRepository(BaseRepository):
                 or not has_classifier_primary(task_v2.failure_category)
             ):
                 return None
-            task_v2.failure_category = with_diagnostic_entry(task_v2.failure_category, entry)
+            task_v2.failure_category = scrub_failure_category(
+                with_diagnostic_entry(task_v2.failure_category, entry), task_v2.workflow_run_id
+            )
             await session.commit()
             await session.refresh(task_v2)
             return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
@@ -580,7 +584,7 @@ class ObserverRepository(BaseRepository):
         attempt_number: int | None = None,
     ) -> WorkflowRunBlock:
         output_write = capped_jsonb_write(
-            output,
+            scrub_block_output(output, workflow_run_id),
             context={"workflow_run_id": workflow_run_id, "label": label, "block_type": block_type},
         )
         async with self.Session() as session:
@@ -596,7 +600,7 @@ class ObserverRepository(BaseRepository):
                 capped_output=output_write.capped_value,
                 continue_on_failure=continue_on_failure,
                 engine=engine,
-                current_value=current_value,
+                current_value=scrub_run_text(current_value, workflow_run_id),
                 current_index=current_index,
                 attempt_number=attempt_number,
                 script_run=ScriptRunResponse(ai_fallback_triggered=ai_fallback_triggered).model_dump(mode="json")
@@ -674,10 +678,26 @@ class ObserverRepository(BaseRepository):
         # Read before truncation: the jsonb storage guard strips downloaded_files from
         # oversized payloads, which would zero out an otherwise-real count.
         derived_downloaded_file_count = downloaded_file_count_from_output(output)
-        output_write = capped_jsonb_write(
-            output,
-            context={"workflow_run_block_id": workflow_run_block_id},
-        )
+        # Scrubbed before the session opens: the write below holds the block and lease row locks.
+        output_write = None
+        if output or failure_reason or loop_values is not None or current_value is not None or prompt:
+            async with self.Session() as session:
+                run_id = (
+                    await session.scalars(
+                        select(WorkflowRunBlockModel.workflow_run_id)
+                        .filter_by(workflow_run_block_id=workflow_run_block_id)
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).first()
+            if output:
+                output_write = capped_jsonb_write(
+                    scrub_block_output(output, run_id),
+                    context={"workflow_run_block_id": workflow_run_block_id},
+                )
+            failure_reason = scrub_run_text(failure_reason, run_id)
+            loop_values = scrub_run_json(loop_values, run_id)
+            current_value = scrub_run_text(current_value, run_id)
+            prompt = scrub_run_text(prompt, run_id)
         async with self.Session() as session:
             block_query = (
                 select(WorkflowRunBlockModel)
@@ -738,7 +758,7 @@ class ObserverRepository(BaseRepository):
             elif workflow_run_block:
                 if status:
                     workflow_run_block.status = status
-                if output:
+                if output_write is not None:
                     workflow_run_block.output = output_write.value
                     workflow_run_block.capped_output = output_write.capped_value
                 if task_id:
@@ -847,7 +867,7 @@ class ObserverRepository(BaseRepository):
         async with self.Session() as session:
             update_values: dict[str, Any] = {"status": new_status}
             if failure_reason is not None:
-                update_values["failure_reason"] = failure_reason
+                update_values["failure_reason"] = scrub_run_text(failure_reason, workflow_run_id)
 
             stmt = update(WorkflowRunBlockModel).where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
             # No index leads with workflow_run_id; the run lookup index is (organization_id, workflow_run_id).

@@ -25,6 +25,7 @@ from skyvern.forge.sdk.services.org_auth_token_service import get_valid_org_api_
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import get_recorded_decision, on_terminal_transition
 from skyvern.services import task_v2_service, uploaded_file_service
+from skyvern.utils.run_data_scrub import stored_text_matches
 
 LOG = structlog.get_logger()
 _STARTED = (WorkflowRunStatus.running, WorkflowRunStatus.paused)
@@ -164,7 +165,7 @@ async def _reap_workflow(
     resuming = (
         lease.owner_id.endswith(REAPER_OWNER_SUFFIX)
         and run.status == WorkflowRunStatus.failed
-        and run.failure_reason == reason
+        and stored_text_matches(run.failure_reason, reason, run.workflow_run_id)
     )
     if not resuming and run.status not in (*_STARTED, *_NOT_STARTED):
         return False, None
@@ -232,7 +233,7 @@ async def _reap_workflow(
                 if (
                     finalized is None
                     or finalized.status != WorkflowRunStatus.failed
-                    or finalized.failure_reason != reason
+                    or not stored_text_matches(finalized.failure_reason, reason, lease.run_id)
                 ):
                     raise
                 LOG.warning(
@@ -243,7 +244,9 @@ async def _reap_workflow(
                 # The task v2 write already committed `failed`, so its webhook and runs-list sync must still go out.
                 finalized = run
         effect = partial(_task_v2_side_effects, finalized, task_v2)
-        if finalized.status != WorkflowRunStatus.failed or finalized.failure_reason != reason:
+        if finalized.status != WorkflowRunStatus.failed or not stored_text_matches(
+            finalized.failure_reason, reason, lease.run_id
+        ):
             # Without this reaper's failure on the run a later pass cannot resume it, so a failed release would drop
             # the effect; schedule it now.
             schedule_side_effects(effect)
@@ -262,7 +265,11 @@ async def _reap_workflow(
             )
         except Exception:
             finalized = await app.DATABASE.workflow_runs.get_workflow_run(lease.run_id)
-            if finalized is None or finalized.status != WorkflowRunStatus.failed or finalized.failure_reason != reason:
+            if (
+                finalized is None
+                or finalized.status != WorkflowRunStatus.failed
+                or not stored_text_matches(finalized.failure_reason, reason, lease.run_id)
+            ):
                 raise
             LOG.warning("Reaped workflow status committed before finalizer failed", run_id=lease.run_id, exc_info=True)
             await _finish_committed_failure(finalized, lease.attempt_number)
