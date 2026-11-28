@@ -1,6 +1,7 @@
 import asyncio
 import io
 import os
+import re
 import time
 import weakref
 import zipfile
@@ -40,6 +41,7 @@ from skyvern.forge.sdk.services.request_reads import note_shared_artifact_links
 from skyvern.utils.secret_redaction import (
     MIN_UNANCHORED_SECRET_LENGTH,
     REDACTION_FAILED_STUB,
+    redact_credential_shapes_from_bytes,
     redact_har_bytes,
     redact_multi_field_totp_artifact_bytes,
     redact_secrets_from_bytes,
@@ -231,22 +233,83 @@ def _scrub_har(data: bytes, inputs: tuple[set[str], frozenset[str]] | None) -> b
     if inputs is None:
         return data
     secret_values, placeholder_ids = inputs
+    started = time.thread_time()
     try:
         return redact_har_bytes(data, secret_values, multi_field_totp=False, placeholder_ids=placeholder_ids)
     except Exception:
         # Redaction was required and did not complete, so the HAR is withheld rather than stored raw.
-        LOG.warning("HAR scrub failed; withholding artifact data", artifact_type=ArtifactType.HAR, exc_info=True)
+        _log_withheld("HAR scrub failed; withholding artifact data", ArtifactType.HAR, data, started)
         return REDACTION_FAILED_STUB
 
 
-def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workflow_run_id: str | None = None) -> bytes:
+def _log_withheld(message: str, artifact_type: ArtifactType, data: bytes, started: float) -> None:
+    LOG.warning(
+        message,
+        artifact_type=artifact_type,
+        size_bytes=len(data),
+        cpu_seconds=round(time.thread_time() - started, 3),
+        exc_info=True,
+    )
+
+
+# An optional UTF-8 byte order mark, any amount of leading whitespace, then the document's first byte.
+_JSON_DOCUMENT_START_RE = re.compile(rb"(?:\xef\xbb\xbf)?\s*[\[{]")
+
+
+def _maybe_redact_artifact_data(
+    artifact_type: ArtifactType,
+    data: bytes,
+    workflow_run_id: str | None = None,
+    *,
+    scrub_credential_shapes: bool = True,
+) -> bytes:
     """Async callers pass HARs through `_maybe_redact_artifact_data_off_loop` instead."""
     if artifact_type == ArtifactType.HAR:
         return _scrub_har(data, _har_redaction_inputs(workflow_run_id))
+    data = _redact_known_secret_values(artifact_type, data, workflow_run_id)
+    if not scrub_credential_shapes:
+        return data
+    return _scrub_credential_shapes(artifact_type, data, _credential_shape_scrub_inputs(artifact_type, workflow_run_id))
+
+
+def _credential_shape_scrub_inputs(artifact_type: ArtifactType, workflow_run_id: str | None) -> frozenset[str] | None:
+    """The run's placeholder ids to keep, or None when the artifact is stored without the credential shape scrub."""
+    if (
+        artifact_type not in _REDACTABLE_TEXT_ARTIFACT_TYPES
+        or not settings.ENABLE_SECRET_ARTIFACT_REDACTION
+        or not settings.ENABLE_ARTIFACT_CREDENTIAL_SHAPE_SCRUB
+    ):
+        return None
+    return _placeholder_ids_for_run(_resolve_redaction_workflow_run_id(workflow_run_id))
+
+
+def _scrub_credential_shapes(artifact_type: ArtifactType, data: bytes, placeholder_ids: frozenset[str] | None) -> bytes:
+    if placeholder_ids is None:
+        return data
+    started = time.thread_time()
+    try:
+        json_document = artifact_type in _JSON_TEXT_ARTIFACT_TYPES or _JSON_DOCUMENT_START_RE.match(data) is not None
+        return redact_credential_shapes_from_bytes(data, json_document=json_document, placeholder_ids=placeholder_ids)
+    except Exception:
+        _log_withheld("Credential shape scrub failed; withholding artifact data", artifact_type, data, started)
+        return REDACTION_FAILED_STUB
+
+
+def _scrub_credential_shapes_of_entries(
+    entries: dict[str, bytes], pending: dict[str, tuple[ArtifactType, frozenset[str]]]
+) -> dict[str, bytes]:
+    return {
+        filename: _scrub_credential_shapes(artifact_type, entries[filename], placeholder_ids)
+        for filename, (artifact_type, placeholder_ids) in pending.items()
+    }
+
+
+def _redact_known_secret_values(artifact_type: ArtifactType, data: bytes, workflow_run_id: str | None) -> bytes:
     if artifact_type in _MULTI_FIELD_TOTP_TEXT_ARTIFACT_TYPES:
         data = redact_multi_field_totp_artifact_bytes(data)
     if artifact_type not in _REDACTABLE_TEXT_ARTIFACT_TYPES:
         return data
+    started = time.thread_time()
     try:
         resolved_workflow_run_id = _resolve_redaction_workflow_run_id(workflow_run_id)
         if not app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(resolved_workflow_run_id):
@@ -267,17 +330,22 @@ def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workfl
         if not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
             return data
         # Without the run's settings it is unknown whether this artifact holds secrets, so it is withheld.
-        LOG.warning("Secret lookup failed; withholding artifact data", artifact_type=artifact_type, exc_info=True)
+        _log_withheld("Secret lookup failed; withholding artifact data", artifact_type, data, started)
         return REDACTION_FAILED_STUB
     placeholder_ids = _placeholder_ids_for_run(resolved_workflow_run_id)
     if not secret_values and not skyvern_context.multi_field_totp_masking_task_ids():
         return data
     # A JSON artifact's root can be a bare number or string (a scalar extraction result).
-    if secret_values and (artifact_type in _JSON_TEXT_ARTIFACT_TYPES or data.lstrip()[:1] in (b"{", b"[")):
+    if secret_values and (
+        artifact_type in _JSON_TEXT_ARTIFACT_TYPES or _JSON_DOCUMENT_START_RE.match(data) is not None
+    ):
         scrubbed = redact_secrets_from_json_bytes(data, secret_values, placeholder_ids=placeholder_ids)
         if scrubbed is not None:
             return scrubbed
     return redact_secrets_from_bytes(data, secret_values, multi_field_totp=False, placeholder_ids=placeholder_ids)
+
+
+_CREDENTIAL_SHAPE_SCRUB_THREAD_BYTES = 32 * 1024
 
 
 async def _maybe_redact_artifact_data_off_loop(
@@ -287,7 +355,13 @@ async def _maybe_redact_artifact_data_off_loop(
     # sets are read on the event loop, which owns them; only the scrub runs in the thread.
     if artifact_type == ArtifactType.HAR:
         return await asyncio.to_thread(_scrub_har, data, _har_redaction_inputs(workflow_run_id))
-    return _maybe_redact_artifact_data(artifact_type, data, workflow_run_id)
+    data = _redact_known_secret_values(artifact_type, data, workflow_run_id)
+    placeholder_ids = _credential_shape_scrub_inputs(artifact_type, workflow_run_id)
+    # The scan holds the GIL inside each regex call, so the thread only lets the loop run between calls. Crafted input
+    # under this size was measured at 2.2 to 2.9 s of CPU per MB worst case, so it holds the loop under 0.1 s.
+    if placeholder_ids is not None and len(data) >= _CREDENTIAL_SHAPE_SCRUB_THREAD_BYTES:
+        return await asyncio.to_thread(_scrub_credential_shapes, artifact_type, data, placeholder_ids)
+    return _scrub_credential_shapes(artifact_type, data, placeholder_ids)
 
 
 def _read_file_bytes(path: str) -> bytes:
@@ -378,6 +452,8 @@ class StepArchiveAccumulator:
     # *after* bulk_create_artifacts() so the artifact row always exists first.
     pending_action_screenshot_updates: list[tuple[str, str, str]] = field(default_factory=list)
     # (organization_id, action_id, artifact_id)
+    # filename -> (artifact_type, placeholder ids) of entries whose credential shape scrub runs at flush, off the loop.
+    pending_credential_shape_scrubs: dict[str, tuple[ArtifactType, frozenset[str]]] = field(default_factory=dict)
 
 
 def _configured_name(organization_id: str, run_id: str, checksum: str | None, source_path: str | None) -> str | None:
@@ -1926,7 +2002,14 @@ class ArtifactManager:
         Returns the artifact_id (pre-generated or provided) so callers can link it
         in DB foreign keys (e.g. action.screenshot_artifact_id) before flush.
         """
-        acc.entries[filename] = _maybe_redact_artifact_data(artifact_type, data, workflow_run_id=acc.workflow_run_id)
+        acc.entries[filename] = _maybe_redact_artifact_data(
+            artifact_type, data, workflow_run_id=acc.workflow_run_id, scrub_credential_shapes=False
+        )
+        placeholder_ids = _credential_shape_scrub_inputs(artifact_type, acc.workflow_run_id)
+        if placeholder_ids is None:
+            acc.pending_credential_shape_scrubs.pop(filename, None)
+        else:
+            acc.pending_credential_shape_scrubs[filename] = (artifact_type, placeholder_ids)
         # Deduplicate by filename — update in place if it already exists
         for i, (_, fn, existing_id) in enumerate(acc.member_types):
             if fn == filename:
@@ -2067,6 +2150,19 @@ class ArtifactManager:
         acc.pending_action_screenshot_updates.append((organization_id, action_id, artifact_id))
 
     @staticmethod
+    async def _scrub_pending_credential_shapes(accumulator: StepArchiveAccumulator) -> None:
+        # Every storage write of an archive entry goes through this, so no entry is stored before its shape scan.
+        # An entry re-added while the thread runs keeps its newer bytes and is scanned on the next pass.
+        pending = accumulator.pending_credential_shape_scrubs
+        while pending:
+            originals = {filename: accumulator.entries[filename] for filename in pending}
+            scrubbed = await asyncio.to_thread(_scrub_credential_shapes_of_entries, originals, dict(pending))
+            for filename, data in scrubbed.items():
+                if accumulator.entries.get(filename) is originals[filename]:
+                    accumulator.entries[filename] = data
+                    pending.pop(filename, None)
+
+    @staticmethod
     def _build_zip(entries: dict[str, bytes]) -> bytes:
         """Build an in-memory ZIP from a filename → bytes mapping.
 
@@ -2197,6 +2293,7 @@ class ArtifactManager:
         entries: dict[str, bytes] = {}
         members: list[tuple[StepArchiveAccumulator, ArtifactType, str, str]] = []
         for accumulator in accumulators:
+            await self._scrub_pending_credential_shapes(accumulator)
             # Every step numbers its files from 0, so another step's files get its step id as a prefix in the ZIP.
             prefix = "" if accumulator.step.step_id == owner.step_id else f"{accumulator.step.step_id}_"
             for artifact_type, filename, artifact_id in accumulator.member_types:
@@ -2244,6 +2341,7 @@ class ArtifactManager:
         No STEP_ARCHIVE parent — the ZIP doesn't exist in this mode. Storage
         PUTs are sequenced; the member count per step is small (typically < 20).
         """
+        await self._scrub_pending_credential_shapes(accumulator)
         step = accumulator.step
         now = datetime.now(UTC)
         member_models: list[ArtifactModel] = []
