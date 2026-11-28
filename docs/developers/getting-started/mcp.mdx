@@ -155,19 +155,32 @@ claude mcp add-json skyvern '{"type":"http","url":"https://api.skyvern.com/mcp/"
 
 If Claude says Skyvern needs authorization, the key is missing: open **Settings → Extensions → Skyvern → Configure** and paste it. The bundle does not update itself; download and install it again to upgrade.
 
-**Linux** (Node.js 20 or later). Add to `~/.config/Claude/claude_desktop_config.json`:
+**Linux, self-hosted, or advanced API-key fallback** (Node.js 20.18.1 or later and the Skyvern CLI).
 
-```json
-{
-  "mcpServers": {
-    "Skyvern": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://api.skyvern.com/mcp/", "--header", "x-api-key:${SKYVERN_API_KEY}"],
-      "env": { "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY" }
-    }
-  }
-}
+Set `SKYVERN_API_KEY` in your environment, then run:
+
+```bash
+skyvern setup claude
 ```
+
+For another HTTPS deployment, use `skyvern setup claude --url https://your-host/mcp`.
+The CLI extracts the API-key adapter and its pinned SDK 2.3.1 dependencies from the
+`.mcpb` shipped with the Python package into a cache keyed by the archive SHA-256.
+It writes a direct Node.js entry with the key and URL in the environment; it does
+not run `npx` or install npm packages. Existing cached runtime bytes are verified
+against the archive before setup reuses them. Set `SKYVERN_MCP_CACHE_DIR` to choose
+the cache location. Dry run and declining the config prompt do not extract files.
+
+The adapter supports API-key authentication and HTTPS Streamable HTTP. HTTP-only
+endpoints and OAuth are not supported by this fallback. For a private CA, set
+`NODE_EXTRA_CA_CERTS` to its PEM file before setup; the generated entry retains
+that explicit trust setting. The OS trust store is not changed.
+
+The CLI preserves unrelated entries in the Claude Desktop configuration:
+
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 
 </Tab>
 <Tab title="Cursor">

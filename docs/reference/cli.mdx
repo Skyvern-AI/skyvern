@@ -279,6 +279,8 @@ skyvern mcp profile save work-prod --api-key YOUR_KEY --base-url https://api.sky
 
 For the local self-hosted path, `skyvern quickstart` or `skyvern init` can also configure Claude Code during the interactive MCP step. In a project directory that flow writes `.mcp.json`, installs the bundled skills (including `/qa`) into `.claude/skills/`, and keeps the MCP connection fully local for localhost testing.
 
+For Skyvern Cloud in Claude Desktop, use **Customize > Connectors > Add custom connector**, enter `https://api.skyvern.com/mcp/`, and sign in with your Skyvern account. This path needs no API key or local Node.js installation. For API-key setups, the downloadable `.mcpb` bundle on macOS and Windows remains an alternative. `skyvern setup claude` writes a direct Node.js configuration for the bundled API-key adapter (SDK 2.3.1), without `npx` or npm installation; Node.js 20.18.1 or later is required. See [MCP and coding agents](/developers/getting-started/mcp).
+
 `skyvern mcp switch` updates existing Skyvern entries in Claude Code, Claude Desktop, Cursor, Windsurf, Codex, Hermes, OpenClaw, and OpenCode configs. It lets you choose a source from env, saved profiles, existing configs already on disk, or manual entry; creates backups before writing; and preserves the config's current transport shape. If a tool has no Skyvern entry yet, run `skyvern setup` first.
 
 ### Other
