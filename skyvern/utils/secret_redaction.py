@@ -1,23 +1,36 @@
 import base64
+import bisect
 import contextvars
 import dataclasses
 import functools
+import heapq
 import html
+import itertools
 import json
 import re
 import urllib.parse
-from collections.abc import Callable, Collection, Iterable, Mapping
+from array import array
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from typing import Any
 
 import structlog
 
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.utils.raw_secret_redaction import (
+    TEXT_BUILDER_SLICE_CHARS,
+    TWIN_PREFIXES,
+    TWIN_SUFFIXES,
+    TextBuilder,
+    artifact_scan_text,
+    check_scan_budget,
     has_credential_shape,
     is_hex_credential,
+    is_private_key_block,
+    iter_artifact_credential_spans,
     iter_auth_scheme_credentials,
     iter_jwt_runs,
     percent_decoded,
+    scan_budget,
 )
 
 LOG = structlog.get_logger()
@@ -97,10 +110,8 @@ _NORMALIZED_QUERY_PARAM_NAMES = frozenset(_normalized_name(name) for name in SEN
 _NORMALIZED_FORM_FIELD_NAMES = frozenset(_normalized_name(name) for name in SENSITIVE_FORM_FIELD_NAMES)
 _URL_HEADER_NAMES = frozenset({"referer", "location", "contentlocation", ":path"})
 _NAME_PART_SEPARATOR_RE = re.compile(r"[\[\]$:.]+")
-# A twin of a listed name (`new_password`, `password_confirmation`, `password2`) still has the listed name as its exact
-# residue once these closed modifier words and trailing digits come off; nothing else may sit in the name.
-_TWIN_PREFIXES = ("new", "old", "current", "confirm", "repeat", "retype", "verify", "user", "account", "login", "re")
-_TWIN_SUFFIXES = ("confirmation", "confirmed", "confirm", "again", "repeat", "verify", "verification")
+# A twin of a listed name keeps the listed name as its exact residue once TWIN_PREFIXES, TWIN_SUFFIXES and trailing
+# digits come off; nothing else may sit in the name.
 _DIGITS = frozenset("0123456789")
 # No form field name is this long; a longer one is checked for exact membership only, which keeps the twin check cheap.
 _MAX_TWIN_NAME_CHARS = 256
@@ -131,7 +142,7 @@ def _is_listed_or_twin(normalized: str, normalized_names: frozenset[str]) -> boo
     pending = [0]
     while pending:
         index = pending.pop()
-        for word in _TWIN_PREFIXES:
+        for word in TWIN_PREFIXES:
             if normalized.startswith(word, index) and index + len(word) not in starts:
                 starts.add(index + len(word))
                 pending.append(index + len(word))
@@ -139,7 +150,7 @@ def _is_listed_or_twin(normalized: str, normalized_names: frozenset[str]) -> boo
     pending = [size]
     while pending:
         index = pending.pop()
-        candidates = [index - len(word) for word in _TWIN_SUFFIXES if normalized.endswith(word, 0, index)]
+        candidates = [index - len(word) for word in TWIN_SUFFIXES if normalized.endswith(word, 0, index)]
         if index and normalized[index - 1] in _DIGITS:
             candidates.append(index - 1)
         for candidate in candidates:
@@ -1161,28 +1172,332 @@ def _redact_post_data_text(post_data: dict[str, Any]) -> None:
         post_data["text"] = base64.b64encode(scrubbed.encode()).decode() if encoded else scrubbed
 
 
-def _redact_credential_shapes_in_text(text: str) -> str:
-    spans = [match.span() for match in iter_jwt_runs(text)]
-    spans += [match.span() for match in _DELIMITED_HEX_VALUE_RE.finditer(text) if is_hex_credential(match.group())]
-    for match in iter_auth_scheme_credentials(text):
+def _iter_jwt_and_auth_scheme_spans(
+    text: str, *, scheme_token_needs_digit: bool = False, line_start_is_value: bool = False
+) -> Iterator[tuple[int, int]]:
+    for match in iter_jwt_runs(text):
+        yield match.span()
+    for match in iter_auth_scheme_credentials(text, line_start_is_value=line_start_is_value):
         if match.group("digest"):
             value = _DIGEST_RESPONSE_VALUE_RE.match(text, match.end())
-            spans.append((match.end(), value.end() if value else match.end()))
+            yield match.end(), value.end() if value else match.end()
+        elif (token := match.group("token")) is not None:
+            if not scheme_token_needs_digit or any(char.isdigit() for char in token):
+                yield match.span("token")
         else:
-            spans.append(match.span("token") if match.group("token") is not None else match.span("basic"))
-    if not spans:
+            yield match.span("basic")
+
+
+# A span is packed as `start << 32 | end` in an `array("q")`, 8 bytes each, so a text dense with credentials holds no
+# tuple per span. Packed spans sort by start, then end.
+_SPAN_END_MASK = (1 << 32) - 1
+
+
+def _packed_spans(spans: Iterable[tuple[int, int]]) -> array:
+    return array("q", (start << 32 | end for start, end in spans))
+
+
+def _sorted_ints(values: array, *, unique: bool = False) -> array:
+    # Every scanner yields its spans in order, so the values are a few ascending runs, merged without a list of them.
+    runs: list[memoryview] = []
+    view = memoryview(values)
+    run_start = 0
+    repeated = False
+    for index in range(1, len(values)):
+        if values[index] < values[index - 1]:
+            runs.append(view[run_start:index])
+            run_start = index
+        elif values[index] == values[index - 1]:
+            repeated = True
+    if not runs and not (unique and repeated):
+        return values
+    runs.append(view[run_start:])
+    merged = heapq.merge(*runs)
+    return array("q", (value for value, _ in itertools.groupby(merged)) if unique else merged)
+
+
+def _span_union(spans: array) -> array:
+    """Sorted spans merged where they overlap or touch: the same characters, in disjoint spans whose ends are sorted
+    too, so one array answers whether any span overlaps a range."""
+    union = array("q")
+    for span in spans:
+        if union and span >> 32 <= union[-1] & _SPAN_END_MASK:
+            if span & _SPAN_END_MASK > union[-1] & _SPAN_END_MASK:
+                union[-1] = union[-1] >> 32 << 32 | span & _SPAN_END_MASK
+        else:
+            union.append(span)
+    return union
+
+
+def _overlaps(union: array, start: int, end: int) -> bool:
+    return bisect.bisect_left(union, end, key=_span_start) > bisect.bisect_right(union, start, key=_span_end)
+
+
+def _span_start(span: int) -> int:
+    return span >> 32
+
+
+def _span_end(span: int) -> int:
+    return span & _SPAN_END_MASK
+
+
+def _replace_spans(text: str, spans: Iterable[tuple[int, int]]) -> str:
+    return _replace_packed_spans(text, _sorted_ints(_packed_spans(spans)))
+
+
+def _replace_packed_spans(text: str, spans: array) -> str:
+    if all(span >> 32 == span & _SPAN_END_MASK for span in spans):
         return text
-    parts: list[str] = []
+    builder = TextBuilder()
+    _add_with_spans_replaced(builder, text, spans)
+    return builder.build()
+
+
+def _add_with_spans_replaced(
+    builder: TextBuilder, text: str, spans: Iterable[int], encode: Callable[[str], str] | None = None
+) -> None:
+    """Adds ``text`` with each sorted span replaced by the placeholder, every piece passed through ``encode``."""
     position = 0
-    for start, end in sorted(spans):
+    for span in spans:
+        start, end = span >> 32, span & _SPAN_END_MASK
         if end <= position or start == end:
             continue
-        start = max(start, position)
-        parts.append(text[position:start])
-        parts.append(REDACTED_SECRET_PLACEHOLDER)
+        if start < position:
+            # An overlapping span extends the placeholder already written rather than adding a second one.
+            position = max(position, end)
+            continue
+        _add_encoded_slice(builder, text, position, start, encode)
+        builder.add(REDACTED_SECRET_PLACEHOLDER)
         position = end
-    parts.append(text[position:])
-    return "".join(parts)
+    _add_encoded_slice(builder, text, position, len(text), encode)
+
+
+def _add_encoded_slice(
+    builder: TextBuilder, text: str, start: int, end: int, encode: Callable[[str], str] | None
+) -> None:
+    if encode is None:
+        builder.add_slice(text, start, end)
+        return
+    for chunk_start in range(start, end, TEXT_BUILDER_SLICE_CHARS):
+        builder.add(encode(text[chunk_start : min(end, chunk_start + TEXT_BUILDER_SLICE_CHARS)]))
+
+
+def _json_string_body(text: str) -> str:
+    # Escaping is per character, so the bodies of the pieces of a string join into the body of the whole string.
+    return json.encoder.encode_basestring(text)[1:-1]
+
+
+def _redact_credential_shapes_in_text(text: str) -> str:
+    spans = _packed_spans(_iter_jwt_and_auth_scheme_spans(text))
+    spans += _packed_spans(
+        match.span() for match in _DELIMITED_HEX_VALUE_RE.finditer(text) if is_hex_credential(match.group())
+    )
+    return _replace_packed_spans(text, _sorted_ints(spans))
+
+
+def _spans_outside_placeholders(text: str, spans: array, placeholder_ids: Collection[str]) -> array:
+    exempt_ids = frozenset(token for token in placeholder_ids if token)
+    if not exempt_ids:
+        return spans
+    kept_starts, kept_ends = array("q"), array("q")
+    for match in _compiled_placeholder_id_pattern(exempt_ids).finditer(text):
+        kept_starts.append(match.start())
+        kept_ends.append(match.end())
+    pieces = array("q")
+    for span in spans:
+        start, end = span >> 32, span & _SPAN_END_MASK
+        index = bisect.bisect_right(kept_ends, start)
+        while index < len(kept_starts) and kept_starts[index] < end:
+            if kept_starts[index] > start:
+                pieces.append(start << 32 | kept_starts[index])
+            start = max(start, kept_ends[index])
+            index += 1
+        if start < end:
+            pieces.append(start << 32 | end)
+    return pieces
+
+
+def _credential_shape_spans(text: str, placeholder_ids: Collection[str]) -> array:
+    check_scan_budget()
+    # Hex runs are left to the HAR scrub: in a page they are mostly asset hashes and commit ids.
+    scan_text = artifact_scan_text(text)
+    spans = _packed_spans(
+        _iter_jwt_and_auth_scheme_spans(scan_text, scheme_token_needs_digit=True, line_start_is_value=True)
+    )
+    del scan_text
+    spans += _packed_spans(iter_artifact_credential_spans(text))
+    return _spans_outside_placeholders(text, spans, placeholder_ids) if spans else spans
+
+
+# Strings and numbers; a number a span covers (`{"pin": 839201}`) is written back as the placeholder string.
+_JSON_KEY_FOLLOWS_RE = re.compile(r"\s*:")
+_JSON_VALUE_TOKEN_RE = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*+"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?')
+# Decodes the JSON string starting after a quote at an offset, without copying the token first; typeshed omits it.
+_scan_json_string: Callable[[str, int], tuple[str, int]] = json.decoder.scanstring  # type: ignore[attr-defined]
+# One escape of a JSON string; a surrogate pair decodes to one character.
+_JSON_STRING_ESCAPE_RE = re.compile(
+    r"\\(?:u[dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)", re.S
+)
+
+
+def _decoded_offsets(text: str, token_start: int, token_end: int, offsets: Iterable[int]) -> Iterator[int]:
+    """For each ascending offset in a JSON string token of ``text`` (quotes included), the offset in its decoded value
+    it falls at; an offset inside an escape falls at the escape's character."""
+    content_start, content_end = token_start + 1, token_end - 1
+    escapes = _JSON_STRING_ESCAPE_RE.finditer(text, content_start, content_end)
+    escape = next(escapes, None)
+    shift = 0
+    for offset in offsets:
+        while escape is not None and escape.end() <= offset:
+            shift += escape.end() - escape.start() - 1
+            escape = next(escapes, None)
+        position = min(offset, content_end)
+        if escape is not None and escape.start() < position:
+            position = escape.start()
+        yield max(0, position - content_start - shift)
+
+
+def redact_credential_shapes_from_bytes(
+    data: bytes, *, json_document: bool, placeholder_ids: Collection[str] = ()
+) -> bytes:
+    """Replace credentials the run never registered (JWTs, auth-scheme and keyword-assigned values, prefixed API keys,
+    private keys) with the placeholder. A JSON document is scrubbed string by string, so it stays valid JSON. Raises
+    ScanBudgetExceeded when the scan runs past the budget for the data's size."""
+    with scan_budget(len(data)):
+        return _redact_credential_shapes(data, json_document=json_document, placeholder_ids=placeholder_ids)
+
+
+def _redact_credential_shapes(data: bytes, *, json_document: bool, placeholder_ids: Collection[str]) -> bytes:
+    text = data.decode("utf-8", errors="replace")
+    spans = _credential_shape_spans(text, placeholder_ids)
+    if not spans:
+        return data
+    spans = _sorted_ints(spans, unique=True)
+    if json_document and _parses_as_json(text):
+        within = _sorted_ints(array("q", _spans_within_one_value(text, spans)), unique=True)
+        touched = _span_union(spans)
+        del spans
+        builder = _json_with_strings_scrubbed(text, touched, within, placeholder_ids)
+        del touched, within
+        return _encode_json_text(text if builder is None else builder.build())
+    return _replace_packed_spans(text, spans).encode()
+
+
+def _parses_as_json(text: str) -> bool:
+    try:
+        json.loads(text.removeprefix("\ufeff"))
+    except (ValueError, RecursionError):
+        return False
+    return True
+
+
+def _spans_within_one_value(text: str, spans: array) -> Iterator[int]:
+    # Every string a span of the whole text touches is scanned again on its own, so a span of the whole text counts
+    # only inside one string value: one that runs past its string is cut at the closing quote. A private key whose lines
+    # are separate strings is the one shape read across them. ``spans`` is sorted, so the tokens are read once.
+    tokens = _JSON_VALUE_TOKEN_RE.finditer(text)
+    token: re.Match[str] | None = None
+    upcoming = next(tokens, None)
+    for span in spans:
+        start, end = span >> 32, span & _SPAN_END_MASK
+        if is_private_key_block(text, start, end):
+            yield span
+            continue
+        while upcoming is not None and upcoming.start() <= start:
+            token, upcoming = upcoming, next(tokens, None)
+        if token is None:
+            continue
+        token_start, token_end = token.span()
+        # Inside a string value's quotes, or the whole of a number; a member name gets only its own rescan.
+        if text[token_start] == '"':
+            if token_start < start < token_end - 1 and not _JSON_KEY_FOLLOWS_RE.match(text, token_end):
+                yield start << 32 | min(end, token_end - 1)
+        elif end <= token_end:
+            yield span
+
+
+def _json_with_strings_scrubbed(
+    text: str, touched: array, spans: array, placeholder_ids: Collection[str]
+) -> TextBuilder | None:
+    """The text with its scrubbed strings, still in pieces so the caller can free the spans before joining them; None
+    when no string changes. ``touched`` is the union of the spans found in the whole text; ``spans`` are those that
+    count inside one value."""
+    # The union of ``spans``, built once a number is touched, as few documents need it.
+    covering = array("q")
+    # A private key whose lines are separate strings crosses from one string into the next; every string value it reaches
+    # is withheld whole. Any other span was cut to one string above. Merged once into disjoint intervals, so each string
+    # finds the one that can reach it by bisect.
+    crossing_starts, crossing_ends = array("q"), array("q")
+    for span in spans:
+        start, end = span >> 32, span & _SPAN_END_MASK
+        if text.find('"', start, end) < 0 or not is_private_key_block(text, start, end):
+            continue
+        if crossing_ends and start <= crossing_ends[-1]:
+            crossing_ends[-1] = max(crossing_ends[-1], end)
+        else:
+            crossing_starts.append(start)
+            crossing_ends.append(end)
+
+    def crossed(token_start: int, token_end: int) -> bool:
+        # The last interval starting before the string's end may lie inside it; the one before may cross in.
+        last = bisect.bisect_left(crossing_starts, token_end) - 1
+        return any(
+            crossing_ends[index] > token_start
+            and (crossing_starts[index] < token_start or crossing_ends[index] > token_end)
+            for index in (last, last - 1)
+            if index >= 0
+        ) and not _JSON_KEY_FOLLOWS_RE.match(text, token_end)
+
+    def scrubbed_token(token_start: int, token_end: int) -> str | tuple[str, Iterator[int]] | None:
+        # A string scanned again comes back as its value and spans, written below without a copy of the whole string.
+        # Only a string that a span found in the raw text overlaps is decoded and scanned again.
+        if not _overlaps(touched, token_start, token_end):
+            return None
+        if text[token_start] != '"':
+            if not covering:
+                covering.extend(_span_union(spans))
+            return json.dumps(REDACTED_SECRET_PLACEHOLDER) if _overlaps(covering, token_start, token_end) else None
+        value = _scan_json_string(text, token_start + 1)[0]
+        value_spans = _credential_shape_spans(value, placeholder_ids)
+        first = bisect.bisect_right(spans, token_start, key=_span_start)
+        inside = range(first, bisect.bisect_left(spans, token_end - 1, key=_span_start))
+        inside_ends = array("q", (end for index in inside if (end := spans[index] & _SPAN_END_MASK) < token_end))
+        if value_spans:
+            # The rescan and the spans the whole text found inside this string both apply, so a value whose keyword
+            # sits outside the string (`"Cookie": "sid=..."`) is scrubbed as in text mode. Starts and ends map through
+            # the escapes in two ordered passes; paired in order they cover the same characters as the spans did.
+            inside_starts = (spans[index] >> 32 for index in inside if spans[index] & _SPAN_END_MASK < token_end)
+            mapped = (
+                start << 32 | end
+                for start, end in zip(
+                    _decoded_offsets(text, token_start, token_end, inside_starts),
+                    _decoded_offsets(text, token_start, token_end, _sorted_ints(inside_ends)),
+                )
+            )
+            return value, heapq.merge(_sorted_ints(value_spans), mapped)
+        # A span wholly inside the string whose keyword sits outside it, as in `"password": "..."`, takes the whole value.
+        if inside_ends or crossed(token_start, token_end):
+            return json.dumps(REDACTED_SECRET_PLACEHOLDER)
+        return None
+
+    builder = TextBuilder()
+    position = 0
+    for match in _JSON_VALUE_TOKEN_RE.finditer(text):
+        if (replacement := scrubbed_token(*match.span())) is None:
+            continue
+        builder.add_slice(text, position, match.start())
+        if isinstance(replacement, str):
+            builder.add(replacement)
+        else:
+            builder.add('"')
+            _add_with_spans_replaced(builder, *replacement, _json_string_body)
+            builder.add('"')
+        del replacement
+        position = match.end()
+    if not position:
+        return None
+    builder.add_slice(text, position, len(text))
+    return builder
 
 
 def _redact_cookies(cookies: Any) -> None:
