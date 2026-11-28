@@ -516,7 +516,7 @@ async def _block_schema_pre_hook_result(
     return {
         "ok": False,
         "error": (
-            f"Block type {block_type!r} is not available in the workflow copilot. "
+            f"Block type {block_type!r} is not available in Ember. "
             f"{_render_block_policy_detail(normalized, policy)} {_ember_banned_block_alternatives(ctx)}"
         ),
     }

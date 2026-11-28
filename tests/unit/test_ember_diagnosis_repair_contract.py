@@ -3725,7 +3725,7 @@ def test_a_run_that_never_started_does_not_count_as_a_run_of_this_turn() -> None
     ctx = _ctx()
     preflight_failure: dict[str, object] = {
         "ok": False,
-        "error": "Unable to prepare the Copilot test-run snapshot; execution was not started.",
+        "error": "Unable to prepare the Ember test-run snapshot; execution was not started.",
         "data": {"workflow_run_id": None, "overall_status": "failed", "blocks": []},
     }
 

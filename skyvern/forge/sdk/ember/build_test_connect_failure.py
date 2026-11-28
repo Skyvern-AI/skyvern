@@ -113,7 +113,7 @@ def build_test_connect_failure_sentence(failure: BuildTestConnectFailure) -> str
         )
     if failure.state == "browser_start_capacity":
         return (
-            f"No browser session started: {failure.starting_sessions} Copilot browser sessions are already starting "
+            f"No browser session started: {failure.starting_sessions} Ember browser sessions are already starting "
             f"for this organization, which is its limit of {failure.max_starting_sessions}. The capacity check "
             f"suggests retrying after {failure.retry_after_seconds} seconds."
         )

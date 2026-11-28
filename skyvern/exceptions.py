@@ -887,10 +887,10 @@ class SyncTriggeredSequentialCredentialUnsupported(SkyvernException):
 class EmberInlineSequentialCredentialUnsupported(SkyvernException):
     def __init__(self, workflow_run_id: str) -> None:
         super().__init__(
-            f"Copilot run {workflow_run_id} resolves to a sequential credential, but the copilot inline "
+            f"Ember run {workflow_run_id} resolves to a sequential credential, but the Ember inline "
             "block-run path executes in-process and never reaches the Temporal V2 serialization gate, so it "
             "cannot be serialized against other runs using the same credential. The run fails closed rather "
-            "than running unserialized. Clear run_sequentially on the credential, or enable the copilot "
+            "than running unserialized. Clear run_sequentially on the credential, or enable the Ember "
             "dispatch flag so the run publishes through the gate."
         )
 

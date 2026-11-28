@@ -1558,7 +1558,7 @@ async def test_error_mapping_by_route(server: FakeEmber, monkeypatch: pytest.Mon
     assert "upgrade" not in json.dumps(unknown["error"]).lower()
 
     server.set_history(CHAT, working_history())
-    server.cancel = httpx.Response(404, json={"detail": "Unknown Copilot chat"})
+    server.cancel = httpx.Response(404, json={"detail": "Chat not found"})
     handler_404 = await _call(ember.skyvern_ember_stop, ember_chat_id=CHAT, wait_seconds=0)
     assert handler_404["error"]["code"] == "CHAT_NOT_FOUND"
     assert "upgrade" not in json.dumps(handler_404["error"]).lower()
@@ -2547,15 +2547,15 @@ async def test_decide_refusals_post_nothing(
         (409, "Unknown choice for this part", "question-response", "INVALID_INPUT"),
         (409, "Select at least one credential", "credential-deletion", "INVALID_INPUT"),
         (409, "A confirmation lists a credential the card did not", "credential-deletion", "INVALID_INPUT"),
-        (404, "Unknown Copilot chat", "question-response", "CHAT_NOT_FOUND"),
+        (404, "Chat not found", "question-response", "CHAT_NOT_FOUND"),
         (404, "Chat not found", "apply-proposed-workflow", "CHAT_NOT_FOUND"),
         (404, "Credential cred_9 not found", "credential-response", "INVALID_INPUT"),
         (409, "This card did not ask about that login's site", "credential-response", "INVALID_INPUT"),
-        (409, "Copilot proposal changed; reload required", "apply-proposed-workflow", "PROPOSAL_CHANGED"),
-        (409, "Copilot proposal changed; reload required", "clear-proposed-workflow", "PROPOSAL_CHANGED"),
+        (409, "Ember proposal changed; reload required", "apply-proposed-workflow", "PROPOSAL_CHANGED"),
+        (409, "Ember proposal changed; reload required", "clear-proposed-workflow", "PROPOSAL_CHANGED"),
         (409, "Workflow changed after this proposal", "apply-proposed-workflow", "PROPOSAL_CHANGED"),
-        (409, "Copilot proposal metadata is invalid; reload required", "apply-proposed-workflow", "PROPOSAL_CHANGED"),
-        (409, "Copilot proposal is already being accepted", "apply-proposed-workflow", "PROPOSAL_CHANGED"),
+        (409, "Ember proposal metadata is invalid; reload required", "apply-proposed-workflow", "PROPOSAL_CHANGED"),
+        (409, "Ember proposal is already being accepted", "apply-proposed-workflow", "PROPOSAL_CHANGED"),
         (409, "Ember proposal changed; reload required", "apply-proposed-workflow", "PROPOSAL_CHANGED"),
         (400, "No proposed workflow to apply", "apply-proposed-workflow", "NO_PROPOSAL"),
         (
@@ -2564,10 +2564,10 @@ async def test_decide_refusals_post_nothing(
             "question-response",
             "TURN_CONTROL_DENIED",
         ),
-        (403, "Credential deletion from Copilot is off", "credential-deletion", "PERMISSION_DENIED"),
+        (403, "Credential deletion from Ember is off", "credential-deletion", "PERMISSION_DENIED"),
         (403, "You can't use this login", "credential-response", "PERMISSION_DENIED"),
         (409, "Copilot is busy", "steer", "TURN_IN_PROGRESS"),
-        (404, "Unknown Copilot chat", "cancel", "CHAT_NOT_FOUND"),
+        (404, "Chat not found", "cancel", "CHAT_NOT_FOUND"),
         (404, "Not Found", "cancel", "EMBER_UNAVAILABLE"),
         (503, "Cancel not supported in this environment", "cancel", "API_ERROR"),
         (403, "Missing permission", "cancel", "PERMISSION_DENIED"),

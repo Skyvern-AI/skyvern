@@ -124,7 +124,7 @@ _EMBER_BLOCK_TYPE_POLICIES: dict[str, EmberBlockPolicy] = {
         _ALWAYS,
         "declared AI leaf support",
         (
-            "The legacy task_v2 agent is not available in the workflow copilot; decompose the goal into explicit "
+            "The legacy task_v2 agent is not available in Ember; decompose the goal into explicit "
             "workflow blocks or focused code blocks instead."
         ),
     ),

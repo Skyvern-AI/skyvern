@@ -437,7 +437,7 @@ RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
 _KEPT_RUN_ACTIVITY_RENEWAL_CAP_SECONDS = 20 * 60
 
 EMBER_SANDBOX_UNAVAILABLE_ERROR = "Sandboxed worker is unavailable; execution was not started."
-EMBER_SNAPSHOT_PREPARATION_ERROR = "Unable to prepare the Copilot test-run snapshot; execution was not started."
+EMBER_SNAPSHOT_PREPARATION_ERROR = "Unable to prepare the Ember test-run snapshot; execution was not started."
 
 
 EMBER_FOLDER_REFERENCE_ERROR = (
@@ -446,7 +446,7 @@ EMBER_FOLDER_REFERENCE_ERROR = (
 )
 _PROPOSAL_BIND_REFUSED_KEY = "proposal_bind_refused"
 EMBER_PROPOSAL_SETTINGS_CHANGED_ERROR = (
-    "This request's workflow settings differ from the pending Copilot proposal's; "
+    "This request's workflow settings differ from the pending Ember proposal's; "
     "re-save the proposal with the current settings, then test again."
 )
 
@@ -1797,7 +1797,7 @@ def _runtime_code_security_failure_for_selected_labels(
     if not errors:
         return None
 
-    failure_reason = "Copilot runtime blocked unsafe synthesized code before browser dispatch."
+    failure_reason = "Ember runtime blocked unsafe synthesized code before browser dispatch."
     return {
         "ok": False,
         "error": failure_reason,
@@ -1817,7 +1817,7 @@ def _runtime_code_security_failure_for_selected_labels(
 
 
 _INLINE_SEQUENTIAL_CREDENTIAL_USER_REASON = (
-    "This test run uses a credential that is set to be used by one run at a time, and the copilot's "
+    "This test run uses a credential that is set to be used by one run at a time, and Ember's "
     "in-process test run cannot hold that ordering. The run stopped instead of using the credential "
     "alongside another run."
 )
@@ -5382,13 +5382,13 @@ async def _run_blocks_with_minted_browser_claim(
                         ctx.proposal_workflow_run_id = workflow_run.workflow_run_id
             if bind_conflict is not None or bind_unexpected:
                 if bind_conflict is None:
-                    cancel_reason = "The Copilot test run could not be bound to its proposal."
+                    cancel_reason = "The Ember test run could not be bound to its proposal."
                 elif bind_conflict[0] == "being_accepted":
-                    cancel_reason = "The Copilot proposal was being accepted, so its test run was not started."
+                    cancel_reason = "The Ember proposal was being accepted, so its test run was not started."
                 elif bind_conflict[0] == "run_bound":
-                    cancel_reason = "Another test of this Copilot proposal had already started, so this one was not."
+                    cancel_reason = "Another test of this Ember proposal had already started, so this one was not."
                 else:
-                    cancel_reason = "The Copilot proposal changed before its test run started."
+                    cancel_reason = "The Ember proposal changed before its test run started."
                 await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final(
                     workflow_run_id=workflow_run.workflow_run_id,
                     failure_reason=cancel_reason,
@@ -5400,7 +5400,7 @@ async def _run_blocks_with_minted_browser_claim(
                     return {
                         "ok": False,
                         "error": (
-                            "The test run could not be bound to the pending Copilot proposal, so it was not started."
+                            "The test run could not be bound to the pending Ember proposal, so it was not started."
                         ),
                         "data": {"run_dispatched": False, _PROPOSAL_BIND_REFUSED_KEY: True},
                     }

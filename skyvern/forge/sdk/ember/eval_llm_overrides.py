@@ -63,13 +63,13 @@ def admit_eval_llm_overrides(raw: str | None, organization_id: str) -> EvalLLMOv
         ):
             raise ValueError("Invalid prompt mapping")
     except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid Copilot eval model overrides") from exc
+        raise HTTPException(status_code=400, detail="Invalid Ember eval model overrides") from exc
     if not parsed:
         return None
     if organization_id not in settings.EMBER_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS:
         raise HTTPException(
             status_code=403,
-            detail="Copilot eval model overrides require an allowlisted Evaluation organization",
+            detail="Ember eval model overrides require an allowlisted Evaluation organization",
         )
     keys: dict[str, str] = dict(sorted(parsed.items()))
     handlers: dict[str, LLMAPIHandler] = {}
@@ -80,7 +80,7 @@ def admit_eval_llm_overrides(raw: str | None, organization_id: str) -> EvalLLMOv
             LLMConfigRegistry.validate_config(key, LLMConfigRegistry.get_config(key))
             handlers[prompt_type] = LLMAPIHandlerFactory.get_llm_api_handler(key)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail="Unsupported Copilot eval model configuration") from exc
+        raise HTTPException(status_code=400, detail="Unsupported Ember eval model configuration") from exc
     encoded = json.dumps(keys, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return EvalLLMOverrides(
         organization_id, MappingProxyType(keys), MappingProxyType(handlers), hashlib.sha256(encoded).hexdigest()

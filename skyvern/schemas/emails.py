@@ -51,7 +51,7 @@ def is_connected_gmail_id(value: str | None) -> bool:
 
 
 CONNECTED_ACCOUNT_EMBER_TEST_RUN_REASON = (
-    "Copilot test runs can't use a Connected Gmail account, except the run Test end-to-end starts in the editor (not"
+    "Ember test runs can't use a Connected Gmail account, except the run Test end-to-end starts in the editor (not"
     " workflows it triggers). Otherwise, save the workflow and run it to use this account."
 )
 

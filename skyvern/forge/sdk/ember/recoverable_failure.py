@@ -120,17 +120,17 @@ def _failure_kind_for_exception(error: BaseException | None) -> RecoverableFailu
 
 def _reason_for_failure(error: BaseException | None, failure_kind: RecoverableFailureKind) -> str:
     if failure_kind == "timeout":
-        return "Copilot timed out before it could finish this turn"
+        return "Ember timed out before it could finish this turn"
     if failure_kind == "validation":
         return "The workflow update could not be validated"
     if failure_kind == "external_dep":
-        return "A Copilot dependency stopped responding"
+        return "An Ember dependency stopped responding"
     if failure_kind == "tool_call":
         chain = list(iter_exception_chain(error)) if error is not None else []
         if any(_is_exception_named(item, "EmberNonRetriableNavError") for item in chain):
             return "A browser navigation step could not reach the target URL"
         return "A browser or workflow helper stopped responding"
-    return "Copilot hit an internal error before it could finish this turn"
+    return "Ember hit an internal error before it could finish this turn"
 
 
 def build_recoverable_failure(
@@ -161,7 +161,7 @@ def format_recoverable_failure_reply(failure: RecoverableFailure) -> str:
 
 def merge_failure_into_context(global_llm_context: str | None, failure: RecoverableFailure) -> str:
     structured = StructuredContext.from_json_str(global_llm_context)
-    note = f"copilot turn failed: {failure.failure_kind} {failure.internal_error_id}"
+    note = f"ember turn failed: {failure.failure_kind} {failure.internal_error_id}"
     if note not in structured.decisions_made:
         structured.decisions_made.append(note)
     return structured.to_json_str()
