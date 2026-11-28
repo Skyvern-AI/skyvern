@@ -2931,7 +2931,7 @@
             "description": "Invalid request - source not found or source archive unavailable"
           },
           "409": {
-            "description": "Browser profile name already exists"
+            "description": "Browser profile name already exists, or the source browser session was used by more than one workflow"
           },
           "422": {
             "description": "Validation Error",
