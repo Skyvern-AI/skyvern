@@ -181,7 +181,10 @@ async def read_html(target: Page | Frame, selection: BrowserEngineSelection | No
 
     require_current()
     browser = context.browser
-    if browser is None or browser.browser_type.name != "chromium":
+    # A persistent context has no owning Browser, but still exposes a CDP
+    # session through context.new_cdp_session(). Only a non-chromium owning
+    # browser rules out the bounded transport.
+    if browser is not None and browser.browser_type.name != "chromium":
         return await page.content()
     enabled = await app.AGENT_FUNCTION.html_content_bounded_transport_enabled()
     require_current()
