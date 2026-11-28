@@ -11,7 +11,7 @@ class GoogleDriveHopRefusal(StrEnum):
 
 
 GOOGLE_DRIVE_EMBER_TEST_RUN_REASON = (
-    "Copilot test runs can't use a connected Drive account, except the run Test end-to-end starts in the editor "
+    "Ember test runs can't use a connected Drive account, except the run Test end-to-end starts in the editor "
     "(not workflows it triggers). Otherwise, save the workflow and run it to use this account."
 )
 

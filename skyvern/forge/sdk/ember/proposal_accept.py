@@ -147,13 +147,13 @@ async def accept_ember_proposal(
 
     metadata = ember_proposal_metadata(proposal)
     if EMBER_PROPOSAL_METADATA_KEY in proposal and metadata is None:
-        raise refused(status.HTTP_409_CONFLICT, "Copilot proposal metadata is invalid; reload required")
+        raise refused(status.HTTP_409_CONFLICT, "Ember proposal metadata is invalid; reload required")
     if metadata is not None:
         untokenized_client = _client_sent_no_proposal_token(owner_turn_id, revision)
         if not untokenized_client and (owner_turn_id != metadata.owner_turn_id or revision != metadata.revision):
-            raise refused(status.HTTP_409_CONFLICT, "Copilot proposal changed; reload required")
+            raise refused(status.HTTP_409_CONFLICT, "Ember proposal changed; reload required")
         if metadata.claim_is_live(datetime.now(UTC)):
-            raise refused(status.HTTP_409_CONFLICT, "Copilot proposal is already being accepted")
+            raise refused(status.HTTP_409_CONFLICT, "Ember proposal is already being accepted")
     # A lapsed claim is being taken over, so the disposition to restore on failure is the
     # reviewable one this accept started from, never the dead claim's own marker.
     original_disposition: ProposalDisposition = (
@@ -163,7 +163,7 @@ async def accept_ember_proposal(
     )
 
     if not proposal.get(EMBER_PROPOSAL_YAML_KEY):
-        raise refused(status.HTTP_400_BAD_REQUEST, "Proposed workflow has no copilot YAML to apply")
+        raise refused(status.HTTP_400_BAD_REQUEST, "Proposed workflow has no Ember YAML to apply")
 
     # Claim before the canonical check and the write: a history read that overtakes this POST must
     # already see a write in flight, or it reports the proposal unsaved and releases the Save hold.
@@ -185,7 +185,7 @@ async def accept_ember_proposal(
                 expected_revision=metadata.revision,
             )
     except EmberProposalConflictError:
-        raise refused(status.HTTP_409_CONFLICT, "Copilot proposal changed; reload required")
+        raise refused(status.HTTP_409_CONFLICT, "Ember proposal changed; reload required")
     claim = ember_proposal_metadata(claimed.proposed_workflow)
     if claim is None:
         raise RuntimeError("Copilot proposal claim returned no ownership token")
@@ -215,7 +215,7 @@ async def accept_ember_proposal(
         except (yaml.YAMLError, ValidationError) as e:
             raise refused(
                 status.HTTP_400_BAD_REQUEST,
-                f"Proposed copilot YAML is invalid: {e}",
+                f"Proposed Ember YAML is invalid: {e}",
                 reason="Proposed copilot YAML is invalid",
             )
         live_title = _accepted_workflow_title(yaml_request.title, canonical, metadata)

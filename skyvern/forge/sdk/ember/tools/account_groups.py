@@ -1362,7 +1362,7 @@ async def build_single_run_review(
 
 async def _recheck_single_run(ctx: EmberContext, review: AccountGroupReview) -> None:
     if not single_run_submit_enabled():
-        raise AccountGroupRefused("Starting runs from Copilot was turned off after the review, so nothing was started.")
+        raise AccountGroupRefused("Starting runs from Ember was turned off after the review, so nothing was started.")
     await _require_run_role()
     if await _chat_has_pending_proposal(ctx):
         raise AccountGroupRefused(_SINGLE_RUN_PENDING_PROPOSAL_REFUSAL)
@@ -1432,7 +1432,7 @@ async def _recheck_draft_save(
 ) -> EmberChat | Workflow:
     """The chat to save the reviewed draft from, or the version an Accept already saved from it."""
     if not single_run_submit_enabled():
-        raise AccountGroupRefused("Starting runs from Copilot was turned off after the review, so nothing was started.")
+        raise AccountGroupRefused("Starting runs from Ember was turned off after the review, so nothing was started.")
     await _require_run_role()
     await _require_save_permission(chat_id)
     await _recheck_single_run_inputs(ctx, review)

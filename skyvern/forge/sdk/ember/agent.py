@@ -3359,7 +3359,7 @@ def _recorded_failure_reply(
         if saved:
             return f"I couldn't verify the saved workflow: {reason}.{status_sentence}"
         return f"I built {block_phrase}, but I couldn't verify it: {reason}.{status_sentence}"
-    return f"I couldn't finish the Copilot turn: {reason}.{status_sentence}"
+    return f"I couldn't finish the Ember turn: {reason}.{status_sentence}"
 
 
 def _build_wip_exit_result(
@@ -4743,15 +4743,15 @@ def _build_request_policy_clarification_result(
 
 
 PENDING_PROPOSAL_TEST_NOT_RESTORED_REPLY = (
-    "Nothing was run: the pending Copilot proposal changed before this test started, so it would not have "
+    "Nothing was run: the pending Ember proposal changed before this test started, so it would not have "
     "run the proposal as offered. Reload and test the current proposal."
 )
 ACCOUNT_PICK_PROPOSAL_CHANGED_REPLY = (
-    "Nothing was run: the pending Copilot proposal changed after the account picker was shown. "
+    "Nothing was run: the pending Ember proposal changed after the account picker was shown. "
     "Test the current proposal again."
 )
 PICKED_ACCOUNT_NOT_ACTIVE_REPLY = (
-    "Nothing was run: Copilot could not confirm the account you picked is an active connection this test can use. "
+    "Nothing was run: Ember could not confirm the account you picked is an active connection this test can use. "
     "Pick it again, or reconnect it on the Integrations page if it was disconnected."
 )
 
@@ -5436,7 +5436,7 @@ async def _run_ember_turn_impl(
                 workflow_permanent_id=chat_request.workflow_permanent_id,
             )
             missing_sdk_reply = (
-                "Copilot backend is missing the OpenAI Agents SDK dependency. "
+                "Ember backend is missing the OpenAI Agents SDK dependency. "
                 "Rebuild or redeploy the backend image so `openai-agents` is installed."
             )
             # ctx isn't constructed yet at this exit (deploy-state check fires

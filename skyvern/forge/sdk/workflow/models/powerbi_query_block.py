@@ -360,7 +360,7 @@ class PowerBIQueryBlock(Block):
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=effective_org_id,
                     error_code=EMBER_TEST_RUN_UNSUPPORTED_CODE,
-                    failure_reason="Power BI blocks can't run in Copilot test runs yet; run the saved workflow instead.",
+                    failure_reason="Power BI blocks can't run in Ember test runs yet; run the saved workflow instead.",
                 )
             if exc.code == "row_limit_exceeded":
                 return await self._failure(

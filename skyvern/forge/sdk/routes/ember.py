@@ -659,7 +659,7 @@ async def _ember_control_allowed(organization_id: str, starter_user_id: str | No
         LOG.warning("Ember turn control check failed", organization_id=organization_id, control=control, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Copilot could not check whether you can do this. Retry shortly.",
+            detail="Ember could not check whether you can do this. Retry shortly.",
             headers={"Retry-After": "2"},
         ) from None
 
@@ -3271,7 +3271,7 @@ async def _new_ember_chat_post(
                 await stream.send(
                     EmberStreamErrorUpdate(
                         type=EmberStreamMessageType.ERROR,
-                        error="Copilot is not configured for this organization. Contact support.",
+                        error="Ember is not configured for this organization. Contact support.",
                         failure_kind="configuration",
                         turn_id=turn_id,
                         narrative_summary=None,
@@ -4170,7 +4170,7 @@ async def ember_chat_post(
         if not chat_request.demonstration_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="demonstration_id is required for a Copilot demonstration",
+                detail="demonstration_id is required for an Ember demonstration",
             )
         try:
             demonstration = await validate_demonstration_for_replay(
@@ -4196,13 +4196,13 @@ async def ember_chat_post(
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Unsupported Copilot eval mode",
+                detail="Unsupported Ember eval mode",
             ) from exc
         if (
             not settings.EMBER_BROWSER_ABLATION_ENABLED
             or organization.organization_id not in settings.EMBER_BROWSER_ABLATION_ORGANIZATION_IDS
         ):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Copilot eval mode is disabled")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Ember eval mode is disabled")
         return await _new_ember_chat_post(
             request,
             chat_request,
@@ -4799,7 +4799,7 @@ async def ember_question_response(
         organization.organization_id, question_response.workflow_copilot_chat_id
     )
     if chat is None:
-        raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+        raise HTTPException(status_code=404, detail="Chat not found")
     turn = _pending_turn_with_question(chat, question_response.interaction_id)
     review = next(
         (
@@ -4983,7 +4983,7 @@ async def ember_credential_deletion(
 ) -> QuestionInteraction:
     """Confirm a deletion card: claim it once, delete the chosen credentials, and record each outcome on it."""
     if not credential_delete_enabled():
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Credential deletion from Copilot is off")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Credential deletion from Ember is off")
     organization_id = organization.organization_id
     # Credential routes sit outside the folder guard, but this one acts on a chat that belongs to a workflow.
     await app.AGENT_FUNCTION.enforce_folder_access(
@@ -5037,7 +5037,7 @@ async def ember_steer(
         organization.organization_id, steer_request.workflow_copilot_chat_id
     )
     if chat is None:
-        raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+        raise HTTPException(status_code=404, detail="Chat not found")
     turn = _pending_turn_with_cancel_token(chat, steer_request.cancel_token)
     await _require_ember_turn_control(organization.organization_id, turn, "steer")
     eval_llm_overrides = admit_eval_llm_overrides(
@@ -5107,7 +5107,7 @@ async def ember_message_feedback(
         workflow_copilot_chat_id=feedback_request.workflow_copilot_chat_id,
     )
     if chat is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown Copilot chat")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
     message_id = feedback_request.workflow_copilot_chat_message_id
     if message_id is None and feedback_request.turn_id is not None:
         row = await _assistant_row_for_turn(chat, feedback_request.turn_id)
@@ -5169,7 +5169,7 @@ async def ember_cancel(
             organization.organization_id, cancel_request.workflow_copilot_chat_id
         )
         if chat is None:
-            raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+            raise HTTPException(status_code=404, detail="Chat not found")
         await _require_ember_turn_control(
             organization.organization_id, _pending_turn_with_cancel_token(chat, cancel_request.cancel_token), "cancel"
         )
@@ -5178,7 +5178,7 @@ async def ember_cancel(
                 organization.organization_id, cancel_request.workflow_copilot_chat_id, cancel_request.cancel_token
             )
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail="Unknown Copilot chat") from exc
+            raise HTTPException(status_code=404, detail="Chat not found") from exc
     cache = getattr(app, "CACHE", None)
     if cache is None:
         if cancelled_questions:
@@ -5218,7 +5218,7 @@ async def _resolve_manual_sign_in(
                 browser_session_id=claim.sign_in.browser_session_id,
                 login_urls=claim.sign_in.login_urls,
                 name=claim.sign_in.profile_name,
-                description="Saved when you signed in yourself from the Copilot credential card.",
+                description="Saved when you signed in yourself from the Ember credential card.",
             ),
             MANUAL_SIGN_IN_SAVE_TIMEOUT_SECONDS,
         )
@@ -5982,7 +5982,7 @@ async def ember_clear_proposed_workflow(
     except NotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
     except EmberProposalConflictError:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal changed; reload required")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ember proposal changed; reload required")
     LOG.info(
         "Ember proposal rejected",
         organization_id=organization.organization_id,

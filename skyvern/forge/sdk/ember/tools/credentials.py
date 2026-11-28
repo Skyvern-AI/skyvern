@@ -528,7 +528,7 @@ def _unapproved_credential_reference_tool_error(unapproved_credential_ids: list[
     formatted_ids = ", ".join(f"`{credential_id}`" for credential_id in unapproved_credential_ids)
     id_word = "ID" if len(unapproved_credential_ids) == 1 else "IDs"
     return (
-        "Credential approval blocked this Copilot run before dispatch. "
+        "Credential approval blocked this Ember run before dispatch. "
         f"Reason codes: unapproved_credential_reference. Unapproved credential {id_word}: {formatted_ids}. "
         "Ask the user to select or confirm the saved credential for this request before running the workflow."
         + (
@@ -1200,7 +1200,7 @@ def bitwarden_binding_change_error(workflow_yaml: str, policy: RequestPolicy | N
     if not bitwarden_secret_bindings(workflow_yaml) - existing:
         return None
     return (
-        "Copilot cannot add or change a `bitwarden_login_credential`, `bitwarden_sensitive_information` or "
+        "Ember cannot add or change a `bitwarden_login_credential`, `bitwarden_sensitive_information` or "
         "`bitwarden_credit_card_data` parameter. Bind a login from `list_credentials` as a `credential` "
         "parameter instead; the user can add a Bitwarden parameter in the workflow editor."
     )

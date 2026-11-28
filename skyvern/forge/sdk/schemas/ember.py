@@ -268,22 +268,20 @@ class EmberCreatedSpreadsheet(BaseModel):
 class EmberChat(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    workflow_copilot_chat_id: str = Field(
-        ..., validation_alias=_CHAT_ID_ALIASES, description="ID for the workflow copilot chat"
-    )
+    workflow_copilot_chat_id: str = Field(..., validation_alias=_CHAT_ID_ALIASES, description="ID for the Ember chat")
     organization_id: str = Field(..., description="Organization ID for the chat")
     workflow_permanent_id: str = Field(..., description="Workflow permanent ID for the chat")
     proposed_workflow: ClientVisibleProposedWorkflow | None = Field(
-        None, description="Latest workflow proposed by the copilot"
+        None, description="Latest workflow proposed by Ember"
     )
     accepted_turn_ids: list[str] = Field(
         default_factory=list, description="Turns whose manual Accept completed on the server"
     )
-    auto_accept: bool | None = Field(False, description="Whether copilot auto-accepts workflow updates")
+    auto_accept: bool | None = Field(False, description="Whether Ember auto-accepts workflow updates")
     pending_turns: dict[str, EmberPendingTurn] = Field(
         default_factory=dict, description="In-flight turns keyed by turn id"
     )
-    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
+    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the Ember model wrote")
     accepted_tested_run: EmberAcceptedTestedRun | None = Field(
         None, description="The run that tested the draft this chat last accepted, keyed by the saved version"
     )
@@ -477,10 +475,10 @@ class EmberChatMessage(BaseModel):
     _narrative_payload_unreadable: bool = PrivateAttr(default=False)
 
     workflow_copilot_chat_message_id: str = Field(
-        ..., validation_alias=_CHAT_MESSAGE_ID_ALIASES, description="ID for the workflow copilot chat message"
+        ..., validation_alias=_CHAT_MESSAGE_ID_ALIASES, description="ID for the Ember chat message"
     )
     workflow_copilot_chat_id: str = Field(
-        ..., validation_alias=_CHAT_ID_ALIASES, description="ID of the parent workflow copilot chat"
+        ..., validation_alias=_CHAT_ID_ALIASES, description="ID of the parent Ember chat"
     )
     sender: EmberChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
@@ -570,7 +568,7 @@ class EmberChatRequest(BaseModel):
     )
     doc_editor_enabled: bool = Field(
         False,
-        description="The client may opt out of Doc note-aware Copilot behavior; the server controls enablement.",
+        description="The client may opt out of Doc note-aware Ember behavior; the server controls enablement.",
         json_schema_extra={"x-internal": True},
     )
     editor_settings_digest: str | None = Field(
@@ -594,7 +592,7 @@ class EmberChatRequest(BaseModel):
     target_block_label: str | None = Field(
         None,
         description=(
-            "When set, the copilot regenerates only this code block from its goal and leaves every "
+            "When set, Ember regenerates only this code block from its goal and leaves every "
             "other block unchanged. Used by the block-level Generate action."
         ),
     )
@@ -915,9 +913,7 @@ class EmberChatHistoryMessage(BaseModel):
 class EmberChatSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    workflow_copilot_chat_id: str = Field(
-        ..., validation_alias=_CHAT_ID_ALIASES, description="ID for the workflow copilot chat"
-    )
+    workflow_copilot_chat_id: str = Field(..., validation_alias=_CHAT_ID_ALIASES, description="ID for the Ember chat")
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1039,7 +1035,7 @@ class EmberStreamResponseUpdate(BaseModel):
     work_plan: list[str] | None = Field(
         None,
         description=(
-            "Latest work plan the copilot model wrote, as of this turn's end. An empty list means the "
+            "Latest work plan the Ember model wrote, as of this turn's end. An empty list means the "
             "model cleared it; None means this frame carries no snapshot and clients keep what they have."
         ),
     )
@@ -1241,9 +1237,9 @@ class EmberRunOutcomeUpdate(BaseModel):
     browser_session_id: str | None = Field(
         None, description="Browser session that owned this run's recorded execution state"
     )
-    workflow_permanent_id: str | None = Field(None, description="Workflow whose Copilot turn created this run")
-    turn_id: str | None = Field(None, description="Parent Copilot turn for this child run")
-    workflow_copilot_chat_id: str | None = Field(None, description="Parent Copilot chat for this child run")
+    workflow_permanent_id: str | None = Field(None, description="Workflow whose Ember turn created this run")
+    turn_id: str | None = Field(None, description="Parent Ember turn for this child run")
+    workflow_copilot_chat_id: str | None = Field(None, description="Parent Ember chat for this child run")
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1442,7 +1438,7 @@ class EmberChatHistoryResponse(BaseModel):
         default_factory=list, description="Turns whose manual Accept completed on the server"
     )
     proposed_workflow: ClientVisibleProposedWorkflow | None = Field(
-        None, description="Latest workflow proposed by the copilot"
+        None, description="Latest workflow proposed by Ember"
     )
     proposed_workflow_metadata: EmberProposalMetadata | None = None
     proposed_claim_expires_in_seconds: float | None = Field(
@@ -1453,9 +1449,9 @@ class EmberChatHistoryResponse(BaseModel):
         ),
     )
     proposed_workflow_run: EmberProposalRunFacts | None = None
-    auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
+    auto_accept: bool | None = Field(None, description="Whether Ember auto-accepts workflow updates")
 
-    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
+    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the Ember model wrote")
 
 
 class EmberCodegenProgressUpdate(BaseModel):

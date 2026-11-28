@@ -102,7 +102,7 @@ async def delete_saved_credentials(
     ctx: EmberContext, *, tool_call_id: str, credential_ids: list[str]
 ) -> dict[str, Any]:
     if not credential_delete_enabled():
-        return CredentialDeletionRefusal(error="Deleting credentials from Copilot is turned off.").model_dump()
+        return CredentialDeletionRefusal(error="Deleting credentials from Ember is turned off.").model_dump()
     review = await build_delete_review(ctx, credential_ids)
     if isinstance(review, str):
         return CredentialDeletionRefusal(error=review).model_dump()
