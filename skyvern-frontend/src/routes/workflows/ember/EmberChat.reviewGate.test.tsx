@@ -4839,7 +4839,7 @@ describe("EmberChat — g2 review gate", () => {
                         ? {
                             data: {
                               detail:
-                                "Copilot proposal is already being accepted",
+                                "Ember proposal is already being accepted",
                             },
                           }
                         : {}),
@@ -13471,7 +13471,7 @@ describe("A46 Accept recovery", () => {
     cancelPost.mockRejectedValueOnce({
       response: {
         status: 409,
-        data: { detail: "Copilot proposal is already being accepted" },
+        data: { detail: "Ember proposal is already being accepted" },
       },
     });
     await act(async () => {
@@ -14130,7 +14130,7 @@ describe("A46 Accept recovery", () => {
     [400, "Proposed Ember YAML is invalid: blocks", true],
     [409, "Ember proposal metadata is invalid; reload required", true],
     [404, "Chat not found", true],
-    [409, "Copilot proposal is already being accepted", false],
+    [409, "Ember proposal is already being accepted", false],
     [500, "Workflow changed after this proposal", false],
     [409, undefined, true],
   ])(
@@ -14141,7 +14141,7 @@ describe("A46 Accept recovery", () => {
       const accept = await screen.findByRole("button", { name: "Accept" });
       const owner = createYamlCommitOwner("wpid_1");
       registerEditorOwner(owner);
-      if (detail === "Copilot proposal is already being accepted")
+      if (detail === "Ember proposal is already being accepted")
         historyResponse.data.proposed_claim_expires_in_seconds = 120;
       cancelPost.mockRejectedValueOnce({
         response: {
@@ -14159,7 +14159,7 @@ describe("A46 Accept recovery", () => {
       if (releases) {
         if (
           detail !== undefined &&
-          detail !== "Copilot proposal changed; reload required"
+          detail !== "Ember proposal changed; reload required"
         )
           expect(vi.mocked(toast)).toHaveBeenCalledWith(
             expect.objectContaining({

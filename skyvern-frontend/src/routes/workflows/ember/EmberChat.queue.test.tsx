@@ -3185,7 +3185,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     await act(async () => {
       call.onMessage({
         ...terminalResponse(
-          "Copilot hit an internal error before it could finish this turn.",
+          "Ember hit an internal error before it could finish this turn.",
         ),
         narrative_payload: {
           turnId: "turn-1",
@@ -3197,7 +3197,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
           blocks: [],
           terminal: "error",
           terminalMessage:
-            "Copilot hit an internal error before it could finish this turn.",
+            "Ember hit an internal error before it could finish this turn.",
           narrativeSummary: "Ember hit an internal error.",
           priorBlockCount: null,
           designActivity: [],

@@ -981,7 +981,7 @@ describe("applyNarrativeEvent — terminal", () => {
       EMPTY_NARRATIVE,
       response({
         message:
-          "Copilot hit an internal error before it could finish this turn.",
+          "Ember hit an internal error before it could finish this turn.",
         narrative_payload: {
           turnId: "turn-1",
           turnIndex: 0,
@@ -1002,7 +1002,7 @@ describe("applyNarrativeEvent — terminal", () => {
           ],
           terminal: "error",
           terminalMessage:
-            "Copilot hit an internal error before it could finish this turn.",
+            "Ember hit an internal error before it could finish this turn.",
           narrativeSummary: "Ember hit an internal error.",
           priorBlockCount: null,
           designActivity: [],
