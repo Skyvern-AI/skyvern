@@ -2367,7 +2367,7 @@ async def test_cancelling_a_run_timeline_settles_the_work_it_started(
 
 
 async def _upload_to_s3(path: str, parameters: dict[str, str] | None = None) -> list[str]:
-    client = SimpleNamespace(upload_file_from_path=AsyncMock())
+    upload = AsyncMock()
     workflow_run_context = MagicMock()
     workflow_run_context.has_parameter.side_effect = lambda key: key in (parameters or {})
     workflow_run_context.get_value.side_effect = lambda key: (parameters or {})[key]
@@ -2376,14 +2376,14 @@ async def _upload_to_s3(path: str, parameters: dict[str, str] | None = None) -> 
         patch.object(UploadToS3Block, "format_potential_template_parameters", return_value=None),
         patch.object(UploadToS3Block, "record_output_parameter_value", AsyncMock()),
         patch.object(UploadToS3Block, "build_block_result", AsyncMock()),
-        patch.object(UploadToS3Block, "get_async_aws_client", return_value=client),
+        patch("skyvern.forge.sdk.workflow.models.block.app.STORAGE.upload_managed_file_from_path", upload),
         patch("skyvern.forge.sdk.workflow.models.block.get_download_retry_started_at", AsyncMock(return_value=None)),
         patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
     ):
         await UploadToS3Block.model_construct(label="upload", path=path).execute(
             workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1"
         )
-    return sorted(Path(call.kwargs["file_path"]).name for call in client.upload_file_from_path.await_args_list)
+    return sorted(Path(call.kwargs["file_path"]).name for call in upload.await_args_list)
 
 
 @pytest.mark.parametrize("chosen", ["download_directory_key", "parameter_naming_the_directory", "directory_path"])

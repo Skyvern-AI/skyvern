@@ -319,8 +319,7 @@ def _stub_app(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             state.artifacts.append(kwargs)
             return f"artifact_{len(state.artifacts)}"
 
-    class Storage:
-        async def store_artifact(self, artifact: SimpleNamespace, data: bytes) -> None:
+        async def overwrite_artifact_data(self, artifact: SimpleNamespace, data: bytes) -> None:
             # Yield once so an unawaited upload stays in flight for the rest of the caller's turn.
             await asyncio.sleep(0)
             if state.fail_store_artifact:
@@ -336,11 +335,6 @@ def _stub_app(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         cached_script_deploy_service.app,
         "ARTIFACT_MANAGER",
         ArtifactManager(),
-    )
-    monkeypatch.setattr(
-        cached_script_deploy_service.app,
-        "STORAGE",
-        Storage(),
     )
     monkeypatch.setattr(
         cached_script_deploy_service.app,

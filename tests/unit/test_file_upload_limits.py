@@ -79,7 +79,7 @@ async def test_upload_to_s3_counts_files_not_subdirectories(tmp_path: Path) -> N
     for index in range(300):
         (run_dir / f"file_{index}.txt").touch()
     (run_dir / "nested").mkdir()
-    client = MagicMock(upload_file_from_path=AsyncMock())
+    upload = AsyncMock()
     workflow_run_context = MagicMock()
     workflow_run_context.has_parameter.return_value = False
 
@@ -93,16 +93,16 @@ async def test_upload_to_s3_counts_files_not_subdirectories(tmp_path: Path) -> N
         patch.object(UploadToS3Block, "format_potential_template_parameters", return_value=None),
         patch.object(UploadToS3Block, "record_output_parameter_value", AsyncMock()),
         patch.object(UploadToS3Block, "build_block_result", AsyncMock()),
-        patch.object(UploadToS3Block, "get_async_aws_client", return_value=client),
+        patch("skyvern.forge.sdk.workflow.models.block.app.STORAGE.upload_managed_file_from_path", upload),
         patch("skyvern.forge.sdk.workflow.models.block.get_download_retry_started_at", AsyncMock(return_value=None)),
         patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
         patch.object(settings, "DOWNLOAD_PATH", str(tmp_path)),
     ):
         await execute()
-        assert client.upload_file_from_path.await_count == 300
+        assert upload.await_count == 300
 
         (run_dir / "file_300.txt").touch()
-        client.upload_file_from_path.reset_mock()
+        upload.reset_mock()
         with pytest.raises(ValueError, match="Too many files"):
             await execute()
-        client.upload_file_from_path.assert_not_awaited()
+        upload.assert_not_awaited()

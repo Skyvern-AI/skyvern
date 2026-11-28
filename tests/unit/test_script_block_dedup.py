@@ -118,7 +118,7 @@ class TestScriptBlockDedup:
 
             assert result is True
             # S3 upload should NOT happen — content unchanged
-            mock_app.STORAGE.store_artifact.assert_not_called()
+            mock_app.ARTIFACT_MANAGER.overwrite_artifact_data.assert_not_called()
             mock_app.DATABASE.artifacts.get_artifact_by_id.assert_not_called()
 
     @pytest.mark.asyncio
@@ -139,7 +139,7 @@ class TestScriptBlockDedup:
             mock_app.DATABASE.scripts.get_script_file_by_id = AsyncMock(return_value=mock_script_file)
             mock_app.DATABASE.artifacts.get_artifact_by_id = AsyncMock(return_value=mock_artifact)
             mock_app.DATABASE.scripts.update_script_file = AsyncMock()
-            mock_app.STORAGE.store_artifact = AsyncMock()
+            mock_app.ARTIFACT_MANAGER.overwrite_artifact_data = AsyncMock()
 
             result = await create_or_update_script_block(
                 block_code="async def task_1_v2(): pass",
@@ -153,7 +153,7 @@ class TestScriptBlockDedup:
             assert result is True
             # S3 upload SHOULD happen — content changed
             mock_app.DATABASE.artifacts.get_artifact_by_id.assert_called_once()
-            mock_app.STORAGE.store_artifact.assert_called_once()
+            mock_app.ARTIFACT_MANAGER.overwrite_artifact_data.assert_called_once()
             # content_hash should be updated on the ScriptFile record AFTER S3 upload
             mock_app.DATABASE.scripts.update_script_file.assert_called_once()
             assert "content_hash" in mock_app.DATABASE.scripts.update_script_file.call_args.kwargs

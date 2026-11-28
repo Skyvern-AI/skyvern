@@ -276,9 +276,9 @@ def _ungated_secret_lookup_only(
 def test_task_artifact_gate_floors_runtime_secret_for_har_and_console(
     monkeypatch: pytest.MonkeyPatch, scrub_all_runs: bool
 ) -> None:
-    # Task-level HAR/console persistence goes through _maybe_redact_artifact_data; a mask-off
+    # Task-level HAR/console persistence goes through scrub_run_bytes; a mask-off
     # workflow must still have runtime-resolved secrets floored there.
-    from skyvern.forge.sdk.artifact import manager as artifact_manager_module
+    from skyvern.utils import run_data_scrub as run_data_scrub_module
 
     fake_app = SimpleNamespace(
         WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
@@ -287,17 +287,17 @@ def test_task_artifact_gate_floors_runtime_secret_for_har_and_console(
             runtime_secret_values_for_artifacts=Mock(return_value={_SHORT_RUNTIME_CODE}),
         )
     )
-    monkeypatch.setattr(artifact_manager_module, "app", fake_app)
-    monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", scrub_all_runs)
+    monkeypatch.setattr(run_data_scrub_module, "app", fake_app)
+    monkeypatch.setattr(run_data_scrub_module.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", scrub_all_runs)
     skyvern_context.set(SkyvernContext(workflow_run_id=WORKFLOW_RUN_ID))
     try:
-        har_out = artifact_manager_module._maybe_redact_artifact_data(
+        har_out = run_data_scrub_module.scrub_run_bytes_sync(
             ArtifactType.HAR, _har_bytes(_SHORT_RUNTIME_CODE), WORKFLOW_RUN_ID
         )
-        console_out = artifact_manager_module._maybe_redact_artifact_data(
+        console_out = run_data_scrub_module.scrub_run_bytes_sync(
             ArtifactType.BROWSER_CONSOLE_LOG, f"code={_SHORT_RUNTIME_CODE}".encode(), WORKFLOW_RUN_ID
         )
-        llm_out = artifact_manager_module._maybe_redact_artifact_data(
+        llm_out = run_data_scrub_module.scrub_run_bytes_sync(
             ArtifactType.LLM_REQUEST, f"code={_SHORT_RUNTIME_CODE}".encode(), WORKFLOW_RUN_ID
         )
     finally:
@@ -314,17 +314,17 @@ def test_task_artifact_gate_floors_runtime_secret_for_har_and_console(
 def test_task_artifact_gate_untouched_when_no_runtime_secrets(
     monkeypatch: pytest.MonkeyPatch, artifact_type: ArtifactType, kill_switch_on: bool
 ) -> None:
-    from skyvern.forge.sdk.artifact import manager as artifact_manager_module
+    from skyvern.utils import run_data_scrub as run_data_scrub_module
 
-    monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", kill_switch_on)
+    monkeypatch.setattr(run_data_scrub_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", kill_switch_on)
     fake_app = SimpleNamespace(
         WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
             artifact_redaction_enabled=Mock(return_value=False),
             runtime_secret_values_for_artifacts=Mock(return_value=set()),
         )
     )
-    monkeypatch.setattr(artifact_manager_module, "app", fake_app)
-    monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", False)
+    monkeypatch.setattr(run_data_scrub_module, "app", fake_app)
+    monkeypatch.setattr(run_data_scrub_module.settings, "ENABLE_ARTIFACT_VALUE_SCRUB_ALL_RUNS", False)
     payload = _har_bytes(SECRET) if artifact_type == ArtifactType.HAR else f"console {SECRET}".encode()
-    out = artifact_manager_module._maybe_redact_artifact_data(artifact_type, payload, WORKFLOW_RUN_ID)
+    out = run_data_scrub_module.scrub_run_bytes_sync(artifact_type, payload, WORKFLOW_RUN_ID)
     assert out == payload
