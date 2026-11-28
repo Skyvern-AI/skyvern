@@ -1937,6 +1937,10 @@ class AgentFunction:
     def is_backup_queue_organization(self, organization_id: str) -> bool:
         return False
 
+    async def scheduled_run_skip_reason(self, organization_id: str) -> str | None:
+        """Let a deployment name a reason to skip a recurring schedule's fire."""
+        return None
+
     workflow_schedules_enabled: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the workflow scheduler routes should serve traffic on this build.
 

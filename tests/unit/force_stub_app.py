@@ -111,6 +111,7 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.relay_http_request_hop = base_agent_function.relay_http_request_hop
     fake_app_module.AGENT_FUNCTION.relay_http_download_hop = base_agent_function.relay_http_download_hop
     fake_app_module.AGENT_FUNCTION.classify_failure = base_agent_function.classify_failure
+    fake_app_module.AGENT_FUNCTION.scheduled_run_skip_reason = base_agent_function.scheduled_run_skip_reason
     fake_app_module.AGENT_FUNCTION.note_page_action = base_agent_function.note_page_action
     fake_app_module.AGENT_FUNCTION.page_submission_evidence = base_agent_function.page_submission_evidence
     fake_app_module.AGENT_FUNCTION.settle_page_reload_signal = base_agent_function.settle_page_reload_signal
