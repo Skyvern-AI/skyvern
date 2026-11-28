@@ -18,7 +18,7 @@ keywords:
   - Workato
 ---
 
-Open **Integrations** in the sidebar to connect outside services to your agents. The page lists everything you have connected at the top, then every integration you can add under **Available**. Search by name, or filter with the category chips (**Workspace**, **Communication**, **Docs**, **Agent Orchestrators**, **Credentials**).
+Open **Integrations** in the sidebar to connect outside services to your agents. The page lists everything you have connected at the top under **Connected**, then every integration you can add under **Available**. Each section is one list. A row shows the integration's logo, name, category and, where it has one, a status badge. Rows under **Available** carry their button; rows under **Connected** open to the accounts on them. Search by name, or filter with the category chips (**Workspace**, **Communication**, **Docs**, **Agent Orchestrators**, **Credentials**).
 
 <img src="/images/cloud/cloud-integrations-page.png" alt="Integrations page with the search box, category filters, connected Google Sheets and Gmail cards, and the Available grid" />
 
@@ -38,10 +38,10 @@ Every integration with a **Connect**, **Configure** or **Set up →** button is 
 | n8n, Zapier, Make, Workato | Agent Orchestrators | Run Skyvern agents from those platforms | **Learn more** |
 | Google Docs, Notion | Workspace, Docs | Not available yet | **Request →** |
 
-Don't see what you need? Click **Request →** on the **Request another integration** card and name the service.
+Don't see what you need? Click **Request →** on the **Request another integration** row and name the service.
 
 <Note>
-Every Admin and Member can connect a Google or Microsoft account or configure a password vault, unless your organization enables [role-based access control](/cloud/account#roles). With it on, these follow what the person's role has been granted, and by default only the **Admin** role has them. Without the grant, the Google Sheets, Google Drive, Gmail and Outlook tiles show **Admin required** in place of **Connect**, and the **Credentials** tiles show it in place of **Configure** or **Edit**. The button is disabled; hovering it shows **Organization admin access is required for this action.** A Member can still pick an already connected account in an agent's blocks.
+Every Admin and Member can connect a Google or Microsoft account or configure a password vault, unless your organization enables [role-based access control](/cloud/account#roles). With it on, these follow what the person's role has been granted, and by default only the **Admin** role has them. Without the grant, the Google Sheets, Google Drive, Gmail and Outlook rows show **Admin required** in place of **Connect**, and the **Credentials** rows show it in place of **Configure** or **Edit**. The button is disabled; hovering it shows **Organization admin access is required for this action.** A Member can still pick an already connected account in an agent's blocks.
 </Note>
 
 ## Google and Microsoft accounts
@@ -50,7 +50,7 @@ Google Sheets, Google Drive, Gmail and Outlook connect through Google or Microso
 
 <Steps>
   <Step title="Click Connect">
-    Click **Connect** on the tile.
+    Click **Connect** on the row.
   </Step>
   <Step title="Name the connection">
     Enter a name, such as "Finance Gmail". You pick the account by this name in your agent's blocks. For Gmail, choose what agents may do: **Read inbox** (on by default) and **Send email**. Click **Continue to Google** (or **Continue to Microsoft** for Outlook).
@@ -77,12 +77,14 @@ Block settings are in the [blocks reference](/reference/blocks).
 
 ### Manage a connected account
 
-Each connected card lists its accounts. From there you can:
+Open an integration's row under **Connected** to see its accounts. The badge on the row counts them, as in **Connected · 1 account**, and reads **Needs reconnect**, **Finish setup** or **Needs attention** when one needs you. From the opened row you can:
 
 - **Add another account**: click **Add another Gmail account** (or the matching name) to connect a second inbox or Google account.
 - **Rename** or **Disconnect**: open the **...** menu on the account row. The name you set is what agent blocks show in their account picker.
 - **Turn on reading or sending** (Gmail): the account row shows **Read inbox** and **Send email**. Click the one that isn't on yet and approve the extra permission. Sending needs the account's address, so a connection with no Google account on record asks you to confirm the account in **Set Google account?** first.
-- **Reconnect** (Google only): if the card shows **Needs reconnect**, the authorization expired or you didn't approve every permission. Click **Reconnect** and sign in with the same account. Skyvern asks Google for the permissions the connection already has, plus any it is missing, and keeps the connection itself, so agents that use the account resume without edits. Sign in with a different account, or leave a permission unapproved, and the previous connection is left unchanged. A connection with no Google account on record asks **Set Google account?** first, and records the account you then sign in with as the one agents use.
+- **Reconnect** (Google only): if the row shows **Needs reconnect**, the authorization expired or you didn't approve every permission. Click **Reconnect** and sign in with the same account. Skyvern asks Google for the permissions the connection already has, plus any it is missing, and keeps the connection itself, so agents that use the account resume without edits. Sign in with a different account, or leave a permission unapproved, and the previous connection is left unchanged. A connection with no Google account on record asks **Set Google account?** first, and records the account you then sign in with as the one agents use.
+
+Each account also lists what it may do: **Can:** names the actions its permissions cover, **Missing permission for:** names the ones they don't, and **Show scopes** lists the scopes the account granted. An account whose permissions Skyvern never recorded reads **Permissions not recorded. Reconnect to see them.** The opened row ends with an **Actions and triggers →** link to the integration's own page.
 
 With role-based access control on, these controls follow the same grants. Without them, you see the account list without **Add another account**, the **...** menu or the Sheets and Drive **Reconnect** button, and Gmail's **Read inbox**, **Send email** and **Reconnect** buttons are disabled.
 
@@ -92,7 +94,7 @@ Disconnecting cannot be undone. Agents that use the account fail on their next r
 
 ## Password vaults
 
-The four **Credentials** tiles let agents log in with secrets you already keep elsewhere. Click **Configure**, fill in the form, and save. The tile then shows **Status: Active**, or **Status: Inactive** if Skyvern could not use what you entered.
+The four **Credentials** rows let agents log in with secrets you already keep elsewhere. Click **Configure**, fill in the form, and save. The row's badge then reads **Active**, or **Inactive** if Skyvern could not use what you entered.
 
 | Vault | What you enter |
 |---|---|
@@ -103,7 +105,7 @@ The four **Credentials** tiles let agents log in with secrets you already keep e
 
 For 1Password, Skyvern checks the token against 1Password before it saves it. A token that 1Password rejects, or that takes more than ten seconds to check, is not saved: the reason appears under **Service Account Token** and the token you had keeps working.
 
-Once the 1Password tile reads **Status: Active**, it also offers **Import from 1Password**, which adds selected vault items to your credential list. See [Import 1Password items as credentials](/credentials#import-1password-items-as-credentials).
+Once the 1Password row reads **Active**, it also offers **Import from 1Password**, which adds selected vault items to your credential list. See [Import 1Password items as credentials](/credentials#import-1password-items-as-credentials).
 
 Until an Admin turns on [role-based access control](/cloud/account#roles), anyone in your organization can configure all four vaults, including saving or clearing the 1Password **Service Account Token**. After that, each role's grants decide.
 
@@ -117,13 +119,13 @@ With a personal API key, Skyvern signs in to Bitwarden with the same device iden
 
 To rotate the key, select **Rotate API key** in Bitwarden, then save the new secret in Skyvern. Saving replaces the whole credential, so enter your master password again too. Saving Bitwarden settings with the `skyvern_bitwarden_config_set` MCP tool also replaces the whole credential and removes any saved API key.
 
-To change or remove a vault, click **Edit** on the tile, then update the fields or click **Clear Token** / **Clear Credential** / **Clear Configuration**.
+To change or remove a vault, click **Edit** on the row, then update the fields or click **Clear Token** / **Clear Credential** / **Clear Configuration**.
 
 How agents pick a vault item at run time, and how to reference items in an agent's inputs, is on [Credentials and 2FA](/credentials).
 
 ## MCP
 
-Click **Set up →** on the **MCP** tile, or **Integrations → MCP** in the sidebar, to open **Connect Skyvern with MCP** at `/integrations/mcp`. Pick your client: **Claude Code**, **Cursor**, **Codex CLI**, **ChatGPT**, **Claude Desktop**, **Windsurf**, **Hermes** or **OpenClaw**. The page shows the recommended setup for that client, with commands you can copy. Browser sign-in (OAuth) methods need no API key. API key methods come pre-filled with your key, unless your organization enables [role-based access control](/cloud/account#roles) and withholds **API keys: View** from your role. You then read **An organization admin manages API keys. Use an OAuth method for this client, or ask an admin for a key.**
+Click **Set up →** on the **MCP** row, or **Integrations → MCP** in the sidebar, to open **Connect Skyvern with MCP** at `/integrations/mcp`. Pick your client: **Claude Code**, **Cursor**, **Codex CLI**, **ChatGPT**, **Claude Desktop**, **Windsurf**, **Hermes** or **OpenClaw**. The page shows the recommended setup for that client, with commands you can copy. Browser sign-in (OAuth) methods need no API key. API key methods come pre-filled with your key, unless your organization enables [role-based access control](/cloud/account#roles) and withholds **API keys: View** from your role. You then read **An organization admin manages API keys. Use an OAuth method for this client, or ask an admin for a key.**
 
 <img src="/images/cloud/cloud-integrations-mcp.png" alt="Connect Skyvern with MCP with Claude Code selected and the Browser sign-in steps" />
 
