@@ -1,10 +1,17 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.credentials import PasswordCredential, TotpType
+from skyvern.forge.sdk.schemas.credentials import (
+    CreateCredentialRequest,
+    CredentialType,
+    NonEmptyPasswordCredential,
+    PasswordCredential,
+    TotpType,
+)
 from skyvern.forge.sdk.services.credential import azure_credential_vault_service as service_module
 from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
 
@@ -206,3 +213,34 @@ async def test_azure_delete_reraises_db_error_when_vault_restore_fails(monkeypat
     assert log_error.call_args.kwargs["credential_id"] == "cred_1"
     assert log_error.call_args.kwargs["item_id"] == "item_1"
     assert log_error.call_args.kwargs["exc_info"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_type", "message"),
+    [
+        pytest.param(RuntimeError, "database unavailable", id="exception"),
+        pytest.param(asyncio.CancelledError, "create cancelled", id="cancelled"),
+    ],
+)
+async def test_create_credential_reclaims_new_secret_when_db_create_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+    message: str,
+) -> None:
+    client = AsyncMock()
+    service = AzureCredentialVaultService(client=client, vault_name="vault")
+    monkeypatch.setattr(service, "_create_azure_secret_item", AsyncMock(return_value="item_new"))
+    monkeypatch.setattr(service, "_create_db_credential", AsyncMock(side_effect=failure_type(message)))
+
+    with pytest.raises(failure_type):
+        await service.create_credential(
+            organization_id="org_test",
+            data=CreateCredentialRequest(
+                name="Login",
+                credential_type=CredentialType.PASSWORD,
+                credential=NonEmptyPasswordCredential(username="user_test", password="secret_test"),
+            ),
+        )
+
+    client.delete_secret.assert_awaited_with(secret_name="item_new", vault_name="vault")
