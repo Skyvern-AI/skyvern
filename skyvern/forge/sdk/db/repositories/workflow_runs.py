@@ -151,6 +151,7 @@ from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsRec
 from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TERMINAL_STATUSES, ProxyLocationInput, RunType
 from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.utils.run_data_scrub import scrub_failure_category, scrub_run_text
 
 LOG = structlog.get_logger()
 _OTP_REQUEST_BINDING_PK = "otp_request_bindings_pkey"
@@ -785,9 +786,9 @@ class WorkflowRunsRepository(BaseRepository):
             if not terminal:
                 run.status, run.finished_at = status.value, now
                 if failure_reason is not None:
-                    run.failure_reason = failure_reason
+                    run.failure_reason = scrub_run_text(failure_reason, workflow_run_id)
                 if failure_category is not None:
-                    run.failure_category = failure_category
+                    run.failure_category = scrub_failure_category(failure_category, workflow_run_id)
                 changed = True
             elif repair_timeout and run.finished_at is None:
                 run.finished_at = now
@@ -1520,7 +1521,7 @@ class WorkflowRunsRepository(BaseRepository):
                 if status and status.is_final() and workflow_run.finished_at is None:
                     workflow_run.finished_at = naive_utc_now()
                 if failure_reason:
-                    workflow_run.failure_reason = failure_reason
+                    workflow_run.failure_reason = scrub_run_text(failure_reason, workflow_run_id)
                 if webhook_failure_reason is not None:
                     workflow_run.webhook_failure_reason = webhook_failure_reason
                 if webhook_delivery_status is not _UNSET:
@@ -1595,7 +1596,7 @@ class WorkflowRunsRepository(BaseRepository):
                         typing_cast(ProxyLocationInput, proxy_location)
                     )
                 if failure_category is not None:
-                    workflow_run.failure_category = failure_category
+                    workflow_run.failure_category = scrub_failure_category(failure_category, workflow_run_id)
                 if status == WorkflowRunStatus.completed:
                     # Emit SQL NULL even if this session loaded NULL before a failure committed.
                     workflow_run.failure_attribution = null()
@@ -1667,7 +1668,9 @@ class WorkflowRunsRepository(BaseRepository):
             )
             if newer_attempt is not None:
                 return None
-            run.failure_category = with_diagnostic_entry(run.failure_category, entry)
+            run.failure_category = scrub_failure_category(
+                with_diagnostic_entry(run.failure_category, entry), run.workflow_run_id
+            )
             await session.commit()
             await session.refresh(run)
             return convert_to_workflow_run(run)
@@ -1766,7 +1769,9 @@ class WorkflowRunsRepository(BaseRepository):
                 return False
             if not await self._mapping_source_is_current(session, run, attempt_number, source):
                 return False
-            run.failure_category = with_final_har_user_match_claim(run.failure_category, identity, source)
+            run.failure_category = scrub_failure_category(
+                with_final_har_user_match_claim(run.failure_category, identity, source), run.workflow_run_id
+            )
             await session.commit()
             return True
 
@@ -1790,8 +1795,9 @@ class WorkflowRunsRepository(BaseRepository):
                 return None
             if not await self._mapping_source_is_current(session, run, attempt_number, source):
                 return None
-            run.failure_category = with_final_har_user_match_result(
-                run.failure_category, identity, source, [], user_errors
+            run.failure_category = scrub_failure_category(
+                with_final_har_user_match_result(run.failure_category, identity, source, [], user_errors),
+                run.workflow_run_id,
             )
             await session.commit()
             await session.refresh(run)
@@ -1904,13 +1910,13 @@ class WorkflowRunsRepository(BaseRepository):
         if status == WorkflowRunStatus.running and not reserve_for_dispatch:
             values["started_at"] = func.coalesce(WorkflowRunModel.started_at, now)
         if failure_reason is not None:
-            values["failure_reason"] = failure_reason
+            values["failure_reason"] = scrub_run_text(failure_reason, workflow_run_id)
         if run_with is not None:
             values["run_with"] = run_with
         if ai_fallback is not None:
             values["ai_fallback"] = ai_fallback
         if failure_category is not None:
-            values["failure_category"] = failure_category
+            values["failure_category"] = scrub_failure_category(failure_category, workflow_run_id)
         if job_id:
             values["job_id"] = job_id
         if depends_on_workflow_run_id:
@@ -2029,13 +2035,16 @@ class WorkflowRunsRepository(BaseRepository):
         now = naive_utc_now()
         values: dict[str, Any] = {"finished_at": now}
         if failure_reason is not None:
-            values["failure_reason"] = func.coalesce(WorkflowRunModel.failure_reason, failure_reason)
+            values["failure_reason"] = func.coalesce(
+                WorkflowRunModel.failure_reason, scrub_run_text(failure_reason, workflow_run_id)
+            )
         if run_with is not None:
             values["run_with"] = func.coalesce(WorkflowRunModel.run_with, run_with)
         if failure_category is not None:
+            scrubbed_category = scrub_failure_category(failure_category, workflow_run_id)
             values["failure_category"] = func.coalesce(
                 WorkflowRunModel.failure_category,
-                literal(failure_category, type_=WorkflowRunModel.failure_category.type),
+                literal(scrubbed_category, type_=WorkflowRunModel.failure_category.type),
             )
         # Overwrite (strengthen) the provisional attribution the bulk sweep wrote: this repair
         # only reaches an unfinished timed_out row, so the value here is the bulk sweep's
@@ -2094,7 +2103,7 @@ class WorkflowRunsRepository(BaseRepository):
             merged = merge(row.failure_category)
             if merged is None:
                 return False
-            row.failure_category = merged
+            row.failure_category = scrub_failure_category(merged, row.workflow_run_id)
             row.failure_attribution = derive_failure_attribution(merged)
             await session.commit()
             return True

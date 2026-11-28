@@ -117,6 +117,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import EMBER_TEST_WORKFLOW_CREATOR
+from skyvern.utils.run_data_scrub import ACTION_JSON_SCRUBBED_KEYS, scrub_run_text, scrub_run_value
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -323,6 +324,13 @@ def _dump_attached_files(attached_files: list[EmberAttachedFile] | None) -> list
     if not attached_files:
         return None
     return [attached.model_dump(mode="json", exclude={"available"}) for attached in attached_files]
+
+
+def _action_payload_with_run_text_scrubbed(action: Action) -> dict[str, Any]:
+    payload = action.model_dump()
+    for key in ACTION_JSON_SCRUBBED_KEYS:
+        payload[key] = scrub_run_value(payload.get(key), action.workflow_run_id)
+    return payload
 
 
 class WorkflowParametersRepository(BaseRepository):
@@ -784,8 +792,8 @@ class WorkflowParametersRepository(BaseRepository):
                 data_extraction_goal=data_extraction_goal,
                 extracted_information_schema=extracted_information_schema,
                 llm=llm,
-                llm_prompt=llm_prompt,
-                llm_response=llm_response,
+                llm_prompt=scrub_run_text(llm_prompt),
+                llm_response=scrub_run_text(llm_response),
                 suggested_title=suggested_title,
                 source_task_generation_id=source_task_generation_id,
             )
@@ -2858,7 +2866,7 @@ class WorkflowParametersRepository(BaseRepository):
     @db_operation("create_action")
     async def create_action(self, action: Action) -> Action:
         async with self.Session() as session:
-            raw_action_payload = action.model_dump()
+            action_payload = _action_payload_with_run_text_scrubbed(action)
             new_action = ActionModel(
                 action_type=action.action_type,
                 source_action_id=action.source_action_id,
@@ -2869,14 +2877,14 @@ class WorkflowParametersRepository(BaseRepository):
                 step_order=action.step_order,
                 action_order=action.action_order,
                 status=action.status,
-                reasoning=action.reasoning,
+                reasoning=action_payload["reasoning"],
                 intention=action.intention,
-                response=action.response,
+                response=action_payload["response"],
                 element_id=action.element_id,
                 skyvern_element_hash=action.skyvern_element_hash,
                 skyvern_element_data=action.skyvern_element_data,
                 screenshot_artifact_id=action.screenshot_artifact_id,
-                action_json=raw_action_payload,
+                action_json=action_payload,
                 confidence_float=action.confidence_float,
                 started_at=action.started_at,
                 finished_at=action.finished_at,
@@ -2894,6 +2902,7 @@ class WorkflowParametersRepository(BaseRepository):
         # uploaded) and its end-of-block batch converge on the same row, so the batch backfills the
         # screenshot instead of inserting a duplicate. Isolated from create_action to leave the agent
         # write path untouched.
+        action_payload = _action_payload_with_run_text_scrubbed(action)
         values = {
             "action_id": action.action_id,
             "action_type": action.action_type,
@@ -2905,14 +2914,14 @@ class WorkflowParametersRepository(BaseRepository):
             "step_order": action.step_order,
             "action_order": action.action_order,
             "status": action.status,
-            "reasoning": action.reasoning,
+            "reasoning": action_payload["reasoning"],
             "intention": action.intention,
-            "response": action.response,
+            "response": action_payload["response"],
             "element_id": action.element_id,
             "skyvern_element_hash": action.skyvern_element_hash,
             "skyvern_element_data": action.skyvern_element_data,
             "screenshot_artifact_id": action.screenshot_artifact_id,
-            "action_json": action.model_dump(),
+            "action_json": action_payload,
             "confidence_float": action.confidence_float,
             "started_at": action.started_at,
             "finished_at": action.finished_at,
@@ -2951,7 +2960,7 @@ class WorkflowParametersRepository(BaseRepository):
                 )
             ).first()
             if action:
-                action.reasoning = reasoning
+                action.reasoning = scrub_run_text(reasoning, action.workflow_run_id)
                 await session.commit()
                 await session.refresh(action)
                 return Action.model_validate(action)
