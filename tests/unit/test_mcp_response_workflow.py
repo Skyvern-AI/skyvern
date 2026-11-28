@@ -286,14 +286,35 @@ async def test_workflow_status_full_bypasses_formatter(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
-async def test_workflow_status_full_over_cap_keeps_existing_summary_degradation(
+async def test_workflow_status_full_over_cap_trims_only_the_oversized_outputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    loop_parameter = {
+        "key": "parse_output",
+        "output_parameter_id": "op_over_cap",
+        "workflow_id": "w_over_cap",
+        "parameter_type": "output",
+        "description": "Output parameter for the parse block",
+        "created_at": "2026-11-27T00:00:00",
+        "modified_at": "2026-11-27T00:00:00",
+    }
     run = {
         "workflow_run_id": "wr_over_cap",
         "workflow_id": "wpid_over_cap",
         "status": "completed",
-        "outputs": {"result": "x" * (MCP_MAX_RESPONSE_CHARS + 1_000)},
+        "outputs": {
+            "parse_a_output": "a" * 90_000,
+            "parse_b_output": "b" * 90_000,
+            "loop_output": [
+                [
+                    {"loop_value": i, "output_parameter": loop_parameter, "output_value": "c" * 4_000},
+                    {"loop_value": i, "output_parameter": loop_parameter, "output_value": f"note {i}"},
+                ]
+                for i in range(40)
+            ],
+            "note_output": "keep me",
+            "summary_output": "s" * 5_000,
+        },
     }
     status = AsyncMock(return_value=run)
     monkeypatch.setattr(workflow_tools, "get_workflow_run_status", status)
@@ -301,11 +322,15 @@ async def test_workflow_status_full_over_cap_keeps_existing_summary_degradation(
     tool = await mcp.get_tool("skyvern_workflow_status")
     result = await tool.fn(run_id="wr_over_cap", verbosity="full")
 
-    status.assert_awaited_once_with("wr_over_cap", include_output_details=True)
     assert result["data"]["run_id"] == "wr_over_cap"
-    assert "output" not in result["data"]
-    assert result["data"]["output_summary"]["present"] is True
-    assert any("returning a reduced payload" in warning for warning in result["warnings"])
+    output = result["data"]["output"]
+    assert output["note_output"] == "keep me"
+    assert output["summary_output"] == "s" * 5_000
+    assert output["parse_a_output"]["truncated"] is True
+    assert output["parse_b_output"]["truncated"] is True
+    iterations = output["loop_output"]
+    assert [iteration[1]["output_value"] for iteration in iterations] == [f"note {i}" for i in range(40)]
+    assert 0 < sum(isinstance(iteration[0]["output_value"], dict) for iteration in iterations) < 40
     assert "_truncated" not in result
 
 
@@ -339,14 +364,8 @@ async def test_workflow_status_full_over_byte_cap_keeps_the_run_and_its_download
     assert "_truncated" not in result
     assert result["data"]["run_id"] == "wr_bytes"
     assert result["data"]["status"] == "completed"
-    assert result["data"]["artifact_summary"]["downloaded_files"] == [
-        {
-            "url": _DOWNLOADED_PDF["url"],
-            "checksum": _DOWNLOADED_PDF["checksum"],
-            "filename": _DOWNLOADED_PDF["filename"],
-        }
-    ]
-    assert any("returning a reduced payload" in warning for warning in result["warnings"])
+    assert result["data"]["downloaded_files"] == [_DOWNLOADED_PDF]
+    assert result["data"]["output"]["extracted_information"]["truncated"] is True
 
 
 @pytest.mark.asyncio
