@@ -1351,7 +1351,8 @@ class TasksRepository(BaseRepository):
                 if status.is_final():
                     update_values["finished_at"] = func.coalesce(TaskModel.finished_at, naive_utc_now())
             if failure_reason:
-                update_values["failure_reason"] = failure_reason
+                # Task ids carry no run id, so only the current context's run, if any, is scrubbed.
+                update_values["failure_reason"] = scrub_run_text(failure_reason)
 
             if not update_values:
                 return []
@@ -1389,7 +1390,9 @@ class TasksRepository(BaseRepository):
             if new_status.is_final():
                 update_values["finished_at"] = func.coalesce(TaskModel.finished_at, naive_utc_now())
             if failure_reason is not None:
-                update_values["failure_reason"] = failure_reason
+                update_values["failure_reason"] = scrub_run_text(
+                    failure_reason, workflow_run_ids[0] if len(workflow_run_ids) == 1 else None
+                )
 
             update_stmt = (
                 update(TaskModel)
