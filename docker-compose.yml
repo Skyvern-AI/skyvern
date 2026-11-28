@@ -134,6 +134,12 @@ services:
     # - LLM_KEY=GROQ
     # - GROQ_API_KEY=<your_key>
     # - GROQ_MODEL=openai/gpt-oss-120b
+    #
+    # Atlas Cloud:
+    # - ENABLE_ATLASCLOUD=true
+    # - LLM_KEY=ATLASCLOUD
+    # - ATLASCLOUD_API_KEY=<your_key>
+    # - ATLASCLOUD_MODEL=deepseek-ai/deepseek-v4-pro
 
     # Bitwarden Settings
     # If you are looking to integrate Skyvern with a password manager (eg Bitwarden), you can use the following environment variables.
